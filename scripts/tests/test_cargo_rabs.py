@@ -23,6 +23,7 @@ import unittest
 from unittest import mock
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "cargo-rabs"
+WORKER_ADAPTER = LAUNCHER.parent.parent / "rch-common/src/toolchain/worker_cache.py"
 loader = importlib.machinery.SourceFileLoader("cargo_rabs", str(LAUNCHER))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 rabs = importlib.util.module_from_spec(spec)
@@ -43,6 +44,37 @@ print("cargo's own stderr", file=sys.stderr, flush=True)
 if os.environ.get("TEST_CARGO_SIGNAL"):
     os.kill(os.getpid(), int(os.environ["TEST_CARGO_SIGNAL"]))
 sys.exit(int(os.environ.get("TEST_CARGO_STATUS", "0")))
+'''
+
+RCH = r'''
+import json, os, pathlib, signal, sys
+keys = ["RCH_REQUIRE_REMOTE", "RCH_RABS_WORKER_CACHE", "CARGO_RABS_REMOTE_ACTIVE",
+        "RCH_WORKER", "RCH_WORKERS", "RCH_CONFIG", "RUSTUP_TOOLCHAIN", "RUSTC",
+        "RUSTC_WRAPPER", "CARGO", "CARGO_TARGET_DIR", "CARGO_MAKEFLAGS"]
+value = {"argv": sys.argv[1:], "pid": os.getpid(), "cwd": os.getcwd(),
+         "rabs_state_present": os.path.exists(os.environ["RABS_STATE_DIR"]),
+         "env": {key: os.environ[key] for key in keys if key in os.environ}}
+with open(pathlib.Path(os.environ["TEST_ROOT"]) / "rch-starts", "a") as stream:
+    stream.write(json.dumps(value) + "\n")
+if os.environ.get("TEST_RCH_WORKER_ADAPTER"):
+    # Explicit RCH/transport double; the worker Python adapter below is real.
+    assert sys.argv[1:5] == ["exec", "--source-content-receipt", "--", "cargo"]
+    assert os.environ["RCH_REQUIRE_REMOTE"] == "1"
+    assert os.environ["RCH_RABS_WORKER_CACHE"] == "1"
+    os.execv(sys.executable, [sys.executable, "-S", os.environ["TEST_RCH_WORKER_ADAPTER"]]
+             + sys.argv[4:])
+if os.environ.get("TEST_RCH_STDIN"):
+    value["stdin"] = sys.stdin.buffer.read().hex()
+if "TEST_JOBSERVER_FD" in os.environ:
+    value["jobserver"] = os.read(int(os.environ["TEST_JOBSERVER_FD"]), 1).hex()
+if os.environ.get("TEST_RCH_RECURSE"):
+    os.execv(sys.executable, [sys.executable, "-S", os.environ["TEST_RCH_RECURSE"],
+                            "rabs", "--rabs-remote", "build"])
+print(json.dumps(value), flush=True)
+print("rch-owned stderr", file=sys.stderr, flush=True)
+if os.environ.get("TEST_RCH_SIGNAL"):
+    os.kill(os.getpid(), int(os.environ["TEST_RCH_SIGNAL"]))
+sys.exit(int(os.environ.get("TEST_RCH_STATUS", "0")))
 '''
 
 DAEMON = r'''
@@ -142,6 +174,7 @@ class LauncherTests(unittest.TestCase):
         for key in list(self.env):
             if key.startswith(("CARGO", "RUST", "RABS")):
                 del self.env[key]
+        self.env.pop("RCH_RABS_WORKER_ACTIVE", None)
         self.env.update({
             "TEST_ROOT": str(self.root), "HOME": str(self.root / "home"),
             "CARGO": str(self.cargo), "CARGO_RABS_DAEMON": str(self.daemon),
@@ -604,6 +637,252 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 127)
         self.assertEqual(self.starts(), [])
 
+    def remote_setup(self, **overrides):
+        rch = self.make_program("rch", RCH)
+        return dict(CARGO_RABS_RCH=str(rch), CARGO_RABS_REMOTE_ACTIVE="0",
+                    RCH_RABS_WORKER_ACTIVE="0", **overrides)
+
+    def rch_starts(self):
+        path = self.root / "rch-starts"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def assert_no_local_setup(self):
+        self.assertEqual(self.starts(), [])
+        self.assertFalse(self.endpoint.exists())
+        self.assertFalse((self.root / "state").exists())
+
+    def test_remote_dispatch_needs_no_dispatcher_cargo_or_rabs_installation(self):
+        changes = self.remote_setup(CARGO="/absent/cargo", CARGO_RABS_DAEMON="/absent/rabsd",
+                                    CARGO_RABS_WRAP="/absent/wrap")
+        result = self.launch(["--rabs-remote"], changes)
+        value = self.cargo_result(result)
+        self.assertEqual(value["argv"], ["exec", "--source-content-receipt", "--", "cargo", "build"])
+        for key in ("RCH_REQUIRE_REMOTE", "RCH_RABS_WORKER_CACHE", "CARGO_RABS_REMOTE_ACTIVE"):
+            self.assertEqual(value["env"][key], "1")
+        self.assertEqual(value["cwd"], str(self.root))
+        self.assertEqual(len(self.rch_starts()), 1)
+        self.assertEqual(result.stderr, b"rch-owned stderr\n")
+        self.assert_no_local_setup()
+
+    def test_remote_preserves_toolchain_routing_and_literal_arguments(self):
+        args = ["+nightly-2026-08-31", "test", "--manifest-path", "a path/Cargo.toml",
+                "--config", 'build.rustflags=["-C", "opt-level=1"]', "--", "",
+                "'\"\\$HOME", "x;touch should-not-exist", "$(touch should-not-exist)",
+                "*", "line\nbreak", "λ雪", "--rabs-no-start"]
+        settings = dict(RUSTUP_TOOLCHAIN="nightly-test", RCH_WORKER="worker-a",
+                        RCH_CONFIG="custom rch.toml", CARGO_TARGET_DIR="private target",
+                        RUSTC_WRAPPER="/custom/wrapper", CARGO="/dispatcher/only/cargo",
+                        RCH_REQUIRE_REMOTE="0", RCH_RABS_WORKER_CACHE="0")
+        value = self.cargo_result(self.launch(["--rabs-remote"] + args,
+                                            self.remote_setup(**settings)))
+        self.assertEqual(value["argv"], ["exec", "--source-content-receipt", "--", "cargo"] + args)
+        for key, expected in settings.items():
+            if key not in ("RCH_REQUIRE_REMOTE", "RCH_RABS_WORKER_CACHE"):
+                self.assertEqual(value["env"][key], expected)
+        self.assertFalse((self.root / "should-not-exist").exists())
+        self.assert_no_local_setup()
+
+    def test_remote_switch_does_not_cross_the_cargo_argument_boundary(self):
+        for args in (["check", "--rabs-remote"], ["--", "--rabs-remote"]):
+            with self.subTest(args=args):
+                value = self.cargo_result(self.launch(args, self.remote_setup()))
+                expected = list(args[1:] if args[0] == "--" else args)
+                self.assertEqual(value["argv"], [os.fsencode(arg).hex() for arg in expected])
+                self.assertEqual(self.rch_starts(), [])
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_remote_local_daemon_options_refuse_before_starting_anything(self):
+        for local in ("--rabs-no-start", "--rabs-require-daemon"):
+            for args in (["--rabs-remote", local], [local, "--rabs-remote"]):
+                with self.subTest(args=args):
+                    result = self.launch(args, self.remote_setup())
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertIn(b"cannot combine", result.stderr)
+                    self.assertEqual(self.rch_starts(), [])
+                    self.assert_no_local_setup()
+
+    def test_remote_missing_and_recursive_executables_never_fall_back_locally(self):
+        alias = self.bin / "rch-alias"
+        alias.symlink_to(LAUNCHER)
+        for path in ("/absent/rch", str(LAUNCHER), str(alias), str(self.bin)):
+            with self.subTest(path=path):
+                result = self.launch(["--rabs-remote"], {"CARGO_RABS_RCH": path})
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(self.rch_starts(), [])
+                self.assert_no_local_setup()
+
+    def test_remote_exec_failure_has_no_local_fallback(self):
+        broken = self.bin / "broken-rch"
+        broken.write_bytes(b"#! /missing/interpreter\n")
+        broken.chmod(0o755)
+        result = self.launch(["--rabs-remote"], {"CARGO_RABS_RCH": str(broken)})
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn(b"cannot execute RCH", result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assert_no_local_setup()
+
+    def test_remote_statuses_never_trigger_a_launcher_retry(self):
+        changes = self.remote_setup()
+        for count, status in enumerate((0, 1, 2, 101, 102, 103, 125, 137, 255), 1):
+            with self.subTest(status=status):
+                result = self.launch(["--rabs-remote", "check"],
+                                     dict(changes, TEST_RCH_STATUS=str(status)))
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(len(self.rch_starts()), count)
+                self.assertEqual(json.loads(result.stdout)["argv"][-1], "check")
+                self.assertEqual(result.stderr, b"rch-owned stderr\n")
+                self.assert_no_local_setup()
+
+    def test_remote_exec_preserves_pid_streams_cwd_and_jobserver_descriptor(self):
+        read_fd, write_fd = os.pipe()
+        child = None
+        try:
+            os.write(write_fd, b"+")
+            env = dict(self.env, **self.remote_setup())
+            env.update(TEST_RCH_STDIN="1", TEST_JOBSERVER_FD=str(read_fd),
+                       CARGO_MAKEFLAGS="-j --jobserver-auth={},{}".format(read_fd, write_fd))
+            child = subprocess.Popen(
+                [sys.executable, "-S", str(LAUNCHER), "rabs", "--rabs-remote", "build"],
+                env=env, cwd=self.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, pass_fds=(read_fd, write_fd),
+            )
+            payload = b"original stdin\0\xff\n"
+            out, err = child.communicate(payload, timeout=5)
+            self.assertEqual(child.returncode, 0, err)
+            value = json.loads(out)
+            self.assertEqual(value["pid"], child.pid)
+            self.assertEqual(value["cwd"], str(self.root))
+            self.assertEqual(value["stdin"], payload.hex())
+            self.assertEqual(value["jobserver"], b"+".hex())
+            self.assertEqual(value["env"]["CARGO_MAKEFLAGS"], env["CARGO_MAKEFLAGS"])
+            self.assertEqual(err, b"rch-owned stderr\n")
+            self.assert_no_local_setup()
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.communicate(timeout=3)
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_remote_signal_is_preserved_without_compiler_reexecution(self):
+        result = self.launch(["--rabs-remote"],
+                             self.remote_setup(TEST_RCH_SIGNAL=str(signal.SIGTERM)))
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stderr)
+        self.assertEqual(len(self.rch_starts()), 1)
+        self.assert_no_local_setup()
+
+    def test_remote_recursive_process_tree_refuses_second_dispatch(self):
+        result = self.launch(["--rabs-remote"],
+                             self.remote_setup(TEST_RCH_RECURSE=str(LAUNCHER)))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b"nested remote dispatch", result.stderr)
+        self.assertEqual(len(self.rch_starts()), 1)
+        self.assertEqual(result.stdout, b"")
+        self.assert_no_local_setup()
+
+    def test_remote_worker_context_cannot_create_a_second_hop(self):
+        for name in ("CARGO_RABS_REMOTE_ACTIVE", "RCH_RABS_WORKER_ACTIVE"):
+            with self.subTest(name=name):
+                changes = self.remote_setup()
+                changes[name] = "1"
+                result = self.launch(["--rabs-remote"], changes)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"nested remote dispatch", result.stderr)
+                self.assertEqual(self.rch_starts(), [])
+                self.assert_no_local_setup()
+
+    def test_remote_non_utf8_argument_is_refused_not_replaced_or_compiled_locally(self):
+        result = self.launch(["--rabs-remote", "rustc", "--", os.fsdecode(b"arg-\xff")],
+                             self.remote_setup())
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b"must be UTF-8", result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(self.rch_starts(), [])
+        self.assert_no_local_setup()
+
+    def test_remote_help_does_not_resolve_executables(self):
+        result = self.launch(["--rabs-remote", "--help"],
+                             {"CARGO": "/absent/cargo", "CARGO_RABS_RCH": "/absent/rch"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"--rabs-remote", result.stdout)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(self.rch_starts(), [])
+        self.assert_no_local_setup()
+
+    def test_remote_path_search_works_without_local_cargo(self):
+        self.make_program("rch", RCH)
+        value = self.cargo_result(self.launch(["--rabs-remote", "check"],
+                                            {"PATH": str(self.bin), "CARGO": ""}))
+        self.assertEqual(value["argv"][-2:], ["cargo", "check"])
+        self.assert_no_local_setup()
+
+    def test_remote_environment_copy_platform_and_nul_refusals(self):
+        env = dict(self.env, **self.remote_setup())
+        saved = dict(env)
+        _, argv, selected = rabs.remote_invocation(["build"], env)
+        self.assertEqual(env, saved)
+        self.assertIsNot(env, selected)
+        self.assertEqual(selected["RCH_REQUIRE_REMOTE"], "1")
+        self.assertEqual(argv[-2:], ["cargo", "build"])
+        with self.assertRaises(rabs.SetupError):
+            rabs.remote_invocation(["build", "bad\0argument"], env)
+        for platform in ("win32", "freebsd", "unknown"):
+            with self.subTest(platform=platform), mock.patch.object(rabs.sys, "platform", platform):
+                with self.assertRaises(rabs.SetupError):
+                    rabs.remote_invocation(["build"], env)
+        # This tests branch selection only, not native macOS execution.
+        with mock.patch.object(rabs.sys, "platform", "darwin"):
+            self.assertEqual(rabs.remote_invocation(["check"], env)[1][-1], "check")
+        self.assertEqual(self.rch_starts(), [])
+        self.assert_no_local_setup()
+
+    def worker_route_setup(self, **overrides):
+        (self.bin / "cargo-rabs").symlink_to(LAUNCHER)
+        return self.remote_setup(TEST_RCH_WORKER_ADAPTER=str(WORKER_ADAPTER),
+                                 PATH=str(self.bin) + os.pathsep + os.defpath, **overrides)
+
+    def test_remote_worker_adapter_imports_updated_launcher_and_prepares_once(self):
+        changes = self.worker_route_setup()
+        for count in (1, 2):
+            value = self.cargo_result(self.launch(["--rabs-remote", "check"], changes))
+            self.assertEqual(value["argv"], [b"check".hex()])
+            self.assertEqual(value["env"]["RUSTC_WRAPPER"], str(self.wrap))
+            self.assertEqual(len(self.starts()), 1)
+            self.assertEqual(len(self.rch_starts()), count)
+            self.assertEqual(value["pid"], self.rch_starts()[-1]["pid"])
+        self.assertFalse(self.rch_starts()[0]["rabs_state_present"])
+        self.assertTrue(self.rch_starts()[1]["rabs_state_present"])
+        self.assertFalse(rabs.process_exited(self.starts()[0]["pid"]))
+
+    def test_remote_worker_cache_failure_execs_cargo_once_without_local_setup(self):
+        changes = self.worker_route_setup(CARGO_RABS_WRAP="/absent/wrapper", TEST_CARGO_STATUS="101")
+        result = self.launch(["--rabs-remote", "test", "--no-run"], changes)
+        self.assertEqual(result.returncode, 101, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["argv"], [b"test".hex(), b"--no-run".hex()])
+        self.assertNotIn("RUSTC_WRAPPER", value["env"])
+        self.assertEqual(len(self.rch_starts()), 1)
+        self.assertEqual(value["pid"], self.rch_starts()[0]["pid"])
+        self.assertIn(b"using stock Cargo", result.stderr)
+        self.assert_no_local_setup()
+
+    def test_remote_worker_preparation_leaves_jobserver_token_for_cargo(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"+")
+            changes = self.worker_route_setup(TEST_JOBSERVER_FD=str(read_fd))
+            value = self.cargo_result(self.launch(["--rabs-remote", "build"], changes,
+                                                 pass_fds=(read_fd, write_fd)))
+            self.assertEqual(value["jobserver"], b"+".hex())
+            self.assertEqual(value["env"]["RUSTC_WRAPPER"], str(self.wrap))
+            self.assertEqual(value["pid"], self.rch_starts()[0]["pid"])
+            self.assertEqual(len(self.starts()), 1)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
     def owner_receipt(self):
         return self.root / "state/cargo-launcher/daemon-owner.json"
 
@@ -826,11 +1105,14 @@ class LauncherTests(unittest.TestCase):
 
 class ProtocolTests(unittest.TestCase):
     def test_argument_boundary_does_not_consume_cargo_options(self):
-        self.assertEqual(rabs.arguments(["rabs"]), (["build"], False, False))
+        self.assertEqual(rabs.arguments(["rabs"]), (["build"], False, False, False))
         self.assertEqual(rabs.arguments(["rabs", "--rabs-no-start", "check", "--rabs-require-daemon"]),
-                         (["check", "--rabs-require-daemon"], True, False))
-        self.assertEqual(rabs.arguments(["--", "--help"]), (["--help"], False, False))
-        self.assertEqual(rabs.arguments(["+nightly", "build"]), (["+nightly", "build"], False, False))
+                         (["check", "--rabs-require-daemon"], True, False, False))
+        self.assertEqual(rabs.arguments(["--", "--help"]), (["--help"], False, False, False))
+        self.assertEqual(rabs.arguments(["+nightly", "build"]), (["+nightly", "build"], False, False, False))
+        self.assertEqual(rabs.arguments(["rabs", "--rabs-remote"]), (["build"], False, False, True))
+        self.assertEqual(rabs.arguments(["--rabs-remote", "--", "--help"]),
+                         (["--help"], False, False, True))
 
     def test_json_object_must_be_complete_unambiguous_and_utf8(self):
         for data in [b'[]', b'null', b'{"kind":"x","kind":"y"}', b'{"a":{"x":1,"x":2}}',

@@ -3,7 +3,8 @@
 
 This is a launcher, not a cache or a second build executor. Cargo still plans
 and runs the build; rabs-wrap and rabsd retain all admission, capture, sampling,
-publication and compiler-skip authority. Requires Linux and Python 3.9+.
+publication and compiler-skip authority. Local setup requires Linux; remote
+dispatch supports Linux/macOS clients. Python 3.9+ is required.
 """
 
 import fcntl
@@ -35,7 +36,7 @@ HELLO = {
     "transport": {"minimum_compatible": 1, "current": 1},
     "application": {"minimum_compatible": 1, "current": 1},
 }
-HELP = """Usage: cargo rabs [--rabs-no-start] [--rabs-require-daemon] [--] [CARGO ARGS...]
+HELP = """Usage: cargo rabs [--rabs-remote | --rabs-no-start] [--rabs-require-daemon] [--] [CARGO ARGS...]
 
 Run Cargo through RABS's evidence-gated live dependency cache. No arguments
 means `build`. Cargo arguments after the first non-launcher option are passed
@@ -43,7 +44,24 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
 
   --rabs-no-start        Only use an already-running daemon.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
+  --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
   --help                Show this help without starting a daemon or Cargo.
+
+Remote mode requires a matching RCH installation and configured POSIX workers.
+It execs `rch exec --source-content-receipt -- cargo ...`, with remote execution
+required and the worker-local cache bridge enabled. RCH owns worker selection,
+toolchain resolution, source/target leases, cancellation, recovery and artifact
+delivery. The launcher starts neither a local build nor a local RABS daemon.
+There is no launcher-side retry or local fallback, including after an uncertain
+remote outcome. RCH's own output contracts and recovery instructions apply.
+This is whole-command remote execution with worker-local dependency reuse, not
+fleet-wide per-action scheduling or a shared cross-worker cache. Cache setup is
+best effort on the worker; a remote build need not produce any cache hits.
+--rabs-remote cannot combine with the two local-daemon options. Linux and macOS
+dispatchers are supported; CARGO_RABS_RCH can select an explicit RCH executable.
+The dispatcher's CARGO executable path is not used as a worker command. Existing
+RUSTUP_TOOLCHAIN, Cargo +toolchain arguments and RCH routing settings are passed
+to RCH without reinterpretation. Custom local Cargo binaries are not transported.
 
 The first invocation can start one shared rabsd with RABS_LIVE_DEPENDENCY=1.
 Later invocations reuse it. An existing daemon is never stopped, replaced, or
@@ -647,28 +665,85 @@ def arguments(argv):
         args.pop(0)  # Cargo's external-subcommand invocation contract.
     no_start = False
     required = False
+    remote = False
     while args:
         if args[0] == "--":
             args.pop(0)
             break
         if args[0] == "--help":
-            return None, False, False
+            return None, False, False, False
         if args[0] == "--rabs-no-start":
             no_start = True
         elif args[0] == "--rabs-require-daemon":
             required = True
+        elif args[0] == "--rabs-remote":
+            remote = True
         else:
             break
         args.pop(0)
-    return args or ["build"], no_start, required
+    if remote and (no_start or required):
+        raise SetupError("--rabs-remote cannot combine with local-daemon options")
+    return args or ["build"], no_start, required, remote
+
+
+def remote_invocation(args, env):
+    """Prepare one RCH argv, never a shell string or a second build executor.
+
+    The Unix RCH backend enforces remote-required refusals and owns all remote
+    effects. The Windows backend has different fallback semantics, so it is
+    deliberately not selected here. No local daemon/compiler probe is needed.
+    RCH already quotes each command argv element: prequoting here would change
+    literal Cargo arguments or turn data into shell syntax.
+    """
+    if sys.platform not in ("linux", "darwin"):
+        raise SetupError("remote dispatch requires a Linux or macOS RCH client")
+    if (env.get("CARGO_RABS_REMOTE_ACTIVE") == "1"
+            or env.get("RCH_RABS_WORKER_ACTIVE") == "1"):
+        raise SetupError("nested remote dispatch is not supported")
+    # RCH's command boundary is Vec<String>. Local passthrough still accepts
+    # opaque Unix argv; remote requests must refuse rather than replace bytes.
+    try:
+        for arg in args:
+            arg.encode("utf-8")
+            if "\0" in arg:
+                raise ValueError("NUL in argument")
+    except (UnicodeError, ValueError) as error:
+        raise SetupError("remote Cargo arguments must be UTF-8 without NUL") from error
+    rch = executable("rch", "CARGO_RABS_RCH", env)
+    if os.path.samefile(rch, __file__):
+        raise SetupError("CARGO_RABS_RCH resolves to cargo-rabs itself")
+    child_env = dict(env)
+    # These are the explicit meaning of --rabs-remote, not global defaults.
+    # Do not alter RCH's selection/retry policy or relax any serving gate.
+    child_env["RCH_REQUIRE_REMOTE"] = "1"
+    child_env["RCH_RABS_WORKER_CACHE"] = "1"
+    child_env["CARGO_RABS_REMOTE_ACTIVE"] = "1"
+    return rch, [rch, "exec", "--source-content-receipt", "--", "cargo"] + args, child_env
 
 
 def main():
-    args, no_start, required = arguments(sys.argv[1:])
+    try:
+        args, no_start, required, remote = arguments(sys.argv[1:])
+    except SetupError as error:
+        print("cargo-rabs: {}".format(error), file=sys.stderr)
+        return 2
     if args is None:
         print(HELP, end="")
         return 0
     env = dict(os.environ)
+    if remote:
+        try:
+            rch, command, child_env = remote_invocation(args, env)
+        except (SetupError, OSError) as error:
+            print("cargo-rabs: remote setup refused: {}".format(error), file=sys.stderr)
+            return 2
+        try:
+            # Transfer ownership once. No wait/retry/fallback branch can run
+            # a local build after RCH has admitted or executed remote work.
+            os.execvpe(rch, command, child_env)
+        except OSError as error:
+            print("cargo-rabs: cannot execute RCH: {}".format(error), file=sys.stderr)
+            return 127
     cargo = env.get("CARGO") or shutil.which("cargo")
     if not cargo:
         print("cargo-rabs: cargo is not installed", file=sys.stderr)
