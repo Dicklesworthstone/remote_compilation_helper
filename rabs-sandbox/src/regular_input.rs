@@ -72,7 +72,7 @@ mod tests {
         use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fifo");
-        rustix::fs::mkfifo(&path, Mode::RUSR | Mode::WUSR).unwrap();
+        rustix::fs::mkfifoat(rustix::fs::CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
         let input = path.clone();
         let thread = std::thread::spawn(move || sender.send(open(&input).is_err()).unwrap());
