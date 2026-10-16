@@ -381,6 +381,9 @@ if [ "$operation" = cancelled ]; then
     # after its tree was retired). It never grants path access.
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
+        # Recovery may query after a rename whose durability acknowledgment
+        # failed. Visibility alone cannot retire the caller's obligations.
+        confirm_durable_record "$cancelled"
         printf cancelled
     else
         printf pending

@@ -387,11 +387,13 @@ class SourceClaimRegistryTests(unittest.TestCase):
                 self.assert_unconfirmed(self.transact(token, roots, operation, env))
                 before = (receipt.stat().st_ino, receipt.read_bytes())
                 self.assertEqual(before[1], body(roots))
-                for retry in ("cancel", "finish-cancel"):
+                for retry in ("cancel", "finish-cancel", "cancelled"):
                     self.assert_unconfirmed(self.transact(token, roots, retry, env))
                     result = self.transact(token, roots, retry)
                     self.assert_granted(result)
-                    self.assertEqual(result.stdout, b"unowned" if retry == "cancel" else b"")
+                    self.assertEqual(result.stdout, {
+                        "cancel": b"unowned", "finish-cancel": b"", "cancelled": b"cancelled",
+                    }[retry])
                 self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
                 self.assert_refused(self.transact(token, roots))
                 self.assert_refused(self.transact(token, roots, "recover"))
@@ -403,7 +405,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
     def test_every_terminal_replay_sync_barrier_is_required_before_success(self):
         roots = [self.root / "project"]
         for state, token, operations in [("released", "aa", ("released", "release")),
-                                         ("cancelled", "ab", ("cancel", "finish-cancel"))]:
+                                         ("cancelled", "ab", ("cancel", "finish-cancel", "cancelled"))]:
             self.assert_granted(self.transact(token, roots))
             if state == "released":
                 self.assert_granted(self.transact(token, roots, "release"))
@@ -470,7 +472,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
         pairs = [("released", state) for state in
                  ("claim", "pending", "cancelling", "cancelled", "quarantine")]
         pairs += [("cancelled", "claim"), ("cancelled", "pending")]
-        operations = ("acquire", "recover", "release", "released", "cancel", "finish-cancel")
+        operations = ("acquire", "recover", "release", "released", "cancel", "finish-cancel", "cancelled")
         for index, states in enumerate(pairs):
             for operation in operations:
                 with self.subTest(states=states, operation=operation):
@@ -519,14 +521,46 @@ class SourceClaimRegistryTests(unittest.TestCase):
             # quarantine fence can contain incomplete bytes, not a valid claim.
             fence = self.registry / (token + "." + digest(roots) + ".cancelling")
             before = (fence.stat().st_ino, fence.read_bytes())
-            for operation in ("cancel", "finish-cancel"):
+            for operation in ("cancel", "finish-cancel", "cancelled"):
                 result = self.transact(token, roots, operation)
                 self.assert_granted(result)
-                self.assertEqual(result.stdout, b"unowned" if operation == "cancel" else b"")
+                self.assertEqual(result.stdout, {
+                    "cancel": b"unowned", "finish-cancel": b"", "cancelled": b"cancelled",
+                }[operation])
             self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
             self.assert_granted(self.transact("cc" if quarantined else "cd", roots))
             self.assert_refused(self.transact(token, roots, "recover"))
             self.assert_refused(self.transact(token, roots, "release"))
+
+    def test_cancellation_query_never_grants_or_retires_source_ownership(self):
+        roots = [self.root / "project"]
+        receipt = self.registry / "cancelled" / ("aa." + digest(roots) + ".claim")
+        for transition in (None, "acquire", "cancel"):
+            if transition:
+                self.assert_granted(self.transact("aa", roots, transition))
+            before = {str(path): (path.stat().st_ino, path.read_bytes())
+                      for path in self.registry.rglob("*") if path.is_file()}
+            query = self.transact("aa", roots, "cancelled")
+            self.assert_granted(query)
+            self.assertEqual(query.stdout, b"pending")
+            self.assertFalse(receipt.exists())
+            after = {str(path): (path.stat().st_ino, path.read_bytes())
+                     for path in self.registry.rglob("*") if path.is_file()}
+            # The first query may create only the flock inode, not any record.
+            self.assertEqual({p: v for p, v in after.items() if not p.endswith("/.lock")},
+                             {p: v for p, v in before.items() if not p.endswith("/.lock")})
+
+        self.assert_granted(self.transact("aa", roots, "finish-cancel"))
+        self.assert_granted(self.transact("bb", roots))
+        next_owner = self.registry / ("bb." + digest(roots) + ".claim")
+        before = [(path.stat().st_ino, path.read_bytes()) for path in (receipt, next_owner)]
+        query = self.transact("aa", roots, "cancelled")
+        self.assert_granted(query)
+        self.assertEqual(query.stdout, b"cancelled")
+        self.assertEqual([(path.stat().st_ino, path.read_bytes())
+                          for path in (receipt, next_owner)], before)
+        self.assert_refused(self.transact("aa", [roots[0] / "different"], "cancelled"))
+        self.assert_refused(self.transact("cc", roots))
 
 
 @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
