@@ -263,9 +263,12 @@ rch_capture_group_witnesses() {
         rch_boot=$2; rch_pgid=$3; rch_start=$4; shift 4
         rch_remote_leader_matches || exit 43
         for member in "$@"; do
-            if rch_read_process "$member" && [ "$rch_observed_boot" = "$rch_boot" ]; then
-                printf "%s:%s\n" "$member" "$rch_observed_start" || exit 44
-            fi
+            # The census classified this member as live. An unavailable
+            # identity is not permission to omit its escalation witness:
+            # fall back to independently authenticated immediate KILL.
+            rch_read_process "$member" || exit 46
+            [ "$rch_observed_boot" = "$rch_boot" ] || exit 46
+            printf "%s:%s\n" "$member" "$rch_observed_start" || exit 44
         done
         rch_remote_leader_matches || exit 43
     ' rch-witnesses "$rch_launch_source" "$rch_boot" "$rch_pgid" "$rch_start" $rch_member_pids)
