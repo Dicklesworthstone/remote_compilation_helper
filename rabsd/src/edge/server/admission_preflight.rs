@@ -7,7 +7,7 @@
 //! and every input guard. In particular, do not fabricate a host triple here
 //! or classify a directory source without its captured checksum witness.
 
-use rabs_key::invocation::{SourceInput, parse};
+use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
 use rabs_key::live_dependency::{LiveRefusal, LiveRustcRequest};
 
 /// A host-independent subset of the live dependency planner's refusals.
@@ -106,11 +106,47 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
     {
         return Some(LiveRefusal::NativeCpu);
     }
-    invocation
-        .native_libs
-        .first()
-        .map(|library| LiveRefusal::NativeLibrary(library.clone()))
+    dependency_inputs_rejection(&invocation)
 }
+
+fn dependency_inputs_rejection(invocation: &NormalizedRustcInvocation) -> Option<LiveRefusal> {
+    if let Some(library) = invocation.native_libs.first() {
+        return Some(LiveRefusal::NativeLibrary(library.clone()));
+    }
+    // A proc-macro PRODUCER is rejected above, but the ordinary lib/rlib
+    // that CONSUMES it cannot enter this unsandboxed class either. Likewise,
+    // build scripts commonly add native search directories even without -l.
+    // Neither needs a host probe, source capture, or dependency enumeration
+    // to establish this refusal. Let Cargo make progress immediately rather
+    // than spend the wrapper's cold-readiness budget on an impossible hit.
+    for entry in &invocation.lib_search {
+        if !entry.starts_with("dependency=") {
+            return Some(LiveRefusal::SearchPath(entry.clone()));
+        }
+    }
+    for (_, path) in &invocation.externs {
+        let Some(path) = path else {
+            // A bare --extern can name a toolchain crate. Only the full
+            // planner and the observed sysroot can bind that dependency.
+            continue;
+        };
+        if path.ends_with(".so") || path.ends_with(".dylib") {
+            return Some(LiveRefusal::ProcMacroDependency(path.clone()));
+        }
+        if !path.ends_with(".rmeta") && !path.ends_with(".rlib") {
+            return Some(LiveRefusal::Extern(path.clone()));
+        }
+    }
+    // Admissible-looking inputs still need the full planner's path topology,
+    // output-alias, target, and complete byte-closure checks. In particular,
+    // unrelated .so files merely sharing a dependency directory are NOT
+    // consumed externs and must not be rejected by this syntactic preflight.
+    None
+}
+
+#[cfg(test)]
+#[path = "dependency_preflight_tests.rs"]
+mod dependency_preflight_tests;
 
 #[cfg(test)]
 mod tests {
