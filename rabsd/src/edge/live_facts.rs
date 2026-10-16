@@ -41,6 +41,7 @@ mod stable_file;
 mod toolchain_hashing;
 mod toolchain_observation;
 mod toolchain_probe;
+mod toolchain_runtime;
 
 /// Domain of the sysroot tree digest.
 pub const DOMAIN_SYSROOT_TREE: &str = "rabs.live-dependency.sysroot-tree.v1";
@@ -225,7 +226,10 @@ fn toolchain_entries(directory: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-fn observe_toolchain_inputs(compiler: &Path, sysroot: &Path) -> Result<ToolchainInputs, String> {
+fn observe_toolchain_inputs(
+    compiler: &Path,
+    sysroot: &Path,
+) -> Result<(ToolchainInputs, toolchain_runtime::Aliases), String> {
     let compiler_sig = lstat_regular(compiler).map_err(|error| format!("compiler: {error}"))?;
     let mut inputs = ToolchainInputs {
         compiler: (compiler.to_path_buf(), compiler_sig),
@@ -243,20 +247,11 @@ fn observe_toolchain_inputs(compiler: &Path, sysroot: &Path) -> Result<Toolchain
     ] {
         inputs.record_directory(&root)?;
     }
-    // Preserve the existing Linux runtime-library selection and key order.
-    // A selected symlink or unreadable file can no longer disappear from
-    // the closure just because lstat_regular failed.
-    for path in toolchain_entries(&lib)? {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("non-UTF-8 toolchain runtime entry")?;
-        if name.contains(".so") {
-            let sig = lstat_regular(&path)
-                .map_err(|error| format!("toolchain runtime {name}: {error}"))?;
-            inputs.runtime_libraries.push((path, sig));
-        }
-    }
+    // SONAME aliases are admitted only through a closed sibling-link profile.
+    // Terminal files retain the existing selected-name order and stable hasher;
+    // the separate alias witness binds their layout and original generations.
+    let runtime = toolchain_runtime::observe(&lib)?;
+    inputs.runtime_libraries = runtime.files;
     let mut pending = Vec::new();
     for target in toolchain_entries(&rustlib)? {
         let meta = std::fs::symlink_metadata(&target)
@@ -294,10 +289,10 @@ fn observe_toolchain_inputs(compiler: &Path, sysroot: &Path) -> Result<Toolchain
         }
     }
     inputs.sysroot_files.sort_by(|a, b| a.0.cmp(&b.0));
-    if !inputs.still_current() {
+    if !inputs.still_current() || !runtime.aliases.still_current() {
         return Err("toolchain inputs changed during enumeration".into());
     }
-    Ok(inputs)
+    Ok((inputs, runtime.aliases))
 }
 
 /// A probed toolchain plus its complete observed file/directory closure.
@@ -305,11 +300,14 @@ fn observe_toolchain_inputs(compiler: &Path, sysroot: &Path) -> Result<Toolchain
 struct ProbedToolchain {
     facts: ToolchainFacts,
     inputs: ToolchainInputs,
+    runtime_aliases: toolchain_runtime::Aliases,
 }
 
 impl ProbedToolchain {
     fn still_current(&self) -> bool {
-        self.inputs.still_current()
+        self.runtime_aliases.still_current()
+            && self.inputs.still_current()
+            && self.runtime_aliases.still_current()
     }
 }
 
@@ -960,7 +958,7 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
     let sysroot = bin.parent().ok_or("compiler has no sysroot")?;
     // Probe output, binary bytes and library facts must belong to this one
     // observed generation, not successive stages of a toolchain update.
-    let inputs = observe_toolchain_inputs(compiler, sysroot)?;
+    let (inputs, runtime_aliases) = observe_toolchain_inputs(compiler, sysroot)?;
     // The shared warm pool must not be held forever by a hung version/sysroot
     // child, an inherited pipe, or unbounded diagnostic output. The existing
     // process supervisor owns cleanup before a failed observation is returned.
@@ -994,14 +992,17 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
     for (relative, digest) in &tree {
         enc.str(relative).str(digest.domain).bytes(&digest.bytes);
     }
+    let mut runtime_libraries = digests.runtime;
+    runtime_aliases.bind_layout(&mut runtime_libraries);
     let probed = ProbedToolchain {
         facts: ToolchainFacts {
             compiler_binary_digest: digests.compiler,
             verbose_version,
             sysroot_root_digest: compute(DOMAIN_SYSROOT_TREE, &enc.finish()),
-            runtime_libraries: digests.runtime,
+            runtime_libraries,
         },
         inputs,
+        runtime_aliases,
     };
     if !probed.still_current() {
         return Err("toolchain inputs changed while it was probed".into());
@@ -2777,7 +2778,7 @@ esac
     #[test]
     fn linked_toolchain_members_refuse_before_running_a_probe() {
         for (relative, target) in [
-            ("lib/libalias.so", "libdriver.so"),
+            ("lib/libalias.so", "../libdriver.so"),
             ("lib/rustlib/test-host/lib/libalias.rlib", "libcore.rlib"),
             ("lib/rustlib/test-host/lib/nested", "self-contained"),
             ("lib/rustlib/linked-target", "test-host"),
