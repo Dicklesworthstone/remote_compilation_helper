@@ -31,7 +31,9 @@ fn boot_once(state_dir: &std::path::Path, quota: Option<&str>) -> std::process::
 /// Seed one real object into the store the daemon will mount, so the
 /// sweep has something to account for and usage is nonzero.
 fn seed_one_object(cas: &Path) {
+    use std::os::unix::fs::PermissionsExt;
     let layout = BlobStoreLayout::open(&cas.join("blobs")).unwrap();
+    std::fs::set_permissions(cas, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = RusqliteEngine::open(&cas.join("meta.sqlite")).unwrap();
     let mut store = SqlMetadataStore::open(engine).unwrap();
     let bytes = b"w1-gc-live-payload";

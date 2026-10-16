@@ -67,7 +67,9 @@ fn daemon_recovers_from_a_store_torn_mid_publication() {
     // will mount: object linked into the published namespace, metadata
     // never recorded (the classic "died between link and commit" tear).
     {
+        use std::os::unix::fs::PermissionsExt;
         let layout = BlobStoreLayout::open(&cas.join("blobs")).unwrap();
+        std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o700)).unwrap();
         let engine = RusqliteEngine::open(&cas.join("meta.sqlite")).unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
         let bytes = b"torn-object-payload";
