@@ -57,9 +57,9 @@ jobs:
           else
             # Refuse a different parent implementation rather than guessing
             # around concurrent source changes or replacing the whole module.
-            # Reviewed through 429ad932: preserve the artifact-header probes
-            # and tracked build/dist/coverage input exceptions.
-            test "$(git hash-object rch/src/transfer.rs)" = c6c528f1a37b7a89fd88f29a4b7598baa41cf74b
+            # Reviewed through the current transfer blob: preserve concurrent
+            # artifact-header, retrieval, and tracked-input changes.
+            test "$(git hash-object rch/src/transfer.rs)" = 2291542a0bc0e2568ddd611d6f85d2ed7e729131
             git apply --check "$patch"
             git apply "$patch"
             echo 'needs_integration=true' >> "$GITHUB_OUTPUT"
