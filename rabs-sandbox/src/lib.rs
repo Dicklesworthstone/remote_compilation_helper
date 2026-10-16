@@ -52,6 +52,8 @@ pub mod pseudo_files;
 pub mod regular_input;
 pub mod runtime_path_scanner;
 pub mod snapshot_capture;
+#[cfg(unix)]
+pub mod socket_endpoint;
 pub mod source_capture;
 pub mod source_transfer;
 pub mod toolchain_dataset;
