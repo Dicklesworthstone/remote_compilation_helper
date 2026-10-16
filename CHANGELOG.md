@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.33` (2026-10-16).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.34` (2026-10-16).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,35 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.34 — 2026-10-16
+
+Dead job leases settle instead of being retried forever. Worker capability probes no longer leave
+core dumps behind, and admin-disabled workers are no longer probed at all.
+
+- **Dead leases settle** (`bd-ey7fr`, `bd-rhhs4`). Two recovery dead ends are closed. A worker grant
+  that was cancelled after execution is retired as failed instead of being reattached, which the
+  registry always refused. A lease whose build the daemon has forgotten is acknowledged without a
+  release once its last heartbeat is more than 24 hours old; that covers terminal receipts evicted by
+  the 500-receipt cap. One dispatcher held 14 such leases, 1.5 to 8 days old
+  ([`39ce991b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/39ce991be00a9ec9602a5b1f8442ab69676eefc1)).
+- **Retiring a Go module cache.** Tree retirement removed trees with a plain `rm -rf`, which fails on
+  Go's read-only module cache when the worker user is not root. It now makes the tree's own
+  directories writable, without following symlinks, and retries
+  ([`351dfd30`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/351dfd309f715124e5787420a7272fd1b69df6a5)).
+- **No core dump when the reader is gone.** `rch-wkr` exits 141, like a SIGPIPE death, when it prints
+  to a caller that already gave up. Before, the release profile aborted and apport wrote a ~288 MB
+  core for every capability probe that outlived rchd's 25 s timeout
+  ([`0da943b5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0da943b5d0cc38b8701f571ad7891b3140735707)).
+- **Admin-disabled workers are not capability-probed.** They receive no work, so the probe had no
+  consumer; the first health cycle after re-enable refreshes the facts
+  ([`156cbfed`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/156cbfed7def2ca20f2d73ce819d6a5f6cd559a8)).
+- `rch status` and `rch doctor` no longer report local-build detection as unavailable when a
+  process exits mid-scan ([`930c10ec`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/930c10ece889840abc7b679f57439da6649c5331)).
+- The pre-download artifact header check (#110) traverses by descriptor and refuses directory
+  symlinks ([`d52bff08`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d52bff0867f08ae3083741193e370dd07ab7d6fc)).
+  Cancellation witness scans are bounded across the whole process group (#115)
+  ([`04e24aea`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/04e24aeaafb4d3f6ff2db765dcc8184f8080c3b3)).
 
 ## 2.1.33 — 2026-10-16
 
