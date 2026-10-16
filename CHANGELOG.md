@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.32` (2026-10-15).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.33` (2026-10-16).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,34 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.33 — 2026-10-16
+
+A worker whose source another owner holds no longer absorbs a project's builds one refusal at
+a time. Foreign-platform Cargo artifacts are rejected from their headers before any payload is
+downloaded. Publication runs off the hook's reactor, and Darwin workers get sturdier process
+supervision.
+
+- **Busy-source fence** (`bd-p3kuz`). A stopped client (here, SIGSTOPped by a disk guard) keeps its
+  worker's source lock until it resumes, but rchd retires its build and kept placing the same
+  project there. Each placement waited 60 s for the lock and was refused: about 290 times in five
+  hours on one dispatcher. A lock wait that times out, or an overlapping claim that never retires,
+  is now reported with the release, and rchd keeps that project off that worker for 15 minutes
+  ([`c69c60e8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c69c60e818500b44896e56a7a72f8019401d7699)).
+- **Foreign artifacts rejected before download** (#110). Retrieval first reads only the headers of
+  the rsync-selected executables (at most 64 bytes each) and refuses a target or CPU mismatch with
+  E327, without replacing local outputs or downloading the test suite. Explicit cross targets and
+  the foreign-artifact opt-in are unchanged, and detached recovery applies the same check
+  ([`cd3fe4d2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cd3fe4d2309730a8253cd884931171a96eefedad), [`984c94f5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/984c94f5a8047b37d4959830d318c47ae161a85d)).
+- **Publication off the reactor** (#112). Artifact publication runs on a blocking worker with
+  cancellation-safe ownership, and preparation no longer re-hashes reused output trees
+  ([`c38bdba3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c38bdba376bfc7d7388a46cfb94f96d27bb2ddb6), [`ff8774c6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ff8774c624140b48bd5960ddf74e064976a71fc6)).
+- **Darwin worker supervision** (#115). Owned-group supervision works on Darwin, jobs complete
+  through verified group completion, leader-crash orphans are reaped, failed boot evidence is
+  rejected, and lifecycle helpers run Python isolated from site hooks
+  ([`732a2927`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/732a2927e36aab578cf8bd21c70dc6335c5049fe), [`85fd4b5c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/85fd4b5c4aaaa100b0759c813deab3e4373329e8), [`c37b5078`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c37b507834d02c2f8e5d359250beee9624f9ccbb), [`37a99dfc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/37a99dfc48966c2dfb02b013c057cb9f4af8923e)).
+- Hook tests keep the temporary directories they chdir into, which removes a recovery-staging
+  rsync flake ([`34f53a16`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/34f53a16b19964253211646246d83c15a3a24f61)).
 
 ## 2.1.32 — 2026-10-15
 
