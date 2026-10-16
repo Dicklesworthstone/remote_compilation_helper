@@ -1,14 +1,12 @@
 diff --git a/rch/src/transfer.rs b/rch/src/transfer.rs
 --- a/rch/src/transfer.rs
 +++ b/rch/src/transfer.rs
-@@ -9,6 +9,7 @@
+@@ -9,4 +9,5 @@
  mod retrieval_space;
  #[cfg(all(test, unix))]
  mod retrieval_space_tests;
 +mod source_archive;
  pub(crate) mod source_content_barrier;
- 
- use crate::error::TransferError;
 @@ -3983,8 +3984,17 @@
 -    // Selection runs entirely locally. Windows include-only tar uploads must
 -    // use the same rsync filters as POSIX uploads, without enabling the separate
