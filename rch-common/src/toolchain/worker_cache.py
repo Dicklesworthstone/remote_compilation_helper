@@ -10,6 +10,9 @@ maximum 35000). The default is CARGO_RABS_STARTUP_MS plus 2000 ms, or 7000 ms
 without a launcher override. Cleanup adds at most 250 ms of cooperative wait;
 a kernel-blocked helper can retain pending SIGKILL. Cargo execution has no new
 timeout. Existing/shared daemons are outside the preparer's process group.
+Diagnostic replay has a separate 100 ms delivery budget and the same 250 ms
+cleanup grace. A stalled stderr reader cannot hold Cargo before exec. Blocking
+kernel operations can still outlive cooperative deadlines with SIGKILL pending.
 """
 
 import ast
@@ -30,6 +33,9 @@ MAX_PREPARE_BYTES = 1024 * 1024
 MAX_PREPARE_LOG_BYTES = 16 * 1024
 MAX_PREPARE_MS = 35_000
 CLEANUP_SECONDS = 0.25
+DIAGNOSTIC_SECONDS = 0.1
+SETUP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP")
+                      if hasattr(signal, name))
 
 
 class PreparationCancelled(BaseException):
@@ -165,31 +171,102 @@ def cleanup_preparer(pid):
     # The direct child has NOT been reaped, even after observed exit. Its PID
     # therefore cannot have been recycled into an unrelated process/group.
     # cargo-rabs starts shared daemons in separate sessions; never kill them.
-    for send in (lambda: os.killpg(pid, signal.SIGKILL),
-                 lambda: os.kill(pid, signal.SIGKILL)):
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, SETUP_SIGNALS)
+    try:
+        for send in (lambda: os.killpg(pid, signal.SIGKILL),
+                     lambda: os.kill(pid, signal.SIGKILL)):
+            try:
+                send()
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + CLEANUP_SECONDS
+        while True:
+            try:
+                child, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return True
+            if child:
+                return True
+            if time.monotonic() >= deadline:
+                # Report through bounded replay, never a blocking parent write.
+                return False
+            time.sleep(0.01)
+    finally:
+        # Deliver a pending cancellation only AFTER the owned child is reaped
+        # or has pending SIGKILL; cancellation must not detach that child.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def replay_diagnostics(data):
+    """Best-effort raw stderr under ownership, without changing Cargo's FDs.
+
+    dup()/O_NONBLOCK would change the shared open-file description, leaking
+    nonblocking I/O into Cargo or its caller. Instead only a short-lived relay
+    may block in write. It owns no stdin, stdout, jobserver or control handles,
+    runs no installed code, and is terminated/reaped before Cargo's exec.
+    """
+    if not data or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        return
+    data = bytes(data[:MAX_PREPARE_LOG_BYTES + 8192])
+    pid = None
+    # Close the fork-to-assignment cancellation window before taking ownership.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, SETUP_SIGNALS)
+    try:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.setsid()
+                for number in SETUP_SIGNALS:
+                    signal.signal(number, signal.SIG_DFL)
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+                for entry in os.listdir("/proc/self/fd"):
+                    descriptor = int(entry)
+                    if descriptor != 2:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                remaining = memoryview(data)
+                while remaining:
+                    written = os.write(2, remaining)
+                    if written <= 0:
+                        break
+                    remaining = remaining[written:]
+            except BaseException:
+                pass
+            os._exit(0)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+        while True:
+            try:
+                exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                # An inherited auto-reap disposition relinquished this PID.
+                # The fixed relay has no descendants: do not signal a reused ID.
+                pid = None
+                return
+            if exited is not None or time.monotonic() >= deadline:
+                return
+            time.sleep(0.005)
+    except OSError:
+        # Exhausted process/FD resources or closed stderr cannot fail a build.
+        # Never attempt to diagnose a relay failure with another stderr write.
+        return
+    finally:
         try:
-            send()
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + CLEANUP_SECONDS
-    while True:
-        try:
-            child, _ = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if child:
-            return
-        if time.monotonic() >= deadline:
-            # A kernel-blocked child can retain pending SIGKILL. Do not turn
-            # bounded setup into an unbounded waitpid; no compile was admitted.
-            print("rch: RABS setup cleanup remains pending; acceleration not used",
-                  file=sys.stderr)
-            return
-        time.sleep(0.01)
+            if pid:
+                cleanup_preparer(pid)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def bounded_prepared_environment(original):
     if sys.platform != "linux" or sys.version_info < (3, 9) or original.get(ACTIVE) == "1":
+        return original
+    # WNOWAIT cannot retain a PID under auto-reap or an external reaper. Refuse
+    # setup before creating effects, rather than risk signaling a reused ID.
+    # Preserve that original disposition for the eventual Cargo exec.
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
         return original
     budget = preparation_seconds(original)
     if budget == 0:
@@ -200,6 +277,7 @@ def bounded_prepared_environment(original):
     pid = None
     logs = bytearray()
     truncated = False
+    failure = b""
     try:
         parent, child = socket.socketpair()
         log_read, log_write = os.pipe2(os.O_CLOEXEC)
@@ -266,23 +344,21 @@ def bounded_prepared_environment(original):
             raise RuntimeError("RABS preparation returned an invalid environment")
         return environment
     except Exception as error:
-        print("rch: worker-local RABS setup unavailable: {}; using stock Cargo".format(error),
-              file=sys.stderr)
+        failure = ("rch: worker-local RABS setup unavailable: {}; using stock Cargo\n"
+                   .format(str(error)[:4096])).encode("utf-8", errors="backslashreplace")
         return original
     finally:
-        if pid:
-            cleanup_preparer(pid)
+        if pid and not cleanup_preparer(pid):
+            failure += b"rch: RABS setup cleanup remains pending; acceleration not used\n"
         for stream in (parent, child):
             if stream is not None:
                 stream.close()
         for descriptor in (log_read, log_write):
             if descriptor is not None:
                 os.close(descriptor)
-        if logs:
-            sys.stderr.buffer.write(logs)
-            sys.stderr.buffer.flush()
         if truncated:
-            print("rch: RABS preparation diagnostics truncated", file=sys.stderr)
+            logs.extend(b"rch: RABS preparation diagnostics truncated\n")
+        replay_diagnostics(failure + logs)
 
 
 def main():

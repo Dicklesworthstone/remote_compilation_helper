@@ -36,6 +36,55 @@ loading the Linux-only preparation path.
 
 ## Execution and fallback
 
+### Direct Cargo entry point
+
+The launcher can select this remote profile directly, without preparing RABS
+or starting a local build on the dispatcher:
+
+```sh
+cargo rabs --rabs-remote build --release
+cargo +nightly rabs --rabs-remote check
+RCH_WORKER=worker-a cargo rabs --rabs-remote test --no-run
+```
+
+This requires the updated `cargo-rabs` launcher, a matching rebuilt RCH client,
+and the worker installation described above. `CARGO_RABS_RCH` selects an explicit
+RCH executable; otherwise the launcher uses its normal sibling/PATH/release
+search. Linux and macOS dispatchers are supported. It does not need a local
+RABS installation. RCH may still perform its own metadata and toolchain probes.
+
+The launcher execs `rch exec --source-content-receipt -- cargo ...` with
+`RCH_REQUIRE_REMOTE=1` and `RCH_RABS_WORKER_CACHE=1`. Source receipts request
+RCH's existing owned source/target path. They do not authorize caching an
+arbitrary whole-Cargo result. RCH retains source-policy enforcement, worker
+selection, toolchain resolution, target isolation, publication and delivery.
+RCH's supported POSIX source-receipt transport is required; unsupported worker
+or command combinations refuse rather than falling back to a local build.
+
+Cargo arguments are passed as separate, unquoted argv elements. The executable
+on the worker is literal `cargo`, not the dispatcher's `CARGO` path. Existing
+`RUSTUP_TOOLCHAIN`, explicit Cargo `+toolchain` arguments and RCH routing settings
+reach RCH unchanged. No custom local Cargo executable is transported or inferred
+from its pathname. Non-UTF-8 arguments refuse remote dispatch without replacement;
+the existing local launcher continues to support opaque Unix argv.
+
+Once RCH is execed, the launcher cannot retry a failed/uncertain build or start
+a local compiler. RCH owns its own admitted attempts and recovery policy. Its
+statuses, output contracts and recovery instructions apply, including its
+restrictions on Cargo JSON stdout; this is not a claim that every Cargo command
+has stock-Cargo stdout behavior through the current RCH backend. Worker cache
+setup remains best effort: remote-required is not cache-hit-required.
+
+`--rabs-remote` cannot be combined with `--rabs-no-start` or
+`--rabs-require-daemon`, which refer to local daemon setup. Options after the
+first Cargo argument or an explicit `--` are never interpreted by the launcher.
+`CARGO_RABS_REMOTE_ACTIVE=1` marks the RCH process tree so re-entering remote mode
+refuses; an existing `RCH_RABS_WORKER_ACTIVE=1` similarly prevents second-hop
+dispatch. These are recursion controls, not authentication or publication rights.
+Normal local mode and the version-1 imported `prepare()` API are unchanged.
+
+### Worker-side preparation
+
 RCH's existing environment controls run before preparation. The adapter then
 loads the worker-installed launcher's versioned `prepare` API without running
 its CLI, and finally execs the unchanged `rustup run <toolchain> cargo ...`
@@ -60,6 +109,27 @@ handles and the command's exit status remain under their existing owners.
 `RCH_RABS_WORKER_ACTIVE=1` prevents repeated preparation in an already-prepared
 process tree; it is not cache-hit or compiler-skip authority.
 
+Preparation runs in an owned helper under `RCH_RABS_PREPARE_TIMEOUT_MS`
+(0 skips setup, maximum 35000 ms; default `CARGO_RABS_STARTUP_MS` plus 2000 ms,
+or 7000 ms without that override). Cargo retains its original descriptors.
+Captured setup diagnostics are replayed by a separate, short-lived process
+with only stderr, not by a potentially blocking write in the Cargo parent.
+Replay has a 100 ms delivery budget and up to 250 ms of cooperative cleanup;
+the existing preparation cleanup has its own 250 ms grace. A full stderr pipe
+therefore cannot indefinitely prevent the final Cargo exec. No extra relay
+is created for silent setup. Cargo's own output is never passed through this
+bounded setup logger, and no inherited open-file-description flags are changed.
+
+Readable setup logs retain their raw bytes up to the existing 16 KiB capture
+bound. Slow, closed or unavailable diagnostic sinks can lose a suffix or the
+whole setup diagnostic; this is not a durable logging contract. Cancellation
+during replay terminates the owned relay and does not start Cargo. SIGCHLD
+auto-reap or a custom child reaper bypasses setup before any helper is forked,
+because those contexts cannot provide the retained PID ownership required for
+safe cleanup. The original child-reaping disposition is not overwritten.
+Kernel-blocked operations can outlive cooperative deadlines with SIGKILL
+pending; this does not assert a hard wall-clock filesystem or process bound.
+
 RABS still checks exact input keys, output custody, publication, trust,
 sampling and materialization. Readiness is not a hit. Unsupported units and
 required verification executions compile normally. No serving policy, default
@@ -75,8 +145,30 @@ and jobserver pipes. Its 23 tests include concurrent startup, managed crash
 recovery, refusal of incompatible launchers before source execution, opaque
 argv, exec-once exit/signal behavior and a PATH-shim sensitivity control.
 Cargo, Rustup and the daemon in these tests are fixture executables. The
-existing 50 launcher tests remain unchanged. Five additional Rust unit tests
-exercise command construction and opt-out parity.
+original launcher behavior remains covered by its 50 regressions. Five additional
+Rust unit tests exercise command construction and opt-out parity.
+
+Eighteen additional tests in `scripts/tests/test_cargo_rabs.py` exercise the
+remote entry point with real exec, signals, streams, cwd and jobserver handles.
+They cover missing or recursive RCH executables, local-option conflicts,
+unsupported argument encoding, routing/toolchain/argument preservation,
+status propagation and the absence of launcher retries or local setup. The
+RCH program in these tests is an explicit fixture. Three tests continue through
+the production `worker_cache.py` and imported preparation API, proving
+shared fixture-daemon setup, worker-side cache refusal and jobserver custody.
+They still do not run the Rust RCH backend, SSH, real remote Cargo, source receipts
+or cache hits. The existing workflow already executes this whole test file;
+no permission changes are needed. Native macOS and full fleet acceptance remain
+separate checks.
+
+`tests/test_rabs_worker_cache_diagnostics.py` adds sixteen adapter regressions
+with real filled/broken pipes, raw diagnostic bytes, regular-file offsets,
+jobserver descriptors, and relay cancellation under INT/TERM/HUP. Cargo and
+installed preparation code are explicit doubles; one cancellation driver records
+real fork results, and resource-failure tests inject fork refusal. Successful and
+timed-out setup both wedge against the exact prior adapter when stderr is full;
+the repaired adapter passes the same tests without draining that pipe. All 68
+launcher tests and all 16 diagnostic tests passed during this integration.
 
 Both native suites passed during implementation. Rust compilation, those Rust
 unit tests, Clippy, formatting, real Cargo cache-hit parity and fleet acceptance
