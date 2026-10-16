@@ -252,29 +252,55 @@ rch_capture_group_witnesses() {
     rch_member_pids=$(printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" '
         $2 == group && $3 !~ /^[ZXx]/ { print $1 }
     ') || return 44
-    for rch_member_pid in $rch_member_pids; do
-        if rch_read_process "$rch_member_pid" && [ "$rch_observed_boot" = "$rch_boot" ]; then
-            rch_witnesses="$rch_witnesses $rch_member_pid:$rch_observed_start"
-        fi
+    # A per-process deadline still grows without bound with the job's size.
+    # Collect in one timed control exchange using the SAME literal protocol.
+    # No signal is sent here, and partial/failed output grants no authority.
+    # 46 means collection unavailable: the caller may use a freshly verified
+    # leader for immediate KILL, never send TERM with incomplete witnesses.
+    [ -n "${rch_launch_source:-}" ] || return 46
+    rch_collected=$(rch_control_capture 5s /bin/sh -c '
+        command eval "$1" || exit 44
+        rch_boot=$2; rch_pgid=$3; rch_start=$4; shift 4
+        rch_remote_leader_matches || exit 43
+        for member in "$@"; do
+            if rch_read_process "$member" && [ "$rch_observed_boot" = "$rch_boot" ]; then
+                printf "%s:%s\n" "$member" "$rch_observed_start" || exit 44
+            fi
+        done
+        rch_remote_leader_matches || exit 43
+    ' rch-witnesses "$rch_launch_source" "$rch_boot" "$rch_pgid" "$rch_start" $rch_member_pids)
+    case $? in 0) ;; 43) return 43;; *) return 46;; esac
+    [ -n "$rch_collected" ] || return 46
+    for rch_witness in $rch_collected; do
+        case "$rch_witness" in *:*) ;; *) return 46;; esac
+        rch_valid_pgid "${rch_witness%%:*}" &&
+            rch_scope_uint "${rch_witness#*:}" && [ "${rch_witness#*:}" != 0 ] || return 46
     done
     # Do not transfer authority across a leader exit/reuse during collection.
-    rch_remote_leader_matches || { rch_witnesses=; return 43; }
+    rch_remote_leader_matches || return 43
+    rch_witnesses=$rch_collected
     rch_witness_identity="$rch_boot:$rch_pgid:$rch_start"
 }
 
 rch_remote_witness_matches() {
     [ "${rch_witness_identity:-}" = "$rch_boot:$rch_pgid:$rch_start" ] || return 1
-    for rch_witness in $rch_witnesses; do
-        rch_witness_pid=${rch_witness%%:*}
-        rch_witness_start=${rch_witness#*:}
-        # rch_read_process also checks current group membership and liveness.
-        if rch_read_process "$rch_witness_pid" &&
-            [ "$rch_observed_boot" = "$rch_boot" ] &&
-            [ "$rch_observed_start" = "$rch_witness_start" ]; then
-            return 0
-        fi
-    done
-    return 1
+    [ -n "${rch_launch_source:-}" ] || return 1
+    # TERM can change a previously fast observer into a stalled one. Bound
+    # revalidation too; a failed exchange is NOT permission to signal an orphan.
+    rch_matched=$(rch_control_capture 5s /bin/sh -c '
+        command eval "$1" || exit 44
+        rch_boot=$2; rch_pgid=$3; shift 3
+        for witness in "$@"; do
+            if rch_read_process "${witness%%:*}" &&
+                [ "$rch_observed_boot" = "$rch_boot" ] &&
+                [ "$rch_observed_start" = "${witness#*:}" ]; then
+                printf "RCH_WITNESS_MATCH_V1\n"
+                exit 0
+            fi
+        done
+        exit 1
+    ' rch-witnesses "$rch_launch_source" "$rch_boot" "$rch_pgid" $rch_witnesses) || return 1
+    [ "$rch_matched" = RCH_WITNESS_MATCH_V1 ]
 }
 
 # Signal authority does not come from a system-wide census. Independently
@@ -398,10 +424,15 @@ rch_remote_cancel_loaded() {
             rch_mode=kill;;
         *) return 44;;
     esac
+    if [ "$rch_mode" = term ] && [ "${rch_scope_bound:-0}" != 1 ]; then
+        rch_capture_group_witnesses
+        case $? in
+            0) ;;
+            46) rch_mode=kill;; # Signal boundary must still authenticate the leader.
+            *) return $?;;
+        esac
+    fi
     if [ "$rch_mode" = term ]; then
-        if [ "${rch_scope_bound:-0}" != 1 ]; then
-            rch_capture_group_witnesses || return $?
-        fi
         rch_signal_group TERM || return $?
         rch_term_sent=1
         sleep 1 || return 44

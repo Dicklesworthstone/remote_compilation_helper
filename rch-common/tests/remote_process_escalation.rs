@@ -98,6 +98,17 @@ rch_read_process() {
     rch_observed_boot=$test_boot
     rch_observed_start=$test_start
 }
+# Observation now runs inside the bounded control exchange. Give that exact
+# protocol copy the same explicit fake backend and export its changing facts.
+# Signal interception and every refusal assertion remain in this observer.
+export test_boot test_start test_member_live
+rch_launch_source="$rch_launch_source"'
+rch_read_process() {
+    [ "$1" = 301 ] && [ "$test_member_live" = 1 ] || return 1
+    rch_observed_boot=$test_boot
+    rch_observed_start=$test_start
+}
+'
 kill() { test_signals=$((test_signals + 1)); }
 refused() {
     rch_signal_group "$1"
@@ -150,6 +161,12 @@ rch_remote_leader_matches() {
     [ "$test_leader_reads" = 1 ]
 }
 rch_read_process() { rch_observed_boot=boot; rch_observed_start=200; }
+# The collector observes the live leader, but it exits before the parent can
+# accept those witnesses. The parent's second birth check MUST still fail.
+rch_launch_source="$rch_launch_source"'
+rch_remote_leader_matches() { return 0; }
+rch_read_process() { rch_observed_boot=boot; rch_observed_start=200; }
+'
 rch_capture_group_witnesses
 code=$?
 [ "$code" = 43 ] && [ -z "$rch_witnesses" ] && [ -z "$rch_witness_identity" ] || exit 1

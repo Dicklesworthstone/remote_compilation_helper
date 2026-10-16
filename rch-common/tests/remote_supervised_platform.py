@@ -115,7 +115,7 @@ class SupervisedPlatform(unittest.TestCase):
                 f"while [ ! -f {shlex.quote(str(self.release))} ]; do sleep .1; done")
 
     def observe(self, body):
-        return subprocess.run([SHELL, "-c", CORE + "\n" + body], env=self.env,
+        return subprocess.run([SHELL, "-c", PROTOCOL + "\n" + body], env=self.env,
                               capture_output=True, timeout=30)
 
     def cancel(self, mode="term"):
@@ -197,6 +197,151 @@ class SupervisedPlatform(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(run[0].wait(timeout=15), 0)
         self.assert_empty()
+
+    def cancel_with_probe(self, probe):
+        # Fault injection is confined to the cancelling channel. Launch,
+        # leader identity, actual signals and the final census remain native.
+        # Put it in the literal shared source so a bounded collector sees the
+        # same observation backend as its parent, not a special test path.
+        core = CORE.replace("rch_read_process() {", "rch_real_read_process() {")
+        core += "\n" + probe
+        trace = self.root / "signals"
+        core = core.replace("rch_signal_group() {", "rch_real_signal_group() {")
+        core += ("\nrch_signal_group() { printf '%s\\n' \"$1\" >> "
+                 + shlex.quote(str(trace)) + '; rch_real_signal_group "$@"; }\n')
+        script = PROTOCOL.replace(CORE, core) + (
+            f"\nrch_remote_cancel {shlex.quote(str(self.receipt))} 115 term")
+        started = time.monotonic()
+        result = subprocess.run([SHELL, "-c", script], env=self.env,
+                                capture_output=True, timeout=25)
+        elapsed = time.monotonic() - started
+        return result, elapsed, trace.read_text() if trace.exists() else ""
+
+    def test_stalled_member_probe_cannot_starve_cancellation(self):
+        run = self.start(
+            f"trap '' TERM; echo $$ > {shlex.quote(str(self.ready))}; "
+            "while :; do sleep 1; done")
+        self.wait_ready(run[0])
+        member = int(self.ready.read_text())
+        result, elapsed, signals = self.cancel_with_probe(f'''
+rch_read_process() {{
+    if [ "$1" = {member} ]; then sleep 15; fi
+    rch_real_read_process "$1"
+}}
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 10, "member observation consumed the recovery budget")
+        self.assertEqual(signals, "KILL\n", "partial collection must not authorize TERM")
+        self.assert_empty()
+        self.assertNotEqual(run[0].wait(timeout=10), 0)
+
+    def test_large_group_has_one_collection_budget_not_one_per_member(self):
+        run = self.start(
+            "trap '' TERM; i=0; while [ \"$i\" -lt 32 ]; do sleep 60 & i=$((i+1)); done; "
+            + self.blocking_payload())
+        self.wait_ready(run[0])
+        result, elapsed, signals = self.cancel_with_probe('''
+rch_read_process() {
+    if [ "$1" != "$rch_pgid" ]; then sleep .4; fi
+    rch_real_read_process "$1"
+}
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 10, "per-member limits accumulated without a global limit")
+        self.assertEqual(signals, "KILL\n")
+        self.assert_empty()
+        self.assertNotEqual(run[0].wait(timeout=10), 0)
+
+    def test_complete_collection_retains_graceful_term(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        result, _, signals = self.cancel_with_probe('''
+rch_read_process() { rch_real_read_process "$1"; }
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(signals.startswith("TERM\n"), signals)
+        self.assert_empty()
+        self.assertNotEqual(run[0].wait(timeout=10), 0)
+
+    def test_witness_revalidation_has_a_shared_deadline(self):
+        run = self.start(
+            f"echo $$ > {shlex.quote(str(self.ready))}; while :; do sleep 1; done")
+        self.wait_ready(run[0])
+        member = int(self.ready.read_text())
+        setup = f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; "
+        observed = self.observe(setup + f'rch_read_process {member} || exit 90; '
+                                'printf "%s" "$rch_observed_start"')
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        birth = int(observed.stdout)
+        core = CORE.replace("rch_read_process() {", "rch_real_read_process() {")
+        core += f'''
+rch_read_process() {{ sleep 15; rch_real_read_process "$1"; }}
+'''
+        script = PROTOCOL.replace(CORE, core) + "\n" + setup + f'''
+rch_witness_identity="$rch_boot:$rch_pgid:$rch_start"
+rch_witnesses={member}:{birth}
+rch_remote_witness_matches
+'''
+        started = time.monotonic()
+        result = subprocess.run([SHELL, "-c", script], env=self.env,
+                                capture_output=True, timeout=25)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIsNone(run[0].poll(), "failed witness probe signalled the workload")
+        self.assertEqual(self.cancel("kill").returncode, 0)
+
+    def test_partial_and_malformed_collection_never_leaks_witnesses(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        for output, code in (("123:456", 7), ("", 0), ("123", 0),
+                             ("123:0", 0), ("1:456", 0), ("123:456:789", 0)):
+            with self.subTest(output=output, status=code):
+                result = self.observe(f'''
+rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
+rch_group_state; [ "$?" = 1 ] || exit 81
+rch_control_capture() {{ printf '%s\\n' {shlex.quote(output)}; return {code}; }}
+rch_witnesses=stale; rch_witness_identity=stale
+rch_capture_group_witnesses
+[ "$?" = 46 ] && [ -z "$rch_witnesses$rch_witness_identity" ] || exit 82
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNone(run[0].poll())
+        self.assertEqual(self.cancel("kill").returncode, 0)
+
+    def test_collection_failure_does_not_bypass_live_birth_check(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        # Model a changed identity between collection and the signal boundary.
+        # Even the immediate-KILL fallback must refuse this still-live group.
+        result = self.observe(f'''
+rch_capture_group_witnesses() {{ rch_start=$((rch_start + 1)); return 46; }}
+rch_remote_cancel {shlex.quote(str(self.receipt))} 115 term
+''')
+        self.assertEqual(result.returncode, 43, result.stderr)
+        self.assertIsNone(run[0].poll())
+        self.assertEqual(self.cancel("kill").returncode, 0)
+
+    def test_bounded_witness_match_preserves_birth_and_exchange_fences(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        result = self.observe(f'''
+rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
+rch_group_state; [ "$?" = 1 ] || exit 81
+rch_capture_group_witnesses || exit 82
+rch_remote_witness_matches || exit 83
+rch_witnesses="$rch_pgid:$((rch_start + 1))"
+if rch_remote_witness_matches; then exit 84; fi
+rch_control_capture() {{ printf 'RCH_WITNESS_MATCH_V1\\n'; return 7; }}
+if rch_remote_witness_matches; then exit 85; fi
+rch_control_capture() {{ printf 'RCH_WITNESS_MATCH_V1 contaminated\\n'; }}
+if rch_remote_witness_matches; then exit 86; fi
+rch_witness_identity=stale
+rch_control_capture() {{ exit 87; }}
+if rch_remote_witness_matches; then exit 88; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(run[0].poll())
+        self.assertEqual(self.cancel("kill").returncode, 0)
 
     def test_duplicate_admission_cannot_replace_live_receipt(self):
         first = self.start(self.blocking_payload())
