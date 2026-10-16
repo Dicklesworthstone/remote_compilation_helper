@@ -60,6 +60,70 @@ struct PreparedBuild<'a> {
 }
 
 impl PreparedBuild<'_> {
+    /// Preparation and execution share this one CLI process. In particular,
+    /// do not start a second orchestration child between a mutable checkout
+    /// and the existing retained-request execution/recovery boundary.
+    fn prepare_from(&self, source: &str, specification: &str) -> io::Result<()> {
+        if self.mode != DeliveryMode::Execute || self.resume_from.is_some() {
+            return Err(invalid(
+                "source preparation cannot be combined with result recovery",
+            ));
+        }
+        // Validate placement/trust before copying source or a large toolchain.
+        let address: std::net::SocketAddr = self
+            .address
+            .parse()
+            .map_err(|_| invalid("listen must be a literal IP:port"))?;
+        match self.pin {
+            Some(pin) => {
+                parse_worker_pin(pin)?;
+            }
+            None if !address.ip().is_loopback() => {
+                return Err(invalid("plaintext worker execution requires loopback"));
+            }
+            None => {}
+        }
+        self.validate_paths(false)?;
+        ordinary_directory(Path::new(source), false)?;
+        for destination in [self.bundle, self.directory, self.output] {
+            ordinary_directory(destination, true)?;
+            if destination.starts_with(source) || Path::new(source).starts_with(destination) {
+                return Err(invalid(
+                    "build destinations must not overlap the source anchor",
+                ));
+            }
+            match fs::symlink_metadata(destination) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => {
+                    return Err(invalid(
+                        "prepare-from requires new bundle, delivery and output directories; recover the existing operation without prepare-from",
+                    ));
+                }
+            }
+        }
+        // Reuse the ordinary bounded preparation CLI implementation, including
+        // coherent capture, Cargo source resolution, toolchain retention and
+        // the final request.json durability marker. Nothing is dispatched by it.
+        crate::prepare_from_arguments(&[
+            source.to_owned(),
+            specification.to_owned(),
+            self.bundle
+                .to_str()
+                .ok_or_else(|| invalid("bundle path must be UTF-8"))?
+                .to_owned(),
+        ])?;
+        // The normal build path reopens and validates that exact retained
+        // request and its source bytes before any execution write. It does not
+        // recapture the original checkout or trust this informational event.
+        writeln!(
+            io::stderr().lock(),
+            "{}",
+            json!({"kind":"worker-build-prepared", "bundle":self.bundle,
+                "execution_may_have_run":false, "publication_authorized":false}),
+        )
+    }
+
     fn failure(&self, detail: String) -> DeliveryFailure {
         operation_failure(self.directory, self.mode, detail)
     }
@@ -267,15 +331,23 @@ impl PreparedBuild<'_> {
 }
 
 fn run(args: &[String], tls: bool) -> i32 {
+    let (args, preparation) = match args {
+        [flag, source, specification, rest @ ..] if flag == "--prepare-from" => {
+            (rest, Some((source.as_str(), specification.as_str())))
+        }
+        _ => (args, None),
+    };
     let count = if tls { 6 } else { 5 };
     let Some((args, mode, resume_from)) =
-        operation_arguments(args, count).filter(|(args, _, _)| {
-            args.iter()
-                .all(|arg| !arg.is_empty() && !arg.starts_with("--"))
+        operation_arguments(args, count).filter(|(args, mode, resume_from)| {
+            (preparation.is_none() || (*mode == DeliveryMode::Execute && resume_from.is_none()))
+                && args
+                    .iter()
+                    .all(|arg| !arg.is_empty() && !arg.starts_with("--"))
         })
     else {
         eprintln!(
-            "usage: rabsd --worker-build-{} [--resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
+            "usage: rabsd --worker-build-{} [--prepare-from <absolute-source-root> <spec.json> | --resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
             if tls { "tls" } else { "loopback" },
             if tls { "<worker-spki-sha256> " } else { "" }
         );
@@ -285,7 +357,7 @@ fn run(args: &[String], tls: bool) -> i32 {
         return 2;
     };
     let offset = if tls { 3 } else { 2 };
-    PreparedBuild {
+    let build = PreparedBuild {
         address: &args[0],
         worker: &args[1],
         pin: tls.then(|| args[2].as_str()),
@@ -294,8 +366,20 @@ fn run(args: &[String], tls: bool) -> i32 {
         output: Path::new(&args[offset + 2]),
         mode,
         resume_from,
+    };
+    if let Some((source, specification)) = preparation
+        && let Err(error) = build.prepare_from(source, specification)
+    {
+        eprintln!(
+            "{}",
+            json!({"kind":"worker-build-prepare-error", "bundle":build.bundle,
+                "directory":build.directory, "output_directory":build.output,
+                "detail":error.to_string(), "execution_may_have_run":false,
+                "publication_authorized":false, "reexecute":false}),
+        );
+        return 1;
     }
-    .report()
+    build.report()
 }
 
 pub fn run_build(args: &[String]) -> i32 {
@@ -372,6 +456,142 @@ pub fn execute_prepared_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preparation_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 42 }\n").unwrap();
+        let specification = root.join("spec.json");
+        fs::write(
+            &specification,
+            json!({"kind":"canonical-exec", "request_id":91, "program":"rustc",
+                "toolchain_backing":"/tc", "source_files":["lib.rs"],
+                "artifacts":{"unit":"build", "files":["lib.rlib"]}}).to_string(),
+        ).unwrap();
+        (source, specification)
+    }
+
+    fn preparation_build(root: &Path) -> PreparedBuild<'_> {
+        // Callers provide stable borrowed paths below; this helper only tests
+        // refusals, so its three paths may deliberately share this root.
+        PreparedBuild {
+            address: "127.0.0.1:0", worker: "worker", pin: None,
+            bundle: root, directory: root, output: root,
+            mode: DeliveryMode::Execute, resume_from: None,
+        }
+    }
+
+    #[test]
+    fn prepare_from_captures_once_and_keeps_original_checkout_out_of_execution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (source, specification) = preparation_fixture(&root);
+        let bundle = root.join("bundle");
+        let delivery = root.join("delivery");
+        let output = root.join("output");
+        let build = PreparedBuild {
+            bundle: &bundle, directory: &delivery, output: &output,
+            ..preparation_build(&root)
+        };
+        build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).unwrap();
+        let request = build.request().unwrap();
+        assert!(request_manifest(&request).unwrap().is_some());
+        assert!(request.get("source_files").is_none());
+        assert_eq!(request["request_id"], 91);
+        fs::write(source.join("lib.rs"), b"changed original").unwrap();
+        assert_eq!(fs::read(bundle.join("source/lib.rs")).unwrap(), b"pub fn value() -> u32 { 42 }\n");
+        assert_eq!(build.request().unwrap(), request);
+        assert!(!delivery.exists());
+        assert!(!output.exists());
+        assert!(build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).is_err());
+        assert_eq!(build.request().unwrap(), request);
+    }
+
+    #[test]
+    fn prepare_from_cannot_overwrite_any_existing_build_directory() {
+        for occupied in ["bundle", "delivery", "output"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().canonicalize().unwrap();
+            let (source, specification) = preparation_fixture(&root);
+            let bundle = root.join("bundle");
+            let delivery = root.join("delivery");
+            let output = root.join("output");
+            fs::create_dir(root.join(occupied)).unwrap();
+            fs::write(root.join(occupied).join("retained"), b"keep").unwrap();
+            let build = PreparedBuild {
+                bundle: &bundle, directory: &delivery, output: &output,
+                ..preparation_build(&root)
+            };
+            let error = build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).unwrap_err();
+            assert!(error.to_string().contains("requires new"));
+            assert_eq!(fs::read(root.join(occupied).join("retained")).unwrap(), b"keep");
+            assert!(!bundle.join("request.json").exists());
+        }
+    }
+
+    #[test]
+    fn recovery_and_invalid_transport_refuse_before_source_preparation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let missing = root.join("not-read");
+        for (mode, address, pin) in [
+            (DeliveryMode::Resume, "127.0.0.1:0", None),
+            (DeliveryMode::Execute, "not-an-address", None),
+            (DeliveryMode::Execute, "192.0.2.1:1234", None),
+            (DeliveryMode::Execute, "127.0.0.1:0", Some("invalid-pin")),
+        ] {
+            let build = PreparedBuild { mode, address, pin, ..preparation_build(&root) };
+            assert!(build.prepare_from(missing.to_str().unwrap(), "not-read.json").is_err());
+            assert!(fs::read_dir(&root).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn prepare_from_rejects_destinations_inside_approved_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (source, specification) = preparation_fixture(&root);
+        let bundle = source.join("bundle");
+        let delivery = root.join("delivery");
+        let output = root.join("output");
+        let build = PreparedBuild {
+            bundle: &bundle, directory: &delivery, output: &output,
+            ..preparation_build(&root)
+        };
+        let error = build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("overlap the source"));
+        assert!(!bundle.exists());
+    }
+
+    #[test]
+    fn malformed_preparation_does_not_create_an_executable_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (source, specification) = preparation_fixture(&root);
+        fs::write(&specification, b"{not valid JSON").unwrap();
+        let bundle = root.join("bundle");
+        let delivery = root.join("delivery");
+        let output = root.join("output");
+        let build = PreparedBuild {
+            bundle: &bundle, directory: &delivery, output: &output,
+            ..preparation_build(&root)
+        };
+        assert!(build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).is_err());
+        assert!(!bundle.exists());
+        assert!(!delivery.exists());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn prepare_and_resume_flags_are_mutually_exclusive_before_io() {
+        for args in [
+            vec!["--prepare-from", "/source", "/spec", "--resume", "127.0.0.1:1", "worker", "/bundle", "/delivery", "/output"],
+            vec!["--prepare-from", "/source", "/spec", "127.0.0.1:1", "worker", "/bundle", "/delivery", "/output", "--resume"],
+            vec!["--prepare-from", "/source"],
+        ] {
+            assert_eq!(run_build(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()), 2);
+        }
+    }
 
     #[test]
     fn output_preflight_rejects_missing_parents_traversal_and_symlink_ancestors() {
