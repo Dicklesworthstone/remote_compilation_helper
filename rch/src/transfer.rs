@@ -7865,7 +7865,17 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
 
     fn remote_tree_retirement_command(root: &str) -> String {
         let root = escape(Cow::from(root));
-        format!("if [ -e {root} ] || [ -L {root} ]; then rm -rf -- {root}; fi")
+        // Go leaves its module cache read-only (0555 directories), so a
+        // non-root worker user cannot unlink inside it and `rm -rf` fails.
+        // Every retry failed the same way and the lease never settled (hz3,
+        // lumera_ai .rch-go, 2026-10-15). On failure, give the owner write
+        // permission on the tree's real directories only (find never follows
+        // a symlink, and a symlinked root is never traversed), then retry.
+        format!(
+            "if [ -e {root} ] || [ -L {root} ]; then rm -rf -- {root} 2>/dev/null || \
+             {{ [ -L {root} ] || find {root} -type d ! -perm -u=w -exec chmod u+w -- {{}} +; \
+             rm -rf -- {root}; }}; fi"
+        )
     }
 
     /// Retrieve one declared job result directory (bd-p0yoo).
@@ -15122,6 +15132,44 @@ Number of files transferred: 42
         );
         assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 1);
         assert_eq!(std::fs::read_link(&control).unwrap(), foreign);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_retirement_removes_read_only_go_module_caches_without_following_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let evidence = tempfile::tempdir().unwrap().keep();
+        let root = evidence.join("container with ' quotes");
+        let module = root.join(".rch-go/mod/lukechampine.com/blake3@v1.4.1/testdata");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("vectors.json"), "{}").unwrap();
+        let outside = evidence.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "foreign").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".rch-go/mod/link")).unwrap();
+        let read_only = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&outside, read_only.clone()).unwrap();
+        for dir in module.ancestors().take_while(|dir| *dir != root) {
+            std::fs::set_permissions(dir, read_only.clone()).unwrap();
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &TransferPipeline::remote_tree_retirement_command(root.to_str().unwrap()),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root.exists());
+        // The linked directory outside the tree keeps its mode and contents.
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555);
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"foreign");
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(target_os = "linux")]
