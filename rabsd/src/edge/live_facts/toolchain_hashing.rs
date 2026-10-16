@@ -11,6 +11,7 @@
 //! This never supplies a toolchain observation or bypasses its directory checks.
 //! Scheduling counts only bytes that still need reading.
 
+mod digest_flights;
 mod disk_memo;
 
 use super::{FileSig, ToolchainInputs, digest_stable_at, lstat_regular};
@@ -193,20 +194,7 @@ fn hash_files(
         &cold_jobs,
         helper_busy,
         total >= PARALLEL_BYTES,
-        &|path, sig| {
-            verify_files(&[(path, sig)])?;
-            // Another warm may have finished this file since planning. Neither
-            // lookup nor insertion holds a mutex over an actual filesystem read.
-            if let Some(digest) = memo.get(&sig) {
-                return Ok(digest);
-            }
-            let digest = hash(path, sig)?;
-            verify_files(&[(path, sig)])?;
-            // Keep individually verified work even if a later file fails. A partial
-            // batch cannot produce ToolchainFacts, but retry need not reread it all.
-            memo.remember(sig, &digest)?;
-            Ok(digest)
-        },
+        &|path, sig| digest_flights::read(memo, path, sig, &hash),
     )?;
     for (index, digest) in cold_positions.into_iter().zip(cold) {
         digests[index] = Some(digest);
