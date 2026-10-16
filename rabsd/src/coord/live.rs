@@ -42,7 +42,7 @@ use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, SqlValue, StoreE
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
     OfferPreparedActionResult, OfferRefusal, PublicationOutcome, SEMANTIC_PROJECTION_DOMAIN,
-    authority_digest, process_offer,
+    authority_digest, process_offer_resolving,
 };
 use rabs_cas::serving_sample_gate::{
     ActionClassRisk, PrivateExecutionReason, SampleGateDecision, SamplingPolicy,
@@ -1983,13 +1983,11 @@ impl CoordLive {
             .lock()
             .map_err(|_| CommitRefusal::StoreUnavailable)?;
 
-        // A018 classification needs the COMMITTED manifest for this key.
-        // Resolve it up front, out of its CAS bytes: `process_offer`
-        // borrows the store for the whole admission, so the resolver it
-        // takes cannot itself touch the store — and the only key it ever
-        // asks for is this one. Reading the bytes (rather than
-        // remembering the manifest in process memory) is what makes
-        // classification survive a restart.
+        // Retain this action's pre-offer baseline for comparison feedback.
+        // Producers are resolved on demand by the SAME admission walk below,
+        // after its fences, through the already-held store. No second graph
+        // walk, eager manifest map, nested metadata lock, or daemon-lifetime
+        // cache of producer state is needed.
         let committed_key = store
             .published_manifest_key(&offer.manifest.action_key)
             .map_err(|e| CommitRefusal::Store(format!("{e:?}")))?;
@@ -1997,12 +1995,17 @@ impl CoordLive {
             Some(key) => load_manifest(&mut *store, key),
             None => None,
         };
-        let resolver = |key: &str| match (&committed_key, &committed) {
-            (Some(committed_key), Some(manifest)) if committed_key == key => Some(manifest.clone()),
-            _ => None,
+        let resolver = |store: &mut dyn RabsMetadataStore, key: &str| {
+            if committed_key.as_deref() == Some(key) {
+                // An unavailable baseline must remain unavailable, rather than
+                // becoming a different comparison after a second read.
+                committed.clone()
+            } else {
+                load_manifest(store, key)
+            }
         };
 
-        let outcome = process_offer(
+        let outcome = process_offer_resolving(
             &mut *store,
             offer,
             expected_descriptor,
