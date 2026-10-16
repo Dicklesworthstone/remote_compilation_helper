@@ -169,6 +169,7 @@ enum OutputFormat {
 }
 
 fn main() -> Result<()> {
+    exit_quietly_when_stdout_reader_is_gone();
     let cli = Cli::parse();
     // This bounded control-plane probe is called by watchdogs and recovery.
     // Do not start a thread pool or initialize optional logging sinks for it:
@@ -178,6 +179,33 @@ fn main() -> Result<()> {
         return print_process_identity(*pid);
     }
     run_worker(cli)
+}
+
+/// Rust ignores SIGPIPE, so a write to a reader that already left (an rchd
+/// capability probe that timed out at 25 s while the inventory scan ran on)
+/// makes `println!` panic. Under `panic = "abort"` that became SIGABRT, and
+/// apport wrote a ~288 MB core for each: 72+ on trj in one afternoon
+/// (2026-10-15). Nobody is left to read the output, so exit as a SIGPIPE
+/// death would (141) instead of aborting. Every other panic is unchanged.
+fn exit_quietly_when_stdout_reader_is_gone() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if is_lost_reader_panic(info.payload()) {
+            std::process::exit(141);
+        }
+        default_hook(info);
+    }));
+}
+
+fn is_lost_reader_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    // std's own wording (library/std/src/io/stdio.rs); EPIPE is 32 on Linux
+    // and macOS. The errno, not its locale-dependent text, is the evidence.
+    message.starts_with("failed printing to std") && message.ends_with("(os error 32)")
 }
 
 fn print_process_identity(pid: u32) -> Result<()> {
@@ -2290,6 +2318,22 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn only_std_print_failures_on_a_closed_pipe_count_as_a_lost_reader() {
+        let lost = String::from("failed printing to stdout: Broken pipe (os error 32)");
+        assert!(is_lost_reader_panic(&lost));
+        let lost_stderr = "failed printing to stderr: Broken pipe (os error 32)";
+        assert!(is_lost_reader_panic(&lost_stderr));
+        for other in [
+            "failed printing to stdout: No space left on device (os error 28)",
+            "called `Option::unwrap()` on a `None` value",
+            "Broken pipe (os error 32)",
+        ] {
+            assert!(!is_lost_reader_panic(&other.to_string()), "{other}");
+        }
+        assert!(!is_lost_reader_panic(&42_u32));
+    }
 
     fn approx_eq(lhs: f64, rhs: f64) -> bool {
         (lhs - rhs).abs() < 1e-9
