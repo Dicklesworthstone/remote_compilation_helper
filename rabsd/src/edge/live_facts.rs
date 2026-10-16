@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 mod package_capture;
 mod stable_file;
 mod toolchain_hashing;
+mod toolchain_observation;
 mod toolchain_probe;
 
 /// Domain of the sysroot tree digest.
@@ -140,7 +141,7 @@ pub fn digest_stable(path: &Path) -> std::io::Result<(FileSig, TypedDigest)> {
     digest_stable_at(path, lstat_regular(path)?)
 }
 
-fn digest_stable_at(path: &Path, before: FileSig) -> std::io::Result<(FileSig, TypedDigest)> {
+fn digest_stable_at(path: &Path, before: FileSig) -> Result<(FileSig, TypedDigest), std::io::Error> {
     let mut file = stable_file::open(path, before)?;
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(before.size));
     let mut buffer = vec![0_u8; 256 * 1024];
@@ -340,7 +341,7 @@ impl ToolchainGuard {
 
 #[derive(Debug)]
 enum Slot<T> {
-    Warming,
+    Warming(Arc<()>),
     Ready(Arc<T>),
     Failed { reason: String, at: Instant },
 }
@@ -1358,44 +1359,7 @@ impl LiveFacts {
         compiler: &Path,
         env: &[(String, String)],
     ) -> Result<ToolchainFacts, FactsMiss> {
-        if !compiler.is_absolute() {
-            return Err(FactsMiss::Refused("compiler path is not absolute".into()));
-        }
-        {
-            let mut toolchains = self
-                .toolchains
-                .lock()
-                .map_err(|_| FactsMiss::Refused("toolchain memo poisoned".into()))?;
-            match toolchains.get(compiler) {
-                Some(Slot::Ready(probed)) if probed.still_current() => {
-                    return Ok(probed.facts.clone());
-                }
-                Some(Slot::Warming) => return Err(FactsMiss::Pending),
-                Some(Slot::Failed { reason, at }) if at.elapsed() < PROBE_RETRY => {
-                    return Err(FactsMiss::Refused(reason.clone()));
-                }
-                _ => {}
-            }
-            toolchains.insert(compiler.to_path_buf(), Slot::Warming);
-        }
-        let compiler_owned = compiler.to_path_buf();
-        let env = env.to_vec();
-        let started = self.start_warm(move |facts| {
-            let slot = match probe_toolchain(&compiler_owned, &env) {
-                Ok(probed) => Slot::Ready(Arc::new(probed)),
-                Err(reason) => Slot::Failed {
-                    reason,
-                    at: Instant::now(),
-                },
-            };
-            if let Ok(mut toolchains) = facts.toolchains.lock() {
-                toolchains.insert(compiler_owned, slot);
-            }
-        });
-        if !started && let Ok(mut toolchains) = self.toolchains.lock() {
-            toolchains.remove(compiler);
-        }
-        Err(FactsMiss::Pending)
+        toolchain_observation::observe(self, compiler, env)
     }
 
     /// Retain the ready observation that produced `expected` for this request.
@@ -2666,7 +2630,7 @@ mod tests {
 
     // A scripted version/sysroot probe over real filesystem inputs. This
     // exercises toolchain observation, not a real compiler or cache hit.
-    fn toolchain_fixture() -> (tempfile::TempDir, PathBuf) {
+    pub(super) fn toolchain_fixture() -> (tempfile::TempDir, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         // Short paths also fit macOS's smaller Unix-domain socket address.
         let dir = tempfile::Builder::new()
