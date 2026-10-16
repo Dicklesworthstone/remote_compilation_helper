@@ -6884,8 +6884,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // escapes; probing must not grant authority to read outside the output
         // root. A missing/unreadable candidate is not evidence of compatibility.
         let cargo_target_root = self.remote_cargo_target_dir();
-        let script =
-            artifact_header_probe_script(&remote, Some(&cargo_target_root), &paths)?;
+        let script = artifact_header_probe_script(&remote, Some(&cargo_target_root), &paths)?;
         let mut command = self.worker_ssh_command(worker, &["sh", "-s"]);
         command
             .stdin(Stdio::piped())
