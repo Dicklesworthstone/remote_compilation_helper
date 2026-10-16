@@ -562,6 +562,53 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_refused(self.transact("aa", [roots[0] / "different"], "cancelled"))
         self.assert_refused(self.transact("cc", roots))
 
+    def test_registry_durability_syncs_records_and_directories_not_filesystems(self):
+        trace = self.root / "sync-arguments"
+        env = self.tool_env("sync", 'printf "%s\\000" "$@" >> {}\nexec {} "$@"'.format(
+            shlex.quote(str(trace)), shlex.quote(SYNC)))
+        cancelled_roots = [self.root / "cancelled-project"]
+        for operation in ("acquire", "recover", "cancel", "finish-cancel", "cancelled"):
+            self.assert_granted(self.transact("aa", cancelled_roots, operation, env))
+        released_roots = [self.root / "released-project"]
+        for operation in ("acquire", "release", "released"):
+            self.assert_granted(self.transact("bb", released_roots, operation, env))
+        self.assert_granted(self.transact("cc", [self.root / "absent-project"], "cancel", env))
+
+        quarantined_roots = [self.root / "quarantined-project"]
+        pending = self.record("dd", quarantined_roots, "pending")
+        pending.write_bytes(b"partial write")
+        self.assert_granted(self.transact("ee", [self.root / "other-project"], "acquire", env))
+        self.assert_granted(self.transact("dd", quarantined_roots, "cancel", env))
+
+        # Observe the real utility's arguments, then execute it. Every record
+        # barrier includes metadata (not -d) and is file-scoped (not -f).
+        # This includes calls originating in the shared record helpers.
+        arguments = trace.read_bytes().split(b"\0")
+        self.assertEqual(arguments.pop(), b"")
+        self.assertEqual(len(arguments) % 2, 0)
+        paths = set()
+        for option, path in zip(arguments[::2], arguments[1::2]):
+            self.assertEqual(option, b"--", "no whole-filesystem sync under the registry lock")
+            path = Path(os.fsdecode(path))
+            self.assertTrue(path == self.registry or self.registry in path.parents)
+            paths.add(path)
+        for directory in (self.registry, self.registry / "released",
+                          self.registry / "cancelled", self.registry / "quarantine"):
+            self.assertIn(directory, paths, "directory-entry durability is still required")
+        for token, roots, directory in (("aa", cancelled_roots, "cancelled"),
+                                         ("bb", released_roots, "released")):
+            self.assertIn(self.registry / directory / (token + "." + digest(roots) + ".claim"), paths)
+        self.assertTrue(any(path.name.startswith(".record-write.") for path in paths),
+                        "private record bytes must be synced before publication")
+
+    def test_failed_file_sync_never_falls_back_to_a_global_flush_or_grants(self):
+        env = self.tool_env("sync", 'if [ "$1" = -- ]; then exit 91; fi\nexec {} "$@"'.format(
+            shlex.quote(SYNC)))
+        result = self.transact("aa", [self.root / "project"], env=env)
+        self.assert_unconfirmed(result)
+        self.assertFalse(list(self.registry.glob("aa.*.claim")))
+        self.assertFalse(list(self.registry.glob("aa.*.pending")))
+
 
 @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
 class SourceClaimRegistryBashTests(SourceClaimRegistryTests):

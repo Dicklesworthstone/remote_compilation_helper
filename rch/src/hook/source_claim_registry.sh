@@ -15,6 +15,24 @@ released="$registry/released/$token.$digest.claim"
 cancelled="$registry/cancelled/$token.$digest.claim"
 cancelling="$registry/$token.$digest.cancelling"
 
+# This transaction already names every record and containing-directory barrier.
+# GNU sync -f calls syncfs: under the worker-wide registry flock, that waits for
+# unrelated builds' dirty pages on the same filesystem. Use full file fsync
+# instead, preserving both data and metadata and every checked directory sync.
+# The local adapter also covers the shared record helpers without changing
+# their GC callers outside this transaction. Topology's -d calls are unchanged.
+# No new utility dependency is introduced; native-Darwin performance remains
+# unqualified. Never retry a failed file sync with a broader/unchecked operation.
+sync() {
+    case "${1-}" in
+        -f)
+            [ "$#" -eq 2 ] && [ -n "$2" ] || return 1
+            command sync -- "$2"
+            ;;
+        *) command sync "$@" ;;
+    esac
+}
+
 refuse() {
     printf 'RCH: durable source ownership: %s\n' "$1" >&2
     exit 73
