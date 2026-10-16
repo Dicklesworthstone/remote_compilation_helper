@@ -604,6 +604,34 @@ pub(super) async fn remote_source_authority_was_released(
     }
 }
 
+/// Reconcile an exact cancellation receipt for a dead job (bd-ey7fr). Like
+/// the release probe, this grants no source read or mutation authority.
+pub(super) async fn remote_source_intent_was_cancelled(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<bool> {
+    let command =
+        source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "cancelled")?;
+    let output = run_offload_ssh_command_with_stdin(
+        worker,
+        "sh -s",
+        command.as_bytes(),
+        Duration::from_secs(15),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot reconcile durable source cancellation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    match output.stdout.as_slice() {
+        b"cancelled" => Ok(true),
+        b"pending" => Ok(false),
+        _ => anyhow::bail!("invalid durable source cancellation response"),
+    }
+}
+
 /// Begin cancellation of a persisted pre-execution intent, draining normal
 /// activity and fencing delayed acquisition. True retains the existing claim
 /// for cleanup; false grants no source authority. Execution must never have
@@ -3005,6 +3033,53 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             .await
             .unwrap();
         fresh.release().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_cancellation_receipt_is_reported_read_only_for_its_exact_roots() {
+        // bd-ey7fr: recovery settles a dead job whose grant was cancelled
+        // after execution, instead of retrying a refused reattach forever.
+        let directory = source_lock_test_dir();
+        let registry = directory.join("registry");
+        let source = directory.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let roots = vec![source.display().to_string()];
+        let other = vec![directory.join("other").display().to_string()];
+        let probe = async |roots: &[String]| {
+            test_source_intent(&registry, roots, "ac01", "cancelled").await
+        };
+        let unclaimed = probe(&roots).await;
+        assert!(unclaimed.status.success());
+        assert_eq!(unclaimed.stdout, b"pending");
+        let mut owner = claim_test_durable_source_closure(&registry, &roots, "ac01", "acquire")
+            .await
+            .unwrap();
+        drop(owner.stdin.take());
+        owner.child.as_mut().unwrap().wait().await.unwrap();
+        drop(owner);
+        assert_eq!(probe(&roots).await.stdout, b"pending");
+        let cancellation = test_source_intent(&registry, &roots, "ac01", "cancel").await;
+        assert_eq!(cancellation.stdout, b"owned");
+        assert_eq!(probe(&roots).await.stdout, b"pending");
+        assert!(
+            test_source_intent(&registry, &roots, "ac01", "finish-cancel")
+                .await
+                .status
+                .success()
+        );
+        let cancelled = probe(&roots).await;
+        assert!(cancelled.status.success());
+        assert_eq!(cancelled.stdout, b"cancelled");
+        assert!(
+            claim_test_durable_source_closure(&registry, &roots, "ac01", "recover")
+                .await
+                .is_err()
+        );
+        assert_eq!(probe(&roots).await.stdout, b"cancelled");
+        let mismatched = probe(&other).await;
+        assert!(!mismatched.status.success());
+        assert!(String::from_utf8_lossy(&mismatched.stderr).contains("source claim roots changed"));
     }
 
     #[cfg(target_os = "linux")]

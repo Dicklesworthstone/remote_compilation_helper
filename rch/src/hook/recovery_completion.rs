@@ -161,6 +161,21 @@ pub(super) fn validate_recorded_delivery(lease: &DurableJobLease) -> Result<()> 
     validate_successful_delivery(&recipe)
 }
 
+/// Matches rchd's stuck-build hard cap (`should_remediate`).
+const DAEMON_ABSENCE_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn daemon_absence_is_conclusive(lease: &crate::hook::DurableJobLease, now_unix_ms: u64) -> bool {
+    lease.heartbeat_unix_ms > 0
+        && now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DAEMON_ABSENCE_MIN_AGE_MS
+}
+
 /// Caller holds the same-wrapper recovery lock and has proved the original
 /// wrapper absent. Never release based on an exit code, age or PID alone.
 pub(super) async fn finish(
@@ -219,6 +234,23 @@ pub(super) async fn finish(
             tracing::warn!(build_id, %error, "Recovery release reply lost; verifying terminal ownership");
         }
         reply = body(&send(&query).await?)?;
+    }
+    if reply["status"] == "not_found" {
+        // The daemon forgets completed builds and pre-2.1.16 reservations, so
+        // a long-dead lease could never settle (bd-ey7fr). Absence is only
+        // conclusive after the stuck detector's 24h cap: by then any
+        // reservation re-adopted from durable ownership was remediated.
+        anyhow::ensure!(
+            daemon_absence_is_conclusive(&lease, unix_ms_now()),
+            "daemon has no record of recovered build {build_id}; acknowledgement waits until the lease is 24h old"
+        );
+        anyhow::ensure!(
+            writer.snapshot() == lease,
+            "recovery journal changed during daemon reconciliation; acknowledgement refused"
+        );
+        recipe.daemon_record_absent = true;
+        writer.set_recovery(serde_json::to_value(recipe)?)?;
+        return writer.acknowledge_terminal();
     }
     let daemon_exit = completed(&reply, build_id, worker, wrapper)?;
     anyhow::ensure!(
@@ -664,6 +696,50 @@ mod tests {
         assert!(disk.terminal_acknowledged);
         assert_eq!(disk.exit_code, Some(102));
         assert_eq!(disk.recovery.unwrap()["daemon_exit_code"], 102);
+    }
+
+    #[tokio::test]
+    async fn long_dead_build_the_daemon_forgot_settles_without_a_release() {
+        let (_directory, writer) = fixture(1);
+        writer.lease.lock().unwrap().heartbeat_unix_ms =
+            unix_ms_now() - DAEMON_ABSENCE_MIN_AGE_MS - 60_000;
+        writer.persist().unwrap();
+        let mut calls = Vec::new();
+        finish(&writer, async |command: &str| {
+            calls.push(command.to_owned());
+            Ok(response(serde_json::json!({"status":"not_found"})))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.len(), 1, "absence must never send a release");
+        assert!(calls[0].starts_with("GET /builds/41?"));
+        let disk: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+        assert!(disk.terminal_acknowledged);
+        assert_eq!(disk.exit_code, Some(1));
+        let recovery = disk.recovery.unwrap();
+        assert_eq!(recovery["daemon_record_absent"], true);
+        assert!(recovery.get("daemon_exit_code").is_none());
+    }
+
+    #[test]
+    fn daemon_absence_needs_a_known_heartbeat_older_than_the_stuck_cap() {
+        let (_directory, writer) = fixture(1);
+        let mut lease = writer.snapshot();
+        let now = 10 * DAEMON_ABSENCE_MIN_AGE_MS;
+        for (heartbeat, conclusive) in [
+            (0, false),
+            (now - DAEMON_ABSENCE_MIN_AGE_MS + 1, false),
+            (now - DAEMON_ABSENCE_MIN_AGE_MS, true),
+            (now + 5, false),
+        ] {
+            lease.heartbeat_unix_ms = heartbeat;
+            assert_eq!(
+                daemon_absence_is_conclusive(&lease, now),
+                conclusive,
+                "{heartbeat}"
+            );
+        }
     }
 
     #[tokio::test]

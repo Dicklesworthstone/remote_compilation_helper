@@ -375,6 +375,19 @@ if [ "$operation" = released ]; then
     exit 0
 fi
 
+if [ "$operation" = cancelled ]; then
+    # Read-only, like `released`: the exact caller-bound cancellation receipt
+    # proves this identity holds no source rights (finish-cancel runs only
+    # after its tree was retired). It never grants path access.
+    if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
+        matches_request "$cancelled"
+        printf cancelled
+    else
+        printf pending
+    fi
+    exit 0
+fi
+
 if [ "$operation" = release ]; then
     if [ -e "$released" ] || [ -L "$released" ]; then
         # Resume a completed move, not a new release. A lost acknowledgment

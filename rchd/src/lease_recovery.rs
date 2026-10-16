@@ -86,11 +86,17 @@ fn verify_recovery_completion(
             .as_i64()
             .and_then(|code| i32::try_from(code).ok())
     });
+    // A long-dead build the daemon no longer knew held no reservation; the
+    // client accepts that absence only after the 24h stuck cap (bd-ey7fr).
+    let daemon_record_absent = after
+        .recovery
+        .as_ref()
+        .is_some_and(|recipe| recipe["daemon_record_absent"].as_bool() == Some(true));
     if !after.terminal_acknowledged
         || after.state != rch_common::job_identity::JobLifecycleState::Finished
         || retired_delivery(after).is_none()
         || retired_delivery(after) != after.exit_code
-        || daemon_exit.is_none()
+        || (daemon_exit.is_none() && !daemon_record_absent)
     {
         return Err(
             "recovery command exited without durable daemon/delivery acknowledgement".into(),
@@ -889,6 +895,13 @@ mod tests {
         let mut no_daemon_receipt = complete.clone();
         no_daemon_receipt.recovery.as_mut().unwrap()["daemon_exit_code"] = serde_json::Value::Null;
         assert!(verify_recovery_completion(&before, &no_daemon_receipt).is_err());
+        // bd-ey7fr: a long-dead build the daemon no longer knew settles on
+        // the client's recorded absence instead of a terminal receipt.
+        let mut forgotten = no_daemon_receipt.clone();
+        forgotten.recovery.as_mut().unwrap()["daemon_record_absent"] = serde_json::json!(true);
+        verify_recovery_completion(&before, &forgotten).unwrap();
+        forgotten.recovery.as_mut().unwrap()["daemon_record_absent"] = serde_json::json!("true");
+        assert!(verify_recovery_completion(&before, &forgotten).is_err());
         let mut false_success = complete.clone();
         false_success.exit_code = Some(0);
         assert!(verify_recovery_completion(&before, &false_success).is_err());

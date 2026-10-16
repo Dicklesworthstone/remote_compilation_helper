@@ -82,6 +82,10 @@ pub(crate) struct RecoveryRecipe {
     /// Preserve its outcome independently of command and artifact delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     daemon_exit_code: Option<i32>,
+    /// The daemon had no record of a long-dead build when its recovery
+    /// settled, so it held no reservation to release (bd-ey7fr).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    daemon_record_absent: bool,
     #[serde(default)]
     prepared: bool,
     #[serde(default)]
@@ -936,6 +940,7 @@ impl RecoverySession {
             exit_code: None,
             returned: None,
             daemon_exit_code: None,
+            daemon_record_absent: false,
             prepared: false,
             execution_started: false,
             preparation_cancelled: false,
@@ -1114,6 +1119,7 @@ impl RecoverySession {
             exit_code: None,
             returned: None,
             daemon_exit_code: None,
+            daemon_record_absent: false,
             prepared: true,
             execution_started: false,
             preparation_cancelled: false,
@@ -2789,6 +2795,32 @@ async fn recover_owned_job_with_daemon(
             "same-id remote execution has no durable completion yet; command was not replayed"
         );
     };
+    // The grant can be cancelled after execution completed: a wrapper that
+    // dies between finish-cancel and persisting its retirement leaves the
+    // worker receipt and this journal behind. Reattaching the cancelled grant
+    // is refused forever, so every recovery failed and the lease never
+    // settled (bd-ey7fr). finish-cancel ran only after the tree was retired,
+    // so no outputs remain to collect: retire the job as failed instead.
+    if session.recipe.pair.is_none()
+        && !session.recipe.source_roots.is_empty()
+        && super::super::ssh::remote_source_intent_was_cancelled(
+            &worker,
+            &session.recipe.source_roots,
+            &session.recipe.identity,
+        )
+        .await?
+    {
+        tracing::warn!(
+            identity = %session.recipe.identity,
+            worker = %worker.id,
+            remote_exit = exit,
+            "source grant was cancelled after execution; retiring it as failed without collecting outputs"
+        );
+        cancel_source_grant(session).await?;
+        writer.record_exit(EXIT_BUILD_ERROR)?;
+        recovery_completion::finish(writer, &mut daemon).await?;
+        return Ok(EXIT_BUILD_ERROR);
+    }
     let mut pair = if let Some((root, token)) = &session.recipe.pair {
         Some(
             super::super::ssh::recover_clean_overlay_source_pair(
