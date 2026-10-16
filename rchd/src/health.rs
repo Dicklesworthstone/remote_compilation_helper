@@ -682,14 +682,22 @@ impl HealthMonitor {
                         // scheduling onto a worker that is about to run out of disk.
                         let timeout = CAPABILITY_PROBE_TIMEOUT;
                         let probe_pool = ssh_pool.clone();
-                        tokio::spawn(async move {
-                            let _ = probe_worker_capabilities(
-                                &worker_clone,
-                                timeout,
-                                probe_pool.as_ref(),
-                            )
-                            .await;
-                        });
+                        // An admin-disabled worker receives no work, so its
+                        // capability facts have no consumer; the first cycle
+                        // after re-enable refreshes them. Probing anyway ran
+                        // `rch-wkr capabilities` on trj every few seconds for
+                        // a disabled entry, and each probe outlived this
+                        // timeout and aborted on the closed pipe (2026-10-15).
+                        if !worker.is_disabled().await {
+                            tokio::spawn(async move {
+                                let _ = probe_worker_capabilities(
+                                    &worker_clone,
+                                    timeout,
+                                    probe_pool.as_ref(),
+                                )
+                                .await;
+                            });
+                        }
                     } else {
                         warn!(
                             "Worker {} check failed: {:?} (failures: {})",
