@@ -145,6 +145,8 @@ fn put_manifest(
 }
 
 fn spawn_daemon(state_dir: &std::path::Path) -> Child {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))
         .env("RABS_BOOT_MARKER", state_dir.join("rabsd.boot"))

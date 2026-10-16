@@ -500,6 +500,8 @@ fn concurrent_submission_and_dispatch_claims_collapse_at_public_api() {
 
 /// Run the real binary over `state_dir` for a short bounded life.
 fn boot_binary(state_dir: &std::path::Path, ms: &str) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .args(["--run-for-ms", ms])
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))
@@ -608,6 +610,8 @@ struct LiveOutcomes {
 #[test]
 fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = dir.path().to_path_buf();
     let cas_root = state_dir.join("cas");
 
@@ -866,6 +870,8 @@ fn divergence_is_classified_from_cas_bytes_after_a_restart() {
 #[test]
 fn committed_state_survives_a_kill_dash_nine_and_reboot() {
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = dir.path().to_path_buf();
     let cas_root = state_dir.join("cas");
 

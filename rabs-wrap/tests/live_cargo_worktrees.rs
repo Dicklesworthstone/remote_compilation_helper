@@ -177,6 +177,8 @@ impl World {
     }
 
     fn with_source(root: &Path, source: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let world = Self {
             root: root.to_path_buf(),
             socket: root.join("d.sock"),

@@ -258,6 +258,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let owner = tempfile::tempdir().unwrap();
+        fs::set_permissions(owner.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let certificates = Certificates::new(&owner.path().join("credentials"));
         Self {
             owner,

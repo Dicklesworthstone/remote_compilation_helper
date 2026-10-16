@@ -14,6 +14,8 @@ fn rabsd() -> Command {
 #[test]
 fn doctor_is_green_against_a_live_daemon() {
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
     let state = dir.path().join("state");

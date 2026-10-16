@@ -303,6 +303,7 @@ fn daemon_dead_fails_open_fast_and_breaker_opens_per_model() {
 #[test]
 fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
     let mut daemon = Command::new(rabsd_bin())

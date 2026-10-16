@@ -66,6 +66,8 @@ struct Daemon {
 
 impl Daemon {
     fn start(root: &Path, socket: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let log = root.join("rabsd.log");
         let child = Command::new(rabsd_bin())
             .env("RABS_CONFIG", root.join("absent.toml"))

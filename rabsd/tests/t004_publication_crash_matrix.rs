@@ -297,6 +297,8 @@ const SIGABRT: i32 = 6;
 /// Boot the shipped daemon over the store and return its output: the
 /// product's own reconcile is the recovery oracle.
 fn reboot(state_dir: &Path) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .args(["--run-for-ms", "1200"])
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))

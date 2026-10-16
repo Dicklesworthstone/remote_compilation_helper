@@ -22,6 +22,8 @@ struct Seeded {
 
 fn seed() -> Seeded {
     let root = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let cas = mount_and_reconcile(&root.path().join("cas")).unwrap();
     let mut store = cas.store().lock().unwrap();
     let mut paths = Vec::new();

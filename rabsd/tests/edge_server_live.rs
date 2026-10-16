@@ -11,6 +11,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn spawn_daemon(socket: &std::path::Path, marker: &std::path::Path) -> Child {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .env("RABS_SOCKET_PATH", socket)
         .env("RABS_BOOT_MARKER", marker)
@@ -244,6 +250,8 @@ fn coord_down_leaves_edge_alive_in_typed_degraded_mode() {
     // consults still answer, loudly degraded; the shutdown receipt
     // names the abandoned coord region (exit code 1 = unclean, honest).
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_rabsd"))
@@ -400,7 +408,10 @@ fn stale_socket_takeover_and_live_daemon_refusal() {
     let marker = dir.path().join("rabsd.boot");
 
     // A stale socket file from a dead incarnation.
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    use std::os::unix::fs::PermissionsExt;
+    let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(stale);
     assert!(socket.exists());
 
     let mut daemon = spawn_daemon(&socket, &marker);

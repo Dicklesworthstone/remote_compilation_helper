@@ -29,6 +29,7 @@ fn rabsd_bin() -> std::path::PathBuf {
 #[test]
 fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
     let mut daemon = Command::new(rabsd_bin())

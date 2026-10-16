@@ -12,6 +12,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn boot_once(state_dir: &std::path::Path, quota: Option<&str>) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rabsd"));
     cmd.args(["--run-for-ms", "1500"])
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))

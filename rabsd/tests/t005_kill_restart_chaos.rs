@@ -101,6 +101,8 @@ fn seed_publication(state_dir: &Path) {
 }
 
 fn daemon_env(command: &mut Command, state_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     command
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))
         .env("RABS_BOOT_MARKER", state_dir.join("rabsd.boot"))

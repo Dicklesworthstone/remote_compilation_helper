@@ -79,6 +79,8 @@ fn hundred_boot_shutdown_cycles_all_obligation_clean() {
     // concurrent daemons fight over one store (and scribble on the
     // developer's own).
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let marker = dir.path().join("rabsd.boot");
     let socket = dir.path().join("rabsd.sock");
     let state = dir.path().join("state");
@@ -108,6 +110,12 @@ fn hundred_boot_shutdown_cycles_all_obligation_clean() {
 fn spawn_daemon(marker: &std::path::Path) -> Child {
     // Unique socket AND state dir beside the marker: concurrent daemons
     // on one host must never share the default socket path or the store.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        marker.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let socket = marker.with_extension("sock");
     rabsd()
         .env("RABS_BOOT_MARKER", marker)
