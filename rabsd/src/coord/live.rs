@@ -2112,12 +2112,12 @@ impl CoordLive {
             .lock()
             .map_err(|_| ServeError::StoreUnavailable)?;
         declare_coordinator_domains(&mut *store);
-        if let Some(held) = replay_authority {
+        if let Some(ref held) = replay_authority {
             match store
                 .active_authority()
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
             {
-                Some(active) if active.digest == authority_digest(&held) => {}
+                Some(active) if active.digest == authority_digest(held) => {}
                 _ => return Err(ServeError::CoordinatorUnavailable),
             }
         }
@@ -2173,21 +2173,6 @@ impl CoordLive {
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
-        let replay_permit = if sampling.is_some() {
-            match live_replay_permit(&mut *store, action_key, &manifest_key)
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?
-            {
-                Some(permit) => Some(permit),
-                None => {
-                    return Ok(ServeOutcome::ExecutePrivately(
-                        ReplayRefusal::FreshVerificationRequired,
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.
@@ -2199,10 +2184,124 @@ impl CoordLive {
         if mode == ServeMode::Preview {
             return Ok(ServeOutcome::Servable);
         }
-        if let Some(permit) = replay_permit {
-            // Spend durably while holding the same lock as admission and
-            // installation. A failed/partial install conservatively spends its
-            // allowance; a crash must never grant it a second time.
+        if plan.outputs.is_empty() {
+            if sampling.is_some() {
+                let Some(permit) = live_replay_permit(&mut *store, action_key, &manifest_key)
+                    .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                else {
+                    return Ok(ServeOutcome::ExecutePrivately(
+                        ReplayRefusal::FreshVerificationRequired,
+                    ));
+                };
+                store
+                    .record_decision_receipt(
+                        LIVE_INSTALL_RECEIPT,
+                        &permit.subject,
+                        permit.seq,
+                        "install",
+                        &manifest_key,
+                    )
+                    .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+            }
+            return Ok(ServeOutcome::Served { files: Vec::new() });
+        }
+
+        // D031: reserve every destination all-or-nothing before any staging or
+        // install. The reservation stays live across the metadata-lock handoff,
+        // so another subscriber cannot race private preparation into the same
+        // final namespace.
+        let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
+        use rabs_protocol::raw_bytes::RawBytes;
+        use std::os::unix::ffi::OsStrExt;
+        let paths: Vec<Vec<u8>> = plan
+            .outputs
+            .iter()
+            .map(|out| out.destination.as_os_str().as_bytes().to_vec())
+            .collect();
+        let _reservation = reserve_scoped(&self.arbiter, bundle, &paths).map_err(|conflict| {
+            ServeError::DestinationConflict {
+                path: RawBytes::new(conflict.path).escaped(),
+                holder: conflict.holder.0,
+            }
+        })?;
+
+        // Select exact non-quarantined replicas while metadata is authoritative,
+        // then release the global store mutex for expensive copy/hash/derivation.
+        // The staged owner exposes no final destination and carries no serving
+        // authority. A corrupt replica is settled only after reacquiring metadata.
+        let selected = output_install::select_for_install(&mut *store, &plan)?;
+        drop(store);
+        let prepared = match output_install::stage_for_install(selected, &plan) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| ServeError::StoreUnavailable)?;
+                return Err(output_install::settle_stage_failure(&mut *store, failure));
+            }
+        };
+
+        // Bytes may have taken arbitrarily long to stage. Re-enter every mutable
+        // authority/gating boundary before the FIRST rename. The prepared CAS
+        // owner independently rechecks object quarantine, selected locations and
+        // private file generations during install.
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| ServeError::StoreUnavailable)?;
+        declare_coordinator_domains(&mut *store);
+        if let Some(ref held) = replay_authority {
+            match store
+                .active_authority()
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            {
+                Some(active) if active.digest == authority_digest(held) => {}
+                _ => return Err(ServeError::CoordinatorUnavailable),
+            }
+        }
+        let standing = release_standing(
+            store
+                .release_verdict(&self.build_identity)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                .as_ref(),
+            &self.build_identity,
+            now_unix_micros,
+            now_epoch,
+        );
+        if !standing.permits_serving(self.release_mode) {
+            return Ok(ServeOutcome::ReleaseUnauthorized { standing });
+        }
+        match serving_gate(&mut *store, &key, now_unix_micros, now_epoch)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            ServeDecision::Servable => {}
+            decision => return Ok(ServeOutcome::NotServable(decision)),
+        }
+        if let Some(policy) = sampling
+            && let Some(refusal) = live_replay_gate(&mut *store, action_key, &policy)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
+        }
+        match store
+            .published_manifest_key(action_key)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            Some(current) if current == manifest_key => {}
+            Some(current) => return Ok(ServeOutcome::ManifestUnavailable { key: current }),
+            None => return Ok(ServeOutcome::NoCommit),
+        }
+        if sampling.is_some() {
+            let Some(permit) = live_replay_permit(&mut *store, action_key, &manifest_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            else {
+                return Ok(ServeOutcome::ExecutePrivately(
+                    ReplayRefusal::FreshVerificationRequired,
+                ));
+            };
+            // Spend only after the post-staging gates pass. A failed/partial
+            // install still conservatively consumes this durable allowance.
             store
                 .record_decision_receipt(
                     LIVE_INSTALL_RECEIPT,
@@ -2213,45 +2312,7 @@ impl CoordLive {
                 )
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?;
         }
-        if plan.outputs.is_empty() {
-            return Ok(ServeOutcome::Served { files: Vec::new() });
-        }
-
-        // D031: reserve every destination all-or-nothing before any
-        // install, so a concurrent serve into an overlapping path is
-        // refused rather than interleaved.
-        let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
-        use rabs_protocol::raw_bytes::RawBytes;
-        use std::os::unix::ffi::OsStrExt;
-        // BYTES, not a lossy decode. A destination is an arbitrary byte
-        // sequence on Unix, and `to_string_lossy` mapped every one that
-        // differed only in invalid UTF-8 onto the same U+FFFD-bearing
-        // key — so two concurrent serves writing genuinely different
-        // files conflicted, and the refusal named a path that was not
-        // the path either of them asked for (bd-1rofg). It also made
-        // this the one lossy decode in a pipeline T026/R89 exists to
-        // keep byte-exact.
-        let paths: Vec<Vec<u8>> = plan
-            .outputs
-            .iter()
-            .map(|out| out.destination.as_os_str().as_bytes().to_vec())
-            .collect();
-        // The guard releases on drop, so the reservation cannot outlive
-        // this call however it ends — including an unwind, which
-        // previously stranded the paths for the process's lifetime
-        // (bd-v9ho1). Bound to a name, not `_`, so it lives until the
-        // end of the scope rather than being dropped immediately.
-        let _reservation = reserve_scoped(&self.arbiter, bundle, &paths).map_err(|conflict| {
-            ServeError::DestinationConflict {
-                // Escaped rather than lossily decoded, so the operator
-                // sees a path they can tell apart from its neighbours
-                // and map back to real bytes. Same treatment the
-                // virtual-path refusals already give (`RawBytes`).
-                path: RawBytes::new(conflict.path).escaped(),
-                holder: conflict.holder.0,
-            }
-        })?;
-        let files = output_install::install(&mut *store, &plan)?;
+        let files = output_install::install_prepared(&mut *store, &plan, prepared)?;
         Ok(ServeOutcome::Served { files })
     }
 

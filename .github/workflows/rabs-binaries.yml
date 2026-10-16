@@ -121,6 +121,7 @@ jobs:
       - name: Durable replay allowance and real compiler verification
         run: |
           cargo test --release -p rabs-cas --lib serving_sample_gate --locked
+          cargo test --release -p rabs-cas --lib materialization::staged --locked
           cargo test --release -p rabs-cas --lib read_indexes --locked
           cargo test --release -p rabs-cas --lib trust_evidence --locked
           cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --locked

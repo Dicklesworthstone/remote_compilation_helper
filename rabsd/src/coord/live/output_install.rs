@@ -12,8 +12,8 @@ use crate::edge::dep_info::{
 };
 use rabs_cas::manifest_validation::{ManifestMember, ManifestMemberKind, validate_manifest};
 use rabs_cas::materialization::{
-    MaterializationMode, PlannedActionOutput, materialize_action_outputs_prepared,
-    materialize_object,
+    MaterializationMode, PlannedActionOutput, materialize_object,
+    staged::{PreparationFailure, PreparedActionOutputs, SelectedActionOutputs},
 };
 use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
 use rabs_protocol::result_identity::{CanonicalActionResultManifest, OutputRole, ResultKind};
@@ -405,26 +405,47 @@ pub(super) fn prepare(
     }))
 }
 
-pub(super) fn install(
+pub(super) fn select_for_install(
     store: &mut dyn RabsMetadataStore,
     plan: &PreparedOutputs,
-) -> Result<Vec<PathBuf>, ServeError> {
-    let receipt = materialize_action_outputs_prepared(
+) -> Result<SelectedActionOutputs, ServeError> {
+    SelectedActionOutputs::select(
         store,
         &plan.outputs,
         MaterializationMode::VerifiedCowReflink,
         plan.freshness,
-        &|output, staged| {
-            if let Some(derived) = plan.dep_info.get(&output.destination) {
-                let mut staged = staged.try_clone()?;
-                staged.rewind()?;
-                staged.set_len(0)?;
-                staged.write_all(&derived.bytes)?;
-            }
-            Ok(())
-        },
     )
-    .map_err(ServeError::Materialize)?;
+    .map_err(ServeError::Materialize)
+}
+
+pub(super) fn stage_for_install(
+    selected: SelectedActionOutputs,
+    plan: &PreparedOutputs,
+) -> Result<PreparedActionOutputs, PreparationFailure> {
+    selected.stage(&|output, staged| {
+        if let Some(derived) = plan.dep_info.get(&output.destination) {
+            let mut staged = staged.try_clone()?;
+            staged.rewind()?;
+            staged.set_len(0)?;
+            staged.write_all(&derived.bytes)?;
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn settle_stage_failure(
+    store: &mut dyn RabsMetadataStore,
+    failure: PreparationFailure,
+) -> ServeError {
+    ServeError::Materialize(failure.settle(store))
+}
+
+pub(super) fn install_prepared(
+    store: &mut dyn RabsMetadataStore,
+    plan: &PreparedOutputs,
+    prepared: PreparedActionOutputs,
+) -> Result<Vec<PathBuf>, ServeError> {
+    let receipt = prepared.install(store).map_err(ServeError::Materialize)?;
     for (destination, derived) in &plan.dep_info {
         // Digests distinguish canonical identity from subscriber derivation.
         // Never log raw dep-info or source/environment contents.
