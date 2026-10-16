@@ -222,10 +222,10 @@ impl PreparationFailure {
     /// An unavailable quarantine write takes precedence over an ordinary error.
     pub fn settle(self, store: &mut dyn RabsMetadataStore) -> ActionMaterializeFailure {
         let mut error = self.error;
-        if let Some((object, path)) = self.corrupt {
-            if let Err(failure) = store.set_location_quarantined(&object, &path, true) {
-                error = MaterializeError::Store(format!("{failure:?}"));
-            }
+        if let Some((object, path)) = self.corrupt
+            && let Err(failure) = store.set_location_quarantined(&object, &path, true)
+        {
+            error = MaterializeError::Store(format!("{failure:?}"));
         }
         ActionMaterializeFailure { installed: Vec::new(), error }
     }
@@ -270,6 +270,9 @@ impl SelectedActionOutputs {
     /// Copy, hash, derive and freshness-stamp private files WITHOUT metadata
     /// access. The existing materializer is the sole byte-verification/CoW path.
     /// Retain the returned owner until the caller rechecks action authority.
+    // The failure carries the typed error plus the corrupt location that
+    // `settle` must quarantine; it is returned once, on the failure path.
+    #[allow(clippy::result_large_err)]
     pub fn stage(
         self,
         prepare: &impl Fn(&PlannedActionOutput, &File) -> std::io::Result<()>,
