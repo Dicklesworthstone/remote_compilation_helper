@@ -451,7 +451,7 @@ impl PackageFacts {
 pub struct DependencyFacts {
     /// Pure facts bound to the action key, in first-use directory order.
     pub directories: Vec<DependencyDirectoryFact>,
-    roots: Vec<(PathBuf, Vec<String>)>,
+    roots: DependencyRoots,
     members: Vec<Vec<(String, FileSig)>>,
     output: DependencyOutput,
     // Each root must remain the same real directory. Its generation is NOT
@@ -480,14 +480,50 @@ impl DependencyFacts {
     }
 }
 
-type DependencyRoots = Vec<(PathBuf, Vec<String>)>;
+// Real root, excluded owned outputs, and exact --extern rlib basenames.
+// Selection belongs to the observation identity as well as its rechecks:
+// a metadata-only waiter must not lend its projected inventory to an
+// invocation that explicitly consumes an archive in the same directory.
+type DependencyRoots = Vec<(PathBuf, Vec<String>, Vec<String>)>;
 type DependencyMembers = Vec<Vec<(String, FileSig)>>;
 type DependencyOutput = (PathBuf, Vec<String>);
+
+fn dependency_roots(plan: &DependencyActionPlan) -> DependencyRoots {
+    use rabs_key::live_dependency::PlannedExtern;
+    plan.dependency_dirs
+        .iter()
+        .map(|root| {
+            let mut explicit_rlibs: Vec<String> = plan
+                .externs
+                .iter()
+                .filter_map(|entry| match entry {
+                    PlannedExtern::File { path, .. } => {
+                        let (parent, name) = path.rsplit_once('/')?;
+                        (parent == root.as_str() && name.ends_with(".rlib"))
+                            .then(|| name.to_owned())
+                    }
+                    PlannedExtern::Toolchain { .. } => None,
+                })
+                .collect();
+            explicit_rlibs.sort();
+            explicit_rlibs.dedup();
+            (
+                PathBuf::from(root),
+                if root == &plan.out_dir {
+                    plan.output_names()
+                } else {
+                    Vec::new()
+                },
+                explicit_rlibs,
+            )
+        })
+        .collect()
+}
 
 fn dependency_root_identities(roots: &DependencyRoots) -> Result<Vec<(u64, u64)>, String> {
     roots
         .iter()
-        .map(|(root, _)| dependency_root_identity(root))
+        .map(|(root, _, _)| dependency_root_identity(root))
         .collect()
 }
 
@@ -505,7 +541,7 @@ fn reject_dependency_output_aliases(
         if !output.is_dir() {
             return Err("output root is not a real directory".into());
         }
-        for (root, _) in roots {
+        for (root, _, _) in roots {
             let dependency = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
             if root != out_dir
                 && dependency.dev() == output.dev()
@@ -531,8 +567,12 @@ fn reject_dependency_output_aliases(
 }
 
 /// Whether rustc's crate locator can ever consider `name` as a crate.
-/// Every candidate family is `lib<crate>…`; scratch files and ordinary
-/// compiler outputs are therefore excluded before any metadata read.
+/// Candidate families start with `lib`, but so do the ordinary outputs of
+/// crates named `libc`, `libm` or `libloading`. Their dep-info and codegen
+/// intermediates are NOT crate candidates. Exclude only these known suffixes;
+/// interface (.rs), static-library (.a), and unknown lib-prefixed names keep
+/// their conservative refusal in the walker. See rustc_metadata::locator's
+/// prefix AND suffix queries, not just its prefix prefilter.
 ///
 /// Dynamic candidates need one additional class-specific rule below:
 /// Cargo passes an actually consumed proc-macro/dylib as an explicit
@@ -541,7 +581,11 @@ fn reject_dependency_output_aliases(
 /// merely sharing `-L dependency` with an admitted metadata-only compile is
 /// consequently not selectable by that compile and must not poison its key.
 fn crate_locator_may_open(name: &std::ffi::OsStr) -> bool {
-    name.as_encoded_bytes().starts_with(b"lib")
+    let bytes = name.as_encoded_bytes();
+    bytes.starts_with(b"lib")
+        && ![b".d".as_slice(), b".o", b".bc", b".ll", b".s", b".dwo"]
+            .iter()
+            .any(|suffix| bytes.ends_with(suffix))
 }
 
 /// The same real directory, ignoring the generation churn that other
@@ -558,7 +602,7 @@ fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64)
     let mut inventories = Vec::new();
     let mut bytes = 0_u64;
     let mut count = 0_usize;
-    for (root, excluded_outputs) in roots {
+    for (root, excluded_outputs, explicit_rlibs) in roots {
         let before = dependency_root_identity(root)?;
         let mut members = Vec::new();
         for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
@@ -598,7 +642,7 @@ fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64)
         if dependency_root_identity(root)? != before {
             return Err("dependency directory changed while enumerating".into());
         }
-        let members = metadata_shadowed_rlibs_removed(members)?;
+        let members = metadata_shadowed_rlibs_removed(members, explicit_rlibs)?;
         for (_, sig) in &members {
             bytes = bytes
                 .checked_add(sig.size)
@@ -621,8 +665,12 @@ fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64)
 /// `.rmeta`, so only a non-empty sibling shadows the `.rlib`. An `.rlib`
 /// strictly OLDER than its `.rmeta` comes from a different compile than the
 /// metadata and might still be selected by hash: refuse that mixed pair.
+/// This search-path optimization does NOT apply to an archive named by an
+/// exact `--extern`: rustc's exact-path lookup does not discover its sibling
+/// rmeta. Those bytes remain inputs even if a sibling exists or is newer.
 fn metadata_shadowed_rlibs_removed(
     mut members: Vec<(String, FileSig)>,
+    explicit_rlibs: &[String],
 ) -> Result<Vec<(String, FileSig)>, String> {
     let metadata: BTreeMap<String, FileSig> = members
         .iter()
@@ -630,7 +678,8 @@ fn metadata_shadowed_rlibs_removed(
         .collect();
     let mut kept = Vec::with_capacity(members.len());
     for (name, sig) in members.drain(..) {
-        if let Some(stem) = name.strip_suffix(".rlib")
+        if !explicit_rlibs.contains(&name)
+            && let Some(stem) = name.strip_suffix(".rlib")
             && let Some(rmeta) = metadata.get(stem)
             && rmeta.size > 0
         {
@@ -656,7 +705,7 @@ fn capture_dependencies(
 ) -> Result<DependencyFacts, FactsMiss> {
     let root_identities = dependency_root_identities(&roots).map_err(FactsMiss::Refused)?;
     let mut directories = Vec::new();
-    for ((root, _), inventory) in roots.iter().zip(&members) {
+    for ((root, _, _), inventory) in roots.iter().zip(&members) {
         let mut artifacts = Vec::new();
         for (name, sig) in inventory {
             let path = root.join(name);
@@ -1164,20 +1213,7 @@ impl LiveFacts {
         self: &Arc<Self>,
         plan: &DependencyActionPlan,
     ) -> Result<Arc<DependencyFacts>, FactsMiss> {
-        let roots: DependencyRoots = plan
-            .dependency_dirs
-            .iter()
-            .map(|root| {
-                (
-                    PathBuf::from(root),
-                    if root == &plan.out_dir {
-                        plan.output_names()
-                    } else {
-                        Vec::new()
-                    },
-                )
-            })
-            .collect();
+        let roots = dependency_roots(plan);
         let (members, _) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
         let output = (PathBuf::from(&plan.out_dir), plan.output_names());
         reject_dependency_output_aliases(&roots, &members, &output).map_err(FactsMiss::Refused)?;
@@ -1251,7 +1287,7 @@ impl LiveFacts {
         mut budget: u64,
     ) -> bool {
         let files = self.files.lock().ok();
-        for ((root, _), inventory) in roots.iter().zip(members) {
+        for ((root, _, _), inventory) in roots.iter().zip(members) {
             for (name, sig) in inventory {
                 if files
                     .as_ref()
@@ -1413,20 +1449,7 @@ mod tests {
     use super::*;
 
     fn dependency_observation(plan: &DependencyActionPlan) -> Arc<DependencyObservation> {
-        let roots: DependencyRoots = plan
-            .dependency_dirs
-            .iter()
-            .map(|root| {
-                (
-                    PathBuf::from(root),
-                    if root == &plan.out_dir {
-                        plan.output_names()
-                    } else {
-                        Vec::new()
-                    },
-                )
-            })
-            .collect();
+        let roots = dependency_roots(plan);
         let (members, _) = walk_dependencies(&roots).unwrap();
         let output = (PathBuf::from(&plan.out_dir), plan.output_names());
         reject_dependency_output_aliases(&roots, &members, &output).unwrap();
@@ -1540,7 +1563,7 @@ mod tests {
         let (_dir, plan, paths) = dependency_budget_fixture(&[17]);
         let facts = LiveFacts::new();
         facts.file_digest(&paths[0]).unwrap();
-        let roots = vec![(PathBuf::from(&plan.out_dir), plan.output_names())];
+        let roots = dependency_roots(&plan);
         let (members, _) = walk_dependencies(&roots).unwrap();
         assert!(facts.dependency_budget_fits(&roots, &members, 0));
         facts.files.lock().unwrap().clear();
@@ -2063,7 +2086,7 @@ mod tests {
         let artifact = root.join("libdep.rmeta");
         std::fs::write(&artifact, b"first").unwrap();
         std::fs::write(root.join("dep.d"), b"arbitrary dep-info placement").unwrap();
-        let roots = vec![(root.clone(), vec!["libcurrent.rmeta".into()])];
+        let roots = vec![(root.clone(), vec!["libcurrent.rmeta".into()], Vec::new())];
         let memo = LiveFacts::new();
         let capture = || {
             let (members, _) = walk_dependencies(&roots).unwrap();
@@ -2109,7 +2132,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("libdep-0123.rmeta"), b"metadata").unwrap();
-        let roots = vec![(root.clone(), Vec::new())];
+        let roots = vec![(root.clone(), Vec::new(), Vec::new())];
         let (members, _) = walk_dependencies(&roots).unwrap();
         let captured = capture_dependencies(
             &LiveFacts::new(),
@@ -2141,16 +2164,21 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(name), b"not a Rust candidate").unwrap();
             assert!(
-                walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new())]).is_err(),
+                walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new(), Vec::new())])
+                    .is_err(),
                 "{name}"
             );
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("libnested.rlib")).unwrap();
-        assert!(walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new())]).is_err());
+        assert!(
+            walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new(), Vec::new())]).is_err()
+        );
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("missing", dir.path().join("libalias.rmeta")).unwrap();
-        assert!(walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new())]).is_err());
+        assert!(
+            walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new(), Vec::new())]).is_err()
+        );
     }
 
     #[test]
@@ -2160,7 +2188,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("libdep-0123.rmeta"), b"metadata").unwrap();
-        let roots = vec![(root.clone(), Vec::new())];
+        let roots = vec![(root.clone(), Vec::new(), Vec::new())];
         let (members, _) = walk_dependencies(&roots).unwrap();
         let captured = capture_dependencies(
             &LiveFacts::new(),
@@ -2193,10 +2221,102 @@ mod tests {
     }
 
     #[test]
+    fn lib_prefixed_crate_scratch_does_not_invalidate_live_dependency_facts() {
+        let (_dir, mut plan, _) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let first = facts.dependencies(&plan).unwrap();
+        let root = PathBuf::from(&plan.out_dir);
+        for name in [
+            "libc-a123.d",
+            "libc-a123.libc.abcd-cgu.0.rcgu.o",
+            "libloading-b234.libloading.ef01-cgu.1.rcgu.bc",
+            "libm-c345.ll",
+            "libm-c345.s",
+            "libc-a123.libc.abcd-cgu.0.rcgu.dwo",
+        ] {
+            std::fs::write(root.join(name), b"not crate metadata").unwrap();
+            first.verify_unchanged().unwrap();
+            assert!(Arc::ptr_eq(&first, &facts.dependencies(&plan).unwrap()));
+        }
+        // This is not an own-output exemption: another operation with a
+        // different output root sees exactly the same dependency candidates.
+        plan.out_dir = root
+            .parent()
+            .unwrap()
+            .join("other-output")
+            .to_str()
+            .unwrap()
+            .into();
+        let other = facts.dependencies(&plan).unwrap();
+        assert_eq!(other.directories, first.directories);
+        std::fs::write(root.join("libnew-4567.rmeta"), b"new candidate").unwrap();
+        assert!(first.verify_unchanged().is_err());
+        assert!(other.verify_unchanged().is_err());
+    }
+
+    #[test]
+    fn scratch_suffixes_are_checked_before_following_any_filesystem_entry() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let roots = vec![(root.to_path_buf(), Vec::new(), Vec::new())];
+        std::fs::write(root.join("libreal.rmeta"), b"metadata").unwrap();
+        let before = walk_dependencies(&roots).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("libc-123.d")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(root.join("libc-123.o")).unwrap();
+        std::fs::create_dir(root.join("libc-123.bc")).unwrap();
+        let raw = OsString::from_vec(b"libc-\xff.d".to_vec());
+        std::fs::write(root.join(raw), b"unrelated byte-path dep-info").unwrap();
+        assert_eq!(walk_dependencies(&roots).unwrap(), before);
+        // The same suffix embedded INSIDE a candidate must not hide it.
+        std::os::unix::fs::symlink("missing", root.join("libc-123.d.rmeta")).unwrap();
+        assert!(walk_dependencies(&roots).is_err());
+    }
+
+    #[test]
+    fn lib_prefixed_scratch_does_not_spend_the_crate_candidate_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_DEPENDENCY_FILES {
+            std::fs::write(dir.path().join(format!("libc-{index}.d")), b"scratch").unwrap();
+        }
+        std::fs::write(dir.path().join("libreal.rmeta"), b"metadata").unwrap();
+        let roots = vec![(dir.path().to_path_buf(), Vec::new(), Vec::new())];
+        let (members, bytes) =
+            walk_dependencies(&roots).expect("scratch count is not the candidate count");
+        assert_eq!(members[0].len(), 1);
+        assert_eq!(members[0][0].0, "libreal.rmeta");
+        assert_eq!(bytes, 8);
+    }
+
+    #[test]
+    fn scratch_exemption_does_not_widen_the_admitted_crate_formats() {
+        for name in [
+            "libnative.a",
+            "libiface.rs",
+            "libunknown",
+            "libfoo.d.rmeta",
+            "libfoo.o.rlib",
+            "libfoo.dwo.so",
+            "libfoo.bc.dylib",
+        ] {
+            assert!(crate_locator_may_open(std::ffi::OsStr::new(name)), "{name}");
+        }
+        for name in ["libunknown", "libnative.a", "libiface.rs", "libfoo.d.rmeta"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            assert!(
+                walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new(), Vec::new())])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn a_pipelined_rlib_is_shadowed_by_its_metadata_and_stale_pairs_refuse() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let roots = vec![(root.clone(), Vec::new())];
+        let roots = vec![(root.clone(), Vec::new(), Vec::new())];
         let rmeta = root.join("libdep-0123.rmeta");
         std::fs::write(&rmeta, b"metadata").unwrap();
         let (before, _) = walk_dependencies(&roots).unwrap();
@@ -2236,8 +2356,160 @@ mod tests {
         let lone = tempfile::tempdir().unwrap();
         std::fs::write(lone.path().join("libsolo-89.rlib"), b"archive").unwrap();
         let (members, _) =
-            walk_dependencies(&vec![(lone.path().to_path_buf(), Vec::new())]).unwrap();
+            walk_dependencies(&vec![(lone.path().to_path_buf(), Vec::new(), Vec::new())]).unwrap();
         assert_eq!(members[0].len(), 1);
+    }
+
+    fn require_archive(plan: &mut DependencyActionPlan, path: &Path) {
+        use rabs_key::extern_resolution::DependencyArtifactKind;
+        use rabs_key::live_dependency::PlannedExtern;
+        let path = path.to_str().unwrap().to_owned();
+        plan.invocation
+            .externs
+            .push(("upstream".into(), Some(path.clone())));
+        plan.externs.push(PlannedExtern::File {
+            name: "upstream".into(),
+            path,
+            kind: DependencyArtifactKind::Rlib,
+        });
+    }
+
+    fn dependency_archive_pair(root: &Path, archive_time: u64) -> PathBuf {
+        let metadata = root.join("libupstream-0123.rmeta");
+        let archive = root.join("libupstream-0123.rlib");
+        std::fs::write(&metadata, b"metadata").unwrap();
+        std::fs::write(&archive, b"archive-v1").unwrap();
+        // Explicit ordering, not a filesystem-resolution-sensitive sleep.
+        for (path, seconds) in [(&metadata, 20), (&archive, archive_time)] {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        }
+        archive
+    }
+
+    #[test]
+    fn exact_extern_archives_are_never_replaced_by_a_metadata_sibling() {
+        for archive_time in [10, 30] {
+            let (_dir, mut plan, _) = dependency_budget_fixture(&[]);
+            let archive = dependency_archive_pair(Path::new(&plan.out_dir), archive_time);
+            require_archive(&mut plan, &archive);
+            let facts = LiveFacts::new();
+            let captured = facts.dependencies(&plan).expect("exact rlib remains an input");
+            let candidates = &captured.directories[0].artifacts;
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].path, archive.to_str().unwrap());
+            assert_eq!(candidates[0].content_digest, digest_stable(&archive).unwrap().1);
+            captured.verify_unchanged().unwrap();
+            std::fs::write(&archive, b"archive-v2").unwrap();
+            assert!(captured.verify_unchanged().is_err());
+            let changed = facts.dependencies(&plan).unwrap();
+            assert_ne!(changed.directories[0].artifacts, captured.directories[0].artifacts);
+        }
+    }
+
+    #[test]
+    fn metadata_projection_and_exact_archive_consumption_keep_separate_memos() {
+        let (_dir, plan, _) = dependency_budget_fixture(&[]);
+        let archive = dependency_archive_pair(Path::new(&plan.out_dir), 30);
+        let facts = LiveFacts::new();
+        let projected = facts.dependencies(&plan).unwrap();
+        assert_eq!(projected.directories[0].artifacts.len(), 1);
+        let mut exact = plan.clone();
+        require_archive(&mut exact, &archive);
+        let full = facts.dependencies(&exact).unwrap();
+        assert_eq!(full.directories[0].artifacts.len(), 2);
+        assert!(!Arc::ptr_eq(&projected, &full));
+        assert!(Arc::ptr_eq(&projected, &facts.dependencies(&plan).unwrap()));
+        std::fs::write(&archive, b"a later completed archive").unwrap();
+        projected.verify_unchanged().unwrap();
+        assert!(full.verify_unchanged().is_err());
+        assert!(Arc::ptr_eq(&projected, &facts.dependencies(&plan).unwrap()));
+    }
+
+    #[test]
+    fn explicit_archive_selection_is_scoped_to_its_real_directory() {
+        let (dir, mut plan, _) = dependency_budget_fixture(&[]);
+        let first = dependency_archive_pair(Path::new(&plan.out_dir), 30);
+        let other = dir.path().join("other-dependencies");
+        std::fs::create_dir(&other).unwrap();
+        let second = dependency_archive_pair(&other, 30);
+        plan.dependency_dirs.push(other.to_str().unwrap().into());
+        require_archive(&mut plan, &first);
+        let facts = LiveFacts::new();
+        let captured = facts.dependencies(&plan).unwrap();
+        assert_eq!(captured.directories[0].artifacts.len(), 2);
+        assert_eq!(captured.directories[1].artifacts.len(), 1);
+        std::fs::write(&second, b"unconsumed archive replacement").unwrap();
+        captured.verify_unchanged().unwrap();
+        std::fs::write(&first, b"consumed archive replacement").unwrap();
+        assert!(captured.verify_unchanged().is_err());
+    }
+
+    #[test]
+    fn a_projected_capture_reservation_cannot_hide_an_explicit_archive_request() {
+        let (_dir, mut plan, _) = dependency_budget_fixture(&[]);
+        let archive = dependency_archive_pair(Path::new(&plan.out_dir), 30);
+        let facts = LiveFacts::new();
+        let projected = dependency_observation(&plan);
+        let owner = dependency_reservation(&facts, &projected);
+        require_archive(&mut plan, &archive);
+        let captured = facts.dependencies(&plan).expect("distinct input selection");
+        assert_eq!(captured.directories[0].artifacts.len(), 2);
+        drop(owner);
+        assert!(Arc::ptr_eq(&captured, &facts.dependencies(&plan).unwrap()));
+    }
+
+    #[test]
+    fn explicit_archives_spend_the_actual_cold_byte_and_total_inventory_budgets() {
+        for size in [SYNCHRONOUS_PACKAGE_BYTES + 1, MAX_DEPENDENCY_BYTES + 1] {
+            let (_dir, mut plan, _) = dependency_budget_fixture(&[]);
+            let archive = dependency_archive_pair(Path::new(&plan.out_dir), 30);
+            std::fs::File::options()
+                .write(true)
+                .open(&archive)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            let facts = LiveFacts::new();
+            *facts.warming.lock().unwrap() = MAX_WARMING;
+            assert_eq!(facts.dependencies(&plan).unwrap().directories[0].artifacts.len(), 1);
+            require_archive(&mut plan, &archive);
+            if size > MAX_DEPENDENCY_BYTES {
+                assert!(matches!(
+                    facts.dependencies(&plan),
+                    Err(FactsMiss::Refused(reason)) if reason.contains("bytes exceed")
+                ));
+            } else {
+                assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+                assert!(!facts.files.lock().unwrap().contains_key(&archive));
+                facts.file_digest(&archive).unwrap();
+                assert_eq!(facts.dependencies(&plan).unwrap().directories[0].artifacts.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_archive_capture_still_rejects_output_aliases_and_replaced_roots() {
+        let (dir, mut plan, _) = dependency_budget_fixture(&[]);
+        let archive = dependency_archive_pair(Path::new(&plan.out_dir), 30);
+        require_archive(&mut plan, &archive);
+        let facts = LiveFacts::new();
+        let captured = facts.dependencies(&plan).unwrap();
+        let output = Path::new(&plan.out_dir).join(&plan.output_names()[0]);
+        std::fs::hard_link(&archive, output).unwrap();
+        assert!(matches!(
+            facts.dependencies(&plan),
+            Err(FactsMiss::Refused(reason)) if reason.contains("aliases a declared output")
+        ));
+        assert!(captured.verify_unchanged().is_err());
+        let root = PathBuf::from(&plan.out_dir);
+        let retained = dir.path().join("retained-dependencies");
+        std::fs::rename(&root, &retained).unwrap();
+        std::os::unix::fs::symlink(retained, &root).unwrap();
+        assert!(captured.verify_unchanged().is_err());
+        assert!(facts.dependencies(&plan).is_err());
     }
 
     #[test]
@@ -2249,7 +2521,7 @@ mod tests {
         std::fs::create_dir_all(&dependencies).unwrap();
         std::fs::create_dir(&out).unwrap();
         std::fs::write(dependencies.join("libdep.rlib"), b"dependency bytes").unwrap();
-        let roots = vec![(dependencies.clone(), Vec::new())];
+        let roots = vec![(dependencies.clone(), Vec::new(), Vec::new())];
         let output = (out.clone(), vec!["libcurrent.rlib".into()]);
         let (members, _) = walk_dependencies(&roots).unwrap();
         let captured =
@@ -2272,7 +2544,7 @@ mod tests {
         // roots still identify the same real directory and cannot be input/output.
         let alias_parent = dir.path().join("alias");
         std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
-        let alias_roots = vec![(alias_parent.join("deps"), Vec::new())];
+        let alias_roots = vec![(alias_parent.join("deps"), Vec::new(), Vec::new())];
         let (members, _) = walk_dependencies(&alias_roots).unwrap();
         assert!(
             reject_dependency_output_aliases(&alias_roots, &members, &(dependencies, Vec::new()))
@@ -2289,7 +2561,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&out).unwrap();
         std::fs::write(root.join("libstable.rlib"), b"stable").unwrap();
-        let roots = vec![(root.clone(), Vec::new())];
+        let roots = vec![(root.clone(), Vec::new(), Vec::new())];
         let (members, _) = walk_dependencies(&roots).unwrap();
         let captured = capture_dependencies(
             &LiveFacts::new(),
