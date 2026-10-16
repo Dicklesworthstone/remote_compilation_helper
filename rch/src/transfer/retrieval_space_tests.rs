@@ -48,7 +48,7 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
             parse_rsync_itemized_regular_files(&String::from_utf8_lossy(&selected.stdout));
         assert_eq!(selected_paths.len(), 1040);
         let script =
-            artifact_header_probe_script(worker.to_str().unwrap(), &selected_paths).unwrap();
+            artifact_header_probe_script(worker.to_str().unwrap(), None, &selected_paths).unwrap();
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
@@ -71,7 +71,7 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
     std::os::unix::fs::symlink(stage.join("sentinel"), worker.join("escape")).unwrap();
     for path in ["escape", "../stage/sentinel"] {
         let script =
-            artifact_header_probe_script(worker.to_str().unwrap(), &[path.into()]).unwrap();
+            artifact_header_probe_script(worker.to_str().unwrap(), None, &[path.into()]).unwrap();
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
@@ -79,6 +79,60 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
             .unwrap();
         assert!(!output.status.success());
     }
+
+    // Ordinary intermediate symlinks are never followed, even when their
+    // referent remains under the selected root. Cargo's managed target alias
+    // is the sole exception and must bind the separately authorized root.
+    std::fs::create_dir_all(worker.join("real/deps")).unwrap();
+    std::fs::write(worker.join("real/deps/native"), b"\x7fELF").unwrap();
+    std::os::unix::fs::symlink(worker.join("real"), worker.join("link")).unwrap();
+    let script = artifact_header_probe_script(
+        worker.to_str().unwrap(),
+        None,
+        &["link/deps/native".into()],
+    )
+    .unwrap();
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+
+    let managed = root.path().join("managed-target");
+    std::fs::create_dir_all(managed.join("debug/deps")).unwrap();
+    std::fs::write(managed.join("debug/deps/native"), b"\x7fELF").unwrap();
+    std::os::unix::fs::symlink(&managed, worker.join("target")).unwrap();
+    let script = artifact_header_probe_script(
+        worker.to_str().unwrap(),
+        Some(managed.to_str().unwrap()),
+        &["target/debug/deps/native".into()],
+    )
+    .unwrap();
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let headers: Vec<(String, Vec<u8>)> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(headers[0].0, "target/debug/deps/native");
+    assert!(headers[0].1.starts_with(b"\x7fELF"));
+
+    let wrong = root.path().join("wrong-target");
+    std::fs::create_dir_all(&wrong).unwrap();
+    let script = artifact_header_probe_script(
+        worker.to_str().unwrap(),
+        Some(wrong.to_str().unwrap()),
+        &["target/debug/deps/native".into()],
+    )
+    .unwrap();
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
 }
 
 fn fixture() -> (PathBuf, TransferPipeline, WorkerConfig) {

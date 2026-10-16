@@ -11,9 +11,31 @@ mod retrieval_space;
 mod retrieval_space_tests;
 pub(crate) mod source_content_barrier;
 
-fn artifact_header_probe_script(remote: &str, paths: &[String]) -> anyhow::Result<String> {
+fn artifact_header_probe_script(
+    remote: &str,
+    cargo_target_root: Option<&str>,
+    paths: &[String],
+) -> anyhow::Result<String> {
     use std::fmt::Write as _;
-    let bytes = serde_json::to_vec(&(remote, paths))?;
+    const MAX_HEADER_CANDIDATES: usize = 16_384;
+    const MAX_HEADER_PATH_BYTES: usize = 4_096;
+    anyhow::ensure!(
+        paths.len() <= MAX_HEADER_CANDIDATES,
+        "artifact platform preflight selected too many executable candidates"
+    );
+    anyhow::ensure!(
+        paths.iter().all(|path| {
+            !path.is_empty()
+                && path.len() <= MAX_HEADER_PATH_BYTES
+                && !path.starts_with('/')
+                && !path.chars().any(char::is_control)
+                && path
+                    .split('/')
+                    .all(|component| !matches!(component, "" | "." | ".."))
+        }),
+        "artifact platform preflight selected an unsafe path"
+    );
+    let bytes = serde_json::to_vec(&(remote, cargo_target_root, paths))?;
     let mut payload = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(payload, "{byte:02x}")?;
@@ -21,21 +43,125 @@ fn artifact_header_probe_script(remote: &str, paths: &[String]) -> anyhow::Resul
     Ok(format!(
         r#"python3 -I - <<'RCH_ARTIFACT_HEADERS'
 import json, os, stat
-root, paths = json.loads(bytes.fromhex('{payload}'))
-root = os.path.realpath(root)
-result = []
-for path in paths:
-    full = os.path.join(root, path)
-    if os.path.commonpath([root, os.path.realpath(full)]) != root:
-        raise RuntimeError('artifact header escapes output root')
-    fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+root_name, target_name, paths = json.loads(bytes.fromhex('{payload}'))
+
+def require(condition, detail):
+    if not condition:
+        raise RuntimeError(detail)
+
+def same_inode(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+def generation(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def open_root(path):
+    resolved = os.path.realpath(path)
+    descriptor = os.open(
+        resolved, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise RuntimeError('artifact header is not a regular file')
-        result.append([path, list(os.read(fd, 64))])
-    finally:
-        os.close(fd)
-print(json.dumps(result))
+        require(same_inode(os.fstat(descriptor), os.stat(path)),
+                'artifact probe root changed while opening')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+root = open_root(root_name)
+target = None
+result = []
+try:
+    for path in paths:
+        parts = path.split('/')
+        require(parts and all(part not in ('', '.', '..') for part in parts),
+                'artifact path is not a literal relative path')
+        opened = [os.dup(root)]
+        directory = opened[0]
+        chain = []
+        file_descriptor = None
+        target_alias = False
+        try:
+            if parts[0] == 'target' and len(parts) > 1:
+                selected = os.stat('target', dir_fd=root, follow_symlinks=False)
+                if stat.S_ISLNK(selected.st_mode):
+                    require(target_name is not None, 'target alias has no authorized root')
+                    if target is None:
+                        target = open_root(target_name)
+                    require(same_inode(
+                        os.stat('target', dir_fd=root, follow_symlinks=True),
+                        os.fstat(target)
+                    ), 'target alias has a different authorized root')
+                    directory = os.dup(target)
+                    opened.append(directory)
+                    parts = parts[1:]
+                    target_alias = True
+
+            for part in parts[:-1]:
+                next_directory = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+                opened.append(next_directory)
+                chain.append((directory, part, next_directory))
+                directory = next_directory
+
+            file_descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                | os.O_NONBLOCK | os.O_NOCTTY,
+                dir_fd=directory,
+            )
+            before = os.fstat(file_descriptor)
+            require(stat.S_ISREG(before.st_mode), 'artifact header is not a regular file')
+            wanted = min(64, before.st_size)
+            prefix = bytearray()
+            while len(prefix) < wanted:
+                chunk = os.read(file_descriptor, wanted - len(prefix))
+                require(chunk, 'artifact header was truncated while reading')
+                prefix.extend(chunk)
+
+            after = os.fstat(file_descriptor)
+            named = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+            require(
+                generation(before) == generation(after) == generation(named),
+                'artifact changed while reading its header',
+            )
+            for parent, name, child in reversed(chain):
+                require(
+                    same_inode(
+                        os.stat(name, dir_fd=parent, follow_symlinks=False),
+                        os.fstat(child),
+                    ),
+                    'artifact directory changed while reading its header',
+                )
+            if target_alias:
+                require(
+                    same_inode(
+                        os.stat('target', dir_fd=root, follow_symlinks=True),
+                        os.fstat(target),
+                    ),
+                    'target alias changed while reading its header',
+                )
+            result.append([path, list(prefix)])
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+
+    require(same_inode(os.fstat(root), os.stat(root_name)),
+            'artifact probe root changed before response')
+    if target is not None:
+        require(same_inode(os.fstat(target), os.stat(target_name)),
+                'authorized target root changed before response')
+    print(json.dumps(result, separators=(',', ':')))
+finally:
+    if target is not None:
+        os.close(target)
+    os.close(root)
 RCH_ARTIFACT_HEADERS
 "#
     ))
@@ -6757,7 +6883,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Paths travel as JSON data, never shell arguments. Refuse symlinks and
         // escapes; probing must not grant authority to read outside the output
         // root. A missing/unreadable candidate is not evidence of compatibility.
-        let script = artifact_header_probe_script(&remote, &paths)?;
+        let cargo_target_root = self.remote_cargo_target_dir();
+        let script =
+            artifact_header_probe_script(&remote, Some(&cargo_target_root), &paths)?;
         let mut command = self.worker_ssh_command(worker, &["sh", "-s"]);
         command
             .stdin(Stdio::piped())
