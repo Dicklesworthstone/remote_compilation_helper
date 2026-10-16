@@ -5,6 +5,10 @@
 //! existing no-follow streaming path. The key binds the selected names and
 //! link graph; inode/time observations remain freshness evidence only. This
 //! does not admit directory links, external libraries, or linked sysroot trees.
+//! Installed codegen backends join this same observation and hashing batch:
+//! their bytes are compiler inputs, not implied by rustc's version string.
+
+mod codegen_backends;
 
 use super::{CanonicalEncoder, FileSig, TypedDigest, compute, lstat_regular, toolchain_entries};
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,23 +67,28 @@ impl Link {
 }
 
 /// Retained alongside the original toolchain observation, never replaced by a
-/// newer shared memo. The optional layout digest distinguishes aliased profiles
-/// while preserving the exact previous key bytes for plain regular toolchains.
+/// newer shared memo. The optional alias digest distinguishes linked profiles.
+/// The backend layout is always bound, even when no backends are installed, so
+/// entries created before backend observation cannot become hits in this lane.
 #[derive(Debug)]
 pub(super) struct Aliases {
     links: Vec<Link>,
     layout: Option<TypedDigest>,
+    backends: codegen_backends::Closure,
 }
 
 impl Aliases {
     pub(super) fn still_current(&self) -> bool {
-        self.links.iter().all(Link::still_current)
+        self.backends.still_current()
+            && self.links.iter().all(Link::still_current)
+            && self.backends.still_current()
     }
 
     pub(super) fn bind_layout(&self, runtime_digests: &mut Vec<TypedDigest>) {
         if let Some(layout) = &self.layout {
             runtime_digests.push(layout.clone());
         }
+        runtime_digests.push(self.backends.layout.clone());
     }
 }
 
@@ -185,9 +194,13 @@ pub(super) fn observe(directory: &Path) -> Result<Observation, String> {
         }
         Some(compute(DOMAIN_RUNTIME_ALIASES, &encoder.finish()))
     };
+    let (backend_files, backends) =
+        codegen_backends::observe(directory, MAX_LINKS.saturating_sub(links.len()))?;
+    files.extend(backend_files);
     let aliases = Aliases {
         links: links.into_values().collect(),
         layout,
+        backends,
     };
     let directory_current = || {
         std::fs::symlink_metadata(directory)
@@ -217,14 +230,17 @@ mod tests {
     }
 
     #[test]
-    fn regular_runtime_keeps_the_previous_digest_vector() {
+    fn regular_runtime_keeps_its_bytes_but_requires_the_backend_observation_epoch() {
         let (_dir, compiler) = toolchain_fixture();
         let library = library_root(&compiler).join("libdriver.so");
         let probed = probe_toolchain(&compiler, &[]).unwrap();
         assert!(probed.runtime_aliases.links.is_empty());
         assert_eq!(
             probed.facts.runtime_libraries,
-            vec![digest_stable(&library).unwrap().1]
+            vec![
+                digest_stable(&library).unwrap().1,
+                probed.runtime_aliases.backends.layout.clone(),
+            ]
         );
         assert!(probed.still_current());
     }
@@ -242,7 +258,7 @@ mod tests {
         let llvm = digest_stable(&lib.join("runtime-llvm")).unwrap().1;
         assert_eq!(probed.facts.runtime_libraries[0], llvm);
         assert_eq!(probed.facts.runtime_libraries[1], llvm);
-        assert_eq!(probed.facts.runtime_libraries.len(), 4);
+        assert_eq!(probed.facts.runtime_libraries.len(), 5);
         assert!(probed.still_current());
         assert_eq!(probed.facts, probe_toolchain(&compiler, &[]).unwrap().facts);
         std::fs::write(lib.join("runtime-llvm"), b"changed LLVM bytes").unwrap();
