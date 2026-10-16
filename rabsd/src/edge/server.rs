@@ -12,13 +12,14 @@
 //! Wire format: newline-delimited JSON, one request per line, 64 KiB bound.
 //! Malformed input never grants execution, publication, or fallback authority.
 //!
-//! Stale-socket takeover: never a blind unlink. If the socket path
-//! exists, LIVENESS-PROBE it (connect): a live daemon means this boot
-//! REFUSES (typed); only a probe-dead socket file (stale runtime state
-//! from a dead incarnation) is removed and taken over, and the takeover
-//! is logged.
+//! Endpoint ownership spans the listener AND every admitted session. A
+//! permanent endpoint lock, private namespace and exact socket generation
+//! fence takeover and teardown independently of the configured CAS root.
+//! Only an unchanged socket whose bounded connect was refused is retired;
+//! timeout, permissions, wrong type and replacement never prove death.
 
 mod backpressure;
+mod endpoint;
 mod frame_read;
 mod liveness;
 mod rustc_outputs;
@@ -26,7 +27,9 @@ mod rustc_request;
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncWriteExt, BufReader};
-use asupersync::net::unix::{UnixListener, UnixStream};
+#[cfg(test)]
+use asupersync::net::unix::UnixListener;
+use asupersync::net::unix::UnixStream;
 use asupersync::signal::ShutdownReceiver;
 use liveness::{Limit, WorkError};
 use rabs_asupersync::daemon_runtime::SubsystemWork;
@@ -34,7 +37,6 @@ use rabs_protocol::socket_admission::{
     AdmissionPolicy, ConnectionEvidence, PeerCredentials, SocketMetadata, TokenContext, admit,
 };
 use rabs_protocol::version_negotiation::{Negotiation, VersionHello, VersionRange, negotiate};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -163,46 +165,18 @@ async fn serve(
     mut shutdown: ShutdownReceiver,
     config: EdgeServerConfig,
 ) -> Result<(), String> {
-    // Stale-socket takeover: liveness probe, never blind unlink.
-    if config.socket_path.exists() {
-        match UnixStream::connect(&config.socket_path).await {
-            Ok(_) => {
-                return Err(format!(
-                    "another rabsd is alive at {} — refusing to take over",
-                    config.socket_path.display()
-                ));
-            }
-            Err(_) => {
-                log_line(
-                    "rabsd-socket-takeover",
-                    &[("stale", &config.socket_path.display().to_string())],
-                );
-                std::fs::remove_file(&config.socket_path)
-                    .map_err(|e| format!("stale socket removal failed: {e}"))?;
-            }
-        }
-    }
-    if let Some(parent) = config.socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let listener = UnixListener::bind(&config.socket_path)
-        .await
-        .map_err(|e| format!("bind {}: {e}", config.socket_path.display()))?;
-    std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("socket chmod: {e}"))?;
-
-    // Admission evidence baseline: the socket we just created. The
-    // daemon's own uid is the socket owner's uid (we created it).
-    let socket_meta = std::fs::metadata(&config.socket_path).map_err(|e| e.to_string())?;
-    let expected_uid = socket_meta.uid();
+    let listener = endpoint::bind(&config.socket_path, FRAME_IO_BUDGET).await?;
+    // The endpoint owner just checked the exact bound inode, kernel UID and
+    // mode. Socket metadata never chooses a different user's admission policy.
+    let expected_uid = listener.owner_uid();
     let policy = AdmissionPolicy {
         expected_uid,
         require_token_on_unix: false,
         tcp_enabled: false,
     };
     let socket_evidence = SocketMetadata {
-        owner_uid: socket_meta.uid(),
-        mode: socket_meta.mode() & 0o777,
+        owner_uid: expected_uid,
+        mode: 0o600,
     };
     log_line(
         "rabsd-edge-listening",
@@ -235,15 +209,15 @@ async fn serve(
 
     shutdown.wait().await;
     acceptor.abort();
-    // The socket file is this incarnation's runtime state: remove it on
-    // clean shutdown so the next boot needs no takeover.
-    let _ = std::fs::remove_file(&config.socket_path);
+    // The acceptor and its admitted sessions retain endpoint ownership.
+    // Their final drop, after joined writers return, retires only the exact
+    // bound generation. Never unlink here while a session may still own work.
     Ok(())
 }
 
 async fn accept_loop(
     cx: Cx,
-    listener: UnixListener,
+    listener: endpoint::ListenerOwner,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     services: EdgeServices,
@@ -251,7 +225,7 @@ async fn accept_loop(
 ) {
     let mut connection_id: u64 = 0;
     loop {
-        match listener.accept().await {
+        match listener.listener.accept().await {
             Ok((stream, _addr)) => {
                 // Refuse before task allocation. Do not attempt a potentially
                 // blocking refusal write to a peer we have not admitted.
@@ -267,7 +241,12 @@ async fn accept_loop(
                 connection_id = id;
                 let services = services.clone();
                 let limits = limits.clone();
+                let endpoint_owner = std::sync::Arc::clone(&listener.owner);
                 let spawned = cx.spawn(move |cx| async move {
+                    // Outlives handle_connection, including cancellation that
+                    // drops its joined blocking-work owners. A replacement
+                    // daemon cannot acquire this endpoint during that cleanup.
+                    let _endpoint_owner = endpoint_owner;
                     if cx.checkpoint().is_ok() {
                         handle_connection(id, stream, policy, socket_evidence, services, limits)
                             .await;
