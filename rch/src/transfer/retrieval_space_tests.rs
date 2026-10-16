@@ -69,16 +69,24 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
         );
     }
     std::os::unix::fs::symlink(stage.join("sentinel"), worker.join("escape")).unwrap();
-    for path in ["escape", "../stage/sentinel"] {
-        let script =
-            artifact_header_probe_script(worker.to_str().unwrap(), None, &[path.into()]).unwrap();
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-    }
+    // A lexically unsafe path is refused before any probe is built.
+    assert!(
+        artifact_header_probe_script(
+            worker.to_str().unwrap(),
+            None,
+            &["../stage/sentinel".into()]
+        )
+        .is_err()
+    );
+    // One that escapes only through a symlink is refused by the probe itself.
+    let script =
+        artifact_header_probe_script(worker.to_str().unwrap(), None, &["escape".into()]).unwrap();
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
 
     // Ordinary intermediate symlinks are never followed, even when their
     // referent remains under the selected root. Cargo's managed target alias
@@ -86,12 +94,9 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
     std::fs::create_dir_all(worker.join("real/deps")).unwrap();
     std::fs::write(worker.join("real/deps/native"), b"\x7fELF").unwrap();
     std::os::unix::fs::symlink(worker.join("real"), worker.join("link")).unwrap();
-    let script = artifact_header_probe_script(
-        worker.to_str().unwrap(),
-        None,
-        &["link/deps/native".into()],
-    )
-    .unwrap();
+    let script =
+        artifact_header_probe_script(worker.to_str().unwrap(), None, &["link/deps/native".into()])
+            .unwrap();
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
