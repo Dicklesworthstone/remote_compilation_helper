@@ -10,6 +10,9 @@
 use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
 use rabs_key::live_dependency::{LiveRefusal, LiveRustcRequest};
 
+#[path = "sysroot_preflight.rs"]
+mod sysroot_preflight;
+
 /// A host-independent subset of the live dependency planner's refusals.
 /// Keep this deliberately small; differential tests below require supported
 /// requests to continue to the full planner, not become false cache misses.
@@ -107,6 +110,7 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
         return Some(LiveRefusal::NativeCpu);
     }
     dependency_inputs_rejection(&invocation)
+        .or_else(|| sysroot_preflight::rejection(&invocation))
 }
 
 fn dependency_inputs_rejection(invocation: &NormalizedRustcInvocation) -> Option<LiveRefusal> {
