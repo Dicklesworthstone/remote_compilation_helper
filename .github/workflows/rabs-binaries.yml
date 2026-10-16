@@ -20,6 +20,7 @@ on:
       - 'rch-common/src/toolchain/**'
       - 'scripts/cargo-rabs'
       - 'scripts/tests/test_cargo_rabs.py'
+      - 'scripts/tests/test_cargo_rabs_canonical.py'
       - 'scripts/install-rabs'
       - 'tests/test_install_rabs*.py'
       - 'tests/test_rabs_sprt_evidence.py'
@@ -63,6 +64,8 @@ jobs:
           python3 scripts/tests/test_cargo_rabs.py -v
           python3 tests/test_rabs_worker_cache.py -v
           python3 tests/test_rabs_worker_cache_diagnostics.py -v
+      - name: Canonical Cargo frontend (native driver is an explicit fixture)
+        run: python3 -I -S scripts/tests/test_cargo_rabs_canonical.py -v
       - name: Capture recovery SQL and interruption model (not a Rust execution proof)
         run: python3 tests/test_rabs_capture_recovery.py -v
       - name: Indexed evidence queries (native SQLite, not Rust execution)
@@ -103,6 +106,8 @@ jobs:
         run: cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
       - name: Worker-cache command assembly and opt-out parity
         run: cargo test --release -p rch-common --lib toolchain::worker_cache --locked
+      - name: Coherent preparation to native worker-build handoff
+        run: cargo test --release -p rabsd --bin rabsd worker_exec::prepared_build --locked
       - name: Binary size budget (rabs-wrap < 2 MiB, A021)
         run: |
           size=$(stat -c%s target/release/rabs-wrap)

@@ -45,7 +45,19 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-no-start        Only use an already-running daemon.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
+  --rabs-canonical FILE  Build named binaries through a canonical worker profile.
   --help                Show this help without starting a daemon or Cargo.
+
+Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
+It runs the existing rabsd source/toolchain preparation and pinned-TLS worker
+build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
+explicit upload boundary, profile and worker connection setup. This Linux-only
+profile uses a captured toolchain, fixed worker environment and new output tree;
+it is not transparent local-path replay, per-action scheduling or cache serving.
+Only named binary builds and the documented argument subset are accepted.
+Cargo metadata may run locally; builds never do. No local/RCH fallback or
+automatic execution retry occurs. stdout is the native worker-build report,
+not Cargo JSON; full compiler diagnostics remain in the verified delivery.
 
 Remote mode requires a matching RCH installation and configured POSIX workers.
 It execs `rch exec --source-content-receipt -- cargo ...`, with remote execution
@@ -678,6 +690,8 @@ def arguments(argv):
             required = True
         elif args[0] == "--rabs-remote":
             remote = True
+        elif args[0] == "--rabs-canonical":
+            raise SetupError("--rabs-canonical must be the first and only launcher mode")
         else:
             break
         args.pop(0)
@@ -721,7 +735,242 @@ def remote_invocation(args, env):
     return rch, [rch, "exec", "--source-content-receipt", "--", "cargo"] + args, child_env
 
 
+def canonical_path(value, absolute=False):
+    """A path spelling for the existing canonical source/output contracts."""
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise SetupError("canonical profile paths must be bounded nonempty strings")
+    try:
+        value.encode("utf-8")
+    except UnicodeError as error:
+        raise SetupError("canonical paths must be UTF-8") from error
+    parts = value[1:].split("/") if absolute else value.split("/")
+    if (value.startswith("/") != absolute or "\\" in value or ":" in value
+            or any(ord(c) < 32 or ord(c) == 127 for c in value)
+            or any(part in ("", ".", "..") for part in parts)):
+        raise SetupError("canonical paths must not contain aliases or traversal")
+    return value
+
+
+def canonical_profile(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_FRAME:
+            raise SetupError("canonical profile must be a bounded regular file")
+        data = source.read(MAX_FRAME + 1)
+        after = os.fstat(source.fileno())
+        signature = lambda m: (m.st_dev, m.st_ino, m.st_size, m.st_mtime_ns, m.st_ctime_ns)
+        if len(data) != before.st_size or signature(before) != signature(after):
+            raise SetupError("canonical profile changed during reading")
+    profile = decode_object(data)
+    required = {"version", "listen", "worker", "worker_spki_sha256",
+                "source_root", "toolchain_root", "operation_root"}
+    if (not required <= profile.keys() or profile.keys() - required - {"manifest", "vendor"}
+            or profile["version"] != "canonical-cargo-v1"):
+        raise SetupError("invalid canonical-cargo-v1 profile fields")
+    import ipaddress
+    import re
+    address = profile["listen"]
+    if not isinstance(address, str) or len(address) > 128:
+        raise SetupError("listen must be a literal coordinator IP:port")
+    try:
+        host, port = address.rsplit(":", 1)
+        # Brackets are required for IPv6, as by Rust's SocketAddr parser.
+        parsed = ipaddress.ip_address(host[1:-1] if host.startswith("[") and host.endswith("]") else host)
+        if ("%" in host or (parsed.version == 6) != (host.startswith("[") and host.endswith("]"))
+                or not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535):
+            raise ValueError("invalid address or port")
+    except ValueError as error:
+        raise SetupError("listen must be a literal coordinator IP and nonzero port") from error
+    if (not isinstance(profile["worker"], str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", profile["worker"]) is None
+            or not isinstance(profile["worker_spki_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", profile["worker_spki_sha256"]) is None):
+        raise SetupError("canonical worker identity and lowercase SHA-256 pin are required")
+    for field in ("source_root", "toolchain_root", "operation_root"):
+        path = Path(canonical_path(profile[field], absolute=True))
+        # Do not normalize away an unsafe ancestor or follow a profile alias.
+        for parent in reversed((path,) + tuple(path.parents)):
+            if not stat.S_ISDIR(parent.lstat().st_mode):
+                raise SetupError("canonical roots require ordinary directory ancestors")
+    operation = Path(profile["operation_root"])
+    metadata = operation.lstat()
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise SetupError("canonical operation root must be private to this user")
+    for field in ("source_root", "toolchain_root"):
+        source = Path(profile[field])
+        if operation == source or operation in source.parents or source in operation.parents:
+            raise SetupError("canonical operation root must be disjoint from inputs")
+    profile["manifest"] = canonical_path(profile.get("manifest", "Cargo.toml"))
+    if Path(profile["manifest"]).name != "Cargo.toml":
+        raise SetupError("canonical manifest must name Cargo.toml")
+    if "vendor" in profile:
+        canonical_path(profile["vendor"])
+    for name in ("cargo", "rustc"):
+        tool = Path(profile["toolchain_root"]) / "bin" / name
+        if (not stat.S_ISDIR(tool.parent.lstat().st_mode)
+                or not stat.S_ISREG(tool.lstat().st_mode) or not os.access(tool, os.X_OK)):
+            raise SetupError("canonical toolchain requires ordinary executable cargo and rustc")
+    return profile
+
+
+def canonical_build_arguments(args):
+    """Preserve supported argv and derive REAL mandatory binary outputs.
+
+    Do not use Cargo's incidental metadata files as an invented success marker.
+    Broader target classes need their own explicit output contract first.
+    """
+    import re
+    if not args or args[0] != "build" or len(args) > 256:
+        raise SetupError("canonical mode requires build with explicit --bin NAME")
+    if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
+        raise SetupError("canonical Cargo arguments exceed their bounds")
+    try:
+        for arg in args:
+            arg.encode("utf-8")
+    except UnicodeError as error:
+        raise SetupError("canonical Cargo arguments must be UTF-8") from error
+    binaries = set()
+    release = False
+    target = None
+    at = 1
+    while at < len(args):
+        option, separator, value = args[at].partition("=")
+        if option in ("--bin", "--package", "-p", "--features", "-F", "--target", "--color"):
+            if not separator:
+                at += 1
+                if at == len(args):
+                    raise SetupError("canonical Cargo option requires a value")
+                value = args[at]
+            if not value or value.startswith("-"):
+                raise SetupError("invalid canonical Cargo option value")
+            if option == "--bin":
+                if (re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,127}", value) is None
+                        or value in binaries or len(binaries) >= 128):
+                    raise SetupError("canonical binary names must be unique literal names")
+                binaries.add(value)
+            elif option == "--target":
+                if target is not None or value not in (
+                    "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+                    "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
+                ):
+                    raise SetupError("canonical target must be one explicit supported Linux triple")
+                target = value
+            elif option == "--color" and value not in ("auto", "always", "never"):
+                raise SetupError("invalid Cargo color choice")
+        elif not separator and option in ("--release", "-r"):
+            release = True
+        elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
+                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q"):
+            pass
+        else:
+            raise SetupError("unsupported canonical Cargo argument: " + args[at])
+        at += 1
+    if not binaries:
+        raise SetupError("canonical mode requires at least one explicit --bin NAME")
+    prefix = ((target + "/") if target else "") + ("release/" if release else "debug/")
+    return list(args), [prefix + name for name in sorted(binaries)]
+
+
+def canonical_invocation(profile_path, args, env):
+    """Create local intent, then hand everything to the existing native driver.
+
+    These files contain no proof, executable result or cache-publication grant.
+    Preparation, execution, cancellation and delivery remain native operations.
+    """
+    if sys.platform != "linux":
+        raise SetupError("canonical Cargo preparation currently requires Linux")
+    if any(env.get(name) == "1" for name in (
+        "CARGO_RABS_CANONICAL_ACTIVE", "CARGO_RABS_REMOTE_ACTIVE", "RCH_RABS_WORKER_ACTIVE",
+    )):
+        raise SetupError("nested canonical/remote dispatch is not supported")
+    cargo_args, outputs = canonical_build_arguments(args)
+    profile = canonical_profile(profile_path)
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    if os.path.samefile(daemon, __file__):
+        raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
+    manifest = "/__rabs/workspace/" + profile["manifest"]
+    if "--frozen" not in cargo_args:
+        for flag in ("--locked", "--offline"):
+            if flag not in cargo_args:
+                cargo_args.append(flag)
+    cargo_args += ["--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
+    import secrets
+    specification = {
+        "kind": "canonical-exec", "request_id": secrets.randbits(64) or 1,
+        "program": "/__rabs/toolchain/bin/cargo", "args": cargo_args,
+        "command_context": {"version": "env-cwd-v1", "cwd": str(Path(manifest).parent),
+                            "env": {"CARGO_INCREMENTAL": "0"}},
+        "toolchain_source": profile["toolchain_root"],
+        "cargo_source": {"manifest": profile["manifest"]},
+        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs},
+    }
+    if "vendor" in profile:
+        specification["cargo_source"]["vendor"] = profile["vendor"]
+    encoded_specification = json.dumps(specification, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded_specification) > MAX_FRAME:
+        raise SetupError("canonical Cargo specification exceeds its frontend bound")
+    operation = Path(profile["operation_root"]) / ("cargo-" + secrets.token_hex(16))
+    # Exclusive, retained state. No retry into an old operation and no deletion
+    # on failure. The approved source/toolchain are untouched by this launcher.
+    operation.mkdir(mode=0o700)
+    bundle, delivery, output = (str(operation / name) for name in ("bundle", "delivery", "outputs"))
+    native = [daemon, "--worker-build-tls", profile["listen"], profile["worker"],
+              profile["worker_spki_sha256"], bundle, delivery, output]
+    metadata = {"version": "canonical-cargo-v1", "request_id": specification["request_id"],
+                "operation_directory": str(operation), "prepared_build_argv": native,
+                "automatic_retry": False, "publication_authorized": False}
+    for name, value in (("spec.json", specification), ("operation.json", metadata)):
+        descriptor = os.open(str(operation / name), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+            file.flush()
+            os.fsync(file.fileno())
+    for path in (operation, operation.parent):
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    child_env = dict(env)
+    child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
+    # The existing offline metadata planner explicitly resolves these tools.
+    # TLS credentials stay local in env, never in the uploaded command context.
+    child_env["CARGO"] = str(Path(profile["toolchain_root"]) / "bin/cargo")
+    child_env["RUSTC"] = str(Path(profile["toolchain_root"]) / "bin/rustc")
+    command = native[:2] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[2:]
+    print("cargo-rabs: canonical operation retained at " + str(operation), file=sys.stderr, flush=True)
+    return daemon, command, child_env
+
+
+def run_canonical(args, env):
+    try:
+        if not args or not args[0] or args[0].startswith("--"):
+            raise SetupError("--rabs-canonical requires a profile file")
+        cargo_args = args[1:]
+        if cargo_args[:1] == ["--"]:
+            cargo_args = cargo_args[1:]
+        daemon, command, child_env = canonical_invocation(args[0], cargo_args, env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: canonical setup refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
+        os.execvpe(daemon, command, child_env)
+    except OSError as error:
+        print("cargo-rabs: cannot execute canonical driver: {}".format(error), file=sys.stderr)
+        return 127
+
+
 def main():
+    # Keep the preparation import API and all older modes unchanged. This
+    # explicit profile transfers ownership directly to the existing native
+    # preparation/execution driver; there is no Python build supervisor.
+    raw = sys.argv[1:]
+    if raw[:1] == ["rabs"]:
+        raw = raw[1:]
+    if raw[:1] == ["--rabs-canonical"]:
+        return run_canonical(raw[1:], dict(os.environ))
     try:
         args, no_start, required, remote = arguments(sys.argv[1:])
     except SetupError as error:
