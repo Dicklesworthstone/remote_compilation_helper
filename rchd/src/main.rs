@@ -1116,7 +1116,15 @@ async fn main() -> Result<()> {
 
     // Install the disk-slot policy before adding workers so later config reloads
     // inherit the same budget as workers present at startup.
+    // Workers start with unknown disk; hold them at zero slots until their
+    // first capacity probe (normally well under a minute), at most 2 min.
+    // Mock transport never reports disk, so it keeps the configured ceiling.
     let worker_pool = workers::WorkerPool::with_selection_config(&rch_config.selection);
+    let worker_pool = if rch_common::mock::is_mock_enabled() {
+        worker_pool
+    } else {
+        worker_pool.with_unmeasured_capacity_hold(std::time::Duration::from_secs(120))
+    };
     for worker_config in workers {
         info!(
             "Adding worker: {} ({}@{}, {} slots)",

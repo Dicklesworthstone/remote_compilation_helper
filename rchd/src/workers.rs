@@ -458,6 +458,9 @@ pub struct WorkerState {
     pressure_assessment: RwLock<PressureAssessment>,
     /// Disk budget shared by all workers created by the same daemon pool.
     disk_slot_policy: DiskSlotPolicy,
+    /// Until this instant, a worker with no disk capacity sample gets no
+    /// slots. `None` (tests, embedded pools) keeps the configured ceiling.
+    unmeasured_capacity_hold_until: std::sync::Mutex<Option<std::time::Instant>>,
     /// Reason for disabling this worker (if disabled).
     disabled_reason: RwLock<Option<String>>,
     /// Administrative intent to apply when a draining worker reaches zero slots.
@@ -583,6 +586,7 @@ impl WorkerState {
             toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
             disk_slot_policy,
+            unmeasured_capacity_hold_until: std::sync::Mutex::new(None),
             disabled_reason: RwLock::new(None),
             drain_completion: RwLock::new(DrainCompletionAction::default()),
             disabled_at: AtomicI64::new(0),
@@ -788,8 +792,39 @@ impl WorkerState {
     pub async fn effective_total_slots(&self) -> u32 {
         let config = self.config.read().await;
         let pressure = self.pressure_assessment.read().await;
-        self.disk_slot_policy
-            .effective_slots(config.total_slots, &pressure)
+        self.slots_for(config.total_slots, &pressure)
+    }
+
+    /// Hold this worker at zero slots until its first disk capacity sample,
+    /// or until `hold` elapses, whichever comes first.
+    pub(crate) fn hold_until_capacity_measured(&self, hold: std::time::Duration) {
+        *self
+            .unmeasured_capacity_hold_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now().checked_add(hold);
+    }
+
+    /// Disk-derated slots. A restarted daemon knows no worker's disk until the
+    /// first capability probe lands, and `effective_slots` then grants the full
+    /// configured ceiling. On 2026-10-16 a drain-restart of every dispatcher
+    /// re-added a 193 GB worker with 12 GB free at its full 3 slots; one mtdt
+    /// source sync was admitted and filled the disk to 0. While the hold is
+    /// active, an unmeasured worker gets no slots. A worker whose telemetry
+    /// never arrives keeps the previous fail-open ceiling after the hold.
+    fn slots_for(&self, configured: u32, pressure: &PressureAssessment) -> u32 {
+        let measured = pressure
+            .capacity_free_gb()
+            .is_some_and(|free| free.is_finite());
+        let held = !measured
+            && self
+                .unmeasured_capacity_hold_until
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|until| std::time::Instant::now() < until);
+        if held {
+            return 0;
+        }
+        self.disk_slot_policy.effective_slots(configured, pressure)
     }
 
     /// Available slots after disk derating and existing reservations.
@@ -833,9 +868,7 @@ impl WorkerState {
             }
             let config = self.config.read().await;
             let pressure = self.pressure_assessment.read().await;
-            let total_slots = self
-                .disk_slot_policy
-                .effective_slots(config.total_slots, &pressure);
+            let total_slots = self.slots_for(config.total_slots, &pressure);
             let Some(next) = current.checked_add(count) else {
                 return false;
             };
@@ -1431,6 +1464,8 @@ pub struct WorkerPool {
     /// Track worker count atomically for sync access.
     worker_count: Arc<AtomicUsize>,
     disk_slot_policy: DiskSlotPolicy,
+    /// Zero-slot hold for each newly added worker until its first disk sample.
+    unmeasured_capacity_hold: Option<std::time::Duration>,
     /// Broadcast retargets to health and bypass recovery even while they probe.
     endpoint_changes: watch::Sender<u64>,
 }
@@ -1448,8 +1483,16 @@ impl WorkerPool {
             recovered_absent_slots: Arc::new(RwLock::new(HashMap::new())),
             worker_count: Arc::new(AtomicUsize::new(0)),
             disk_slot_policy: DiskSlotPolicy::from(config),
+            unmeasured_capacity_hold: None,
             endpoint_changes: watch::channel(0).0,
         }
+    }
+
+    /// Give every worker this pool adds a zero-slot hold until its first disk
+    /// capacity sample, bounded by `hold` (see [`WorkerState::slots_for`]).
+    pub fn with_unmeasured_capacity_hold(mut self, hold: std::time::Duration) -> Self {
+        self.unmeasured_capacity_hold = Some(hold);
+        self
     }
 
     pub(crate) fn subscribe_endpoint_changes(&self) -> watch::Receiver<u64> {
@@ -1480,6 +1523,9 @@ impl WorkerPool {
             config,
             self.disk_slot_policy,
         ));
+        if let Some(hold) = self.unmeasured_capacity_hold {
+            state.hold_until_capacity_measured(hold);
+        }
         let mut workers = self.workers.write().await;
         // Check again under write lock
         if let Some(existing) = workers.get(&id) {
@@ -2086,6 +2132,57 @@ mod tests {
             tags: Vec::new(),
             tools: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_freshly_added_worker_gets_no_slots_until_its_disk_is_measured() {
+        // Daemon startup: every worker is re-added with unknown disk. Without
+        // the hold, a 12 GB-free worker took its full ceiling and one source
+        // sync filled it (2026-10-16).
+        let selection = rch_common::SelectionConfig {
+            min_free_gb: Some(10.0),
+            disk_gb_per_slot: 5.0,
+            ..Default::default()
+        };
+        let pool = WorkerPool::with_selection_config(&selection)
+            .with_unmeasured_capacity_hold(std::time::Duration::from_secs(120));
+        pool.add_worker(recovered_worker_config("unmeasured", 3))
+            .await;
+        let worker = pool.get(&WorkerId::new("unmeasured")).await.unwrap();
+        assert_eq!(worker.effective_total_slots().await, 0);
+        assert_eq!(worker.available_slots().await, 0);
+        assert!(!worker.reserve_slots(1).await);
+        // Startup re-adoption of durable ownership is not an admission.
+        worker.restore_slots(1).unwrap();
+        assert_eq!(worker.used_slots(), 1);
+
+        // The first sample ends the hold and the normal disk math applies:
+        // floor((22 - 10) / 5) = 2 of 3.
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: crate::disk_pressure::PressureState::Warning,
+                telemetry_fresh: true,
+                disk_free_gb: Some(22.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(worker.effective_total_slots().await, 2);
+        assert!(worker.reserve_slots(1).await);
+
+        // A worker whose telemetry never arrives regains the configured
+        // ceiling once the hold lapses (the previous behaviour).
+        pool.add_worker(recovered_worker_config("never-measured", 3))
+            .await;
+        let silent = pool.get(&WorkerId::new("never-measured")).await.unwrap();
+        assert_eq!(silent.effective_total_slots().await, 0);
+        silent.hold_until_capacity_measured(std::time::Duration::ZERO);
+        assert_eq!(silent.effective_total_slots().await, 3);
+
+        // Pools built without a hold (tests, embedded use) are unchanged.
+        let plain = WorkerPool::with_selection_config(&selection);
+        plain.add_worker(recovered_worker_config("plain", 3)).await;
+        let plain = plain.get(&WorkerId::new("plain")).await.unwrap();
+        assert_eq!(plain.effective_total_slots().await, 3);
     }
 
     #[tokio::test]
