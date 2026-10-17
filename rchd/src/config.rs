@@ -71,6 +71,12 @@ pub struct DaemonConfig {
     /// Build queue settings.
     #[serde(default)]
     pub queue: QueueConfig,
+
+    /// Builds of one project a worker may run at once, each in its own mirror
+    /// (`<root>.rch-lane-<k>`), keyed by worker id (bd-sgvod). Unlisted
+    /// workers keep one lane. Each lane costs a full extra mirror on disk.
+    #[serde(default)]
+    pub project_lanes: std::collections::HashMap<String, u32>,
 }
 
 /// Configuration for build queueing when all workers are busy.
@@ -125,6 +131,7 @@ impl Default for DaemonConfig {
             cache_cleanup: CacheCleanupConfig::default(),
             stale_target_reap: StaleTargetReapConfig::default(),
             queue: QueueConfig::default(),
+            project_lanes: std::collections::HashMap::new(),
         }
     }
 }
@@ -746,6 +753,16 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
     use tempfile::TempDir;
+
+    #[test]
+    fn daemon_config_reads_per_worker_project_lanes() {
+        // bd-sgvod
+        let config: DaemonConfig = toml::from_str("[project_lanes]\nhz3 = 3\nhz4 = 2\n").unwrap();
+        assert_eq!(config.project_lanes.get("hz3"), Some(&3));
+        assert_eq!(config.project_lanes.get("hz4"), Some(&2));
+        let defaults: DaemonConfig = toml::from_str("").unwrap();
+        assert!(defaults.project_lanes.is_empty());
+    }
 
     fn init_test_logging() {
         let _ = tracing_subscriber::fmt()

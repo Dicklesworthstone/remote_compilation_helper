@@ -3532,6 +3532,7 @@ mod tests {
                 slots_available: 6,
                 speed_score: 90.0,
                 declared_os: None,
+                project_lane: 0,
             }),
             reason: rch_common::SelectionReason::Success,
             diagnostics: Some(diagnostics),

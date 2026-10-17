@@ -1176,6 +1176,13 @@ async fn main() -> Result<()> {
             config::DaemonConfig::default()
         }
     };
+    if !daemon_config.project_lanes.is_empty() {
+        info!(
+            "Project lanes (bd-sgvod): {:?}",
+            daemon_config.project_lanes
+        );
+    }
+    worker_pool.set_project_lanes(daemon_config.project_lanes.clone());
 
     // Shared SSH connection pool for the daemon's per-worker background
     // subsystems (health, telemetry, cache cleanup, stale-target reap, reclaim,

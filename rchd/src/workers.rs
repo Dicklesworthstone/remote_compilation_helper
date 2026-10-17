@@ -1452,6 +1452,9 @@ impl ToolchainPreflightStatus {
     }
 }
 
+/// Upper bound on per-worker project lanes: each lane is a full extra mirror.
+pub const MAX_PROJECT_LANES: u32 = 8;
+
 /// Pool of all workers.
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -1466,6 +1469,8 @@ pub struct WorkerPool {
     disk_slot_policy: DiskSlotPolicy,
     /// Zero-slot hold for each newly added worker until its first disk sample.
     unmeasured_capacity_hold: Option<std::time::Duration>,
+    /// Per-worker project lanes from daemon.toml `[project_lanes]` (bd-sgvod).
+    project_lanes: Arc<std::sync::RwLock<HashMap<String, u32>>>,
     /// Broadcast retargets to health and bypass recovery even while they probe.
     endpoint_changes: watch::Sender<u64>,
 }
@@ -1484,8 +1489,31 @@ impl WorkerPool {
             worker_count: Arc::new(AtomicUsize::new(0)),
             disk_slot_policy: DiskSlotPolicy::from(config),
             unmeasured_capacity_hold: None,
+            project_lanes: Arc::new(std::sync::RwLock::new(HashMap::new())),
             endpoint_changes: watch::channel(0).0,
         }
+    }
+
+    /// Replace the per-worker project lane counts (`[project_lanes]` in
+    /// daemon.toml, bd-sgvod). Unlisted workers keep one lane.
+    pub fn set_project_lanes(&self, lanes: HashMap<String, u32>) {
+        *self
+            .project_lanes
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = lanes;
+    }
+
+    /// How many builds of one project this worker may run at once, each in its
+    /// own mirror (`<root>.rch-lane-<k>`). At least 1, at most
+    /// [`MAX_PROJECT_LANES`].
+    pub fn project_lanes(&self, worker_id: &str) -> u32 {
+        self.project_lanes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(worker_id)
+            .copied()
+            .unwrap_or(1)
+            .clamp(1, MAX_PROJECT_LANES)
     }
 
     /// Give every worker this pool adds a zero-slot hold until its first disk

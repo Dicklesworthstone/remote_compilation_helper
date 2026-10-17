@@ -109,6 +109,15 @@ fn decimal(value: &str) -> Option<u64> {
 /// The result authorizes observation/recovery, never an unfenced kill(pid).
 pub fn owner_presence(pid: u32, expected: Option<&ProcessIdentity>) -> OwnerPresence {
     if pid <= 1 || i32::try_from(pid).is_err() {
+        // A boot mismatch proves absence even for reserved PIDs. For normal
+        // PIDs observe_process already supplies boot evidence in one probe.
+        // Failed inspection (including foreign procfs) proves nothing.
+        if let Some(expected) = expected.filter(|identity| identity.is_valid())
+            && let Some(current) = current_process_identity()
+            && expected.boot_id != current.boot_id
+        {
+            return OwnerPresence::Absent;
+        }
         return OwnerPresence::Unknown;
     }
     observed_owner_presence(expected, &observe_process(pid))
@@ -467,6 +476,34 @@ mod tests {
     use super::*;
 
     const BOOT: &str = "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f";
+
+    #[test]
+    fn reserved_pid_needs_affirmative_boot_evidence() {
+        assert_eq!(owner_presence(1, None), OwnerPresence::Unknown);
+        let invalid = ProcessIdentity {
+            boot_id: "invalid".into(),
+            start: ProcessStart::Linux { ticks: 1 },
+        };
+        assert_eq!(owner_presence(1, Some(&invalid)), OwnerPresence::Unknown);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn previous_boot_proves_reserved_pid_owner_absent() {
+        let Some(mut previous) = current_process_identity() else {
+            eprintln!("native identity unavailable; reserved-PID boot integration unavailable");
+            return;
+        };
+        assert_eq!(owner_presence(1, Some(&previous)), OwnerPresence::Unknown);
+        previous.boot_id = if previous.boot_id == BOOT {
+            "00000000-0000-0000-0000-000000000001".into()
+        } else {
+            BOOT.into()
+        };
+        for pid in [0, 1, u32::MAX] {
+            assert_eq!(owner_presence(pid, Some(&previous)), OwnerPresence::Absent);
+        }
+    }
 
     #[test]
     fn native_precision_survives_records_and_rejects_second_resolution_history() {

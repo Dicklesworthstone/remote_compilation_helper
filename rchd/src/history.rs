@@ -197,6 +197,10 @@ fn build_record_succeeded(record: &BuildRecord) -> bool {
     record.exit_code == 0
 }
 
+fn is_lane_zero(lane: &u32) -> bool {
+    *lane == 0
+}
+
 /// In-flight build state tracked for active build visibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveBuildState {
@@ -219,6 +223,10 @@ pub struct ActiveBuildState {
     pub local_wrapper_id: Option<String>,
     pub remote_pgid_file: Option<String>,
     pub slots: u32,
+    /// Which of the worker's project lanes this build holds (bd-sgvod). Lane
+    /// 0 is the canonical mirror; lane k > 0 is `<root>.rch-lane-<k>`.
+    #[serde(default, skip_serializing_if = "is_lane_zero")]
+    pub project_lane: u32,
     /// Declared additional build space retained until this owner completes.
     #[serde(default)]
     pub disk_headroom_gib: u32,
@@ -553,6 +561,7 @@ impl BuildHistory {
             local_wrapper_id,
             remote_pgid_file: None,
             slots,
+            project_lane: 0,
             disk_headroom_gib: 0,
             disk_free_start_gib: None,
             disk_free_min_gib: None,
@@ -641,6 +650,39 @@ impl BuildHistory {
         disk: DiskHeadroomAdmission,
         worker_endpoint: Option<WorkerEndpointSnapshot>,
     ) -> std::io::Result<Option<ActiveBuildState>> {
+        self.try_start_active_build_in_lanes(
+            project_id,
+            worker_id,
+            command,
+            hook_pid,
+            local_wrapper_id,
+            slots,
+            location,
+            waiter,
+            disk,
+            worker_endpoint,
+            1,
+        )
+    }
+
+    /// Admit a build into the lowest free of the worker's `project_lanes`
+    /// lanes for this project (bd-sgvod). One lane is the historical rule:
+    /// at most one active build of a project per worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_start_active_build_in_lanes(
+        &self,
+        project_id: String,
+        worker_id: String,
+        command: String,
+        hook_pid: u32,
+        local_wrapper_id: Option<String>,
+        slots: u32,
+        location: BuildLocation,
+        waiter: Option<&QueuedWaiterClaim>,
+        disk: DiskHeadroomAdmission,
+        worker_endpoint: Option<WorkerEndpointSnapshot>,
+        project_lanes: u32,
+    ) -> std::io::Result<Option<ActiveBuildState>> {
         if worker_endpoint.as_ref().is_some_and(|endpoint| {
             endpoint.config.id.as_str() != worker_id || location != BuildLocation::Remote
         }) {
@@ -677,6 +719,7 @@ impl BuildHistory {
             local_wrapper_id,
             remote_pgid_file: None,
             slots,
+            project_lane: 0,
             disk_headroom_gib: disk.requested_gib,
             disk_free_start_gib,
             disk_free_min_gib: None,
@@ -772,10 +815,18 @@ impl BuildHistory {
             // reply or retry indistinguishable from duplicate execution.
             return Ok(None);
         }
-        if active.values().any(|existing| {
-            existing.project_id == state.project_id && existing.worker_id == state.worker_id
-        }) {
-            return Ok(None);
+        // Lanes are separate worker mirrors, locks and targets (bd-sgvod), so
+        // a project may hold one active build per lane on a worker.
+        let used_lanes: Vec<u32> = active
+            .values()
+            .filter(|existing| {
+                existing.project_id == state.project_id && existing.worker_id == state.worker_id
+            })
+            .map(|existing| existing.project_lane)
+            .collect();
+        match (0..project_lanes.max(1)).find(|lane| !used_lanes.contains(lane)) {
+            Some(lane) => state.project_lane = lane,
+            None => return Ok(None),
         }
         if state.location == BuildLocation::Remote {
             // Overlapping builds on one worker share its free-space drop, so
@@ -1161,6 +1212,21 @@ impl BuildHistory {
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|state| state.project_id == project_id && state.worker_id == worker_id)
+    }
+
+    /// Active builds of `project_id` per worker (bd-sgvod lane occupancy).
+    pub fn active_build_counts_for_project(&self, project_id: &str) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for state in self
+            .active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|state| state.project_id == project_id)
+        {
+            *counts.entry(state.worker_id.clone()).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Return worker IDs currently running an active build for the given project.
@@ -2949,6 +3015,51 @@ mod tests {
                 None,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn project_lanes_admit_one_build_per_lane_and_reuse_freed_lanes() {
+        // bd-sgvod: three lanes on one worker, one project.
+        let history = BuildHistory::new(10);
+        let start = |worker: &str, wrapper: &str, lanes: u32| {
+            history
+                .try_start_active_build_in_lanes(
+                    "mtdt".into(),
+                    worker.into(),
+                    "bash scripts/gate_of_record_job.sh".into(),
+                    0,
+                    Some(wrapper.into()),
+                    1,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    None,
+                    lanes,
+                )
+                .unwrap()
+        };
+        let a = start("hz3", "w-a", 3).expect("lane 0");
+        let b = start("hz3", "w-b", 3).expect("lane 1");
+        let c = start("hz3", "w-c", 3).expect("lane 2");
+        assert_eq!((a.project_lane, b.project_lane, c.project_lane), (0, 1, 2));
+        assert!(start("hz3", "w-d", 3).is_none(), "every lane is busy");
+        // Another worker has its own lanes.
+        assert_eq!(start("hz4", "w-e", 3).unwrap().project_lane, 0);
+        // A worker with one lane keeps the historical one-build rule.
+        assert!(start("hz4", "w-f", 1).is_none());
+        assert_eq!(history.active_build_counts_for_project("mtdt")["hz3"], 3);
+
+        // The lowest freed lane is reused.
+        history.finish_active_build(b.id, 0, None, None, None);
+        assert_eq!(start("hz3", "w-g", 3).unwrap().project_lane, 1);
+
+        // The lane survives the durable ownership snapshot.
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["project_lane"], 2);
+        let zero = serde_json::to_value(&a).unwrap();
+        assert!(zero.get("project_lane").is_none(), "lane 0 stays implicit");
+        let restored: ActiveBuildState = serde_json::from_value(zero).unwrap();
+        assert_eq!(restored.project_lane, 0);
     }
 
     fn disk_budget_completion(exit_code: i32) -> BuildCompletion {
