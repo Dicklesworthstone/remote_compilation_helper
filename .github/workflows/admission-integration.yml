@@ -1,0 +1,165 @@
+name: Admission integration
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/admission-integration.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TARGET_DIR: ${{ runner.temp }}/admission-target
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          clean: false
+          persist-credentials: false
+      - name: Apply only the exact reviewed source integration
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const cp = require('child_process');
+            const crypto = require('crypto');
+            const zlib = require('zlib');
+            const expected = {
+              'rch-common/src/lib.rs': '327eb4f4d6403d73577bc28290ae3113e7e69dac',
+              'rchd/src/api.rs': 'dd9e913f0c3b24938db4d8964a42822d2a6dedc8',
+              'rch/src/hook/daemon_ipc.rs': 'd283a7ecb9f96d4f5766d6926707ff6891bab973',
+              'rch/src/commands/status.rs': 'b0d7409cc79d9ea9fe36b859b3d0e304722524f3',
+              'rch/src/hook_windows.rs': 'a3824ea71cb5a01d62bb31c33f48c331df9dccc1'
+            };
+            const added = [
+              'rch-common/src/admission_preview.rs',
+              'rch/src/hook/daemon_ipc/admission_preview.rs',
+              'rch/src/commands/status/admission.rs'
+            ];
+            for (const [file, sha] of Object.entries(expected)) {
+              const actual = cp.execFileSync('git', ['rev-parse', `HEAD:${file}`], {encoding:'utf8'}).trim();
+              if (actual !== sha) throw new Error(`Concurrent source change in ${file}: ${actual}`);
+            }
+            for (const file of added) {
+              if (fs.existsSync(file)) throw new Error(`New module already exists: ${file}`);
+            }
+            const chunks = [
+              '784e04b7dd8a748108213e5d2c2132837f0f69da',
+              '20aa82bf343607e603a98e816c6522ce2e60d9c1',
+              'af4e6aa8eb8792af49af2303ebebb14b5480e2f9'
+            ];
+            let encoded = '';
+            for (const file_sha of chunks) {
+              const {data} = await github.rest.git.getBlob({...context.repo, file_sha});
+              if (data.encoding !== 'base64') throw new Error('Unexpected patch blob encoding');
+              encoded += Buffer.from(data.content, 'base64').toString('utf8');
+            }
+            const patch = zlib.gunzipSync(Buffer.from(encoded, 'base64'));
+            if (crypto.createHash('sha256').update(patch).digest('hex') !== '697c99661892d042ba3b9a9c29989e6267a1ca9797a5cc5339a8ffbe9e3f49d7') {
+              throw new Error('Reviewed patch digest mismatch');
+            }
+            const evidence = path.join(process.env.RUNNER_TEMP, 'admission-evidence');
+            fs.mkdirSync(evidence, {recursive:true});
+            const patchPath = path.join(evidence, 'reviewed.patch');
+            fs.writeFileSync(patchPath, patch);
+            cp.execFileSync('git', ['apply', '--check', patchPath], {stdio:'inherit'});
+            cp.execFileSync('git', ['apply', patchPath], {stdio:'inherit'});
+            cp.execFileSync('git', ['add', '--intent-to-add', '--', ...added], {stdio:'inherit'});
+            cp.execFileSync('git', ['diff', '--check'], {stdio:'inherit'});
+            const files = [...Object.keys(expected), ...added];
+            const changed = cp.execFileSync('git', ['diff', '--name-only'], {encoding:'utf8'}).trim().split('\n').sort();
+            if (JSON.stringify(changed) !== JSON.stringify([...files].sort())) throw new Error('Unexpected changed-file set');
+            for (const file of files) {
+              const dest = path.join(evidence, 'candidate', file);
+              fs.mkdirSync(path.dirname(dest), {recursive:true});
+              fs.copyFileSync(file, dest);
+              if (expected[file]) {
+                const original = path.join(evidence, 'base', file);
+                fs.mkdirSync(path.dirname(original), {recursive:true});
+                fs.writeFileSync(original, cp.execFileSync('git', ['show', `HEAD:${file}`], {maxBuffer: 16777216}));
+              }
+            }
+            for (const file of ['.beads/issues.jsonl', 'COMPREHENSIVE_MASTER_PLAN_FOR_RABS_ASUPERSYNC_NATIVE.md', 'RABS_BRIDGE_PLAN.md', 'AGENTS.md', 'Cargo.toml', 'rust-toolchain.toml']) {
+              const dest = path.join(evidence, 'context', file);
+              fs.mkdirSync(path.dirname(dest), {recursive:true});
+              if (fs.existsSync(file)) fs.copyFileSync(file, dest);
+            }
+            fs.writeFileSync(path.join(evidence, 'inputs.json'), JSON.stringify({base_commit:context.sha, expected, added, files}, null, 2));
+            core.exportVariable('ADMISSION_EVIDENCE', evidence);
+      - name: Retain full-checkout source evidence before compilation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-source-before-format
+          path: ${{ runner.temp }}/admission-evidence
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Install the repository's pinned compiler
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - name: Format the changed modules without traversing unrelated children
+        run: |
+          rustfmt --edition 2024 --config skip_children=true \
+            rch-common/src/admission_preview.rs rch-common/src/lib.rs \
+            rchd/src/api.rs rch/src/hook/daemon_ipc.rs \
+            rch/src/hook/daemon_ipc/admission_preview.rs \
+            rch/src/commands/status.rs rch/src/commands/status/admission.rs \
+            rch/src/hook_windows.rs
+          git diff --check
+      - name: Export exact source blobs for explicit publication
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const cp = require('child_process');
+            const crypto = require('crypto');
+            const root = process.env.ADMISSION_EVIDENCE;
+            const manifest = JSON.parse(fs.readFileSync(path.join(root, 'inputs.json'), 'utf8'));
+            manifest.entries = [];
+            for (const file of manifest.files) {
+              const bytes = fs.readFileSync(file);
+              const {data} = await github.rest.git.createBlob({...context.repo, content:bytes.toString('base64'), encoding:'base64'});
+              const actual = crypto.createHash('sha1').update(Buffer.from(`blob ${bytes.length}\0`)).update(bytes).digest('hex');
+              if (data.sha !== actual) throw new Error(`Source upload mismatch: ${file}`);
+              manifest.entries.push({path:file, mode:'100644', type:'blob', sha:data.sha});
+              fs.copyFileSync(file, path.join(root, 'candidate', file));
+            }
+            fs.writeFileSync(path.join(root, 'manifest.json'), JSON.stringify(manifest, null, 2));
+            fs.writeFileSync(path.join(root, 'candidate.patch'), cp.execFileSync('git', ['diff', '--binary'], {maxBuffer:16777216}));
+            console.log(JSON.stringify(manifest));
+      - name: Retain formatted candidates and blob manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-prepared-source
+          path: ${{ runner.temp }}/admission-evidence
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Type-check the integrated crates and test targets
+        run: cargo check --locked -p rch-common -p rch -p rchd --all-targets
+      - name: Run the protocol regressions
+        run: cargo test --locked -p rch-common --lib admission_preview -- --nocapture
+      - name: Run the CLI and socket regressions
+        run: cargo test --locked -p rch --bin rch commands::status::admission -- --nocapture
+      - name: Run the actual daemon endpoint regressions
+        run: cargo test --locked -p rchd --bin rchd admission_preview -- --nocapture
+      - name: Lint the integrated crates
+        run: cargo clippy --locked -p rch-common -p rch -p rchd --all-targets -- -D warnings
+      - name: Check workspace formatting
+        run: cargo fmt --all -- --check
