@@ -31,6 +31,22 @@ fn signature(path: &Path) -> io::Result<FileSig> {
     regular_signature(&std::fs::symlink_metadata(path)?)
 }
 
+/// Bind acquisition to the already observed output generation. A prior lstat
+/// does not prevent replacement by a FIFO, symlink or device before open.
+/// Reuse the shared no-follow/nonblocking regular-input boundary, then verify
+/// both the descriptor and pathname before allocating any private staging.
+/// This avoids FIFO rendezvous, not unbounded regular-file/kernel I/O latency.
+fn open_observed(source: &Path, before: FileSig, maximum: u64) -> io::Result<File> {
+    if before.size() > maximum {
+        return Err(io::Error::other("compiler output exceeds the byte bound"));
+    }
+    let input = rabs_sandbox::regular_input::open(source)?;
+    if regular_signature(&input.metadata()?)? != before || signature(source)? != before {
+        return Err(io::Error::other("compiler output changed before capture"));
+    }
+    Ok(input)
+}
+
 /// Hash exactly the observed payload, with one extra byte to detect growth.
 /// The buffer size and read bound do not depend on the artifact's byte length.
 fn copy_exact(
@@ -86,13 +102,7 @@ struct StagedOutput {
 impl StagedOutput {
     fn capture(staging: &Path, source: &Path, maximum: u64) -> io::Result<Self> {
         let before = signature(source)?;
-        if before.size() > maximum {
-            return Err(io::Error::other("compiler output exceeds the byte bound"));
-        }
-        let mut input = File::open(source)?;
-        if regular_signature(&input.metadata()?)? != before || signature(source)? != before {
-            return Err(io::Error::other("compiler output changed before capture"));
-        }
+        let mut input = open_observed(source, before, maximum)?;
         let mut temporary = tempfile::Builder::new()
             .prefix("live-output-")
             .tempfile_in(staging)?;
@@ -296,7 +306,9 @@ mod tests {
         assert_eq!(std::fs::read(&captured.stage).unwrap(), b"original");
         assert_ne!(
             std::fs::metadata(&source).unwrap().ino(),
-            std::fs::metadata(&captured.stage).unwrap().ino()
+            std::fs::metadata(&captured.stage)
+                .unwrap()
+                .ino()
         );
         assert!(
             std::fs::metadata(&captured.stage)
@@ -327,5 +339,132 @@ mod tests {
         std::os::unix::fs::symlink(&source, &alias).unwrap();
         assert!(StagedOutput::capture(&staging, &alias, 1000).is_err());
         assert_eq!(std::fs::read_dir(staging).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn output_acquisition_rejects_stale_regular_generations_and_size_changes() {
+        for replacement in [b"original".as_slice(), b"x", b"larger replacement"] {
+            let dir = crate::test_util::private_tempdir();
+            let source = dir.path().join("output.rlib");
+            std::fs::write(&source, b"original").unwrap();
+            let before = signature(&source).unwrap();
+            std::fs::rename(&source, dir.path().join("retained-output")).unwrap();
+            std::fs::write(&source, replacement).unwrap();
+            assert!(open_observed(&source, before, u64::MAX).is_err());
+            // A new observation may capture the replacement, never adopt the
+            // old signature merely because its payload has equal bytes.
+            let current = signature(&source).unwrap();
+            let mut held = open_observed(&source, current, u64::MAX).unwrap();
+            let mut bytes = Vec::new();
+            held.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, replacement);
+            assert_ne!(current, before);
+        }
+    }
+
+    #[test]
+    fn output_acquisition_rejects_directory_and_same_inode_symlink_replacements() {
+        for linked in [false, true] {
+            let dir = crate::test_util::private_tempdir();
+            let source = dir.path().join("output.rmeta");
+            let retained = dir.path().join("retained-output");
+            std::fs::write(&source, b"original").unwrap();
+            let before = signature(&source).unwrap();
+            std::fs::rename(&source, &retained).unwrap();
+            if linked {
+                std::os::unix::fs::symlink(&retained, &source).unwrap();
+            } else {
+                std::fs::create_dir(&source).unwrap();
+            }
+            assert!(open_observed(&source, before, 8).is_err());
+            assert_eq!(std::fs::read(retained).unwrap(), b"original");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_fifo_replacement_cannot_wait_for_a_writer_after_compiler_exit() {
+        use std::time::Duration;
+        for linked in [false, true] {
+            let dir = crate::test_util::private_tempdir();
+            let source = dir.path().join("output.rlib");
+            std::fs::write(&source, b"original").unwrap();
+            let before = signature(&source).unwrap();
+            std::fs::rename(&source, dir.path().join("retained-output")).unwrap();
+            let fifo = if linked {
+                dir.path().join("fifo")
+            } else {
+                source.clone()
+            };
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            if linked {
+                std::os::unix::fs::symlink(&fifo, &source).unwrap();
+            }
+            // Deterministic observation/acquisition cut in the production
+            // opener, not a race loop. A rescue endpoint also bounds the test
+            // on regression to File::open so no capture thread is stranded.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                sender
+                    .send(open_observed(&source, before, 8).is_err())
+                    .unwrap();
+            });
+            let first = receiver.recv_timeout(Duration::from_secs(2));
+            // Linux O_RDWR on a FIFO does not rendezvous with a peer. Hold
+            // this test-owned endpoint until a regressed opener has returned.
+            let rescue = first
+                .is_err()
+                .then(|| File::options().read(true).write(true).open(&fifo).unwrap());
+            thread.join().unwrap();
+            drop(rescue);
+            assert_eq!(
+                first,
+                Ok(true),
+                "compiler output acquisition waited on a FIFO"
+            );
+        }
+    }
+
+    #[test]
+    fn output_byte_limit_is_enforced_before_acquiring_a_replaced_path() {
+        let dir = crate::test_util::private_tempdir();
+        let source = dir.path().join("output.rlib");
+        std::fs::write(&source, b"original").unwrap();
+        let before = signature(&source).unwrap();
+        std::fs::rename(&source, dir.path().join("retained-output")).unwrap();
+        let error = open_observed(&source, before, 7).unwrap_err();
+        assert!(error.to_string().contains("exceeds the byte bound"));
+    }
+
+    #[test]
+    fn full_capture_keeps_empty_binary_and_opaque_path_outputs_byte_exact() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        for bytes in [b"".as_slice(), b"\0binary\xff\n".as_slice()] {
+            let dir = crate::test_util::private_tempdir();
+            let source = dir
+                .path()
+                .join(OsString::from_vec(b"output-\xff.rlib".to_vec()));
+            let staging = dir.path().join("staging");
+            std::fs::create_dir(&staging).unwrap();
+            std::fs::write(&source, bytes).unwrap();
+            let captured = StagedOutput::capture(&staging, &source, bytes.len() as u64).unwrap();
+            assert_eq!(captured.source_sig, signature(&source).unwrap());
+            assert_eq!(std::fs::read(&captured.stage).unwrap(), bytes);
+            assert_eq!(
+                captured.digest,
+                digest_set(bytes, DigestRequest::default(), None)
+                    .unwrap()
+                    .atp_content_id
+            );
+            captured.verify().unwrap();
+            assert_eq!(std::fs::read(source).unwrap(), bytes);
+        }
     }
 }
