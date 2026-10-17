@@ -13,6 +13,7 @@
 #   bash install.sh --local              # Same as above (default mode)
 #   bash install.sh --worker             # Worker-only install (no daemon)
 #   bash install.sh --from-source        # Build from source
+#   bash install.sh --with-rabs          # Also install the complete opt-in RABS toolset (Linux GNU)
 #   bash install.sh --easy-mode          # Configure PATH + detect agents + run doctor
 #   bash install.sh --no-service         # Install without system service
 #   bash install.sh --offline <tarball>  # Install from local tarball
@@ -20,6 +21,7 @@
 #
 # Environment:
 #   RCH_INSTALL_DIR     Where to install binaries (default: ~/.local/bin)
+#   RCH_RABS_INSTALL_DIR Optional separate RABS bin directory (default: RCH_INSTALL_DIR)
 #   RCH_CONFIG_DIR      Where to store config (default: ~/.config/rch)
 #   RCH_NO_HOOK         Skip Claude Code hook setup if set
 #   RCH_SKIP_FLEET_SYNC Skip worker deploy/health checks after install
@@ -445,6 +447,19 @@ detect_platform() {
         RELEASE_TARGETS=("$TARGET")
     fi
 
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        # RABS is published only in the Linux GNU archives. Selecting the
+        # preferred core-only musl archive would otherwise silently omit it.
+        case "$TARGET" in
+            linux-x86_64) RELEASE_TARGETS=("x86_64-unknown-linux-gnu") ;;
+            linux-aarch64) RELEASE_TARGETS=("aarch64-unknown-linux-gnu") ;;
+            *) die "--with-rabs supports Linux GNU x86_64 and aarch64 only ($TARGET is unsupported)" ;;
+        esac
+        if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+            die "--with-rabs requires a GNU libc host; musl RABS releases are not available"
+        fi
+    fi
+
     success "Platform: $TARGET"
 }
 
@@ -471,6 +486,15 @@ check_prerequisites() {
     info "Checking prerequisites..."
 
     local errors=0
+
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        if ! command_exists python3 || ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+            die "--with-rabs requires Python 3.9 or later for installation and cargo-rabs"
+        fi
+        if [[ "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}" != /* ]]; then
+            die "The RABS installation directory must be absolute (RCH_RABS_INSTALL_DIR or RCH_INSTALL_DIR)"
+        fi
+    fi
 
     # Required for building from source
     if [[ "${FROM_SOURCE:-false}" == "true" ]]; then
@@ -634,8 +658,8 @@ install_binary_file() {
 
 # A021 split-profile installer: resolve NAME built under PROFILE, falling back
 # to the legacy single-profile target/release layout. Required binaries abort
-# the install when missing; optional ones (the RABS spine) are skipped with a
-# note so a transient spine breakage can never block the core fleet install.
+# the install when missing; optional ones are skipped with a note. RABS uses
+# install_rabs_toolset instead so its launcher and binaries cannot be mixed.
 install_split_binary() {
     local name="$1" profile="$2" required="$3"
     local candidate src=""
@@ -654,6 +678,92 @@ install_split_binary() {
     fi
     install_binary_file "$src" "$INSTALL_DIR/$name"
     success "Installed $name ($profile)"
+}
+
+check_rabs_launchers() {
+    # Use the bundle installer's existing file/ELF validation before executing
+    # supplied tools. An empty validator selects already-installed public links
+    # for --verify-only. Version/probe commands have a finite lifetime and never
+    # enroll workers, consult the daemon, or start a RABS service.
+    python3 -I - "$@" <<'PY'
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+
+validator, source_kind, source_path = sys.argv[1:]
+try:
+    if validator:
+        api = runpy.run_path(validator)
+        paths = (api["source_files"](None, source_path) if source_kind == "--from-build"
+                 else api["source_files"](source_path, None))
+        machine = api["host_machine"]()
+        for name in ("rabs-wrap", "rabsd", "rabs-wkr"):
+            with paths[name].open("rb") as reader:
+                api["require_native_elf"](name, reader.read(64), machine)
+    else:
+        paths = {name: Path(source_path) / name
+                 for name in ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr")}
+    probe_tool = shutil.which("true")
+    if probe_tool is None:
+        raise RuntimeError("wrapper verification requires an external true executable")
+    for name, arguments in (("cargo-rabs", ["--help"]), ("rabsd", ["--version"]),
+                            ("rabs-wkr", ["--version"]), ("rabs-wrap", [probe_tool, "-vV"])):
+        if not paths[name].is_file() or not os.access(paths[name], os.X_OK):
+            raise RuntimeError(name + " is missing or not executable")
+        try:
+            result = subprocess.run([str(paths[name]), *arguments], timeout=10,
+                                    stdout=subprocess.DEVNULL if name == "cargo-rabs" else None)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(name + " cannot execute on this host: " + str(error)) from error
+        if result.returncode:
+            raise RuntimeError(name + " launch check failed with exit " + str(result.returncode))
+except Exception as error:
+    print("RABS launch check: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+install_rabs_toolset() {
+    [[ "${WITH_RABS:-false}" == "true" ]] || return 0
+    local installer="$1" source_option="$2" source_path="$3"
+    local bin_dir="${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"
+    if [[ ! -f "$installer" || -L "$installer" ]]; then
+        die "Requested RABS toolset is incomplete: install-rabs is missing; use a Linux GNU release containing all RABS tools"
+    fi
+    local probe_source="$source_path" probe_kind="$source_option"
+    if [[ "$source_option" == "--from-archive" ]]; then
+        # Both archive paths have already extracted this exact trusted bundle.
+        # The installer validates the original archive again during staging.
+        probe_source="${installer%/*}"
+        probe_kind="--from-bundle"
+    fi
+    if ! check_rabs_launchers "$installer" "$probe_kind" "$probe_source"; then
+        die "Requested RABS executables failed launch checks; generation activation was not attempted"
+    fi
+    info "Installing the complete RABS toolset into $bin_dir..."
+    # Use the supplied bundle/build's installer and its atomic generation
+    # switch. It verifies all four tools before activating any of them and
+    # refuses to overwrite unmanaged files from an older loose installation.
+    if ! python3 -I "$installer" "$source_option" "$source_path" --bin-dir "$bin_dir"; then
+        die "Requested RABS installation failed; inspect the reported error before retrying. For an existing unmanaged installation, choose a separate RCH_RABS_INSTALL_DIR."
+    fi
+    success "Installed cargo-rabs, rabs-wrap, rabsd and rabs-wkr"
+}
+
+build_rabs_toolset() {
+    [[ "${WITH_RABS:-false}" == "true" ]] || return 0
+    local project_dir="$1"
+    info "Building the requested RABS toolset..."
+    if ! cargo build --locked --profile wrapper-release -p rabs-wrap; then
+        die "Requested RABS wrapper build failed; installation stopped"
+    fi
+    if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; then
+        die "Requested RABS daemon/worker build failed; installation stopped"
+    fi
+    install_rabs_toolset "$project_dir/scripts/install-rabs" --from-build "$TARGET_DIR"
 }
 
 build_from_source() {
@@ -679,7 +789,8 @@ build_from_source() {
 
     # A021 split profiles: hook CLI under wrapper-release (startup +
     # footprint first), daemon/worker under daemon-release (throughput,
-    # symbols retained for crashpacks). The RABS spine builds best-effort.
+    # symbols retained for crashpacks). RABS is built only when requested and
+    # its complete generation must install successfully before reporting success.
     if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
         TARGET_DIR="${CARGO_TARGET_DIR%/}"
     else
@@ -689,35 +800,23 @@ build_from_source() {
     if $USE_GUM; then
         spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch
         spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
-        fi
     else
         info "Building rch (wrapper-release profile; this may take a while)..."
         cargo build --locked --profile wrapper-release -p rch
         info "Building rchd + rch-wkr (daemon-release profile)..."
         cargo build --locked --profile daemon-release -p rchd -p rch-wkr
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
-        fi
     fi
+
+    build_rabs_toolset "$project_dir"
 
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wkr" "daemon-release" optional
     else
         # Local mode: hook CLI from wrapper-release; daemon and worker from
         # daemon-release (worker binary needed for fleet deploy).
         install_split_binary "$HOOK_BIN" "wrapper-release" required
         install_split_binary "$DAEMON_BIN" "daemon-release" required
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wrap" "wrapper-release" optional
-        install_split_binary "rabsd" "daemon-release" optional
-        install_split_binary "rabs-wkr" "daemon-release" optional
     fi
 
     success "Build complete"
@@ -880,6 +979,8 @@ download_binaries() {
         fi
     fi
 
+    install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$TEMP_DIR/$asset_name"
+
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
             install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
@@ -956,11 +1057,6 @@ clone_and_build_from_source() {
         if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
-        fi
     else
         info "Building rch (wrapper-release profile; this may take a few minutes)..."
         if ! cargo build --locked --profile wrapper-release -p rch; then
@@ -970,23 +1066,16 @@ clone_and_build_from_source() {
         if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
-        fi
     fi
+
+    build_rabs_toolset "$TEMP_DIR/rch"
 
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wkr" "daemon-release" optional
     else
         install_split_binary "$HOOK_BIN" "wrapper-release" required
         install_split_binary "$DAEMON_BIN" "daemon-release" required
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wrap" "wrapper-release" optional
-        install_split_binary "rabsd" "daemon-release" optional
-        install_split_binary "rabs-wkr" "daemon-release" optional
     fi
 
     success "Build from source complete"
@@ -1640,6 +1729,8 @@ install_from_tarball() {
         info "Extracting tarball..."
         tar -xzf "$tarball" -C "$TEMP_DIR"
     fi
+
+    install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$tarball"
 
     # Install binaries from tarball
     if [[ "$MODE" == "worker" ]]; then
@@ -2611,6 +2702,13 @@ verify_installation() {
 
     local failed=0
 
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        if ! check_rabs_launchers "" --installed "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"; then
+            die "Installed RABS toolset failed launch checks"
+        fi
+        success "RABS toolset launch checks passed"
+    fi
+
     if [[ "$MODE" == "worker" ]]; then
         if [[ -x "$INSTALL_DIR/$WORKER_BIN" ]]; then
             local version
@@ -2690,6 +2788,16 @@ print_summary() {
     echo "  📁 Binaries:    $INSTALL_DIR"
     echo "  ⚙️  Config:      $CONFIG_DIR"
     echo ""
+
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        echo "  RABS tools: ${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"
+        echo "  Opt in to a build with 'cargo rabs build'; see 'cargo rabs --help'."
+        echo "  RABS services and Cargo configuration were not changed."
+        if [[ "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}" != "$INSTALL_DIR" ]]; then
+            printf '  Add the RABS tools to PATH: export PATH=%q:$PATH\n' "$RCH_RABS_INSTALL_DIR"
+        fi
+        echo ""
+    fi
 
     if [[ "$MODE" == "worker" ]]; then
         echo "  🔧 Worker binary: $INSTALL_DIR/$WORKER_BIN"
@@ -2895,6 +3003,7 @@ Options:
   --local              Install hook and daemon (default)
   --worker             Install worker agent only
   --from-source        Build from source (requires Rust)
+  --with-rabs          Also install complete opt-in RABS tools (Linux GNU only)
   --offline <tarball>  Install from local tarball (airgap mode)
   --easy-mode          Configure PATH + detect agents + run doctor
   --verify-only        Verify existing installation
@@ -2907,6 +3016,7 @@ Options:
 
 Environment:
   RCH_INSTALL_DIR      Installation directory (default: ~/.local/bin)
+  RCH_RABS_INSTALL_DIR Separate RABS bin directory (default: RCH_INSTALL_DIR)
   RCH_CONFIG_DIR       Config directory (default: ~/.config/rch)
   RCH_NO_HOOK          Skip Claude Code hook setup if set
   RCH_NO_COLOR         Disable colored output
@@ -2929,6 +3039,7 @@ Service Setup:
 Examples:
   ./install.sh                         # Install locally (auto-detects source)
   ./install.sh --from-source           # Force build from source
+  ./install.sh --with-rabs             # Install RCH and the complete RABS toolset
   ./install.sh --worker                # Install on a worker machine
   ./install.sh --easy-mode             # Full setup with PATH and detection
   ./install.sh --offline rch.tar.gz    # Install from local tarball
@@ -2947,6 +3058,7 @@ main() {
     # Parse arguments
     MODE="local"
     FROM_SOURCE="false"
+    WITH_RABS="false"
     UNINSTALL="false"
     VERIFY_ONLY="false"
     EASY_MODE="false"
@@ -2968,6 +3080,10 @@ main() {
                 ;;
             --from-source)
                 FROM_SOURCE="true"
+                shift
+                ;;
+            --with-rabs)
+                WITH_RABS="true"
                 shift
                 ;;
             --offline)
@@ -3021,6 +3137,10 @@ main() {
     # Setup UI
     setup_ui
 
+    if [[ "$WITH_RABS" == "true" && "$UNINSTALL" == "true" ]]; then
+        die "--with-rabs is an installation option; it cannot be combined with --uninstall. RABS generations are retained."
+    fi
+
     # Detect target version (needed for header and upgrade banner)
     detect_target_version
 
@@ -3043,6 +3163,9 @@ main() {
     # Never let a failed release lookup downgrade a working install
     enforce_no_downgrade
     if [[ "$SKIP_INSTALL_NO_DOWNGRADE" == "true" ]]; then
+        if [[ "$WITH_RABS" == "true" ]]; then
+            die "RABS was requested but version discovery would downgrade RCH. Retry with VERSION=$VERSION to install matching RABS tools."
+        fi
         success "rch v${VERSION} is already installed and newer than the resolved target; nothing to do."
         exit 0
     fi
