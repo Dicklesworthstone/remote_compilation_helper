@@ -15,24 +15,22 @@ fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
 }
 
-/// The rabsd binary lives beside ours in the target dir. Always ask Cargo,
-/// once per test process: it is a no-op when fresh, and a daemon left over
-/// from an older tree must never answer for this one.
+#[path = "support/rabsd.rs"]
+mod daemon_binary;
+
+/// Use a prepared binary pair, or a profile-matched Cargo artifact.
 fn rabsd_bin() -> std::path::PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
-        assert!(status.success(), "rabsd build failed");
-    });
-    std::path::Path::new(wrap()).with_file_name("rabsd")
+    daemon_binary::binary(wrap())
 }
 
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::io::Write;
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(format!("#!/bin/sh\n{body}").as_bytes())
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -316,8 +314,17 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
         .spawn()
         .expect("spawn rabsd");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "socket never appeared");
+    while !socket.exists()
+        || !Command::new(rabsd_bin())
+            .arg("--coord-status")
+            .env("RABS_SOCKET_PATH", &socket)
+            .env("RABS_CONFIG", "/nonexistent-rabs-config")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        assert!(Instant::now() < deadline, "daemon never became ready");
         std::thread::sleep(Duration::from_millis(10));
     }
 

@@ -11,19 +11,12 @@ use std::time::{Duration, Instant};
 
 const SLO_MS: f64 = 10.0;
 
-/// Always ask Cargo, once per test process: it is a no-op when fresh, and a
-/// daemon left over from an older tree must never answer for this one.
+#[path = "support/rabsd.rs"]
+mod daemon_binary;
+
+/// Use a prepared binary pair, or a profile-matched Cargo artifact.
 fn rabsd_bin() -> std::path::PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let mut build = Command::new(env!("CARGO"));
-        build.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
-        if !cfg!(debug_assertions) {
-            build.arg("--release");
-        }
-        assert!(build.status().expect("build rabsd").success());
-    });
-    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
+    daemon_binary::binary(env!("CARGO_BIN_EXE_rabs-wrap"))
 }
 
 #[test]
@@ -42,8 +35,17 @@ fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
         .spawn()
         .expect("spawn rabsd");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "socket never appeared");
+    while !socket.exists()
+        || !Command::new(rabsd_bin())
+            .arg("--coord-status")
+            .env("RABS_SOCKET_PATH", &socket)
+            .env("RABS_CONFIG", "/nonexistent-rabs-config")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        assert!(Instant::now() < deadline, "daemon never became ready");
         std::thread::sleep(Duration::from_millis(10));
     }
 
