@@ -118,11 +118,7 @@ fn agent_directory_churn_between_capture_passes_does_not_consume_retries() {
             std::thread::sleep(std::time::Duration::from_millis(10));
             for (_, root) in &roots {
                 for directory in STATE_DIRS {
-                    fs::write(
-                        root.join(directory).join("new-session.json"),
-                        b"new state",
-                    )
-                    .unwrap();
+                    fs::write(root.join(directory).join("new-session.json"), b"new state").unwrap();
                 }
             }
         }
@@ -177,7 +173,7 @@ fn excluded_directories_are_not_enumerated_even_with_opaque_or_unreadable_childr
             let path = root.join(directory);
             let opaque = std::ffi::OsString::from_vec(b"invalid-\xff-name".to_vec());
             fs::write(path.join(opaque), b"private opaque filename").unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         }
     }
     // Root can read mode-000 directories; the invalid filename separately
@@ -188,8 +184,7 @@ fn excluded_directories_are_not_enumerated_even_with_opaque_or_unreadable_childr
         for directory in STATE_DIRS {
             assert!(!scan.members.contains_key(*directory));
             assert!(!image.manifest(id).unwrap().members.contains_key(*directory));
-            fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700))
-                .unwrap();
+            fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
     assert_inputs(&image, &roots);
@@ -217,6 +212,9 @@ fn same_named_symlink_to_selected_directory_is_not_pruned_or_followed_during_sca
             fs::read(output.backing(id).unwrap().join("links/.ntm/lib.rs")).unwrap(),
             b"build-input"
         );
-        assert_eq!(fs::read_link(root.join("links/.ntm")).unwrap(), PathBuf::from("../src"));
+        assert_eq!(
+            fs::read_link(root.join("links/.ntm")).unwrap(),
+            PathBuf::from("../src")
+        );
     }
 }
