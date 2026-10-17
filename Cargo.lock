@@ -5239,6 +5239,7 @@ dependencies = [
 name = "rabs-sandbox"
 version = "2.1.34"
 dependencies = [
+ "memchr",
  "rabs-protocol",
  "rustix",
  "sha2 0.11.0",

@@ -19,6 +19,7 @@ doctest = false
 # rabs-asupersync. Privileged helpers are separate audited binaries recorded
 # in the unsafe-boundary ledger (bead A011).
 [dependencies]
+memchr = { workspace = true }
 rabs-protocol = { path = "../rabs-protocol" }
 sha2 = { workspace = true }
 
