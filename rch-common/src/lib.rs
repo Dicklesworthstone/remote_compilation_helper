@@ -12,6 +12,7 @@ mod remote_scoped_launch;
 /// Shared Linux launch and cancellation protocol; callers select their receipt.
 pub use remote_scoped_launch::REMOTE_PROCESS_IDENTITY_SCRIPT;
 
+pub mod admission_preview;
 pub mod admission_recommendation;
 pub mod admission_rejection;
 pub mod admit_preflight;
