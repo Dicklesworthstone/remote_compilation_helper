@@ -6,6 +6,8 @@
 //! - `/ready` - Readiness probe (workers available)
 //! - `/budget` - AGENTS.md budget compliance status
 
+mod admission_preview;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -450,6 +452,7 @@ pub fn create_api_router(api_state: ApiState, http_state: HttpState) -> Router {
         .route("/workers/capabilities", get(api_capabilities_handler))
         .route("/workers/config", get(api_workers_config_handler))
         .route("/repo-convergence/status", get(api_convergence_handler))
+        .merge(admission_preview::router())
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_token,
