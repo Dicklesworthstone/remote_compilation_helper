@@ -688,11 +688,12 @@ rch_control_capture() {
 
     rm -f -- "$rch_control_pipe"
 
+    # Balance case-pattern parentheses for Darwin's bash 3.2 substitution parser.
     rch_control_metadata=$(
         case "$(uname -s)" in
-            Darwin) LC_ALL=C stat -f '%Lp:%l:%z' "$rch_control_file";;
-            Linux) LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file";;
-            *) exit 125;;
+            (Darwin) LC_ALL=C stat -f '%Lp:%l:%z' "$rch_control_file";;
+            (Linux) LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file";;
+            (*) exit 125;;
         esac
     ) || {
         rm -f -- "$rch_control_file"

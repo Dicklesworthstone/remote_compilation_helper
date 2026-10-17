@@ -4639,11 +4639,17 @@ impl TransferPipeline {
                 // timer retains fd 3 for its deadline marker before group kill.
                 let watchdog = escape(Cow::Owned(remote_build_watchdog_script()));
 
+                // Darwin provides setsid(2), but not setsid(1). Use the same
+                // isolated Python syscall/exec path as the owned-group child;
+                // do not bypass session creation or the supervisor's witnesses.
                 format!(
-                    "if ! command -v setsid >/dev/null 2>&1; then \
+                    "case \"$(uname -s)\" in \
+Darwin) set -- python3 -I -S -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])';; \
+*) set -- setsid;; esac; \
+if ! command -v \"$1\" >/dev/null 2>&1; then \
 printf '\\n%s\\n' {} >&2; exit 125; fi; \
 mkdir -p {} && rm -f {} && \
-setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
+\"$@\" sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
                     self.remote_process_setup_marker(),
                     escaped_run_dir,
                     escaped_pgid_file,
@@ -14263,7 +14269,7 @@ Number of files transferred: 42
         let capture = command.find("export RCH_CH_BASE").unwrap();
         assert!(capture < command.find("touch ").unwrap());
         assert!(capture < command.find("&& cd ").unwrap());
-        assert!(capture < command.find("setsid sh -c").unwrap());
+        assert!(capture < command.find("\"$@\" sh -c").unwrap());
         let plain = "printf plain";
         assert_eq!(
             crate::hook::add_cargo_isolation(plain, &WorkerId::new("cache-worker")),
@@ -16324,7 +16330,11 @@ fn main() {
         assert!(!command.contains("/.rch-run/"));
         assert!(command.contains("RCH_REMOTE_PROCESS_V1:"));
         assert!(command.contains("rch_remote_record \"$1\" \"$4\""));
-        assert!(command.contains("setsid sh -c"));
+        assert!(command.contains("*) set -- setsid;;"));
+        assert!(command.contains("Darwin) set -- python3 -I -S -c"));
+        assert!(command.contains("os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])"));
+        assert!(command.contains("command -v \"$1\""));
+        assert!(command.contains("\"$@\" sh -c"));
         assert!(command.contains(&remote_pgid_file));
     }
 
