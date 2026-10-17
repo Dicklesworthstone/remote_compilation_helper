@@ -322,11 +322,12 @@ rch_scope_launch_child() {
 
 rch_scope_launch_read_result() {
     [ -f "$__sl_control/result" ] && [ ! -L "$__sl_control/result" ] || return 1
+    # Balance case-pattern parentheses for Darwin's bash 3.2 substitution parser.
     __sl_result_metadata=$(
         case "$(uname -s)" in
-            Darwin) stat -f '%u:%Lp:%l:%z' "$__sl_control/result";;
-            Linux) stat -c '%u:%a:%h:%s' -- "$__sl_control/result";;
-            *) exit 1;;
+            (Darwin) stat -f '%u:%Lp:%l:%z' "$__sl_control/result";;
+            (Linux) stat -c '%u:%a:%h:%s' -- "$__sl_control/result";;
+            (*) exit 1;;
         esac
     ) || return 1
     case "$__sl_result_metadata" in "$__sl_uid:600:1:"*) ;; *) return 1;; esac
