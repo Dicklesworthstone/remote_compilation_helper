@@ -560,6 +560,43 @@ fn load_bound_transcript(
     None
 }
 
+fn verify_canonical_surface_free_of_staging_roots(
+    surface: rabs_sandbox::leak_scanner::Surface,
+    bytes: &[u8],
+    plan: &DependencyActionPlan,
+) -> Result<(), String> {
+    verify_canonical_surface_free_of_roots(surface, bytes, &plan.out_dir, &plan.dependency_dirs)
+}
+
+fn verify_canonical_surface_free_of_roots(
+    surface: rabs_sandbox::leak_scanner::Surface,
+    bytes: &[u8],
+    out_dir: &str,
+    dependency_dirs: &[String],
+) -> Result<(), String> {
+    let hidden = rabs_sandbox::leak_scanner::HiddenWorld {
+        worktree_roots: Vec::new(),
+        user_homes: Vec::new(),
+        staging_roots: std::iter::once(out_dir.to_owned())
+            .chain(
+                dependency_dirs
+                    .iter()
+                    .filter(|root| root.as_str() != out_dir)
+                    .cloned(),
+            )
+            .collect(),
+        identities: Vec::new(),
+        secret_backing_roots: Vec::new(),
+    };
+    let findings = rabs_sandbox::leak_scanner::scan_surface(surface, bytes, &hidden, true);
+    match rabs_sandbox::leak_scanner::disposition(&findings) {
+        rabs_sandbox::leak_scanner::ScanDisposition::CanonicalAuthorityHolds => Ok(()),
+        other => Err(format!(
+            "leak scanner refused {surface:?} after placement canonicalization: {other:?}"
+        )),
+    }
+}
+
 impl LiveDependencyLane {
     /// The lane over a live coordinator.
     #[must_use]
@@ -859,6 +896,11 @@ impl LocalAttempt {
         self.request.dependencies.verify_unchanged()?;
         let input_roots = mappings_for_plan(plan);
         let transcript = canonicalize_placements(&report.stderr, plan)?;
+        verify_canonical_surface_free_of_staging_roots(
+            rabs_sandbox::leak_scanner::Surface::CompilerEvents,
+            &transcript,
+            plan,
+        )?;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let authority = self.authority.clone().ok_or("attempt not admitted")?;
         let mut pins = CapturePins::new(Arc::clone(cas), &authority);
@@ -890,6 +932,11 @@ impl LocalAttempt {
                     return Err(format!("closure: {violation}"));
                 }
                 let bytes = canonicalize_placements(&raw, plan)?;
+                verify_canonical_surface_free_of_staging_roots(
+                    rabs_sandbox::leak_scanner::Surface::DepInfo,
+                    &bytes,
+                    plan,
+                )?;
                 (sig, put_bytes(cas, &bytes, &mut pins)?)
             } else {
                 let captured = output_capture::put_output(cas, &path, MAX_OUTPUT_BYTES, &mut pins)?;
@@ -1184,5 +1231,37 @@ mod installed_output_tests {
             std::os::unix::fs::symlink(&retained, &alias).unwrap();
             assert!(known_installed_output(&alias, &expected).is_err());
         }
+    }
+
+    #[test]
+    fn canonical_surface_leak_scanner_refuses_residual_staging_roots() {
+        let out_dir = "/tmp/agent-a/target/debug/deps";
+        let dep_dirs = vec![
+            out_dir.to_owned(),
+            "/tmp/agent-a/target/debug/build/pkg/out".to_owned(),
+        ];
+        assert!(
+            verify_canonical_surface_free_of_roots(
+                rabs_sandbox::leak_scanner::Surface::DepInfo,
+                b"/__rabs/out/libfoo.d: /__rabs/pkg/src/lib.rs\n",
+                out_dir,
+                &dep_dirs,
+            )
+            .is_ok()
+        );
+        let leaked_out = verify_canonical_surface_free_of_roots(
+            rabs_sandbox::leak_scanner::Surface::DepInfo,
+            b"/tmp/agent-a/target/debug/deps/libfoo.d: /__rabs/pkg/src/lib.rs\n",
+            out_dir,
+            &dep_dirs,
+        );
+        assert!(leaked_out.is_err());
+        let leaked_dep = verify_canonical_surface_free_of_roots(
+            rabs_sandbox::leak_scanner::Surface::CompilerEvents,
+            b"note: searched /tmp/agent-a/target/debug/build/pkg/out\n",
+            out_dir,
+            &dep_dirs,
+        );
+        assert!(leaked_dep.is_err());
     }
 }
