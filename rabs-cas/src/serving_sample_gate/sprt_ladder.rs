@@ -48,6 +48,14 @@ const RECEIPT_SQL: &str = r#"
 SELECT decision, reason FROM decision_receipts
 WHERE kind = ?1 AND subject = ?2 AND seq = ?3
 "#;
+// decision_receipts is append-only. Its (kind, subject, seq) primary key
+// supports loading the latest generation without scanning checkpoint history.
+// Generation is independent of the journal cursor: a conservative cursor reset
+// must not rewrite an earlier receipt or resurrect an older positive count.
+const CHECKPOINT_SQL: &str = r#"
+SELECT seq, decision, reason FROM decision_receipts
+WHERE kind = ?1 AND subject = ?2 ORDER BY seq DESC LIMIT 1
+"#;
 // Only the production publication engine's receipt plus its exact sample and
 // actual attempt/generation can earn credit. Raw samples and winner re-offers
 // cannot. Membership is bound by submission, not by a request's risk flag.
@@ -139,23 +147,62 @@ struct Checkpoint {
 }
 
 impl Checkpoint {
-    fn load(store: &mut dyn RabsMetadataStore) -> Result<Self, StoreError> {
-        let Some((passes, cursor)) = receipt(store, STATE, CLASS, 0)? else {
-            return Ok(Self::default());
-        };
-        let passes = number(&passes)?;
-        let cursor = i64::try_from(number(&cursor)?).map_err(|_| corrupt("cursor overflow"))?;
-        if passes > FINAL_PASSES || passes > cursor as u64 {
+    fn validate(self) -> Result<Self, StoreError> {
+        let cursor = u64::try_from(self.cursor).map_err(|_| corrupt("negative cursor"))?;
+        if self.passes > FINAL_PASSES || self.passes > cursor {
             return Err(corrupt("inconsistent checkpoint"));
         }
-        Ok(Self { cursor, passes })
+        Ok(self)
     }
 
+    fn latest(store: &mut dyn RabsMetadataStore) -> Result<Option<(i64, Self)>, StoreError> {
+        let rows = store.query(
+            CHECKPOINT_SQL,
+            &[SqlValue::Text(STATE.into()), SqlValue::Text(CLASS.into())],
+        )?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => match row.as_slice() {
+                [SqlValue::Int(generation), SqlValue::Text(passes), SqlValue::Text(cursor)]
+                    if *generation >= 0 =>
+                {
+                    let checkpoint = Self {
+                        cursor: i64::try_from(number(cursor)?)
+                            .map_err(|_| corrupt("cursor overflow"))?,
+                        passes: number(passes)?,
+                    }
+                    .validate()?;
+                    Ok(Some((*generation, checkpoint)))
+                }
+                _ => Err(corrupt("checkpoint receipt shape")),
+            },
+            _ => Err(corrupt("ambiguous checkpoint")),
+        }
+    }
+
+    fn load(store: &mut dyn RabsMetadataStore) -> Result<Self, StoreError> {
+        // A legacy seq-0 record is the first generation, not a mutable slot.
+        // Never fall back to it if a newer checkpoint is malformed/unreadable.
+        Ok(Self::latest(store)?.map_or_else(Self::default, |(_, checkpoint)| checkpoint))
+    }
+
+    /// The caller keeps the existing exclusive CAS lock from load/scan through
+    /// this append. Markers precede credit, and publication follows persistence.
+    /// An exact retry after an ambiguous append is read-only; a changed state
+    /// consumes the next generation. No upsert, deletion, or conflict fallback.
     fn persist(self, store: &mut dyn RabsMetadataStore) -> Result<(), StoreError> {
+        self.validate()?;
+        let generation = match Self::latest(store)? {
+            Some((_, previous)) if previous == self => return Ok(()),
+            Some((generation, _)) => generation
+                .checked_add(1)
+                .ok_or_else(|| corrupt("checkpoint generation overflow"))?,
+            None => 0,
+        };
         store.record_decision_receipt(
             STATE,
             CLASS,
-            0,
+            u64::try_from(generation).map_err(|_| corrupt("negative checkpoint generation"))?,
             &self.passes.to_string(),
             &self.cursor.to_string(),
         )
@@ -263,7 +310,7 @@ fn advance(store: &mut dyn RabsMetadataStore) -> Result<Checkpoint, StoreError> 
             break;
         }
     }
-    // Do not rewrite the checkpoint forever just to scan our own checkpoint.
+    // Do not append checkpoints forever just to scan our own checkpoint.
     // Full pages still advance, even if filled entirely by our own markers.
     if checkpoint != original && (external_progress || rows.len() == PAGE) {
         checkpoint.persist(store)?;
@@ -520,7 +567,9 @@ mod replay_budget_tests {
     fn unbound_and_private_classes_cannot_borrow_a_promoted_dependency_ceiling() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), None);
-        let key = fixture(&mut store);
+        // Class bindings are immutable too: create a private action rather
+        // than attempting to overwrite fixture()'s live dependency binding.
+        let key = published(&mut store, 1, 10);
         store.record_decision_receipt(CLASS_KIND, &key, 0, "private-only", "not a dependency").unwrap();
         Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }.persist(&mut store).unwrap();
         let before = store.differential_snapshot().unwrap();
@@ -534,6 +583,11 @@ mod replay_budget_tests {
         fixture(&mut store);
         store.record_decision_receipt(STATE, CLASS, 0, "not-a-counter", "100").unwrap();
         assert!(ceiling(&mut store, Mode::Sprt).is_err());
+        // Corruption is not repaired by superseding its receipt. Exercise the
+        // independent promotion-conflict case against a fresh, valid store.
+        assert!(Checkpoint::default().persist(&mut store).is_err());
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        fixture(&mut store);
         Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }.persist(&mut store).unwrap();
         store.record_decision_receipt(PROMOTION, CLASS, 1, "verification-bps=0", "forged").unwrap();
         assert!(ceiling(&mut store, Mode::Sprt).is_err());
