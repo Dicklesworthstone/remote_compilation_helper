@@ -734,10 +734,9 @@ fn connect_owned(
     }
     let (sender, receiver) = std::sync::mpsc::channel();
     let socket_owned = socket.to_owned();
-    std::thread::Builder::new()
-        .spawn(move || {
-            let _ = sender.send(UnixStream::connect(socket_owned));
-        })?;
+    std::thread::Builder::new().spawn(move || {
+        let _ = sender.send(UnixStream::connect(socket_owned));
+    })?;
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::other("RABS connect deadline overflow"))?;
@@ -752,7 +751,10 @@ fn connect_owned(
         match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(result) => return result,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "RABS connect worker stopped"));
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "RABS connect worker stopped",
+                ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -771,8 +773,12 @@ fn consult(
     if !owned() {
         return Err(());
     }
-    let stream = connect_owned(socket, Duration::from_millis(u64::from(connect_timeout_ms)), owned)
-        .map_err(|_| ())?;
+    let stream = connect_owned(
+        socket,
+        Duration::from_millis(u64::from(connect_timeout_ms)),
+        owned,
+    )
+    .map_err(|_| ())?;
     let cwd = std::env::current_dir()
         .map_err(|_| ())?
         .into_os_string()
@@ -1104,6 +1110,23 @@ fn exit_like(status: std::process::ExitStatus) -> ! {
     std::process::exit(1);
 }
 
+fn is_executable_file_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ExecutableFileBusy || error.raw_os_error() == Some(26)
+}
+
+fn exec_compiler(real_rustc: &OsStr, args: &[OsString]) -> ! {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        let error = std::process::Command::new(real_rustc).args(args).exec();
+        if is_executable_file_busy(&error) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
+        std::process::exit(127);
+    }
+}
+
 /// Run the admitted compiler with exact environment and live streams, then
 /// retain output custody until the daemon has captured immutable bytes.
 /// Overflowed, abandoned or unacknowledged captures are never published.
@@ -1124,9 +1147,7 @@ fn run_attempt(
             // compiler, rather than leave an unsupervised observed child.
             drop(session);
             stop_if_caller_lost(Some(owner));
-            let error = std::process::Command::new(real_rustc).args(args).exec();
-            eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
-            std::process::exit(127);
+            exec_compiler(real_rustc, args);
         }
     };
     let stdout = child.stdout.take();
@@ -1260,9 +1281,7 @@ fn main() {
 
     // Become the compiler. On success this never returns; exit codes,
     // signals, and stdio semantics are the real chain's, exactly.
-    let error = std::process::Command::new(&real_rustc).args(&args).exec();
-    eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
-    std::process::exit(127);
+    exec_compiler(&real_rustc, &args);
 }
 
 #[cfg(test)]

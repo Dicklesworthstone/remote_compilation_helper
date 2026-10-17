@@ -288,6 +288,22 @@ impl Owner {
     }
 }
 
+fn spawn_with_etxtbsy_retry(command: &mut Command) -> io::Result<Child> {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        match command.spawn() {
+            Err(error)
+                if (error.kind() == io::ErrorKind::ExecutableFileBusy
+                    || error.raw_os_error() == Some(26))
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// No compiler has started when this returns Err. The caller may abandon the
 /// admission and exec the original chain, without publishing an observed run.
 /// A lost caller instead terminates the wrapper: cancellation must never pass
@@ -299,35 +315,37 @@ pub(super) fn spawn(
     owner: Owner,
 ) -> io::Result<Child> {
     if !cfg!(target_os = "linux") {
-        return Command::new(compiler)
-            .args(args)
-            .env_clear()
-            .envs(env.iter().map(|(key, value)| (key, value)))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        return spawn_with_etxtbsy_retry(
+            Command::new(compiler)
+                .args(args)
+                .env_clear()
+                .envs(env.iter().map(|(key, value)| (key, value)))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
     }
     if owner.pid != std::process::id() || !owner.alive() {
         eprintln!("rabs-wrap: compiler caller disappeared before execution");
         std::process::exit(1);
     }
     kill_program()?;
-    Command::new("/proc/self/exe")
-        .arg(GUARD_ARGUMENT)
-        .arg(owner.pid.to_string())
-        .arg(owner.start.to_string())
-        .arg(owner.caller_pid.to_string())
-        .arg(owner.caller_start.to_string())
-        .arg("--")
-        .arg(compiler)
-        .args(args)
-        .env_clear()
-        .envs(env.iter().map(|(key, value)| (key, value)))
-        .process_group(0)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    spawn_with_etxtbsy_retry(
+        Command::new("/proc/self/exe")
+            .arg(GUARD_ARGUMENT)
+            .arg(owner.pid.to_string())
+            .arg(owner.start.to_string())
+            .arg(owner.caller_pid.to_string())
+            .arg(owner.caller_start.to_string())
+            .arg("--")
+            .arg(compiler)
+            .args(args)
+            .env_clear()
+            .envs(env.iter().map(|(key, value)| (key, value)))
+            .process_group(0)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
 }
 
 fn kill_program() -> io::Result<&'static str> {
@@ -398,7 +416,7 @@ pub(super) fn run_if_guard() {
             ));
         }
         let kill = kill_program()?;
-        let child = Command::new(compiler).args(args).process_group(0).spawn()?;
+        let child = spawn_with_etxtbsy_retry(Command::new(compiler).args(args).process_group(0))?;
         let mut owned = OwnedCompiler {
             child,
             kill,
