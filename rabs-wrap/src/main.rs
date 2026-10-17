@@ -1115,7 +1115,7 @@ fn is_executable_file_busy(error: &io::Error) -> bool {
 }
 
 fn exec_compiler(real_rustc: &OsStr, args: &[OsString]) -> ! {
-    let deadline = Instant::now() + Duration::from_millis(50);
+    let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         let error = std::process::Command::new(real_rustc).args(args).exec();
         if is_executable_file_busy(&error) && Instant::now() < deadline {

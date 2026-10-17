@@ -1,5 +1,5 @@
-use super::*;
 use super::policy::MAX_RETRIES;
+use super::*;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -82,8 +82,7 @@ fn cold_facts_join_a_keyed_flight_then_one_admitted_execution() {
 
 #[test]
 fn preparation_can_finish_without_a_singleflight_wait() {
-    let (result, requests) =
-        exchange(vec![PREPARING.to_owned(), EXECUTE.to_owned()], policy(3));
+    let (result, requests) = exchange(vec![PREPARING.to_owned(), EXECUTE.to_owned()], policy(3));
     assert!(matches!(result, Ok(Live::Execute { .. })));
     assert_eq!(requests, ["original bytes\n"]);
 }
@@ -585,22 +584,17 @@ fn disabled_cold_wait_does_not_disable_keyed_waiting() {
     assert_eq!(requests, ["original bytes\n"]);
 }
 
-
 #[test]
 fn cold_preparation_rolls_over_after_sixty_requests() {
     use std::os::unix::net::UnixListener;
-    let base = std::env::temp_dir().join(format!(
-        "rabs-rollover-{}-{:?}-{:?}",
-        std::process::id(),
-        std::thread::current().id(),
-        std::time::SystemTime::now(),
-    ));
-    std::fs::create_dir(&base).unwrap();
-    let socket = base.join("edge.sock");
+    let base = tempfile::tempdir().unwrap();
+    let socket = base.path().join("edge.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let daemon = std::thread::spawn(move || {
         let (first, _) = listener.accept().unwrap();
-        first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut first = BufReader::new(first);
         first.get_mut().write_all(PREPARING.as_bytes()).unwrap();
         for _ in 0..59 {
@@ -612,12 +606,17 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
         // The first connection's 60 requests have all received their
         // replies before the follower may open a new connection.
         let (second, _) = listener.accept().unwrap();
-        second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut second = BufReader::new(second);
         let mut hello = String::new();
         second.read_line(&mut hello).unwrap();
         assert_eq!(hello.trim_end(), HELLO);
-        second.get_mut().write_all(b"{\"kind\":\"hello-ok\"}\n").unwrap();
+        second
+            .get_mut()
+            .write_all(b"{\"kind\":\"hello-ok\"}\n")
+            .unwrap();
         let mut request = String::new();
         second.read_line(&mut request).unwrap();
         assert_eq!(request, "original bytes\n");
@@ -638,6 +637,4 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
     );
     assert!(matches!(result, Ok(Live::Execute { .. })));
     daemon.join().unwrap();
-    std::fs::remove_file(socket).unwrap();
-    std::fs::remove_dir(base).unwrap();
 }

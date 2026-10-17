@@ -289,7 +289,7 @@ impl Owner {
 }
 
 fn spawn_with_etxtbsy_retry(command: &mut Command) -> io::Result<Child> {
-    let deadline = Instant::now() + Duration::from_millis(50);
+    let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         match command.spawn() {
             Err(error)

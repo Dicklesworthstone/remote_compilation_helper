@@ -40,22 +40,15 @@ impl Lcg {
     }
 }
 
+#[path = "support/rabsd.rs"]
+mod daemon_binary;
+
 fn rabsd() -> std::path::PathBuf {
-    // The rabsd binary lives beside ours in the target dir. Always ask
-    // Cargo, once per test process: it is a no-op when fresh, and a daemon
-    // left over from an older tree must never answer for this one.
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
-        assert!(status.success(), "rabsd build failed");
-    });
-    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
+    daemon_binary::binary(env!("CARGO_BIN_EXE_rabs-wrap"))
 }
 
 fn spawn_daemon(dir: &std::path::Path) -> Child {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(rabsd())
         .env("RABS_SOCKET_PATH", dir.join("rabsd.sock"))
         .env("RABS_BOOT_MARKER", dir.join("rabsd.boot"))
@@ -86,8 +79,9 @@ fn wait_for_socket(socket: &std::path::Path, up: bool) {
     while socket.exists() != up {
         assert!(
             Instant::now() < deadline,
-            "socket {} did not reach up={up} (seed {SEED:#x})",
-            socket.display()
+            "socket {} did not reach up={up} (seed {SEED:#x})\ndaemon log:\n{}",
+            socket.display(),
+            socket.parent().map(daemon_log).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -95,7 +89,11 @@ fn wait_for_socket(socket: &std::path::Path, up: bool) {
 
 fn fake_rustc(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("fake-rustc");
-    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        f.sync_all().unwrap();
+    }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }

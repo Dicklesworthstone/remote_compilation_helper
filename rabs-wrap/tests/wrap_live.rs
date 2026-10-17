@@ -94,7 +94,21 @@ fn exec_preserves_non_utf8_argv_and_compiler_path() {
     ];
 
     for (executable, args) in cases {
-        let direct = Command::new(executable).args(&args).output().unwrap();
+        let direct = {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            loop {
+                match Command::new(executable).args(&args).output() {
+                    Err(error)
+                        if (error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            || error.raw_os_error() == Some(26))
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    result => break result.unwrap(),
+                }
+            }
+        };
         assert_eq!(direct.status.code(), Some(23));
         let wrapped = Command::new(wrap())
             .arg(executable)

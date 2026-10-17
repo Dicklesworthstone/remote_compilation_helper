@@ -2176,6 +2176,15 @@ impl CoordLive {
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
+        if sampling.is_some()
+            && live_replay_permit(&mut *store, action_key, &manifest_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                .is_none()
+        {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::FreshVerificationRequired,
+            ));
+        }
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.

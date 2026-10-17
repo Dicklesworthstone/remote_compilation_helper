@@ -620,7 +620,8 @@ fn capture_ack(frame: &[u8], attempt: &str, capture: &str) -> Option<CaptureAck>
         .then_some(ack)
 }
 
-fn completion_not_published(detail: &str) -> String {
+fn completion_not_published(key_text: &str, detail: &str) -> String {
+    log("not-published", &[("key", key_text), ("detail", detail)]);
     json!({
         "kind": "rustc-completion", "outcome": "not-published", "detail": detail,
         "publication_authorized": false,
@@ -659,12 +660,13 @@ pub(super) async fn complete_on_lane(
     frame: Vec<u8>,
     stream: &mut super::EdgeStream,
 ) -> String {
+    let key_text = digest_key(attempt.action_key());
     // Reserve ONCE for capture -> acknowledgment -> publication/cleanup.
     // A fresh burst must not steal the publication slot after we told Cargo
     // that its outputs were captured. This permit grants capacity only: the
     // exact acknowledgment and every coordinator publication gate still apply.
     let Some(reservation) = lane.acquire() else {
-        return completion_not_published(&super::WorkError::Saturated.to_string());
+        return completion_not_published(&key_text, &super::WorkError::Saturated.to_string());
     };
     let prepared = match reservation.stage(move || {
         let report = completion_report(&frame, &attempt.attempt_hex())
@@ -676,28 +678,28 @@ pub(super) async fn complete_on_lane(
     };
     let (prepared, reservation) = match prepared {
         Ok(result) => result,
-        Err(detail) => return completion_not_published(&detail),
+        Err(detail) => return completion_not_published(&key_text, &detail),
     };
     let captured = match prepared {
         Ok(captured) => captured,
-        Err(detail) => return completion_not_published(&detail),
+        Err(detail) => return completion_not_published(&key_text, &detail),
     };
     let attempt_hex = captured.attempt_hex();
     let ack = acknowledge_capture(stream, &attempt_hex, captured.manifest_key()).await;
     // Capture's worker has been joined; acknowledgment held no thread or CAS
     // lock. Consume the same non-clone reservation, never race a second acquire.
+    let finished_key = key_text.clone();
     let finished = reservation.finish(move || {
         let Some(ack) = ack else {
             drop(captured);
-            return completion_not_published("output capture was not acknowledged");
+            return completion_not_published(&finished_key, "output capture was not acknowledged");
         };
         // Recheck against the retained candidate, not values from a new
         // request or a mutable source path. Publication consumes this owner.
         if ack.attempt != captured.attempt_hex() || ack.capture != captured.manifest_key() {
             drop(captured);
-            return completion_not_published("capture identity mismatch");
+            return completion_not_published(&finished_key, "capture identity mismatch");
         }
-        let key_text = digest_key(captured.action_key());
         let (outcome, known) = captured.publish();
         for output in known {
             live.facts.remember(&output.path, output.sig, output.digest);
@@ -707,7 +709,10 @@ pub(super) async fn complete_on_lane(
             | crate::coord::live_dependency::CompletionOutcome::Refused(reason) => reason.clone(),
             _ => String::new(),
         };
-        log(outcome.label(), &[("key", &key_text), ("detail", &detail)]);
+        log(
+            outcome.label(),
+            &[("key", &finished_key), ("detail", &detail)],
+        );
         json!({"kind": "rustc-completion", "outcome": outcome.label(), "detail": detail})
             .to_string()
     });
@@ -721,7 +726,7 @@ pub(super) async fn complete_on_lane(
             })
             .to_string()
         }),
-        Err(error) => completion_not_published(&error.to_string()),
+        Err(error) => completion_not_published(&key_text, &error.to_string()),
     }
 }
 

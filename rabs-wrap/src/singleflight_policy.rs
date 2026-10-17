@@ -67,7 +67,11 @@ impl WaitPolicy {
 }
 
 fn parse_milliseconds(value: Option<&str>) -> Option<u64> {
-    value?.trim().parse::<u64>().ok().map(|ms| ms.min(MAX_WAIT_MS))
+    value?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|ms| ms.min(MAX_WAIT_MS))
 }
 
 fn maximum_delay(budget: Duration) -> Duration {
