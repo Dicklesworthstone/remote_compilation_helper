@@ -2167,6 +2167,7 @@ fn test_selected_worker_to_config() {
         slots_available: 8,
         speed_score: 75.5,
         declared_os: None,
+        project_lane: 0,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -2967,6 +2968,7 @@ async fn retry_selection_selected_response_stays_pending_until_new_admission() {
                 slots_available: 4,
                 speed_score: 90.0,
                 declared_os: None,
+                project_lane: 0,
             }),
             build_id: Some(42),
             reason: SelectionReason::Success,
@@ -3537,6 +3539,7 @@ async fn test_daemon_query_protocol() {
                 slots_available: 16,
                 speed_score: 95.0,
                 declared_os: None,
+                project_lane: 0,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -3625,6 +3628,7 @@ async fn test_daemon_query_sends_preferred_workers() {
                 slots_available: 16,
                 speed_score: 95.0,
                 declared_os: None,
+                project_lane: 0,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -3711,6 +3715,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
                     slots_available: 6,
                     speed_score: 90.0,
                     declared_os: None,
+                    project_lane: 0,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(42),
@@ -3814,6 +3819,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
                     slots_available: 6,
                     speed_score: 90.0,
                     declared_os: None,
+                    project_lane: 0,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(43),
@@ -3929,6 +3935,7 @@ async fn test_daemon_query_wait_parameters() {
                 slots_available: 16,
                 speed_score: 95.0,
                 declared_os: None,
+                project_lane: 0,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4010,6 +4017,7 @@ async fn test_daemon_query_url_encoding() {
                 slots_available: 1,
                 speed_score: 1.0,
                 declared_os: None,
+                project_lane: 0,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4135,6 +4143,7 @@ async fn test_process_hook_remote_success_mocked() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4215,6 +4224,7 @@ async fn test_force_local_allows_even_when_remote_available() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4283,6 +4293,7 @@ async fn test_force_remote_bypasses_confidence_threshold() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4470,6 +4481,7 @@ async fn test_process_hook_remote_nonzero_exit_uses_transparent_interception() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4521,6 +4533,7 @@ fn test_worker_config_from_selected_worker() {
         slots_available: 32,
         speed_score: 88.8,
         declared_os: None,
+        project_lane: 0,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -8057,6 +8070,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         slots_available: 1,
         speed_score: 1.0,
         declared_os: Some("windows".to_string()),
+        project_lane: 0,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
     let result = Box::pin(execute_remote_compilation(
@@ -8181,6 +8195,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         slots_available: 8,
         speed_score: 90.0,
         declared_os: None,
+        project_lane: 0,
     };
 
     let reporter = HookReporter::new(OutputVisibility::None);
@@ -8288,6 +8303,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         slots_available: 8,
         speed_score: 90.0,
         declared_os: None,
+        project_lane: 0,
     };
     let transfer_config = TransferConfig {
         sync_timeout_ms: Some(1_000),
@@ -8460,6 +8476,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         slots_available: 8,
         speed_score: 90.0,
         declared_os: None,
+        project_lane: 0,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
     let layer0 = rch_common::types::Layer0Config {
@@ -8561,6 +8578,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         slots_available: 8,
         speed_score: 90.0,
         declared_os: None,
+        project_lane: 0,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
 
@@ -8888,6 +8906,7 @@ async fn test_cargo_test_remote_build_failure() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -8950,6 +8969,7 @@ async fn test_cargo_test_with_filter() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9012,6 +9032,7 @@ async fn test_cargo_test_with_test_threads() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9079,6 +9100,7 @@ async fn test_cargo_test_signal_killed() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9146,6 +9168,7 @@ async fn test_cargo_test_signal_killed_with_toolchain_path_does_not_fallback_loc
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9207,6 +9230,7 @@ async fn test_cargo_test_toolchain_fallback() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
         }),
         reason: SelectionReason::Success,
         build_id: None,

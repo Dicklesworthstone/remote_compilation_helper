@@ -603,6 +603,15 @@ pub struct SelectedWorker {
     /// wire-compatible.
     #[serde(default)]
     pub declared_os: Option<String>,
+    /// The worker project lane this build holds (bd-sgvod). 0 is the
+    /// canonical mirror; k > 0 means every remote root is `<root>.rch-lane-<k>`.
+    /// Old daemons never send it, so old and new hooks both read 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub project_lane: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Worker selection response from daemon to hook.
@@ -4826,6 +4835,7 @@ retry_max = 2
                 slots_available: 8,
                 speed_score: 75.0,
                 declared_os: None,
+                project_lane: 0,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4920,6 +4930,7 @@ retry_max = 2
                 slots_available: 16,
                 speed_score: 90.5,
                 declared_os: None,
+                project_lane: 0,
             }),
             reason: SelectionReason::Success,
             build_id: None,

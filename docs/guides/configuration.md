@@ -282,6 +282,19 @@ Fields:
 - `max_jobs_per_slot` (default `1`) — Max concurrent jobs per slot.
 - `connection_pooling` (default `true`) — Reuse SSH connections.
 - `log_level` (default `"info"`) — Daemon logging level.
+- `[project_lanes]` (default empty) — how many builds of one project a worker
+  may run at once, keyed by worker id. Without it, a worker runs at most one
+  build per project, because builds share the worker's mirror of the project.
+  Lane `k > 0` syncs into its own mirror, `<root>.rch-lane-<k>`, with its own
+  source lock and target dir. Each lane costs a full extra mirror on disk, so
+  give lanes only to workers with the disk, cores and slots for them.
+  Values are clamped to 1-8, and changes take effect after a daemon restart:
+
+  ```toml
+  [project_lanes]
+  hz3 = 2
+  hz4 = 2
+  ```
 
 ## Environment Variables (RCH_*)
 

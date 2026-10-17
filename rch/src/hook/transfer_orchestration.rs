@@ -420,6 +420,12 @@ fn pooled_store_base_for<'a>(
         .or_else(|| clean_overlay.then(|| transfer_remote_base.trim_end_matches('/')))
 }
 
+/// The worker mirror of `root` for project lane `lane` (bd-sgvod): a sibling
+/// directory, so lane 0's canonical mirror is never touched.
+fn project_lane_remote_root(root: &str, lane: u32) -> String {
+    format!("{}.rch-lane-{lane}", root.trim_end_matches('/'))
+}
+
 fn stable_pooled_target_dir(remote_base: &str, project_id: &str, pooled_dir_name: &str) -> String {
     format!(
         "{}/{}/{}",
@@ -1079,6 +1085,22 @@ async fn execute_remote_compilation_inner(
         }
         overlay_remote_root = Some(container);
     }
+    // bd-sgvod: a build in project lane k > 0 owns a separate worker mirror of
+    // every closure root, so concurrent builds of one project on one worker
+    // never share a source tree, source lock or target dir. Clean-overlay and
+    // source-content runs already own isolated roots and ignore the lane.
+    let project_lane = worker.project_lane;
+    let ordinary_mirror =
+        clean_overlay.is_none() && !owned_source_content_pair && source_content_build_id.is_none();
+    if project_lane > 0 && ordinary_mirror && !worker_is_windows {
+        for entry in &mut sync_plan {
+            entry.remote_root = project_lane_remote_root(&entry.remote_root, project_lane);
+        }
+        reporter.verbose(&format!(
+            "[RCH] project lane {project_lane} on {}: using a separate worker mirror",
+            worker_config.id
+        ));
+    }
     let retained_source_root = owned_source_content_pair.then(|| {
         format!(
             "{}.retained-{recovery_identity}",
@@ -1101,12 +1123,17 @@ async fn execute_remote_compilation_inner(
     // override above but applies to the whole plan. See rch#<NN>.
     if worker_is_windows {
         for entry in sync_plan.iter_mut() {
-            entry.remote_root = format!(
+            let root = format!(
                 "{}/{}/{}",
                 crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE,
                 entry.project_id,
                 entry.root_hash
             );
+            entry.remote_root = if project_lane > 0 && ordinary_mirror {
+                project_lane_remote_root(&root, project_lane)
+            } else {
+                root
+            };
         }
     }
     let sync_roots = sync_plan
@@ -1283,7 +1310,16 @@ async fn execute_remote_compilation_inner(
         pooled_store_base
             .zip(remote_cargo_target_dir_name_override.as_ref())
             .map(|(base, name)| {
-                let stable = stable_pooled_target_dir(base, &project_id, name);
+                // Lanes never share a pooled target (bd-sgvod).
+                let stable = if project_lane > 0 && ordinary_mirror {
+                    stable_pooled_target_dir(
+                        base,
+                        &project_id,
+                        &format!("{name}-lane-{project_lane}"),
+                    )
+                } else {
+                    stable_pooled_target_dir(base, &project_id, name)
+                };
                 let stable = if owned_source_content_pair {
                     super::ssh::canonical_source_authority_root(&stable)
                 } else {
@@ -1445,7 +1481,9 @@ async fn execute_remote_compilation_inner(
     // Both isolated modes already name their complete staged source roots.
     // Converging canonical worker checkouts would mutate paths outside this
     // job's source grant and cannot prepare any of its selected destinations.
-    if clean_overlay.is_none() && !source_content_receipt {
+    // A lane's roots are private mirrors, never the canonical checkouts the
+    // repo updater converges (bd-sgvod).
+    if clean_overlay.is_none() && !source_content_receipt && project_lane == 0 {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
             &sync_roots,
@@ -3751,6 +3789,34 @@ mod tests {
     /// Issue #64: the default (no `store_base`, no clean overlay) keeps the
     /// pooled store inside the project mirror — nobody's paths move until the
     /// setting is written.
+    /// bd-sgvod: a lane's mirror is a sibling of the canonical one, so lane 0
+    /// is never touched, and a daemon that predates lanes means lane 0.
+    #[test]
+    fn project_lane_mirrors_are_siblings_and_old_daemons_mean_lane_zero() {
+        use super::project_lane_remote_root;
+
+        assert_eq!(
+            project_lane_remote_root("/data/projects/music_theory_data_tool", 2),
+            "/data/projects/music_theory_data_tool.rch-lane-2"
+        );
+        assert_eq!(
+            project_lane_remote_root("/data/projects/mtdt/", 1),
+            "/data/projects/mtdt.rch-lane-1"
+        );
+        let old: rch_common::SelectedWorker = serde_json::from_value(serde_json::json!({
+            "id": "hz3", "host": "h", "user": "u", "identity_file": "k",
+            "slots_available": 1, "speed_score": 50.0
+        }))
+        .unwrap();
+        assert_eq!(old.project_lane, 0);
+        let lane: rch_common::SelectedWorker = serde_json::from_value(serde_json::json!({
+            "id": "hz3", "host": "h", "user": "u", "identity_file": "k",
+            "slots_available": 1, "speed_score": 50.0, "project_lane": 2
+        }))
+        .unwrap();
+        assert_eq!(lane.project_lane, 2);
+    }
+
     #[test]
     fn pooled_store_stays_in_the_mirror_without_a_store_base() {
         use super::pooled_store_base_for;

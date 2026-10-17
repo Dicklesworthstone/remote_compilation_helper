@@ -1221,6 +1221,7 @@ mod tests {
             slots_available: 4,
             speed_score: 1.5,
             declared_os: None,
+            project_lane: 0,
         };
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,

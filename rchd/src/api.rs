@@ -2556,6 +2556,7 @@ async fn handle_select_worker_dry_run(
                 slots_available,
                 speed_score,
                 declared_os: rch_common::declared_os(&config.tags),
+                project_lane: 0,
             })
         }
         None => None,
@@ -2845,7 +2846,7 @@ async fn handle_select_worker_mode(
                         .clone()
                         .unwrap_or_else(|| "<unknown>".to_string());
 
-                    let admission = ctx.history.try_start_active_build_with_waiter(
+                    let admission = ctx.history.try_start_active_build_in_lanes(
                         request.project.clone(),
                         id.as_str().to_string(),
                         command.clone(),
@@ -2859,6 +2860,7 @@ async fn handle_select_worker_mode(
                             capacity: worker.disk_capacity_observation().await,
                         },
                         Some(selected_endpoint.clone()),
+                        ctx.pool.project_lanes(id.as_str()),
                     );
                     drop(config);
                     let state = match admission {
@@ -2932,6 +2934,7 @@ async fn handle_select_worker_mode(
                             slots_available,
                             speed_score,
                             declared_os,
+                            project_lane: state.project_lane,
                         }),
                         reason: selection_reason,
                         build_id,
@@ -3464,7 +3467,15 @@ fn project_excluded_workers(
     ctx: &DaemonContext,
     project: &str,
 ) -> std::collections::HashSet<String> {
-    let mut excluded = ctx.history.active_workers_for_project(project);
+    // A worker is full for this project once every one of its project lanes
+    // holds an active build (bd-sgvod; one lane unless daemon.toml says more).
+    let mut excluded: std::collections::HashSet<String> = ctx
+        .history
+        .active_build_counts_for_project(project)
+        .into_iter()
+        .filter(|(worker, count)| *count >= ctx.pool.project_lanes(worker) as usize)
+        .map(|(worker, _)| worker)
+        .collect();
     excluded.extend(
         ctx.history
             .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
@@ -8864,6 +8875,56 @@ mod tests {
             );
             assert!(project_excluded_workers(&ctx, "other-project").is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn project_lanes_keep_a_worker_eligible_until_every_lane_is_busy() {
+        // bd-sgvod
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool.clone());
+        let start = |wrapper: &str| {
+            ctx.history
+                .try_start_active_build_in_lanes(
+                    "lane-project".into(),
+                    "worker1".into(),
+                    "cargo test".into(),
+                    12345,
+                    Some(wrapper.into()),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    None,
+                    ctx.pool.project_lanes("worker1"),
+                )
+                .unwrap()
+        };
+        assert!(start("one").is_some());
+        // One lane (the default): a second build of the project is excluded.
+        assert!(project_excluded_workers(&ctx, "lane-project").contains("worker1"));
+        pool.set_project_lanes(std::collections::HashMap::from([(
+            "worker1".to_string(),
+            2,
+        )]));
+        assert!(!project_excluded_workers(&ctx, "lane-project").contains("worker1"));
+        assert_eq!(start("two").unwrap().project_lane, 1);
+        assert!(project_excluded_workers(&ctx, "lane-project").contains("worker1"));
+        assert!(project_excluded_workers(&ctx, "other-project").is_empty());
+        // Out-of-range settings are clamped.
+        pool.set_project_lanes(std::collections::HashMap::from([(
+            "worker1".to_string(),
+            0,
+        )]));
+        assert_eq!(pool.project_lanes("worker1"), 1);
+        pool.set_project_lanes(std::collections::HashMap::from([(
+            "worker1".to_string(),
+            99,
+        )]));
+        assert_eq!(
+            pool.project_lanes("worker1"),
+            crate::workers::MAX_PROJECT_LANES
+        );
     }
 
     fn disk_fault_release_request(build_id: u64) -> ReleaseRequest {
