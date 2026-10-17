@@ -40,7 +40,15 @@ class Fixture:
         """)
 
     def record(self, kind, subject, seq, decision, reason):
-        self.db.execute("INSERT OR REPLACE INTO decision_receipts VALUES(?,?,?,?,?)",
+        # Match the production receipt contract: exact retries are read-only,
+        # different payloads at one primary key are append conflicts. REPLACE
+        # hid the fixed-seq checkpoint defect and changed receipt rowids.
+        previous = self.receipt(kind, subject, seq)
+        if previous is not None:
+            if previous != (decision, reason):
+                raise sqlite3.IntegrityError('AppendConflict("decision_receipts")')
+            return
+        self.db.execute("INSERT INTO decision_receipts VALUES(?,?,?,?,?)",
                         (kind, subject, seq, decision, reason))
         self.db.commit()
 
@@ -65,17 +73,33 @@ class Fixture:
         if receipt:
             self.record(CONSTANTS["VERIFIED"], action, seq, identity, manifest or "manifest-" + action)
 
-    def state(self):
-        row = self.receipt(CONSTANTS["STATE"], CONSTANTS["CLASS"])
+    def checkpoint(self):
+        row = self.db.execute(SQL["CHECKPOINT"],
+                              (CONSTANTS["STATE"], CONSTANTS["CLASS"])).fetchone()
         if row is None:
-            return 0, 0
-        passes, cursor = map(int, row)
-        if row != (str(passes), str(cursor)) or not 0 <= passes <= FINAL or not passes <= cursor <= 2**63 - 1:
+            return None
+        generation, passes_text, cursor_text = row
+        passes, cursor = int(passes_text), int(cursor_text)
+        if (type(generation) is not int or not 0 <= generation <= 2**63 - 1
+                or (passes_text, cursor_text) != (str(passes), str(cursor))
+                or not 0 <= passes <= FINAL or not passes <= cursor <= 2**63 - 1):
             raise ValueError("invalid checkpoint")
-        return passes, cursor
+        return generation, passes, cursor
+
+    def state(self):
+        checkpoint = self.checkpoint()
+        return (0, 0) if checkpoint is None else checkpoint[1:]
 
     def save(self, passes, cursor):
-        self.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 0, str(passes), str(cursor))
+        if not 0 <= passes <= FINAL or not passes <= cursor <= 2**63 - 1:
+            raise ValueError("invalid checkpoint")
+        previous = self.checkpoint()
+        if previous is not None and previous[1:] == (passes, cursor):
+            return
+        generation = 0 if previous is None else previous[0] + 1
+        if generation > 2**63 - 1:
+            raise OverflowError("checkpoint generation overflow")
+        self.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], generation, str(passes), str(cursor))
 
     def admitted(self, action, seq, attempt, manifest):
         expected = self.db.execute("SELECT manifest_key FROM action_publications WHERE action_key=?", (action,)).fetchone()
@@ -223,7 +247,7 @@ class EvidenceTests(unittest.TestCase):
         self.f.proof(2)
         self.assertEqual(self.f.drain()[0], 1)
 
-    def test_repeated_samples_receipts_and_rowid_churn_cannot_double_count(self):
+    def test_repeated_samples_and_exact_receipt_retries_cannot_double_count(self):
         self.f.proof(1)
         self.assertEqual(self.f.drain()[0], 1)
         for seq in range(2, 20):
@@ -282,9 +306,14 @@ class EvidenceTests(unittest.TestCase):
 
     def test_corrupt_checkpoints_and_marker_conflicts_refuse(self):
         for passes, cursor in (("01", "10"), ("1", "0"), (str(FINAL + 1), "300000"), ("1", "-1"), ("1", str(2**63))):
-            self.f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 0, passes, cursor)
-            with self.assertRaises(ValueError):
-                self.f.fold()
+            f = Fixture()
+            try:
+                f.bind()
+                f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 0, passes, cursor)
+                with self.assertRaises(ValueError):
+                    f.fold()
+            finally:
+                f.db.close()
         self.f.save(0, 0)
         self.f.proof(1)
         self.f.record(CONSTANTS["COUNTED"], f"a:{1:032x}", 0, "consumed", "wrong-class")
@@ -320,6 +349,150 @@ class EvidenceTests(unittest.TestCase):
         before = self.f.db.total_changes
         self.assertEqual(self.f.fold(), (FINAL, FINAL))
         self.assertEqual(before, self.f.db.total_changes)
+
+    def history(self):
+        return self.f.db.execute(
+            "SELECT rowid,seq,decision,reason FROM decision_receipts "
+            "WHERE kind=? AND subject=? ORDER BY seq",
+            (CONSTANTS["STATE"], CONSTANTS["CLASS"]),
+        ).fetchall()
+
+    def test_receipt_conflicts_fail_and_exact_retries_preserve_row_identity(self):
+        original = self.f.db.execute("SELECT rowid,* FROM decision_receipts").fetchall()
+        changes = self.f.db.total_changes
+        self.f.record(CONSTANTS["CLASS_KIND"], "a", 0, CONSTANTS["CLASS"], "fixture")
+        self.assertEqual(self.f.db.total_changes, changes)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "AppendConflict"):
+            self.f.record(CONSTANTS["CLASS_KIND"], "a", 0, "private-only", "changed")
+        self.assertEqual(self.f.db.execute("SELECT rowid,* FROM decision_receipts").fetchall(), original)
+
+    def test_successive_generations_preserve_all_old_receipts_and_exact_retries(self):
+        previous = []
+        for attempt in range(1, 5):
+            self.f.proof(attempt)
+            self.assertEqual(self.f.drain()[0], attempt)
+            history = self.history()
+            self.assertEqual(len(history), attempt)
+            self.assertEqual(history[:len(previous)], previous)
+            self.assertEqual(history[-1][1:3], (attempt - 1, str(attempt)))
+            previous = history
+            changes = self.f.db.total_changes
+            self.f.save(*self.f.state())
+            self.assertEqual(self.f.db.total_changes, changes)
+
+    def test_latest_checkpoint_query_uses_the_class_generation_index(self):
+        plan = self.f.db.execute("EXPLAIN QUERY PLAN " + SQL["CHECKPOINT"],
+                                (CONSTANTS["STATE"], CONSTANTS["CLASS"])).fetchall()
+        description = " ".join(row[-1] for row in plan)
+        self.assertIn("INDEX", description)
+        self.assertIn("kind=? AND subject=?", description)
+        self.assertNotIn("TEMP B-TREE", description)
+        self.assertNotIn("SCAN decision_receipts", description)
+
+    def test_legacy_zero_receipt_is_not_overwritten_by_new_checkpoints(self):
+        self.f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 0, "0", "0")
+        legacy = self.history()
+        for attempt in range(1, 4):
+            self.f.proof(attempt)
+            self.assertEqual(self.f.drain()[0], attempt)
+        self.assertEqual(self.history()[:1], legacy)
+        self.assertEqual([row[1] for row in self.history()], [0, 1, 2, 3])
+
+    def test_generation_not_rowid_cursor_or_passes_selects_checkpoint(self):
+        self.f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 5, "1", "7")
+        self.f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 4, "100", "100")
+        self.f.record(CONSTANTS["STATE"], "other-class", 2**63 - 1, "1", "1")
+        self.f.record("other-state", CONSTANTS["CLASS"], 2**63 - 1, "1", "1")
+        self.assertEqual(self.f.checkpoint(), (5, 1, 7))
+        self.f.save(2, 10)
+        self.assertEqual(self.f.checkpoint(), (6, 2, 10))
+
+    def test_bad_latest_generation_cannot_be_hidden_by_old_or_new_valid_state(self):
+        self.f.save(1, 10)
+        self.f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 1, "01", "10")
+        original = self.history()
+        with self.assertRaises(ValueError):
+            self.f.state()
+        with self.assertRaises(ValueError):
+            self.f.save(2, 20)
+        with self.assertRaises(ValueError):
+            self.f.fold()
+        self.assertEqual(self.history(), original)
+
+    def test_negative_or_non_integer_generation_is_not_checkpoint_authority(self):
+        for generation in (-1, "not-a-sequence", 0.5):
+            f = Fixture()
+            try:
+                f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], generation, "0", "0")
+                with self.assertRaises(ValueError):
+                    f.checkpoint()
+                with self.assertRaises(ValueError):
+                    f.save(0, 0)
+            finally:
+                f.db.close()
+
+    def test_generation_overflow_refuses_without_reset_and_exact_retry_is_read_only(self):
+        self.f.record(CONSTANTS["STATE"], CONSTANTS["CLASS"], 2**63 - 1, "1", "10")
+        changes = self.f.db.total_changes
+        self.f.save(1, 10)
+        with self.assertRaises(OverflowError):
+            self.f.save(2, 11)
+        self.assertEqual(self.f.db.total_changes, changes)
+        self.assertEqual(self.f.state(), (1, 10))
+
+    def test_failed_checkpoint_append_keeps_previous_state_and_loses_only_uncredited_work(self):
+        self.f.proof(1)
+        self.assertEqual(self.f.drain()[0], 1)
+        previous = self.history()
+        self.f.proof(2)
+        # Real SQLite insertion failure after the reducer's separately durable
+        # attempt marker. This does not execute the Rust store's error path.
+        self.f.db.executescript("""
+        CREATE TEMP TRIGGER fail_checkpoint BEFORE INSERT ON decision_receipts
+        WHEN NEW.kind = 'rabs-sprt-checkpoint-v1'
+        BEGIN SELECT RAISE(FAIL, 'injected checkpoint append failure'); END;
+        """)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected checkpoint"):
+            self.f.fold()
+        self.f.db.rollback()
+        self.assertEqual(self.history(), previous)
+        self.f.db.execute("DROP TRIGGER fail_checkpoint")
+        self.assertEqual(self.f.drain()[0], 1)
+        self.f.proof(3)
+        self.assertEqual(self.f.drain()[0], 2)
+
+    def test_checkpoint_commit_with_lost_reply_is_idempotent_on_retry(self):
+        self.f.save(0, 0)
+        record = self.f.record
+
+        def lost_reply(kind, subject, seq, decision, reason):
+            record(kind, subject, seq, decision, reason)
+            if kind == CONSTANTS["STATE"]:
+                raise OSError("modeled lost acknowledgment after SQLite commit")
+
+        self.f.record = lost_reply
+        try:
+            with self.assertRaises(OSError):
+                self.f.save(1, 10)
+        finally:
+            self.f.record = record
+        changes = self.f.db.total_changes
+        self.f.save(1, 10)
+        self.assertEqual(self.f.db.total_changes, changes)
+        self.assertEqual(self.f.checkpoint(), (1, 1, 10))
+
+    def test_full_pages_of_internal_history_do_not_starve_new_evidence_or_chase_forever(self):
+        self.f.proof(1)
+        self.f.drain()
+        for n in range(PAGE * 2):
+            self.f.record(CONSTANTS["COUNTED"], "history-" + str(n), 0, "consumed", CONSTANTS["CLASS"])
+        self.f.proof(2)
+        self.assertEqual(self.f.drain()[0], 2)
+        self.assertGreaterEqual(len(self.history()), 4)
+        changes = self.f.db.total_changes
+        for _ in range(100):
+            self.f.fold()
+        self.assertEqual(self.f.db.total_changes, changes)
 
 
 if __name__ == "__main__":
