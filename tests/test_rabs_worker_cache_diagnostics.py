@@ -52,6 +52,62 @@ def prepare(env, no_start):
     return env
 '''
 
+# Real fork and signals, with a deterministic interruption before the fork
+# result is assigned by the adapter, or at entry to its final cleanup. The
+# driver retains custody of every unreaped child and rescues a broken baseline;
+# test failure must not leave that baseline's preparer behind for thirty seconds.
+PREPARATION_CUT_DRIVER = r'''
+import importlib.util, json, os, signal, sys
+spec = importlib.util.spec_from_file_location("adapter", os.environ["TEST_ADAPTER"])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+native_fork = os.fork
+native_cleanup = module.cleanup_preparer
+children = []
+number = int(os.environ["TEST_SETUP_SIGNAL"])
+phase = os.environ["TEST_SETUP_CUT"]
+fired = False
+def record_fork():
+    pid = native_fork()
+    if pid:
+        children.append(pid)
+        if len(children) == 1 and phase == "fork":
+            os.kill(os.getpid(), number)
+    return pid
+def interrupted_cleanup(pid):
+    global fired
+    if phase == "cleanup" and not fired:
+        fired = True
+        os.kill(os.getpid(), number)
+    return native_cleanup(pid)
+os.fork = record_fork
+module.cleanup_preparer = interrupted_cleanup
+before_mask = sorted(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+before_fds = sorted(os.listdir("/proc/self/fd"))
+reaped = []
+try:
+    status = module.main()
+    after_mask = sorted(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+    after_fds = sorted(os.listdir("/proc/self/fd"))
+finally:
+    # No child was reaped by this driver before this point. WNOWAIT checks
+    # continued ownership before any rescue signal; never use a stale PID.
+    signal.pthread_sigmask(signal.SIG_BLOCK, module.SETUP_SIGNALS)
+    for pid in children:
+        try:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            reaped.append(True)
+            continue
+        reaped.append(False)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+print(json.dumps({"owned_children": len(children), "reaped": reaped,
+                  "mask_before": before_mask, "mask_after": after_mask,
+                  "fds_before": before_fds, "fds_after": after_fds}), flush=True)
+sys.exit(status)
+'''
+
 
 @unittest.skipUnless(sys.platform == "linux", "Linux fork, WNOWAIT and descriptor custody")
 class DiagnosticTests(unittest.TestCase):
@@ -251,6 +307,72 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_hup_during_relay_never_execs_cargo_or_leaves_a_child(self):
         self.cancel_during_relay(signal.SIGHUP)
+
+    def cancel_at_preparation_cut(self, phase, number):
+        if phase == "fork":
+            self.install('def prepare(env, no_start):\n    import time\n'
+                         '    time.sleep(30)\n    return env\n')
+        else:
+            self.install(GOOD)
+        driver = self.root / "preparation-cut.py"
+        driver.write_text(PREPARATION_CUT_DRIVER)
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-S", str(driver), sys.executable, "-S", str(self.cargo)],
+            cwd=self.root, env=dict(self.env, TEST_ADAPTER=str(ADAPTER),
+                TEST_SETUP_CUT=phase, TEST_SETUP_SIGNAL=str(number)),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.children.append(child)
+        output, errors = child.communicate(timeout=3)
+        self.assertEqual(child.returncode, 128 + number, errors)
+        observed = json.loads(output)
+        self.assertEqual(observed["owned_children"], 1, observed)
+        self.assertEqual(observed["reaped"], [True], observed)
+        self.assertEqual(observed["mask_before"], observed["mask_after"], observed)
+        self.assertEqual(observed["fds_before"], observed["fds_after"], observed)
+        self.assertFalse((self.root / "cargo-events").exists(), "cancelled setup must not exec")
+
+    def test_each_cancellation_at_fork_handoff_retains_and_reaps_the_preparer(self):
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=number):
+                self.cancel_at_preparation_cut("fork", number)
+
+    def test_each_cancellation_during_final_cleanup_reaps_and_closes_before_delivery(self):
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=number):
+                self.cancel_at_preparation_cut("cleanup", number)
+
+    def test_preparation_restores_parent_and_child_original_signal_masks(self):
+        self.install('def prepare(env, no_start):\n    import json, signal\n'
+                     '    env["PREPARE_MASK"] = json.dumps(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, [])))\n'
+                     '    env["PREPARE_HANDLERS"] = json.dumps([int(signal.getsignal(s)) for s in '
+                     '(signal.SIGINT, signal.SIGTERM, signal.SIGHUP)])\n    return env\n')
+        spec = importlib.util.spec_from_file_location("worker_mask_test", ADAPTER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for held in (set(), {signal.SIGUSR1}, {signal.SIGTERM, signal.SIGUSR1}):
+            previous = signal.pthread_sigmask(signal.SIG_SETMASK, held)
+            try:
+                prepared = module.bounded_prepared_environment(dict(self.env))
+                self.assertEqual(json.loads(prepared["PREPARE_MASK"]), sorted(held))
+                self.assertEqual(json.loads(prepared["PREPARE_HANDLERS"]), [0, 0, 0])
+                self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), held)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+    def test_setup_acquisition_failures_restore_masks_and_release_descriptors(self):
+        spec = importlib.util.spec_from_file_location("worker_setup_resource_test", ADAPTER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for owner, name in [(module.socket, "socketpair"), (module.os, "pipe2"), (module.os, "fork")]:
+            with self.subTest(resource=name):
+                before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+                descriptors = sorted(os.listdir("/proc/self/fd"))
+                with mock.patch.object(owner, name, side_effect=OSError(errno.EMFILE, "fixture limit")):
+                    original = dict(self.env)
+                    self.assertIs(module.bounded_prepared_environment(original), original)
+                self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), before)
+                self.assertEqual(sorted(os.listdir("/proc/self/fd")), descriptors)
 
     def test_relay_resource_failure_is_silent_and_restores_signal_mask(self):
         spec = importlib.util.spec_from_file_location("worker_diagnostic_test", ADAPTER)

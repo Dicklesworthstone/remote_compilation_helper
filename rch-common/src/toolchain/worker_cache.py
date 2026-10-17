@@ -128,7 +128,7 @@ def preparation_seconds(environment):
                            MAX_PREPARE_MS) / 1000
 
 
-def prepare_child(original, response, log_descriptor):
+def prepare_child(original, response, log_descriptor, original_signal_mask):
     # This is a fresh, single-threaded Python adapter, not a daemon runtime.
     # The parent retains Cargo's stdin, process identity and jobserver FDs.
     # Setup helpers must neither consume those tokens nor keep their pipes alive.
@@ -147,6 +147,10 @@ def prepare_child(original, response, log_descriptor):
                 os.close(descriptor)
             except OSError:
                 pass
+    # Fork inherited the parent's short ownership-transfer mask. Restore the
+    # caller's mask only after session/handler/descriptor isolation, before any
+    # installed preparation code or shared-daemon startup can inherit it.
+    signal.pthread_sigmask(signal.SIG_SETMASK, original_signal_mask)
     try:
         environment = prepared_environment(original)
         report = {"environment": environment}
@@ -278,6 +282,10 @@ def bounded_prepared_environment(original):
     logs = bytearray()
     truncated = False
     failure = b""
+    # Cancellation must not run between fork returning a child and retaining
+    # its PID here. Keep acquisition in one short masked ownership transition;
+    # after it, the ordinary finally path owns cleanup even on cancellation.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, SETUP_SIGNALS)
     try:
         parent, child = socket.socketpair()
         log_read, log_write = os.pipe2(os.O_CLOEXEC)
@@ -286,7 +294,7 @@ def bounded_prepared_environment(original):
             try:
                 parent.close()
                 os.close(log_read)
-                prepare_child(original, child, log_write)
+                prepare_child(original, child, log_write, previous)
             except BaseException:
                 os._exit(1)
             os._exit(0)
@@ -294,6 +302,7 @@ def bounded_prepared_environment(original):
         child = None
         os.close(log_write)
         log_write = None
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         parent.setblocking(False)
         os.set_blocking(log_read, False)
         data = bytearray()
@@ -348,14 +357,23 @@ def bounded_prepared_environment(original):
                    .format(str(error)[:4096])).encode("utf-8", errors="backslashreplace")
         return original
     finally:
-        if pid and not cleanup_preparer(pid):
-            failure += b"rch: RABS setup cleanup remains pending; acceleration not used\n"
-        for stream in (parent, child):
-            if stream is not None:
-                stream.close()
-        for descriptor in (log_read, log_write):
-            if descriptor is not None:
-                os.close(descriptor)
+        # A signal during cleanup must not skip reaping or leak raw pipe FDs.
+        # The nested cleanup helper preserves this outer mask; pending signals
+        # reach the original handlers only after all owned resources settle.
+        signal.pthread_sigmask(signal.SIG_BLOCK, SETUP_SIGNALS)
+        try:
+            try:
+                if pid and not cleanup_preparer(pid):
+                    failure += b"rch: RABS setup cleanup remains pending; acceleration not used\n"
+            finally:
+                for stream in (parent, child):
+                    if stream is not None:
+                        stream.close()
+                for descriptor in (log_read, log_write):
+                    if descriptor is not None:
+                        os.close(descriptor)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         if truncated:
             logs.extend(b"rch: RABS preparation diagnostics truncated\n")
         replay_diagnostics(failure + logs)
