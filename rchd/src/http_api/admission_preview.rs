@@ -9,8 +9,9 @@ use super::ApiState;
 use crate::DaemonContext;
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, RawQuery, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, RawQuery, Request, State, rejection::JsonRejection},
     http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -34,7 +35,45 @@ fn router_with_limit(limit: Arc<Semaphore>) -> Router<Arc<ApiState>> {
     Router::new()
         .route(ROUTE, get(get_preview).post(post_preview))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .layer(Extension(limit))
+        .route_layer(middleware::from_fn_with_state(limit, bounded_request))
+}
+
+/// Charge ingress to the same budget as selection. A JSON extractor runs
+/// before its handler: acquiring here, not in `preview`, bounds incomplete
+/// uploads as well as fully decoded requests. The parent's auth layer is
+/// outside this layer, so an unauthenticated request never occupies a permit.
+async fn bounded_request(
+    State(limit): State<Arc<Semaphore>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let permit = match limit.try_acquire_owned() {
+        Ok(permit) => Arc::new(permit),
+        Err(_) => {
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "admission-preview capacity exhausted",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
+    request.extensions_mut().insert(Arc::clone(&permit));
+    // One deadline covers body ingestion, parsing, source inspection and
+    // selection. Finishing a slow upload does not start a fresh timeout.
+    let response = match tokio::time::timeout(PREVIEW_TIMEOUT, next.run(request)).await {
+        Ok(response) => no_store(response),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admission-preview timed out; no build was admitted",
+        ),
+    };
+    // A non-cancellable blocking source read retains its own Arc until it
+    // actually finishes, even if the request deadline expired above.
+    drop(permit);
+    response
 }
 
 fn no_store(mut response: Response) -> Response {
@@ -59,7 +98,7 @@ fn error(status: StatusCode, message: &str) -> Response {
 
 async fn get_preview(
     State(state): State<Arc<ApiState>>,
-    Extension(limit): Extension<Arc<Semaphore>>,
+    Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
     RawQuery(query): RawQuery,
 ) -> Response {
     let query = query.as_deref().unwrap_or_default();
@@ -71,18 +110,18 @@ async fn get_preview(
         );
     }
     match PreviewRequest::from_query(query) {
-        Ok(request) => preview(state, limit, request).await,
+        Ok(request) => preview(state, permit, request).await,
         Err(_) => error(StatusCode::BAD_REQUEST, "invalid admission-preview request"),
     }
 }
 
 async fn post_preview(
     State(state): State<Arc<ApiState>>,
-    Extension(limit): Extension<Arc<Semaphore>>,
+    Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
     payload: Result<Json<PreviewRequest>, JsonRejection>,
 ) -> Response {
     match payload {
-        Ok(Json(request)) => preview(state, limit, request).await,
+        Ok(Json(request)) => preview(state, permit, request).await,
         // Preserve 413/415 and syntax/data rejection status, but do not echo
         // command contents, tool names or credentials in parser diagnostics.
         Err(rejection) => error(rejection.status(), "invalid admission-preview JSON"),
@@ -91,33 +130,16 @@ async fn post_preview(
 
 async fn preview(
     state: Arc<ApiState>,
-    limit: Arc<Semaphore>,
+    permit: Arc<OwnedSemaphorePermit>,
     request: PreviewRequest,
 ) -> Response {
     let request = match request.into_selection() {
         Ok(request) => request,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid admission-preview request"),
     };
-    let permit = match limit.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let mut response = error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "admission-preview capacity exhausted",
-            );
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            return response;
-        }
-    };
-    match tokio::time::timeout(PREVIEW_TIMEOUT, observe(&state.ctx, request, permit)).await {
-        Ok(Ok(response)) => no_store(Json(response).into_response()),
-        Ok(Err(message)) => error(StatusCode::SERVICE_UNAVAILABLE, message),
-        Err(_) => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "admission-preview timed out; no build was admitted",
-        ),
+    match observe(&state.ctx, request, permit).await {
+        Ok(response) => no_store(Json(response).into_response()),
+        Err(message) => error(StatusCode::SERVICE_UNAVAILABLE, message),
     }
 }
 
@@ -136,7 +158,7 @@ fn refused(reason: &str) -> PreviewResponse {
 async fn observe(
     ctx: &DaemonContext,
     request: SelectionRequest,
-    permit: OwnedSemaphorePermit,
+    permit: Arc<OwnedSemaphorePermit>,
 ) -> Result<PreviewResponse, &'static str> {
     // A restart cannot close admission between this check and the observation.
     // The outer timeout bounds this read-lock hold; no reservation is created.
@@ -542,6 +564,237 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    type UploadChunk = Result<hyper::body::Frame<axum::body::Bytes>, std::io::Error>;
+
+    /// A real streaming HTTP body: the JSON extractor must poll it to receive
+    /// bytes. Keeping the sender open models a client that stalls mid-upload.
+    struct Upload {
+        chunks: tokio::sync::mpsc::Receiver<UploadChunk>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl hyper::body::Body for Upload {
+        type Data = axum::body::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<UploadChunk>> {
+            let upload = self.get_mut();
+            upload.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            upload.chunks.poll_recv(cx)
+        }
+    }
+
+    fn upload() -> (
+        Body,
+        tokio::sync::mpsc::Sender<UploadChunk>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (sender, chunks) = tokio::sync::mpsc::channel(1);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = Body::new(Upload {
+            chunks,
+            polls: Arc::clone(&polls),
+        });
+        (body, sender, polls)
+    }
+
+    fn upload_request(body: Body) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(ROUTE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    fn limited_router(ctx: &DaemonContext, limit: Arc<Semaphore>) -> Router {
+        router_with_limit(limit)
+            .with_state(Arc::new(ApiState {
+                ctx: ctx.clone(),
+                token: None,
+            }))
+            .merge(create_router(HttpState {
+                pool: ctx.pool.clone(),
+                version: "fixture",
+                started_at: Instant::now(),
+                pid: 1,
+            }))
+    }
+
+    async fn body_was_polled(polls: &std::sync::atomic::AtomicUsize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler never entered the streaming body");
+    }
+
+    #[tokio::test]
+    async fn saturated_ingress_is_rejected_without_polling_the_body() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let _held = limit.clone().acquire_owned().await.unwrap();
+        let (body, _sender, polls) = upload();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            limited_router(&ctx, limit).oneshot(upload_request(body)),
+        )
+        .await
+        .expect("saturated ingress waited for a body")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_upload_holds_capacity_until_cancelled_but_not_health() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let router = limited_router(&ctx, limit.clone());
+        let (body, _sender, polls) = upload();
+        let slow = tokio::spawn(router.clone().oneshot(upload_request(body)));
+        body_was_polled(&polls).await;
+        assert_eq!(limit.available_permits(), 0);
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let busy = router
+            .clone()
+            .oneshot(http_request(&input(), true, None))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+        assert_eq!(limit.available_permits(), 1);
+        let response = router
+            .oneshot(http_request(&input(), true, None))
+            .await
+            .unwrap();
+        assert!(decoded(response).await.selection.worker.is_some());
+        assert_eq!(limit.available_permits(), 1);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_upload_expires_without_entering_selection() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let (body, _sender, polls) = upload();
+        let response = tokio::time::timeout(
+            PREVIEW_TIMEOUT + Duration::from_secs(1),
+            limited_router(&ctx, limit.clone()).oneshot(upload_request(body)),
+        )
+        .await
+        .expect("body ingress escaped the request deadline")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(polls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(limit.available_permits(), 1);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn completing_a_slow_upload_does_not_renew_selection_time() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let _blocked = ctx.admission_barrier.write().await;
+        let (body, sender, polls) = upload();
+        let slow =
+            tokio::spawn(limited_router(&ctx, limit.clone()).oneshot(upload_request(body)));
+        body_was_polled(&polls).await;
+        tokio::time::sleep(PREVIEW_TIMEOUT * 3 / 4).await;
+        sender
+            .send(Ok(hyper::body::Frame::data(
+                serde_json::to_vec(&input()).unwrap().into(),
+            )))
+            .await
+            .unwrap();
+        drop(sender);
+        let response = tokio::time::timeout(PREVIEW_TIMEOUT / 2, slow)
+            .await
+            .expect("finishing the body restarted the selection timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(limit.available_permits(), 1);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_and_oversized_streams_release_the_ingress_permit() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let router = limited_router(&ctx, limit.clone());
+        for (bytes, status) in [
+            (b"{".to_vec(), StatusCode::BAD_REQUEST),
+            (
+                vec![b' '; MAX_REQUEST_BYTES + 1],
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let (body, sender, _) = upload();
+            sender
+                .send(Ok(hyper::body::Frame::data(bytes.into())))
+                .await
+                .unwrap();
+            drop(sender);
+            let response = router
+                .clone()
+                .oneshot(upload_request(body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(limit.available_permits(), 1);
+        }
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn authentication_still_precedes_body_ingress() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        for token in [None, Some("wrong-token")] {
+            let (body, _sender, polls) = upload();
+            let mut request = upload_request(body);
+            if let Some(token) = token {
+                request
+                    .headers_mut()
+                    .insert("x-rch-token", token.parse().unwrap());
+            }
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                router.clone().oneshot(request),
+            )
+            .await
+            .expect("unauthenticated body was read")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
         assert_unowned(&ctx, 4).await;
     }
 }
