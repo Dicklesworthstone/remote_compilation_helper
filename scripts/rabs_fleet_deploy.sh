@@ -181,13 +181,22 @@ PRIVATE_KEY_ID=$(openssl pkey -passin pass: -pubout -outform DER < <(printf '%s'
 emit() { printf '{"kind":"fleet-deploy","worker":"%s","step":"%s","status":"%s"}\n' "$WORKER" "$1" "$2"; }
 failed() { emit "$1" failed; printf 'rabs_fleet_deploy: %s\n' "$2" >&2; exit 1; }
 
-# CAPABILITY GATE: probe bwrap + userns on the worker BEFORE any copy.
+# CAPABILITY GATE: exercise the complete canonical namespace BEFORE any copy.
+# Keep this no-input launch aligned with rabs-sandbox's canonical namespace
+# probe: a host may allow a root-bind userns while refusing private proc/dev/tmp
+# mounts or one of the other namespaces the actual worker always requires.
 emit capability-probe start
 CAP=$(ssh "${SSH_OPTS[@]}" "root@$WORKER" '
   command -v bwrap >/dev/null 2>&1 || { echo "no-bwrap"; exit 0; }
-  # A real userns smoke test, not just a which(): bwrap must actually run.
-  bwrap --unshare-user --uid 0 --ro-bind / / true >/dev/null 2>&1 ||
-    { echo "bwrap-present-but-userns-fails"; exit 0; }
+  bwrap --die-with-parent --unshare-user --unshare-pid --unshare-ipc \
+    --unshare-uts --unshare-net --hostname rabs --clearenv \
+    --proc /proc --dev /dev --ro-bind /usr /usr \
+    --symlink usr/bin /bin --symlink usr/sbin /sbin \
+    --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+    --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+    --ro-bind-try /etc/alternatives /etc/alternatives \
+    --tmpfs /__rabs/tmp --chdir / -- /usr/bin/true >/dev/null 2>&1 ||
+    { echo "bwrap-present-but-canonical-fails"; exit 0; }
   for tool in systemctl flock install mktemp cat chmod mv; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing-deployment-tool"; exit 0; }
   done
@@ -197,7 +206,7 @@ CAP=$(ssh "${SSH_OPTS[@]}" "root@$WORKER" '
 
 if [ "$CAP" != "canonical-ok" ]; then
   case "$CAP" in
-    no-bwrap|bwrap-present-but-userns-fails|missing-deployment-tool|systemd-unavailable)
+    no-bwrap|bwrap-present-but-canonical-fails|missing-deployment-tool|systemd-unavailable)
       emit capability-probe "refused:$CAP"
       printf 'REFUSED: %s (%s); no files copied\n' "$WORKER" "$CAP" >&2
       exit 1

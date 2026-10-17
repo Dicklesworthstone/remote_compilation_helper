@@ -125,7 +125,10 @@ cat > "$FIXTURE_BIN/bwrap" <<'BWRAP'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$RABS_TEST_CASE/bwrap.log"
-[[ "${RABS_TEST_BWRAP:-allow}" == allow ]]
+[[ "${RABS_TEST_BWRAP:-allow}" == allow ]] || exit 1
+for argument do
+    [[ "$argument" != "${RABS_TEST_BWRAP_DENY:-}" ]] || exit 1
+done
 BWRAP
 
 cat > "$FIXTURE_BIN/systemctl" <<'SYSTEMCTL'
@@ -243,7 +246,7 @@ run_deploy() {
     snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.before"
     if env -u BASH_ENV -u ENV PATH="$FIXTURE_BIN:$PATH" \
         RABS_TEST_CASE="$CASE_DIR" RABS_TEST_REMOTE_ROOT="$CASE_DIR/remote" \
-        RABS_TEST_BWRAP=allow RABS_TEST_FAIL_TLS_TRANSFER=0 \
+        RABS_TEST_BWRAP=allow RABS_TEST_BWRAP_DENY= RABS_TEST_FAIL_TLS_TRANSFER=0 \
         RABS_TEST_SYSTEMCTL_FAIL= RABS_TEST_VERSION_FAIL=0 \
         RABS_WORKER_TLS_CA="$CERT_DIR/coordinator-ca.pem" \
         RABS_WORKER_TLS_CERT="$CERT_DIR/client.pem" \
@@ -325,6 +328,26 @@ cmp "$CASE_DIR/attempt-$ATTEMPT.before" "$CASE_DIR/attempt-$ATTEMPT.after" \
     || fail 'bwrap refusal wrote deployment files'
 [[ ! -s "$CASE_DIR/systemctl.log" ]] || fail 'bwrap refusal touched the service'
 pass 'bwrap refuses before remote installation writes'
+
+# Each controlled host admits the old root-bind userns smoke command but
+# refuses one operation required by the actual canonical worker. The complete
+# generated remote shell must reject it before transferring a single file.
+for facet in --proc --dev --tmpfs --unshare-pid --unshare-ipc --unshare-uts --unshare-net; do
+    run_deploy "canonical-refused-${facet#--}" failure worker.example coordinator.example:7443 \
+        "RABS_TEST_BWRAP_DENY=$facet"
+    grep -Fq 'refused:bwrap-present-but-canonical-fails' "$CASE_STDOUT" \
+        || fail "$facet refusal did not identify the canonical capability failure"
+    [[ $(grep -c '^CALL$' "$CASE_DIR/ssh.log") == 1 ]] \
+        || fail "$facet refusal reached a later deployment step"
+    snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.after"
+    cmp "$CASE_DIR/attempt-$ATTEMPT.before" "$CASE_DIR/attempt-$ATTEMPT.after" \
+        || fail "$facet refusal wrote deployment files"
+    [[ ! -s "$CASE_DIR/systemctl.log" ]] || fail "$facet refusal touched the service"
+    env RABS_TEST_CASE="$CASE_DIR" RABS_TEST_BWRAP=allow RABS_TEST_BWRAP_DENY="$facet" \
+        "$FIXTURE_BIN/bwrap" --unshare-user --uid 0 --ro-bind / / true \
+        || fail "controlled $facet host must admit the old, insufficient smoke probe"
+    pass "$facet failure refuses canonical deployment despite a working root-bind userns"
+done
 
 run_deploy systemd-unavailable failure worker.example coordinator.example:7443 \
     RABS_TEST_SYSTEMCTL_FAIL=show-environment
