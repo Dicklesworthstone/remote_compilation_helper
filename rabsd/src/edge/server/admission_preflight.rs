@@ -95,6 +95,15 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
             "dependency outputs require --out-dir",
         ));
     }
+    // The live capture path needs rustc's file/environment read report before
+    // it can publish a result. Missing --emit defaults to link, not dep-info.
+    // Do not warm facts for a compile that can never provide that evidence.
+    // Exact destination/option validation still belongs to the output adapter.
+    if !invocation.emit.iter().any(|kind| kind == "dep-info") {
+        return Some(LiveRefusal::NotDependencyCompile(
+            "live dependency serving requires dep-info read evidence",
+        ));
+    }
     if !invocation
         .passthrough
         .iter()
@@ -300,6 +309,86 @@ mod tests {
                 rejection(request),
                 Some(LiveRefusal::MissingEnv("CARGO_MANIFEST_DIR"))
             );
+        }
+    }
+
+    #[test]
+    fn missing_read_evidence_is_rejected_by_preflight_and_the_full_planner() {
+        for extra in [
+            vec![],
+            vec!["--emit=link"],
+            vec!["--emit", "metadata"],
+            vec!["--emit=metadata,link"],
+            vec!["--emit=metadata", "-Cmetadata=dep-info"],
+            vec!["--emit=metadata,dep-info=/tmp/elsewhere.d"],
+        ] {
+            let (mut argv, env) = fixture(PACKAGE);
+            argv.retain(|arg| arg != "--emit=metadata,dep-info");
+            argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            let request = LiveRustcRequest {
+                argv: &argv,
+                cwd: PACKAGE,
+                env: &env,
+            };
+            assert!(matches!(
+                rejection(request),
+                Some(LiveRefusal::NotDependencyCompile(
+                    "live dependency serving requires dep-info read evidence"
+                ))
+            ));
+            for host in [
+                HOST,
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-musl",
+            ] {
+                assert!(
+                    plan_dependency_action(request, host).is_err(),
+                    "{extra:?} on {host}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_edge_never_warms_or_serves_without_read_evidence() {
+        use super::super::{Decided, LiveEdge, decide};
+        use crate::coord::live::CoordLive;
+        use crate::coord::live_dependency::LiveDependencyLane;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let temporary = crate::test_util::private_tempdir();
+        let cas = Arc::new(
+            crate::janitor::store::mount_and_reconcile(&temporary.path().join("cas")).unwrap(),
+        );
+        let coord = Arc::new(CoordLive::with_cas(cas));
+        coord
+            .acquire_boot_authority("read-evidence-preflight")
+            .unwrap();
+        coord.mark_up();
+        let live = LiveEdge::new(LiveDependencyLane::new(coord));
+        for may_wait in [false, true] {
+            for extra in [vec![], vec!["--emit=link"], vec!["--emit", "metadata,link"]] {
+                let (mut argv, mut env) = fixture(PACKAGE);
+                argv.retain(|arg| arg != "--emit=metadata,dep-info");
+                argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+                // Read-veto projections must not gain an exception: even an
+                // OUT_DIR consumer with otherwise ordinary Cargo args refuses.
+                env.push(("OUT_DIR".into(), "/target/build/leaf/out".into()));
+                let request = json!({
+                    "kind": "rustc-request", "argv": argv, "cwd": PACKAGE,
+                    "env": env, "wait_for_inflight": may_wait,
+                });
+                let Decided::Shadow(observed) = decide(&live, &request) else {
+                    panic!("missing read evidence must bypass before native facts or cache lookup");
+                };
+                assert_eq!(
+                    observed.argv, argv,
+                    "fallback must preserve the exact emit request"
+                );
+            }
         }
     }
 

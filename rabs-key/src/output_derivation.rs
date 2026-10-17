@@ -264,8 +264,10 @@ pub fn derive_output_declarations(
 /// Derive the complete file set for the first Cargo dependency serving lane
 /// (bd-14t4j), rather than treating a naming table as an output-closure proof.
 ///
-/// Supported here: ordinary Linux `lib`/`rlib` invocations producing link,
-/// metadata and/or dep-info files. Unknown flags are safe to retain in a key,
+/// Supported here: ordinary Linux `lib`/`rlib` invocations producing dep-info
+/// and optionally link/metadata files. Dep-info is mandatory read evidence for
+/// the live lane's post-execution file and environment closure checks, not just
+/// an optional artifact. Unknown flags are safe to retain in a key,
 /// but NOT safe to ignore when predicting the complete set of writes. In
 /// particular `--test`, `-o`, response files, incremental state, save-temps,
 /// split-debug sidecars and unmodeled unstable output modes cannot use this
@@ -338,6 +340,20 @@ pub fn derive_dependency_output_declarations(
     }
     check_dependency_output_options(invocation)?;
     let declarations = derive_output_declarations(invocation, host_target)?;
+    // Knowing the output names does not close the compiler's input reads.
+    // The live capture path enforces source/include and tracked environment
+    // reads only when harvesting DepInfo. Without it a successful compile
+    // could publish unobserved inputs, including reads vetoed by a placement
+    // projection. Refuse before keying; never add outputs to the user's argv.
+    if !declarations
+        .declarations
+        .iter()
+        .any(|output| output.class == OutputClass::DepInfo && !output.optional)
+    {
+        return Err(unsupported(
+            "live dependency serving requires dep-info read evidence",
+        ));
+    }
     for output in &declarations.declarations {
         let name = &output.virtual_path;
         if name.len() > 255
@@ -661,6 +677,117 @@ mod tests {
         assert_eq!(names(&derive(&inv)), vec!["foo-123.d", "libfoo-123.rmeta"]);
         inv.out_dir = Some("/another/worktree/target/debug/deps".into());
         assert_eq!(names(&derive(&inv)), vec!["foo-123.d", "libfoo-123.rmeta"]);
+    }
+
+    #[test]
+    fn live_serving_requires_dep_info_but_general_output_naming_does_not() {
+        for extra in [
+            vec![],
+            vec!["--emit=link"],
+            vec!["--emit", "link"],
+            vec!["--emit=metadata"],
+            vec!["--emit", "metadata"],
+            vec!["--emit=link,metadata"],
+            vec!["--emit", "metadata,link"],
+        ] {
+            let mut args = vec![
+                "--crate-name=foo",
+                "--crate-type=lib",
+                "--out-dir=/work/deps",
+                "src/lib.rs",
+            ];
+            args.extend_from_slice(&extra);
+            let inv = invocation(&args);
+            for host in [
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-musl",
+            ] {
+                let general = derive_output_declarations(&inv, host).unwrap();
+                assert!(!general.declarations.is_empty());
+                assert!(
+                    general.declarations.iter().all(|d| d.class != OutputClass::DepInfo)
+                );
+                assert_eq!(
+                    derive_dependency_output_declarations(&inv, host),
+                    Err(DerivationRefusal::UnsupportedDependencyInvocation(
+                        "live dependency serving requires dep-info read evidence"
+                    )),
+                    "{extra:?} on {host}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_serving_keeps_complete_outputs_when_read_evidence_is_declared() {
+        for emit in [
+            "dep-info",
+            "dep-info,metadata",
+            "metadata,dep-info",
+            "link,dep-info",
+            "dep-info,metadata,link",
+        ] {
+            for split in [false, true] {
+                let joined = format!("--emit={emit}");
+                let mut args = vec![
+                    "--crate-name=foo",
+                    "--crate-type=rlib",
+                    "--out-dir=/work/deps",
+                    "-Cextra-filename=-123",
+                    "src/lib.rs",
+                ];
+                if split {
+                    args.extend(["--emit", emit]);
+                } else {
+                    args.push(&joined);
+                }
+                let inv = invocation(&args);
+                let declared =
+                    derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu")
+                        .unwrap();
+                assert_eq!(
+                    declared,
+                    derive_output_declarations(&inv, "x86_64-unknown-linux-gnu").unwrap()
+                );
+                let evidence: Vec<_> = declared
+                    .declarations
+                    .iter()
+                    .filter(|d| d.class == OutputClass::DepInfo)
+                    .collect();
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(evidence[0].virtual_path, "foo-123.d");
+                assert!(!evidence[0].optional);
+            }
+        }
+    }
+
+    #[test]
+    fn a_dep_info_spelling_in_data_or_an_unmodeled_destination_is_not_evidence() {
+        for extra in [
+            vec!["--emit=metadata", "--cfg=dep_info"],
+            vec!["--emit=link", "-Cmetadata=dep-info"],
+            vec!["--emit=metadata", "--remap-path-prefix=/source=/dep-info"],
+            vec!["--emit=metadata,dep-info=/tmp/elsewhere.d"],
+            vec!["--emit=metadata,dep-info=-"],
+        ] {
+            let mut args = vec![
+                "--crate-name=foo",
+                "--crate-type=lib",
+                "--out-dir=/work/deps",
+                "src/lib.rs",
+            ];
+            args.extend_from_slice(&extra);
+            assert!(
+                derive_dependency_output_declarations(
+                    &invocation(&args),
+                    "x86_64-unknown-linux-gnu"
+                )
+                .is_err(),
+                "{extra:?}"
+            );
+        }
     }
 
     #[test]
