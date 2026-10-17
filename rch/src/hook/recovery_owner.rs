@@ -73,7 +73,8 @@ impl RecoveryOwnership {
     /// The first lease must never replace an existing wrapper's evidence.
     /// Readers can refuse an incomplete initial file; daemon admission starts
     /// only after this write and its held directory have been synchronized.
-    /// An initialization failure retains its exact partial bytes, too.
+    /// An initialization failure retains its exact partial bytes, too, while a
+    /// zero-byte creation failure unlinks our own empty file before admission.
     pub(in crate::hook) fn initialize(&self, bytes: &[u8]) -> anyhow::Result<()> {
         use rustix::fs::{Mode, OFlags};
         use std::io::Write;
@@ -86,7 +87,18 @@ impl RecoveryOwnership {
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::RUSR | Mode::WUSR,
         )?);
-        file.write_all(bytes)?;
+        if let Err(error) = file.write_all(bytes) {
+            if file.metadata().is_ok_and(|metadata| metadata.len() == 0)
+                && self.require_named_file(&file, &self.journal_name).is_ok()
+            {
+                let _ = rustix::fs::unlinkat(
+                    self.directory.as_fd(),
+                    self.journal_name.as_c_str(),
+                    rustix::fs::AtFlags::empty(),
+                );
+            }
+            return Err(error.into());
+        }
         file.sync_all()?;
         self.finish_initialization(&file, bytes)
     }

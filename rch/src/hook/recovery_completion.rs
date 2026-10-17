@@ -162,16 +162,19 @@ pub(super) fn validate_recorded_delivery(lease: &DurableJobLease) -> Result<()> 
 }
 
 /// Matches rchd's stuck-build hard cap (`should_remediate`).
-const DAEMON_ABSENCE_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+pub(crate) const DAEMON_ABSENCE_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
-fn unix_ms_now() -> u64 {
+pub(crate) fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
-fn daemon_absence_is_conclusive(lease: &crate::hook::DurableJobLease, now_unix_ms: u64) -> bool {
+pub(crate) fn daemon_absence_is_conclusive(
+    lease: &crate::hook::DurableJobLease,
+    now_unix_ms: u64,
+) -> bool {
     lease.heartbeat_unix_ms > 0
         && now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DAEMON_ABSENCE_MIN_AGE_MS
 }

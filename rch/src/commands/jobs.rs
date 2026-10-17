@@ -623,6 +623,48 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             )?;
             return Ok(());
         }
+        if recover
+            && status["status"] == "not_found"
+            && lease.recovery.is_none()
+            && owner_presence(&lease) == OwnerPresence::Absent
+        {
+            let build_id = lease
+                .identity
+                .remote_build_id
+                .filter(|id| *id > 0)
+                .context("recovery requires an admitted build identity")?;
+            anyhow::ensure!(
+                lease
+                    .worker_id
+                    .as_deref()
+                    .is_some_and(|worker| !worker.is_empty()),
+                "recovery requires an admitted worker identity"
+            );
+            anyhow::ensure!(
+                crate::hook::daemon_absence_is_conclusive(&lease, crate::hook::unix_ms_now()),
+                "daemon has no record of recovered build {build_id}; acknowledgement waits until the lease is 24h old"
+            );
+            let latest_writer = within_job_deadline(
+                deadline,
+                "terminal journal ownership",
+                writer.claim_recovery(),
+            )
+            .await?;
+            let Some(code) = settle_absent_not_found_without_recovery(
+                &lease,
+                &latest_writer,
+                crate::hook::unix_ms_now(),
+            )?
+            else {
+                wait_for_job_poll(deadline).await?;
+                continue;
+            };
+            emit(
+                ctx,
+                &latest_writer.terminal_job_report(&wrapper_id, "recovered", Some(code))?,
+            )?;
+            return Ok(());
+        }
         if !process_matches(&lease) {
             anyhow::bail!(
                 "original wrapper is absent or its identity cannot be verified; use jobs recover with retained retrieval evidence (daemon status: {}); command will not be replayed",
@@ -631,6 +673,38 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         }
         wait_for_job_poll(deadline).await?;
     }
+}
+
+#[cfg(unix)]
+fn settle_absent_not_found_without_recovery(
+    observed: &DurableJobLease,
+    writer: &crate::hook::DurableLeaseWriter,
+    now_unix_ms: u64,
+) -> Result<Option<i32>> {
+    let latest = writer.snapshot();
+    if !same_unfinished_owner_without_recovery(observed, &latest) {
+        return Ok(None);
+    }
+    let build_id = latest
+        .identity
+        .remote_build_id
+        .filter(|id| *id > 0)
+        .context("recovery requires an admitted build identity")?;
+    anyhow::ensure!(
+        latest
+            .worker_id
+            .as_deref()
+            .is_some_and(|worker| !worker.is_empty()),
+        "recovery requires an admitted worker identity"
+    );
+    anyhow::ensure!(
+        crate::hook::daemon_absence_is_conclusive(&latest, now_unix_ms),
+        "daemon has no record of recovered build {build_id}; acknowledgement waits until the lease is 24h old"
+    );
+    let code = latest.exit_code.unwrap_or(102);
+    writer.record_exit(code)?;
+    writer.acknowledge_terminal()?;
+    Ok(Some(code))
 }
 
 #[cfg(test)]
@@ -1396,5 +1470,76 @@ mod tests {
             "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f:darwin:1791280000:123456",
         );
         assert!(!same_unfinished_owner_without_recovery(&observed, &latest));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recipeless_dead_lease_not_found_waits_24h_then_acknowledges_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = crate::hook::DurableLeaseWriter::create_in(
+            directory.path(),
+            "cargo build",
+            true,
+            false,
+        )
+        .unwrap();
+        writer
+            .admit(42, &rch_common::WorkerId::new("worker-a"))
+            .unwrap();
+        let observed = writer.snapshot();
+        let heartbeat = observed.heartbeat_unix_ms;
+        let twenty_four_hours_ms = 24 * 60 * 60 * 1000;
+
+        let premature = settle_absent_not_found_without_recovery(
+            &observed,
+            &writer,
+            heartbeat + twenty_four_hours_ms - 1,
+        )
+        .unwrap_err();
+        assert!(format!("{premature:#}").contains("waits until the lease is 24h old"));
+        assert!(!writer.snapshot().terminal_acknowledged);
+        assert_eq!(writer.snapshot().exit_code, None);
+
+        let code = settle_absent_not_found_without_recovery(
+            &observed,
+            &writer,
+            heartbeat + twenty_four_hours_ms,
+        )
+        .unwrap();
+        assert_eq!(code, Some(102));
+        let settled = writer.snapshot();
+        assert!(settled.terminal_acknowledged);
+        assert_eq!(settled.exit_code, Some(102));
+        assert_eq!(
+            settled.state,
+            rch_common::job_identity::JobLifecycleState::Finished
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recipeless_dead_lease_not_found_preserves_existing_observed_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer =
+            crate::hook::DurableLeaseWriter::create_in(directory.path(), "cargo test", true, false)
+                .unwrap();
+        writer
+            .admit(42, &rch_common::WorkerId::new("worker-a"))
+            .unwrap();
+        writer.record_exit(101).unwrap();
+        let observed = writer.snapshot();
+        let heartbeat = observed.heartbeat_unix_ms;
+        let twenty_four_hours_ms = 24 * 60 * 60 * 1000;
+
+        let code = settle_absent_not_found_without_recovery(
+            &observed,
+            &writer,
+            heartbeat + twenty_four_hours_ms,
+        )
+        .unwrap();
+        assert_eq!(code, Some(101));
+        let settled = writer.snapshot();
+        assert!(settled.terminal_acknowledged);
+        assert_eq!(settled.exit_code, Some(101));
     }
 }

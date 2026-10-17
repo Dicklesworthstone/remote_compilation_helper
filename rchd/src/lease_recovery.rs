@@ -65,6 +65,18 @@ fn retired_delivery(lease: &DurableJobLease) -> Option<i32> {
         .and_then(|code| i32::try_from(code).ok())
 }
 
+/// Matches rchd's stuck-build hard cap (`should_remediate`) and the client's
+/// `DAEMON_ABSENCE_MIN_AGE_MS` threshold (bd-ey7fr).
+const DAEMON_ABSENCE_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn abandoned_without_recovery(lease: &DurableJobLease, now_unix_ms: u64) -> bool {
+    lease.recovery.is_none()
+        && lease.identity.remote_build_id.is_some_and(|id| id > 0)
+        && lease.worker_id.as_deref().is_some_and(|id| !id.is_empty())
+        && lease.heartbeat_unix_ms > 0
+        && now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DAEMON_ABSENCE_MIN_AGE_MS
+}
+
 /// A successful CLI exit can mean only that a live wrapper was asked to resume.
 /// Count recovery as complete only after reading the original journal back.
 fn verify_recovery_completion(
@@ -80,6 +92,21 @@ fn verify_recovery_completion(
         || before.command_fingerprint != after.command_fingerprint
     {
         return Err("recovery journal identity changed; completion not confirmed".into());
+    }
+    if before.recovery.is_none() && after.recovery.is_none() {
+        if before.heartbeat_unix_ms == 0
+            || !after.terminal_acknowledged
+            || after.state != rch_common::job_identity::JobLifecycleState::Finished
+            || after.exit_code.is_none()
+            || before
+                .exit_code
+                .is_some_and(|observed| Some(observed) != after.exit_code)
+        {
+            return Err(
+                "recovery command exited without durable daemon/delivery acknowledgement".into(),
+            );
+        }
+        return Ok(());
     }
     let daemon_exit = after.recovery.as_ref().and_then(|recipe| {
         recipe["daemon_exit_code"]
@@ -162,7 +189,9 @@ fn recoverable_candidates(
         .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
         .filter(|lease| {
             !lease.terminal_acknowledged
-                && (lease_owns_unretired_source(lease) || retired_delivery(lease).is_some())
+                && (lease_owns_unretired_source(lease)
+                    || retired_delivery(lease).is_some()
+                    || abandoned_without_recovery(lease, now_unix_ms))
                 && !lease_blocks_restart(lease, now_unix_ms, || alive(lease.wrapper_pid))
         })
         .filter_map(|lease| {
@@ -1057,5 +1086,48 @@ mod tests {
             );
             assert_eq!(std::fs::read(&path).unwrap(), journal);
         }
+    }
+
+    #[test]
+    fn recipeless_dead_leases_become_recoverable_after_24h_and_verify_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let twenty_four_hours_ago = now - DAEMON_ABSENCE_MIN_AGE_MS;
+        let too_young = twenty_four_hours_ago + 1;
+
+        let mut mature = lease(twenty_four_hours_ago, 11, serde_json::Value::Null);
+        mature.recovery = None;
+        let mut young = lease(too_young, 11, serde_json::Value::Null);
+        young.recovery = None;
+        let mut live_owner = lease(twenty_four_hours_ago, 22, serde_json::Value::Null);
+        live_owner.recovery = None;
+
+        for candidate in [&mature, &young, &live_owner] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", candidate.identity.local_wrapper_id)),
+                serde_json::to_vec(candidate).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
+            std::slice::from_ref(&mature.identity.local_wrapper_id)
+        );
+
+        assert!(verify_recovery_completion(&mature, &mature).is_err());
+        let mut settled = mature.clone();
+        settled.exit_code = Some(102);
+        settled.acknowledge_terminal(now);
+        verify_recovery_completion(&mature, &settled).unwrap();
+
+        let mut with_observed_exit = mature.clone();
+        with_observed_exit.exit_code = Some(101);
+        let mut mismatched_exit = settled.clone();
+        mismatched_exit.exit_code = Some(102);
+        assert!(verify_recovery_completion(&with_observed_exit, &mismatched_exit).is_err());
+        let mut matching_exit = settled;
+        matching_exit.exit_code = Some(101);
+        verify_recovery_completion(&with_observed_exit, &matching_exit).unwrap();
     }
 }

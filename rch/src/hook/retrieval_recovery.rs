@@ -26,6 +26,7 @@ mod publication_runtime_tests;
 
 #[path = "recovery_completion.rs"]
 mod recovery_completion;
+pub(crate) use recovery_completion::{daemon_absence_is_conclusive, unix_ms_now};
 #[path = "recovery_owner.rs"]
 pub(in crate::hook) mod recovery_owner;
 #[path = "result_recovery.rs"]

@@ -1972,7 +1972,7 @@ impl DurableLeaseWriter {
         )
     }
 
-    fn create_in(
+    pub(crate) fn create_in(
         directory: &Path,
         command: &str,
         strict_remote: bool,
@@ -2031,7 +2031,7 @@ impl DurableLeaseWriter {
             .clone()
     }
 
-    fn admit(&self, remote_build_id: u64, worker_id: &WorkerId) -> anyhow::Result<()> {
+    pub(crate) fn admit(&self, remote_build_id: u64, worker_id: &WorkerId) -> anyhow::Result<()> {
         anyhow::ensure!(
             remote_build_id > 0
                 && remote_build_id < (1_u64 << 63)
@@ -5067,7 +5067,9 @@ mod progress_reporting;
 // unqualified.
 mod transfer_orchestration;
 use transfer_orchestration::execute_remote_compilation;
-pub(crate) use transfer_orchestration::recovery::{recover_job, recover_job_cargo_json};
+pub(crate) use transfer_orchestration::recovery::{
+    daemon_absence_is_conclusive, recover_job, recover_job_cargo_json, unix_ms_now,
+};
 
 // Exact source-byte manifest construction and worker-side re-verification for
 // `rch exec --source-content-receipt` proof runs.
