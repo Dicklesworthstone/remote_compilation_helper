@@ -36,6 +36,7 @@ pub mod canonical_mounts;
 pub mod canonical_namespace;
 pub mod cargo_home;
 pub mod cgroup_envelope;
+pub mod dependency_context;
 pub mod edit_watcher;
 pub mod env_builder;
 pub mod equality_suite;
@@ -50,6 +51,7 @@ pub mod process_context;
 pub mod pseudo_files;
 #[cfg(unix)]
 pub mod regular_input;
+pub mod runtime_cohort;
 pub mod runtime_path_scanner;
 pub mod snapshot_capture;
 #[cfg(unix)]

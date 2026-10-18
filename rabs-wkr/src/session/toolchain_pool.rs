@@ -165,6 +165,20 @@ impl ToolchainLease {
     /// existing inode/mutation verification still applies.
     pub(super) fn validate_namespace(&self, spec: &CanonicalNamespaceSpec) -> io::Result<()> {
         let visible = Path::new(rabs_sandbox::layout::TOOLCHAIN);
+        self.validate_namespace_at(spec, visible)
+    }
+
+    /// The distinct dependency context validates original aliases without
+    /// widening the canonical namespace's fixed toolchain root.
+    pub(super) fn validate_dependency_namespace(
+        &self,
+        spec: &CanonicalNamespaceSpec,
+        context: &rabs_sandbox::dependency_context::DependencyExecContext,
+    ) -> io::Result<()> {
+        self.validate_namespace_at(spec, Path::new(context.toolchain_root()))
+    }
+
+    fn validate_namespace_at(&self, spec: &CanonicalNamespaceSpec, visible: &Path) -> io::Result<()> {
         let root = std::fs::canonicalize(self.root())?;
         let pool = std::fs::canonicalize(self.dataset.pool.0.path())?;
         let durable = self

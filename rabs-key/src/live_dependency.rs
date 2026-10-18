@@ -99,6 +99,8 @@ use crate::path_policy::{BuildPathSemanticPolicy, policy_component_digest};
 use crate::toolchain::ToolchainContract;
 use crate::typed_digest::compute;
 
+pub mod remote;
+
 /// Key epoch of the live dependency class. Epoch 3 preserves and keys the
 /// complete compiler environment. It retains epoch 2's acknowledged immutable
 /// output capture requirement; entries from either earlier epoch are not reused.

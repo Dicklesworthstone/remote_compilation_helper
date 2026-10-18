@@ -204,6 +204,21 @@ impl JobserverBridge {
         env.push(("CARGO_MAKEFLAGS".to_string(), bridge.makeflags.clone()));
         env.sort_by(|a, b| a.0.cmp(&b.0));
     }
+
+    /// A direct rustc dependency has no child build tools whose logical
+    /// capacity may be rewritten. Keep its keyed NUM_JOBS exact, including
+    /// absence and empty values, while replacing unusable remote descriptors.
+    /// The coordinator must veto delivery if dep-info records any read of a
+    /// replaced coordination variable (even an originally absent variable).
+    pub fn apply_dependency(env: &mut Vec<(String, String)>, bridge: &Self) {
+        let original = env.iter().find(|(name, _)| name == "NUM_JOBS").cloned();
+        Self::apply(env, bridge);
+        env.retain(|(name, _)| name != "NUM_JOBS");
+        if let Some(original) = original {
+            env.push(original);
+        }
+        env.sort_by(|left, right| left.0.cmp(&right.0));
+    }
 }
 
 impl Drop for JobserverBridge {
@@ -215,6 +230,30 @@ impl Drop for JobserverBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dependency_bridge_preserves_num_jobs_absent_empty_and_exact_value() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = JobserverBridge::mint(3, root.path()).unwrap();
+        for original in [None, Some(""), Some("19")] {
+            let mut env = env_of(&[
+                ("CUSTOM", "exact value"), ("CARGO_MAKEFLAGS", "--jobserver-auth=999,1000"),
+                ("MFLAGS", "stale"), ("MAKEFLAGS", "-j777"),
+            ]);
+            if let Some(value) = original {
+                env.push(("NUM_JOBS".into(), value.into()));
+            }
+            JobserverBridge::apply_dependency(&mut env, &bridge);
+            let number = env.iter().find(|(name, _)| name == "NUM_JOBS").map(|(_, value)| value.as_str());
+            assert_eq!(number, original);
+            assert_eq!(env.iter().filter(|(name, _)| name == "MAKEFLAGS").count(), 1);
+            assert_eq!(env.iter().find(|(name, _)| name == "MAKEFLAGS").unwrap().1, bridge.makeflags());
+            assert_eq!(env.iter().find(|(name, _)| name == "CARGO_MAKEFLAGS").unwrap().1, bridge.makeflags());
+            assert!(!env.iter().any(|(name, _)| name == "MFLAGS"));
+            assert_eq!(env.iter().find(|(name, _)| name == "CUSTOM").unwrap().1, "exact value");
+        }
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

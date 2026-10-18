@@ -352,7 +352,7 @@ fn sorted_binds(binds: &[Bind]) -> Result<Vec<Bind>, IsolationError> {
     Ok(out)
 }
 
-fn push_common_prelude(argv: &mut Vec<OsString>) {
+pub(crate) fn push_common_prelude(argv: &mut Vec<OsString>) {
     argv.push("--die-with-parent".into());
     argv.push("--unshare-user".into());
     argv.push("--unshare-pid".into());
@@ -360,7 +360,7 @@ fn push_common_prelude(argv: &mut Vec<OsString>) {
     argv.push("--unshare-uts".into());
 }
 
-fn push_host_usr(argv: &mut Vec<OsString>) {
+pub(crate) fn push_host_usr(argv: &mut Vec<OsString>) {
     // Merged-usr host base, read-only: the dynamic linker, libc, and
     // /bin/sh for build scripts. Recorded as `host_usr_ro` in the boundary.
     argv.push("--ro-bind".into());
@@ -384,7 +384,7 @@ fn push_host_usr(argv: &mut Vec<OsString>) {
     argv.push("/etc/alternatives".into());
 }
 
-fn push_env(argv: &mut Vec<OsString>, env: &[(String, String)]) {
+pub(crate) fn push_env(argv: &mut Vec<OsString>, env: &[(String, String)]) {
     argv.push("--clearenv".into());
     let mut pairs = env.to_vec();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -395,7 +395,7 @@ fn push_env(argv: &mut Vec<OsString>, env: &[(String, String)]) {
     }
 }
 
-fn push_binds(argv: &mut Vec<OsString>, ro: &[Bind], rw: &[Bind]) {
+pub(crate) fn push_binds(argv: &mut Vec<OsString>, ro: &[Bind], rw: &[Bind]) {
     for bind in ro {
         argv.push("--ro-bind".into());
         argv.push(bind.backing.clone().into_os_string());
@@ -408,7 +408,7 @@ fn push_binds(argv: &mut Vec<OsString>, ro: &[Bind], rw: &[Bind]) {
     }
 }
 
-fn require_support(support: &HostIsolationSupport) -> Result<(), IsolationError> {
+pub(crate) fn require_support(support: &HostIsolationSupport) -> Result<(), IsolationError> {
     let missing = support.missing_for_canonical();
     if missing.is_empty() {
         Ok(())

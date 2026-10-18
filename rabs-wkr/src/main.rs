@@ -19,6 +19,7 @@ use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
+use rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION;
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
 use rabs_wkr::artifacts::{
@@ -33,7 +34,7 @@ use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{
     CanonicalExecRequest, execute_canonical_controlled, execute_uploaded_canonical_controlled,
-    parse_command_context, probe_capability, sample_pressure,
+    parse_command_context, parse_dependency_context, probe_capability, sample_pressure,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceOwner};
@@ -1033,6 +1034,7 @@ where
         output_preview_enabled,
         execution_lease,
         false,
+        false,
         |request, timeout, artifacts, source, toolchain, lease| {
             assert!(
                 toolchain.is_none(),
@@ -1060,6 +1062,7 @@ async fn drive_session_with_inputs<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
+    dependency_context_enabled: bool,
     launch: L,
     heartbeat: H,
 ) -> Result<(), String>
@@ -1086,6 +1089,7 @@ where
         output_preview_enabled,
         execution_lease,
         toolchain_reuse_enabled,
+        dependency_context_enabled,
         InputBudgets::default(),
         launch,
         heartbeat,
@@ -1105,6 +1109,7 @@ async fn drive_session_with_input_budgets<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
+    dependency_context_enabled: bool,
     input_budgets: InputBudgets,
     mut launch: L,
     mut heartbeat: H,
@@ -1123,6 +1128,11 @@ where
 {
     if toolchain_reuse_enabled && !toolchain_transfer_enabled {
         return Err("toolchain reuse requires toolchain transfer".to_owned());
+    }
+    if dependency_context_enabled
+        && !(source_transfer_enabled && toolchain_transfer_enabled && artifact_transfer_enabled)
+    {
+        return Err("dependency execution requires negotiated source, toolchain and artifact transfer".to_owned());
     }
     let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
@@ -1364,7 +1374,12 @@ where
                             }
                         }
                         Some("canonical-exec") => {
-                            let parsed = parse_exec_request(&value).and_then(|mut request| {
+                            let parsed = (|| {
+                                if value.get("dependency_context").is_some() && !dependency_context_enabled {
+                                    return Err("dependency context not negotiated".to_owned());
+                                }
+                                parse_exec_request(&value)
+                            })().and_then(|mut request| {
                                 // A different request or a worker-local execute
                                 // cannot orphan the staged owner and its clock.
                                 input_deadline.execution_request(&value, toolchain_transfer_enabled)?;
@@ -1376,6 +1391,9 @@ where
                                 let artifacts = artifacts::parse_plan(&value)?;
                                 if artifacts.is_some() && !artifact_transfer_enabled {
                                     return Err("artifact transfer not negotiated".to_owned());
+                                }
+                                if request.dependency_context.is_some() && artifacts.is_none() {
+                                    return Err("dependency execution requires declared artifacts".to_owned());
                                 }
                                 if let Some(path) = source_transfer.prepared_path(&value, source_transfer_enabled)? {
                                     request.workspace_backing = path;
@@ -1497,6 +1515,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
+        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION],
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
         "recovery_protocols": [RECOVERY_PROTOCOL],
         "result_retentions": [RESULT_RETENTION],
@@ -1539,6 +1558,7 @@ async fn session_loop(
         reuse_toolchain,
         output_preview,
         execution_lease,
+        dependency_context,
     ) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
@@ -1636,6 +1656,9 @@ async fn session_loop(
             let reuse =
                 toolchain_transfer::selected_reuse(&ack, local_identity.is_some(), toolchain)?;
             let preview = output_preview_requested(&ack)?;
+            let dependency_context = dependency_context_selection(
+                &ack, local_identity.is_some(), output, artifacts, source, toolchain,
+            )?;
             let lease = execution_lease_selection(
                 &ack,
                 local_identity.is_some(),
@@ -1646,7 +1669,7 @@ async fn session_loop(
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
             Ok::<_, String>((
-                output, artifacts, retain, source, toolchain, reuse, preview, lease,
+                output, artifacts, retain, source, toolchain, reuse, preview, lease, dependency_context,
             ))
         },
     )
@@ -1675,6 +1698,7 @@ async fn session_loop(
         output_preview,
         &execution_lease,
         reuse_toolchain,
+        dependency_context,
         |request, timeout, artifacts, source, toolchain, lease| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
@@ -1779,6 +1803,30 @@ fn result_retention_requested(frame: &str) -> Result<bool, String> {
     }
 }
 
+/// This extension can only run with authenticated input and complete result
+/// transfer. Selection is explicit: a malformed or unknown grant cannot be
+/// ignored and an old peer cannot silently execute different path semantics.
+fn dependency_context_selection(
+    frame: &str,
+    authenticated: bool,
+    output: bool,
+    artifacts: bool,
+    source: bool,
+    toolchain: bool,
+) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_str(frame).map_err(|error| error.to_string())?;
+    match value.get("dependency_context") {
+        None => Ok(false),
+        Some(selected) if selected.as_str() == Some(DEPENDENCY_CONTEXT_VERSION) => {
+            if !(authenticated && output && artifacts && source && toolchain) {
+                return Err("dependency context requires authenticated input and complete result transfer".to_owned());
+            }
+            Ok(true)
+        }
+        Some(_) => Err("unsupported dependency_context selection".to_owned()),
+    }
+}
+
 fn parse_timeout(value: &serde_json::Value) -> Result<Duration, String> {
     match value.get("timeout_ms") {
         None => Ok(DEFAULT_EXECUTION_TIMEOUT),
@@ -1831,14 +1879,26 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
             .unwrap_or(u32::MAX),
         ),
     };
+    let dependency_context = parse_dependency_context(value)?;
+    let program = text("program")?;
+    let source_manifest = source_transfer::request_manifest(value)?;
+    let transferred_toolchain = toolchain_transfer::request_identity(value)?;
+    let toolchain_identity = rabs_wkr::session::parse_toolchain_identity(value)?;
+    if let Some(context) = &dependency_context
+        && (program != context.compiler() || source_manifest.is_none()
+            || transferred_toolchain.is_none() || toolchain_identity.is_none()
+            || value.get("cargo_home").is_some())
+    {
+        return Err("dependency execution requires its exact compiler and plain transferred inputs".to_owned());
+    }
     // A source-bearing request has no worker path on the wire. Only the live
     // admission path can fill this slot from the exact sealed source owner.
-    let workspace_backing = if source_transfer::request_manifest(value)?.is_some() {
+    let workspace_backing = if source_manifest.is_some() {
         String::new()
     } else {
         text("workspace_backing")?
     };
-    let toolchain_backing = if toolchain_transfer::request_identity(value)?.is_some() {
+    let toolchain_backing = if transferred_toolchain.is_some() {
         String::new()
     } else {
         text("toolchain_backing")?
@@ -1848,13 +1908,14 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
             .get("request_id")
             .and_then(serde_json::Value::as_u64)
             .ok_or("exec request missing request_id")?,
-        program: text("program")?,
+        program,
         args,
         toolchain_backing,
-        toolchain_identity: rabs_wkr::session::parse_toolchain_identity(value)?,
+        toolchain_identity,
         workspace_backing,
         jobserver_grant,
         command_context: parse_command_context(value)?,
+        dependency_context,
     })
 }
 
@@ -1871,6 +1932,7 @@ mod tests {
 
     #[cfg(unix)]
     mod source_tests;
+    mod dependency_tests;
 
     #[derive(Default)]
     struct WireState {
@@ -2312,7 +2374,9 @@ mod tests {
             workspace_backing,
             jobserver_grant,
             command_context,
+            dependency_context,
         } = parse_exec_request(&frame).expect("parses");
+        assert!(dependency_context.is_none());
         assert_eq!(toolchain_identity, None);
         assert_eq!(request_id, 1);
         assert_eq!(program, "true");

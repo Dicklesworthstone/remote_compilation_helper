@@ -151,6 +151,8 @@ impl RemoteDependencyTransport {
             })?;
         Ok(RemoteDependencyReservation {
             transport: Arc::clone(self),
+            admission: None,
+            request_id: None,
         })
     }
 
@@ -169,8 +171,10 @@ impl RemoteDependencyTransport {
             .execute(request, upload, destination, cancellation, on_admitted)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_reserved(
         &self,
+        admission: Option<PinnedWorkerAdmission>,
         request: &Value,
         upload: &SourceUpload,
         destination: &Path,
@@ -190,8 +194,11 @@ impl RemoteDependencyTransport {
         let acceptor = self.tls.acceptor().map_err(io::Error::other).map_err(&before_dispatch)?;
         // This exclusive store is transport identity fencing. The callback
         // below must separately admit the actual offer into the LIVE authority.
-        let admission = PinnedWorkerAdmission::open(&self.state, &self.worker, self.pin)
-            .map_err(&before_dispatch)?;
+        let admission = match admission {
+            Some(admission) => admission,
+            None => PinnedWorkerAdmission::open(&self.state, &self.worker, self.pin)
+                .map_err(&before_dispatch)?,
+        };
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .map_err(|error| before_dispatch(io::Error::other(format!(
@@ -241,25 +248,68 @@ impl RemoteDependencyTransport {
 
 /// Exactly one caller owns this worker slot until execution/delivery finishes
 /// or the caller abandons its pre-execution offer. It cannot be cloned.
-#[derive(Debug)]
 pub struct RemoteDependencyReservation {
     transport: Arc<RemoteDependencyTransport>,
+    admission: Option<PinnedWorkerAdmission>,
+    request_id: Option<u64>,
+}
+
+impl std::fmt::Debug for RemoteDependencyReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RemoteDependencyReservation")
+            .field("transport", &self.transport)
+            .field("request_id", &self.request_id)
+            .field("admission_held", &self.admission.is_some())
+            .finish()
+    }
 }
 
 impl RemoteDependencyReservation {
+    /// Allocate after the wrapper accepts remote execution, before preparing
+    /// the immutable request and uploads. This is blocking metadata work, never
+    /// part of the decision lane. The persistent worker lock stays owned until
+    /// execute finishes or this reservation is dropped.
+    pub fn allocate_request_id(&mut self) -> io::Result<u64> {
+        if asupersync::cx::Cx::current().is_some() {
+            return Err(invalid("worker request allocation requires a dedicated blocking thread"));
+        }
+        if self.request_id.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                "this remote dependency reservation already owns a request ID"));
+        }
+        if self.admission.is_none() {
+            self.admission = Some(PinnedWorkerAdmission::open(
+                &self.transport.state,
+                &self.transport.worker,
+                self.transport.pin,
+            )?);
+        }
+        let admission = self.admission.as_ref()
+            .ok_or_else(|| invalid("missing reserved worker admission"))?;
+        let request_id = admission.allocate_request_id()?;
+        self.request_id = Some(request_id);
+        Ok(request_id)
+    }
+
+
     /// Run on a dedicated blocking thread. A transport error after the execution
     /// write may have run the compiler; preserve the receiver's uncertainty bit.
     /// All files stay in the caller's private destination until it publishes and
     /// installs them through the ordinary coordinator and wrapper paths.
     pub fn execute(
-        self,
+        mut self,
         request: &Value,
         upload: &SourceUpload,
         destination: &Path,
         cancellation: OperationCancellation,
         on_admitted: impl FnOnce(&WorkerSessionOffer) -> io::Result<()> + Send + 'static,
     ) -> Result<Delivery, DeliveryFailure> {
+        if self.request_id.is_some_and(|allocated| request["request_id"].as_u64() != Some(allocated)) {
+            return Err(failure(destination,
+                invalid("execution request differs from its durable reserved worker ID")));
+        }
         self.transport.execute_reserved(
+            self.admission.take(),
             request,
             upload,
             destination,
@@ -271,6 +321,9 @@ impl RemoteDependencyReservation {
 
 impl Drop for RemoteDependencyReservation {
     fn drop(&mut self) {
+        // Release persistent ownership before making the in-process slot
+        // available; its next owner must never race a still-held store lock.
+        drop(self.admission.take());
         self.transport.occupied.store(false, Ordering::Release);
     }
 }
@@ -319,11 +372,15 @@ mod tests {
     use super::*;
 
     fn transport() -> Arc<RemoteDependencyTransport> {
+        transport_at(Path::new("/private/remote-state"))
+    }
+
+    fn transport_at(state: &Path) -> Arc<RemoteDependencyTransport> {
         Arc::new(RemoteDependencyTransport::new(
             "127.0.0.1:9123".parse().unwrap(),
             "worker".into(),
             [1; 32],
-            PathBuf::from("/private/remote-state"),
+            state.to_path_buf(),
             TlsFiles {
                 ca: PathBuf::from("/private/ca.pem"),
                 certificate: PathBuf::from("/private/server.pem"),
@@ -347,6 +404,62 @@ mod tests {
         thread.join().unwrap();
         drop(transport.try_reserve().unwrap());
         assert!(transport.try_reserve().is_ok());
+    }
+
+    #[test]
+    fn allocation_keeps_the_persistent_worker_lock_until_reservation_release() {
+        let state = tempfile::tempdir().unwrap();
+        let transport = transport_at(state.path());
+        let independent = transport_at(state.path());
+        let mut reservation = transport.try_reserve().unwrap();
+        let first = reservation.allocate_request_id().unwrap();
+        assert!(first > 0);
+        assert_eq!(reservation.allocate_request_id().unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        let mut competing = independent.try_reserve().unwrap();
+        assert!(competing.allocate_request_id().is_err());
+        drop(competing);
+        drop(reservation);
+
+        let mut next = independent.try_reserve().unwrap();
+        assert!(next.allocate_request_id().unwrap() > first);
+        assert!(transport.try_reserve().is_ok());
+        drop(next);
+        let mut reopened = transport.try_reserve().unwrap();
+        assert!(reopened.allocate_request_id().unwrap() > first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_rejects_a_request_that_does_not_own_its_reserved_id_and_releases_the_lock() {
+        use rabs_sandbox::snapshot_capture::capture_sealed_source;
+        use serde_json::json;
+
+        let state = tempfile::tempdir().unwrap();
+        let transport = transport_at(state.path());
+        let mut reservation = transport.try_reserve().unwrap();
+        let allocated = reservation.allocate_request_id().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("lib.rs"), b"pub fn answer() -> u8 { 42 }").unwrap();
+        let snapshot = capture_sealed_source(
+            &[("workspace".into(), source.path().to_path_buf())], false, 1, 1024,
+        ).unwrap();
+        let upload = SourceUpload::from_snapshot(
+            Arc::new(snapshot), "workspace", &["lib.rs".into()],
+        ).unwrap();
+        let destination = state.path().join("must-not-be-created");
+        let error = reservation.execute(
+            &json!({"request_id":allocated.checked_add(1).unwrap()}),
+            &upload,
+            &destination,
+            OperationCancellation::new(),
+            |_| panic!("mismatched request must not admit a live worker"),
+        ).unwrap_err();
+        assert!(!error.execution_may_have_run);
+        assert!(!error.transport_interrupted);
+        assert!(error.detail.contains("durable reserved worker ID"));
+        assert!(!destination.exists());
+        let mut next = transport.try_reserve().unwrap();
+        assert!(next.allocate_request_id().unwrap() > allocated);
     }
 
     #[test]

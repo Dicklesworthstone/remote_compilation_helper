@@ -181,6 +181,51 @@ pub struct SourceOwner {
 }
 
 impl SourceOwner {
+    /// The transferred, verified source root for the original-path dependency
+    /// mode. No wire-supplied backing path or Cargo-home projection is admitted.
+    pub(crate) fn dependency_root(&self, request_id: u64) -> io::Result<&std::path::Path> {
+        if !self.execution_owned {
+            self.within_budget().map_err(io::Error::other)?;
+        }
+        if self.source_failed || request_id != self.request_id || self.cargo_home.is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "dependency source owner is not the admitted plain source tree"));
+        }
+        self.receiver.sealed_root().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
+            "dependency execution source is not completely verified"))
+    }
+
+    /// Ensure the source alias remains read-only with no writable physical
+    /// alias. The ordinary canonical workspace method retains its fixed root.
+    pub(crate) fn protect_dependency(
+        &self,
+        request_id: u64,
+        context: &rabs_sandbox::dependency_context::DependencyExecContext,
+        spec: &rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+    ) -> io::Result<()> {
+        let root = self.dependency_root(request_id)?;
+        let visible = std::path::Path::new(context.source_root());
+        let overlap = |left: &std::path::Path, right: &std::path::Path| left.starts_with(right) || right.starts_with(left);
+        let mut owned = 0;
+        for bind in &spec.ro_binds {
+            if bind.visible == visible && bind.backing == root {
+                owned += 1;
+            } else if overlap(&bind.visible, visible) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "mount shadows dependency source"));
+            }
+        }
+        if owned != 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "dependency source lacks its retained read-only mount"));
+        }
+        let root = std::fs::canonicalize(root)?;
+        for bind in &spec.rw_binds {
+            if overlap(&bind.visible, visible) || overlap(&std::fs::canonicalize(&bind.backing)?, &root) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "writable mount aliases dependency source"));
+            }
+        }
+        Ok(())
+    }
+
     /// Constrain the final namespace to the exact sealed workspace owned by
     /// this admission. File modes alone do not stop a compiler from changing
     /// its own input files or adding undeclared inputs. The workspace becomes

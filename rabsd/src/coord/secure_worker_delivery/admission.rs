@@ -16,11 +16,15 @@ use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io;
 use std::path::{Component, Path};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PIN_BINDING: &str = "rabs-pinned-worker-key-v1";
+const REQUEST_ALLOCATION: &str = "rabs-pinned-worker-request-id-v1";
+const REQUEST_ALLOCATION_REASON: &str = "reserved before constructing immutable dependency request";
 
 /// Exclusive, persistent admission for one locally named, TLS-pinned worker.
 /// Concurrent operator processes targeting the same worker refuse while its
@@ -80,6 +84,92 @@ impl PinnedWorkerAdmission {
             worker: worker.to_owned(),
             pin,
         })
+    }
+
+    /// Allocate only after the wrapper accepts remote execution, on its
+    /// dedicated blocking lane. The receipt is committed and synced before the
+    /// caller can include this ID in an immutable saved request.
+    ///
+    /// This allocator owns a dedicated worker journal. A manually dispatched
+    /// future ID on that worker remains a pre-dispatch high-water refusal; an
+    /// already saved request is never rewritten from a peer's hello.
+    pub(crate) fn allocate_request_id(&self) -> io::Result<u64> {
+        let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let floor = u64::try_from(elapsed.as_nanos())
+            .map_err(|_| invalid("worker request clock seed exceeds u64"))?;
+        self.allocate_request_id_at(floor)
+    }
+
+    fn allocate_request_id_at(&self, floor: u64) -> io::Result<u64> {
+        let mut store = self.cas.store().lock()
+            .map_err(|_| invalid("worker request allocation lock poisoned"))?;
+        // The normal store uses SQLite's durable defaults. Refuse a store
+        // configured to acknowledge commits without crash-safe journaling.
+        let synchronous = store.query("PRAGMA synchronous", &[])
+            .map_err(|error| invalid(format!("read worker request durability: {error:?}")))?;
+        require(
+            matches!(synchronous.as_slice(), [row] if matches!(row.as_slice(), [SqlValue::Int(2 | 3)])),
+            "worker request allocation requires durable SQLite synchronization",
+        )?;
+        let journal = store.query("PRAGMA journal_mode", &[])
+            .map_err(|error| invalid(format!("read worker request journal: {error:?}")))?;
+        require(
+            matches!(journal.as_slice(), [row] if matches!(row.as_slice(),
+                [SqlValue::Text(mode)] if matches!(mode.as_str(), "delete" | "truncate" | "persist" | "wal"))),
+            "worker request allocation requires a crash-safe SQLite journal",
+        )?;
+        let rows = store.query(
+            "SELECT seq, decision, reason FROM decision_receipts WHERE kind = ?1 AND subject = ?2 ORDER BY seq DESC LIMIT 1",
+            &[SqlValue::Text(REQUEST_ALLOCATION.to_owned()), SqlValue::Text(self.worker.clone())],
+        ).map_err(|error| invalid(format!("read worker request allocation: {error:?}")))?;
+        let (sequence, previous) = match rows.as_slice() {
+            [] => (0, 0),
+            [row] => {
+                let [SqlValue::Int(sequence), SqlValue::Text(value), SqlValue::Text(reason)] = row.as_slice() else {
+                    return Err(invalid("invalid worker request allocation receipt"));
+                };
+                require(
+                    *sequence >= 0
+                        && value.len() == 16
+                        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                        && reason == REQUEST_ALLOCATION_REASON,
+                    "invalid worker request allocation receipt",
+                )?;
+                let previous = u64::from_str_radix(value, 16)
+                    .map_err(|_| invalid("invalid worker request allocation value"))?;
+                require(previous > 0, "zero worker request allocation")?;
+                let sequence = sequence.checked_add(1)
+                    .ok_or_else(|| invalid("worker request allocation sequence exhausted"))?;
+                (u64::try_from(sequence)
+                    .map_err(|_| invalid("invalid worker request allocation sequence"))?, previous)
+            }
+            _ => return Err(invalid("ambiguous worker request allocation history")),
+        };
+        let next = previous.checked_add(1)
+            .ok_or_else(|| invalid("worker request ID exhausted"))?
+            .max(floor);
+        store.record_decision_receipt(
+            REQUEST_ALLOCATION,
+            &self.worker,
+            sequence,
+            &format!("{next:016x}"),
+            REQUEST_ALLOCATION_REASON,
+        ).map_err(|error| invalid(format!("persist worker request allocation: {error:?}")))?;
+        // Hold the metadata guard and exclusive mount ownership through fsync.
+        // Burn an ID on any later error; never hand out an unsynced reservation.
+        File::open(self.cas.cas_root().join("meta.sqlite"))?.sync_all()?;
+        match File::open(self.cas.cas_root().join("meta.sqlite-wal")) {
+            Ok(wal) => wal.sync_all()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // The first allocation may have created several state directories.
+        // Persist the complete entry chain, including after a previous failed
+        // first-allocation fsync, before any request using the ID can escape.
+        for directory in self.cas.cas_root().ancestors() {
+            File::open(directory)?.sync_all()?;
+        }
+        Ok(next)
     }
 
     pub(super) fn pin(&self) -> [u8; 32] {
@@ -235,6 +325,83 @@ mod tests {
 
     fn open(root: &Path, worker: &str, pin: [u8; 32]) -> io::Result<Arc<PinnedWorkerAdmission>> {
         PinnedWorkerAdmission::open(root, worker, pin).map(Arc::new)
+    }
+
+    #[test]
+    fn request_ids_are_durable_monotonic_and_ignore_clock_rollback() {
+        let root = tempfile::tempdir().unwrap();
+        let admission = open(root.path(), "worker", [1; 32]).unwrap();
+        assert_eq!(admission.allocate_request_id_at(500).unwrap(), 500);
+        assert_eq!(admission.allocate_request_id_at(400).unwrap(), 501);
+        assert_eq!(admission.allocate_request_id_at(900).unwrap(), 900);
+        drop(admission);
+
+        let reopened = open(root.path(), "worker", [1; 32]).unwrap();
+        assert_eq!(reopened.allocate_request_id_at(0).unwrap(), 901);
+        let rows = reopened.cas.store().lock().unwrap().query(
+            "SELECT seq, decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2 ORDER BY seq",
+            &[SqlValue::Text(REQUEST_ALLOCATION.to_owned()), SqlValue::Text("worker".into())],
+        ).unwrap();
+        assert_eq!(rows, vec![
+            vec![SqlValue::Int(0), SqlValue::Text("00000000000001f4".into())],
+            vec![SqlValue::Int(1), SqlValue::Text("00000000000001f5".into())],
+            vec![SqlValue::Int(2), SqlValue::Text("0000000000000384".into())],
+            vec![SqlValue::Int(3), SqlValue::Text("0000000000000385".into())],
+        ]);
+    }
+
+    #[test]
+    fn request_allocator_exhaustion_cannot_wrap_or_reset_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let admission = open(root.path(), "worker", [1; 32]).unwrap();
+        assert_eq!(admission.allocate_request_id_at(u64::MAX).unwrap(), u64::MAX);
+        assert!(admission.allocate_request_id_at(0).unwrap_err().to_string().contains("ID exhausted"));
+        drop(admission);
+        let reopened = open(root.path(), "worker", [1; 32]).unwrap();
+        assert!(reopened.allocate_request_id_at(0).unwrap_err().to_string().contains("ID exhausted"));
+
+        let other = open(root.path(), "sequence-exhausted", [2; 32]).unwrap();
+        other.cas.store().lock().unwrap().record_decision_receipt(
+            REQUEST_ALLOCATION, "sequence-exhausted", i64::MAX as u64,
+            "0000000000000001", REQUEST_ALLOCATION_REASON,
+        ).unwrap();
+        assert!(other.allocate_request_id_at(0).unwrap_err().to_string().contains("sequence exhausted"));
+    }
+
+    #[test]
+    fn corrupt_request_allocation_receipts_refuse_instead_of_starting_over() {
+        for (value, reason) in [
+            ("", REQUEST_ALLOCATION_REASON),
+            ("000000000000001", REQUEST_ALLOCATION_REASON),
+            ("GGGGGGGGGGGGGGGG", REQUEST_ALLOCATION_REASON),
+            ("000000000000000A", REQUEST_ALLOCATION_REASON),
+            ("0000000000000000", REQUEST_ALLOCATION_REASON),
+            ("0000000000000001", "different allocation protocol"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let admission = open(root.path(), "worker", [1; 32]).unwrap();
+            admission.cas.store().lock().unwrap().record_decision_receipt(
+                REQUEST_ALLOCATION, "worker", 0, value, reason,
+            ).unwrap();
+            assert!(admission.allocate_request_id_at(10_000).is_err(), "{value:?}");
+            drop(admission);
+            let reopened = open(root.path(), "worker", [1; 32]).unwrap();
+            assert!(reopened.allocate_request_id_at(20_000).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn request_allocators_share_worker_exclusion_and_keep_other_workers_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let first = open(root.path(), "worker", [1; 32]).unwrap();
+        assert_eq!(first.allocate_request_id_at(10).unwrap(), 10);
+        assert!(open(root.path(), "worker", [1; 32]).is_err());
+        let other = open(root.path(), "other-worker", [2; 32]).unwrap();
+        assert_eq!(other.allocate_request_id_at(2).unwrap(), 2);
+        drop(first);
+        let reopened = open(root.path(), "worker", [1; 32]).unwrap();
+        assert_eq!(reopened.allocate_request_id_at(1).unwrap(), 11);
+        assert_eq!(other.allocate_request_id_at(1).unwrap(), 3);
     }
 
     #[test]

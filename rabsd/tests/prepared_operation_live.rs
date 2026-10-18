@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "prepared_operation_live/dependency_worker.rs"]
+mod dependency_worker;
+
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 
 fn read_log(path: &Path) -> Vec<u8> {
