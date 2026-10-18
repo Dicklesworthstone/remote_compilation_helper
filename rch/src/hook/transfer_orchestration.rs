@@ -47,11 +47,12 @@ use super::progress_reporting::{
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
-    PreparedSourceContentRoot, bind_build_source_aliases, build_source_commit_env,
-    capture_build_source_stamp, finalize_owned_source_content_receipt,
-    finalize_source_content_receipt, guard_owned_source_content_cargo_config,
-    owned_source_content_freshness_identity, prepare_source_content_root,
-    reconcile_build_source_stamps, validate_owned_source_content_closure,
+    PreparedSourceContentRoot, attach_coalesced_source_roots, bind_build_source_aliases,
+    build_source_commit_env, capture_build_source_stamp, coalesce_source_content_plan,
+    finalize_owned_source_content_receipt, finalize_source_content_receipt,
+    guard_owned_source_content_cargo_config, owned_source_content_freshness_identity,
+    prepare_source_content_root, reconcile_build_source_stamps,
+    validate_owned_source_content_closure, verify_coalesced_source_plan,
     verify_owned_source_content_roots, verify_source_content_roots,
 };
 use super::ssh::{
@@ -1002,6 +1003,16 @@ async fn execute_remote_compilation_inner(
             topology_policy,
         )
     };
+    let mut coalesced_source_roots = std::collections::BTreeMap::new();
+    if source_content_receipt && clean_overlay.is_none() {
+        (sync_plan, coalesced_source_roots) = coalesce_source_content_plan(
+            sync_plan,
+            &transfer_config,
+            WorkerPlatform::from_worker(&worker_config),
+            owned_source_content_pair,
+        )
+        .await?;
+    }
     // Ordinary Cargo invocations target shared canonical worker paths. Capture
     // those logical authorities before any proof/overlay/Windows relocation so
     // overlapping primary projects that share a path dependency take the same
@@ -1063,6 +1074,7 @@ async fn execute_remote_compilation_inner(
             .to_string();
         }
     }
+    verify_coalesced_source_plan(&sync_plan, &coalesced_source_roots)?;
     if let Some(spec) = clean_overlay {
         anyhow::ensure!(
             sync_plan.iter().filter(|entry| entry.is_primary).count() == 1,
@@ -1609,10 +1621,15 @@ async fn execute_remote_compilation_inner(
         );
 
         let prepared_source_root = if source_content_receipt {
-            Some(
+            let mut prepared =
                 prepare_source_content_root(prepared_source_roots.len(), entry, &root_pipeline)
-                    .await?,
+                    .await?;
+            attach_coalesced_source_roots(
+                &mut prepared,
+                coalesced_source_roots.remove(&entry.local_root),
             )
+            .await?;
+            Some(prepared)
         } else {
             None
         };

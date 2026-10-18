@@ -5,7 +5,10 @@
 //! checksum mode, a no-delta rsync barrier reopens the synchronized tree, and a
 //! worker-side verifier re-hashes every selected regular file before Cargo.
 
-use super::dependency_closure::{SyncClosureMode, SyncClosurePlanEntry};
+use super::dependency_closure::{
+    SyncClosureMode, SyncClosurePlanEntry, source_content_coalescing_candidates,
+    workspace_metadata_sync_patterns,
+};
 use super::ssh::run_offload_ssh_command_with_stdin;
 use super::*;
 use serde::Serialize;
@@ -81,6 +84,9 @@ struct SourceContentRootPreimage<'a> {
 pub(super) struct PreparedSourceContentRoot {
     pipeline: TransferPipeline,
     manifest: SourceContentRootManifest,
+    directories: Vec<PathBuf>,
+    // Absorbed selections remain live proof obligations, not extra transfers.
+    coalesced: Vec<PreparedSourceContentRoot>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -182,8 +188,8 @@ async fn capture_manifest(
     ordinal: usize,
     entry: &SyncClosurePlanEntry,
     pipeline: &TransferPipeline,
-) -> anyhow::Result<SourceContentRootManifest> {
-    let paths = pipeline.enumerate_source_content_files().await?;
+) -> anyhow::Result<(SourceContentRootManifest, Vec<PathBuf>)> {
+    let (paths, directories) = pipeline.enumerate_source_content_selection().await?;
     if paths.is_empty() {
         anyhow::bail!(
             "source-content transfer universe is empty for {}",
@@ -262,21 +268,24 @@ async fn capture_manifest(
         files: &files,
     };
     let content_root = sha256_hex(&serde_json::to_vec(&preimage)?);
-    Ok(SourceContentRootManifest {
-        schema: ROOT_SCHEMA,
-        ordinal,
-        project_id: entry.project_id.clone(),
-        local_root,
-        remote_root: entry.remote_root.clone(),
-        root_hash: entry.root_hash.clone(),
-        is_primary: entry.is_primary,
-        mode: entry.mode,
-        filter_policy,
-        file_count: files.len(),
-        byte_count,
-        files,
-        content_root,
-    })
+    Ok((
+        SourceContentRootManifest {
+            schema: ROOT_SCHEMA,
+            ordinal,
+            project_id: entry.project_id.clone(),
+            local_root,
+            remote_root: entry.remote_root.clone(),
+            root_hash: entry.root_hash.clone(),
+            is_primary: entry.is_primary,
+            mode: entry.mode,
+            filter_policy,
+            file_count: files.len(),
+            byte_count,
+            files,
+            content_root,
+        },
+        directories,
+    ))
 }
 
 pub(super) async fn prepare_source_content_root(
@@ -284,10 +293,219 @@ pub(super) async fn prepare_source_content_root(
     entry: &SyncClosurePlanEntry,
     pipeline: &TransferPipeline,
 ) -> anyhow::Result<PreparedSourceContentRoot> {
+    let (manifest, directories) = capture_manifest(ordinal, entry, pipeline).await?;
     Ok(PreparedSourceContentRoot {
         pipeline: pipeline.clone(),
-        manifest: capture_manifest(ordinal, entry, pipeline).await?,
+        manifest,
+        directories,
+        coalesced: Vec::new(),
     })
+}
+
+fn ensure_coalesced_selection(
+    owner: &PreparedSourceContentRoot,
+    child: &PreparedSourceContentRoot,
+) -> anyhow::Result<()> {
+    let prefix = Path::new(&child.manifest.local_root)
+        .strip_prefix(&owner.manifest.local_root)
+        .context("coalesced source root escaped its owner")?;
+    anyhow::ensure!(
+        !prefix.as_os_str().is_empty()
+            && !child.manifest.is_primary
+            && owner.manifest.mode == SyncClosureMode::Full,
+        "coalescing cannot replace the primary execution root"
+    );
+    let selected: std::collections::BTreeMap<_, _> = owner
+        .manifest
+        .files
+        .iter()
+        .filter_map(|file| {
+            Path::new(&file.path).strip_prefix(prefix).ok().map(|path| {
+                (
+                    path.to_path_buf(),
+                    (&file.sha256, file.byte_count, file.executable),
+                )
+            })
+        })
+        .collect();
+    let child_files: std::collections::BTreeMap<_, _> = child
+        .manifest
+        .files
+        .iter()
+        .map(|file| {
+            (
+                PathBuf::from(&file.path),
+                (&file.sha256, file.byte_count, file.executable),
+            )
+        })
+        .collect();
+    let selected_directories: std::collections::BTreeSet<_> = owner
+        .directories
+        .iter()
+        .filter_map(|path| path.strip_prefix(prefix).ok())
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    let child_directories: std::collections::BTreeSet<_> =
+        child.directories.iter().map(PathBuf::as_path).collect();
+    let covered = if child.manifest.mode == SyncClosureMode::Full {
+        selected == child_files && selected_directories == child_directories
+    } else {
+        child_files
+            .iter()
+            .all(|(path, value)| selected.get(path) == Some(value))
+            && child_directories.is_subset(&selected_directories)
+    };
+    anyhow::ensure!(
+        covered,
+        "source-content coalescing policy/content mismatch between {} and {}",
+        owner.manifest.local_root,
+        child.manifest.local_root
+    );
+    Ok(())
+}
+
+/// Coalesce only receipt-mode roots whose actual rsync-selected bytes agree.
+/// Keep each absorbed capture to recheck its root-relative policy before Cargo
+/// and before issuing the receipt. No ignore pattern is rebased or combined.
+pub(super) async fn coalesce_source_content_plan(
+    plan: Vec<SyncClosurePlanEntry>,
+    transfer_config: &rch_common::TransferConfig,
+    platform: WorkerPlatform,
+    owned_materialization: bool,
+) -> anyhow::Result<(
+    Vec<SyncClosurePlanEntry>,
+    std::collections::BTreeMap<PathBuf, PreparedSourceContentRoot>,
+)> {
+    let candidates = source_content_coalescing_candidates(&plan);
+    let mut captures = std::collections::BTreeMap::new();
+    for (parent, child) in &candidates {
+        for index in [*parent, *child] {
+            if captures.contains_key(&index) {
+                continue;
+            }
+            let entry = &plan[index];
+            let mut pipeline = TransferPipeline::new(
+                entry.local_root.clone(),
+                entry.project_id.clone(),
+                entry.root_hash.clone(),
+                transfer_config.clone(),
+            )
+            .with_worker_platform(platform)
+            .with_remote_path_override(entry.remote_root.clone())
+            .with_sync_checksum(true);
+            if owned_materialization {
+                pipeline = pipeline.with_owned_source_materialization();
+            }
+            if entry.mode == SyncClosureMode::WorkspaceMetadata {
+                pipeline = pipeline.with_sync_include_patterns(workspace_metadata_sync_patterns());
+            }
+            captures.insert(
+                index,
+                prepare_source_content_root(index, entry, &pipeline).await?,
+            );
+        }
+        ensure_coalesced_selection(&captures[parent], &captures[child])?;
+    }
+    let mut absorbed = std::collections::BTreeMap::new();
+    let mut removed = std::collections::BTreeSet::new();
+    for (parent, child) in candidates {
+        removed.insert(child);
+        let child_capture = captures
+            .remove(&child)
+            .expect("captured coalescing candidate");
+        captures
+            .get_mut(&parent)
+            .expect("captured coalescing owner")
+            .coalesced
+            .push(child_capture);
+    }
+    for (_, owner) in captures {
+        absorbed.insert(PathBuf::from(&owner.manifest.local_root), owner);
+    }
+    Ok((
+        plan.into_iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (!removed.contains(&index)).then_some(entry))
+            .collect(),
+        absorbed,
+    ))
+}
+
+/// Layout may relocate remote paths, but must not drop or replace a captured
+/// local owner when it canonicalizes the plan. Check before starting transfers.
+pub(super) fn verify_coalesced_source_plan(
+    plan: &[SyncClosurePlanEntry],
+    captures: &std::collections::BTreeMap<PathBuf, PreparedSourceContentRoot>,
+) -> anyhow::Result<()> {
+    for (path, original) in captures {
+        anyhow::ensure!(
+            plan.iter()
+                .filter(|entry| entry.local_root == *path)
+                .count()
+                == 1
+                && plan.iter().any(|entry| entry.local_root == *path
+                    && entry.mode == SyncClosureMode::Full
+                    && entry.is_primary == original.manifest.is_primary
+                    && entry.project_id == original.manifest.project_id),
+            "source-content coalescing owner authority changed during layout: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(super) async fn attach_coalesced_source_roots(
+    owner: &mut PreparedSourceContentRoot,
+    original: Option<PreparedSourceContentRoot>,
+) -> anyhow::Result<()> {
+    let Some(original) = original else {
+        return Ok(());
+    };
+    // Relocation intentionally changes ordinals, remote paths and root hashes;
+    // the compared local policy/content must still be the exact initial capture.
+    anyhow::ensure!(
+        owner.manifest.local_root == original.manifest.local_root
+            && owner.manifest.filter_policy == original.manifest.filter_policy
+            && owner.manifest.files == original.manifest.files
+            && owner.directories == original.directories,
+        "source-content coalescing owner policy/content changed before transfer"
+    );
+    verify_local_source_content_root(&original).await?;
+    owner.coalesced = original.coalesced;
+    Ok(())
+}
+
+async fn verify_local_source_content_manifest(
+    root: &PreparedSourceContentRoot,
+) -> anyhow::Result<()> {
+    let (recaptured, directories) = capture_manifest(
+        root.manifest.ordinal,
+        &SyncClosurePlanEntry {
+            local_root: PathBuf::from(&root.manifest.local_root),
+            remote_root: root.manifest.remote_root.clone(),
+            project_id: root.manifest.project_id.clone(),
+            root_hash: root.manifest.root_hash.clone(),
+            is_primary: root.manifest.is_primary,
+            mode: root.manifest.mode,
+        },
+        &root.pipeline,
+    )
+    .await?;
+    anyhow::ensure!(
+        recaptured == root.manifest && directories == root.directories,
+        "local source-content changed during transfer proof for {}",
+        root.manifest.project_id
+    );
+    Ok(())
+}
+
+async fn verify_local_source_content_root(root: &PreparedSourceContentRoot) -> anyhow::Result<()> {
+    verify_local_source_content_manifest(root).await?;
+    for child in &root.coalesced {
+        verify_local_source_content_manifest(child).await?;
+        ensure_coalesced_selection(root, child)?;
+    }
+    Ok(())
 }
 
 /// Stable selected bytes and policy for the predecessor-only timestamp ledger.
@@ -956,25 +1174,7 @@ async fn verify_source_content_roots_with_policy(
     // edit, added file, deletion, mode change, or filter drift therefore refuses
     // the receipt. The caller's recursive watcher supplies ABA/overflow proof.
     for root in prepared {
-        let recaptured = capture_manifest(
-            root.manifest.ordinal,
-            &SyncClosurePlanEntry {
-                local_root: PathBuf::from(&root.manifest.local_root),
-                remote_root: root.manifest.remote_root.clone(),
-                project_id: root.manifest.project_id.clone(),
-                root_hash: root.manifest.root_hash.clone(),
-                is_primary: root.manifest.is_primary,
-                mode: root.manifest.mode,
-            },
-            &root.pipeline,
-        )
-        .await?;
-        if recaptured != root.manifest {
-            anyhow::bail!(
-                "local source-content changed during transfer proof for {}",
-                root.manifest.project_id
-            );
-        }
+        verify_local_source_content_root(root).await?;
     }
     Ok(())
 }
@@ -1193,6 +1393,414 @@ pub(super) fn reconcile_build_source_stamps(before: &str, after: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod coalescing {
+        use super::*;
+        use crate::hook::dependency_closure::{
+            build_owned_sync_closure_layout, build_sync_closure_plan,
+        };
+        use std::fs;
+
+        // Retain these small actual-rsync fixtures for diagnosis; no cleanup.
+        fn fixture() -> (PathBuf, PathTopologyPolicy, Vec<SyncClosurePlanEntry>) {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            for (path, text) in [
+                (
+                    "app/Cargo.toml",
+                    "[package]\nname='app'\nversion='0.1.0'\n[dependencies]\ndep={path='../dep'}\n",
+                ),
+                ("app/src/lib.rs", "pub fn app() {}\n"),
+                (
+                    "dep/Cargo.toml",
+                    "[package]\nname='dep'\nversion='0.1.0'\n[workspace]\nmembers=['macros']\n[dependencies]\nmacros={path='macros'}\n",
+                ),
+                ("dep/.cargo/config.toml", "[build]\njobs=1\n"),
+                ("dep/src/lib.rs", "pub fn dep() {}\n"),
+                (
+                    "dep/macros/Cargo.toml",
+                    "[package]\nname='macros'\nversion='0.1.0'\n",
+                ),
+                (
+                    "dep/macros/src/lib.rs",
+                    "pub const INPUT: &str = include_str!(\"../input.txt\");\n",
+                ),
+                ("dep/macros/input.txt", "required non-entrypoint input\n"),
+                ("dep/macros/build.rs", "fn main() {}\n"),
+            ] {
+                let path = root.join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+            let policy = PathTopologyPolicy::new(root.clone(), root.clone());
+            let plan = build_sync_closure_plan(
+                &[root.join("dep/macros"), root.join("app"), root.join("dep")],
+                &root.join("app"),
+                "primary-hash",
+                &policy,
+            );
+            (root, policy, plan)
+        }
+
+        fn config() -> rch_common::TransferConfig {
+            rch_common::TransferConfig::default()
+        }
+
+        async fn coalesce(
+            plan: Vec<SyncClosurePlanEntry>,
+            config: &rch_common::TransferConfig,
+        ) -> anyhow::Result<(
+            Vec<SyncClosurePlanEntry>,
+            std::collections::BTreeMap<PathBuf, PreparedSourceContentRoot>,
+        )> {
+            coalesce_source_content_plan(plan, config, WorkerPlatform::default(), true).await
+        }
+
+        async fn capture_owner(
+            entry: &SyncClosurePlanEntry,
+            config: &rch_common::TransferConfig,
+        ) -> PreparedSourceContentRoot {
+            let pipeline = TransferPipeline::new(
+                entry.local_root.clone(),
+                entry.project_id.clone(),
+                entry.root_hash.clone(),
+                config.clone(),
+            )
+            .with_remote_path_override(entry.remote_root.clone())
+            .with_owned_source_materialization();
+            prepare_source_content_root(0, entry, &pipeline)
+                .await
+                .unwrap()
+        }
+
+        fn layout(
+            plan: &[SyncClosurePlanEntry],
+            policy: &PathTopologyPolicy,
+        ) -> anyhow::Result<super::super::super::dependency_closure::OwnedSyncClosureLayout>
+        {
+            Ok(build_owned_sync_closure_layout(
+                plan,
+                policy,
+                "/tmp/rch-test-owned",
+                ".rch-target-test-pool-0123456789abcdef0123456789abcdef",
+            )?)
+        }
+
+        #[tokio::test]
+        async fn equal_selection_coalesces_external_full_roots_and_preserves_real_cargo_inputs() {
+            let (root, policy, plan) = fixture();
+            // Causal incumbent control: the original planner reaches the exact guard refusal.
+            assert!(
+                layout(&plan, &policy)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("overlapping transfer selections")
+            );
+            let (reduced, mut absorbed) = coalesce(plan.clone(), &config()).await.unwrap();
+            let mapped = layout(&reduced, &policy).unwrap();
+            assert_eq!(mapped.plan.len(), 2);
+            assert_eq!(reduced.iter().filter(|entry| entry.is_primary).count(), 1);
+            assert_eq!(
+                reduced.iter().find(|entry| entry.is_primary).unwrap(),
+                plan.iter().find(|entry| entry.is_primary).unwrap()
+            );
+            let mut prepared = Vec::new();
+            for entry in &mapped.plan {
+                let mut owner = capture_owner(entry, &config()).await;
+                attach_coalesced_source_roots(&mut owner, absorbed.remove(&entry.local_root))
+                    .await
+                    .unwrap();
+                verify_local_source_content_root(&owner).await.unwrap();
+                prepared.push(owner);
+            }
+            let dep = prepared
+                .iter()
+                .find(|entry| entry.manifest.local_root == root.join("dep").to_str().unwrap())
+                .unwrap();
+            for path in [
+                "macros/Cargo.toml",
+                "macros/src/lib.rs",
+                "macros/build.rs",
+                "macros/input.txt",
+                ".cargo/config.toml",
+            ] {
+                assert!(
+                    dep.manifest.files.iter().any(|file| file.path == path),
+                    "missing {path}"
+                );
+            }
+            let mapped_command = validate_owned_source_content_closure(
+                &prepared,
+                &mapped.source_root,
+                &root.join("app"),
+                None,
+                "cargo check",
+                &policy,
+            )
+            .unwrap();
+            assert!(mapped_command.contains("cargo check"));
+            let reordered = build_sync_closure_plan(
+                &[
+                    root.join("dep"),
+                    root.join("app"),
+                    root.join("dep/macros"),
+                    root.join("dep"),
+                ],
+                &root.join("app"),
+                "primary-hash",
+                &policy,
+            );
+            let (again, _) = coalesce(reordered, &config()).await.unwrap();
+            assert_eq!(reduced, again);
+        }
+
+        #[tokio::test]
+        async fn child_root_ignore_cannot_be_lost_when_parent_selects_private_file() {
+            let (root, _, plan) = fixture();
+            fs::write(root.join("dep/macros/.rchignore"), "/private.txt\n").unwrap();
+            fs::write(root.join("dep/macros/private.txt"), "do not transfer\n").unwrap();
+            let err = coalesce(plan, &config()).await.err().unwrap();
+            assert!(err.to_string().contains("policy/content mismatch"));
+        }
+
+        #[tokio::test]
+        async fn parent_exclusion_cannot_remove_child_build_inputs() {
+            let (root, _, plan) = fixture();
+            fs::write(root.join("dep/.rchignore"), "/macros/input.txt\n").unwrap();
+            let err = coalesce(plan, &config()).await.err().unwrap();
+            assert!(err.to_string().contains("policy/content mismatch"));
+        }
+
+        #[tokio::test]
+        async fn empty_directories_must_have_the_same_selection_at_both_roots() {
+            let (root, _, plan) = fixture();
+            fs::create_dir_all(root.join("dep/macros/generated/empty")).unwrap();
+            let (_, captures) = coalesce(plan.clone(), &config()).await.unwrap();
+            let owner = captures.get(&root.join("dep")).unwrap();
+            assert!(
+                owner
+                    .directories
+                    .contains(&PathBuf::from("macros/generated/empty"))
+            );
+            assert!(
+                owner.coalesced[0]
+                    .directories
+                    .contains(&PathBuf::from("generated/empty"))
+            );
+            // Files alone agree: the excluded directory is empty but may be a
+            // build-script input. The original Full child would transfer it.
+            fs::write(root.join("dep/.rchignore"), "/macros/generated/\n").unwrap();
+            let err = coalesce(plan, &config()).await.err().unwrap();
+            assert!(err.to_string().contains("policy/content mismatch"));
+        }
+
+        #[tokio::test]
+        async fn child_excluded_empty_directory_cannot_be_added_by_coalescing() {
+            let (root, _, plan) = fixture();
+            fs::create_dir_all(root.join("dep/macros/private-empty")).unwrap();
+            fs::write(root.join("dep/macros/.rchignore"), "/private-empty/\n").unwrap();
+            let err = coalesce(plan, &config()).await.err().unwrap();
+            assert!(err.to_string().contains("policy/content mismatch"));
+        }
+
+        #[tokio::test]
+        async fn owner_policy_drift_before_attachment_refuses_even_with_unchanged_files() {
+            let (root, _, plan) = fixture();
+            let mut settings = config();
+            settings.exclude_patterns.push(".rchignore".to_owned());
+            fs::write(root.join("dep/.rchignore"), "# initial policy\n").unwrap();
+            let (reduced, mut captures) = coalesce(plan, &settings).await.unwrap();
+            let entry = reduced
+                .iter()
+                .find(|entry| entry.local_root == root.join("dep"))
+                .unwrap();
+            fs::write(root.join("dep/.rchignore"), "/not-present-yet\n").unwrap();
+            let mut owner = capture_owner(entry, &settings).await;
+            let original = captures.remove(&entry.local_root).unwrap();
+            assert_eq!(owner.manifest.files, original.manifest.files);
+            assert!(
+                attach_coalesced_source_roots(&mut owner, Some(original))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("owner policy/content changed")
+            );
+        }
+
+        #[tokio::test]
+        async fn directory_drift_before_attachment_refuses_even_with_unchanged_files() {
+            let (root, _, plan) = fixture();
+            let (reduced, mut captures) = coalesce(plan, &config()).await.unwrap();
+            let entry = reduced
+                .iter()
+                .find(|entry| entry.local_root == root.join("dep"))
+                .unwrap();
+            fs::create_dir_all(root.join("dep/macros/new-empty")).unwrap();
+            let mut owner = capture_owner(entry, &config()).await;
+            let original = captures.remove(&entry.local_root).unwrap();
+            assert_eq!(owner.manifest.files, original.manifest.files);
+            assert!(
+                attach_coalesced_source_roots(&mut owner, Some(original))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("owner policy/content changed")
+            );
+        }
+
+        #[tokio::test]
+        async fn retargeted_owner_cannot_silently_skip_absorbed_policy_custody() {
+            let (root, policy, plan) = fixture();
+            let (reduced, captures) = coalesce(plan, &config()).await.unwrap();
+            verify_coalesced_source_plan(&layout(&reduced, &policy).unwrap().plan, &captures)
+                .unwrap();
+            // Keep all bytes and the relative Cargo references usable, but
+            // change the physical owner that layout's canonicalization sees.
+            fs::rename(root.join("dep"), root.join("dep-original")).unwrap();
+            std::os::unix::fs::symlink(root.join("dep-original"), root.join("dep")).unwrap();
+            let mapped = layout(&reduced, &policy).unwrap();
+            assert!(
+                mapped
+                    .plan
+                    .iter()
+                    .any(|entry| entry.local_root == root.join("dep-original"))
+            );
+            assert!(!captures.contains_key(&root.join("dep-original")));
+            assert!(
+                verify_coalesced_source_plan(&mapped.plan, &captures)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("owner authority changed")
+            );
+        }
+
+        #[tokio::test]
+        async fn anchored_shared_config_is_compared_at_each_original_root() {
+            let (root, _, plan) = fixture();
+            fs::write(root.join("dep/macros/private.txt"), "do not transfer\n").unwrap();
+            let mut settings = config();
+            settings.exclude_patterns.push("/private.txt".to_owned());
+            let err = coalesce(plan, &settings).await.err().unwrap();
+            assert!(err.to_string().contains("policy/content mismatch"));
+        }
+
+        #[tokio::test]
+        async fn member_only_workspace_metadata_and_primary_execution_root_are_preserved() {
+            let (root, policy, _) = fixture();
+            let member_only = build_sync_closure_plan(
+                &[root.join("dep/macros")],
+                &root.join("app"),
+                "primary",
+                &policy,
+            );
+            let (reduced, absorbed) = coalesce(member_only.clone(), &config()).await.unwrap();
+            assert_eq!(reduced, member_only);
+            assert!(absorbed.is_empty());
+            assert!(
+                reduced
+                    .iter()
+                    .any(|entry| entry.local_root == root.join("dep")
+                        && entry.mode == SyncClosureMode::WorkspaceMetadata)
+            );
+            layout(&reduced, &policy).unwrap();
+            let nested_primary = build_sync_closure_plan(
+                &[root.join("dep")],
+                &root.join("dep/macros"),
+                "primary",
+                &policy,
+            );
+            let (reduced, _) = coalesce(nested_primary.clone(), &config()).await.unwrap();
+            assert_eq!(reduced, nested_primary);
+            assert!(
+                layout(&reduced, &policy)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("overlapping transfer selections")
+            );
+        }
+
+        #[tokio::test]
+        async fn metadata_below_full_root_must_remain_covered() {
+            let (root, policy, mut plan) = fixture();
+            fs::create_dir_all(root.join("dep/nested/.cargo")).unwrap();
+            fs::write(
+                root.join("dep/nested/Cargo.toml"),
+                "[workspace]\nmembers=[]\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("dep/nested/.cargo/config.toml"),
+                "[build]\njobs=2\n",
+            )
+            .unwrap();
+            let mut metadata = plan
+                .iter()
+                .find(|entry| entry.local_root == root.join("dep"))
+                .unwrap()
+                .clone();
+            metadata.local_root = root.join("dep/nested");
+            metadata.mode = SyncClosureMode::WorkspaceMetadata;
+            plan.push(metadata);
+            let (reduced, _) = coalesce(plan.clone(), &config()).await.unwrap();
+            assert_eq!(reduced.len(), 2);
+            layout(&reduced, &policy).unwrap();
+            fs::write(root.join("dep/.rchignore"), "/nested/.cargo/\n").unwrap();
+            assert!(
+                coalesce(plan, &config())
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("policy/content mismatch")
+            );
+        }
+
+        #[tokio::test]
+        async fn changed_child_bytes_between_planning_and_transfer_refuse() {
+            let (root, _, plan) = fixture();
+            let (reduced, mut absorbed) = coalesce(plan, &config()).await.unwrap();
+            fs::write(root.join("dep/macros/input.txt"), "different bytes\n").unwrap();
+            let entry = reduced
+                .iter()
+                .find(|entry| entry.local_root == root.join("dep"))
+                .unwrap();
+            let mut owner = capture_owner(entry, &config()).await;
+            assert!(
+                attach_coalesced_source_roots(&mut owner, absorbed.remove(&entry.local_root))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("owner policy/content changed")
+            );
+        }
+
+        #[tokio::test]
+        async fn absorbed_policy_drift_is_checked_even_when_parent_does_not_capture_ignore_file() {
+            let (root, _, plan) = fixture();
+            let mut settings = config();
+            settings.exclude_patterns.push(".rchignore".to_owned());
+            fs::write(root.join("dep/macros/.rchignore"), "# initial policy\n").unwrap();
+            let (reduced, mut absorbed) = coalesce(plan, &settings).await.unwrap();
+            let entry = reduced
+                .iter()
+                .find(|entry| entry.local_root == root.join("dep"))
+                .unwrap();
+            let mut owner = capture_owner(entry, &settings).await;
+            attach_coalesced_source_roots(&mut owner, absorbed.remove(&entry.local_root))
+                .await
+                .unwrap();
+            fs::write(root.join("dep/macros/.rchignore"), "/not-present-yet\n").unwrap();
+            // Parent bytes and policy are unchanged: only the retained child policy catches it.
+            verify_local_source_content_manifest(&owner).await.unwrap();
+            assert!(
+                verify_local_source_content_root(&owner)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("local source-content changed")
+            );
+        }
+    }
 
     #[cfg(unix)]
     mod owned_closure {

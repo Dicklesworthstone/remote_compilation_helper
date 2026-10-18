@@ -4191,17 +4191,33 @@ impl TransferPipeline {
     /// Reusing rsync for selection is deliberate: a second glob interpreter
     /// would eventually drift from rsync's first-match-wins semantics and let a
     /// receipt authenticate a different set of files than the transfer itself.
+    #[cfg(test)]
     pub(crate) async fn enumerate_source_content_files(&self) -> Result<Vec<PathBuf>> {
+        Ok(self.enumerate_source_content_selection().await?.0)
+    }
+
+    /// Files and directories from the same rsync invocation. Empty directories
+    /// are transfer inputs too, although the receipt hashes regular files only.
+    pub(crate) async fn enumerate_source_content_selection(
+        &self,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         if self.worker_platform.is_windows() {
             anyhow::bail!("source-content receipts require the rsync transport");
         }
-        self.enumerate_source_upload_files().await
+        self.enumerate_source_upload_selection(true).await
     }
 
     // Selection runs entirely locally. Windows include-only tar uploads must
     // use the same rsync filters as POSIX uploads, without enabling the separate
     // remote source-content receipt protocol on Windows.
     async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
+        Ok(self.enumerate_source_upload_selection(false).await?.0)
+    }
+
+    async fn enumerate_source_upload_selection(
+        &self,
+        collect_directories: bool,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let effective_excludes = self.get_effective_excludes();
         let nonexistent_destination = std::env::temp_dir().join(format!(
             "rch-source-content-enumeration-{}",
@@ -4240,6 +4256,7 @@ impl TransferPipeline {
         let stdout = std::str::from_utf8(&output.stdout)
             .context("source-content enumeration output was not UTF-8")?;
         let mut paths = Vec::new();
+        let mut directories = Vec::new();
         for line in stdout.lines() {
             if line.is_empty() || line.starts_with("created directory ") {
                 continue;
@@ -4247,10 +4264,11 @@ impl TransferPipeline {
             let (itemized, raw_path) = line.split_once('\t').ok_or_else(|| {
                 anyhow::anyhow!("unexpected source-content enumeration line: {line:?}")
             })?;
-            if itemized.as_bytes().get(1) == Some(&b'd') {
+            let directory = itemized.as_bytes().get(1) == Some(&b'd');
+            if directory && (!collect_directories || raw_path == "./") {
                 continue;
             }
-            if itemized.as_bytes().get(1) != Some(&b'f') {
+            if !directory && itemized.as_bytes().get(1) != Some(&b'f') {
                 anyhow::bail!(
                     "source-content proof refuses non-regular rsync item {itemized:?} at {raw_path:?}"
                 );
@@ -4267,13 +4285,21 @@ impl TransferPipeline {
             {
                 anyhow::bail!("unsafe source-content path emitted by rsync: {raw_path:?}");
             }
-            paths.push(PathBuf::from(relative));
+            if directory {
+                directories.push(PathBuf::from(relative));
+            } else {
+                paths.push(PathBuf::from(relative));
+            }
         }
         paths.sort();
         if paths.windows(2).any(|pair| pair[0] == pair[1]) {
             anyhow::bail!("source-content enumeration emitted duplicate paths");
         }
-        Ok(paths)
+        directories.sort();
+        if directories.windows(2).any(|pair| pair[0] == pair[1]) {
+            anyhow::bail!("source-content enumeration emitted duplicate directories");
+        }
+        Ok((paths, directories))
     }
 
     fn build_source_content_rsync_barrier_command(

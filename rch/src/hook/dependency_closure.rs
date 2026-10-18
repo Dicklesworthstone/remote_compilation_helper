@@ -967,6 +967,30 @@ pub(super) fn build_sync_closure_plan(
         .collect()
 }
 
+/// Potential redundant roots, subject to exact transfer-selection verification.
+/// An ancestor Full root is only a candidate owner: its root-relative filters
+/// may select different files. Never absorb the primary execution directory.
+pub(super) fn source_content_coalescing_candidates(
+    plan: &[SyncClosurePlanEntry],
+) -> Vec<(usize, usize)> {
+    plan.iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.is_primary)
+        .filter_map(|(child, entry)| {
+            plan.iter()
+                .enumerate()
+                .filter(|(parent, owner)| {
+                    *parent != child
+                        && owner.mode == SyncClosureMode::Full
+                        && entry.local_root != owner.local_root
+                        && entry.local_root.starts_with(&owner.local_root)
+                })
+                .min_by_key(|(_, owner)| (owner.local_root.components().count(), &owner.local_root))
+                .map(|(parent, _)| (parent, child))
+        })
+        .collect()
+}
+
 /// Project an exact closure beneath one owned non-Git source container without
 /// flattening sibling dependencies or their enclosing workspace metadata.
 ///
