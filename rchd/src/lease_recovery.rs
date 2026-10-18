@@ -11,9 +11,12 @@
 //! Source retirement can precede the daemon handoff: those unacknowledged
 //! journals still need recovery, even though no worker filesystem work remains.
 
-use crate::api::{is_process_alive, lease_blocks_restart, lease_owns_unretired_source};
+#[cfg(test)]
+use crate::api::is_process_alive;
+use crate::api::{lease_blocks_restart, lease_owns_unretired_source};
 use crate::events::EventBus;
 use rch_common::job_identity::{DurableJobLease, default_job_lease_directory};
+use rch_common::process_identity::{OwnerPresence, owner_presence};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -171,7 +174,7 @@ struct RecoveryCandidate {
 fn recoverable_candidates(
     lease_dir: &Path,
     now_unix_ms: u64,
-    alive: impl Fn(u32) -> bool,
+    presence: impl Fn(&DurableJobLease) -> OwnerPresence,
 ) -> Vec<RecoveryCandidate> {
     let Ok(entries) = std::fs::read_dir(lease_dir) else {
         return Vec::new();
@@ -192,7 +195,7 @@ fn recoverable_candidates(
                 && (lease_owns_unretired_source(lease)
                     || retired_delivery(lease).is_some()
                     || abandoned_without_recovery(lease, now_unix_ms))
-                && !lease_blocks_restart(lease, now_unix_ms, || alive(lease.wrapper_pid))
+                && !lease_blocks_restart(lease, now_unix_ms, || presence(lease))
         })
         .filter_map(|lease| {
             Some(RecoveryCandidate {
@@ -356,7 +359,9 @@ pub(crate) fn start(events: EventBus, socket: PathBuf) -> tokio::task::JoinHandl
                     }
                     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
                     match tokio::task::spawn_blocking(move || {
-                        recoverable_candidates(&default_job_lease_directory(), now, is_process_alive)
+                        recoverable_candidates(&default_job_lease_directory(), now, |lease| {
+                            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+                        })
                     }).await {
                         Ok(candidates) => queue.refresh(candidates),
                         Err(error) => warn!(%error, "Lease recovery scan failed; retaining in-flight tasks"),
@@ -525,10 +530,20 @@ mod tests {
         now: u64,
         alive: impl Fn(u32) -> bool,
     ) -> Vec<String> {
-        recoverable_candidates(directory, now, alive)
-            .into_iter()
-            .map(|candidate| candidate.wrapper_id)
-            .collect()
+        recoverable_candidates(directory, now, |lease| {
+            if lease.wrapper_pid == 0 {
+                // The legacy test probe cannot establish ownership when no
+                // PID was recorded. Model the production tri-state result.
+                OwnerPresence::Unknown
+            } else if alive(lease.wrapper_pid) {
+                OwnerPresence::Live
+            } else {
+                OwnerPresence::Absent
+            }
+        })
+        .into_iter()
+        .map(|candidate| candidate.wrapper_id)
+        .collect()
     }
 
     fn candidate(id: &str, worker: &str) -> RecoveryCandidate {
@@ -820,6 +835,30 @@ mod tests {
     fn missing_lease_directory_has_no_candidates() {
         let dir = tempfile::tempdir().unwrap();
         assert!(recoverable_lease_ids(&dir.path().join("absent"), 0, |_| false).is_empty());
+    }
+
+    #[test]
+    fn uncertain_ownership_never_authorizes_source_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let candidate = lease(
+            now - 60 * 60 * 1000,
+            4242,
+            serde_json::json!({"source_roots":["/p"],"retired":false}),
+        );
+        std::fs::write(
+            dir.path()
+                .join(format!("{}.json", candidate.identity.local_wrapper_id)),
+            serde_json::to_vec(&candidate).unwrap(),
+        )
+        .unwrap();
+
+        for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
+            assert!(recoverable_candidates(dir.path(), now, |_| presence).is_empty());
+        }
+        let recovered = recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].wrapper_id, candidate.identity.local_wrapper_id);
     }
 
     #[test]
