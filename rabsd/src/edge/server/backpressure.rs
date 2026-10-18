@@ -1,9 +1,11 @@
-//! Cooperative backpressure before a live compiler decision is admitted.
+//! Cooperative backpressure before a live compiler decision or hit acceptance.
 //!
-//! The capacity permit is acquired by the existing blocking lane. Only its
-//! synchronous Saturated refusal proves the decision closure never ran; work
-//! errors after admission cannot turn into this hint. There is no server queue,
-//! action reservation, output writer, or capacity permit behind the reply.
+//! Initial decisions acquire their permit from the existing blocking lane.
+//! Only its synchronous Saturated refusal proves the decision closure never
+//! ran. A verified hit may use the same hint before acceptance when its
+//! independent installation lane has no capacity and its preview is dropped.
+//! Work errors after admission cannot turn into this hint. There is no server
+//! queue, action reservation, output writer, or capacity permit behind the reply.
 //!
 //! Keep pass-through as the wire decision: older wrappers compile normally.
 //! New wrappers recognize the explicit versioned hint, retain their original
@@ -21,6 +23,23 @@ const CAPACITY_RETRY: &str = concat!(
 );
 const CAPACITY_LEGACY: &str =
     "{\"kind\":\"rustc-decision\",\"decision\":\"pass-through\",\"reason\":\"edge-capacity\"}";
+
+/// Report a capacity refusal before compiler or installation authority exists.
+/// The phase is diagnostic only; keep the established retry wire contract.
+pub(super) fn capacity_reply(may_wait: bool, phase: &str) -> String {
+    super::log_line(
+        "rabsd-live-dependency",
+        &[
+            (
+                "decision",
+                if may_wait { "capacity-wait" } else { "pass-through" },
+            ),
+            ("reason", "edge-capacity"),
+            ("phase", phase),
+        ],
+    );
+    if may_wait { CAPACITY_RETRY } else { CAPACITY_LEGACY }.to_owned()
+}
 
 /// This entry point is for INITIAL decisions only, never accepted-hit
 /// installation, compiler completion, capture acknowledgment, or publication.
@@ -41,16 +60,7 @@ async fn on_lane(
     match lane.spawn(work) {
         Ok(mut work) => work.wait().await,
         Err(WorkError::Saturated) => {
-            super::log_line(
-                "rabsd-live-dependency",
-                &[
-                    ("decision", if may_wait { "capacity-wait" } else { "pass-through" }),
-                    ("reason", "edge-capacity"),
-                ],
-            );
-            Ok(Decided::Reply(
-                if may_wait { CAPACITY_RETRY } else { CAPACITY_LEGACY }.to_owned(),
-            ))
+            Ok(Decided::Reply(capacity_reply(may_wait, "decision")))
         }
         // Do not broaden this to arbitrary errors. A panic in an admitted
         // decision may already have reserved an attempt; its owner must settle

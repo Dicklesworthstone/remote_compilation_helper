@@ -52,11 +52,14 @@ const FRAME_READ_BUFFER_BYTES: usize = 16 * 1024;
 type EdgeStream = BufReader<UnixStream>;
 const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
+/// Artifact installs, including accepted live hits. Reserve before asking a
+/// subscriber to wait, so fresh decisions cannot steal its installation slot.
+/// A bounded acknowledgment wait retains capacity, never a blocking thread.
 const MATERIALIZATION_WORKERS: usize = 2;
 const PREPARED_ADMISSION_WORKERS: usize = 2;
-/// Live dependency decisions and hit installs: a compiler is waiting on
-/// each. Pre-decision saturation may carry a bounded wrapper retry hint;
-/// no work is queued or capacity retained while that wrapper backs off.
+/// Live dependency decisions: a compiler is waiting on each. Saturation
+/// before a decision may carry a bounded wrapper retry hint; no work is queued
+/// or capacity retained while that wrapper backs off.
 const LIVE_DECISION_WORKERS: usize = 8;
 /// Live dependency completions (capture, durable uploads, publication).
 /// Wrappers retain their outputs until capture is acknowledged, but do not
@@ -492,6 +495,8 @@ async fn handle_connection(
                 serve_on_lane(&limits.materialization, coord.clone(), value).await
             }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("rustc-request") => {
+                let may_wait = value.get("wait_for_inflight").and_then(serde_json::Value::as_bool)
+                    == Some(true);
                 let decided = match &live {
                     Some(live) => {
                         backpressure::decide(&limits.live, std::sync::Arc::clone(live), value)
@@ -534,6 +539,23 @@ async fn handle_connection(
                         }
                     }
                     Ok(rustc_request::Decided::Hit { reply, pending }) => {
+                        // Reserve the independent installation lane BEFORE
+                        // offering a hit. Once Cargo accepts, a fresh decision
+                        // burst cannot force a verified hit back to compilation.
+                        let Some(installation) = limits.materialization.acquire() else {
+                            // This preview owns no writer or compiler attempt.
+                            // Drop it before advertising a non-owning retry.
+                            drop(pending);
+                            if !write_frame(
+                                &mut stream,
+                                &backpressure::capacity_reply(may_wait, "materialization"),
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        };
                         // Nothing is written unless the subscriber commits to
                         // waiting for the install. A subscriber that already
                         // gave up (timeout, crash) never sees a late writer.
@@ -555,9 +577,8 @@ async fn handle_connection(
                         }
                         let live = live.clone();
                         let installed = match live {
-                            Some(live) => limits
-                                .live
-                                .spawn(move || rustc_request::install(&live, pending)),
+                            Some(live) => installation
+                                .finish(move || rustc_request::install(&live, pending)),
                             None => break,
                         };
                         match installed {
