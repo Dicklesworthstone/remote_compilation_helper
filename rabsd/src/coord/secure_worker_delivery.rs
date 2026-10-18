@@ -26,6 +26,7 @@ use rabs_protocol::capability_tokens::{CapabilityKind, mint};
 use rabs_protocol::envelope::DEFAULT_LIMITS;
 use rabs_protocol::identity_store::{IdentityStore, TransportIdentity, TrustScope};
 use rabs_protocol::version_negotiation::{VersionHello, VersionRange};
+use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_protocol::worker_session::{CoordinatorSession, SessionPolicy, WorkerHelloClaims};
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET;
 use serde_json::{Value, json};
@@ -43,6 +44,17 @@ mod preview;
 use admission::AdmittedWorkerSession;
 pub use admission::PinnedWorkerAdmission;
 pub use cancellation::OperationCancellation;
+
+/// A caller may bind an authenticated worker to its own live coordinator before
+/// any source bytes or execution request leave this process. The durable pin
+/// admission below is transport fencing, not action or publication authority.
+/// Returning an error prevents the session grant, upload and dispatch entirely.
+pub type WorkerAdmissionHook =
+    Box<dyn FnOnce(&WorkerSessionOffer) -> io::Result<()> + Send + 'static>;
+
+/// Negotiation tag for the dependency execution extension. Keeping the
+/// transport selector here lets older workers refuse safely before upload.
+pub(crate) const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v1";
 
 const ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFER_BUDGET: Duration = Duration::from_secs(5 * 60);
@@ -144,6 +156,7 @@ struct AdmittedPeer<P> {
     proof: Option<WorkerAuthentication>,
     operation_sent: bool,
     source: Option<SourceUpload>,
+    on_admitted: Option<WorkerAdmissionHook>,
 }
 
 impl<P: WorkerPeer> AdmittedPeer<P> {
@@ -194,6 +207,7 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
             proof: None,
             operation_sent: false,
             source: None,
+            on_admitted: None,
         })
     }
 
@@ -211,6 +225,11 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
         self.source = Some(upload.clone());
         Ok(self)
     }
+
+    fn with_admission_hook(mut self, hook: Option<WorkerAdmissionHook>) -> Self {
+        self.on_admitted = hook;
+        self
+    }
 }
 
 impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
@@ -220,6 +239,10 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
             "session admission cannot be repeated",
         )?;
         self.negotiation_started = true; // a failed exchange never retries admission
+        require(
+            self.mode == DeliveryMode::Execute || self.on_admitted.is_none(),
+            "live worker admission hook requires new execution",
+        )?;
         let peer = hex(&self.identity.peer_id);
         require(
             hello["kind"] == "worker-hello" && hello["peer_id"].as_str() == Some(peer.as_str()),
@@ -246,6 +269,27 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 "resume requires negotiated durable result retention",
             )?;
         }
+        // Unknown request fields are compatible with older canonical workers.
+        // A dependency context changes mounts, argv and environment, so sending
+        // one without an explicit negotiated selection could execute different
+        // code. Refuse before the challenge, input upload or live action hook.
+        let dependency_context = self.mode == DeliveryMode::Execute
+            && self.expected_operation.get("dependency_context").is_some();
+        if dependency_context {
+            require(
+                self.expected_operation["dependency_context"]["version"] == DEPENDENCY_CONTEXT_VERSION
+                    && hello["dependency_contexts"].as_array().is_some_and(|versions| {
+                        versions.iter().any(|version| version == DEPENDENCY_CONTEXT_VERSION)
+                    }),
+                "worker lacks required dependency-exec-v1 execution context",
+            )?;
+        }
+        require(
+            grant.get("dependency_context").is_none_or(|selection| {
+                dependency_context && selection == DEPENDENCY_CONTEXT_VERSION
+            }),
+            "dependency context was not authorized by this execution session",
+        )?;
         // Refuse an old worker before challenge, source upload or dispatch.
         // The ephemeral grant binds the unchanged journal request and this boot.
         let execution_lease = if self.mode == DeliveryMode::Execute {
@@ -344,7 +388,15 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 && response["token_id"].as_u64() == Some(token_id),
             "worker challenge response mismatch",
         )?;
-        self.session = Some(self.admission.admit(&self.identity, hello)?);
+        let session = self.admission.admit(&self.identity, hello)?;
+        if let Some(on_admitted) = self.on_admitted.take() {
+            // This is the only boundary that exposes the actual TLS-pinned,
+            // challenge-proven and durably fenced worker to a live action.
+            // On refusal, dropping the session releases transport admission;
+            // no grant, source upload or execution has been sent.
+            on_admitted(session.offer())?;
+        }
+        self.session = Some(session);
         grant["session_id"] = json!(session_id);
         grant["transport"] = json!(admitted.grant().transport_version);
         grant["application"] = json!(admitted.grant().application_version);
@@ -354,6 +406,9 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         grant["resume"] = json!("unsupported");
         if let Some(lease) = execution_lease {
             grant["execution_lease"] = lease;
+        }
+        if dependency_context {
+            grant["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
         }
         if self.mode == DeliveryMode::Execute
             && hello["output_previews"]
@@ -966,6 +1021,38 @@ pub fn receive_authenticated_observed(
     cancellation: OperationCancellation,
     observer: Option<crate::coord::prepared_operation::PreviewObserver>,
 ) -> Result<Delivery, DeliveryFailure> {
+    receive_authenticated_with_admission(
+        runtime,
+        peer,
+        admission,
+        request,
+        destination,
+        mode,
+        upload,
+        resume_source,
+        cancellation,
+        observer,
+        None,
+    )
+}
+
+/// Extend authenticated delivery with the caller's live-action admission. The
+/// hook receives only authenticated identity evidence; it cannot write transport
+/// frames or grant publication. Existing operator delivery uses no hook.
+#[allow(clippy::too_many_arguments)]
+pub fn receive_authenticated_with_admission(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    admission: PinnedWorkerAdmission,
+    request: &Value,
+    destination: &Path,
+    mode: DeliveryMode,
+    upload: Option<&SourceUpload>,
+    resume_source: Option<&ResumeSource>,
+    cancellation: OperationCancellation,
+    observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+    on_admitted: Option<WorkerAdmissionHook>,
+) -> Result<Delivery, DeliveryFailure> {
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume,
@@ -977,6 +1064,11 @@ pub fn receive_authenticated_observed(
             "authenticated delivery requires a dedicated thread",
         )));
     }
+    require(
+        mode == DeliveryMode::Execute || on_admitted.is_none(),
+        "live worker admission hook requires new execution",
+    )
+    .map_err(&failure)?;
     require(
         upload.is_none() || (mode == DeliveryMode::Execute && resume_source.is_none()),
         "source upload cannot accompany result recovery",
@@ -1013,7 +1105,8 @@ pub fn receive_authenticated_observed(
         mode,
         Arc::clone(&admission),
     )
-    .map_err(&failure)?;
+    .map_err(&failure)?
+    .with_admission_hook(on_admitted);
     if let Some(upload) = upload {
         admitted = admitted.with_source(upload).map_err(&failure)?;
     }
@@ -1041,9 +1134,18 @@ mod tests {
         sent: Vec<Value>,
         fail_execution: bool,
         interrupt_toolchain_ready: bool,
+        admission_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
     impl WorkerPeer for Script {
         fn send(&mut self, frame: &Value) -> io::Result<()> {
+            if frame["kind"] != "session-challenge"
+                && let Some(observed) = &self.admission_observed
+            {
+                assert!(
+                    observed.load(std::sync::atomic::Ordering::SeqCst),
+                    "grant, input transfer or execution preceded live admission"
+                );
+            }
             self.sent.push(frame.clone());
             if self.fail_execution
                 && matches!(
@@ -1358,6 +1460,30 @@ mod tests {
     }
 
     #[test]
+    fn result_recovery_cannot_mint_live_action_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let mut peer = peer_with_mode(recovery_hello(), response(), DeliveryMode::Resume)
+            .with_admission_hook(Some(Box::new(move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })));
+        let offered = peer.receive().unwrap();
+        let mut selected = grant();
+        selected["result_retention"] = json!("durable-result-v1");
+        let error = peer.negotiate(&offered, &selected).unwrap_err();
+        assert!(error.to_string().contains("requires new execution"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(peer.inner.sent.is_empty());
+        assert!(peer.authentication().is_none());
+        assert!(peer.send(&DeliveryMode::Resume.frame(&request())).is_err());
+        assert!(peer.send(&request()).is_err());
+        assert!(peer.inner.sent.is_empty());
+    }
+
+    #[test]
     fn resume_requires_retention_before_challenge_and_never_downgrades() {
         for missing_hello in [false, true] {
             let mut hello = recovery_hello();
@@ -1607,6 +1733,131 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn live_admission_observes_the_actual_worker_before_grant_or_source_bytes() {
+        use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
+        use rabs_protocol::wire_time::PeerId;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request, mut script, _) = source_fixture(source.path());
+        let observed = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let actual = Arc::new(Mutex::new(None));
+        script.admission_observed = Some(Arc::clone(&observed));
+        let callback_observed = Arc::clone(&observed);
+        let callback_calls = Arc::clone(&calls);
+        let callback_actual = Arc::clone(&actual);
+        let mut peer = source_admission(script, &request)
+            .with_source(&upload)
+            .unwrap()
+            .with_admission_hook(Some(Box::new(move |offer| {
+                *callback_actual.lock().unwrap() = Some(offer.clone());
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                callback_observed.store(true, Ordering::SeqCst);
+                Ok(())
+            })));
+        let offered = peer.receive().unwrap();
+        peer.negotiate(&offered, &grant()).unwrap();
+        assert_eq!(
+            *actual.lock().unwrap(),
+            Some(WorkerSessionOffer {
+                worker_peer_id: PeerId(hex(&[1; 32])),
+                boot_generation: WorkerBootGeneration(2),
+                incarnation: WorkerIncarnationId(2),
+                reenrollment_proof: None,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(peer.authentication().is_some());
+        assert!(peer.inner.sent.iter().any(|frame| frame["kind"] == "source-begin"));
+        assert!(!peer.inner.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+        assert!(peer.negotiate(&offered, &grant()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        peer.send(&request).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_admission_refusal_never_uploads_or_dispatches_and_releases_transport_session() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request, script, _) = source_fixture(source.path());
+        let offered = script.replies[0].clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let mut peer = source_admission(script, &request)
+            .with_source(&upload)
+            .unwrap()
+            .with_admission_hook(Some(Box::new(move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("live action lease was superseded"))
+            })));
+        let delivery = tempfile::tempdir().unwrap();
+        let error = receive_operation(
+            &mut peer,
+            &request,
+            "worker",
+            &delivery.path().join("private-delivery"),
+            DeliveryMode::Execute,
+        ).unwrap_err();
+        assert!(!error.execution_may_have_run);
+        assert!(!error.transport_interrupted);
+        assert!(error.detail.contains("live action lease was superseded"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(peer.authentication().is_none());
+        assert!(peer.send(&request).is_err());
+        assert_eq!(
+            peer.inner.sent.iter().map(|frame| frame["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["session-challenge"]
+        );
+        assert!(peer.negotiate(&offered, &grant()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The failed live action must not strand a durable transport session
+        // that prevents the next request from using this worker incarnation.
+        drop(peer.admission.admit(&peer.identity, &offered).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unproven_or_stale_worker_never_reaches_the_live_admission_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for case in 0..4 {
+            let source = tempfile::tempdir().unwrap();
+            let (upload, request, mut script, _) = source_fixture(source.path());
+            match case {
+                0 => script.replies[0]["peer_id"] = json!(hex(&[2; 32])),
+                1 => script.replies[1]["token_id"] = json!(999),
+                2 => script.replies[0]["source_transfers"] = json!([]),
+                _ => {}
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap()
+                .with_admission_hook(Some(Box::new(move |_| {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })));
+            if case == 3 {
+                let mut newer = recovery_hello();
+                newer["boot_generation"] = json!(4);
+                newer["incarnation"] = json!("00000000000000000000000000000004");
+                drop(peer.admission.admit(&peer.identity, &newer).unwrap());
+            }
+            let offered = peer.receive().unwrap();
+            assert!(peer.negotiate(&offered, &grant()).is_err(), "case {case}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "case {case}");
+            assert!(peer.inner.sent.iter().all(|frame| frame["kind"] == "session-challenge"));
+            assert!(peer.send(&request).is_err());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn toolchain_fixture(root: &Path, warm: bool) -> (SourceUpload, Value, Script) {
         use super::super::worker_delivery::toolchain_identity_value;
@@ -1672,6 +1923,59 @@ mod tests {
             request,
             script,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dependency_execution_requires_explicit_selection_before_live_admission_or_upload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for case in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, mut request, mut script) = toolchain_fixture(root.path(), false);
+            request["dependency_context"] = json!({
+                "version": DEPENDENCY_CONTEXT_VERSION,
+                "source_root":"/ws", "cwd":"/ws", "toolchain_root":"/tc",
+                "compiler":"/tc/rustc", "out_dir":"/out", "env":[], "dependency_dirs":[],
+                "runtime_cohort_sha256":"ab".repeat(32)
+            });
+            request["program"] = json!("/tc/rustc");
+            request["artifacts"] = json!({"unit":"dep", "files":["a"]});
+            match case {
+                0 => {}
+                1 => script.replies[0]["dependency_contexts"] = json!(["dependency-exec-v0"]),
+                2 => {
+                    script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+                    request["dependency_context"]["version"] = json!("dependency-exec-v2");
+                }
+                _ => script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]),
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap()
+                .with_admission_hook(Some(Box::new(move |_| {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })));
+            let offered = peer.receive().unwrap();
+            let outcome = peer.negotiate(&offered, &grant());
+            if case < 3 {
+                assert!(outcome.is_err(), "case {case}");
+                assert!(peer.inner.sent.is_empty(), "case {case}");
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "case {case}");
+                assert!(peer.send(&request).is_err());
+            } else {
+                outcome.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(peer.inner.sent[1]["kind"], "session-ok");
+                assert_eq!(peer.inner.sent[1]["dependency_context"], DEPENDENCY_CONTEXT_VERSION);
+                assert!(peer.inner.sent.iter().any(|frame| frame["kind"] == "source-begin"));
+                peer.send(&request).unwrap();
+                assert_eq!(peer.inner.sent.last().unwrap(), &request);
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

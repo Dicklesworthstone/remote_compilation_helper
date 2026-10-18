@@ -172,6 +172,14 @@ pub(super) struct AdmittedWorkerSession {
     started: u64,
 }
 
+impl AdmittedWorkerSession {
+    /// Evidence for a caller's independent live coordinator admission. This
+    /// offer has already passed TLS pin, challenge and durable boot fencing.
+    pub(super) fn offer(&self) -> &WorkerSessionOffer {
+        &self.offer
+    }
+}
+
 impl Drop for AdmittedWorkerSession {
     fn drop(&mut self) {
         if let Err(error) = self.admission.coord.release_worker_session(
