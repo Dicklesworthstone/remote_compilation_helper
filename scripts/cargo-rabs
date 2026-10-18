@@ -106,6 +106,9 @@ the unchanged socket generation, both lifetime locks, and proof that the recorde
 process exited. rabsd performs its own stale-socket takeover; the launcher never
 unlinks an endpoint or kills a daemon. Unmanaged/legacy stale sockets, unknown
 ownership, live but unresponsive peers, and --rabs-no-start never trigger recovery.
+New owner receipts also bind the Linux boot, PID namespace and process start
+ticks. A reused PID is not the old daemon; an unknown/foreign namespace is not
+proof of exit. Older PID-only receipts retain conservative absence-only recovery.
 """
 
 
@@ -121,8 +124,135 @@ class StaleEndpoint(SetupError):
         self.identity = identity
 
 
-def process_exited(pid):
-    """Observe exit without sending a terminating signal or trusting PID reuse.
+def valid_boot_id(value):
+    return (type(value) is str and len(value) == 36
+            and all(char == "-" if index in (8, 13, 18, 23)
+                    else char in "0123456789abcdef" for index, char in enumerate(value)))
+
+
+def valid_process_identity(value):
+    """Strict bounded receipt schema; bool is not an inode or a start tick."""
+    if type(value) is not dict or value.keys() != {"boot", "pid_namespace", "start_ticks"}:
+        return False
+    namespace = value.get("pid_namespace")
+    ticks = value.get("start_ticks")
+    return (valid_boot_id(value.get("boot"))
+            and type(namespace) is list and len(namespace) == 2
+            and all(type(number) is int and 0 <= number <= 0xffffffffffffffff
+                    for number in namespace) and namespace[1] != 0
+            and type(ticks) is int and 0 < ticks <= 0xffffffffffffffff)
+
+
+def read_proc_bytes(path, maximum):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SetupError("RABS process identity is not a regular procfs record")
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(descriptor, maximum + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+    finally:
+        os.close(descriptor)
+    if not data or len(data) > maximum:
+        raise SetupError("RABS process identity exceeds its procfs bound")
+    return bytes(data)
+
+
+def process_scope():
+    """Use the kernel view of this PID namespace, not a guessed /proc mount.
+
+    This is host-local recovery evidence, never authority to signal a PID.
+    As with the private socket/locks, a trusted native filesystem is required.
+    """
+    if sys.platform != "linux" or os.readlink("/proc/self") != str(os.getpid()):
+        raise SetupError("RABS process identity requires matching native procfs")
+    boot = read_proc_bytes("/proc/sys/kernel/random/boot_id", 37)
+    if boot.endswith(b"\n"):
+        boot = boot[:-1]
+    try:
+        boot = boot.decode("ascii")
+    except UnicodeError as error:
+        raise SetupError("RABS kernel boot identity is malformed") from error
+    if not valid_boot_id(boot):
+        raise SetupError("RABS kernel boot identity is malformed")
+    namespace = os.stat("/proc/self/ns/pid")
+    return {"boot": boot, "pid_namespace": [namespace.st_dev, namespace.st_ino]}
+
+
+def process_start_ticks(data, pid):
+    # /proc/PID/stat's comm is parenthesized and may itself contain spaces,
+    # closing parentheses, newlines and non-UTF-8. Field 22 follows the LAST
+    # ') ', not the first whitespace token. Keep kernel ticks, never seconds.
+    prefix, separator, tail = data.rpartition(b") ")
+    fields = tail.split()
+    if (not separator or not prefix.startswith(str(pid).encode("ascii") + b" (")
+            or len(fields) < 20 or len(fields[0]) != 1
+            or fields[0] not in (b"R", b"S", b"D", b"Z", b"T", b"t", b"X", b"x", b"K", b"W", b"P", b"I")
+            or not fields[19].isdigit() or len(fields[19]) > 20):
+        raise SetupError("RABS process stat identity is malformed")
+    ticks = int(fields[19])
+    if not 0 < ticks <= 0xffffffffffffffff or str(ticks).encode("ascii") != fields[19]:
+        raise SetupError("RABS process start ticks are malformed")
+    return ticks
+
+
+def process_identity(pid):
+    if type(pid) is not int or not 1 < pid <= 0x7fffffff:
+        raise SetupError("RABS process identity requires a valid PID")
+    scope = process_scope()
+    namespace = os.stat("/proc/{}/ns/pid".format(pid))
+    data = read_proc_bytes("/proc/{}/stat".format(pid), 4096)
+    if ([namespace.st_dev, namespace.st_ino] != scope["pid_namespace"]
+            or process_scope() != scope):
+        raise SetupError("RABS process identity namespace changed or is foreign")
+    identity = dict(scope, start_ticks=process_start_ticks(data, pid))
+    if not valid_process_identity(identity):
+        raise SetupError("RABS process identity is unrepresentable")
+    return identity
+
+
+def process_exited(pid, recorded=None):
+    """Affirmative owner absence, never an unfenced signal to a stored PID.
+
+    New receipts can recognize reboot/PID reuse. Unknown scope or observation
+    refuses; a different PID namespace cannot prove this recorded owner gone.
+    Legacy receipts keep the old, stricter PID-absence-only interpretation.
+    """
+    if type(pid) is not int or not 1 < pid <= 0x7fffffff:
+        return False
+    if recorded is not None:
+        if not valid_process_identity(recorded):
+            return False
+        try:
+            scope = process_scope()
+            if scope["boot"] != recorded["boot"]:
+                return True
+            if scope["pid_namespace"] != recorded["pid_namespace"]:
+                return False
+            try:
+                current = process_identity(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                current = None
+            if process_scope() != scope:
+                return False
+            if current is not None:
+                if (current["boot"] != scope["boot"]
+                        or current["pid_namespace"] != scope["pid_namespace"]):
+                    return False
+                if current["start_ticks"] != recorded["start_ticks"]:
+                    return True
+            # A matching process may be an unreaped zombie. An absent procfs
+            # entry alone is not enough: retain the existing kernel exit probe.
+        except (SetupError, OSError):
+            return False
+    return pid_exited(pid)
+
+
+def pid_exited(pid):
+    """PID-only exit observation for a matching scope or a legacy receipt.
 
     A reused live PID conservatively prevents recovery. pidfds also recognize
     an exited child awaiting reaping; a kill(0) fallback alone cannot do that.
@@ -458,15 +588,20 @@ class StartupLock:
         self.acquired = True
         return True
 
-    def owner_binding(self, pid, identity):
+    def owner_binding(self, pid, identity, process=None):
         self.verify()
         if not self.acquired:
             raise SetupError("RABS recovery requires both held startup locks")
         state = os.fstat(self.directory)
         endpoint = os.fstat(self.endpoint_lock)
-        return {"v": 1, "pid": pid, "socket": list(identity),
-                "state": [state.st_dev, state.st_ino],
-                "endpoint_lock": [endpoint.st_dev, endpoint.st_ino]}
+        value = {"v": 1, "pid": pid, "socket": list(identity),
+                 "state": [state.st_dev, state.st_ino],
+                 "endpoint_lock": [endpoint.st_dev, endpoint.st_ino]}
+        if process is not None:
+            if not valid_process_identity(process):
+                raise SetupError("RABS owner receipt has invalid process evidence")
+            value.update(v=2, process=process)
+        return value
 
     def record_owner(self, pid, identity):
         """Persist only a socket whose SO_PEERCRED matched our own ready child.
@@ -474,7 +609,10 @@ class StartupLock:
         One atomic replacement under both locks; no existing receipt is exposed
         truncated. Missing/failed persistence disables later recovery, not builds.
         """
-        value = self.owner_binding(pid, identity)
+        # The readiness peer was our unreaped Popen child: its PID cannot be
+        # recycled between that exchange and this observation. Unavailable
+        # native identity disables recording, not the already healthy daemon.
+        value = self.owner_binding(pid, identity, process_identity(pid))
         try:
             existing = os.stat(OWNER_RECEIPT, dir_fd=self.directory, follow_symlinks=False)
         except FileNotFoundError:
@@ -519,7 +657,15 @@ class StartupLock:
         pid = value.get("pid")
         if type(pid) is not int or not 1 < pid <= 0x7fffffff:
             raise SetupError("RABS owner receipt has no valid process identity")
-        expected = self.owner_binding(pid, identity)
+        version = value.get("v")
+        if type(version) is not int or version not in (1, 2):
+            raise SetupError("RABS owner receipt has an unsupported identity version")
+        process = None
+        if version == 2:
+            process = value.get("process")
+            if not valid_process_identity(process):
+                raise SetupError("RABS owner receipt has invalid process evidence")
+        expected = self.owner_binding(pid, identity, process)
         # Validate shallow, typed fields without recursively comparing or
         # re-encoding an untrusted JSON subtree. bool is not a device/inode/PID.
         matches = (value.keys() == expected.keys() and type(value.get("v")) is int
@@ -531,7 +677,7 @@ class StartupLock:
                                    and observed == expected[field])
         if not matches:
             raise SetupError("RABS stale endpoint does not match this launcher's ownership receipt")
-        if not process_exited(pid):
+        if not process_exited(pid, process):
             raise SetupError("RABS recorded daemon has not exited; leaving its endpoint untouched")
         self.verify()
 
