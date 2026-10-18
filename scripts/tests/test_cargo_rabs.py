@@ -150,7 +150,11 @@ while running and time.monotonic() < end and root.exists():
             peer.sendall(b'{"kind":"hello-ok","transport":1,"application":1}\n')
             request = json.loads(reader.readline())
             if request.get("kind") == "status":
-                peer.sendall(b'{"kind":"coord-status","v":1}\n')
+                status = {"kind": "coord-status", "v": 1,
+                          "live_dependency": os.environ.get("RABS_LIVE_DEPENDENCY") == "1"}
+                if os.environ.get("TEST_STATUS_LEGACY"):
+                    status.pop("live_dependency")
+                peer.sendall(json.dumps(status).encode() + b'\n')
             reader.close()
         except (OSError, ValueError):
             pass
@@ -633,6 +637,52 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.endpoint.stat().st_ino, identity)
         self.assertEqual(self.starts(), [])
 
+    def test_existing_shadow_daemon_does_not_claim_live_cache_readiness(self):
+        child = subprocess.Popen([str(self.daemon)],
+                                 env=dict(self.env, RABS_LIVE_DEPENDENCY="0"))
+        try:
+            deadline = time.monotonic() + 3
+            while not self.endpoint.exists():
+                self.assertIsNone(child.poll(), "fixture daemon exited before binding")
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            identity = rabs.socket_identity(str(self.endpoint))
+            result = self.launch(["check"])
+            value = self.cargo_result(result)
+            self.assertNotIn("RUSTC_WRAPPER", value["env"])
+            self.assertIn(b"does not enable live dependency serving", result.stderr)
+            self.assertIn(b"running stock Cargo", result.stderr)
+
+            required = self.launch(["--rabs-require-daemon", "check"])
+            self.assertEqual(required.returncode, 2, required.stderr)
+            self.assertEqual(required.stdout, b"", "required setup must not run Cargo")
+            self.assertIn(b"RABS_LIVE_DEPENDENCY=1", required.stderr)
+            self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+            self.assertEqual([item["pid"] for item in self.starts()], [child.pid])
+            self.assertIsNone(child.poll(), "launcher stopped a shared shadow daemon")
+        finally:
+            child.terminate()
+            child.wait(timeout=3)
+
+    def test_existing_legacy_daemon_cannot_satisfy_required_live_setup(self):
+        child = subprocess.Popen([str(self.daemon)],
+                                 env=dict(self.env, RABS_LIVE_DEPENDENCY="1", TEST_STATUS_LEGACY="1"))
+        try:
+            deadline = time.monotonic() + 3
+            while not self.endpoint.exists():
+                self.assertIsNone(child.poll(), "fixture daemon exited before binding")
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            result = self.launch(["--rabs-require-daemon", "build"])
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stdout, b"")
+            self.assertIn(b"does not enable live dependency serving", result.stderr)
+            self.assertEqual([item["pid"] for item in self.starts()], [child.pid])
+            self.assertIsNone(child.poll())
+        finally:
+            child.terminate()
+            child.wait(timeout=3)
+
     def test_cargo_self_recursion_is_refused(self):
         result = self.launch(changes={"CARGO": str(LAUNCHER)})
         self.assertEqual(result.returncode, 127)
@@ -981,14 +1031,21 @@ class LauncherTests(unittest.TestCase):
     def test_mismatched_receipt_or_live_pid_cannot_authorize_recovery(self):
         _, identity = self.crash_service()
         original = json.loads(self.owner_receipt().read_text())
-        cases = [("pid", os.getpid()), ("pid", True), ("pid", -1),
-                 ("pid", 0x80000000), ("v", True), ("v", 2),
-                 ("state", [0, 0]), ("endpoint_lock", [0, 0]),
-                 ("socket", [identity[0], identity[1], identity[2] + 1])]
-        for key, changed in cases:
-            with self.subTest(key=key, changed=changed):
+        # V2 identifies the owner by PID AND process incarnation. Merely
+        # replacing a PID while retaining a dead owner's start time describes
+        # PID reuse, which is intentionally recoverable. Exercise a live
+        # identity here; the dedicated incarnation tests cover reused PIDs.
+        live_owner = {"pid": os.getpid()}
+        if original["v"] == 2:
+            live_owner["process"] = rabs.process_identity(os.getpid())
+        cases = [live_owner, {"pid": True}, {"pid": -1},
+                 {"pid": 0x80000000}, {"v": True}, {"v": 3},
+                 {"state": [0, 0]}, {"endpoint_lock": [0, 0]},
+                 {"socket": [identity[0], identity[1], identity[2] + 1]}]
+        for changed in cases:
+            with self.subTest(changed=changed):
                 value = dict(original)
-                value[key] = changed
+                value.update(changed)
                 self.owner_receipt().write_text(json.dumps(value))
                 result = self.launch(["--rabs-require-daemon"])
                 self.assertEqual(result.returncode, 2, result.stderr)

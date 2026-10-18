@@ -78,7 +78,9 @@ to RCH without reinterpretation. Custom local Cargo binaries are not transported
 The first invocation can start one shared rabsd with RABS_LIVE_DEPENDENCY=1.
 Later invocations reuse it. An existing daemon is never stopped, replaced, or
 reconfigured: its live/shadow setting remains its own. A connected daemon is
-not a promise of a cache hit. Unsupported units, warming facts and required
+accepted only when it reports the live dependency lane; a shadow or older
+daemon gives a setup error with the ordinary stock-Cargo fallback. Readiness
+is not a promise of a cache hit. Unsupported units, warming facts and required
 verification runs still compile normally. This is the host-local dependency
 lane, not canonical cross-host execution or a cached build-script executor.
 
@@ -462,8 +464,14 @@ def probe(path, deadline, expected_pid=None):
                 or type(hello.get("application")) is not int or hello["application"] != 1):
             raise SetupError("RABS refused protocol version 1")
         frames.send({"kind": "status"})
-        if frames.receive().get("kind") != "coord-status":
+        status = frames.receive()
+        if status.get("kind") != "coord-status":
             raise SetupError("RABS did not return coordinator status")
+        if status.get("live_dependency") is not True:
+            raise SetupError(
+                "the connected RABS daemon does not enable live dependency serving; "
+                "use a separate RABS_STATE_DIR and RABS_SOCKET_PATH for cargo rabs, "
+                "or start that daemon with RABS_LIVE_DEPENDENCY=1")
         if socket_identity(path) != identity:
             raise SetupError("RABS endpoint changed during the readiness exchange")
     return True

@@ -11,6 +11,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn spawn_daemon(socket: &std::path::Path, marker: &std::path::Path) -> Child {
+    spawn_daemon_with_live_dependency(socket, marker, false)
+}
+
+fn spawn_daemon_with_live_dependency(
+    socket: &std::path::Path,
+    marker: &std::path::Path,
+    live_dependency: bool,
+) -> Child {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         socket.parent().unwrap(),
@@ -22,6 +30,10 @@ fn spawn_daemon(socket: &std::path::Path, marker: &std::path::Path) -> Child {
         .env("RABS_BOOT_MARKER", marker)
         .env("RABS_STATE_DIR", marker.with_extension("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
+        .env(
+            "RABS_LIVE_DEPENDENCY",
+            if live_dependency { "1" } else { "0" },
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -205,6 +217,7 @@ fn coord_singleflight_leader_follower_and_status() {
     let status = read_line(&mut second);
     assert!(status.contains("\"available\":true"), "{status}");
     assert!(status.contains("\"open_flights\":1"), "{status}");
+    assert!(status.contains("\"live_dependency\":false"), "{status}");
     assert!(
         status.contains("\"lease_registry_mounted\":true"),
         "{status}"
@@ -242,6 +255,27 @@ fn coord_singleflight_leader_follower_and_status() {
     let receipts = std::fs::read_to_string(state.join("shadow-receipts.ndjson")).unwrap();
     assert!(receipts.contains("\"flight\":\"leader\""), "{receipts}");
     assert!(receipts.contains("\"flight\":\"follower\""), "{receipts}");
+}
+
+#[test]
+fn live_socket_status_advertises_the_actual_dependency_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rabsd.sock");
+    let marker = dir.path().join("rabsd.boot");
+    let mut daemon = spawn_daemon_with_live_dependency(&socket, &marker, true);
+    wait_for_socket(&socket);
+
+    let mut stream = connect(&socket);
+    assert!(handshake(&mut stream).contains("hello-ok"));
+    send_line(&mut stream, "{\"kind\":\"status\"}");
+    let status = read_line(&mut stream);
+    let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+    let (code, _) = terminate(&mut daemon);
+
+    assert_eq!(code, 0);
+    assert_eq!(status["kind"], "coord-status");
+    assert_eq!(status["live_dependency"], true);
+    assert_eq!(status["cas_mounted"], true);
 }
 
 #[test]

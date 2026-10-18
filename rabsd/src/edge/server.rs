@@ -425,7 +425,7 @@ async fn handle_connection(
         };
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
-                status_on_lane(&limits.control, coord.clone()).await
+                status_on_lane(&limits.control, coord.clone(), live.is_some()).await
             }
             Ok(value)
                 if matches!(
@@ -694,10 +694,25 @@ fn shadow_reply(
     (reply, joined)
 }
 
-async fn status_on_lane(lane: &Limit, coord: crate::coord::live::EdgeSubscriber) -> String {
+async fn status_on_lane(
+    lane: &Limit,
+    coord: crate::coord::live::EdgeSubscriber,
+    live_dependency: bool,
+) -> String {
     // Status can consult release-policy storage and coordinator locks too.
     // Its own lane prevents both inline I/O and bulk-work admission starvation.
-    let result = match lane.spawn(move || coord.status_json()) {
+    // Report the attached edge's actual capability, not the configuration a
+    // new `rabsd --check-config` process would use. A healthy shadow daemon
+    // shares this socket protocol but cannot serve Cargo dependency hits.
+    let result = match lane.spawn(move || {
+        match serde_json::from_str::<serde_json::Value>(&coord.status_json()) {
+            Ok(serde_json::Value::Object(mut status)) => {
+                status.insert("live_dependency".to_owned(), live_dependency.into());
+                serde_json::Value::Object(status).to_string()
+            }
+            _ => refusal("status-unavailable", "invalid coordinator status"),
+        }
+    }) {
         Ok(mut work) => work.wait().await,
         Err(error) => Err(error),
     };

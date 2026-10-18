@@ -61,7 +61,7 @@ with socket.socket(socket.AF_UNIX) as server:
                     connection.sendall(b'{"kind":"hello-ok","transport":1,"application":1}\n')
                     status = json.loads(reader.readline(65536))
                     assert status["kind"] == "status"
-                    connection.sendall(b'{"kind":"coord-status"}\n')
+                    connection.sendall(b'{"kind":"coord-status","live_dependency":true}\n')
                 except (ValueError, AssertionError, OSError):
                     pass
 '''
