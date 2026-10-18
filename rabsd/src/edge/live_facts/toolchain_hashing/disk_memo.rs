@@ -62,7 +62,9 @@ impl Scope {
         }
         let mount = std::fs::metadata("/proc/self/ns/mnt")?;
         Ok(Self {
-            boot: boot.try_into().map_err(|_| invalid("boot identity length"))?,
+            boot: boot
+                .try_into()
+                .map_err(|_| invalid("boot identity length"))?,
             mount_dev: mount.dev(),
             mount_ino: mount.ino(),
             uid: std::fs::metadata("/proc/self")?.uid(),
@@ -95,7 +97,9 @@ fn invalid(detail: &str) -> io::Error {
 fn private_root(root: &Path, uid: u32) -> io::Result<(u64, u64)> {
     let metadata = std::fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
-        return Err(invalid("toolchain digest directory is not owner-controlled"));
+        return Err(invalid(
+            "toolchain digest directory is not owner-controlled",
+        ));
     }
     Ok((metadata.dev(), metadata.ino()))
 }
@@ -147,8 +151,7 @@ impl DiskMemo {
         )) || matches!(
             std::env::var("RABS_TOOLCHAIN_DIGEST_CACHE").as_deref(),
             Ok("0" | "off")
-        )
-        {
+        ) {
             return Ok(None);
         }
         let Some(root) = std::env::var_os("RABS_STATE_DIR").map(PathBuf::from) else {
@@ -237,7 +240,7 @@ impl DiskMemo {
             return Ok((memo, Entries::new()));
         }
         let mut entries = Entries::new();
-        for record in bytes[HEADER_BYTES..].chunks_exact(RECORD_BYTES) {
+        for record in bytes[HEADER_BYTES..].as_chunks::<RECORD_BYTES>().0 {
             let Some((sig, digest)) = decode_record(&memo.header, record) else {
                 memo.reset()?;
                 return Ok((memo, Entries::new()));
@@ -362,8 +365,8 @@ fn decode_record(header: &[u8; HEADER_BYTES], bytes: &[u8]) -> Option<(FileSig, 
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod tests {
-    use super::*;
     use super::super::{DigestMemo, digest_stable_at, hash_files, lstat_regular};
+    use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -380,7 +383,10 @@ mod tests {
 
     fn restored(root: &Path, scope: &Scope) -> DigestMemo {
         let (disk, entries) = DiskMemo::open(root, scope, MAX_TOOLCHAIN_DIGESTS).unwrap();
-        DigestMemo { entries: Mutex::new(entries), disk: Mutex::new(Some(disk)) }
+        DigestMemo {
+            entries: Mutex::new(entries),
+            disk: Mutex::new(Some(disk)),
+        }
     }
 
     #[test]
@@ -390,18 +396,27 @@ mod tests {
         let busy = AtomicBool::new(false);
         let memo = restored(dir.path(), &scope);
         let reads = AtomicUsize::new(0);
-        assert_eq!(hash_files(&files, &busy, &memo, |path, sig| {
-            reads.fetch_add(1, Ordering::Relaxed);
-            digest_stable_at(path, sig).map(|(_, digest)| digest)
-        }).unwrap(), [expected.clone()]);
+        assert_eq!(
+            hash_files(&files, &busy, &memo, |path, sig| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                digest_stable_at(path, sig).map(|(_, digest)| digest)
+            })
+            .unwrap()
+            .as_slice(),
+            std::slice::from_ref(&expected)
+        );
         assert_eq!(reads.load(Ordering::Relaxed), 1);
         drop(memo);
 
         let restarted = restored(dir.path(), &scope);
         assert_eq!(restarted.entries.lock().unwrap().len(), 1);
-        assert_eq!(hash_files(&files, &busy, &restarted, |_, _| {
-            panic!("unchanged file bytes were reread after restarting the memo")
-        }).unwrap(), [expected]);
+        assert_eq!(
+            hash_files(&files, &busy, &restarted, |_, _| {
+                panic!("unchanged file bytes were reread after restarting the memo")
+            })
+            .unwrap(),
+            [expected]
+        );
     }
 
     #[test]
@@ -415,14 +430,23 @@ mod tests {
         assert_ne!(sig, refreshed);
         let restarted = restored(dir.path(), &scope);
         let busy = AtomicBool::new(false);
-        assert!(hash_files(&[(path.as_path(), sig)], &busy, &restarted, |_, _| {
-            panic!("stale file observation reached a read")
-        }).is_err());
+        assert!(
+            hash_files(&[(path.as_path(), sig)], &busy, &restarted, |_, _| {
+                panic!("stale file observation reached a read")
+            })
+            .is_err()
+        );
         let reads = AtomicUsize::new(0);
-        let actual = hash_files(&[(path.as_path(), refreshed)], &busy, &restarted, |path, sig| {
-            reads.fetch_add(1, Ordering::Relaxed);
-            digest_stable_at(path, sig).map(|(_, digest)| digest)
-        }).unwrap();
+        let actual = hash_files(
+            &[(path.as_path(), refreshed)],
+            &busy,
+            &restarted,
+            |path, sig| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                digest_stable_at(path, sig).map(|(_, digest)| digest)
+            },
+        )
+        .unwrap();
         assert_eq!(reads.load(Ordering::Relaxed), 1);
         assert_ne!(actual, [expected]);
     }
@@ -445,7 +469,10 @@ mod tests {
             assert_eq!(disk.file.metadata().unwrap().len(), HEADER_BYTES as u64);
             disk.remember(sig, &digest).unwrap();
             drop(disk);
-            assert_eq!(DiskMemo::open(dir.path(), &other, 8).unwrap().1.get(&sig), Some(&digest));
+            assert_eq!(
+                DiskMemo::open(dir.path(), &other, 8).unwrap().1.get(&sig),
+                Some(&digest)
+            );
         }
     }
 
@@ -470,11 +497,17 @@ mod tests {
                 std::fs::write(&path, bytes).unwrap();
             }
             let (mut recovered, entries) = DiskMemo::open(dir.path(), &scope, 8).unwrap();
-            assert!(entries.is_empty(), "damage must not preserve a partial set of hints");
+            assert!(
+                entries.is_empty(),
+                "damage must not preserve a partial set of hints"
+            );
             assert_eq!(std::fs::metadata(&path).unwrap().len(), HEADER_BYTES as u64);
             recovered.remember(sig, &digest).unwrap();
             drop(recovered);
-            assert_eq!(DiskMemo::open(dir.path(), &scope, 8).unwrap().1.get(&sig), Some(&digest));
+            assert_eq!(
+                DiskMemo::open(dir.path(), &scope, 8).unwrap().1.get(&sig),
+                Some(&digest)
+            );
         }
     }
 
@@ -488,11 +521,19 @@ mod tests {
         let mut next = sig;
         next.ino = next.ino.wrapping_add(1);
         let record = encode_record(&scope.header(), next, &digest).unwrap();
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(&record[..57]).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&record[..57])
+            .unwrap();
         let (mut disk, entries) = DiskMemo::open(dir.path(), &scope, 8).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries.get(&sig), Some(&digest));
-        assert_eq!(disk.file.metadata().unwrap().len(), (HEADER_BYTES + RECORD_BYTES) as u64);
+        assert_eq!(
+            disk.file.metadata().unwrap().len(),
+            (HEADER_BYTES + RECORD_BYTES) as u64
+        );
         disk.remember(next, &digest).unwrap();
         drop(disk);
         let (_, entries) = DiskMemo::open(dir.path(), &scope, 8).unwrap();
@@ -513,7 +554,8 @@ mod tests {
                 "hardlink" => std::fs::hard_link(&target, &path).unwrap(),
                 _ => {
                     std::fs::write(&path, b"not private").unwrap();
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
                 }
             }
             assert!(DiskMemo::open(dir.path(), &scope, 8).is_err());
@@ -532,7 +574,10 @@ mod tests {
         assert!(DiskMemo::open(dir.path(), &scope, 8).is_err());
         first.remember(sig, &digest).unwrap();
         drop(first);
-        assert_eq!(DiskMemo::open(dir.path(), &scope, 8).unwrap().1.get(&sig), Some(&digest));
+        assert_eq!(
+            DiskMemo::open(dir.path(), &scope, 8).unwrap().1.get(&sig),
+            Some(&digest)
+        );
     }
 
     #[test]
@@ -544,18 +589,30 @@ mod tests {
             sig.ino = index;
             disk.remember(sig, &digest).unwrap();
         }
-        assert_eq!(disk.file.metadata().unwrap().len(), (HEADER_BYTES + 2 * RECORD_BYTES) as u64);
+        assert_eq!(
+            disk.file.metadata().unwrap().len(),
+            (HEADER_BYTES + 2 * RECORD_BYTES) as u64
+        );
         drop(disk);
         assert_eq!(DiskMemo::open(dir.path(), &scope, 2).unwrap().1.len(), 2);
     }
 
     #[test]
     fn unknown_formats_and_oversized_files_are_left_untouched() {
-        for bytes in [b"future-format-v2".to_vec(), vec![0; HEADER_BYTES + 2 * RECORD_BYTES + 1]] {
+        for bytes in [
+            b"future-format-v2".to_vec(),
+            vec![0; HEADER_BYTES + 2 * RECORD_BYTES + 1],
+        ] {
             let (dir, scope, _, _, _) = fixture();
             let path = dir.path().join(NAME);
-            OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .open(&path).unwrap().write_all(&bytes).unwrap();
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
             assert!(DiskMemo::open(dir.path(), &scope, 2).is_err());
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
@@ -571,7 +628,10 @@ mod tests {
         sig.ctime_ns = i128::MAX;
         let header = scope.header();
         let encoded = encode_record(&header, sig, &digest).unwrap();
-        assert_eq!(decode_record(&header, &encoded), Some((sig, digest.clone())));
+        assert_eq!(
+            decode_record(&header, &encoded),
+            Some((sig, digest.clone()))
+        );
         let mut other_scope = scope;
         other_scope.mount_dev ^= 1;
         assert!(decode_record(&other_scope.header(), &encoded).is_none());
