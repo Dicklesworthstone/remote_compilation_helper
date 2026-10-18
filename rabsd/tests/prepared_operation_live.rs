@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 #[path = "prepared_operation_live/dependency_worker.rs"]
 mod dependency_worker;
+#[path = "prepared_operation_live/live_dependency_worker.rs"]
+mod live_dependency_worker;
 
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 
@@ -289,11 +291,13 @@ impl Fixture {
     }
 
     fn daemon(&self) -> Process {
-        let mut daemon = Process::spawn(
-            self.owner.path(),
-            &self.next_name("daemon"),
-            &mut self.command(),
-        );
+        self.daemon_with_environment(&[])
+    }
+
+    fn daemon_with_environment(&self, environment: &[(String, String)]) -> Process {
+        let mut command = self.command();
+        command.envs(environment.iter().map(|(name, value)| (name, value)));
+        let mut daemon = Process::spawn(self.owner.path(), &self.next_name("daemon"), &mut command);
         let socket = self.owner.path().join("daemon.sock");
         let until = Instant::now() + Duration::from_secs(15);
         loop {

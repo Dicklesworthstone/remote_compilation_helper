@@ -15,6 +15,130 @@ not a certificate. The receipt explicitly records `transport_authenticated:false
 and `publication_authorized:false`. Failed TLS configurations must not be cleared
 or downgraded to make a fleet connection use this operator lane.
 
+## Run the live Cargo dependency worker
+
+The normal Cargo wrapper can send an eligible dependency compilation directly
+to one authenticated worker, publish its verified result, and install that
+current result after the wrapper acknowledges the exact output manifest. Build
+matching binaries from this checkout:
+
+```sh
+cargo build -p rabsd -p rabs-wkr -p rabs-wrap
+```
+
+Provision a mutual-TLS CA, a coordinator certificate valid for the worker's
+configured server name, and a worker client certificate. Obtain the worker's
+SPKI SHA-256 from that trusted certificate:
+
+```sh
+openssl x509 -in /credentials/worker.pem -pubkey -noout |
+  openssl pkey -pubin -outform DER |
+  openssl dgst -sha256
+```
+
+Start the normal daemon with the following environment. Replace the private
+listen address, credential paths and pin with your deployment values; the pin
+is exactly 64 lowercase hexadecimal characters, without the OpenSSL label.
+Use this socket and state directory for the Cargo launcher too.
+
+```sh
+install -d -m 700 "$HOME/.cache/rabs-leaf"
+RABS_STATE_DIR="$HOME/.cache/rabs-leaf" \
+RABS_SOCKET_PATH="$HOME/.cache/rabs-leaf/rabs.sock" \
+RABS_LIVE_DEPENDENCY=1 \
+RABS_COORD_TLS_CA=/credentials/ca.pem \
+RABS_COORD_TLS_CERT=/credentials/coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/coordinator.key \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_SPKI_SHA256 \
+  ./target/debug/rabsd
+```
+
+On the worker host, run the matching worker continuously. The address must
+reach the coordinator's configured listener, and the TLS server name must
+match its certificate:
+
+```sh
+RABS_WORKER_TLS_CA=/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/credentials/worker.pem \
+RABS_WORKER_TLS_KEY=/credentials/worker.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-worker" \
+  ./target/debug/rabs-wkr \
+    --coordinator coordinator.example.internal:7092 --worker-id leaf-worker
+```
+
+The daemon binds this listener when an eligible wrapper request has accepted
+remote execution. Keep the worker's reconnect loop running without `--once`;
+there is no idle worker queue in this first single-peer lane. Preserve its
+durable state across reconnects and restarts.
+
+In another coordinator-side terminal, run ordinary Cargo through the live
+wrapper. Repeat the same worker selection here so launcher readiness verifies
+that the attached daemon has the requested remote capability:
+
+```sh
+RABS_STATE_DIR="$HOME/.cache/rabs-leaf" \
+RABS_SOCKET_PATH="$HOME/.cache/rabs-leaf/rabs.sock" \
+RABS_LIVE_DEPENDENCY=1 \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_SPKI_SHA256 \
+CARGO_RABS_DAEMON="$PWD/target/debug/rabsd" \
+CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
+  ./scripts/cargo-rabs --rabs-no-start --rabs-require-daemon \
+    check --locked --manifest-path /absolute/project/Cargo.toml
+```
+
+The first eligible request starts a complete toolchain capture in the
+background and may compile locally while that copy warms. Later requests use
+the retained compiler and sysroot only while their complete source witness
+still matches. Worker execution also requires the measured kernel, CPU,
+external loader libraries and filesystem profile to match the coordinator.
+Both hosts need the supported Linux isolation environment; the worker needs
+working bubblewrap and user namespaces.
+
+This initial remote class accepts metadata-only leaf dependencies:
+`--emit=dep-info,metadata`, no extern crates, build-script/generated inputs,
+native libraries or linker output, and empty dependency-artifact inventories.
+Other Cargo units continue through the ordinary local lane. The worker keeps
+the original source, output and toolchain path spellings and full compiler
+environment inside private mounts. The `dependency-exec-v2` loader policy
+supports Cargo's `target/debug/deps` and `target/debug` search paths after fresh
+bounded checks exclude loadable files, symlinks and hardware-capability
+subdirectories. These aliases receive private empty backings with only declared
+child mountpoints; the original target tree is never mounted. Unsupported
+loader paths or changing toolchain/runtime observations refuse remote admission.
+
+A successful remote primary producer does not run a duplicate local compile.
+Publication and installation still check the exact request, outputs, current
+authority, release policy and negative verification/class holds. Subsequent
+cache replays retain the existing qualification and periodic sampling rules.
+Transport uncertainty cannot authorize a concurrent local retry.
+
+### Run the native wrapper-to-worker oracle
+
+After the build above, run the explicit integration fixture on a host with
+Linux isolation and OpenSSL:
+
+```sh
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test prepared_operation_live \
+    live_wrapper_remote_leaf_matches_stock_and_samples_replay \
+    -- --ignored --nocapture
+```
+
+The fixture starts the real wrapper, daemon, TLS worker and rustc. It compares
+every result's metadata, dep-info and diagnostics with stock rustc under the
+same Cargo-shaped invocation, uses durable worker receipts to distinguish
+remote production from cache replay, and checks later sampling and an
+environment-driven key change. It invokes the actual wrapper with Cargo-shaped
+arguments; the operator command above exercises Cargo itself. The fixture is
+explicitly ignored by default and must be run to establish execution evidence
+for a particular host; its presence does not assert a successful remote run.
+
 ## Run one delivery
 
 Build the receiver and worker using the repository's pinned Rust toolchain:

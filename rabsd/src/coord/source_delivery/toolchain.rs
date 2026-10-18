@@ -33,11 +33,15 @@ pub(super) struct ToolchainUpload {
 
 impl ToolchainUpload {
     pub(super) fn new(prepared: PreparedToolchain, request: &Value) -> io::Result<Self> {
+        Self::from_shared(Arc::new(prepared), request)
+    }
+
+    pub(super) fn from_shared(
+        prepared: Arc<PreparedToolchain>,
+        request: &Value,
+    ) -> io::Result<Self> {
         let entries = Arc::new(prepared.entries()?);
-        let upload = Self {
-            prepared: Arc::new(prepared),
-            entries,
-        };
+        let upload = Self { prepared, entries };
         upload.validate_request(request)?;
         Ok(upload)
     }

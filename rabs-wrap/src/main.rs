@@ -28,6 +28,7 @@
 //! a new compiler attempt, or acceptance of a cache installation.
 
 mod capture;
+mod remote;
 mod singleflight;
 mod supervision;
 
@@ -582,7 +583,7 @@ fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
     }
     let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
     let frame = format!(
-        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}],\"wait_for_inflight\":true}}",
+        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}],\"wait_for_inflight\":true,\"remote_protocol\":1}}",
         argv_json.join(","),
         json_string(cwd),
         env.join(","),
@@ -628,6 +629,7 @@ fn live_outcome(
                 env,
             })
         }
+        Some("remote") => remote::outcome(reply, reader, owned),
         Some("hit") => {
             // Decline before accepting output writes from an older daemon:
             // its publications belong to the pre-custody key namespace.

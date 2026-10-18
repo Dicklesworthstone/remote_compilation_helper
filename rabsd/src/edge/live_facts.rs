@@ -142,7 +142,10 @@ pub fn digest_stable(path: &Path) -> std::io::Result<(FileSig, TypedDigest)> {
     digest_stable_at(path, lstat_regular(path)?)
 }
 
-fn digest_stable_at(path: &Path, before: FileSig) -> Result<(FileSig, TypedDigest), std::io::Error> {
+fn digest_stable_at(
+    path: &Path,
+    before: FileSig,
+) -> Result<(FileSig, TypedDigest), std::io::Error> {
     let mut file = stable_file::open(path, before)?;
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(before.size));
     let mut buffer = vec![0_u8; 256 * 1024];
@@ -321,6 +324,19 @@ pub struct ToolchainGuard {
 }
 
 impl ToolchainGuard {
+    /// The original sysroot observed for this request, never a refreshed probe.
+    #[must_use]
+    pub fn sysroot(&self) -> &Path {
+        // Admission constructs guards only for <sysroot>/bin/rustc.
+        self.observed
+            .inputs
+            .compiler
+            .0
+            .parent()
+            .and_then(Path::parent)
+            .expect("admitted compiler has a sysroot")
+    }
+
     /// Recheck the original compiler path and all its observed inputs without
     /// warming, probing, or adopting a newer memo generation.
     ///
@@ -2396,16 +2412,24 @@ mod tests {
             let archive = dependency_archive_pair(Path::new(&plan.out_dir), archive_time);
             require_archive(&mut plan, &archive);
             let facts = LiveFacts::new();
-            let captured = facts.dependencies(&plan).expect("exact rlib remains an input");
+            let captured = facts
+                .dependencies(&plan)
+                .expect("exact rlib remains an input");
             let candidates = &captured.directories[0].artifacts;
             assert_eq!(candidates.len(), 2);
             assert_eq!(candidates[0].path, archive.to_str().unwrap());
-            assert_eq!(candidates[0].content_digest, digest_stable(&archive).unwrap().1);
+            assert_eq!(
+                candidates[0].content_digest,
+                digest_stable(&archive).unwrap().1
+            );
             captured.verify_unchanged().unwrap();
             std::fs::write(&archive, b"archive-v2").unwrap();
             assert!(captured.verify_unchanged().is_err());
             let changed = facts.dependencies(&plan).unwrap();
-            assert_ne!(changed.directories[0].artifacts, captured.directories[0].artifacts);
+            assert_ne!(
+                changed.directories[0].artifacts,
+                captured.directories[0].artifacts
+            );
         }
     }
 
@@ -2474,7 +2498,12 @@ mod tests {
                 .unwrap();
             let facts = LiveFacts::new();
             *facts.warming.lock().unwrap() = MAX_WARMING;
-            assert_eq!(facts.dependencies(&plan).unwrap().directories[0].artifacts.len(), 1);
+            assert_eq!(
+                facts.dependencies(&plan).unwrap().directories[0]
+                    .artifacts
+                    .len(),
+                1
+            );
             require_archive(&mut plan, &archive);
             if size > MAX_DEPENDENCY_BYTES {
                 assert!(matches!(
@@ -2485,7 +2514,12 @@ mod tests {
                 assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
                 assert!(!facts.files.lock().unwrap().contains_key(&archive));
                 facts.file_digest(&archive).unwrap();
-                assert_eq!(facts.dependencies(&plan).unwrap().directories[0].artifacts.len(), 2);
+                assert_eq!(
+                    facts.dependencies(&plan).unwrap().directories[0]
+                        .artifacts
+                        .len(),
+                    2
+                );
             }
         }
     }

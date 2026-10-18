@@ -202,6 +202,25 @@ pub fn serving_sample_decision(
     decide(store, action, risk, policy, sprt_ladder::enabled())
 }
 
+/// Existing durable class-wide negative-evidence veto without replay cadence.
+///
+/// A coordinator installing the freshly executed current producer still must
+/// reject a class with adverse evidence. This reads the same class receipts,
+/// incidents and quarantine rows used by serving_sample_decision, without
+/// requiring positive verification samples or spending cache-replay allowance.
+/// It does not check current authority, release authorization, the requested
+/// action's own serving state, artifact closure or destination ownership; those
+/// remain required under the caller's installation lock.
+///
+/// # Errors
+/// Store errors or malformed class/evidence rows refuse the installation.
+pub fn class_safety_refusal(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+) -> Result<Option<PrivateExecutionReason>, StoreError> {
+    class_quarantine::refusal(store, &digest_key(action))
+}
+
 fn decide(
     store: &mut dyn RabsMetadataStore,
     action: &TypedDigest,
@@ -281,7 +300,7 @@ fn decide(
     // The live coordinator holds the same CAS mutex through this check and
     // installation. Check the durable class again for BOTH preview and install;
     // a previous healthy preview is never an authorization token.
-    if let Some(reason) = class_quarantine::refusal(store, &action_key)? {
+    if let Some(reason) = class_safety_refusal(store, action)? {
         return Ok(SampleGateDecision::ExecutePrivately(reason));
     }
     let bucket = key_bucket_basis_points(action);
@@ -292,9 +311,7 @@ fn decide(
             },
         ));
     }
-    if use_sprt
-        && let Some(reason) = sprt_ladder::refusal(store, &action_key)?
-    {
+    if use_sprt && let Some(reason) = sprt_ladder::refusal(store, &action_key)? {
         return Ok(SampleGateDecision::ExecutePrivately(reason));
     }
     Ok(SampleGateDecision::ServeFromCache)
@@ -453,7 +470,11 @@ mod tests {
     /// Publish action `tag` at generation `generation` and return its
     /// canonical key string. Generations must strictly increase (the
     /// store enforces a high-water mark).
-    pub(super) fn published(store: &mut dyn RabsMetadataStore, tag: u8, generation: u128) -> String {
+    pub(super) fn published(
+        store: &mut dyn RabsMetadataStore,
+        tag: u8,
+        generation: u128,
+    ) -> String {
         let active = digest("rabs.authority.sha256.v1", 1);
         store.acquire_authority(&authority_row(1)).unwrap();
         let entry = ActionEntryRow {

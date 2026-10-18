@@ -8,6 +8,7 @@ dispatch supports Linux/macOS clients. Python 3.9+ is required.
 """
 
 import fcntl
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,12 @@ DEFAULT_STARTUP_MS = 5000
 MAX_STARTUP_MS = 30000
 OWNER_RECEIPT = "daemon-owner.json"
 MAX_OWNER_RECEIPT = 2048
+DEPENDENCY_CONTEXT = "dependency-exec-v2"
+DEPENDENCY_WORKER_KEYS = (
+    "RABS_DEPENDENCY_WORKER_LISTEN",
+    "RABS_DEPENDENCY_WORKER_ID",
+    "RABS_DEPENDENCY_WORKER_SPKI_SHA256",
+)
 HELLO = {
     "kind": "hello",
     "transport": {"minimum_compatible": 1, "current": 1},
@@ -81,8 +88,17 @@ reconfigured: its live/shadow setting remains its own. A connected daemon is
 accepted only when it reports the live dependency lane; a shadow or older
 daemon gives a setup error with the ordinary stock-Cargo fallback. Readiness
 is not a promise of a cache hit. Unsupported units, warming facts and required
-verification runs still compile normally. This is the host-local dependency
-lane, not canonical cross-host execution or a cached build-script executor.
+verification runs still compile normally.
+
+Set all of RABS_DEPENDENCY_WORKER_LISTEN, RABS_DEPENDENCY_WORKER_ID and
+RABS_DEPENDENCY_WORKER_SPKI_SHA256 to select the authenticated per-dependency
+worker lane, together with the existing RABS_COORD_TLS_* credentials for a
+new daemon. The connected daemon must advertise that exact worker, listener,
+pin and dependency-exec-v2 capability. A different, local-only or older daemon
+produces a setup error and an explicit stock-Cargo fallback; use
+--rabs-require-daemon to refuse setup instead. Settings never reconfigure an
+attached daemon. A matching configuration does not promise a connected worker
+or a cache hit; eligible requests retain the worker's execution checks.
 
 RABS_CONFIG, RABS_SOCKET_PATH and RABS_STATE_DIR retain rabsd's meanings.
 CARGO_RABS_DAEMON and CARGO_RABS_WRAP select executable paths explicitly;
@@ -116,6 +132,10 @@ proof of exit. Older PID-only receipts retain conservative absence-only recovery
 
 class SetupError(Exception):
     """Acceleration could not be set up; no compiler or output writer started."""
+
+
+class RemoteConfigurationMismatch(SetupError):
+    """A connected daemon cannot honor the requested dependency worker."""
 
 
 class StaleEndpoint(SetupError):
@@ -437,7 +457,73 @@ class Frames:
             self.buffer.extend(chunk)
 
 
-def probe(path, deadline, expected_pid=None):
+def requested_dependency_worker(env):
+    """Explicit deployment expectations, checked against the connected daemon.
+
+    No DNS lookup or worker connection happens here. The native daemon still
+    validates its own configuration and owns the selected worker transport.
+    """
+    if not any(name in env for name in DEPENDENCY_WORKER_KEYS):
+        return None
+    values = []
+    for name in DEPENDENCY_WORKER_KEYS:
+        value = env.get(name)
+        if not isinstance(value, str) or not value:
+            raise SetupError("all dependency worker settings are required; missing " + name)
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError as error:
+            raise SetupError(name + " must be UTF-8") from error
+        if len(encoded) > 1024 or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise SetupError(name + " must be a bounded string without controls")
+        values.append(value)
+    listen, worker, pin = values
+    host, separator, port = listen.rpartition(":")
+    if not separator or not port or any(char not in "0123456789" for char in port):
+        raise SetupError("RABS_DEPENDENCY_WORKER_LISTEN must be a literal IP and nonzero port")
+    bracketed = host.startswith("[") and host.endswith("]")
+    address_text = host[1:-1] if bracketed else host
+    try:
+        address = ipaddress.ip_address(address_text)
+    except ValueError as error:
+        raise SetupError("RABS_DEPENDENCY_WORKER_LISTEN must use a literal IP address") from error
+    if (bracketed != (address.version == 6) or "%" in address_text
+            or not 0 < int(port) <= 65535):
+        raise SetupError("RABS_DEPENDENCY_WORKER_LISTEN must use IPv4:port or [IPv6]:port")
+    # Match Rust SocketAddr display, including its dotted IPv4-mapped suffix.
+    display = ("::ffff:" + str(address.ipv4_mapped)
+               if address.version == 6 and address.ipv4_mapped is not None else str(address))
+    listen = ("[{}]:{}" if address.version == 6 else "{}:{}").format(display, int(port))
+    if len(pin) != 64 or any(char not in "0123456789abcdef" for char in pin) or pin == "0" * 64:
+        raise SetupError("RABS_DEPENDENCY_WORKER_SPKI_SHA256 must be a nonzero value of 64 lowercase hex digits")
+    return {
+        "remote_protocol": 1,
+        "dependency_context": DEPENDENCY_CONTEXT,
+        "listen": listen,
+        "worker_id": worker,
+        "worker_spki_sha256": pin,
+    }
+
+
+def require_dependency_worker(status, expected):
+    if expected is None:
+        return
+    actual = status.get("remote_dependency")
+    if not isinstance(actual, dict):
+        mismatch = "remote capability is not advertised"
+    else:
+        fields = [name for name, value in expected.items()
+                  if type(actual.get(name)) is not type(value) or actual.get(name) != value]
+        if not fields:
+            return
+        mismatch = ", ".join(fields)
+    raise RemoteConfigurationMismatch(
+        "the connected RABS daemon does not match the requested dependency worker "
+        "configuration ({}); use a separate RABS_STATE_DIR and RABS_SOCKET_PATH "
+        "with a daemon configured for these RABS_DEPENDENCY_WORKER_* settings".format(mismatch))
+
+
+def probe(path, deadline, expected_pid=None, expected_remote=None):
     """Readiness only, never evidence of a hit or authorization to skip rustc."""
     identity = socket_identity(path)
     if identity is None:
@@ -472,6 +558,7 @@ def probe(path, deadline, expected_pid=None):
                 "the connected RABS daemon does not enable live dependency serving; "
                 "use a separate RABS_STATE_DIR and RABS_SOCKET_PATH for cargo rabs, "
                 "or start that daemon with RABS_LIVE_DEPENDENCY=1")
+        require_dependency_worker(status, expected_remote)
         if socket_identity(path) != identity:
             raise SetupError("RABS endpoint changed during the readiness exchange")
     return True
@@ -730,10 +817,12 @@ class StartupLock:
 
 
 def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
+    expected_remote = requested_dependency_worker(env)
     stale = None
     if socket_identity(socket_path) is not None:
         try:
-            if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
+            if not probe(socket_path, min(deadline, time.monotonic() + 1.0),
+                         expected_remote=expected_remote):
                 raise SetupError("RABS endpoint disappeared during readiness checking")
             return
         except StaleEndpoint as error:
@@ -744,10 +833,16 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
         raise SetupError("no RABS daemon is listening and --rabs-no-start was requested")
     with StartupLock(state, socket_path, deadline) as lock:
         if not lock.acquire(socket_path):
+            # The lifetime-lock handoff proves ordinary readiness only. Its
+            # newly connected daemon must satisfy this caller's selected worker.
+            if not probe(socket_path, min(deadline, time.monotonic() + 1.0),
+                         expected_remote=expected_remote):
+                raise SetupError("RABS endpoint disappeared after startup handoff")
             return
         if socket_identity(socket_path) is not None:
             try:
-                if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
+                if not probe(socket_path, min(deadline, time.monotonic() + 1.0),
+                             expected_remote=expected_remote):
                     raise SetupError("RABS endpoint disappeared during readiness checking")
                 return
             except StaleEndpoint as error:
@@ -772,7 +867,8 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
                 raise SetupError("rabsd exited during startup; see {}".format(log))
             try:
                 identity = socket_identity(socket_path)
-                if probe(socket_path, min(deadline, time.monotonic() + 0.25), child.pid):
+                if probe(socket_path, min(deadline, time.monotonic() + 0.25),
+                         child.pid, expected_remote):
                     if socket_identity(socket_path) != identity:
                         raise SetupError("RABS endpoint changed before recording its owner")
                     try:
@@ -781,6 +877,10 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
                         print("cargo-rabs: daemon ready, but crash recovery ownership was not "
                               "recorded: {}".format(error), file=sys.stderr)
                     return
+            except RemoteConfigurationMismatch:
+                # An authenticated status mismatch cannot improve by waiting.
+                # Preserve the shared daemon, but surface the selected-worker error.
+                raise
             except (SetupError, OSError):
                 # Only this newly-started daemon gets a readiness grace period.
                 # Its process and socket are never killed/unlinked on timeout;

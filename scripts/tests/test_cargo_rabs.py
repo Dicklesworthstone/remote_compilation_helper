@@ -152,6 +152,18 @@ while running and time.monotonic() < end and root.exists():
             if request.get("kind") == "status":
                 status = {"kind": "coord-status", "v": 1,
                           "live_dependency": os.environ.get("RABS_LIVE_DEPENDENCY") == "1"}
+                status["remote_dependency"] = None
+                worker_keys = ("RABS_DEPENDENCY_WORKER_LISTEN", "RABS_DEPENDENCY_WORKER_ID",
+                               "RABS_DEPENDENCY_WORKER_SPKI_SHA256")
+                if all(name in os.environ for name in worker_keys):
+                    status["remote_dependency"] = {
+                        "remote_protocol": 1, "dependency_context": "dependency-exec-v2",
+                        "listen": os.environ[worker_keys[0]],
+                        "worker_id": os.environ[worker_keys[1]],
+                        "worker_spki_sha256": os.environ[worker_keys[2]],
+                    }
+                if "TEST_STATUS_REMOTE_JSON" in os.environ:
+                    status["remote_dependency"] = json.loads(os.environ["TEST_STATUS_REMOTE_JSON"])
                 if os.environ.get("TEST_STATUS_LEGACY"):
                     status.pop("live_dependency")
                 peer.sendall(json.dumps(status).encode() + b'\n')
@@ -683,6 +695,118 @@ class LauncherTests(unittest.TestCase):
             child.terminate()
             child.wait(timeout=3)
 
+    def dependency_worker_settings(self, **changes):
+        settings = {
+            "RABS_DEPENDENCY_WORKER_LISTEN": "127.0.0.1:9443",
+            "RABS_DEPENDENCY_WORKER_ID": "compile-worker",
+            "RABS_DEPENDENCY_WORKER_SPKI_SHA256": "ab" * 32,
+        }
+        settings.update(changes)
+        return settings
+
+    def test_requested_dependency_worker_is_verified_on_start_and_reuse(self):
+        settings = self.dependency_worker_settings()
+        first = self.cargo_result(self.launch(["--rabs-require-daemon", "check"], settings))
+        identity = rabs.socket_identity(str(self.endpoint))
+        for changes in [settings, {}]:
+            value = self.cargo_result(self.launch(["--rabs-no-start", "--rabs-require-daemon", "check"], changes))
+            self.assertEqual(value["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(first["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_local_daemon_cannot_silently_satisfy_explicit_dependency_worker(self):
+        self.cargo_result(self.launch())
+        identity = rabs.socket_identity(str(self.endpoint))
+        settings = self.dependency_worker_settings()
+        fallback = self.launch(["check"], settings)
+        self.assertNotIn("RUSTC_WRAPPER", self.cargo_result(fallback)["env"])
+        self.assertIn(b"dependency worker configuration", fallback.stderr)
+        self.assertIn(b"running stock Cargo", fallback.stderr)
+        required = self.launch(["--rabs-require-daemon", "check"], settings)
+        self.assertEqual(required.returncode, 2, required.stderr)
+        self.assertEqual(required.stdout, b"")
+        self.assertIn(b"RABS_STATE_DIR and RABS_SOCKET_PATH", required.stderr)
+        self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_each_attached_worker_identity_field_must_match_without_restart(self):
+        settings = self.dependency_worker_settings()
+        self.cargo_result(self.launch(changes=settings))
+        identity = rabs.socket_identity(str(self.endpoint))
+        for name, replacement in [
+            ("RABS_DEPENDENCY_WORKER_LISTEN", "127.0.0.1:9444"),
+            ("RABS_DEPENDENCY_WORKER_ID", "another-worker"),
+            ("RABS_DEPENDENCY_WORKER_SPKI_SHA256", "cd" * 32),
+        ]:
+            with self.subTest(name=name):
+                changed = dict(settings, **{name: replacement})
+                result = self.launch(["--rabs-no-start", "--rabs-require-daemon", "check"], changed)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"dependency worker configuration", result.stderr)
+        self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_new_daemon_with_old_dependency_context_reports_the_actual_mismatch(self):
+        settings = self.dependency_worker_settings()
+        old = {
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v1",
+            "listen": settings["RABS_DEPENDENCY_WORKER_LISTEN"],
+            "worker_id": settings["RABS_DEPENDENCY_WORKER_ID"],
+            "worker_spki_sha256": settings["RABS_DEPENDENCY_WORKER_SPKI_SHA256"],
+        }
+        result = self.launch(["--rabs-require-daemon", "check"], dict(
+            settings, TEST_STATUS_REMOTE_JSON=json.dumps(old)))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"dependency_context", result.stderr)
+        self.assertNotIn(b"startup was not confirmed", result.stderr)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertFalse(rabs.process_exited(self.starts()[0]["pid"]),
+                         "an incompatible shared daemon remains owned and running")
+
+    def test_prebind_lifetime_lock_handoff_rechecks_selected_dependency_worker(self):
+        gate = self.root / "allow-remote-bind"
+        entered = threading.Event()
+        original_acquire = rabs.StartupLock.acquire
+
+        def acquire(lock, endpoint):
+            entered.set()
+            return original_acquire(lock, endpoint)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.launch, ["check"], {"TEST_START_GATE": str(gate)})
+            try:
+                deadline = time.monotonic() + 3
+                while not self.starts():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                self.assertFalse(self.endpoint.exists())
+                selected = dict(self.env, **self.dependency_worker_settings())
+                with mock.patch.object(rabs.StartupLock, "acquire", acquire):
+                    follower = pool.submit(rabs.prepare, selected, False)
+                    self.assertTrue(entered.wait(timeout=3), "follower must reach the held lifetime lock")
+                    self.assertFalse(self.endpoint.exists())
+                    gate.write_text("bind now")
+                    with self.assertRaisesRegex(rabs.RemoteConfigurationMismatch, "dependency worker"):
+                        follower.result(timeout=5)
+                self.assertEqual(self.cargo_result(first.result(timeout=5))["env"]["RUSTC_WRAPPER"],
+                                 str(self.wrap))
+                self.assertEqual(len(self.starts()), 1)
+            finally:
+                gate.write_text("release fixture")
+                first.result(timeout=5)
+
+    def test_partial_dependency_worker_request_does_not_start_a_daemon(self):
+        for name, value in self.dependency_worker_settings().items():
+            with self.subTest(name=name):
+                result = self.launch(["--rabs-require-daemon", "check"], {name: value})
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"all dependency worker settings are required", result.stderr)
+        self.assertEqual(self.starts(), [])
+
     def test_cargo_self_recursion_is_refused(self):
         result = self.launch(changes={"CARGO": str(LAUNCHER)})
         self.assertEqual(result.returncode, 127)
@@ -1162,6 +1286,52 @@ class LauncherTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_dependency_worker_configuration_normalizes_only_socket_address_spelling(self):
+        settings = {
+            "RABS_DEPENDENCY_WORKER_LISTEN": "[0:0:0:0:0:0:0:1]:09443",
+            "RABS_DEPENDENCY_WORKER_ID": "compiler 雪",
+            "RABS_DEPENDENCY_WORKER_SPKI_SHA256": "ab" * 32,
+        }
+        self.assertEqual(rabs.requested_dependency_worker(settings), {
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v2",
+            "listen": "[::1]:9443", "worker_id": "compiler 雪",
+            "worker_spki_sha256": "ab" * 32,
+        })
+        for spelling in ("[::ffff:192.0.2.1]:9443", "[::ffff:c000:201]:9443"):
+            selected = rabs.requested_dependency_worker(dict(settings, RABS_DEPENDENCY_WORKER_LISTEN=spelling))
+            self.assertEqual(selected["listen"], "[::ffff:192.0.2.1]:9443")
+        self.assertIsNone(rabs.requested_dependency_worker({}))
+        for name, bad in [
+            ("RABS_DEPENDENCY_WORKER_LISTEN", "localhost:9443"),
+            ("RABS_DEPENDENCY_WORKER_LISTEN", "127.0.0.1:0"),
+            ("RABS_DEPENDENCY_WORKER_LISTEN", "::1:9443"),
+            ("RABS_DEPENDENCY_WORKER_LISTEN", "[::1]:65536"),
+            ("RABS_DEPENDENCY_WORKER_LISTEN", "[fe80::1%eth0]:9443"),
+            ("RABS_DEPENDENCY_WORKER_ID", ""),
+            ("RABS_DEPENDENCY_WORKER_ID", "worker\ncontrol"),
+            ("RABS_DEPENDENCY_WORKER_ID", "雪" * 342),
+            ("RABS_DEPENDENCY_WORKER_SPKI_SHA256", "0" * 64),
+            ("RABS_DEPENDENCY_WORKER_SPKI_SHA256", "AB" * 32),
+            ("RABS_DEPENDENCY_WORKER_SPKI_SHA256", "ab" * 31),
+        ]:
+            with self.subTest(name=name, bad=bad), self.assertRaises(rabs.SetupError):
+                rabs.requested_dependency_worker(dict(settings, **{name: bad}))
+
+    def test_dependency_worker_status_requires_typed_supported_capability(self):
+        expected = {
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v2",
+            "listen": "127.0.0.1:9443", "worker_id": "compiler",
+            "worker_spki_sha256": "ab" * 32,
+        }
+        rabs.require_dependency_worker({"remote_dependency": expected}, expected)
+        rabs.require_dependency_worker({}, None)
+        for actual in [None, True, [], {}, dict(expected, remote_protocol=True),
+                       dict(expected, remote_protocol=2),
+                       dict(expected, dependency_context="dependency-exec-v1"),
+                       dict(expected, dependency_context="dependency-exec-v3")]:
+            with self.subTest(actual=actual), self.assertRaises(rabs.RemoteConfigurationMismatch):
+                rabs.require_dependency_worker({"remote_dependency": actual}, expected)
+
     def test_argument_boundary_does_not_consume_cargo_options(self):
         self.assertEqual(rabs.arguments(["rabs"]), (["build"], False, False, False))
         self.assertEqual(rabs.arguments(["rabs", "--rabs-no-start", "check", "--rabs-require-daemon"]),

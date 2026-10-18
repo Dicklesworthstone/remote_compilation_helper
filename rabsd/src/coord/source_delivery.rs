@@ -536,6 +536,24 @@ impl SourceUpload {
         Ok(self)
     }
 
+    /// Reuse one retained compiler image across dependency actions. The owner
+    /// keeps its private backing alive through every upload. Range reads remain
+    /// anchored to the captured inventory and the worker verifies the seal.
+    pub fn with_shared_toolchain(
+        mut self,
+        prepared: Arc<PreparedToolchain>,
+        request: &Value,
+    ) -> io::Result<Self> {
+        require(
+            self.toolchain.is_none(),
+            "toolchain upload already attached",
+        )?;
+        self.validate_source_request(request)?;
+        self.toolchain = Some(toolchain::ToolchainUpload::from_shared(prepared, request)?);
+        self.validate_request(request)?;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn wire_manifest(&self) -> Value {
         manifest_value(&self.manifest)

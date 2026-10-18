@@ -22,6 +22,7 @@ mod backpressure;
 mod endpoint;
 mod frame_read;
 mod liveness;
+mod remote_dependency;
 mod rustc_outputs;
 mod rustc_request;
 
@@ -66,6 +67,8 @@ const LIVE_DECISION_WORKERS: usize = 8;
 /// wait for publication. Keep this lane separate from decisions; no worker
 /// permit is held while awaiting the subscriber's acknowledgment.
 const LIVE_COMPLETION_WORKERS: usize = 8;
+/// Long compiler and input-transfer waits never occupy decision or hit lanes.
+const REMOTE_EXECUTION_WORKERS: usize = 1;
 /// How long an admitted local execution may run before its completion
 /// frame must arrive (the attempt lease is longer still).
 const LOCAL_EXECUTION_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
@@ -79,6 +82,7 @@ struct EdgeLimits {
     prepared_admission: Limit,
     live: Limit,
     live_completion: Limit,
+    remote_execution: Limit,
 }
 impl EdgeLimits {
     fn new() -> Self {
@@ -90,6 +94,7 @@ impl EdgeLimits {
             prepared_admission: Limit::new(PREPARED_ADMISSION_WORKERS),
             live: Limit::new(LIVE_DECISION_WORKERS),
             live_completion: Limit::new(LIVE_COMPLETION_WORKERS),
+            remote_execution: Limit::new(REMOTE_EXECUTION_WORKERS),
         }
     }
 }
@@ -202,7 +207,11 @@ async fn serve(
         live: config
             .live_dependency
             .clone()
-            .map(|lane| std::sync::Arc::new(rustc_request::LiveEdge::new(lane))),
+            .map(|lane| {
+                rustc_request::LiveEdge::configured(lane, &config.state_dir)
+                    .map(std::sync::Arc::new)
+            })
+            .transpose()?,
     };
     let limits = EdgeLimits::new();
     let acceptor = cx
@@ -428,7 +437,11 @@ async fn handle_connection(
         };
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
-                status_on_lane(&limits.control, coord.clone(), live.is_some()).await
+                let remote = live
+                    .as_ref()
+                    .and_then(|edge| edge.remote_configuration())
+                    .cloned();
+                status_on_lane(&limits.control, coord.clone(), live.is_some(), remote).await
             }
             Ok(value)
                 if matches!(
@@ -495,12 +508,13 @@ async fn handle_connection(
                 serve_on_lane(&limits.materialization, coord.clone(), value).await
             }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("rustc-request") => {
-                let may_wait = value.get("wait_for_inflight").and_then(serde_json::Value::as_bool)
+                let may_wait = value
+                    .get("wait_for_inflight")
+                    .and_then(serde_json::Value::as_bool)
                     == Some(true);
                 let decided = match &live {
                     Some(live) => {
-                        backpressure::decide(&limits.live, std::sync::Arc::clone(live), value)
-                            .await
+                        backpressure::decide(&limits.live, std::sync::Arc::clone(live), value).await
                     }
                     None => Ok(rustc_request::shadow_observation(&value).map_or_else(
                         || {
@@ -536,6 +550,25 @@ async fn handle_connection(
                             Err(_) => "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
                                        \"mode\":\"shadow-error\"}"
                                 .to_owned(),
+                        }
+                    }
+                    Ok(rustc_request::Decided::Remote { reply, pending }) => {
+                        let Some(live) = live.clone() else {
+                            break;
+                        };
+                        match remote_dependency::complete_on_connection(
+                            &limits.remote_execution,
+                            &limits.materialization,
+                            live,
+                            pending,
+                            reply,
+                            may_wait,
+                            &mut stream,
+                        )
+                        .await
+                        {
+                            Some(reply) => reply,
+                            None => break,
                         }
                     }
                     Ok(rustc_request::Decided::Hit { reply, pending }) => {
@@ -577,8 +610,9 @@ async fn handle_connection(
                         }
                         let live = live.clone();
                         let installed = match live {
-                            Some(live) => installation
-                                .finish(move || rustc_request::install(&live, pending)),
+                            Some(live) => {
+                                installation.finish(move || rustc_request::install(&live, pending))
+                            }
                             None => break,
                         };
                         match installed {
@@ -719,6 +753,7 @@ async fn status_on_lane(
     lane: &Limit,
     coord: crate::coord::live::EdgeSubscriber,
     live_dependency: bool,
+    remote_dependency: Option<serde_json::Value>,
 ) -> String {
     // Status can consult release-policy storage and coordinator locks too.
     // Its own lane prevents both inline I/O and bulk-work admission starvation.
@@ -729,6 +764,10 @@ async fn status_on_lane(
         match serde_json::from_str::<serde_json::Value>(&coord.status_json()) {
             Ok(serde_json::Value::Object(mut status)) => {
                 status.insert("live_dependency".to_owned(), live_dependency.into());
+                status.insert(
+                    "remote_dependency".to_owned(),
+                    remote_dependency.unwrap_or(serde_json::Value::Null),
+                );
                 serde_json::Value::Object(status).to_string()
             }
             _ => refusal("status-unavailable", "invalid coordinator status"),

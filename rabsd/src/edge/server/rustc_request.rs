@@ -34,6 +34,7 @@
 //! Requests outside the live class keep the shadow plane's observation, so
 //! turning the lane on never loses the existing shadow evidence.
 
+use crate::coord::live_dependency::remote::{PendingRemote, RemoteDependencies};
 use crate::coord::live_dependency::{
     CompletionReport, InstallResult, LiveDecision, LiveDependencyLane, LiveDependencyRequest,
     LocalAttempt, MAX_TRANSCRIPT_BYTES, PendingServe,
@@ -72,8 +73,9 @@ const MAX_ENV: usize = 4096;
 #[derive(Debug)]
 pub struct LiveEdge {
     lane: LiveDependencyLane,
-    facts: Arc<LiveFacts>,
+    pub(super) facts: Arc<LiveFacts>,
     reuse_empty_out_dir: bool,
+    remote: Option<Arc<RemoteDependencies>>,
 }
 
 impl LiveEdge {
@@ -84,7 +86,23 @@ impl LiveEdge {
             lane,
             facts: LiveFacts::new(),
             reuse_empty_out_dir: build_script_reuse::enabled(),
+            remote: None,
         }
+    }
+}
+
+impl LiveEdge {
+    /// The serving socket owns its actual remote configuration. Tests and
+    /// explicit local lanes use new(), which performs no environment lookup.
+    pub(super) fn remote_configuration(&self) -> Option<&Value> {
+        self.remote.as_ref().map(|remote| remote.configuration())
+    }
+
+    pub(super) fn configured(lane: LiveDependencyLane, state: &Path) -> Result<Self, String> {
+        let mut live = Self::new(lane);
+        live.remote =
+            RemoteDependencies::from_environment(state).map_err(|error| error.to_string())?;
+        Ok(live)
     }
 }
 
@@ -101,6 +119,11 @@ pub(super) enum Decided {
     Hit {
         reply: String,
         pending: Box<PendingServe>,
+    },
+    /// Offer private worker execution, then obtain fresh install consent.
+    Remote {
+        reply: String,
+        pending: Box<PendingRemote>,
     },
     /// Not eligible: answer through the shadow plane.
     Shadow(crate::edge::shadow::ConsultObservation),
@@ -421,7 +444,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }
         }
     }
-    let key = match build_script_reuse::key(
+    let mut key = match build_script_reuse::key(
         &mut plan,
         &toolchain,
         &externs,
@@ -443,8 +466,35 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             return Decided::Reply(pass_through(refusal.code()));
         }
     };
+    // Older wrappers keep the existing local protocol. A remote descriptor
+    // can only be selected alongside this distinct accepted-execution path.
+    let remote = if request.get("remote_protocol").and_then(Value::as_u64) == Some(1)
+        && package.build_script_output.is_none()
+    {
+        live.remote.as_ref().and_then(|remote| {
+            match remote.key(
+                &plan,
+                &toolchain,
+                &toolchain_guard,
+                &dependencies.directories,
+                &inputs,
+                &parsed.argv,
+            ) {
+                Ok((remote_key, invocation)) => {
+                    key = remote_key;
+                    Some((Arc::clone(remote), invocation))
+                }
+                Err(reason) => {
+                    log("remote-ineligible", &[("crate", unit), ("reason", &reason)]);
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let key_text = digest_key(&key.action_key);
-    let decision = live.lane.decide(LiveDependencyRequest {
+    let admitted = LiveDependencyRequest {
         key,
         plan,
         inputs,
@@ -455,7 +505,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             .into_iter()
             .map(|fact| (fact.path, fact.content_digest))
             .collect(),
-    });
+    };
+    let decision = match remote {
+        Some((remote, invocation)) => live.lane.decide_remote(admitted, remote, invocation),
+        None => live.lane.decide(admitted),
+    };
     decision_reply(decision, &key_text, unit, may_wait)
 }
 
@@ -473,6 +527,18 @@ fn decision_reply(
                     "kind": "rustc-decision", "decision": "hit",
                     "action_key": key_text, "capture_protocol": 1,
                     "compiler_skip_authorized": false,
+                })
+                .to_string(),
+                pending: Box::new(pending),
+            }
+        }
+        LiveDecision::Remote(pending) => {
+            log("remote-offer", &[("crate", unit), ("key", key_text)]);
+            Decided::Remote {
+                reply: json!({
+                    "kind":"rustc-decision", "decision":"remote", "remote_protocol":1,
+                    "action_key":key_text, "capture_protocol":1,
+                    "compiler_skip_authorized":false,
                 })
                 .to_string(),
                 pending: Box::new(pending),

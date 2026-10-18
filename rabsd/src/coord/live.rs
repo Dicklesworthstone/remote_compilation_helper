@@ -25,6 +25,8 @@
 //! abandoned so nothing hides.
 
 mod output_install;
+#[cfg(test)]
+mod produced_result_tests;
 
 use crate::coord::action_actor::{
     ActionActor, AttemptPurpose, JoinReceipt, JoinRequest, OpenGenerationReceipt, RegisterAttempt,
@@ -46,7 +48,7 @@ use rabs_cas::publication::{
 };
 use rabs_cas::serving_sample_gate::{
     ActionClassRisk, PrivateExecutionReason, SampleGateDecision, SamplingPolicy,
-    serving_sample_decision,
+    class_safety_refusal, serving_sample_decision,
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_key::action_key::{action_input_manifest_digest, compute_action_key};
@@ -661,6 +663,30 @@ fn live_replay_gate(
         SampleGateDecision::ServeFromCache => Ok(None),
         SampleGateDecision::ExecutePrivately(reason) => Ok(Some(ReplayRefusal::Sampling(reason))),
     }
+}
+
+/// A current primary producer bypasses positive sample counts and replay
+/// cadence, while retaining every adverse-evidence and class admission veto.
+fn live_producer_gate(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+) -> Result<Option<ReplayRefusal>, StoreError> {
+    if recorded_action_risk(store, action)? == ActionClassRisk::Elevated {
+        return Ok(Some(ReplayRefusal::Sampling(
+            PrivateExecutionReason::ElevatedClassRisk,
+        )));
+    }
+    let adverse = store
+        .list_verification_samples(action)?
+        .iter()
+        .filter(|sample| !sample.passed)
+        .count();
+    if adverse != 0 {
+        return Ok(Some(ReplayRefusal::FailedVerification {
+            observations: u64::try_from(adverse).unwrap_or(u64::MAX),
+        }));
+    }
+    Ok(class_safety_refusal(store, action)?.map(ReplayRefusal::Sampling))
 }
 
 /// Refusal from the shared foreground/speculative submission path.
@@ -2087,6 +2113,31 @@ impl CoordLive {
         )
     }
 
+    /// Install the exact successfully published result of the current remote
+    /// producer. The opaque live-dependency owner and fresh wrapper consent
+    /// authorize this call; it is not available to the restricted edge cache
+    /// reader. All mutable authority, publication, release and quarantine gates
+    /// remain active. Subsequent reads still spend the normal replay allowance.
+    pub(super) fn serve_produced_result(
+        &self,
+        action_key: &TypedDigest,
+        manifest_key: &str,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+    ) -> Result<ServeOutcome, ServeError> {
+        self.serve_action_bound(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            0,
+            None,
+            ServeMode::Install,
+            Some(manifest_key),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn serve_action_inner(
         &self,
@@ -2098,9 +2149,33 @@ impl CoordLive {
         sampling: Option<SamplingPolicy>,
         mode: ServeMode,
     ) -> Result<ServeOutcome, ServeError> {
+        self.serve_action_bound(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            now_epoch,
+            sampling,
+            mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn serve_action_bound(
+        &self,
+        action_key: &TypedDigest,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        now_epoch: u64,
+        sampling: Option<SamplingPolicy>,
+        mode: ServeMode,
+        produced_manifest: Option<&str>,
+    ) -> Result<ServeOutcome, ServeError> {
         // Take the authority snapshot BEFORE the store lock, preserving the
         // existing authority -> store lock order during coordinator startup.
-        let replay_authority = if sampling.is_some() {
+        let replay_authority = if sampling.is_some() || produced_manifest.is_some() {
             if !self.available() {
                 return Err(ServeError::CoordinatorUnavailable);
             }
@@ -2116,6 +2191,9 @@ impl CoordLive {
             .map_err(|_| ServeError::StoreUnavailable)?;
         declare_coordinator_domains(&mut *store);
         if let Some(ref held) = replay_authority {
+            if !self.available() {
+                return Err(ServeError::CoordinatorUnavailable);
+            }
             match store
                 .active_authority()
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
@@ -2160,6 +2238,12 @@ impl CoordLive {
         {
             return Ok(ServeOutcome::ExecutePrivately(refusal));
         }
+        if produced_manifest.is_some()
+            && let Some(refusal) = live_producer_gate(&mut *store, action_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
+        }
         let Some(manifest_key) = store
             .published_manifest_key(action_key)
             .map_err(|e| ServeError::Store(format!("{e:?}")))?
@@ -2168,6 +2252,9 @@ impl CoordLive {
             // store, not a hit.
             return Ok(ServeOutcome::NoCommit);
         };
+        if produced_manifest.is_some_and(|expected| expected != manifest_key) {
+            return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
+        }
         let Some(manifest) = load_manifest(&mut *store, &manifest_key) else {
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         };
@@ -2264,6 +2351,9 @@ impl CoordLive {
             .map_err(|_| ServeError::StoreUnavailable)?;
         declare_coordinator_domains(&mut *store);
         if let Some(ref held) = replay_authority {
+            if !self.available() {
+                return Err(ServeError::CoordinatorUnavailable);
+            }
             match store
                 .active_authority()
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
@@ -2292,6 +2382,12 @@ impl CoordLive {
         }
         if let Some(policy) = sampling
             && let Some(refusal) = live_replay_gate(&mut *store, action_key, &policy)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
+        }
+        if produced_manifest.is_some()
+            && let Some(refusal) = live_producer_gate(&mut *store, action_key)
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
         {
             return Ok(ServeOutcome::ExecutePrivately(refusal));

@@ -69,6 +69,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod remote;
+
 mod capture_pins;
 mod output_capture;
 use capture_pins::CapturePins;
@@ -156,6 +158,8 @@ pub enum LiveDecision {
     Hit(PendingServe),
     /// Run the compiler as this admitted attempt, then complete it.
     Execute(LocalAttempt),
+    /// Reserved private worker execution, awaiting subscriber acceptance.
+    Remote(remote::PendingRemote),
     /// Another subscriber owns this action's dispatch. No execution or
     /// destination writer was admitted for this request. A bounded follower
     /// may resubmit its original request; the edge must reobserve its inputs
@@ -172,6 +176,7 @@ pub struct PendingServe {
     request: LiveDependencyRequest,
     manifest: CanonicalActionResultManifest,
     canonical_transcript: Vec<u8>,
+    remote_validation: Option<remote::RemoteValidation>,
 }
 
 /// The result of installing an accepted hit.
@@ -203,6 +208,11 @@ impl PendingServe {
     #[must_use]
     pub fn install(self) -> InstallResult {
         let plan = &self.request.plan;
+        if let Some(validation) = &self.remote_validation
+            && let Err(reason) = validation.verify(&self.request)
+        {
+            return InstallResult::Declined(reason);
+        }
         if let Err(reason) = self
             .request
             .verify_toolchain()
@@ -252,6 +262,11 @@ impl PendingServe {
                 // during installation cannot authorize a skip under the old
                 // key; report a settled failure, never uncertain fallback.
                 if let Err(reason) = self.request.verify_toolchain() {
+                    return InstallResult::Fault(reason);
+                }
+                if let Some(validation) = &self.remote_validation
+                    && let Err(reason) = validation.verify(&self.request)
+                {
                     return InstallResult::Fault(reason);
                 }
                 InstallResult::Served {
@@ -333,7 +348,7 @@ pub struct CompletionReport {
 /// Dropping it settles the attempt without publishing, including on disconnect.
 #[derive(Debug)]
 pub struct CapturedLocalAttempt {
-    attempt: LocalAttempt,
+    attempt: ExecutionAttempt,
     result: CapturedLocalResult,
 }
 
@@ -692,6 +707,7 @@ impl LiveDependencyLane {
                 request,
                 manifest,
                 canonical_transcript,
+                remote_validation: None,
             })),
             Ok(_) => Ok(Err(request)),
             Err(error) => Err(error.to_string()),
@@ -702,12 +718,23 @@ impl LiveDependencyLane {
         &self,
         request: LiveDependencyRequest,
     ) -> Result<Option<LocalAttempt>, String> {
+        let worker = self.local_worker()?;
+        self.begin_execution_on(request, &worker)
+            .map(|attempt| attempt.map(LocalAttempt))
+    }
+
+    /// Share singleflight and publication authority without substituting the
+    /// edge-local executor for an authenticated remote worker.
+    fn begin_execution_on(
+        &self,
+        request: LiveDependencyRequest,
+        worker: &WorkerSessionOffer,
+    ) -> Result<Option<ExecutionAttempt>, String> {
         let key = request.key.action_key.clone();
         let refusal = |error: SubmissionRefusal| format!("submission: {error:?}");
         if self.coord.submitted_actor(&key).map_err(refusal)?.is_some() {
             return Ok(None);
         }
-        let worker = self.local_worker()?;
         {
             let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
             let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
@@ -752,7 +779,7 @@ impl LiveDependencyLane {
             // second unobserved compiler run in another subscriber's tree.
             return Ok(None);
         };
-        let mut attempt = LocalAttempt {
+        let mut attempt = ExecutionAttempt {
             coord: Arc::clone(&self.coord),
             key,
             serial,
@@ -762,7 +789,7 @@ impl LiveDependencyLane {
         };
         let authority = self
             .coord
-            .begin_claimed_dispatch(&attempt.key, serial, &worker, LOCAL_LEASE_TTL_MS)
+            .begin_claimed_dispatch(&attempt.key, serial, worker, LOCAL_LEASE_TTL_MS)
             .map_err(refusal)?;
         attempt.authority = Some(authority);
         for state in [
@@ -781,7 +808,11 @@ impl LiveDependencyLane {
 /// finishes the attempt WITHOUT publication. Capturing consumes this owner
 /// and retains it until the result is published or abandoned.
 #[derive(Debug)]
-pub struct LocalAttempt {
+pub struct LocalAttempt(ExecutionAttempt);
+
+/// A coordinator-owned action attempt bound to its actual admitted executor.
+#[derive(Debug)]
+struct ExecutionAttempt {
     coord: Arc<CoordLive>,
     key: TypedDigest,
     serial: u64,
@@ -791,6 +822,39 @@ pub struct LocalAttempt {
 }
 
 impl LocalAttempt {
+    #[must_use]
+    pub fn execution_env(&self) -> &[(String, String)] {
+        self.0.execution_env()
+    }
+
+    #[must_use]
+    pub fn attempt_hex(&self) -> String {
+        self.0.attempt_hex()
+    }
+
+    #[must_use]
+    pub fn action_key(&self) -> &TypedDigest {
+        self.0.action_key()
+    }
+
+    /// Complete a local execution without a transport handoff.
+    pub fn complete(self, report: &CompletionReport) -> (CompletionOutcome, Vec<KnownOutput>) {
+        match self.capture(report) {
+            Ok(captured) => captured.publish(),
+            Err(reason) => (CompletionOutcome::NotPublished(reason), Vec::new()),
+        }
+    }
+
+    /// Capture caller-owned outputs before acknowledging their custody.
+    pub fn capture(self, report: &CompletionReport) -> Result<CapturedLocalAttempt, String> {
+        let attempt = self.0;
+        let result =
+            attempt.capture_result(report, Path::new(&attempt.request.plan.out_dir), None)?;
+        Ok(CapturedLocalAttempt { attempt, result })
+    }
+}
+
+impl ExecutionAttempt {
     /// The constructed environment the compiler must run with.
     #[must_use]
     pub fn execution_env(&self) -> &[(String, String)] {
@@ -817,6 +881,15 @@ impl LocalAttempt {
         self.coord
             .advance_started_dispatch(&self.key, self.serial, authority, state)
             .map_err(|error| format!("attempt {state:?}: {error:?}"))
+    }
+
+    /// Execution may still be running remotely. Preserve the abandoned claim
+    /// for reconciliation; neither Drop nor caller fallback can invent a drain.
+    fn abandon(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            self.coord.release_dispatch_claim(&self.key, self.serial);
+        }
     }
 
     /// Drain → Finished → complete the dispatch → retire the flight, so
@@ -852,28 +925,13 @@ impl LocalAttempt {
         }
     }
 
-    /// Complete a locally owned execution without a transport handoff.
-    pub fn complete(self, report: &CompletionReport) -> (CompletionOutcome, Vec<KnownOutput>) {
-        match self.capture(report) {
-            Ok(captured) => captured.publish(),
-            Err(reason) => (CompletionOutcome::NotPublished(reason), Vec::new()),
-        }
-    }
-
-    /// Capture every declared output, transcript and evidence object into CAS.
-    /// This never commits an action pointer. On failure the consumed attempt
-    /// is settled; on success the returned opaque owner can be acknowledged
-    /// and published later without reopening any caller-owned file.
-    pub fn capture(self, report: &CompletionReport) -> Result<CapturedLocalAttempt, String> {
-        let result = self.capture_result(report)?;
-        Ok(CapturedLocalAttempt {
-            attempt: self,
-            result,
-        })
-    }
-
     #[allow(clippy::too_many_lines)]
-    fn capture_result(&self, report: &CompletionReport) -> Result<CapturedLocalResult, String> {
+    fn capture_result(
+        &self,
+        report: &CompletionReport,
+        physical_outputs: &Path,
+        remote_receipt: Option<&serde_json::Value>,
+    ) -> Result<CapturedLocalResult, String> {
         self.advance(AttemptState::ProcessExited)?;
         if report.signal.is_some() || report.exit_code != Some(0) {
             return Err(format!(
@@ -916,7 +974,7 @@ impl LocalAttempt {
         // parse/placement rewrite; its bytes are released after that one put.
         let mut harvested = Vec::new();
         for declaration in &plan.outputs.declarations {
-            let path = Path::new(&plan.out_dir).join(&declaration.virtual_path);
+            let path = physical_outputs.join(&declaration.virtual_path);
             let (sig, object) = if declaration.class == OutputClass::DepInfo {
                 let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
                     .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
@@ -942,7 +1000,11 @@ impl LocalAttempt {
                 let captured = output_capture::put_output(cas, &path, MAX_OUTPUT_BYTES, &mut pins)?;
                 let object = ObjectId(captured.digest.clone());
                 let sig = captured.sig;
-                known.push(captured);
+                // Private delivery inode signatures do not describe Cargo's
+                // target files. Remember only after a remote install finishes.
+                if remote_receipt.is_none() {
+                    known.push(captured);
+                }
                 (sig, object)
             };
             harvested.push((path, sig));
@@ -1011,6 +1073,7 @@ impl LocalAttempt {
                 "stderr_bytes": report.stderr.len(),
                 "stderr": digest_key(&object_id(&report.stderr)?),
                 "stdout_bytes": report.stdout.len(),
+                "remote_delivery": remote_receipt,
             }))
             .map_err(|error| error.to_string())?;
             let provenance = serde_json::to_vec(&serde_json::json!({
@@ -1158,7 +1221,7 @@ impl LocalAttempt {
     }
 }
 
-impl Drop for LocalAttempt {
+impl Drop for ExecutionAttempt {
     fn drop(&mut self) {
         self.settle();
     }
