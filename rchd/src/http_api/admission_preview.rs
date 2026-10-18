@@ -155,6 +155,20 @@ fn refused(reason: &str) -> PreviewResponse {
     }
 }
 
+/// Observe the lowest unused lane without advancing an identity or reserving
+/// anything. Admission chooses again under its ownership lock. Counts alone
+/// cannot identify a lane: lane one can remain owned after lane zero retires.
+fn available_project_lane(ctx: &DaemonContext, project: &str, worker: &str) -> Option<u32> {
+    let active = ctx.history.active_builds();
+    (0..ctx.pool.project_lanes(worker)).find(|lane| {
+        !active.iter().any(|build| {
+            build.project_id == project
+                && build.worker_id == worker
+                && build.project_lane == *lane
+        })
+    })
+}
+
 async fn observe(
     ctx: &DaemonContext,
     request: SelectionRequest,
@@ -175,9 +189,18 @@ async fn observe(
     // runtime. Keep the permit in that task until it finishes even if the HTTP
     // caller leaves, so cancelled reads cannot evade the concurrency budget.
     let history = Arc::clone(&ctx.history);
+    let pool = ctx.pool.clone();
     let project = request.project.clone();
     let (mut excluded, _permit) = tokio::task::spawn_blocking(move || {
-        let mut excluded = history.active_workers_for_project(&project);
+        // Match actual admission: an active build consumes one project lane,
+        // not necessarily the entire worker. Source fences below still apply
+        // to the worker regardless of how many unused lanes it has.
+        let mut excluded: std::collections::HashSet<String> = history
+            .active_build_counts_for_project(&project)
+            .into_iter()
+            .filter(|(worker, count)| *count >= pool.project_lanes(worker) as usize)
+            .map(|(worker, _)| worker)
+            .collect();
         excluded.extend(
             history.source_fenced_workers(&project, crate::cancellation::client_lease_owns_source),
         );
@@ -193,6 +216,7 @@ async fn observe(
     // rather than reporting that held capacity as immediately available.
     let held_worker = ctx.history.queue_hold_against(None);
     let mut steered_off_hold = false;
+    let mut steered_off_full_lanes = false;
     loop {
         let result = ctx
             .worker_selector
@@ -213,6 +237,16 @@ async fn observe(
                 let Some(config) = worker.lock_current_endpoint(&endpoint).await else {
                     return Ok(refused("worker_endpoint_changed_during_preview"));
                 };
+                let Some(project_lane) =
+                    available_project_lane(ctx, &request.project, config.id.as_str())
+                else {
+                    // Another admission filled the last lane while selection
+                    // awaited worker facts. Re-select with the same constraints
+                    // and deadline; never fabricate an available lane zero.
+                    steered_off_full_lanes = true;
+                    excluded.insert(config.id.to_string());
+                    continue;
+                };
                 Some(SelectedWorker {
                     id: config.id.clone(),
                     host: config.host.clone(),
@@ -221,6 +255,7 @@ async fn observe(
                     slots_available,
                     speed_score,
                     declared_os: rch_common::declared_os(&config.tags),
+                    project_lane,
                 })
             }
             None => None,
@@ -228,7 +263,7 @@ async fn observe(
         if ctx.history.ownership_failed() {
             return Ok(refused("durable_ownership_uncertain"));
         }
-        let reason = if selected.is_none() && steered_off_hold {
+        let reason = if selected.is_none() && (steered_off_hold || steered_off_full_lanes) {
             SelectionReason::AllWorkersBusy
         } else {
             result.reason
@@ -358,6 +393,220 @@ mod tests {
                     .await,
                 expected,
             );
+        }
+    }
+
+    async fn start_lane_owner(
+        ctx: &DaemonContext,
+        project: &str,
+        worker_id: &str,
+        wrapper: &str,
+    ) -> crate::history::ActiveBuildState {
+        let worker = ctx.pool.get(&WorkerId::new(worker_id)).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        ctx.history
+            .try_start_active_build_in_lanes(
+                project.into(),
+                worker_id.into(),
+                "make".into(),
+                0,
+                Some(wrapper.into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission {
+                    requested_gib: 0,
+                    capacity: None,
+                },
+                None,
+                ctx.pool.project_lanes(worker_id),
+            )
+            .unwrap()
+            .expect("fixture must own a real project lane")
+    }
+
+    async fn finish_lane_owner(ctx: &DaemonContext, owner: &crate::history::ActiveBuildState) {
+        let completed = ctx
+            .history
+            .complete_durable_with_disk_fault(
+                owner.id,
+                &owner.worker_id,
+                owner.local_wrapper_id.as_deref(),
+                crate::history::BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .unwrap()
+            .expect("only the fixture's exact owner may complete its lane");
+        assert_eq!(completed.0.project_lane, owner.project_lane);
+        ctx.pool
+            .get(&WorkerId::new(&owner.worker_id))
+            .await
+            .unwrap()
+            .release_slots(owner.slots)
+            .await;
+    }
+
+    fn lane_ownership(ctx: &DaemonContext) -> Vec<(u64, String, String, u32, u32)> {
+        let mut owners: Vec<_> = ctx
+            .history
+            .active_builds()
+            .into_iter()
+            .map(|b| (b.id, b.project_id, b.worker_id, b.project_lane, b.slots))
+            .collect();
+        owners.sort();
+        owners
+    }
+
+    #[tokio::test]
+    async fn previews_observe_spare_and_reused_lanes_without_consuming_ownership() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        ctx.pool
+            .set_project_lanes(std::collections::HashMap::from([("requested".into(), 2)]));
+        let request = input();
+        let first = start_lane_owner(&ctx, &request.project, "requested", "lane-first").await;
+        assert_eq!(first.project_lane, 0);
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        let before = lane_ownership(&ctx);
+        for post in [false, true, false, true] {
+            let result = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let selected = result.selection.worker.unwrap();
+            assert_eq!(selected.id.as_str(), "requested");
+            assert_eq!(selected.project_lane, 1);
+            assert_eq!(lane_ownership(&ctx), before);
+            assert_eq!(worker.available_slots().await, 3);
+            assert_eq!(ctx.history.queue_depth(), 0);
+        }
+        let second = start_lane_owner(&ctx, &request.project, "requested", "lane-second").await;
+        assert_eq!(second.project_lane, 1);
+        assert_eq!(second.id, first.id + 1, "previews must not mint build IDs");
+        let full = decoded(
+            router
+                .clone()
+                .oneshot(http_request(&request, true, Some("fixture-token")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            full.selection.worker.is_none(),
+            "spare slots are not spare project lanes"
+        );
+        assert_eq!(ctx.history.active_builds().len(), 2);
+        assert_eq!(worker.available_slots().await, 2);
+
+        finish_lane_owner(&ctx, &first).await;
+        let before = lane_ownership(&ctx);
+        for post in [false, true] {
+            let sparse = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(sparse.selection.worker.unwrap().project_lane, 0);
+            assert_eq!(
+                lane_ownership(&ctx),
+                before,
+                "lane one remains independently owned"
+            );
+        }
+        let third = start_lane_owner(&ctx, &request.project, "requested", "lane-third").await;
+        assert_eq!(third.project_lane, 0);
+        assert_eq!(third.id, second.id + 1);
+        finish_lane_owner(&ctx, &second).await;
+        finish_lane_owner(&ctx, &third).await;
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn default_lane_exclusion_preserves_pins_and_allows_an_unpinned_alternative() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        let mut request = input();
+        assert_eq!(ctx.pool.project_lanes("requested"), 1);
+        let owner = start_lane_owner(&ctx, &request.project, "requested", "default-lane").await;
+        let before = lane_ownership(&ctx);
+        let pinned = decoded(
+            router
+                .clone()
+                .oneshot(http_request(&request, true, Some("fixture-token")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(pinned.selection.worker.is_none());
+        request.preferred_workers.clear();
+        let automatic = decoded(
+            router
+                .oneshot(http_request(&request, false, Some("fixture-token")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let selected = automatic.selection.worker.unwrap();
+        assert_eq!(selected.id.as_str(), "alternate");
+        assert_eq!(selected.project_lane, 0);
+        assert_eq!(lane_ownership(&ctx), before);
+        finish_lane_owner(&ctx, &owner).await;
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn lane_scope_is_project_and_worker_specific_but_source_fences_still_win() {
+        let _guard = rch_common::test_guard!();
+        for source_fence in ["live", "busy"] {
+            let (ctx, router) = fixture().await;
+            ctx.pool
+                .set_project_lanes(std::collections::HashMap::from([("requested".into(), 3)]));
+            let request = input();
+            let other_project =
+                start_lane_owner(&ctx, "other-project", "requested", "other-project").await;
+            let other_worker =
+                start_lane_owner(&ctx, &request.project, "alternate", "other-worker").await;
+            let before = lane_ownership(&ctx);
+            let observed = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, true, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(observed.selection.worker.unwrap().project_lane, 0);
+            match source_fence {
+                "live" => ctx.history.fence_live_checkout(&request.project, "requested"),
+                "busy" => ctx.history.fence_source_busy(&request.project, "requested"),
+                _ => unreachable!(),
+            }
+            let denied = decoded(
+                router
+                    .oneshot(http_request(&request, false, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(denied.selection.worker.is_none(), "{source_fence}");
+            assert_eq!(lane_ownership(&ctx), before);
+            assert_eq!(ctx.history.queue_depth(), 0);
+            finish_lane_owner(&ctx, &other_project).await;
+            finish_lane_owner(&ctx, &other_worker).await;
+            assert_unowned(&ctx, 4).await;
         }
     }
 
