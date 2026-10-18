@@ -303,7 +303,7 @@ pub(crate) fn restart_admission_wait_bound() -> Duration {
 pub(crate) enum RestartAdmissionWait {
     /// Admission is open, or there was no barrier to wait for.
     Open,
-    /// The barrier was still closed when the bound expired.
+    /// A closed barrier was observed and reopening was not verified before the bound expired.
     StillClosed,
 }
 
@@ -315,25 +315,42 @@ pub(crate) enum RestartAdmissionWait {
 /// waiting for it. If no barrier was ever seen, a probe error keeps the
 /// previous meaning: proceed and let selection and recovery handle the daemon.
 /// `on_wait` runs before each sleep (the caller heartbeats and reports).
+/// After a closed observation, later probes share the remaining wait budget;
+/// a stalled socket cannot extend that budget by its independent I/O timeout.
 pub(crate) async fn wait_for_restart_admission(
     mut probe: impl AsyncFnMut() -> anyhow::Result<bool>,
     bound: Duration,
     poll: Duration,
-    mut on_wait: impl FnMut(),
-) -> RestartAdmissionWait {
+    mut on_wait: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<RestartAdmissionWait> {
     let started = tokio::time::Instant::now();
     let mut saw_closed = false;
     loop {
-        match probe().await {
-            Ok(false) => return RestartAdmissionWait::Open,
+        let observation = if saw_closed {
+            let remaining = bound.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(RestartAdmissionWait::StillClosed);
+            }
+            match timeout(remaining, probe()).await {
+                Ok(observation) => observation,
+                Err(_) => return Ok(RestartAdmissionWait::StillClosed),
+            }
+        } else {
+            // Always allow the initial bounded status probe, including when
+            // the operator selected zero wait. Without a closed observation,
+            // selection retains responsibility for recovering an unavailable daemon.
+            probe().await
+        };
+        match observation {
+            Ok(false) => return Ok(RestartAdmissionWait::Open),
             Ok(true) => saw_closed = true,
-            Err(_) if !saw_closed => return RestartAdmissionWait::Open,
+            Err(_) if !saw_closed => return Ok(RestartAdmissionWait::Open),
             Err(_) => {}
         }
         if started.elapsed() >= bound {
-            return RestartAdmissionWait::StillClosed;
+            return Ok(RestartAdmissionWait::StillClosed);
         }
-        on_wait();
+        on_wait()?;
         tokio::time::sleep(poll.min(bound.saturating_sub(started.elapsed()))).await;
     }
 }
@@ -1594,9 +1611,13 @@ mod bounded_ipc_tests {
                 },
                 Duration::from_millis(bound_ms),
                 Duration::from_millis(1),
-                || waits += 1,
+                || {
+                    waits += 1;
+                    Ok(())
+                },
             )
-            .await;
+            .await
+            .unwrap();
             (outcome, probes, waits)
         }
         // Open at once: no wait.
@@ -1622,6 +1643,53 @@ mod bounded_ipc_tests {
         assert_eq!(
             run(&[Some(true)], 0).await,
             (RestartAdmissionWait::StillClosed, 1, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_admission_wait_bounds_a_stalled_probe_after_observing_closed() {
+        let mut probes = 0;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_restart_admission(
+                async || {
+                    probes += 1;
+                    if probes == 1 {
+                        Ok(true)
+                    } else {
+                        std::future::pending::<anyhow::Result<bool>>().await
+                    }
+                },
+                Duration::from_millis(100),
+                Duration::ZERO,
+                || Ok(()),
+            ),
+        )
+        .await
+        .expect("a later stalled probe must not outlive the admission wait budget")
+        .unwrap();
+        assert_eq!(outcome, RestartAdmissionWait::StillClosed);
+        assert!((1..=2).contains(&probes));
+    }
+
+    #[tokio::test]
+    async fn restart_admission_wait_stops_on_unrecorded_wait_ownership() {
+        let mut probes = 0;
+        let error = wait_for_restart_admission(
+            async || {
+                probes += 1;
+                Ok(true)
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            || anyhow::bail!("durable heartbeat failed"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("durable heartbeat failed"));
+        assert_eq!(
+            probes, 1,
+            "unrecorded ownership must stop before another wait"
         );
     }
 }

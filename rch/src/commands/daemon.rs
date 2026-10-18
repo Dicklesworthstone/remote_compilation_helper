@@ -7,10 +7,14 @@ use crate::status_types::extract_json_body;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
-use rch_common::{ApiError, ApiResponse, ErrorCode};
+use rch_common::process_identity::{
+    OwnerPresence, ProcessIdentity, ProcessObservation, observe_process, owner_presence,
+};
+use rch_common::{ApiError, ApiResponse, ErrorCode, RestartAdmissionResponse};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 
 use super::helpers::configured_socket_path;
@@ -38,69 +42,8 @@ struct ReloadApiResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RestartAdmissionResponse {
-    restart_permitted: bool,
-    active_build_ids: Vec<u64>,
-    queued_build_ids: Vec<u64>,
-    #[serde(default)]
-    client_lease_ids: Vec<String>,
-    #[serde(default)]
-    client_lease_scan_error: Option<String>,
-}
-
 fn reload_success_default() -> bool {
     true
-}
-
-async fn require_restart_admission() -> Result<()> {
-    let verdict = async {
-        let response = send_daemon_command("POST /restart-admission\n")
-            .await
-            .context("daemon did not acknowledge restart admission barrier")?;
-        let body =
-            extract_json_body(&response).context("restart admission response was missing JSON")?;
-        serde_json::from_str::<RestartAdmissionResponse>(body)
-            .context("restart admission response was malformed")
-    }
-    .await;
-    let admission = match verdict {
-        Ok(admission) => admission,
-        Err(error) => {
-            // The daemon may have closed the barrier before its reply was lost,
-            // late or garbled. This restart is abandoned, so reopen admission
-            // rather than leave every later worker selection refused.
-            if let Err(release_error) =
-                send_daemon_command("POST /restart-admission/release\n").await
-            {
-                tracing::warn!(
-                    "failed to release a possibly-closed restart-admission barrier: {release_error}"
-                );
-            }
-            return Err(error);
-        }
-    };
-    if admission.restart_permitted {
-        return Ok(());
-    }
-    // The POST above CLOSED the barrier as a side effect; a refused restart
-    // must reopen it, otherwise this failed attempt leaves the daemon
-    // refusing every subsequent worker selection (restart_admission_barrier_active)
-    // until someone manually hits the release endpoint. Best-effort: if the
-    // release itself fails we still surface the refusal below.
-    if let Err(release_error) = send_daemon_command("POST /restart-admission/release\n").await {
-        tracing::warn!(
-            "failed to release the restart-admission barrier after a refused restart: {release_error}; \
-             worker selection may refuse builds until `POST /restart-admission/release` succeeds"
-        );
-    }
-    anyhow::bail!(
-        "restart blocked by daemon admission barrier: active builds {:?}, queued builds {:?}, client leases {:?}, lease scan {:?}",
-        admission.active_build_ids,
-        admission.queued_build_ids,
-        admission.client_lease_ids,
-        admission.client_lease_scan_error,
-    );
 }
 
 // =============================================================================
@@ -129,16 +72,8 @@ fn daemon_start_args(socket_path: &Path) -> [&std::ffi::OsStr; 2] {
 
 /// Which systemd scope, if any, manages `rchd.service` on this host.
 ///
-/// Mirrors the daemon-side detection (`rchd::rchd_systemd_unit_present`,
-/// which probes `systemctl --user is-enabled rchd`) so that `rch daemon
-/// restart` cycles the unit the same way `rch update`'s restart step does
-/// instead of fighting it with a manual shutdown + `nohup rchd` spawn.
-///
-/// On systemd hosts the manual spawn path is doomed: any rchd launched
-/// outside the unit calls `defer_to_systemd_if_managed()` and exits, while
-/// systemd's `Restart=always` respawns the unit's *own* process — leaving the
-/// old (possibly deleted-on-disk) binary running. `systemctl restart` is the
-/// only thing that re-execs the unit from the freshly installed binary.
+/// Mirrors the daemon's unit detection so a confirmed, fenced shutdown is
+/// followed by a service start rather than an unmanaged competing process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // On non-Linux hosts `detect_rchd_systemd_scope` always returns `None`, so the
 // variants are never constructed there; they are live on Linux.
@@ -165,24 +100,28 @@ impl SystemdUnitScope {
 /// on Linux hosts with no such unit (manual / nohup management) — both of which
 /// keep the legacy shutdown+spawn restart path.
 #[cfg(target_os = "linux")]
-fn detect_rchd_systemd_scope() -> Option<SystemdUnitScope> {
+async fn detect_rchd_systemd_scope() -> Option<SystemdUnitScope> {
     // Prefer the user scope: that is what `rch daemon start`/the hook/`rch
     // update` interact with on dev hosts (trj/css/csd/ts1). System-scope units
     // (vmi root daemons) are checked second.
-    let probe = |scope_args: &[&str]| -> bool {
-        std::process::Command::new("systemctl")
-            .args(scope_args)
-            .args(["is-enabled", "rchd"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
+    async fn probe(scope_args: &[&str]) -> bool {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            Command::new("systemctl")
+                .args(scope_args)
+                .args(["is-enabled", "rchd"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok_and(|status| status.success()))
+    }
 
-    if probe(&["--user"]) {
+    if probe(&["--user"]).await {
         Some(SystemdUnitScope::User)
-    } else if probe(&[]) {
+    } else if probe(&[]).await {
         Some(SystemdUnitScope::System)
     } else {
         None
@@ -190,35 +129,222 @@ fn detect_rchd_systemd_scope() -> Option<SystemdUnitScope> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_rchd_systemd_scope() -> Option<SystemdUnitScope> {
+async fn detect_rchd_systemd_scope() -> Option<SystemdUnitScope> {
     None
 }
 
-/// Restart the daemon via its systemd unit and wait for the socket to come
-/// back live. Returns `Err` (with a human message) on any failure so the
-/// caller can fall back to the manual shutdown+spawn path.
-async fn restart_via_systemd(scope: SystemdUnitScope) -> std::result::Result<(), String> {
-    let status = Command::new("systemctl")
-        .args(scope.systemctl_scope_args())
-        .args(["restart", "rchd"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+#[cfg(target_os = "linux")]
+struct SystemdServiceState {
+    pid: u32,
+    restart: String,
+    active: String,
+    sub: String,
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_manager_present(scope: SystemdUnitScope) -> Result<bool> {
+    match scope {
+        SystemdUnitScope::System => Ok(Path::new("/run/systemd/system").try_exists()?
+            || Path::new("/run/systemd/private").try_exists()?),
+        SystemdUnitScope::User => {
+            if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|value| !value.is_empty()) {
+                return Ok(true);
+            }
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(format!("/run/user/{}", rustix::process::geteuid().as_raw()))
+                });
+            Ok(runtime.join("systemd/private").try_exists()?)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn systemd_service_state(scope: SystemdUnitScope) -> Result<Option<SystemdServiceState>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        Command::new("systemctl")
+            .args(scope.systemctl_scope_args())
+            .args([
+                "show",
+                "rchd",
+                "--property=MainPID",
+                "--property=Restart",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=LoadState",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("systemd service state query timed out; no service stop was verified")?;
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            if String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "LoadState=not-found")
+                || !systemd_manager_present(scope)?
+            {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "systemd service state query failed ({}); manager ownership is unknown; no admission or shutdown change was attempted",
+                output.status
+            );
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !systemd_manager_present(scope)? =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let text = std::str::from_utf8(&output.stdout).context("non-UTF-8 systemd service state")?;
+    let properties: std::collections::HashMap<_, _> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    if properties.get("LoadState") == Some(&"not-found") {
+        return Ok(None);
+    }
+    let pid = properties
+        .get("MainPID")
+        .and_then(|pid| pid.parse().ok())
+        .context("systemd did not report its daemon PID; stop ownership is unknown")?;
+    Ok(Some(SystemdServiceState {
+        pid,
+        restart: properties.get("Restart").unwrap_or(&"").to_string(),
+        active: properties.get("ActiveState").unwrap_or(&"").to_string(),
+        sub: properties.get("SubState").unwrap_or(&"").to_string(),
+    }))
+}
+
+/// Only the unit whose live MainPID is the captured daemon peer may be used
+/// to start its successor. An enabled unit serving another socket is unrelated.
+#[cfg(target_os = "linux")]
+async fn bound_systemd_scope(process: &DaemonProcess) -> Result<Option<SystemdUnitScope>> {
+    bound_systemd_scope_with(process, systemd_service_state).await
+}
+
+#[cfg(target_os = "linux")]
+async fn bound_systemd_scope_with<F, Fut>(
+    process: &DaemonProcess,
+    mut inspect: F,
+) -> Result<Option<SystemdUnitScope>>
+where
+    F: FnMut(SystemdUnitScope) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<SystemdServiceState>>>,
+{
+    for scope in [SystemdUnitScope::User, SystemdUnitScope::System] {
+        let state = inspect(scope).await?;
+        process.require_live()?;
+        if state.is_some_and(|state| state.pid == process.pid) {
+            return Ok(Some(scope));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn bound_systemd_scope(_process: &DaemonProcess) -> Result<Option<SystemdUnitScope>> {
+    Ok(None)
+}
+
+/// A delayed `systemctl stop` could kill a replacement which already admitted
+/// work. A persistent supervisor must instead be handled explicitly before
+/// this CLI mutates admission. Clean on-failure units can use normal shutdown.
+#[cfg(target_os = "linux")]
+async fn inspect_stop_supervisor(process: &DaemonProcess) -> Result<Option<SystemdUnitScope>> {
+    for scope in [SystemdUnitScope::User, SystemdUnitScope::System] {
+        if let Some(state) = systemd_service_state(scope).await?
+            && state.pid == process.pid
+        {
+            anyhow::ensure!(
+                matches!(
+                    state.restart.as_str(),
+                    "no" | "on-failure" | "on-abnormal" | "on-abort" | "on-watchdog"
+                ),
+                "rchd is managed by systemd with Restart={}; a persistent stop cannot be confirmed. No shutdown or admission change was attempted; stop the service through its supervisor",
+                if state.restart.is_empty() {
+                    "unknown"
+                } else {
+                    &state.restart
+                }
+            );
+            return Ok(Some(scope));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn inspect_stop_supervisor(_process: &DaemonProcess) -> Result<Option<SystemdUnitScope>> {
+    if tokio::time::timeout(Duration::from_secs(5), detect_rchd_launchd_target())
         .await
-        .map_err(|e| format!("failed to invoke systemctl: {e}"))?;
+        .context("launchd service state query timed out; no shutdown attempted")?
+        .is_some()
+    {
+        anyhow::bail!(
+            "rchd is managed by launchd; a persistent stop cannot be confirmed. No shutdown or admission change was attempted; stop the service through its supervisor"
+        );
+    }
+    Ok(None)
+}
+
+async fn verify_stopped_supervisor(scope: Option<SystemdUnitScope>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(scope) = scope {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = systemd_service_state(scope)
+                .await?
+                .context("systemd daemon state disappeared; service stop is unconfirmed")?;
+            if state.pid == 0 && state.active == "inactive" && state.sub == "dead" {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                state.active == "deactivating" && tokio::time::Instant::now() < deadline,
+                "original daemon exited, but systemd service stop is unconfirmed (PID {}, state {}/{}, Restart={}); a replacement may be running or pending",
+                state.pid,
+                state.active,
+                state.sub,
+                state.restart
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = scope;
+    Ok(())
+}
+
+/// Start the unit after fenced shutdown. `start` preserves a replacement
+/// daemon that the unit may already have spawned and that may have new work.
+async fn start_via_systemd(scope: SystemdUnitScope) -> std::result::Result<(), String> {
+    let status = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("systemctl")
+            .args(scope.systemctl_scope_args())
+            .args(["start", "rchd"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| "systemctl start timed out; daemon startup is unconfirmed".to_string())?
+    .map_err(|e| format!("failed to invoke systemctl: {e}"))?;
 
     if !status.success() {
-        return Err(format!("systemctl restart rchd exited {status}"));
+        return Err(format!("systemctl start rchd exited {status}"));
     }
 
-    // Confirm a live listener actually came back, not just that systemctl
-    // returned 0 (the unit could fail its own start). wait_for_daemon_ready
-    // polls the configured socket for up to ~2s.
-    if wait_for_daemon_ready().await {
-        Ok(())
-    } else {
-        Err("systemd restarted rchd but no daemon responded on the socket".to_string())
-    }
+    Ok(())
 }
 
 /// The launchd agent that `rch daemon install`-style setups (and the fleet's
@@ -243,6 +369,7 @@ async fn detect_rchd_launchd_target() -> Option<String> {
         .args(["print", &target])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .ok()
@@ -272,6 +399,7 @@ async fn process_listens_on_unix_socket(pid: u32, socket: &std::path::Path) -> b
         .args(["-a", "-p", &pid.to_string(), "-U", "-Fn"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
     else {
@@ -293,28 +421,24 @@ async fn detect_rchd_launchd_target() -> Option<String> {
     None
 }
 
-/// `launchctl kickstart -k` the agent (launchd re-execs the plist's binary,
-/// so a freshly installed rchd takes over), then wait for a live listener.
-/// rchd re-adopts in-flight builds from durable ownership on startup, which
-/// can take a few seconds, so this waits longer than the systemd path.
-async fn restart_via_launchd(target: &str) -> std::result::Result<(), String> {
-    let status = Command::new("/bin/launchctl")
-        .args(["kickstart", "-k", target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map_err(|e| format!("failed to invoke launchctl: {e}"))?;
+/// Start the agent without `-k`: a respawned daemon may already have new work.
+async fn start_via_launchd(target: &str) -> std::result::Result<(), String> {
+    let status = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("/bin/launchctl")
+            .args(["kickstart", target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| "launchctl kickstart timed out; daemon startup is unconfirmed".to_string())?
+    .map_err(|e| format!("failed to invoke launchctl: {e}"))?;
     if !status.success() {
-        return Err(format!("launchctl kickstart -k {target} exited {status}"));
+        return Err(format!("launchctl kickstart {target} exited {status}"));
     }
-    for _ in 0..200 {
-        if daemon_responds_on_configured_socket().await {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    Err("launchd restarted rchd but no daemon responded on the socket within 20s".to_string())
+    Ok(())
 }
 
 fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
@@ -367,6 +491,11 @@ pub async fn daemon_status(ctx: &OutputContext) -> Result<()> {
     } else {
         None
     };
+    let admission = if running {
+        Some(admission_status_at(socket_path).await)
+    } else {
+        None
+    };
 
     if ctx.is_json() {
         let _ = ctx.json(&ApiResponse::ok(
@@ -375,6 +504,12 @@ pub async fn daemon_status(ctx: &OutputContext) -> Result<()> {
                 running,
                 socket_path: socket_path_str.clone(),
                 uptime_seconds,
+                admission: admission.as_ref().map(|result| match result {
+                    Ok(value) => serde_json::to_value(value).unwrap_or_default(),
+                    Err(error) => {
+                        serde_json::json!({"status": "unknown", "error": format!("{error:#}")})
+                    }
+                }),
             },
         ));
         return Ok(());
@@ -407,6 +542,15 @@ pub async fn daemon_status(ctx: &OutputContext) -> Result<()> {
                 hours,
                 mins
             );
+        }
+        match admission {
+            Some(Ok(admission)) => {
+                for line in crate::status_types::admission_diagnostic_lines(&admission) {
+                    eprintln!("  {line}");
+                }
+            }
+            Some(Err(error)) => eprintln!("  Admission: unknown ({error:#})"),
+            None => {}
         }
     } else {
         let socket_note = if socket_exists {
@@ -724,66 +868,404 @@ fn parse_shutdown_response(response: &str) -> Result<ShutdownApiResponse> {
 fn unconfirmed_stop(socket_path: &Path, cause: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!(
         "daemon stop is unconfirmed at {}: {cause}; no fallback process was killed or socket removed; \
-         admission may remain closed after a lost acknowledgement; inspect the daemon and retry the \
-         supported lifecycle command after communication is restored",
+         inspect `rch daemon admission status` before retrying maintenance",
         socket_path.display()
     )
 }
 
-fn parse_admission_response(response: &str) -> Result<RestartAdmissionResponse> {
-    let body = extract_json_body(response).context("admission response was missing JSON")?;
+pub(crate) fn parse_admission_response(response: &str) -> Result<RestartAdmissionResponse> {
+    let (header, body) = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+        .context("admission response was incomplete")?;
+    let mut status = header.lines().next().unwrap_or_default().split_whitespace();
+    anyhow::ensure!(
+        matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")) && status.next() == Some("200"),
+        "daemon refused the admission request: {}",
+        body.trim()
+    );
     serde_json::from_str(body).context("admission response was malformed")
 }
 
-/// Raise the admission barrier (stop the daemon accepting new builds) and
-/// return the workload it reported.
-async fn close_admission() -> Result<DaemonWorkload> {
-    let response = send_daemon_command("POST /restart-admission\n")
-        .await
-        .context("daemon did not acknowledge the admission barrier")?;
-    Ok(DaemonWorkload::from_admission(parse_admission_response(
-        &response,
-    )?))
+/// The client chooses its unguessable operation token BEFORE acquisition. A
+/// lost acquisition reply can therefore be cleaned up without ever releasing
+/// another caller's operation. Tokens are additionally bound by the daemon to
+/// the actual socket peer's PID and process birth identity. Supplying our own
+/// birth claim closes the gap when a peer exits and its PID is reused before
+/// the server accepts the connection; later requests retain the original fence.
+#[derive(Debug, Clone)]
+pub(crate) struct MaintenanceFence {
+    pub(crate) daemon_incarnation: String,
+    pub(crate) token: String,
+    owner_identity: ProcessIdentity,
 }
 
-/// Snapshot the workload without touching the barrier.
-async fn fetch_workload() -> Result<DaemonWorkload> {
-    let response = send_daemon_command("GET /restart-admission\n")
-        .await
-        .context("daemon did not answer the admission status query")?;
-    Ok(DaemonWorkload::from_admission(parse_admission_response(
-        &response,
-    )?))
-}
-
-/// Reopen admission after a refused/aborted stop. A closed barrier makes the
-/// daemon refuse every worker selection, so every failure path must call
-/// this; best-effort, the caller's own error still surfaces.
-async fn release_admission() {
-    if let Err(error) = send_daemon_command("POST /restart-admission/release\n").await {
-        tracing::warn!(
-            "failed to release the admission barrier after an aborted stop: {error}; \
-             worker selection may refuse builds until `POST /restart-admission/release` succeeds"
+impl MaintenanceFence {
+    pub(crate) fn new(status: &RestartAdmissionResponse) -> Result<Self> {
+        anyhow::ensure!(
+            uuid::Uuid::parse_str(&status.daemon_incarnation).is_ok(),
+            "daemon did not supply a valid maintenance incarnation; upgrade the daemon"
         );
+        let owner_identity = rch_common::process_identity::current_process_identity()
+            .filter(ProcessIdentity::is_valid)
+            .context("cannot establish this maintenance client's process birth identity; admission was not changed")?;
+        Ok(Self {
+            daemon_incarnation: status.daemon_incarnation.clone(),
+            token: uuid::Uuid::new_v4().to_string(),
+            owner_identity,
+        })
+    }
+
+    pub(crate) fn command(&self, endpoint: &str) -> String {
+        format!(
+            "POST {endpoint}?daemon_incarnation={}&token={}\n",
+            self.daemon_incarnation, self.token
+        )
+    }
+
+    pub(crate) fn acquire_command(&self, purpose: &str) -> String {
+        format!(
+            "POST /restart-admission?daemon_incarnation={}&token={}&purpose={purpose}&owner_identity={}\n",
+            self.daemon_incarnation,
+            self.token,
+            self.owner_identity
+                .to_record()
+                .expect("maintenance fence retains a validated identity")
+        )
+    }
+
+    pub(crate) fn require_owned(&self, admission: &RestartAdmissionResponse) -> Result<()> {
+        anyhow::ensure!(
+            admission.success
+                && admission.daemon_incarnation == self.daemon_incarnation
+                && admission.maintenance_closed
+                && admission.admission_closed
+                && !admission.shutdown_committed
+                && !admission.ownership_failed
+                && admission.maintenance_owner.as_ref().is_some_and(|owner| {
+                    owner.token == self.token
+                        && owner.pid == std::process::id()
+                        && owner.process_identity == self.owner_identity
+                }),
+            "maintenance ownership is unconfirmed or changed: {}",
+            serde_json::to_string(admission).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn require_shutdown(
+        &self,
+        admission: &RestartAdmissionResponse,
+        force: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            admission.success
+                && admission.status == "shutting_down"
+                && admission.daemon_incarnation == self.daemon_incarnation
+                && admission.admission_closed
+                && admission.shutdown_committed
+                && (force
+                    || (!admission.ownership_failed
+                        && admission.active_build_ids.is_empty()
+                        && admission.queued_build_ids.is_empty()
+                        && admission.client_lease_ids.is_empty()
+                        && admission.client_lease_scan_error.is_none()))
+                && admission.maintenance_owner.as_ref().is_some_and(|owner| {
+                    owner.token == self.token
+                        && owner.pid == std::process::id()
+                        && owner.process_identity == self.owner_identity
+                }),
+            "daemon did not acknowledge an owned shutdown commitment: {}",
+            serde_json::to_string(admission).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn verify_open(&self, admission: &RestartAdmissionResponse) -> Result<&'static str> {
+        anyhow::ensure!(
+            admission.success
+                && uuid::Uuid::parse_str(&admission.daemon_incarnation).is_ok()
+                && !admission.admission_closed
+                && !admission.maintenance_closed
+                && !admission.shutdown_committed
+                && !admission.ownership_failed
+                && admission.maintenance_owner.is_none(),
+            "admission reopening was not confirmed; observed state {}",
+            serde_json::to_string(admission).unwrap_or_default()
+        );
+        Ok(if admission.daemon_incarnation == self.daemon_incarnation {
+            "admission reopened and verified"
+        } else {
+            "replacement daemon observed with open admission; prior lease retired"
+        })
     }
 }
 
-/// Wait (admission already closed) until the daemon is idle or the timeout
-/// elapses. Polls once per second; the barrier is left closed on success and
-/// released on timeout.
+/// Install both handlers before any admission mutation. SIGKILL, task abort,
+/// runtime loss and machine crashes are covered by the daemon's bounded lease.
+pub(crate) struct MaintenanceSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+/// The kernel peer and its birth marker are captured while the daemon is
+/// answering the original admission query. Socket disappearance alone cannot
+/// establish process exit, and a later numeric PID may name a replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DaemonProcess {
+    pub(crate) pid: u32,
+    pub(crate) identity: ProcessIdentity,
+}
+
+impl DaemonProcess {
+    #[cfg(unix)]
+    pub(crate) fn from_peer(stream: &tokio::net::UnixStream) -> Result<Self> {
+        let credentials = stream.peer_cred().context("cannot inspect daemon peer")?;
+        anyhow::ensure!(
+            credentials.uid() == rustix::process::geteuid().as_raw(),
+            "daemon socket belongs to another user"
+        );
+        let pid = credentials
+            .pid()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 1)
+            .context("daemon peer PID is unavailable")?;
+        let ProcessObservation::Present(identity) = observe_process(pid) else {
+            anyhow::bail!("daemon process birth identity is unavailable; maintenance refused");
+        };
+        Ok(Self { pid, identity })
+    }
+
+    pub(crate) fn presence(&self) -> OwnerPresence {
+        owner_presence(self.pid, Some(&self.identity))
+    }
+
+    pub(crate) fn require_live(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.presence() == OwnerPresence::Live,
+            "original daemon process identity changed or could not be confirmed"
+        );
+        Ok(())
+    }
+}
+
+impl MaintenanceSignals {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("cannot install maintenance interrupt handler")?,
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("cannot install maintenance termination handler")?,
+        })
+    }
+
+    pub(crate) async fn cancelled(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    /// Give the signal driver a turn before entering a synchronous mutation.
+    /// Publication then completes as one safe boundary; a signal received
+    /// during it is observed by the following bounded recovery phase.
+    pub(crate) async fn cancellation_pending(&mut self) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => true,
+            _ = tokio::time::sleep(Duration::ZERO) => false,
+        }
+    }
+}
+
+const MAINTENANCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+async fn maintenance_request_with_peer(
+    path: &Path,
+    command: &str,
+) -> Result<(String, DaemonProcess)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(MAINTENANCE_REQUEST_TIMEOUT, async {
+        let mut stream = tokio::net::UnixStream::connect(path).await?;
+        let process = DaemonProcess::from_peer(&stream)?;
+        stream.write_all(command.as_bytes()).await?;
+        stream.shutdown().await?;
+        let mut response = String::new();
+        stream
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut response)
+            .await?;
+        anyhow::ensure!(
+            response.len() <= 1024 * 1024,
+            "oversized maintenance response"
+        );
+        process.require_live()?;
+        Ok((response, process))
+    })
+    .await
+    .context("maintenance identity request timed out")?
+}
+
+async fn maintenance_request(path: &Path, command: &str) -> Result<String> {
+    #[cfg(unix)]
+    {
+        tokio::time::timeout(
+            MAINTENANCE_REQUEST_TIMEOUT,
+            super::send_daemon_command_to_socket(path, command),
+        )
+        .await
+        .context("maintenance request timed out")?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, command);
+        anyhow::bail!("daemon maintenance requires Unix sockets")
+    }
+}
+
+async fn admission_status_at(path: &Path) -> Result<RestartAdmissionResponse> {
+    let response = maintenance_request(path, "GET /restart-admission\n").await?;
+    parse_admission_response(&response)
+}
+
+struct MaintenanceLease {
+    path: PathBuf,
+    fence: MaintenanceFence,
+    process: DaemonProcess,
+    cleanup_on_drop: bool,
+}
+
+impl MaintenanceLease {
+    async fn prepare(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        let (status, process) = {
+            let (response, process) =
+                maintenance_request_with_peer(path, "GET /restart-admission\n").await?;
+            (parse_admission_response(&response)?, process)
+        };
+        #[cfg(not(unix))]
+        let (status, process): (RestartAdmissionResponse, DaemonProcess) = {
+            let _ = path;
+            anyhow::bail!("daemon maintenance requires Unix sockets");
+        };
+        anyhow::ensure!(
+            status.success
+                && !status.admission_closed
+                && !status.maintenance_closed
+                && !status.ownership_failed
+                && !status.shutdown_committed
+                && status.maintenance_owner.is_none(),
+            "admission is already closed; another maintenance operation or ownership error must recover first: {}. Run `rch daemon admission status`",
+            serde_json::to_string(&status).unwrap_or_default()
+        );
+        Ok(Self {
+            path: path.to_owned(),
+            fence: MaintenanceFence::new(&status)?,
+            process,
+            cleanup_on_drop: false,
+        })
+    }
+
+    async fn acquire(&mut self, purpose: &str) -> Result<DaemonWorkload> {
+        // Set this before sending: cancellation may arrive after the daemon
+        // acted but before the reply becomes available to this task.
+        self.cleanup_on_drop = true;
+        let response =
+            maintenance_request(&self.path, &self.fence.acquire_command(purpose)).await?;
+        let admission = parse_admission_response(&response)?;
+        self.fence.require_owned(&admission)?;
+        Ok(DaemonWorkload::from_admission(admission))
+    }
+
+    async fn renew(&self) -> Result<DaemonWorkload> {
+        let response =
+            maintenance_request(&self.path, &self.fence.command("/restart-admission/renew"))
+                .await?;
+        let admission = parse_admission_response(&response)?;
+        self.fence.require_owned(&admission)?;
+        Ok(DaemonWorkload::from_admission(admission))
+    }
+
+    async fn release_verified(&self) -> Result<&'static str> {
+        let release = maintenance_request(
+            &self.path,
+            &self.fence.command("/restart-admission/release"),
+        )
+        .await
+        .and_then(|response| parse_admission_response(&response));
+        // Read back even after a lost or erroneous release acknowledgement:
+        // only a fresh state observation can prove admission is available.
+        let observed = admission_status_at(&self.path).await;
+        match observed {
+            Ok(status) => self.fence.verify_open(&status).with_context(|| format!(
+                "release acknowledgement: {:?}; run `rch daemon admission status` and `rch daemon admission recover` after the owner expires",
+                release.as_ref().map(|value| &value.status).map_err(|error| error.to_string())
+            )),
+            Err(error) => anyhow::bail!(
+                "admission reopening was not confirmed: {error:#}; release acknowledgement: {:?}; this operation's uncommitted lease expires without renewal; inspect `rch daemon admission status` when communication is restored",
+                release.as_ref().map(|value| &value.status).map_err(|error| error.to_string())
+            ),
+        }
+    }
+
+    async fn cleanup(&mut self) -> Result<&'static str> {
+        if !self.cleanup_on_drop {
+            return Ok("no admission mutation remains pending");
+        }
+        let result = self.release_verified().await;
+        self.cleanup_on_drop = false;
+        result
+    }
+}
+
+impl Drop for MaintenanceLease {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+        // Normal cancellation/errors await cleanup explicitly. This fallback
+        // covers a cancelled task while its runtime is still alive; lease
+        // expiry covers runtime/process loss and a dropped cleanup future.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let lease = Self {
+                path: self.path.clone(),
+                fence: self.fence.clone(),
+                process: self.process.clone(),
+                cleanup_on_drop: false,
+            };
+            runtime.spawn(async move {
+                if let Err(error) = lease.release_verified().await {
+                    tracing::warn!("aborted maintenance cleanup unconfirmed: {error:#}");
+                }
+            });
+        }
+    }
+}
+
+/// Renew this operation's lease while waiting. A timeout leaves its fence
+/// owned until the caller either commits a forced shutdown or awaits cleanup.
 async fn drain_until_idle(
-    timeout: std::time::Duration,
+    lease: &MaintenanceLease,
+    timeout: Duration,
     ctx: &OutputContext,
 ) -> Result<DrainOutcome> {
     let started = std::time::Instant::now();
     let mut last_report: Option<String> = None;
     loop {
-        let workload = fetch_workload().await?;
+        let workload = lease.renew().await?;
         if workload.is_idle() {
             return Ok(DrainOutcome::Drained);
         }
         if started.elapsed() >= timeout {
-            release_admission().await;
             return Ok(DrainOutcome::TimedOut(workload));
         }
         if !ctx.is_json() {
@@ -828,6 +1310,14 @@ fn refuse_stop(
                     "queued_build_ids",
                     serde_json::to_string(&workload.queued_build_ids).unwrap_or_default(),
                 )
+                .with_context(
+                    "client_lease_ids",
+                    serde_json::to_string(&workload.client_lease_ids).unwrap_or_default(),
+                )
+                .with_context(
+                    "client_lease_scan_error",
+                    serde_json::to_string(&workload.client_lease_scan_error).unwrap_or_default(),
+                )
                 .with_remediation(remediation.iter().copied()),
         ));
         std::process::exit(1);
@@ -846,64 +1336,53 @@ fn refuse_stop(
     anyhow::anyhow!("{message}: {details}")
 }
 
-/// Ask the running daemon for its PID via `GET /status`.
-async fn daemon_pid() -> Option<u32> {
-    let response = send_daemon_command("GET /status\n").await.ok()?;
-    let json = extract_json_body(&response)?;
-    serde_json::from_str::<crate::status_types::DaemonFullStatusResponse>(json)
-        .ok()
-        .map(|status| status.daemon.pid)
-}
-
-/// Interrupt in-flight builds by terminating the daemon process. The socket
-/// API deliberately refuses an active shutdown. Linux binds a stable pidfd
-/// before rechecking the actual socket peer; it never falls back to a numeric
-/// signal. Other Unix platforms retain their targeted TERM implementation.
-/// No platform removes a lingering socket merely because a PID looks absent.
-async fn terminate_daemon_process(pid: u32, socket_path: &Path) -> Result<()> {
+/// Validate the reported status before committing a force stop. The PID from
+/// JSON is never authority to signal: it must match the original kernel peer,
+/// its birth identity and the exact configured socket path.
+#[cfg(target_os = "linux")]
+async fn verify_force_target(lease: &MaintenanceLease) -> Result<()> {
+    let (response, process) = maintenance_request_with_peer(&lease.path, "GET /status\n").await?;
     anyhow::ensure!(
-        pid > 1 && pid != std::process::id(),
-        "refusing unsafe daemon PID {pid}"
+        process == lease.process,
+        "daemon peer changed before force shutdown"
     );
-    #[cfg(target_os = "linux")]
-    {
-        force_stop::stop(socket_path, pid).await
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        let output = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .await
-            .context("failed to run kill")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "kill -TERM {pid} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        anyhow::ensure!(
-            wait_for_socket_gone(socket_path, 100).await,
-            "TERM sent but daemon socket retirement is unconfirmed; endpoint retained"
-        );
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = socket_path;
-        anyhow::bail!("forced stop is not supported on this platform; use --drain");
-    }
+    let mut http_status = response
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    anyhow::ensure!(
+        matches!(http_status.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+            && http_status.next() == Some("200"),
+        "daemon status was not acknowledged"
+    );
+    let json = extract_json_body(&response).context("daemon status is incomplete")?;
+    let status: crate::status_types::DaemonFullStatusResponse =
+        serde_json::from_str(json).context("daemon status is malformed")?;
+    anyhow::ensure!(
+        status.daemon.pid == process.pid && Path::new(&status.daemon.socket_path) == lease.path,
+        "daemon status does not match the original kernel peer and configured socket"
+    );
+    lease.fence.require_owned(
+        status
+            .admission
+            .as_ref()
+            .context("daemon status lacks the original maintenance fence")?,
+    )?;
+    Ok(())
 }
 
-/// Wait up to ~`attempts` x 100ms for the daemon socket to disappear.
-async fn wait_for_socket_gone(socket_path: &Path, attempts: u32) -> bool {
-    for _ in 0..attempts {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if !socket_path.exists() {
-            return true;
-        }
-    }
-    false
+/// Linux binds a stable pidfd before rechecking the actual socket peer. Other
+/// platforms rely on the fenced shutdown request and daemon exit deadline;
+/// delayed numeric signals would remain vulnerable to PID reuse.
+#[cfg(target_os = "linux")]
+async fn terminate_daemon_process(lease: &MaintenanceLease) -> Result<()> {
+    anyhow::ensure!(
+        lease.process.pid > 1 && lease.process.pid != std::process::id(),
+        "refusing unsafe daemon PID {}",
+        lease.process.pid
+    );
+    force_stop::stop(&lease.path, &lease.process, &lease.fence.daemon_incarnation).await
 }
 
 fn report_stopped(
@@ -936,47 +1415,21 @@ fn report_stopped(
 /// Raises the admission barrier, then shuts down only when nothing is in
 /// flight — or after `--drain` waited for it, or when `--force` explicitly
 /// authorised interrupting it. `-y` alone never interrupts a build.
-pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
-    use dialoguer::Confirm;
-
+async fn stop_owned(
+    lease: &mut MaintenanceLease,
+    opts: StopOptions,
+    restarting: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     let style = ctx.theme();
-    let socket_path_str = configured_socket_path()?;
-    let socket_path = Path::new(&socket_path_str);
-
-    if !socket_path.exists() {
-        if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok(
-                "daemon stop",
-                DaemonActionResponse {
-                    action: "stop".to_string(),
-                    success: true,
-                    socket_path: socket_path_str.clone(),
-                    message: Some("Daemon was not running".to_string()),
-                },
-            ));
-        } else {
-            println!(
-                "{} Daemon is not running {}",
-                StatusIndicator::Pending.display(style),
-                style.muted("(socket not found)")
-            );
-        }
-        return Ok(());
-    }
-
-    // Raise the admission barrier first: /shutdown is refused while admission
-    // is open, and closing it is what stops new builds landing mid-stop.
-    let workload = match close_admission().await {
-        Ok(workload) => workload,
-        Err(error) => {
-            // A busy daemon may lose its IPC response while builds remain
-            // live. Neither --yes nor --force supplies a missing identity.
-            return Err(unconfirmed_stop(
-                socket_path,
-                format!("admission failed: {error:#}"),
-            ));
-        }
+    let command_name = if restarting {
+        "daemon restart"
+    } else {
+        "daemon stop"
     };
+    let workload = lease
+        .acquire(if restarting { "restart" } else { "stop" })
+        .await?;
 
     let mut decision = decide_stop_action(&workload, &opts);
     if decision == StopDecision::Drain {
@@ -988,22 +1441,19 @@ pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
                 opts.drain_timeout_secs
             );
         }
-        match drain_until_idle(std::time::Duration::from_secs(opts.drain_timeout_secs), ctx).await?
-        {
+        match drain_until_idle(lease, Duration::from_secs(opts.drain_timeout_secs), ctx).await? {
             DrainOutcome::Drained => decision = StopDecision::Proceed,
             DrainOutcome::TimedOut(remaining) => {
                 if opts.force {
-                    // Barrier was released by the timeout path; close it
-                    // again so nothing new lands while we interrupt.
-                    let _ = close_admission().await;
                     decision = StopDecision::Interrupt;
                 } else {
+                    let cleanup = lease.cleanup().await?;
                     return Err(refuse_stop(
-                        "daemon stop",
+                        command_name,
                         ErrorCode::CancelTimeoutExceeded,
                         &format!(
-                            "drain timed out after {}s; daemon left running with admission reopened",
-                            opts.drain_timeout_secs
+                            "drain timed out after {}s; {cleanup}",
+                            opts.drain_timeout_secs,
                         ),
                         &remaining,
                         &[
@@ -1019,9 +1469,9 @@ pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
 
     match decision {
         StopDecision::Refuse => {
-            release_admission().await;
+            lease.cleanup().await?;
             return Err(refuse_stop(
-                "daemon stop",
+                command_name,
                 ErrorCode::WorkerAtCapacity,
                 "refusing to stop: builds are in flight (pass --drain to wait or --force to interrupt)",
                 &workload,
@@ -1033,319 +1483,308 @@ pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
             ));
         }
         StopDecision::Interrupt => {
-            if !opts.yes && !ctx.is_json() {
-                println!(
-                    "{} {} will be interrupted.",
-                    StatusIndicator::Warning.display(style),
-                    style.highlight(&workload.describe())
-                );
-                let confirmed = Confirm::new()
-                    .with_prompt("Stop the daemon anyway?")
-                    .default(false)
-                    .interact()?;
-                if !confirmed {
-                    release_admission().await;
-                    println!("{} Aborted.", StatusIndicator::Info.display(style));
-                    return Ok(());
-                }
-            }
             if !ctx.is_json() {
                 println!("Stopping RCH daemon (interrupting in-flight builds)...");
             }
-            let Some(pid) = daemon_pid().await else {
-                release_admission().await;
-                anyhow::bail!("could not determine the daemon PID for a forced stop");
-            };
-            if let Err(error) = terminate_daemon_process(pid, socket_path).await {
-                // TERM may already have acted, or another endpoint may now
-                // own this name. Do not reopen an ambiguously shared barrier.
-                return Err(unconfirmed_stop(
-                    socket_path,
-                    format!("forced stop failed: {error:#}"),
-                ));
-            }
-            report_stopped(
-                "daemon stop",
-                "stop",
-                &socket_path_str,
-                "Daemon stopped (forced; in-flight builds interrupted)",
-                ctx,
+            #[cfg(target_os = "linux")]
+            verify_force_target(lease).await?;
+            // Once committed, admission cannot reopen while a paused force
+            // client resumes its pidfd signal. A renewal alone is not a fence.
+            let request = format!(
+                "{}&force=true\n",
+                lease.fence.command("/shutdown").trim_end()
             );
-            return Ok(());
+            let response = maintenance_request(&lease.path, &request).await?;
+            let admission = parse_admission_response(&response)?;
+            lease.fence.require_shutdown(&admission, true)?;
+            #[cfg(target_os = "linux")]
+            if lease.process.presence() == OwnerPresence::Live
+                && let Err(error) = terminate_daemon_process(lease).await
+            {
+                // A committed daemon may close its listener before the
+                // helper can revalidate /status. Never relax the helper's
+                // identity checks. The daemon's shutdown deadline still
+                // permits bounded, signal-free proof of original process exit.
+                tracing::debug!("force helper did not confirm a signal: {error:#}");
+            }
         }
-        StopDecision::Proceed => {}
+        StopDecision::Proceed => {
+            let response =
+                maintenance_request(&lease.path, &lease.fence.command("/shutdown")).await?;
+            let shutdown = parse_shutdown_response(&response)?;
+            if shutdown.status == "shutdown_blocked" {
+                anyhow::bail!(
+                    "daemon refused shutdown: active builds {:?}, queued builds {:?}",
+                    shutdown.active_build_ids,
+                    shutdown.queued_build_ids
+                );
+            }
+            lease
+                .fence
+                .require_shutdown(&parse_admission_response(&response)?, false)?;
+        }
         StopDecision::Drain => unreachable!("drain resolves to Proceed or Interrupt above"),
     }
-
-    if !ctx.is_json() {
-        println!("Stopping RCH daemon...");
-    }
-
-    let response = match send_daemon_command("POST /shutdown\n").await {
-        Ok(response) => response,
-        Err(error) => {
-            return Err(unconfirmed_stop(
-                socket_path,
-                format!("shutdown failed: {error:#}"),
-            ));
-        }
+    let retirement_timeout = if decision == StopDecision::Interrupt {
+        Duration::from_secs(31)
+    } else {
+        Duration::from_secs(5)
     };
-    let shutdown = parse_shutdown_response(&response)
-        .map_err(|error| unconfirmed_stop(socket_path, format!("{error:#}")))?;
-    if shutdown.status == "shutdown_blocked" {
-        // A build was admitted between our barrier and the shutdown (or
-        // the barrier is not ours). Report exactly what blocked it.
-        release_admission().await;
-        let blocked = DaemonWorkload {
-            active_build_ids: shutdown.active_build_ids,
-            queued_build_ids: shutdown.queued_build_ids,
-            ..Default::default()
+    wait_for_maintenance_retirement(lease, restarting, retirement_timeout).await?;
+    lease.cleanup_on_drop = false;
+    Ok(())
+}
+
+async fn wait_for_maintenance_retirement(
+    lease: &MaintenanceLease,
+    restarting: bool,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let presence = lease.process.presence();
+        let endpoint_present = lease.path.try_exists()?;
+        if presence == OwnerPresence::Absent && !endpoint_present {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "daemon acknowledged shutdown but process exit and endpoint retirement are unconfirmed: original PID {} is {:?}; endpoint present={endpoint_present}",
+                lease.process.pid,
+                presence
+            );
+        }
+        if endpoint_present
+            && let Ok(Ok(status)) =
+                tokio::time::timeout(remaining, admission_status_at(&lease.path)).await
+            && status.daemon_incarnation != lease.fence.daemon_incarnation
+        {
+            anyhow::ensure!(
+                lease.process.presence() == OwnerPresence::Absent,
+                "a replacement daemon appeared while original process exit is unconfirmed"
+            );
+            anyhow::ensure!(
+                restarting,
+                "the original daemon exited but a replacement is running; the service remains active; admission state {}",
+                serde_json::to_string(&status).unwrap_or_default()
+            );
+            lease.fence.verify_open(&status)?;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+    }
+}
+
+async fn restart_ready(path: &Path, previous: Option<&str>) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut last = "daemon endpoint has not appeared".to_string();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "restart readiness unconfirmed: {last}"
+        );
+        match tokio::time::timeout(remaining, admission_status_at(path)).await {
+            Ok(Ok(status)) => {
+                if status.success
+                    && !status.admission_closed
+                    && !status.maintenance_closed
+                    && !status.shutdown_committed
+                    && !status.ownership_failed
+                    && status.maintenance_owner.is_none()
+                    && uuid::Uuid::parse_str(&status.daemon_incarnation).is_ok()
+                    && previous != Some(status.daemon_incarnation.as_str())
+                {
+                    return Ok(());
+                }
+                last = serde_json::to_string(&status).unwrap_or_default();
+            }
+            Ok(Err(error)) => last = error.to_string(),
+            Err(_) => anyhow::bail!("restart readiness timed out: {last}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+    }
+}
+
+async fn start_after_maintenance(
+    path: &Path,
+    previous: Option<&str>,
+    systemd: Option<SystemdUnitScope>,
+    launchd: Option<&str>,
+) -> Result<()> {
+    // A service manager may have already restarted the daemon. Never kill or
+    // cycle that new process: it can have accepted unrelated builds already.
+    if path.try_exists()? {
+        return restart_ready(path, previous).await;
+    }
+    if let Some(scope) = systemd {
+        start_via_systemd(scope).await.map_err(anyhow::Error::msg)?;
+    } else if let Some(target) = launchd {
+        start_via_launchd(target)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    } else {
+        ensure_socket_parent(path)?;
+        Command::new("nohup")
+            .arg(which_rchd())
+            .args(daemon_start_args(path))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .context("failed to start daemon after confirmed shutdown")?;
+    }
+    restart_ready(path, previous).await
+}
+
+async fn daemon_maintenance(
+    opts: StopOptions,
+    restarting: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    use dialoguer::Confirm;
+
+    let socket_path_str = configured_socket_path()?;
+    let socket_path = Path::new(&socket_path_str);
+    let command_name = if restarting {
+        "daemon restart"
+    } else {
+        "daemon stop"
+    };
+    // Confirmation happens before closing admission; a person can take longer
+    // than the lease deadline to answer without blocking anyone's build.
+    if opts.force
+        && !opts.yes
+        && !ctx.is_json()
+        && socket_path.exists()
+        && !Confirm::new()
+            .with_prompt("Interrupt in-flight builds if needed?")
+            .default(false)
+            .interact()?
+    {
+        println!("{} Aborted.", StatusIndicator::Info.display(ctx.theme()));
+        return Ok(());
+    }
+    let mut signals = MaintenanceSignals::new()?;
+    let mut systemd = None;
+    let mut launchd = None;
+    let mut previous = None;
+    let mut stopped_supervisor = None;
+    if socket_path.try_exists()? {
+        let mut lease = tokio::select! {
+            biased;
+            _ = signals.cancelled() => anyhow::bail!("maintenance cancelled before admission changed"),
+            result = MaintenanceLease::prepare(socket_path) => result
+                .map_err(|error| unconfirmed_stop(socket_path, format!("admission failed: {error:#}")))?,
         };
-        return Err(refuse_stop(
-            "daemon stop",
-            ErrorCode::WorkerAtCapacity,
-            "daemon refused to shut down: builds are in flight",
-            &blocked,
-            &[
-                "rch daemon stop --drain [--drain-timeout N]",
-                "rch daemon stop --force",
-            ],
-            ctx,
-        ));
+        if restarting {
+            systemd = tokio::select! {
+                biased;
+                _ = signals.cancelled() => anyhow::bail!("maintenance cancelled before admission changed"),
+                result = bound_systemd_scope(&lease.process) => result?,
+            };
+            if systemd.is_none() {
+                launchd = tokio::select! {
+                    biased;
+                    _ = signals.cancelled() => anyhow::bail!("maintenance cancelled before admission changed"),
+                    result = tokio::time::timeout(Duration::from_secs(5), detect_rchd_launchd_target()) => result.context("launchd ownership query timed out; no admission change was attempted")?,
+                };
+            }
+        } else {
+            stopped_supervisor = tokio::select! {
+                biased;
+                _ = signals.cancelled() => anyhow::bail!("maintenance cancelled before admission changed"),
+                result = inspect_stop_supervisor(&lease.process) => result?,
+            };
+        }
+        previous = Some(lease.fence.daemon_incarnation.clone());
+        let result = tokio::select! {
+            biased;
+            _ = signals.cancelled() => Err(anyhow::anyhow!("maintenance cancelled by signal")),
+            result = stop_owned(&mut lease, opts, restarting, ctx) => result,
+        };
+        if let Err(error) = result {
+            let cleanup = lease.cleanup().await;
+            let detail = match cleanup {
+                Ok(cleanup) => format!("{error:#}; {cleanup}"),
+                Err(cleanup) => format!("{error:#}; {cleanup:#}"),
+            };
+            return Err(unconfirmed_stop(socket_path, detail));
+        }
+    } else if restarting {
+        // There is no prior peer to bind in this case. Preserve the ordinary
+        // startup preference, and let readiness verify any racing daemon.
+        systemd = tokio::select! {
+            biased;
+            _ = signals.cancelled() => anyhow::bail!("maintenance cancelled before admission changed"),
+            result = detect_rchd_systemd_scope() => result,
+        };
+        if systemd.is_none() {
+            launchd = tokio::select! {
+                biased;
+                _ = signals.cancelled() => anyhow::bail!("maintenance cancelled before admission changed"),
+                result = tokio::time::timeout(Duration::from_secs(5), detect_rchd_launchd_target()) => result.context("launchd startup ownership query timed out")?,
+            };
+        }
+    } else {
+        anyhow::bail!(
+            "no daemon endpoint is present at {}; process exit and supervisor state cannot be verified; no shutdown or admission change was attempted",
+            socket_path.display()
+        );
     }
 
-    if wait_for_socket_gone(socket_path, 50).await {
+    if restarting {
+        tokio::select! {
+            biased;
+            _ = signals.cancelled() => anyhow::bail!("restart cancelled after confirmed shutdown; run `rch daemon start`"),
+            result = start_after_maintenance(socket_path, previous.as_deref(), systemd, launchd.as_deref()) => result?,
+        }
+        if ctx.is_json() {
+            ctx.json(&ApiResponse::ok(
+                command_name,
+                DaemonActionResponse {
+                    action: "restart".into(),
+                    success: true,
+                    socket_path: socket_path_str,
+                    message: Some(
+                        "Daemon restarted; new incarnation and open admission verified".into(),
+                    ),
+                },
+            ))?;
+        } else {
+            println!(
+                "{}",
+                StatusIndicator::Success
+                    .with_label(ctx.theme(), "Daemon restarted; open admission verified.")
+            );
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = signals.cancelled() => anyhow::bail!("stop cancelled after original daemon exit; supervisor state remains unconfirmed"),
+            result = verify_stopped_supervisor(stopped_supervisor) => result?,
+        }
         report_stopped(
-            "daemon stop",
+            command_name,
             "stop",
             &socket_path_str,
             "Daemon stopped",
             ctx,
         );
-        return Ok(());
     }
-
-    Err(unconfirmed_stop(
-        socket_path,
-        "daemon acknowledged shutdown but its socket is still present",
-    ))
+    Ok(())
 }
 
-/// Restart the daemon.
-///
-/// Same in-flight contract as [`daemon_stop`]: refuse while builds are in
-/// flight unless `--drain` waits them out or `--force` interrupts them.
+/// Stop with one bounded, peer-owned maintenance lease across drain and shutdown.
+pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
+    daemon_maintenance(opts, false, ctx).await
+}
+
+/// Restart after verifying shutdown, then verify a new incarnation admits work.
 pub async fn daemon_restart(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
-    use dialoguer::Confirm;
-
-    let style = ctx.theme();
-    let socket_path_str = configured_socket_path()?;
-    let socket_path = Path::new(&socket_path_str);
-
-    // Establish the in-flight contract while the daemon is still reachable.
-    // `admission_proven` records that the barrier is closed AND the daemon
-    // was proven idle, which is the precondition `require_restart_admission`
-    // otherwise establishes (it cannot be re-run after a drain: the barrier
-    // is already closed, so it would refuse and release it).
-    let mut interrupting = false;
-    let mut admission_proven = false;
-    if socket_path.exists()
-        && let Ok(workload) = fetch_workload().await
-    {
-        match decide_stop_action(&workload, &opts) {
-            StopDecision::Proceed => {}
-            StopDecision::Drain => {
-                close_admission().await?;
-                if !ctx.is_json() {
-                    println!(
-                        "{} Admission closed; draining {} (timeout {}s)...",
-                        StatusIndicator::Info.display(style),
-                        workload.describe(),
-                        opts.drain_timeout_secs
-                    );
-                }
-                match drain_until_idle(std::time::Duration::from_secs(opts.drain_timeout_secs), ctx)
-                    .await?
-                {
-                    DrainOutcome::Drained => admission_proven = true,
-                    DrainOutcome::TimedOut(remaining) => {
-                        if opts.force {
-                            interrupting = true;
-                        } else {
-                            return Err(refuse_stop(
-                                "daemon restart",
-                                ErrorCode::CancelTimeoutExceeded,
-                                &format!(
-                                    "drain timed out after {}s; daemon left running with admission reopened",
-                                    opts.drain_timeout_secs
-                                ),
-                                &remaining,
-                                &[
-                                    "rch daemon restart --drain --drain-timeout <more seconds>",
-                                    "rch daemon restart --force   # interrupts the listed builds",
-                                ],
-                                ctx,
-                            ));
-                        }
-                    }
-                }
-            }
-            StopDecision::Interrupt => interrupting = true,
-            StopDecision::Refuse => {
-                return Err(refuse_stop(
-                    "daemon restart",
-                    ErrorCode::WorkerAtCapacity,
-                    "refusing to restart: builds are in flight (pass --drain to wait or --force to interrupt)",
-                    &workload,
-                    &[
-                        "rch daemon restart --drain [--drain-timeout N]",
-                        "rch daemon restart --force",
-                    ],
-                    ctx,
-                ));
-            }
-        }
-        if interrupting && !opts.yes && !ctx.is_json() {
-            println!(
-                "{} {} will be interrupted.",
-                StatusIndicator::Warning.display(style),
-                style.highlight(&workload.describe())
-            );
-            let confirmed = Confirm::new()
-                .with_prompt("Restart the daemon anyway?")
-                .default(false)
-                .interact()?;
-            if !confirmed {
-                println!("{} Aborted.", StatusIndicator::Info.display(style));
-                return Ok(());
-            }
-        }
-    }
-
-    if socket_path.exists() && !interrupting && !admission_proven {
-        require_restart_admission().await?;
-    }
-
-    if !ctx.is_json() {
-        println!(
-            "{} Restarting RCH daemon...\n",
-            StatusIndicator::Info.display(style)
-        );
-    }
-
-    // When rchd is managed by a systemd unit, the manual shutdown+spawn path
-    // does NOT reliably cycle it: a `nohup rchd` spawned outside the unit
-    // defers to systemd and exits, while systemd's `Restart=always` respawns
-    // the unit's own process — keeping the OLD (possibly already-deleted)
-    // binary running. Only `systemctl restart` re-execs the unit from the
-    // freshly installed binary. Route through it (reusing the same detection
-    // `rch update`'s restart step relies on) and only fall back to the legacy
-    // path if the unit restart fails.
-    if let Some(scope) = detect_rchd_systemd_scope() {
-        match restart_via_systemd(scope).await {
-            Ok(()) => {
-                let socket_path_str = configured_socket_path()?;
-                if ctx.is_json() {
-                    let _ = ctx.json(&ApiResponse::ok(
-                        "daemon restart",
-                        DaemonActionResponse {
-                            action: "restart".to_string(),
-                            success: true,
-                            socket_path: socket_path_str,
-                            message: Some(format!(
-                                "Daemon restarted via systemctl{} restart rchd",
-                                match scope {
-                                    SystemdUnitScope::User => " --user",
-                                    SystemdUnitScope::System => "",
-                                }
-                            )),
-                        },
-                    ));
-                } else {
-                    println!(
-                        "{}",
-                        StatusIndicator::Success
-                            .with_label(style, "Daemon restarted via its systemd unit.")
-                    );
-                    println!(
-                        "  {} {} {}",
-                        style.key("Unit"),
-                        style.muted(":"),
-                        style.value(match scope {
-                            SystemdUnitScope::User => "systemctl --user rchd.service",
-                            SystemdUnitScope::System => "systemctl rchd.service",
-                        })
-                    );
-                }
-                return Ok(());
-            }
-            Err(reason) => {
-                // Log to stderr so deploy issues are diagnosable, then fall
-                // through to the manual path (e.g. for a defined-but-broken
-                // unit on a host that can still run a bare daemon).
-                eprintln!(
-                    "rch: systemd unit restart did not complete ({reason}); \
-                     falling back to manual stop+start"
-                );
-            }
-        }
-    }
-
-    if let Some(target) = detect_rchd_launchd_target().await {
-        match restart_via_launchd(&target).await {
-            Ok(()) => {
-                let socket_path_str = configured_socket_path()?;
-                if ctx.is_json() {
-                    let _ = ctx.json(&ApiResponse::ok(
-                        "daemon restart",
-                        DaemonActionResponse {
-                            action: "restart".to_string(),
-                            success: true,
-                            socket_path: socket_path_str,
-                            message: Some(format!(
-                                "Daemon restarted via launchctl kickstart -k {target}"
-                            )),
-                        },
-                    ));
-                } else {
-                    println!(
-                        "{}",
-                        StatusIndicator::Success
-                            .with_label(style, "Daemon restarted via its launchd agent.")
-                    );
-                    println!(
-                        "  {} {} {}",
-                        style.key("Agent"),
-                        style.muted(":"),
-                        style.value(&target)
-                    );
-                }
-                return Ok(());
-            }
-            Err(reason) => {
-                eprintln!(
-                    "rch: launchd agent restart did not complete ({reason}); \
-                     falling back to manual stop+start"
-                );
-            }
-        }
-    }
-
-    // Manual path: user-launched daemon (no unit or launchd agent).
-    // Pass true for skip_confirm since we already prompted above.
-    daemon_stop(
-        StopOptions {
-            yes: true,
-            drain: false,
-            drain_timeout_secs: 0,
-            force: interrupting,
-        },
-        ctx,
-    )
-    .await?;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    daemon_start(ctx).await?;
-    Ok(())
+    daemon_maintenance(opts, true, ctx).await
 }
 
 /// Reload daemon configuration without restart.
@@ -1699,6 +2138,68 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_selects_only_systemd_scope_bound_to_captured_peer() {
+        let process = DaemonProcess {
+            pid: std::process::id(),
+            identity: rch_common::process_identity::current_process_identity().unwrap(),
+        };
+        let state = |pid| SystemdServiceState {
+            pid,
+            restart: "on-failure".into(),
+            active: "active".into(),
+            sub: "running".into(),
+        };
+        let selected = bound_systemd_scope_with(&process, |scope| {
+            std::future::ready(Ok(Some(state(match scope {
+                SystemdUnitScope::User => process.pid + 1,
+                SystemdUnitScope::System => process.pid,
+            }))))
+        })
+        .await
+        .unwrap();
+        assert_eq!(selected, Some(SystemdUnitScope::System));
+
+        let unrelated = bound_systemd_scope_with(&process, |scope| {
+            std::future::ready(Ok(match scope {
+                SystemdUnitScope::User => Some(state(process.pid + 1)),
+                SystemdUnitScope::System => None,
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            unrelated, None,
+            "an enabled unrelated unit must not replace manual startup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_manager_uncertainty_never_falls_back_to_unmanaged_start() {
+        let process = DaemonProcess {
+            pid: std::process::id(),
+            identity: rch_common::process_identity::current_process_identity().unwrap(),
+        };
+        let mut probes = 0;
+        let result = bound_systemd_scope_with(&process, |_| {
+            probes += 1;
+            std::future::ready(Err(anyhow::anyhow!("manager inspection timed out")))
+        })
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("inspection timed out")
+        );
+        assert_eq!(
+            probes, 1,
+            "unknown ownership must not be interpreted as absence"
+        );
+    }
+
     fn busy_workload() -> DaemonWorkload {
         DaemonWorkload {
             active_build_ids: vec![41, 42],
@@ -1820,8 +2321,15 @@ mod tests {
     #[test]
     fn admission_response_maps_to_workload() {
         let _guard = test_guard!();
-        let response = "HTTP/1.0 200 OK\r\n\r\n{\"admission_closed\":true,\"restart_permitted\":false,\"active_build_ids\":[1],\"queued_build_ids\":[],\"client_lease_ids\":[\"l1\"]}\n";
-        let admission = parse_admission_response(response).unwrap();
+        let mut admission = open_admission();
+        admission.admission_closed = true;
+        admission.active_build_ids.push(1);
+        admission.client_lease_ids.push("l1".into());
+        let response = format!(
+            "HTTP/1.0 200 OK\r\n\r\n{}",
+            serde_json::to_string(&admission).unwrap()
+        );
+        let admission = parse_admission_response(&response).unwrap();
         assert!(!admission.restart_permitted);
         let workload = DaemonWorkload::from_admission(admission);
         assert_eq!(workload.active_build_ids, vec![1]);
@@ -1829,12 +2337,194 @@ mod tests {
         assert!(!workload.is_idle());
     }
 
-    #[cfg(not(target_os = "linux"))]
+    fn open_admission() -> RestartAdmissionResponse {
+        RestartAdmissionResponse {
+            success: true,
+            status: "open".into(),
+            daemon_incarnation: "a12ca740-4c39-4486-9872-1490f0b6c263".into(),
+            ..Default::default()
+        }
+    }
+
+    fn owned_admission(fence: &MaintenanceFence) -> RestartAdmissionResponse {
+        RestartAdmissionResponse {
+            status: "maintenance_active".into(),
+            admission_closed: true,
+            maintenance_closed: true,
+            maintenance_owner: Some(rch_common::MaintenanceOwner {
+                token: fence.token.clone(),
+                pid: std::process::id(),
+                process_identity: fence.owner_identity.clone(),
+                purpose: "restart".into(),
+                generation: 1,
+                acquired_unix_ms: 100,
+                deadline_unix_ms: 30100,
+                remaining_ms: 30000,
+                owner_presence: "live".into(),
+            }),
+            ..open_admission()
+        }
+    }
+
     #[test]
-    fn non_linux_hosts_have_no_systemd_unit() {
+    fn maintenance_admission_requires_complete_http_and_fenced_state_evidence() {
+        for response in [
+            "HTTP/1.1 200 OK\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\n\r\n{\"admission_closed\":false,\"restart_permitted\":true,\"active_build_ids\":[],\"queued_build_ids\":[],\"client_lease_ids\":[]}",
+            "{\"admission_closed\":false}",
+        ] {
+            assert!(parse_admission_response(response).is_err(), "{response}");
+        }
+        let body = serde_json::to_string(&open_admission()).unwrap();
+        assert!(
+            parse_admission_response(&format!("HTTP/1.1 503 Unavailable\r\n\r\n{body}")).is_err()
+        );
+        assert!(parse_admission_response(&format!("HTTP/1.1 200 OK\r\n\r\n{body}")).is_ok());
+    }
+
+    #[test]
+    fn maintenance_fence_cannot_adopt_another_operation_or_daemon_incarnation() {
+        let fence = MaintenanceFence::new(&open_admission()).unwrap();
+        let owned = owned_admission(&fence);
+        fence.require_owned(&owned).unwrap();
+        let mut wrong = owned.clone();
+        wrong.maintenance_owner.as_mut().unwrap().token = uuid::Uuid::new_v4().to_string();
+        assert!(fence.require_owned(&wrong).is_err());
+        wrong = owned.clone();
+        wrong.maintenance_owner.as_mut().unwrap().pid += 1;
+        assert!(fence.require_owned(&wrong).is_err());
+        wrong = owned.clone();
+        wrong.daemon_incarnation = uuid::Uuid::new_v4().to_string();
+        assert!(fence.require_owned(&wrong).is_err());
+        wrong = owned.clone();
+        wrong.maintenance_owner = None;
+        assert!(fence.require_owned(&wrong).is_err());
+        wrong = owned;
+        wrong.ownership_failed = true;
+        assert!(fence.require_owned(&wrong).is_err());
+    }
+
+    #[test]
+    fn maintenance_acquisition_retains_one_canonical_process_birth_claim() {
+        let fence = MaintenanceFence::new(&open_admission()).unwrap();
+        let current = rch_common::process_identity::current_process_identity().unwrap();
+        assert_eq!(fence.owner_identity, current);
+        let expected = format!(
+            "POST /restart-admission?daemon_incarnation={}&token={}&purpose=restart&owner_identity={}\n",
+            fence.daemon_incarnation,
+            fence.token,
+            current.to_record().unwrap()
+        );
+        assert_eq!(fence.acquire_command("restart"), expected);
+        // Retrying a lost acquisition response carries the same claim/token;
+        // all later mutations rely on the server's stored owner birth fence.
+        assert_eq!(fence.acquire_command("restart"), expected);
+        for endpoint in [
+            "/restart-admission/renew",
+            "/restart-admission/release",
+            "/shutdown",
+        ] {
+            assert!(!fence.command(endpoint).contains("owner_identity="));
+        }
+    }
+
+    #[test]
+    fn maintenance_receipts_reject_matching_pid_with_wrong_process_birth() {
+        use rch_common::process_identity::ProcessStart;
+
+        let fence = MaintenanceFence::new(&open_admission()).unwrap();
+        let mut old_boot = fence.owner_identity.clone();
+        old_boot.boot_id = if old_boot.boot_id == "1beb4d17-d7a6-44ae-811f-96e47a1ebc62" {
+            "655283ed-1dc5-41ba-b97d-e33da948dbd1"
+        } else {
+            "1beb4d17-d7a6-44ae-811f-96e47a1ebc62"
+        }
+        .into();
+        let mut recycled = fence.owner_identity.clone();
+        match &mut recycled.start {
+            ProcessStart::Linux { ticks } => *ticks = ticks.wrapping_add(1),
+            ProcessStart::Darwin { microseconds, .. } => {
+                *microseconds = (*microseconds + 1) % 1_000_000;
+            }
+        }
+        for wrong_birth in [old_boot, recycled] {
+            let mut receipt = owned_admission(&fence);
+            receipt.maintenance_owner.as_mut().unwrap().process_identity = wrong_birth;
+            assert!(fence.require_owned(&receipt).is_err());
+            receipt.status = "shutting_down".into();
+            receipt.shutdown_committed = true;
+            assert!(fence.require_shutdown(&receipt, false).is_err());
+            assert!(fence.require_shutdown(&receipt, true).is_err());
+        }
+    }
+
+    #[test]
+    fn maintenance_release_readback_distinguishes_replacement_and_closed_admission() {
+        let fence = MaintenanceFence::new(&open_admission()).unwrap();
+        assert_eq!(
+            fence.verify_open(&open_admission()).unwrap(),
+            "admission reopened and verified"
+        );
+        assert!(fence.verify_open(&owned_admission(&fence)).is_err());
+        let mut status = open_admission();
+        status.ownership_failed = true;
+        assert!(fence.verify_open(&status).is_err());
+        status = open_admission();
+        status.shutdown_committed = true;
+        assert!(fence.verify_open(&status).is_err());
+        status = open_admission();
+        status.daemon_incarnation = uuid::Uuid::new_v4().to_string();
+        assert!(
+            fence
+                .verify_open(&status)
+                .unwrap()
+                .contains("replacement daemon observed")
+        );
+        status.daemon_incarnation.clear();
+        assert!(fence.verify_open(&status).is_err());
+    }
+
+    #[test]
+    fn shutdown_acknowledgement_requires_owned_commitment_and_quiescence_unless_forced() {
+        let fence = MaintenanceFence::new(&open_admission()).unwrap();
+        let mut committed = owned_admission(&fence);
+        committed.shutdown_committed = true;
+        committed.status = "shutting_down".into();
+        fence.require_shutdown(&committed, false).unwrap();
+        for busy in [
+            RestartAdmissionResponse {
+                active_build_ids: vec![41],
+                ..committed.clone()
+            },
+            RestartAdmissionResponse {
+                queued_build_ids: vec![42],
+                ..committed.clone()
+            },
+            RestartAdmissionResponse {
+                client_lease_ids: vec!["live-owner".into()],
+                ..committed.clone()
+            },
+            RestartAdmissionResponse {
+                client_lease_scan_error: Some("inspection failed".into()),
+                ..committed.clone()
+            },
+        ] {
+            assert!(fence.require_shutdown(&busy, false).is_err());
+            fence.require_shutdown(&busy, true).unwrap();
+        }
+        committed.shutdown_committed = false;
+        assert!(fence.require_shutdown(&committed, true).is_err());
+        committed.shutdown_committed = true;
+        committed.maintenance_owner.as_mut().unwrap().token = uuid::Uuid::new_v4().to_string();
+        assert!(fence.require_shutdown(&committed, true).is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn non_linux_hosts_have_no_systemd_unit() {
         let _guard = test_guard!();
         // macOS (launchd) and other non-Linux hosts must never route restart
         // through systemctl, preserving the manual stop+start path.
-        assert_eq!(detect_rchd_systemd_scope(), None);
+        assert_eq!(detect_rchd_systemd_scope().await, None);
     }
 }

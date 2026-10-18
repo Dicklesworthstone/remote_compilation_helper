@@ -12,7 +12,7 @@ mod agents;
 mod config;
 mod config_doctor;
 mod config_init;
-mod daemon;
+pub(crate) mod daemon;
 mod helpers;
 mod hook;
 mod init;
@@ -43,7 +43,11 @@ pub use hook::{hook_install, hook_status, hook_test, hook_uninstall};
 pub use shim::{shim_install, shim_status, shim_uninstall};
 
 // Re-export status/diagnostics commands for backward compatibility
-pub use status::{admit, check, diagnose, self_test, status_overview};
+pub(crate) use status::query_restart_admission;
+pub use status::{
+    admit, check, daemon_admission_recover, daemon_admission_status, diagnose, self_test,
+    status_overview,
+};
 
 // Re-export queue/cancel commands for backward compatibility
 pub use queue::{cancel_build, queue_status};
@@ -599,6 +603,7 @@ mod tests {
             running: true,
             socket_path: "/tmp/rch.sock".to_string(),
             uptime_seconds: Some(3600),
+            admission: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(json["running"].as_bool().unwrap());
@@ -613,6 +618,7 @@ mod tests {
             running: false,
             socket_path: "/tmp/rch.sock".to_string(),
             uptime_seconds: None,
+            admission: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(!json["running"].as_bool().unwrap());

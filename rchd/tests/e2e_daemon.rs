@@ -175,6 +175,33 @@ fn send_socket_request(socket_path: &std::path::Path, request: &str) -> std::io:
     }))
 }
 
+fn acquire_maintenance(socket_path: &std::path::Path) -> String {
+    let owner_identity = rch_common::process_identity::current_process_identity()
+        .and_then(|identity| identity.to_record())
+        .expect("test process birth identity");
+    let status = send_socket_request(socket_path, "GET /restart-admission").unwrap();
+    let observed: rch_common::RestartAdmissionResponse =
+        serde_json::from_str(extract_json_body(&status).unwrap()).unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
+    let fence = format!(
+        "daemon_incarnation={}&token={token}",
+        observed.daemon_incarnation
+    );
+    let acquired = send_socket_request(
+        socket_path,
+        &format!("POST /restart-admission?{fence}&purpose=test&owner_identity={owner_identity}"),
+    )
+    .unwrap();
+    let acquired: rch_common::RestartAdmissionResponse =
+        serde_json::from_str(extract_json_body(&acquired).unwrap()).unwrap();
+    assert!(
+        acquired.success && acquired.admission_closed,
+        "{acquired:?}"
+    );
+    assert_eq!(acquired.maintenance_owner.unwrap().token, token);
+    fence
+}
+
 /// Wait for daemon to be fully ready (responding to health checks).
 ///
 /// This is more robust than just waiting for socket connectivity because:
@@ -432,21 +459,16 @@ fn test_daemon_shutdown() {
     let premature = send_socket_request(&socket_path, "POST /shutdown").unwrap();
     let premature_body = extract_json_body(&premature).unwrap();
     assert!(
-        premature_body.contains("shutdown_blocked"),
+        !premature_body.contains("\"status\":\"shutting_down\""),
         "Shutdown with open admission must be refused, got: {}",
         premature_body
     );
 
     // Raise the admission barrier (the restart/shutdown precondition).
-    let admission = send_socket_request(&socket_path, "POST /restart-admission").unwrap();
-    assert!(
-        admission.contains("200 OK"),
-        "Expected 200 OK from /restart-admission, got: {}",
-        admission
-    );
+    let fence = acquire_maintenance(&socket_path);
 
     // Send shutdown request (now permitted: admission closed, idle)
-    let response = send_socket_request(&socket_path, "POST /shutdown").unwrap();
+    let response = send_socket_request(&socket_path, &format!("POST /shutdown?{fence}")).unwrap();
 
     // Verify response indicates shutdown
     assert!(
@@ -745,7 +767,8 @@ fn test_daemon_verbose_mode() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     // Clean up: request graceful shutdown via API
-    let _ = send_socket_request(&socket_path, "POST /shutdown");
+    let fence = acquire_maintenance(&socket_path);
+    let _ = send_socket_request(&socket_path, &format!("POST /shutdown?{fence}"));
     // Give daemon time to shut down
     std::thread::sleep(Duration::from_millis(100));
 

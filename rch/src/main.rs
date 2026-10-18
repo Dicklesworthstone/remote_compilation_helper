@@ -1258,6 +1258,11 @@ enum DaemonAction {
     },
     /// Show daemon status
     Status,
+    /// Inspect build admission or recover an abandoned maintenance operation
+    Admission {
+        #[command(subcommand)]
+        action: DaemonAdmissionAction,
+    },
     /// Tail daemon logs
     Logs {
         /// Number of lines to show
@@ -1276,10 +1281,19 @@ impl DaemonAction {
             DaemonAction::Stop { .. } => "stop",
             DaemonAction::Restart { .. } => "restart",
             DaemonAction::Status => "status",
+            DaemonAction::Admission { .. } => "admission",
             DaemonAction::Logs { .. } => "logs",
             DaemonAction::Reload => "reload",
         }
     }
+}
+
+#[derive(Subcommand)]
+enum DaemonAdmissionAction {
+    /// Show the admission barrier, maintenance owner, and recovery deadline
+    Status,
+    /// Recover only an absent or expired owner, then verify admission is open
+    Recover,
 }
 
 #[derive(Subcommand)]
@@ -4040,6 +4054,10 @@ async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> 
         DaemonAction::Status => {
             commands::daemon_status(ctx).await?;
         }
+        DaemonAction::Admission { action } => match action {
+            DaemonAdmissionAction::Status => commands::daemon_admission_status(ctx).await?,
+            DaemonAdmissionAction::Recover => commands::daemon_admission_recover(ctx).await?,
+        },
         DaemonAction::Logs { lines } => {
             commands::daemon_logs(lines, ctx)?;
         }
@@ -9606,6 +9624,23 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "daemon", "status", "-v", "--json"]).unwrap();
         assert!(cli.verbose);
         assert!(cli.json);
+    }
+
+    #[test]
+    fn daemon_admission_diagnostics_and_safe_recovery_have_machine_output() {
+        for action in ["status", "recover"] {
+            let cli =
+                Cli::try_parse_from(["rch", "daemon", "admission", action, "--json"]).unwrap();
+            assert!(cli.json);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Daemon {
+                    action: DaemonAction::Admission { .. }
+                })
+            ));
+        }
+        assert!(Cli::try_parse_from(["rch", "daemon", "admission", "recover", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["rch", "daemon", "admission", "release"]).is_err());
     }
 
     // -------------------------------------------------------------------------

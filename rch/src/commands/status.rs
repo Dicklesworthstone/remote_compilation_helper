@@ -44,6 +44,116 @@ use super::workers::{
 use super::{load_workers_from_config, query_daemon_health, send_daemon_command};
 
 // =============================================================================
+// Maintenance Admission Diagnostics
+// =============================================================================
+
+pub(crate) async fn query_restart_admission() -> Result<rch_common::RestartAdmissionResponse> {
+    admission_request("GET /restart-admission\n".into()).await
+}
+
+async fn admission_request(command: String) -> Result<rch_common::RestartAdmissionResponse> {
+    let response = send_daemon_command(&command).await?;
+    super::daemon::parse_admission_response(&response)
+}
+
+/// Querying status succeeds even if admission is closed: the returned snapshot
+/// is the evidence an operator needs, not a claim that builds can be admitted.
+pub async fn daemon_admission_status(ctx: &OutputContext) -> Result<()> {
+    let admission = query_restart_admission().await?;
+    render_admission_snapshot("daemon admission status", &admission, ctx)
+}
+
+fn render_admission_snapshot(
+    command: &str,
+    admission: &rch_common::RestartAdmissionResponse,
+    ctx: &OutputContext,
+) -> Result<()> {
+    if ctx.is_json() {
+        ctx.json(&ApiResponse::ok(command, admission))?;
+    } else {
+        for line in crate::status_types::admission_diagnostic_lines(admission) {
+            ctx.print(&line);
+        }
+    }
+    Ok(())
+}
+
+fn admission_recovery_error(
+    reason: &str,
+    admission: &rch_common::RestartAdmissionResponse,
+) -> anyhow::Error {
+    rch_common::ApiError::internal(format!(
+        "admission recovery is unconfirmed: {reason}; {}",
+        crate::status_types::admission_diagnostic_lines(admission).join("; ")
+    ))
+    .with_context(
+        "admission_state",
+        serde_json::to_string(admission).unwrap_or_else(|_| "unavailable".into()),
+    )
+    .with_remediation(["rch daemon admission status --json"])
+    .into()
+}
+
+fn verify_admission_open(admission: &rch_common::RestartAdmissionResponse) -> Result<()> {
+    if !admission.success
+        || uuid::Uuid::parse_str(&admission.daemon_incarnation).is_err()
+        || admission.admission_closed
+        || admission.maintenance_closed
+        || admission.maintenance_owner.is_some()
+        || admission.ownership_failed
+        || admission.shutdown_committed
+    {
+        return Err(admission_recovery_error(
+            "the daemon did not confirm that all admission barriers are open",
+            admission,
+        ));
+    }
+    Ok(())
+}
+
+/// Recover one observed owner only. The daemon independently proves absence or
+/// expiry and fences the request against its current incarnation and token.
+/// A second query is required after mutation; a concurrent owner's new barrier
+/// must never be presented as successfully released.
+async fn recover_admission_with(
+    mut request: impl AsyncFnMut(String) -> Result<rch_common::RestartAdmissionResponse>,
+) -> Result<rch_common::RestartAdmissionResponse> {
+    let observed = request("GET /restart-admission\n".into()).await?;
+    let Some(owner) = &observed.maintenance_owner else {
+        verify_admission_open(&observed)?;
+        return Ok(observed);
+    };
+    let command = format!(
+        "POST /restart-admission/recover?daemon_incarnation={}&token={}\n",
+        urlencoding_encode(&observed.daemon_incarnation),
+        urlencoding_encode(&owner.token)
+    );
+    let recovered = request(command).await.context(
+        "admission recovery was not acknowledged; inspect `rch daemon admission status --json`",
+    )?;
+    if recovered.daemon_incarnation != observed.daemon_incarnation {
+        return Err(admission_recovery_error(
+            "the recovery response belongs to a different daemon incarnation",
+            &recovered,
+        ));
+    }
+    verify_admission_open(&recovered)?;
+    let verified = request("GET /restart-admission\n".into()).await.context(
+        "admission recovery acknowledgement could not be verified; inspect `rch daemon admission status --json`",
+    )?;
+    verify_admission_open(&verified)?;
+    Ok(verified)
+}
+
+pub async fn daemon_admission_recover(ctx: &OutputContext) -> Result<()> {
+    let verified = recover_admission_with(async |command| admission_request(command).await).await?;
+    if !ctx.is_json() {
+        ctx.print("Admission verified open.");
+    }
+    render_admission_snapshot("daemon admission recover", &verified, ctx)
+}
+
+// =============================================================================
 // Diagnose Command
 // =============================================================================
 
@@ -2499,6 +2609,36 @@ pub async fn status_overview(
 
     // Posture-level hints.
     match &posture {
+        SystemPosture::AdmissionClosed => {
+            if let Some(admission) = &status.admission {
+                remediation_hints.push(RemediationHint {
+                    reason_code: if admission.ownership_failed {
+                        "durable_ownership_failed"
+                    } else if admission.shutdown_committed {
+                        "daemon_shutdown_committed"
+                    } else {
+                        "maintenance_admission_closed"
+                    }
+                    .into(),
+                    severity: if admission.ownership_failed {
+                        "critical"
+                    } else {
+                        "warning"
+                    }
+                    .into(),
+                    message: crate::status_types::admission_diagnostic_lines(admission).join("; "),
+                    suggested_action: if admission.ownership_failed {
+                        "rch daemon logs; rch daemon admission status --json"
+                    } else if admission.shutdown_committed {
+                        "Wait for daemon exit/restart, then run rch daemon admission status --json"
+                    } else {
+                        "rch daemon admission status --json; rch daemon admission recover"
+                    }
+                    .into(),
+                    worker_id: None,
+                });
+            }
+        }
         SystemPosture::LocalOnly => {
             if status.daemon.workers_total == 0 {
                 remediation_hints.push(RemediationHint {
@@ -3257,6 +3397,186 @@ mod tests {
     use super::*;
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;
+
+    #[tokio::test]
+    async fn admission_recovery_fences_one_owner_and_requires_a_fresh_open_snapshot() {
+        use crate::status_types::admission_test_snapshot;
+        use std::collections::VecDeque;
+
+        let mut expired = admission_test_snapshot(true);
+        let owner = expired.maintenance_owner.as_mut().unwrap();
+        owner.remaining_ms = 0;
+        owner.owner_presence = "unknown".into();
+        let open = admission_test_snapshot(false);
+        let mut next_owner = admission_test_snapshot(true);
+        next_owner.maintenance_owner.as_mut().unwrap().token =
+            "3a4148fb-8d13-4435-92b0-b067d52deba7".into();
+        next_owner.maintenance_owner.as_mut().unwrap().generation = 4;
+        let mut refused = expired.clone();
+        refused.success = false;
+        refused.status = "maintenance_owned".into();
+
+        for (label, replies, expected_ok, expected_calls) in [
+            (
+                "verified",
+                vec![Ok(expired.clone()), Ok(open.clone()), Ok(open.clone())],
+                true,
+                3,
+            ),
+            (
+                "live owner",
+                vec![Ok(expired.clone()), Ok(refused)],
+                false,
+                2,
+            ),
+            (
+                "concurrent owner",
+                vec![Ok(expired.clone()), Ok(open.clone()), Ok(next_owner)],
+                false,
+                3,
+            ),
+            (
+                "lost verification",
+                vec![
+                    Ok(expired.clone()),
+                    Ok(open.clone()),
+                    Err(anyhow::anyhow!("daemon crashed before verification")),
+                ],
+                false,
+                3,
+            ),
+        ] {
+            let mut replies: VecDeque<Result<rch_common::RestartAdmissionResponse>> =
+                replies.into();
+            let mut requests = Vec::new();
+            let outcome = recover_admission_with(async |command| {
+                requests.push(command);
+                replies.pop_front().expect("unexpected recovery request")
+            })
+            .await;
+            assert_eq!(outcome.is_ok(), expected_ok, "{label}: {outcome:?}");
+            assert_eq!(requests.len(), expected_calls, "{label}");
+            assert_eq!(requests[0], "GET /restart-admission\n");
+            assert_eq!(
+                requests[1],
+                format!(
+                    "POST /restart-admission/recover?daemon_incarnation={}&token={}\n",
+                    expired.daemon_incarnation,
+                    expired.maintenance_owner.as_ref().unwrap().token
+                )
+            );
+            if requests.len() == 3 {
+                assert_eq!(requests[2], "GET /restart-admission\n");
+            }
+            if label == "concurrent owner" {
+                let error = outcome.unwrap_err();
+                let api = error.downcast_ref::<rch_common::ApiError>().unwrap();
+                let json = serde_json::to_value(api).unwrap();
+                assert!(
+                    json["context"]["admission_state"]
+                        .as_str()
+                        .unwrap()
+                        .contains("3a4148fb-8d13-4435-92b0-b067d52deba7")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_recovery_does_not_clear_storage_faults_or_assume_success() {
+        use crate::status_types::admission_test_snapshot;
+        let mut fault = admission_test_snapshot(false);
+        fault.admission_closed = true;
+        fault.ownership_failed = true;
+        fault.ownership_error = Some("ENOSPC ownership snapshot".into());
+        let mut requests = Vec::new();
+        let error = recover_admission_with(async |command| {
+            requests.push(command);
+            Ok(fault.clone())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(requests, ["GET /restart-admission\n"]);
+        assert!(error.to_string().contains("ENOSPC ownership snapshot"));
+        let mut falsely_open = admission_test_snapshot(false);
+        falsely_open.success = false;
+        assert!(verify_admission_open(&falsely_open).is_err());
+        falsely_open.success = true;
+        falsely_open.shutdown_committed = true;
+        assert!(verify_admission_open(&falsely_open).is_err());
+        falsely_open.shutdown_committed = false;
+        falsely_open.daemon_incarnation.clear();
+        assert!(verify_admission_open(&falsely_open).is_err());
+    }
+
+    #[test]
+    fn admission_responses_require_explicit_ownership_and_scan_evidence() {
+        let response = |body: &serde_json::Value| {
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}")
+        };
+        for closed in [false, true] {
+            let complete =
+                serde_json::to_value(crate::status_types::admission_test_snapshot(closed)).unwrap();
+            let parsed = super::super::daemon::parse_admission_response(&response(&complete))
+                .expect("complete snapshots include explicit null evidence");
+            assert_eq!(parsed.admission_closed, closed);
+            assert_eq!(verify_admission_open(&parsed).is_ok(), !closed);
+            for field in [
+                "success",
+                "daemon_incarnation",
+                "admission_closed",
+                "maintenance_closed",
+                "ownership_failed",
+                "shutdown_committed",
+                "maintenance_owner",
+                "restart_permitted",
+                "active_build_ids",
+                "queued_build_ids",
+                "client_lease_ids",
+                "client_lease_scan_error",
+            ] {
+                let mut partial = complete.clone();
+                partial.as_object_mut().unwrap().remove(field);
+                assert!(
+                    super::super::daemon::parse_admission_response(&response(&partial)).is_err(),
+                    "closed={closed}: missing {field} must not mean absent ownership or a clean scan"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admission_status_machine_output_preserves_owner_and_recovery_evidence() {
+        use crate::ui::context::OutputMode;
+        let stdout = SharedOutputBuffer::new();
+        let ctx = OutputContext::with_writers(
+            OutputConfig {
+                force_mode: Some(OutputMode::Json),
+                ..Default::default()
+            },
+            stdout.as_writer(false),
+            SharedOutputBuffer::new().as_writer(false),
+        );
+        let admission = crate::status_types::admission_test_snapshot(true);
+        render_admission_snapshot("daemon admission status", &admission, &ctx).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&stdout.to_string_lossy()).unwrap();
+        assert_eq!(json["success"], true, "the inspection succeeded");
+        assert_eq!(
+            json["data"]["admission_closed"], true,
+            "inspection must not claim open admission"
+        );
+        assert_eq!(json["data"]["maintenance_owner"]["pid"], 4242);
+        assert_eq!(json["data"]["maintenance_owner"]["generation"], 3);
+        assert_eq!(
+            json["data"]["maintenance_owner"]["process_identity"]["start"]["ticks"],
+            12345
+        );
+        assert_eq!(json["data"]["maintenance_owner"]["remaining_ms"], 20_000);
+        assert_eq!(
+            json["data"]["daemon_incarnation"],
+            admission.daemon_incarnation
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

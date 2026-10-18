@@ -18,7 +18,8 @@ use std::collections::HashMap;
 // Doctor diagnostic types
 // ===========================================================================
 
-const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
+const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
 
 /// Severity level for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -185,8 +185,8 @@ pub struct DoctorOptions {
 // how to consume, not against aliases of those same live constants.
 const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
     rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
-const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
-const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.1.0";
+const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.1.0";
 const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
 const EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
 
@@ -697,6 +697,8 @@ struct ReliabilityDoctorResponse {
     /// consumers can attribute the unreachability to a specific probe
     /// (e.g., "process_debt: daemon status unavailable"). (t05)
     daemon_unreachable_reasons: Vec<String>,
+    /// Fenced admission state from the same status snapshot used by diagnostics.
+    admission: Option<rch_common::RestartAdmissionResponse>,
     diagnostics: Vec<ReliabilityDiagnostic>,
     summary: ReliabilityDoctorSummary,
     remediation_plan: Vec<ReliabilityRemediationStep>,
@@ -890,6 +892,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     check_ssh_keys(&mut checks, ctx, &options, &mut fixes_applied);
     check_hooks(&mut checks, ctx, &options, &mut fixes_applied);
     check_daemon(&mut checks, ctx, &options, &mut fixes_applied);
+    let admission = check_admission_health(&mut checks, ctx).await;
     check_cancellation_health(&mut checks, ctx).await;
     check_workers(&mut checks, ctx, &options).await;
     check_telemetry_database(&mut checks, ctx, &options);
@@ -936,6 +939,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
                 checks,
                 summary,
                 fixes_applied,
+                admission: admission.as_ref().map(serde_json::to_value).transpose()?,
             },
         ));
     } else {
@@ -1368,6 +1372,15 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     if scope.runs_schema_probe(options.check_schemas) {
         diagnostics.extend(reliability_schema_compatibility_diagnostics());
     }
+    let admission = daemon_status
+        .as_ref()
+        .and_then(|status| status.admission.clone());
+    if let Some(diagnostic) = admission
+        .as_ref()
+        .and_then(reliability_admission_diagnostic)
+    {
+        diagnostics.push(diagnostic);
+    }
 
     let mode = if options.dry_run {
         ReliabilityDoctorMode::DryRun
@@ -1381,6 +1394,7 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     // the operator's intent so the executor previews instead of staying inert,
     // and JSON consumers can tell a fix-preview from a plain dry run.
     response.fix_requested = options.fix;
+    response.admission = admission;
     response
 }
 
@@ -2938,6 +2952,35 @@ fn push_opt_display<T: std::fmt::Display>(buf: &mut String, value: Option<T>) {
     }
 }
 
+fn reliability_admission_diagnostic(
+    admission: &rch_common::RestartAdmissionResponse,
+) -> Option<ReliabilityDiagnostic> {
+    admission.admission_closed.then(|| {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "daemon_admission",
+            if admission.ownership_failed {
+                ReliabilitySeverity::Critical
+            } else {
+                ReliabilitySeverity::Warning
+            },
+            "Daemon admission is closed; new remote builds cannot start",
+            ReliabilityReasonCode::DaemonAdmissionClosed,
+        )
+        .with_details(crate::status_types::admission_diagnostic_lines(admission).join("; "))
+        .with_remediation(
+            if admission.ownership_failed {
+                "rch daemon logs"
+            } else if admission.shutdown_committed {
+                "rch daemon admission status --json"
+            } else {
+                "rch daemon admission recover"
+            },
+            "rch daemon admission status --json",
+        )
+    })
+}
+
 fn reliability_process_debt_diagnostics(
     status: Option<&DaemonFullStatusResponse>,
 ) -> Vec<ReliabilityDiagnostic> {
@@ -3388,6 +3431,7 @@ fn build_reliability_doctor_response(
         scope: scope.as_strings(),
         daemon_unreachable,
         daemon_unreachable_reasons,
+        admission: None,
         diagnostics,
         summary,
         remediation_plan,
@@ -5496,6 +5540,86 @@ fn evaluate_cancellation_health(
     }
 }
 
+fn evaluate_admission_health(admission: &rch_common::RestartAdmissionResponse) -> CheckResult {
+    CheckResult {
+        category: "daemon".into(),
+        name: "daemon_admission".into(),
+        status: if admission.ownership_failed {
+            CheckStatus::Fail
+        } else if admission.admission_closed {
+            CheckStatus::Warning
+        } else {
+            CheckStatus::Pass
+        },
+        message: if admission.ownership_failed {
+            "Build admission closed by a durable ownership failure".into()
+        } else if admission.shutdown_committed {
+            "Build admission closed for committed daemon shutdown".into()
+        } else if admission.admission_closed {
+            "Build admission paused by maintenance".into()
+        } else {
+            "Daemon confirms build admission is open".into()
+        },
+        details: Some(crate::status_types::admission_diagnostic_lines(admission).join("\n")),
+        suggestion: admission.admission_closed.then(|| {
+            if admission.ownership_failed {
+                "Repair the reported durable ownership storage error. The fault stays latched until process restart; verify automatic shutdown and recovery through the matching supervisor, then check the new daemon incarnation with `rch daemon admission status --json`.".into()
+            } else if admission.shutdown_committed {
+                "Wait for daemon exit/restart, then verify admission on the new daemon incarnation with `rch daemon admission status --json`.".into()
+            } else {
+                "Inspect `rch daemon admission status --json`; use `rch daemon admission recover` after the owner exits or its deadline expires.".into()
+            }
+        }),
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
+    }
+}
+
+async fn check_admission_health(
+    checks: &mut Vec<CheckResult>,
+    ctx: &OutputContext,
+) -> Option<rch_common::RestartAdmissionResponse> {
+    let socket_path = configured_or_default_socket_path();
+    let (check, admission) = if !socket_path.exists() {
+        (
+            CheckResult {
+                category: "daemon".into(),
+                name: "daemon_admission".into(),
+                status: CheckStatus::Skipped,
+                message: "Daemon socket not present; admission state is unknown".into(),
+                details: Some(socket_path.display().to_string()),
+                suggestion: Some("Start daemon with: rch daemon start".into()),
+                fixable: false,
+                fix_applied: false,
+                fix_message: None,
+            },
+            None,
+        )
+    } else {
+        match crate::commands::query_restart_admission().await {
+            Ok(admission) => (evaluate_admission_health(&admission), Some(admission)),
+            Err(error) => (
+                CheckResult {
+                    category: "daemon".into(),
+                    name: "daemon_admission".into(),
+                    status: CheckStatus::Warning,
+                    message: "Unable to verify daemon admission state".into(),
+                    details: Some(format!("{error:#}")),
+                    suggestion: Some("rch daemon admission status --json".into()),
+                    fixable: false,
+                    fix_applied: false,
+                    fix_message: None,
+                },
+                None,
+            ),
+        }
+    };
+    print_check_result(&check, ctx);
+    checks.push(check);
+    admission
+}
+
 async fn check_cancellation_health(checks: &mut Vec<CheckResult>, ctx: &OutputContext) {
     let style = ctx.theme();
     if !ctx.is_json() {
@@ -6151,6 +6275,89 @@ mod tests {
             "saved_time": null
         }))
         .expect("daemon status fixture should parse")
+    }
+
+    #[test]
+    fn doctor_distinguishes_maintenance_pause_from_a_durable_ownership_fault() {
+        let mut admission = crate::status_types::admission_test_snapshot(true);
+        let check = evaluate_admission_health(&admission);
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.details.as_ref().unwrap().contains("PID 4242"));
+        assert!(
+            check
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("20000 ms remaining")
+        );
+        assert!(
+            !check.fixable,
+            "doctor must not steal an active maintenance lease"
+        );
+        let diagnostic = reliability_admission_diagnostic(&admission).unwrap();
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::DaemonAdmissionClosed
+        );
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert!(auto_config_flip(diagnostic.code).is_none());
+
+        admission.shutdown_committed = true;
+        let check = evaluate_admission_health(&admission);
+        assert!(check.message.contains("committed daemon shutdown"));
+        assert!(
+            check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("new daemon incarnation")
+        );
+        assert!(
+            !check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("admission recover")
+        );
+        let diagnostic = reliability_admission_diagnostic(&admission).unwrap();
+        assert_eq!(
+            diagnostic.remediation_command.as_deref(),
+            Some("rch daemon admission status --json")
+        );
+        admission.shutdown_committed = false;
+
+        admission.maintenance_closed = false;
+        admission.maintenance_owner = None;
+        admission.ownership_failed = true;
+        admission.ownership_error = Some("ENOSPC: failed to persist durable owners".into());
+        let check = evaluate_admission_health(&admission);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("durable ownership failure"));
+        assert!(check.details.as_ref().unwrap().contains("ENOSPC"));
+        assert!(
+            check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("latched until process restart")
+        );
+        assert!(
+            check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("matching supervisor")
+        );
+        let diagnostic = reliability_admission_diagnostic(&admission).unwrap();
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Critical);
+        assert_eq!(
+            diagnostic.remediation_command.as_deref(),
+            Some("rch daemon logs")
+        );
+
+        let open = crate::status_types::admission_test_snapshot(false);
+        assert_eq!(evaluate_admission_health(&open).status, CheckStatus::Pass);
+        assert!(reliability_admission_diagnostic(&open).is_none());
     }
 
     // ========================
@@ -7915,7 +8122,8 @@ mod tests {
     fn test_doctor_response_serialization() {
         // TEST START: DoctorResponse full serialization
         let response = DoctorResponse {
-            schema_version: "1.0.0".to_string(),
+            schema_version: RELIABILITY_DOCTOR_SCHEMA_VERSION.to_string(),
+            admission: None,
             checks: vec![
                 CheckResult {
                     category: "prerequisites".to_string(),
@@ -7962,7 +8170,8 @@ mod tests {
     fn test_doctor_response_with_fixes() {
         // TEST START: DoctorResponse with applied fixes
         let response = DoctorResponse {
-            schema_version: "1.0.0".to_string(),
+            schema_version: RELIABILITY_DOCTOR_SCHEMA_VERSION.to_string(),
+            admission: None,
             checks: vec![],
             summary: DoctorSummary {
                 total: 1,

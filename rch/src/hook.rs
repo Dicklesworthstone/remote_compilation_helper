@@ -740,7 +740,11 @@ async fn await_restart_admission(
     socket_path: &str,
     durable_lease: &DurableLeaseWriter,
     reporter: &HookReporter,
-) -> RestartAdmissionWait {
+) -> anyhow::Result<RestartAdmissionWait> {
+    // Publish before the first probe: a concurrent drain must be able to
+    // distinguish this never-dispatched wrapper from work it needs to drain,
+    // even when the wait bound is zero or this future is interrupted.
+    durable_lease.begin_restart_admission_wait()?;
     let mut polls: u32 = 0;
     let outcome = wait_for_restart_admission(
         async || restart_admission_is_closed(socket_path).await,
@@ -748,22 +752,23 @@ async fn await_restart_admission(
         std::time::Duration::from_secs(1),
         || {
             if polls == 0 {
-                reporter.summary("[RCH] waiting: daemon restart in progress (admission paused)");
+                reporter.summary("[RCH] waiting: daemon admission paused; inspect `rch daemon admission status --json` for the cause and recovery deadline");
             }
             if polls.is_multiple_of(10) {
-                let _ = durable_lease.heartbeat("restart_admission_wait");
+                durable_lease.heartbeat("restart_admission_wait")?;
             }
             polls = polls.saturating_add(1);
+            Ok(())
         },
     )
-    .await;
+    .await?;
     // Hand the lease back to admission. The selection query that follows can
     // sit in the daemon queue for a long time without heartbeating, and a
     // frozen "restart_admission_wait" would misdescribe a queued wrapper.
-    if outcome == RestartAdmissionWait::Open && polls > 0 {
-        let _ = durable_lease.heartbeat("admission");
+    if outcome == RestartAdmissionWait::Open {
+        durable_lease.heartbeat("admission")?;
     }
-    outcome
+    Ok(outcome)
 }
 
 fn exec_requires_remote() -> bool {
@@ -2188,6 +2193,26 @@ impl DurableLeaseWriter {
         next.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
         next.heartbeat("failed_before_admission", now_unix_ms());
         next.terminal_acknowledged = true;
+        self.publish_transition(&mut lease, next)
+    }
+
+    /// Only a wrapper with no outstanding selection or remote ownership may
+    /// advertise that it is waiting outside restart admission. This phase is
+    /// used by the daemon to exclude new arrivals from the work being drained.
+    fn begin_restart_admission_wait(&self) -> anyhow::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            !selection_is_pending(&lease)
+                && lease.state == rch_common::job_identity::JobLifecycleState::Queued
+                && lease.identity.remote_build_id.is_none()
+                && lease.worker_id.is_none()
+                && lease.recovery.is_none()
+                && lease.exit_code.is_none()
+                && !lease.terminal_acknowledged,
+            "restart admission wait cannot hide pending selection or remote ownership"
+        );
+        let mut next = lease.clone();
+        next.heartbeat("restart_admission_wait", now_unix_ms());
         self.publish_transition(&mut lease, next)
     }
 
@@ -3868,12 +3893,12 @@ pub async fn run_exec(
 
     // A daemon restart closes admission for its drain window. Wait for it
     // (bounded) instead of failing every build that arrives meanwhile.
-    if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+    if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await?
         == RestartAdmissionWait::StillClosed
     {
-        durable_lease.heartbeat("restart_admission_blocked")?;
+        durable_lease.confirm_failed_before_admission()?;
         return Err(anyhow::anyhow!(
-            "remote build admission is paused while daemon restart remediation is active"
+            "remote build admission could not be verified open before the wait expired; inspect `rch daemon admission status --json` for maintenance ownership, recovery deadline, or durable ownership failure"
         ));
     }
 
@@ -3935,12 +3960,12 @@ pub async fn run_exec(
                 // The original endpoint's restart gate says nothing about
                 // a daemon discovered in another runtime-directory context.
                 if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter)
-                    .await
+                    .await?
                     == RestartAdmissionWait::StillClosed
                 {
-                    durable_lease.heartbeat("restart_admission_blocked")?;
+                    durable_lease.confirm_failed_before_admission()?;
                     anyhow::bail!(
-                        "remote build admission is paused while daemon restart remediation is active"
+                        "remote build admission could not be verified open before the wait expired; inspect `rch daemon admission status --json` for maintenance ownership, recovery deadline, or durable ownership failure"
                     );
                 }
                 match query_daemon(
@@ -4048,7 +4073,7 @@ pub async fn run_exec(
         if !is_restart_barrier_refusal(&response) {
             break;
         }
-        if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+        if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await?
             == RestartAdmissionWait::StillClosed
         {
             break;

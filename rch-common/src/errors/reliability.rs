@@ -106,6 +106,8 @@ pub enum ReliabilityReasonCode {
     WorkerStatusUnrecognized,
     /// A worker reported an unrecognized `circuit_state` value (defensive parse).
     WorkerCircuitStateUnrecognized,
+    /// Daemon maintenance or durable ownership failure blocks new builds.
+    DaemonAdmissionClosed,
 
     // ---- DiskPressure (R100-R199) ----
     /// Disk-pressure surface is unavailable.
@@ -237,6 +239,7 @@ impl ReliabilityReasonCode {
             Self::WorkerReady => "WorkerReady",
             Self::WorkerStatusUnrecognized => "WorkerStatusUnrecognized",
             Self::WorkerCircuitStateUnrecognized => "WorkerCircuitStateUnrecognized",
+            Self::DaemonAdmissionClosed => "DaemonAdmissionClosed",
             Self::DiskPressureUnavailable => "DiskPressureUnavailable",
             Self::WorkerDiskPressureCritical => "WorkerDiskPressureCritical",
             Self::WorkerDiskPressureWarning => "WorkerDiskPressureWarning",
@@ -302,6 +305,7 @@ impl ReliabilityReasonCode {
             Self::WorkerReady => "RCH-R012",
             Self::WorkerStatusUnrecognized => "RCH-R013",
             Self::WorkerCircuitStateUnrecognized => "RCH-R014",
+            Self::DaemonAdmissionClosed => "RCH-R015",
 
             // R100-R199 — DiskPressure
             Self::DiskPressureUnavailable => "RCH-R100",
@@ -380,7 +384,8 @@ impl ReliabilityReasonCode {
             | Self::WorkerDegraded
             | Self::WorkerReady
             | Self::WorkerStatusUnrecognized
-            | Self::WorkerCircuitStateUnrecognized => C::Topology,
+            | Self::WorkerCircuitStateUnrecognized
+            | Self::DaemonAdmissionClosed => C::Topology,
 
             Self::DiskPressureUnavailable
             | Self::WorkerDiskPressureCritical
@@ -458,7 +463,8 @@ impl ReliabilityReasonCode {
             | Self::WorkerUnreachable
             | Self::WorkerDegraded
             | Self::WorkerStatusUnrecognized
-            | Self::WorkerCircuitStateUnrecognized => false,
+            | Self::WorkerCircuitStateUnrecognized
+            | Self::DaemonAdmissionClosed => false,
 
             // Disk pressure is external — operator cleans up disk; daemon picks
             // up the new free-space numbers on next probe.
@@ -553,6 +559,9 @@ impl ReliabilityReasonCode {
             }
             Self::WorkerCircuitStateUnrecognized => {
                 "Daemon and rch versions may have drifted; reinstall both binaries."
+            }
+            Self::DaemonAdmissionClosed => {
+                "Inspect `rch daemon admission status --json` for the cause and ownership; `rch daemon admission recover` only recovers an absent or expired, uncommitted maintenance owner. For committed shutdown or durable ownership faults, follow the recovery steps for that cause shown in admission diagnostics."
             }
             Self::DiskPressureUnavailable => "Start the daemon with `rch daemon start` and retry.",
             Self::WorkerDiskPressureCritical => {
@@ -658,6 +667,7 @@ impl ReliabilityReasonCode {
         Self::WorkerReady,
         Self::WorkerStatusUnrecognized,
         Self::WorkerCircuitStateUnrecognized,
+        Self::DaemonAdmissionClosed,
         Self::DiskPressureUnavailable,
         Self::WorkerDiskPressureCritical,
         Self::WorkerDiskPressureWarning,
@@ -1270,6 +1280,7 @@ mod tests {
         (ReliabilityReasonCode::WorkerReady, false),
         (ReliabilityReasonCode::WorkerStatusUnrecognized, false),
         (ReliabilityReasonCode::WorkerCircuitStateUnrecognized, false),
+        (ReliabilityReasonCode::DaemonAdmissionClosed, false),
         // DiskPressure
         (ReliabilityReasonCode::DiskPressureUnavailable, false),
         (ReliabilityReasonCode::WorkerDiskPressureCritical, false),

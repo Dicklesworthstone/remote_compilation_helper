@@ -162,9 +162,7 @@ fn available_project_lane(ctx: &DaemonContext, project: &str, worker: &str) -> O
     let active = ctx.history.active_builds();
     (0..ctx.pool.project_lanes(worker)).find(|lane| {
         !active.iter().any(|build| {
-            build.project_id == project
-                && build.worker_id == worker
-                && build.project_lane == *lane
+            build.project_id == project && build.worker_id == worker && build.project_lane == *lane
         })
     })
 }
@@ -176,8 +174,9 @@ async fn observe(
 ) -> Result<PreviewResponse, &'static str> {
     // A restart cannot close admission between this check and the observation.
     // The outer timeout bounds this read-lock hold; no reservation is created.
+    crate::api::recover_restart_admission(ctx).await;
     let admission = ctx.admission_barrier.read().await;
-    if *admission {
+    if admission.is_closed() {
         return Ok(refused("restart_admission_barrier_active"));
     }
     if ctx.history.ownership_failed() {
@@ -590,7 +589,9 @@ mod tests {
             .await;
             assert_eq!(observed.selection.worker.unwrap().project_lane, 0);
             match source_fence {
-                "live" => ctx.history.fence_live_checkout(&request.project, "requested"),
+                "live" => ctx
+                    .history
+                    .fence_live_checkout(&request.project, "requested"),
                 "busy" => ctx.history.fence_source_busy(&request.project, "requested"),
                 _ => unreachable!(),
             }
@@ -629,7 +630,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                decoded(response).await.selection.worker.unwrap().id.as_str(),
+                decoded(response)
+                    .await
+                    .selection
+                    .worker
+                    .unwrap()
+                    .id
+                    .as_str(),
                 "requested",
             );
         }
@@ -658,7 +665,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                decoded(response).await.selection.worker.unwrap().id.as_str(),
+                decoded(response)
+                    .await
+                    .selection
+                    .worker
+                    .unwrap()
+                    .id
+                    .as_str(),
                 "requested",
             );
             assert_unowned(&ctx, 4).await;
@@ -683,7 +696,9 @@ mod tests {
             let (ctx, router) = fixture().await;
             let mut request = input();
             match fence {
-                "live" => ctx.history.fence_live_checkout(&request.project, "requested"),
+                "live" => ctx
+                    .history
+                    .fence_live_checkout(&request.project, "requested"),
                 "busy" => ctx.history.fence_source_busy(&request.project, "requested"),
                 "tools" => request.required_tools.push("never-probed-tool".into()),
                 "disk" => request.disk_headroom_gib = 23,
@@ -704,7 +719,7 @@ mod tests {
     async fn restart_barrier_is_observed_without_reopening_it_or_admitting_a_build() {
         let _guard = rch_common::test_guard!();
         let (ctx, router) = fixture().await;
-        *ctx.admission_barrier.write().await = true;
+        ctx.admission_barrier.write().await.begin_shutdown();
         let response = router
             .oneshot(http_request(&input(), false, Some("fixture-token")))
             .await
@@ -715,7 +730,7 @@ mod tests {
             response.selection.reason,
             SelectionReason::SelectionError("restart_admission_barrier_active".into()),
         );
-        assert!(*ctx.admission_barrier.read().await);
+        assert!(ctx.admission_barrier.read().await.is_closed());
         assert_unowned(&ctx, 4).await;
     }
 
@@ -834,7 +849,9 @@ mod tests {
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<UploadChunk>> {
             let upload = self.get_mut();
-            upload.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            upload
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             upload.chunks.poll_recv(cx)
         }
     }
@@ -971,8 +988,7 @@ mod tests {
         let limit = Arc::new(Semaphore::new(1));
         let _blocked = ctx.admission_barrier.write().await;
         let (body, sender, polls) = upload();
-        let slow =
-            tokio::spawn(limited_router(&ctx, limit.clone()).oneshot(upload_request(body)));
+        let slow = tokio::spawn(limited_router(&ctx, limit.clone()).oneshot(upload_request(body)));
         body_was_polled(&polls).await;
         tokio::time::sleep(PREVIEW_TIMEOUT * 3 / 4).await;
         sender
@@ -1011,11 +1027,7 @@ mod tests {
                 .await
                 .unwrap();
             drop(sender);
-            let response = router
-                .clone()
-                .oneshot(upload_request(body))
-                .await
-                .unwrap();
+            let response = router.clone().oneshot(upload_request(body)).await.unwrap();
             assert_eq!(response.status(), status);
             assert_eq!(limit.available_permits(), 1);
         }
@@ -1034,13 +1046,11 @@ mod tests {
                     .headers_mut()
                     .insert("x-rch-token", token.parse().unwrap());
             }
-            let response = tokio::time::timeout(
-                Duration::from_secs(1),
-                router.clone().oneshot(request),
-            )
-            .await
-            .expect("unauthenticated body was read")
-            .unwrap();
+            let response =
+                tokio::time::timeout(Duration::from_secs(1), router.clone().oneshot(request))
+                    .await
+                    .expect("unauthenticated body was read")
+                    .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
         }

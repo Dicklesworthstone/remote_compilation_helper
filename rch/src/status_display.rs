@@ -247,12 +247,23 @@ fn render_full_status_to<W: Write>(
         style.muted(":"),
         style.info(&status.daemon.version)
     )?;
+    if let Some(admission) = &status.admission {
+        for line in crate::status_types::admission_diagnostic_lines(admission) {
+            writeln!(out, "  {line}")?;
+        }
+    } else {
+        writeln!(
+            out,
+            "  Admission: unknown; query `rch daemon admission status --json`"
+        )?;
+    }
 
     // System posture
     let posture_display = match posture {
         crate::status_types::SystemPosture::RemoteReady => style.success("remote-ready"),
         crate::status_types::SystemPosture::Degraded => style.warning("degraded"),
         crate::status_types::SystemPosture::LocalOnly => style.error("local-only"),
+        crate::status_types::SystemPosture::AdmissionClosed => style.warning("admission-closed"),
     };
     writeln!(
         out,
@@ -1350,6 +1361,7 @@ mod tests {
 
     fn sample_status() -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
+            admission: None,
             daemon: DaemonInfoFromApi {
                 pid: 4242,
                 uptime_secs: 90,

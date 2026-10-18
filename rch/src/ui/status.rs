@@ -497,6 +497,7 @@ mod tests {
 
     fn sample_status() -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
+            admission: None,
             daemon: DaemonInfoFromApi {
                 pid: 1234,
                 uptime_secs: 3600,

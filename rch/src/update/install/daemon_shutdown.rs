@@ -3,6 +3,9 @@
 //! This is deliberately not the interactive `daemon stop` path: an update never
 //! authorizes killing a process, removing a socket, or interrupting a build.
 
+use crate::commands::daemon::{DaemonProcess, MaintenanceFence, MaintenanceSignals};
+use rch_common::RestartAdmissionResponse as Admission;
+use rch_common::process_identity::OwnerPresence;
 use serde::Deserialize;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
@@ -13,8 +16,14 @@ use tokio::time::{Instant, sleep, timeout};
 
 const MAX_REPLY_BYTES: u64 = 1024 * 1024;
 const ADMISSION_STATUS: &str = "GET /restart-admission\n";
+#[cfg(test)]
 const CLOSE_ADMISSION: &str = "POST /restart-admission\n";
+#[cfg(test)]
 const SHUTDOWN: &str = "POST /shutdown\n";
+#[cfg(test)]
+const RELEASE_ADMISSION: &str = "POST /restart-admission/release\n";
+#[cfg(test)]
+const RENEW_ADMISSION: &str = "POST /restart-admission/renew\n";
 const STATUS: &str = "GET /status\n";
 
 #[derive(Clone, Copy)]
@@ -22,6 +31,7 @@ struct Timing {
     request: Duration,
     shutdown: Duration,
     poll: Duration,
+    renew: Duration,
 }
 
 impl Default for Timing {
@@ -30,6 +40,7 @@ impl Default for Timing {
             request: Duration::from_secs(5),
             shutdown: Duration::from_secs(10),
             poll: Duration::from_millis(100),
+            renew: Duration::from_secs(1),
         }
     }
 }
@@ -59,25 +70,14 @@ async fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>, String> 
 }
 
 /// Every workload field is required. A partial or old response is not proof
-/// that there are no builds or unacknowledged client leases. The optional scan
-/// error is omitted by the daemon only when its scan succeeded.
-#[derive(Debug, Deserialize)]
-struct Admission {
-    admission_closed: bool,
-    restart_permitted: bool,
-    active_build_ids: Vec<u64>,
-    queued_build_ids: Vec<u64>,
-    client_lease_ids: Vec<String>,
-    client_lease_scan_error: Option<String>,
-}
-
-impl Admission {
-    fn idle(&self) -> bool {
-        self.active_build_ids.is_empty()
-            && self.queued_build_ids.is_empty()
-            && self.client_lease_ids.is_empty()
-            && self.client_lease_scan_error.is_none()
-    }
+/// that there are no builds or unacknowledged client leases. The nullable scan
+/// error must be present; an explicit null confirms that the scan succeeded.
+fn admission_idle(admission: &Admission) -> bool {
+    admission.active_build_ids.is_empty()
+        && admission.queued_build_ids.is_empty()
+        && admission.client_lease_ids.is_empty()
+        && admission.client_lease_scan_error.is_none()
+        && !admission.ownership_failed
 }
 
 fn decode_reply<T: serde::de::DeserializeOwned>(reply: &[u8]) -> Result<T, String> {
@@ -113,7 +113,7 @@ async fn request_capture<T: serde::de::DeserializeOwned>(
     command: &str,
     budget: Duration,
     require_peer: bool,
-) -> Result<(T, Option<u32>), String> {
+) -> Result<(T, Option<DaemonProcess>), String> {
     timeout(budget, async {
         if socket_identity(path).await? != Some(expected) {
             return Err("daemon endpoint changed; update refused".to_owned());
@@ -126,15 +126,7 @@ async fn request_capture<T: serde::de::DeserializeOwned>(
             return Err("daemon endpoint changed during connection; update refused".to_owned());
         }
         let peer = if require_peer {
-            Some(
-                stream
-                    .peer_cred()
-                    .map_err(|error| format!("cannot inspect daemon peer: {error}"))?
-                    .pid()
-                    .and_then(|pid| u32::try_from(pid).ok())
-                    .filter(|pid| *pid > 0)
-                    .ok_or("daemon peer PID is unavailable; readiness unconfirmed")?,
-            )
+            Some(DaemonProcess::from_peer(&stream).map_err(|error| error.to_string())?)
         } else {
             None
         };
@@ -149,6 +141,9 @@ async fn request_capture<T: serde::de::DeserializeOwned>(
             .read_to_end(&mut bytes)
             .await
             .map_err(|error| error.to_string())?;
+        if let Some(peer) = &peer {
+            peer.require_live().map_err(|error| error.to_string())?;
+        }
         Ok((decode_reply(&bytes)?, peer))
     })
     .await
@@ -178,7 +173,7 @@ async fn probe_ready(
 ) -> Result<u32, String> {
     let (status, peer): (ReadyStatus, _) =
         request_capture(path, identity, STATUS, budget, true).await?;
-    if peer != Some(status.daemon.pid)
+    if peer.as_ref().map(|peer| peer.pid) != Some(status.daemon.pid)
         || Path::new(&status.daemon.socket_path) != path
         || status.daemon.version.is_empty()
         || status.daemon.version.chars().any(char::is_control)
@@ -191,7 +186,15 @@ async fn probe_ready(
     if second_peer != peer || socket_identity(path).await? != Some(identity) {
         return Err("daemon endpoint changed while confirming readiness".to_owned());
     }
-    if admission.admission_closed || admission.client_lease_scan_error.is_some() {
+    if !admission.success
+        || admission.admission_closed
+        || admission.maintenance_closed
+        || admission.shutdown_committed
+        || admission.ownership_failed
+        || admission.maintenance_owner.is_some()
+        || admission.client_lease_scan_error.is_some()
+        || uuid::Uuid::parse_str(&admission.daemon_incarnation).is_err()
+    {
         return Err("daemon is responding but admission is unavailable".to_owned());
     }
     Ok(status.daemon.pid)
@@ -320,105 +323,164 @@ async fn start_with_timing(
     }
 }
 
-pub(super) async fn stop(path: &Path, drain_timeout: Duration) -> Result<bool, String> {
-    stop_with_timing(path, drain_timeout, Timing::default()).await
+pub(super) async fn stop(
+    path: &Path,
+    drain_timeout: Duration,
+    signals: &mut MaintenanceSignals,
+) -> Result<bool, String> {
+    stop_with_cancellation(path, drain_timeout, Timing::default(), signals.cancelled()).await
 }
 
+#[cfg(test)]
 async fn stop_with_timing(
     path: &Path,
     drain_timeout: Duration,
     timing: Timing,
 ) -> Result<bool, String> {
+    let mut signals = MaintenanceSignals::new().map_err(|error| error.to_string())?;
+    stop_with_cancellation(path, drain_timeout, timing, signals.cancelled()).await
+}
+
+async fn stop_with_cancellation(
+    path: &Path,
+    drain_timeout: Duration,
+    timing: Timing,
+    cancellation: impl std::future::Future<Output = ()>,
+) -> Result<bool, String> {
+    tokio::pin!(cancellation);
     let Some(identity) = socket_identity(path).await? else {
         return Ok(false);
     };
-    // Wait without changing admission. The existing boolean barrier has no
-    // owner token: closing a busy barrier and later unconditionally reopening
-    // it could clear another maintenance operation's gate. Instead acquire the
-    // daemon's atomic, idle-only `restart_permitted` grant after this wait.
-    let mut admission: Admission =
-        request(path, identity, ADMISSION_STATUS, timing.request).await?;
+    let (admission, process) = tokio::select! {
+        biased;
+        _ = &mut cancellation => return Err("update maintenance cancelled before admission changed".into()),
+        result = prepare_admission(path, identity, timing) => result?,
+    };
+    let fence = MaintenanceFence::new(&admission).map_err(|error| error.to_string())?;
+    let mut attempted = false;
+    let result = tokio::select! {
+        biased;
+        _ = &mut cancellation => Err("update maintenance cancelled by signal; installation not started".into()),
+        result = async {
+            // Set before transport so a lost acquisition reply still has an
+            // exact token to release. Neither error nor cancellation can
+            // turn this token into authority over another operation.
+            attempted = true;
+            shutdown_owned(path, identity, &process, &fence, drain_timeout, timing).await
+        } => result,
+    };
+    match result {
+        Ok(stopped) => Ok(stopped),
+        Err(error) if attempted => {
+            let cleanup = release_owned(path, identity, &fence, timing).await;
+            match cleanup {
+                Ok(confirmed) => Err(format!("{error}; {confirmed}")),
+                Err(cleanup) => Err(format!("{error}; {cleanup}")),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn prepare_admission(
+    path: &Path,
+    identity: SocketIdentity,
+    timing: Timing,
+) -> Result<(Admission, DaemonProcess), String> {
+    let (admission, process): (Admission, _) =
+        request_capture(path, identity, ADMISSION_STATUS, timing.request, true).await?;
+    if admission.admission_closed {
+        return Err("daemon admission is already closed; update will not take over another maintenance operation".to_owned());
+    }
+    if !admission.success
+        || admission.ownership_failed
+        || admission.client_lease_scan_error.is_some()
+    {
+        return Err(format!(
+            "cannot prove daemon ownership: {admission:?}; update refused"
+        ));
+    }
+    Ok((
+        admission,
+        process.ok_or("original daemon identity was not captured")?,
+    ))
+}
+
+async fn shutdown_owned(
+    path: &Path,
+    identity: SocketIdentity,
+    process: &DaemonProcess,
+    fence: &MaintenanceFence,
+    drain_timeout: Duration,
+    timing: Timing,
+) -> Result<bool, String> {
+    let mut grant: Admission = request(
+        path,
+        identity,
+        &fence.acquire_command("update"),
+        timing.request,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "{error}; admission ownership is unconfirmed, no shutdown or installation attempted"
+        )
+    })?;
     let deadline = Instant::now()
         .checked_add(drain_timeout)
         .ok_or("update drain timeout is out of range")?;
     loop {
-        if admission.admission_closed {
-            return Err("daemon admission is already closed; update will not take over another maintenance operation".to_owned());
-        }
-        if admission.client_lease_scan_error.is_some() {
+        fence
+            .require_owned(&grant)
+            .map_err(|error| error.to_string())?;
+        if grant.client_lease_scan_error.is_some() || grant.ownership_failed {
             return Err(format!(
-                "cannot prove daemon idle: {admission:?}; update refused"
+                "cannot prove daemon idle: {grant:?}; update refused"
             ));
         }
-        if admission.idle() {
+        if admission_idle(&grant) {
+            if !grant.restart_permitted {
+                return Err(format!(
+                    "daemon did not grant an idle restart: {grant:?}; update refused"
+                ));
+            }
             break;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
-                "update drain timed out with work still in flight: {admission:?}; daemon left running"
+                "update drain timed out with work still in flight: {grant:?}; daemon left running"
             ));
         }
-        sleep(timing.poll.min(remaining)).await;
+        sleep(timing.renew.min(remaining)).await;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
-                "update drain timed out with work still in flight: {admission:?}; daemon left running"
+                "update drain timed out with work still in flight: {grant:?}; daemon left running"
             ));
         }
-        admission = request(
+        grant = request(
             path,
             identity,
-            ADMISSION_STATUS,
+            &fence.command("/restart-admission/renew"),
             timing.request.min(remaining),
         )
         .await?;
     }
-    let grant: Admission = request(path, identity, CLOSE_ADMISSION, timing.request)
+    let reply: Admission = request(path, identity, &fence.command("/shutdown"), timing.request)
         .await
-        .map_err(|error| {
-            format!(
-                "{error}; admission ownership is unconfirmed, no shutdown or installation attempted"
-            )
-        })?;
-    if !grant.admission_closed || !grant.restart_permitted || !grant.idle() {
-        // A concurrent maintenance request or new work won the race. No grant
-        // means no authority to shut down OR to reopen the shared barrier.
-        return Err(format!(
-            "daemon did not grant an idle restart: {grant:?}; update refused, admission left unchanged by this client"
-        ));
-    }
-
-    #[derive(Deserialize)]
-    struct ShutdownReply {
-        status: String,
-    }
-    let reply: ShutdownReply = match request(path, identity, SHUTDOWN, timing.request).await {
-        Ok(reply) => reply,
-        Err(error) => {
-            // A lost shutdown reply cannot prove whether the daemon acted.
-            // Retain the barrier and endpoint; never substitute pkill/unlink.
-            return Err(format!(
-                "{error}; shutdown is unconfirmed, installation not started; admission may remain closed"
-            ));
-        }
-    };
-    if reply.status != "shutting_down" {
-        // Even a blocked reply after an idle grant means the shared admission
-        // state changed. Without an owner token, reopening it could clear a
-        // different operation's barrier. Leave that state intact for explicit
-        // reconciliation rather than authorizing installation or force-stop.
-        return Err(format!(
-            "daemon did not acknowledge shutdown ({}); installation not started; admission may remain closed",
-            reply.status
-        ));
-    }
+        .map_err(|error| format!("{error}; shutdown is unconfirmed, installation not started"))?;
+    fence
+        .require_shutdown(&reply, false)
+        .map_err(|error| format!("{error}; installation not started"))?;
     let deadline = Instant::now()
         .checked_add(timing.shutdown)
         .ok_or("update shutdown timeout is out of range")?;
     loop {
+        let presence = process.presence();
         match socket_identity(path).await? {
-            None => return Ok(true),
+            None if presence == OwnerPresence::Absent => return Ok(true),
+            None => {}
             Some(current) if current != identity => {
                 return Err("a replacement daemon endpoint appeared during shutdown; installation not started".to_owned());
             }
@@ -426,10 +488,39 @@ async fn stop_with_timing(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("daemon acknowledged shutdown but its endpoint remains; installation not started, no process killed or socket removed".to_owned());
+            return Err(format!(
+                "daemon acknowledged shutdown but original process exit and endpoint retirement are unconfirmed (PID {} is {presence:?}); installation not started, no process killed or socket removed",
+                process.pid
+            ));
         }
         sleep(timing.poll.min(remaining)).await;
     }
+}
+
+async fn release_owned(
+    path: &Path,
+    identity: SocketIdentity,
+    fence: &MaintenanceFence,
+    timing: Timing,
+) -> Result<&'static str, String> {
+    // Preserve the updater's inode boundary as well as the new daemon fence.
+    // A replacement endpoint is never sent a mutation by this transaction.
+    if socket_identity(path).await? != Some(identity) {
+        return Err("admission release unconfirmed: original daemon endpoint retired or changed; replacement admission was not modified".into());
+    }
+    let released: Result<Admission, String> = request(
+        path,
+        identity,
+        &fence.command("/restart-admission/release"),
+        timing.request,
+    )
+    .await;
+    let observed: Admission = request(path, identity, ADMISSION_STATUS, timing.request)
+        .await
+        .map_err(|error| format!("admission reopening unconfirmed: {error}; release acknowledgement: {released:?}; uncommitted maintenance expires without renewal; inspect `rch daemon admission status`"))?;
+    fence.verify_open(&observed).map_err(|error| {
+        format!("{error}; release acknowledgement: {released:?}; inspect `rch daemon admission status` and `rch daemon admission recover`")
+    })
 }
 
 #[cfg(test)]
@@ -443,22 +534,102 @@ mod tests {
             request: Duration::from_millis(200),
             shutdown: Duration::from_millis(100),
             poll: Duration::from_millis(2),
+            renew: Duration::from_millis(2),
         }
     }
 
     fn admission(closed: bool, granted: bool) -> Value {
-        json!({"admission_closed": closed, "restart_permitted": granted,
-               "active_build_ids": [], "queued_build_ids": [], "client_lease_ids": []})
+        json!({
+            "success": true,
+            "status": if closed { "maintenance_active" } else { "open" },
+            "message": null,
+            "daemon_incarnation": "a12ca740-4c39-4486-9872-1490f0b6c263",
+            "admission_closed": closed,
+            "maintenance_closed": closed,
+            "ownership_failed": false,
+            "ownership_error": null,
+            "shutdown_committed": false,
+            "maintenance_owner": if closed {
+                json!({
+                    "token": "d677a464-a969-49e7-b471-9580b7f6f6f7",
+                    "pid": std::process::id(),
+                    "process_identity": rch_common::process_identity::current_process_identity()
+                        .expect("test process has a birth identity"),
+                    "purpose": "update",
+                    "generation": 1,
+                    "acquired_unix_ms": 100,
+                    "deadline_unix_ms": 30100,
+                    "remaining_ms": 30000,
+                    "owner_presence": "live"
+                })
+            } else { Value::Null },
+            "last_recovery": null,
+            "restart_permitted": granted,
+            "active_build_ids": [],
+            "queued_build_ids": [],
+            "client_lease_ids": [],
+            "client_lease_scan_error": null
+        })
     }
 
-    async fn answer(listener: &UnixListener, expected: &str, value: Value) {
+    fn verify_command(command: &str, expected: &str) -> Option<String> {
+        let command = command.trim_end();
+        if expected.starts_with("POST ") {
+            let (route, query) = command
+                .split_once('?')
+                .expect("mutation must carry a fence");
+            assert_eq!(route, expected.trim_end());
+            let fields: std::collections::HashMap<_, _> = query
+                .split('&')
+                .map(|field| field.split_once('=').unwrap())
+                .collect();
+            assert_eq!(
+                fields.get("daemon_incarnation"),
+                Some(&"a12ca740-4c39-4486-9872-1490f0b6c263")
+            );
+            let token = *fields.get("token").unwrap();
+            uuid::Uuid::parse_str(token).expect("client-generated operation UUID");
+            if expected == CLOSE_ADMISSION {
+                let claim = *fields
+                    .get("owner_identity")
+                    .expect("acquisition requires the caller's process birth identity");
+                let identity = rch_common::process_identity::current_process_identity().unwrap();
+                assert_eq!(identity.to_record().as_deref(), Some(claim));
+                assert_eq!(
+                    rch_common::process_identity::ProcessIdentity::from_record(claim),
+                    Some(identity)
+                );
+            } else {
+                assert!(!fields.contains_key("owner_identity"));
+            }
+            Some(token.into())
+        } else {
+            assert_eq!(command, expected.trim_end());
+            None
+        }
+    }
+
+    async fn answer(listener: &UnixListener, expected: &str, mut value: Value) {
         let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
             .await
             .unwrap()
             .unwrap();
         let mut command = String::new();
         stream.read_to_string(&mut command).await.unwrap();
-        assert_eq!(command, expected);
+        let token = verify_command(&command, expected);
+        if expected == SHUTDOWN && value.get("admission_closed").is_none() {
+            let mut complete = admission(true, true);
+            for (name, field) in value.as_object().unwrap() {
+                complete[name] = field.clone();
+            }
+            complete["shutdown_committed"] = json!(value["status"] == "shutting_down");
+            value = complete;
+        }
+        if let Some(token) = token
+            && value["maintenance_owner"].is_object()
+        {
+            value["maintenance_owner"]["token"] = token.into();
+        }
         stream
             .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{value}").as_bytes())
             .await
@@ -729,7 +900,12 @@ while time.monotonic() < deadline:
             value = {'daemon': {'pid': os.getpid(), 'version': '9.1.2', 'socket_path': path}}
         elif data == b'GET /restart-admission\n':
             value = {'admission_closed': False, 'restart_permitted': False,
-                     'active_build_ids': [], 'queued_build_ids': [], 'client_lease_ids': []}
+                     'active_build_ids': [], 'queued_build_ids': [], 'client_lease_ids': [],
+                     'client_lease_scan_error': None,
+                     'success': True, 'status': 'open',
+                     'daemon_incarnation': 'a12ca740-4c39-4486-9872-1490f0b6c263',
+                     'maintenance_closed': False, 'ownership_failed': False,
+                     'shutdown_committed': False, 'maintenance_owner': None}
         else:
             raise ValueError('unexpected mutation: ' + repr(data))
         connection.sendall(b'HTTP/1.1 200 OK\r\n\r\n' + json.dumps(value).encode())
@@ -776,7 +952,7 @@ os.replace(done + '.tmp', done)
     }
 
     #[tokio::test]
-    async fn update_shutdown_waits_for_work_then_grants_and_confirms_endpoint_retirement() {
+    async fn update_shutdown_drains_work_but_refuses_socket_retirement_while_process_lives() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let unrelated = directory.path().join("other.sock");
@@ -787,9 +963,16 @@ os.replace(done + '.tmp', done)
         busy["queued_build_ids"] = json!([42]);
         busy["client_lease_ids"] = json!(["rchw-owned"]);
         let server = async {
-            answer(&listener, ADMISSION_STATUS, busy).await;
-            answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
-            answer(&listener, CLOSE_ADMISSION, admission(true, true)).await;
+            answer(&listener, ADMISSION_STATUS, busy.clone()).await;
+            let mut owned_busy = admission(true, false);
+            for field in ["active_build_ids", "queued_build_ids", "client_lease_ids"] {
+                owned_busy[field] = busy[field].clone();
+            }
+            answer(&listener, CLOSE_ADMISSION, owned_busy).await;
+            let mut lease_only = admission(true, false);
+            lease_only["client_lease_ids"] = json!(["rchw-owned"]);
+            answer(&listener, RENEW_ADMISSION, lease_only).await;
+            answer(&listener, RENEW_ADMISSION, admission(true, true)).await;
             answer(&listener, SHUTDOWN, json!({"status":"shutting_down"})).await;
             // The test-owned server performs its own socket retirement.
             drop(listener);
@@ -799,13 +982,116 @@ os.replace(done + '.tmp', done)
             stop_with_timing(&socket, Duration::from_secs(1), timing()),
             server
         );
-        assert!(result.unwrap());
+        let error = result.unwrap_err();
+        assert!(error.contains("original process exit"), "{error}");
+        assert!(error.contains("Live"), "{error}");
         assert!(unrelated.exists());
         drop(peer);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn update_shutdown_zero_wait_and_each_kind_of_inflight_work_refuse_without_mutation() {
+    async fn update_shutdown_confirms_real_peer_exit_after_lease_only_drain() {
+        use tokio::io::AsyncBufReadExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        // A separate process is essential: retiring a listener owned by this
+        // test thread cannot prove daemon process exit. The fixture also keeps
+        // a client lease after its active/queued work has drained.
+        let script = r#"
+import json, os, socket, sys
+from urllib.parse import parse_qs
+path, opened, owned = sys.argv[1:]
+opened, owned = json.loads(opened), json.loads(owned)
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(path)
+listener.listen(4)
+print('ready', flush=True)
+token = None
+routes = ['/restart-admission', '/restart-admission', '/restart-admission/renew', '/restart-admission/renew', '/shutdown']
+for step, expected in enumerate(routes):
+    stream, _ = listener.accept()
+    data = b''
+    while True:
+        chunk = stream.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    method, target = data.decode().strip().split()
+    route, _, query = target.partition('?')
+    assert route == expected
+    value = json.loads(json.dumps(opened if step == 0 else owned))
+    if step:
+        fields = parse_qs(query)
+        assert method == 'POST'
+        assert fields['daemon_incarnation'] == [opened['daemon_incarnation']]
+        if token is None:
+            token = fields['token'][0]
+        assert fields['token'] == [token]
+        if step == 1:
+            birth = owned['maintenance_owner']['process_identity']
+            assert fields['owner_identity'] == [f"{birth['boot_id']}:{birth['start']['ticks']}"]
+        else:
+            assert 'owner_identity' not in fields
+        value['maintenance_owner']['token'] = token
+    if step < 2:
+        value['active_build_ids'] = [41]
+        value['queued_build_ids'] = [42]
+    if step < 3:
+        value['client_lease_ids'] = ['durable-wrapper']
+    if step >= 3:
+        value['restart_permitted'] = True
+    if step == 4:
+        value['status'] = 'shutting_down'
+        value['shutdown_committed'] = True
+    stream.sendall(b'HTTP/1.1 200 OK\r\n\r\n' + json.dumps(value).encode())
+    stream.close()
+listener.close()
+os.rename(path, path + '.retired')
+"#;
+        let mut child = tokio::process::Command::new("python3")
+            .args(["-I", "-S", "-c", script])
+            .arg(&socket)
+            .arg(admission(false, false).to_string())
+            .arg(admission(true, false).to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut ready = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), ready.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "ready\n");
+        let confirmed = stop_with_timing(
+            &socket,
+            Duration::from_secs(2),
+            Timing {
+                shutdown: Duration::from_secs(2),
+                ..timing()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(confirmed);
+        assert!(
+            timeout(Duration::from_secs(2), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert!(!socket.exists());
+        assert!(socket.with_extension("sock.retired").exists());
+    }
+
+    #[tokio::test]
+    async fn update_shutdown_zero_wait_refuses_work_and_verifies_owned_barrier_cleanup() {
         for field in [
             "active_build_ids",
             "queued_build_ids",
@@ -822,11 +1108,26 @@ os.replace(done + '.tmp', done)
                 "client_lease_scan_error" => json!("permission denied"),
                 _ => json!([41]),
             };
-            let (result, ()) = tokio::join!(
-                stop_with_timing(&socket, Duration::ZERO, timing()),
-                answer(&listener, ADMISSION_STATUS, busy),
-            );
+            let server = async {
+                answer(&listener, ADMISSION_STATUS, busy.clone()).await;
+                if field != "client_lease_scan_error" {
+                    let mut owned_busy = admission(true, false);
+                    owned_busy[field] = busy[field].clone();
+                    answer(&listener, CLOSE_ADMISSION, owned_busy).await;
+                    answer(&listener, RELEASE_ADMISSION, admission(false, false)).await;
+                    answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+                }
+            };
+            let (result, ()) =
+                tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
             assert!(result.is_err(), "{field}");
+            if field != "client_lease_scan_error" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("admission reopened and verified")
+                );
+            }
             assert_eq!(socket_identity(&socket).await.unwrap(), before);
             assert!(
                 timeout(Duration::from_millis(10), listener.accept())
@@ -862,6 +1163,8 @@ os.replace(done + '.tmp', done)
         let server = async {
             answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
             answer(&listener, CLOSE_ADMISSION, admission(true, false)).await;
+            answer(&listener, RELEASE_ADMISSION, admission(false, false)).await;
+            answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
         };
         let (result, ()) =
             tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
@@ -875,6 +1178,140 @@ os.replace(done + '.tmp', done)
     }
 
     #[tokio::test]
+    async fn update_interrupted_acquisition_releases_its_original_token_and_verifies_admission() {
+        for cancel_during_acquire in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let before = socket_identity(&socket).await.unwrap();
+            let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+            let server = async {
+                answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut command = String::new();
+                stream.read_to_string(&mut command).await.unwrap();
+                let acquired_token = verify_command(&command, CLOSE_ADMISSION).unwrap();
+                // The daemon applied acquisition, but its response was lost
+                // or the owner received cancellation at that exact boundary.
+                if cancel_during_acquire {
+                    cancel.send(()).unwrap();
+                } else {
+                    // Keep cancellation pending while returning invalid JSON.
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\n\r\n{}")
+                        .await
+                        .unwrap();
+                }
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut command = String::new();
+                stream.read_to_string(&mut command).await.unwrap();
+                assert_eq!(
+                    verify_command(&command, RELEASE_ADMISSION).as_deref(),
+                    Some(acquired_token.as_str())
+                );
+                stream
+                    .write_all(
+                        format!("HTTP/1.1 200 OK\r\n\r\n{}", admission(false, false)).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                drop(stream);
+                answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+            };
+            let cancellation = async {
+                if cancelled.await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let (result, ()) = tokio::join!(
+                stop_with_cancellation(&socket, Duration::ZERO, timing(), cancellation),
+                server,
+            );
+            let error = result.unwrap_err();
+            assert!(error.contains("admission reopened and verified"), "{error}");
+            if cancel_during_acquire {
+                assert!(error.contains("cancelled"), "{error}");
+            } else {
+                assert!(error.contains("invalid daemon reply"), "{error}");
+            }
+            assert_eq!(socket_identity(&socket).await.unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_release_requires_readback_even_when_the_acknowledgement_claims_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = async {
+            answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+            answer(&listener, CLOSE_ADMISSION, admission(true, false)).await;
+            answer(&listener, RELEASE_ADMISSION, admission(false, false)).await;
+            // Another operation closed admission before the verification.
+            answer(&listener, ADMISSION_STATUS, admission(true, false)).await;
+        };
+        let (result, ()) =
+            tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("admission reopening was not confirmed"),
+            "{error}"
+        );
+        assert!(!error.contains("admission reopened and verified"));
+    }
+
+    #[tokio::test]
+    async fn update_lost_release_acknowledgement_is_resolved_by_fresh_open_readback() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = async {
+            answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+            answer(&listener, CLOSE_ADMISSION, admission(true, false)).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut command = String::new();
+            stream.read_to_string(&mut command).await.unwrap();
+            verify_command(&command, RELEASE_ADMISSION);
+            drop(stream);
+            answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+        };
+        let (result, ()) =
+            tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
+        let error = result.unwrap_err();
+        assert!(error.contains("did not grant"));
+        assert!(error.contains("admission reopened and verified"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn update_shutdown_success_cannot_hide_an_unacknowledged_client_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = async {
+            answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+            answer(&listener, CLOSE_ADMISSION, admission(true, true)).await;
+            answer(
+                &listener,
+                SHUTDOWN,
+                json!({"status":"shutting_down", "client_lease_ids":["live-owner"]}),
+            )
+            .await;
+            answer(&listener, RELEASE_ADMISSION, admission(false, false)).await;
+            answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
+        };
+        let (result, ()) =
+            tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("did not acknowledge an owned shutdown commitment"),
+            "{error}"
+        );
+        assert!(error.contains("live-owner"));
+        assert!(socket.exists());
+    }
+
+    #[tokio::test]
     async fn update_shutdown_blocked_response_does_not_override_changed_admission() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
@@ -883,10 +1320,16 @@ os.replace(done + '.tmp', done)
             answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
             answer(&listener, CLOSE_ADMISSION, admission(true, true)).await;
             answer(&listener, SHUTDOWN, json!({"status":"shutdown_blocked"})).await;
+            // The client requests only its own fenced release; a surviving
+            // concurrent owner cannot be treated as successful reopening.
+            answer(&listener, RELEASE_ADMISSION, admission(true, false)).await;
+            answer(&listener, ADMISSION_STATUS, admission(true, false)).await;
         };
         let (result, ()) =
             tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("admission reopening was not confirmed"));
+        assert!(!error.contains("admission reopened and verified"));
         assert!(socket.exists());
         assert!(
             timeout(Duration::from_millis(10), listener.accept())
@@ -905,10 +1348,20 @@ os.replace(done + '.tmp', done)
             answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
             answer(&listener, CLOSE_ADMISSION, admission(true, true)).await;
             answer(&listener, SHUTDOWN, json!({"status":"shutting_down"})).await;
+            let mut committed = admission(true, false);
+            committed["shutdown_committed"] = json!(true);
+            committed["success"] = json!(false);
+            committed["status"] = json!("shutdown_committed");
+            answer(&listener, RELEASE_ADMISSION, committed.clone()).await;
+            answer(&listener, ADMISSION_STATUS, committed).await;
         };
         let (result, ()) =
             tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
-        assert!(result.unwrap_err().contains("endpoint remains"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("process exit and endpoint retirement are unconfirmed")
+        );
         assert_eq!(socket_identity(&socket).await.unwrap(), before);
     }
 
@@ -928,12 +1381,16 @@ os.replace(done + '.tmp', done)
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut command = String::new();
                 stream.read_to_string(&mut command).await.unwrap();
-                assert_eq!(command, SHUTDOWN);
+                verify_command(&command, SHUTDOWN);
                 stream.write_all(reply).await.unwrap();
+                drop(stream);
+                answer(&listener, RELEASE_ADMISSION, admission(false, false)).await;
+                answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
             };
             let (result, ()) =
                 tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
-            assert!(result.is_err());
+            let error = result.unwrap_err();
+            assert!(error.contains("admission reopened and verified"), "{error}");
             assert!(socket.exists());
             assert!(
                 timeout(Duration::from_millis(10), listener.accept())
@@ -990,9 +1447,10 @@ os.replace(done + '.tmp', done)
     async fn update_shutdown_missing_endpoint_is_distinct_from_invalid_endpoint() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        assert!(!stop(&socket, Duration::ZERO).await.unwrap());
+        let mut signals = MaintenanceSignals::new().unwrap();
+        assert!(!stop(&socket, Duration::ZERO, &mut signals).await.unwrap());
         tokio::fs::write(&socket, "not a socket").await.unwrap();
-        assert!(stop(&socket, Duration::ZERO).await.is_err());
+        assert!(stop(&socket, Duration::ZERO, &mut signals).await.is_err());
         assert_eq!(tokio::fs::read(&socket).await.unwrap(), b"not a socket");
     }
 

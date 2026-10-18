@@ -4,6 +4,7 @@ use super::download::DownloadedRelease;
 use super::lock::UpdateLock;
 use super::types::{BackupEntry, MAX_BACKUPS, UpdateError};
 use crate::commands::configured_socket_path;
+use crate::commands::daemon::MaintenanceSignals;
 use crate::ui::OutputContext;
 use flate2::read::GzDecoder;
 use std::fs;
@@ -32,6 +33,72 @@ pub struct InstallResult {
     pub daemon_restarted: bool,
 }
 
+/// Tokio signal handlers remain installed process-wide after their streams
+/// are dropped. Keep one registration for the whole install/rollback, and
+/// never restore default handlers while another task may be using them.
+fn install_signals() -> Result<MaintenanceSignals, UpdateError> {
+    MaintenanceSignals::new().map_err(|error| {
+        UpdateError::InstallFailed(format!("Cannot register update cancellation: {error:#}"))
+    })
+}
+
+async fn cancellation_before_publication(
+    signals: &mut MaintenanceSignals,
+    daemon_was_running: bool,
+    install_dir: &Path,
+) -> Result<(), UpdateError> {
+    if !signals.cancellation_pending().await {
+        return Ok(());
+    }
+    let recovery = if daemon_was_running {
+        match start_daemon(install_dir, None).await {
+            Ok(()) => "existing daemon restarted; open admission verified".to_owned(),
+            Err(error) => format!("existing daemon restart is unconfirmed: {error}"),
+        }
+    } else {
+        "daemon admission was not changed".to_owned()
+    };
+    Err(UpdateError::InstallFailed(format!(
+        "Update cancelled before publication; existing installation retained; {recovery}"
+    )))
+}
+
+/// Once publication has begun, finish its bounded validation/restart before
+/// returning cancellation. Dropping that future could leave a partially
+/// observed daemon start; ignoring the signal would report false success.
+async fn finish_publication<T>(
+    signals: &mut MaintenanceSignals,
+    completion: impl std::future::Future<Output = Result<T, UpdateError>>,
+    verified_state: &str,
+) -> Result<T, UpdateError> {
+    finish_publication_with_cancellation(signals.cancelled(), completion, verified_state).await
+}
+
+async fn finish_publication_with_cancellation<T>(
+    cancellation: impl std::future::Future<Output = ()>,
+    completion: impl std::future::Future<Output = Result<T, UpdateError>>,
+    verified_state: &str,
+) -> Result<T, UpdateError> {
+    tokio::pin!(cancellation);
+    tokio::pin!(completion);
+    let (result, cancelled) = tokio::select! {
+        biased;
+        _ = &mut cancellation => (completion.await, true),
+        result = &mut completion => (result, false),
+    };
+    if cancelled {
+        return Err(UpdateError::InstallFailed(match result {
+            Ok(_) => format!(
+                "Update cancelled after publication; {verified_state}; installed files and backup retained"
+            ),
+            Err(error) => format!(
+                "Update cancelled after publication; completion is unconfirmed: {error}; installed files and backup retained"
+            ),
+        }));
+    }
+    result
+}
+
 /// Install downloaded update.
 pub async fn install_update(
     ctx: &OutputContext,
@@ -41,6 +108,7 @@ pub async fn install_update(
 ) -> Result<InstallResult, UpdateError> {
     // Acquire update lock
     let _lock = UpdateLock::acquire()?;
+    let mut signals = install_signals()?;
 
     if !ctx.is_json() {
         println!("Installing update...");
@@ -53,13 +121,16 @@ pub async fn install_update(
     // installation is still untouched. Stage on the destination filesystem:
     // copying out of an archive (and executing from a noexec temp directory)
     // must not be deferred until after the daemon has been stopped.
-    let prepared = prepare_release(
-        &download.archive_path,
-        &install_dir,
-        &download.version,
-        std::time::Duration::from_secs(10),
-    )
-    .await?;
+    let prepared = tokio::select! {
+        biased;
+        _ = signals.cancelled() => return Err(UpdateError::InstallFailed("Update cancelled during preparation; installation and admission unchanged".into())),
+        result = prepare_release(
+            &download.archive_path,
+            &install_dir,
+            &download.version,
+            std::time::Duration::from_secs(10),
+        ) => result?,
+    };
 
     // Get current version for backup
     let current_version = env!("CARGO_PKG_VERSION");
@@ -73,10 +144,11 @@ pub async fn install_update(
 
     // Both release preparation and backup must succeed before any shutdown.
     let daemon_was_running = if restart_daemon {
-        stop_daemon_gracefully(drain_timeout).await?
+        stop_daemon_gracefully(drain_timeout, &mut signals).await?
     } else {
         false
     };
+    cancellation_before_publication(&mut signals, daemon_was_running, &install_dir).await?;
 
     // Publish exactly the staged payloads that passed the version probes.
     // Each rename is atomic on Unix; this is not a crash-atomic multi-file
@@ -86,27 +158,37 @@ pub async fn install_update(
     }
     let _installed_binaries = replace_binaries(prepared)?;
 
-    // Check the actual installed siblings with the same bounded version probe.
-    super::inspect_installation(
-        &install_dir.join(REQUIRED_UPDATE_BINARY),
-        &download.version,
-        std::time::Duration::from_secs(10),
-    )
-    .await
-    .map_err(|error| {
-        UpdateError::InstallFailed(format!("Installed version check failed: {error:#}"))
-    })?;
-
-    // Restart daemon if it was running
-    let daemon_restarted = if restart_daemon && daemon_was_running {
-        if !ctx.is_json() {
-            println!("Restarting daemon...");
-        }
-        start_daemon(&install_dir, Some(&download.version)).await?;
-        true
+    let verified_state = if daemon_was_running {
+        "installed version and restarted daemon's open admission verified"
     } else {
-        false
+        "installed version verified; daemon restart was not needed"
     };
+    let daemon_restarted = finish_publication(
+        &mut signals,
+        async {
+            // Check the actual installed siblings with the same bounded probe.
+            super::inspect_installation(
+                &install_dir.join(REQUIRED_UPDATE_BINARY),
+                &download.version,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .map_err(|error| {
+                UpdateError::InstallFailed(format!("Installed version check failed: {error:#}"))
+            })?;
+            if restart_daemon && daemon_was_running {
+                if !ctx.is_json() {
+                    println!("Restarting daemon...");
+                }
+                start_daemon(&install_dir, Some(&download.version)).await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        },
+        verified_state,
+    )
+    .await?;
 
     Ok(InstallResult {
         backup_path: backup_dir,
@@ -165,24 +247,41 @@ pub async fn rollback(
         return Ok(());
     }
 
+    let mut signals = install_signals()?;
+
     let install_dir = get_install_dir()?;
     // A missing required client, unreadable companion or staging failure must
     // leave the current daemon and all installed binaries alone.
     let prepared = StagedBinaries::new(&backup_dir, &install_dir)?;
     if let Some(version) = &version_info {
-        prepared
-            .verify(version, std::time::Duration::from_secs(10))
-            .await?;
+        tokio::select! {
+            biased;
+            _ = signals.cancelled() => return Err(UpdateError::InstallFailed("Rollback cancelled during preparation; installation and admission unchanged".into())),
+            result = prepared.verify(version, std::time::Duration::from_secs(10)) => result?,
+        }
     }
 
-    let daemon_was_running = stop_daemon_gracefully(30).await?;
+    let daemon_was_running = stop_daemon_gracefully(30, &mut signals).await?;
+    cancellation_before_publication(&mut signals, daemon_was_running, &install_dir).await?;
 
     replace_binaries(prepared)?;
 
     // Restart daemon if it was running
-    if daemon_was_running {
-        start_daemon(&install_dir, version_info.as_deref()).await?;
-    }
+    finish_publication(
+        &mut signals,
+        async {
+            if daemon_was_running {
+                start_daemon(&install_dir, version_info.as_deref()).await?;
+            }
+            Ok(())
+        },
+        if daemon_was_running {
+            "rollback published and restarted daemon's open admission verified"
+        } else {
+            "rollback published; daemon was not running"
+        },
+    )
+    .await?;
 
     if !ctx.is_json() {
         if let Some(version) = version_info {
@@ -859,20 +958,30 @@ fn copy_regular_binary_payload(
 
 /// Stop daemon gracefully, waiting for builds to complete.
 #[cfg(not(unix))]
-async fn stop_daemon_gracefully(_timeout_secs: u64) -> Result<bool, UpdateError> {
+async fn stop_daemon_gracefully(
+    _timeout_secs: u64,
+    _signals: &mut MaintenanceSignals,
+) -> Result<bool, UpdateError> {
     Ok(false)
 }
 
 /// Stop daemon gracefully, waiting for builds to complete.
 #[cfg(unix)]
-async fn stop_daemon_gracefully(timeout_secs: u64) -> Result<bool, UpdateError> {
+async fn stop_daemon_gracefully(
+    timeout_secs: u64,
+    signals: &mut MaintenanceSignals,
+) -> Result<bool, UpdateError> {
     let socket_path = configured_update_socket_path()?;
     // Both installation and rollback call this before modifying any binaries.
     // The interactive stop path can force a process-level stop; an update
     // never has that authority, even when its drain timeout has elapsed.
-    daemon_shutdown::stop(&socket_path, std::time::Duration::from_secs(timeout_secs))
-        .await
-        .map_err(UpdateError::InstallFailed)
+    daemon_shutdown::stop(
+        &socket_path,
+        std::time::Duration::from_secs(timeout_secs),
+        signals,
+    )
+    .await
+    .map_err(UpdateError::InstallFailed)
 }
 
 /// Restart only the installed sibling and require an operational API. Spawning
@@ -929,6 +1038,55 @@ mod tests {
     use std::io::Cursor;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn cancelled_publication_finishes_verified_recovery_before_returning() {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let recovered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = recovered.clone();
+        let task = tokio::spawn(async move {
+            finish_publication_with_cancellation(
+                async {
+                    let _ = cancelled.await;
+                },
+                async {
+                    let _ = finished.await;
+                    recovered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                "daemon open admission verified",
+            )
+            .await
+        });
+        cancel.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "cancellation must await bounded recovery"
+        );
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+        finish.send(()).unwrap();
+        let error = task.await.unwrap().unwrap_err().to_string();
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.contains("cancelled after publication"), "{error}");
+        assert!(error.contains("daemon open admission verified"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_never_reports_failed_publication_recovery_as_verified() {
+        let error = finish_publication_with_cancellation(
+            std::future::ready(()),
+            async { Err::<(), _>(UpdateError::InstallFailed("readiness failed".into())) },
+            "daemon open admission verified",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("completion is unconfirmed"), "{error}");
+        assert!(error.contains("readiness failed"), "{error}");
+        assert!(!error.contains("daemon open admission verified"), "{error}");
+    }
 
     fn create_tar_gz_with_entries(
         archive_path: &Path,

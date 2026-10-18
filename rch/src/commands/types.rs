@@ -169,6 +169,8 @@ pub struct DaemonStatusResponse {
     pub socket_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_seconds: Option<u64>,
+    /// Complete fenced admission snapshot; null when it could not be queried.
+    pub admission: Option<serde_json::Value>,
 }
 
 /// System overview response.
@@ -676,4 +678,6 @@ pub struct DoctorResponse {
     pub checks: Vec<DoctorCheck>,
     pub summary: DoctorSummary,
     pub fixes_applied: Vec<DoctorFixApplied>,
+    /// Complete admission state, including owner identity and recovery deadline.
+    pub admission: Option<serde_json::Value>,
 }

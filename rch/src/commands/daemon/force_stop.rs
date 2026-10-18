@@ -6,12 +6,23 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
-pub(super) async fn stop(socket_path: &Path, pid: u32) -> Result<()> {
+pub(super) async fn stop(
+    socket_path: &Path,
+    process: &super::DaemonProcess,
+    incarnation: &str,
+) -> Result<()> {
+    let pid = process.pid;
     anyhow::ensure!(pid > 1 && pid != std::process::id(), "unsafe daemon PID");
+    let identity = process
+        .identity
+        .to_record()
+        .context("invalid daemon birth identity")?;
     let mut child = Command::new("python3")
         .args(["-I", "-S", "-c", include_str!("force_stop.py")])
         .arg(socket_path)
         .arg(pid.to_string())
+        .arg(identity)
+        .arg(incarnation)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

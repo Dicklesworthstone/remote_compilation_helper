@@ -410,6 +410,7 @@ pub struct BuildHistory {
     /// completion's slot release or its quarantine acknowledgment.
     release_lock: tokio::sync::Mutex<()>,
     ownership_failed: std::sync::atomic::AtomicBool,
+    ownership_error: Mutex<Option<String>>,
     #[cfg(test)]
     fail_after_ownership_rename: std::sync::atomic::AtomicBool,
 }
@@ -449,6 +450,7 @@ impl BuildHistory {
             footprints: Mutex::new(FootprintBook::default()),
             release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
+            ownership_error: Mutex::new(None),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
         }
@@ -472,6 +474,21 @@ impl BuildHistory {
     }
     pub fn ownership_failed(&self) -> bool {
         self.ownership_failed.load(Ordering::SeqCst)
+    }
+
+    /// The original persistence failure stays distinct from maintenance
+    /// ownership. Releasing or recovering a maintenance lease cannot clear it.
+    pub fn ownership_failure_reason(&self) -> Option<String> {
+        if !self.ownership_failed() {
+            return None;
+        }
+        Some(
+            self.ownership_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+                .unwrap_or_else(|| "durable ownership uncertain; restart required".into()),
+        )
     }
 
     /// Get the next build ID.
@@ -2289,6 +2306,7 @@ impl BuildHistory {
             footprints: Mutex::new(FootprintBook::load(&footprint_path(path))),
             release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
+            ownership_error: Mutex::new(None),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
         };
@@ -2693,7 +2711,11 @@ impl BuildHistory {
             ));
         }
         let result = self.write_ownership(active, completed, queued);
-        if result.is_err() {
+        if let Err(error) = &result {
+            *self
+                .ownership_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(error.to_string());
             self.ownership_failed.store(true, Ordering::SeqCst);
         }
         result

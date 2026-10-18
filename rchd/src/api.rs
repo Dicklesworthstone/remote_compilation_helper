@@ -11,6 +11,7 @@ use crate::history::{BuildHistory, QueueSelectionContract, QueuedWaiterClaim};
 use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
 use crate::reload;
+use crate::restart_admission::{MaintenanceFence, MaintenancePeer, RestartAdmissionState};
 use crate::telemetry::collect_telemetry_from_worker;
 use crate::workers::{
     WorkerCapabilitiesResponse, get_workers_capabilities, handle_worker_disable,
@@ -18,10 +19,11 @@ use crate::workers::{
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
+use rch_common::RestartAdmissionResponse;
 use rch_common::job_identity::{
     DurableJobLease, LOCAL_WRAPPER_ID_PREFIX, default_job_lease_directory,
 };
-use rch_common::process_identity::{OwnerPresence, owner_presence};
+use rch_common::process_identity::{OwnerPresence, ProcessIdentity, owner_presence};
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
     CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
@@ -34,7 +36,7 @@ use rch_telemetry::speedscore::SpeedScore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
@@ -159,10 +161,14 @@ enum ApiRequest {
         limit: usize,
     },
     SelfTestRun(SelfTestRunRequest),
-    Shutdown,
-    /// Atomically close or reopen daemon worker admission for restart safety.
+    Shutdown {
+        fence: MaintenanceFence,
+        force: bool,
+    },
+    /// Atomically mutate fenced daemon maintenance admission.
     RestartAdmission {
-        close: bool,
+        fence: MaintenanceFence,
+        action: MaintenanceAction,
     },
     /// Read the restart barrier without changing daemon state.
     RestartAdmissionStatus,
@@ -223,6 +229,8 @@ enum ApiRequest {
 pub struct DaemonFullStatus {
     /// Daemon metadata.
     pub daemon: DaemonStatusInfo,
+    /// Effective admission state and the separately fenced maintenance owner.
+    pub admission: RestartAdmissionResponse,
     /// Worker states.
     pub workers: Vec<WorkerStatusInfo>,
     /// Currently active builds.
@@ -498,19 +506,15 @@ pub struct BuildHeartbeatResponse {
     pub phase: String,
 }
 
-/// Result of atomically closing admission and proving daemon quiescence.
-#[derive(Debug, Serialize)]
-pub struct RestartAdmissionResponse {
-    pub admission_closed: bool,
-    pub restart_permitted: bool,
-    pub active_build_ids: Vec<u64>,
-    pub queued_build_ids: Vec<u64>,
-    /// Nonterminal or unacknowledged client-side durable job leases.
-    pub client_lease_ids: Vec<String>,
-    /// A lease scan failure must fail closed because it makes the zero-state
-    /// proof unprovable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_lease_scan_error: Option<String>,
+#[derive(Debug)]
+enum MaintenanceAction {
+    Acquire {
+        purpose: String,
+        owner_identity: ProcessIdentity,
+    },
+    Renew,
+    Release,
+    Recover,
 }
 
 // ============================================================================
@@ -777,9 +781,11 @@ async fn handle_connection_with_metrics(
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     request_metrics: Option<rch_telemetry::metrics::Metrics>,
 ) -> Result<()> {
-    // Kept only to attribute operator actions (worker drain/enable/disable) in
-    // the log; read before the split, while the socket is whole.
+    // Bind maintenance to the connection owner's observed birth before any
+    // await. A delayed request may not acquire rights under a recycled PID.
+    // Keep the PID separately for operator-action log attribution.
     let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let maintenance_peer = MaintenancePeer::capture(peer_pid);
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -1105,43 +1111,16 @@ async fn handle_connection_with_metrics(
             };
             (serde_json::to_string(&response)?, "application/json")
         }
-        Ok(ApiRequest::Shutdown) => {
+        Ok(ApiRequest::Shutdown { fence, force }) => {
             metrics::inc_requests("shutdown");
-            let admission = ctx.admission_barrier.read().await;
-            let active_build_ids: Vec<_> = ctx
-                .history
-                .active_builds()
-                .into_iter()
-                .map(|build| build.id)
-                .collect();
-            let queued_build_ids: Vec<_> = ctx
-                .history
-                .queued_builds()
-                .into_iter()
-                .map(|build| build.id)
-                .collect();
-            if !*admission || !active_build_ids.is_empty() || !queued_build_ids.is_empty() {
-                (
-                    serde_json::json!({
-                        "status": "shutdown_blocked",
-                        "admission_closed": *admission,
-                        "active_build_ids": active_build_ids,
-                        "queued_build_ids": queued_build_ids,
-                    })
-                    .to_string(),
-                    "application/json",
-                )
-            } else {
-                let _ = shutdown_tx.send(()).await;
-                (
-                    "{\"status\":\"shutting_down\"}".to_string(),
-                    "application/json",
-                )
-            }
+            let response =
+                handle_shutdown(&ctx, &fence, force, maintenance_peer.as_ref(), &shutdown_tx).await;
+            (serde_json::to_string(&response)?, "application/json")
         }
-        Ok(ApiRequest::RestartAdmission { close }) => {
+        Ok(ApiRequest::RestartAdmission { fence, action }) => {
             metrics::inc_requests("restart-admission");
-            let response = handle_restart_admission(&ctx, close).await;
+            let response =
+                handle_restart_admission(&ctx, &fence, action, maintenance_peer.as_ref()).await;
             (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::RestartAdmissionStatus) => {
@@ -1465,20 +1444,45 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         });
     }
 
-    if path == "/shutdown" && method == "POST" {
-        return Ok(ApiRequest::Shutdown);
-    }
-
-    if path == "/restart-admission" && method == "POST" {
-        return Ok(ApiRequest::RestartAdmission { close: true });
-    }
-
-    if path == "/restart-admission" && method == "GET" {
+    let (maintenance_path, maintenance_query) = split_path_query(path);
+    if maintenance_path == "/restart-admission" && method == "GET" {
         return Ok(ApiRequest::RestartAdmissionStatus);
     }
-
-    if path == "/restart-admission/release" && method == "POST" {
-        return Ok(ApiRequest::RestartAdmission { close: false });
+    if method == "POST"
+        && matches!(
+            maintenance_path,
+            "/shutdown"
+                | "/restart-admission"
+                | "/restart-admission/renew"
+                | "/restart-admission/release"
+                | "/restart-admission/recover"
+        )
+    {
+        let MaintenanceQuery {
+            fence,
+            purpose,
+            force,
+            owner_identity,
+        } = parse_maintenance_query(maintenance_query)?;
+        anyhow::ensure!(
+            maintenance_path == "/restart-admission" || owner_identity.is_none(),
+            "owner_identity is only valid for maintenance acquisition"
+        );
+        if maintenance_path == "/shutdown" {
+            return Ok(ApiRequest::Shutdown { fence, force });
+        }
+        anyhow::ensure!(!force, "force is only valid for shutdown");
+        let action = match maintenance_path {
+            "/restart-admission" => MaintenanceAction::Acquire {
+                purpose,
+                owner_identity: owner_identity
+                    .ok_or_else(|| anyhow!("maintenance owner_identity is required"))?,
+            },
+            "/restart-admission/renew" => MaintenanceAction::Renew,
+            "/restart-admission/release" => MaintenanceAction::Release,
+            _ => MaintenanceAction::Recover,
+        };
+        return Ok(ApiRequest::RestartAdmission { fence, action });
     }
 
     if path == "/reload" && method == "POST" {
@@ -2618,14 +2622,13 @@ async fn handle_select_worker_mode(
     local_wrapper_id: Option<String>,
     resume_queued: bool,
 ) -> Result<SelectionResponse> {
+    recover_restart_admission(ctx).await;
     // Resume refusal must close the exchange, never look like a confirmed busy
     // response that permits local fallback. No selector runs before this claim.
     let resumed = if resume_queued {
         anyhow::ensure!(wait_for_worker, "queued resume requires waiting selection");
-        anyhow::ensure!(
-            !*ctx.admission_barrier.read().await,
-            "restart admission barrier active"
-        );
+        let admission = ctx.admission_barrier.read().await;
+        anyhow::ensure!(!admission.is_closed(), "restart admission barrier active");
         let wrapper = local_wrapper_id
             .as_deref()
             .ok_or_else(|| anyhow!("missing queued owner"))?;
@@ -2636,6 +2639,7 @@ async fn handle_select_worker_mode(
                 .ok_or_else(|| anyhow!("missing queued process"))?,
             &queue_selection_digest(&request, wait_timeout_secs)?,
         )?;
+        drop(admission);
         // One line per reattached waiter, so a restart can be checked for
         // queued rows that resumed versus refused (bd-w2qrp).
         info!(
@@ -2660,7 +2664,7 @@ async fn handle_select_worker_mode(
     {
         return Ok(cancelled_selection());
     }
-    if *ctx.admission_barrier.read().await || ctx.history.ownership_failed() {
+    if ctx.admission_barrier.read().await.is_closed() || ctx.history.ownership_failed() {
         anyhow::ensure!(
             !resume_queued,
             "queued resume blocked by restart admission barrier"
@@ -2732,8 +2736,9 @@ async fn handle_select_worker_mode(
         {
             return Ok(cancelled_selection());
         }
+        recover_restart_admission(ctx).await;
         let admission = ctx.admission_barrier.read().await;
-        if *admission || ctx.history.ownership_failed() {
+        if admission.is_closed() || ctx.history.ownership_failed() {
             return Ok(SelectionResponse {
                 worker: None,
                 reason: SelectionReason::SelectionError(
@@ -2992,8 +2997,9 @@ async fn handle_select_worker_mode(
     let effective_queue_timeout_secs =
         queue_wait_secs(request.job_mode, wait_timeout_secs, ctx.queue_timeout_secs);
     let selection_digest = queue_selection_digest(&request, wait_timeout_secs)?;
+    recover_restart_admission(ctx).await;
     let admission = ctx.admission_barrier.read().await;
-    if *admission || ctx.history.ownership_failed() {
+    if admission.is_closed() || ctx.history.ownership_failed() {
         anyhow::ensure!(
             !resume_queued,
             "queued resume blocked by restart admission barrier"
@@ -3292,89 +3298,335 @@ fn queue_hold_candidate(
     best.map(|worker| worker.worker_id.as_str().to_string())
 }
 
-/// Close admission before a restart and report the daemon-owned build/queue
-/// snapshot.  The caller must treat any nonempty list as a hard no-action and
-/// leave the barrier raised; only a fresh daemon instance may reopen it after
-/// a successful restart.  A failed restart can explicitly reopen the barrier
-/// with `close=false`.
-async fn handle_restart_admission(ctx: &DaemonContext, close: bool) -> RestartAdmissionResponse {
-    let mut admission = ctx.admission_barrier.write().await;
-    let was_closed = *admission;
-    let close = close || ctx.history.ownership_failed();
-    *admission = close;
-    let active_build_ids: Vec<u64> = ctx
-        .history
-        .active_builds()
-        .into_iter()
-        .map(|build| build.id)
-        .collect();
-    let queued_build_ids: Vec<u64> = ctx
-        .history
-        .queued_builds()
-        .into_iter()
-        .map(|build| build.id)
-        .collect();
-    // spawn_blocking: the scan does filesystem I/O and per-lease liveness
-    // syscalls; inline on a runtime thread it starved the accept loop when the
-    // lease directory grew large (bd-daspu).
-    let client_lease_scan = tokio::task::spawn_blocking(nonterminal_client_lease_ids)
-        .await
-        .unwrap_or_else(|error| Err(anyhow!("lease scan task failed: {error}")));
-    let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
-        Ok(ids) => (ids, None),
-        Err(error) => (Vec::new(), Some(error.to_string())),
+fn maintenance_wall_ms() -> u64 {
+    u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0)
+}
+
+struct MaintenanceQuery {
+    fence: MaintenanceFence,
+    purpose: String,
+    force: bool,
+    owner_identity: Option<ProcessIdentity>,
+}
+
+fn parse_maintenance_query(query: &str) -> Result<MaintenanceQuery> {
+    let mut values = std::collections::HashMap::new();
+    for parameter in query.split('&').filter(|value| !value.is_empty()) {
+        let (key, value) = parameter
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid maintenance parameter"))?;
+        anyhow::ensure!(
+            matches!(
+                key,
+                "daemon_incarnation" | "token" | "purpose" | "force" | "owner_identity"
+            ),
+            "unknown maintenance parameter: {key}"
+        );
+        anyhow::ensure!(
+            values
+                .insert(key, percent_unescape_query_value(value))
+                .is_none(),
+            "duplicate maintenance parameter: {key}"
+        );
+    }
+    let daemon_incarnation = values
+        .remove("daemon_incarnation")
+        .ok_or_else(|| anyhow!("maintenance daemon_incarnation is required"))?;
+    let token = values
+        .remove("token")
+        .ok_or_else(|| anyhow!("maintenance token is required"))?;
+    for value in [&daemon_incarnation, &token] {
+        anyhow::ensure!(
+            Uuid::parse_str(value).is_ok_and(|uuid| uuid.to_string() == *value),
+            "maintenance fences require canonical UUIDs"
+        );
+    }
+    let purpose = values
+        .remove("purpose")
+        .unwrap_or_else(|| "maintenance".into());
+    anyhow::ensure!(
+        !purpose.is_empty() && purpose.len() <= 96 && !purpose.chars().any(char::is_control),
+        "invalid maintenance purpose"
+    );
+    let force = match values.remove("force").as_deref() {
+        None | Some("false" | "0") => false,
+        Some("true" | "1") => true,
+        _ => return Err(anyhow!("invalid maintenance force flag")),
     };
-    let restart_permitted = close
-        && !was_closed
-        && active_build_ids.is_empty()
-        && queued_build_ids.is_empty()
-        && client_lease_ids.is_empty()
-        && client_lease_scan_error.is_none();
-    RestartAdmissionResponse {
-        admission_closed: close,
-        restart_permitted,
-        active_build_ids,
-        queued_build_ids,
-        client_lease_ids,
-        client_lease_scan_error,
+    let owner_identity = values
+        .remove("owner_identity")
+        .map(|record| {
+            ProcessIdentity::from_record(&record)
+                .filter(|identity| identity.to_record().as_deref() == Some(record.as_str()))
+                .ok_or_else(|| {
+                    anyhow!("maintenance owner_identity must be a canonical process birth record")
+                })
+        })
+        .transpose()?;
+    Ok(MaintenanceQuery {
+        fence: MaintenanceFence {
+            daemon_incarnation,
+            token,
+        },
+        purpose,
+        force,
+        owner_identity,
+    })
+}
+
+/// Invoked by worker admission, operator status, and an independent ticker.
+/// Taking the write lock fences recovery against any selection still reserving
+/// durable work, and against shutdown's final ownership/quiescence check.
+pub(crate) async fn recover_restart_admission(ctx: &DaemonContext) {
+    let mut admission = ctx.admission_barrier.write().await;
+    admission.recover(Instant::now(), maintenance_wall_ms());
+    let events = admission.take_events();
+    drop(admission);
+    for event in events {
+        event.emit();
     }
 }
 
-/// Snapshot restart admission without changing the barrier.  The hook calls
-/// this after it writes its durable lease and before worker selection, so an
-/// established remediator can refuse new work without a selection race.
-async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionResponse {
-    let admission = ctx.admission_barrier.read().await;
-    let active_build_ids: Vec<u64> = ctx
+async fn bounded_client_lease_scan() -> Result<Vec<String>> {
+    // Retain the permit inside the blocking task even if a caller times out.
+    // A stuck filesystem therefore cannot create an unbounded pile of scans.
+    static SCANS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let scans = SCANS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    run_bounded_client_lease_scan(scans, Duration::from_secs(3), nonterminal_client_lease_ids).await
+}
+
+async fn run_bounded_client_lease_scan(
+    scans: std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+    scan: impl FnOnce() -> Result<Vec<String>> + Send + 'static,
+) -> Result<Vec<String>> {
+    let permit = scans
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("client lease scan already in progress"))?;
+    tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            scan()
+        }),
+    )
+    .await
+    .map_err(|_| anyhow!("client lease scan timed out; quiescence is unknown"))?
+    .map_err(|error| anyhow!("client lease scan task failed: {error}"))?
+}
+
+async fn admission_response(
+    ctx: &DaemonContext,
+    admission: &mut RestartAdmissionState,
+    include_leases: bool,
+) -> RestartAdmissionResponse {
+    let scan = if include_leases {
+        bounded_client_lease_scan().await
+    } else {
+        Ok(Vec::new())
+    };
+    // The scan can outlive the operator or its deadline. Never return a stale
+    // successful acquisition after recovery has invalidated its fence.
+    admission.recover(Instant::now(), maintenance_wall_ms());
+    let mut response = admission.snapshot(Instant::now(), ctx.history.ownership_failure_reason());
+    response.active_build_ids = ctx
         .history
         .active_builds()
         .into_iter()
         .map(|build| build.id)
         .collect();
-    let queued_build_ids: Vec<u64> = ctx
+    response.queued_build_ids = ctx
         .history
         .queued_builds()
         .into_iter()
         .map(|build| build.id)
         .collect();
-    // spawn_blocking: the scan does filesystem I/O and per-lease liveness
-    // syscalls; inline on a runtime thread it starved the accept loop when the
-    // lease directory grew large (bd-daspu).
-    let client_lease_scan = tokio::task::spawn_blocking(nonterminal_client_lease_ids)
-        .await
-        .unwrap_or_else(|error| Err(anyhow!("lease scan task failed: {error}")));
-    let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
-        Ok(ids) => (ids, None),
-        Err(error) => (Vec::new(), Some(error.to_string())),
-    };
-    RestartAdmissionResponse {
-        admission_closed: *admission || ctx.history.ownership_failed(),
-        restart_permitted: false,
-        active_build_ids,
-        queued_build_ids,
-        client_lease_ids,
-        client_lease_scan_error,
+    match scan {
+        Ok(ids) => response.client_lease_ids = ids,
+        Err(error) => response.client_lease_scan_error = Some(error.to_string()),
     }
+    response.restart_permitted = include_leases
+        && response.maintenance_closed
+        && !response.shutdown_committed
+        && !response.ownership_failed
+        && response.active_build_ids.is_empty()
+        && response.queued_build_ids.is_empty()
+        && response.client_lease_ids.is_empty()
+        && response.client_lease_scan_error.is_none();
+    response
+}
+
+fn maintenance_failure(
+    mut response: RestartAdmissionResponse,
+    reason: &str,
+) -> RestartAdmissionResponse {
+    response.success = false;
+    response.status = reason.into();
+    response.restart_permitted = false;
+    response.message = Some(format!(
+        "Maintenance operation refused: {reason}. Inspect `rch daemon admission status --json`; only the current owner can release or stop the daemon, and abandoned operations recover after their deadline."
+    ));
+    response
+}
+
+async fn handle_restart_admission(
+    ctx: &DaemonContext,
+    fence: &MaintenanceFence,
+    action: MaintenanceAction,
+    connection_peer: Option<&MaintenancePeer>,
+) -> RestartAdmissionResponse {
+    let mut admission = ctx.admission_barrier.write().await;
+    let response = async {
+        admission.recover(Instant::now(), maintenance_wall_ms());
+        // Verify the original connection identity under the lock, after any
+        // request/lock wait. Do not recapture a replacement process as owner.
+        let peer = connection_peer.and_then(MaintenancePeer::revalidate);
+        let include_leases = matches!(
+            action,
+            MaintenanceAction::Acquire { .. } | MaintenanceAction::Renew
+        );
+        let releasing = matches!(
+            action,
+            MaintenanceAction::Release | MaintenanceAction::Recover
+        );
+        let (result, status) = match action {
+            MaintenanceAction::Acquire {
+                purpose,
+                owner_identity,
+            } => {
+                let result = peer
+                    .ok_or("maintenance_peer_identity_unknown")
+                    .and_then(|peer| peer.validate_acquisition_identity(&owner_identity))
+                    .and_then(|()| {
+                        admission.acquire(
+                            fence,
+                            peer,
+                            purpose,
+                            Instant::now(),
+                            maintenance_wall_ms(),
+                        )
+                    });
+                (result, "acquired")
+            }
+            MaintenanceAction::Renew => (
+                admission.renew(fence, peer, Instant::now(), maintenance_wall_ms()),
+                "renewed",
+            ),
+            MaintenanceAction::Release => (admission.release(fence, peer), "released"),
+            MaintenanceAction::Recover => (admission.validate_recovery(fence), "recovered"),
+        };
+        let mut response =
+            admission_response(ctx, &mut admission, include_leases && result.is_ok()).await;
+        if let Err(reason) = result {
+            return maintenance_failure(response, reason);
+        }
+        if releasing && response.admission_closed {
+            return maintenance_failure(response, "ownership_failed");
+        }
+        if !releasing
+            && admission
+                .validate_owner(fence, connection_peer.and_then(MaintenancePeer::revalidate))
+                .is_err()
+        {
+            return maintenance_failure(response, "maintenance_ownership_lost");
+        }
+        response.status = status.into();
+        response
+    }
+    .await;
+    let events = admission.take_events();
+    drop(admission);
+    for event in events {
+        event.emit();
+    }
+    response
+}
+
+async fn handle_shutdown(
+    ctx: &DaemonContext,
+    fence: &MaintenanceFence,
+    force: bool,
+    connection_peer: Option<&MaintenancePeer>,
+    shutdown_tx: &tokio::sync::mpsc::Sender<()>,
+) -> RestartAdmissionResponse {
+    let mut admission = ctx.admission_barrier.write().await;
+    let response = async {
+        admission.recover(Instant::now(), maintenance_wall_ms());
+        if let Err(reason) =
+            admission.validate_owner(fence, connection_peer.and_then(MaintenancePeer::revalidate))
+        {
+            return maintenance_failure(
+                admission_response(ctx, &mut admission, false).await,
+                reason,
+            );
+        }
+        let response = admission_response(ctx, &mut admission, !force).await;
+        if !force && !response.restart_permitted {
+            return maintenance_failure(response, "shutdown_blocked");
+        }
+        // Revalidate after the filesystem scan, under the same lock that selection
+        // needs. Expiry or owner death during the scan invalidates this operation.
+        if let Err(reason) =
+            admission.commit_shutdown(fence, connection_peer.and_then(MaintenancePeer::revalidate))
+        {
+            return maintenance_failure(response, reason);
+        }
+        match shutdown_tx.try_send(()) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                // Arm before any logging or subsequent await. An output sink or
+                // stalled runtime cannot strand a committed, closed barrier.
+                crate::arm_shutdown_watchdog();
+                let mut committed = admission_response(ctx, &mut admission, false).await;
+                committed.status = "shutting_down".into();
+                committed
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                admission.rollback_shutdown_send_failure();
+                maintenance_failure(
+                    admission_response(ctx, &mut admission, false).await,
+                    "shutdown_delivery_failed",
+                )
+            }
+        }
+    }
+    .await;
+    let events = admission.take_events();
+    drop(admission);
+    for event in events {
+        event.emit();
+    }
+    if response.shutdown_committed && response.success {
+        info!(
+            daemon_incarnation = %response.daemon_incarnation,
+            token = %fence.token,
+            deadline_secs = 30,
+            "Committed daemon shutdown; admission remains closed until process exit, with a bounded process deadline"
+        );
+    }
+    response
+}
+
+async fn restart_admission_snapshot(
+    ctx: &DaemonContext,
+    include_leases: bool,
+) -> RestartAdmissionResponse {
+    let mut admission = ctx.admission_barrier.write().await;
+    admission.recover(Instant::now(), maintenance_wall_ms());
+    let response = admission_response(ctx, &mut admission, include_leases).await;
+    let events = admission.take_events();
+    drop(admission);
+    for event in events {
+        event.emit();
+    }
+    response
+}
+
+/// Status may recover a dead/expired operator, but never another live operation.
+async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionResponse {
+    restart_admission_snapshot(ctx, true).await
 }
 
 /// Return every client lease that is not both terminal and explicitly
@@ -3416,6 +3668,9 @@ fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
             blocked.push(lease.identity.local_wrapper_id);
         } else if now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS
             && !lease_owns_unretired_source(&lease)
+            && (!lease_waits_for_restart_admission(&lease)
+                || owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+                    == OwnerPresence::Absent)
         {
             // Reap the file: it no longer blocks restart (terminal+acked, or
             // provably dead and stale) and its last heartbeat is over the
@@ -3511,12 +3766,30 @@ pub(crate) fn lease_blocks_restart(
     if lease.state.is_terminal() && lease.terminal_acknowledged {
         return false;
     }
-    let heartbeat_stale =
-        now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+    if lease_waits_for_restart_admission(lease) {
+        // A new wrapper waiting outside the gate owns no execution, queue row
+        // or worker source. Counting it as active makes every new build extend
+        // a drain forever. Its live journal is retained separately by the scan.
+        return false;
+    }
+    // A durable timestamp from a future wall clock cannot establish recent
+    // liveness. Fall back to identity, keeping live/unknown owners conservative.
+    let heartbeat_stale = lease.heartbeat_unix_ms > now_unix_ms
+        || now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DEAD_WRAPPER_HEARTBEAT_STALE_MS;
     if !heartbeat_stale {
         return true;
     }
     wrapper_presence() != OwnerPresence::Absent
+}
+
+fn lease_waits_for_restart_admission(lease: &DurableJobLease) -> bool {
+    lease.phase == "restart_admission_wait"
+        && lease.state == rch_common::job_identity::JobLifecycleState::Queued
+        && lease.identity.remote_build_id.is_none()
+        && lease.worker_id.is_none()
+        && lease.recovery.is_none()
+        && lease.exit_code.is_none()
+        && !lease.terminal_acknowledged
 }
 
 /// Handle a release-worker request.
@@ -4550,6 +4823,7 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
             slots_total,
             slots_available,
         },
+        admission: restart_admission_snapshot(ctx, false).await,
         workers: worker_infos,
         active_builds: active_builds
             .into_iter()
@@ -4899,7 +5173,7 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
+            admission_barrier: Arc::new(tokio::sync::RwLock::new(RestartAdmissionState::default())),
         }
     }
 
@@ -6571,7 +6845,7 @@ mod tests {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
         let ctx = make_test_context(pool);
-        *ctx.admission_barrier.write().await = true;
+        ctx.admission_barrier.write().await.begin_shutdown();
         let request = SelectionRequest {
             job_mode: false,
             project: "restart-guard".to_string(),
@@ -6697,9 +6971,8 @@ mod tests {
 
     #[test]
     fn is_process_alive_uses_the_syscall_truthfully() {
-        // Our own PID is alive; PID 0 is defined dead; a PID from the far end
-        // of the space is almost certainly dead (and if recycled, "alive" is
-        // the conservative, still-correct answer for lease blocking).
+        // This transient liveness helper remains useful to queue waiters;
+        // durable restart leases separately require process birth identity.
         assert!(is_process_alive(std::process::id()));
         assert!(!is_process_alive(0));
     }
@@ -6747,6 +7020,45 @@ mod tests {
     }
 
     #[test]
+    fn restart_admission_waiter_only_stops_blocking_without_execution_ownership() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let mut waiting = make_test_lease(now, std::process::id());
+        waiting.state = rch_common::job_identity::JobLifecycleState::Queued;
+        waiting.identity.remote_build_id = None;
+        waiting.worker_id = None;
+        waiting.phase = "restart_admission_wait".into();
+        assert!(!lease_blocks_restart(&waiting, now, || unreachable!()));
+        let mut admitted = waiting.clone();
+        admitted.identity.remote_build_id = Some(42);
+        assert!(lease_blocks_restart(&admitted, now, || unreachable!()));
+        let mut worker = waiting.clone();
+        worker.worker_id = Some("worker-a".into());
+        assert!(lease_blocks_restart(&worker, now, || unreachable!()));
+        let mut source_owner = waiting.clone();
+        source_owner.recovery = Some(serde_json::json!({"source_roots":["/source"]}));
+        assert!(lease_blocks_restart(&source_owner, now, || unreachable!()));
+        let mut running = waiting;
+        running.state = rch_common::job_identity::JobLifecycleState::Running;
+        assert!(lease_blocks_restart(&running, now, || unreachable!()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_admission_scan_retains_live_waiting_journal_even_with_stale_heartbeat() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut waiting = make_test_lease(1, std::process::id());
+        waiting.process_birth = rch_common::process_identity::current_process_identity();
+        waiting.state = rch_common::job_identity::JobLifecycleState::Queued;
+        waiting.identity.remote_build_id = None;
+        waiting.worker_id = None;
+        waiting.phase = "restart_admission_wait".into();
+        let path = directory.path().join("waiting.json");
+        std::fs::write(&path, serde_json::to_vec(&waiting).unwrap()).unwrap();
+        assert!(scan_client_leases(directory.path()).unwrap().is_empty());
+        assert!(path.exists(), "live waiting lease must remain observable");
+    }
+
+    #[test]
     fn test_lease_blocks_restart_stale_heartbeat_alive_pid_blocks() {
         let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
         let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS, 1);
@@ -6773,6 +7085,15 @@ mod tests {
     fn test_lease_blocks_restart_stale_unknown_ownership_stays_blocking() {
         let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
         let lease = make_test_lease(1, 4242);
+        assert!(lease_blocks_restart(&lease, now, || OwnerPresence::Unknown));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_future_heartbeat_requires_owner_evidence() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let lease = make_test_lease(u64::MAX, 4242);
+        assert!(!lease_blocks_restart(&lease, now, || OwnerPresence::Absent));
+        assert!(lease_blocks_restart(&lease, now, || OwnerPresence::Live));
         assert!(lease_blocks_restart(&lease, now, || OwnerPresence::Unknown));
     }
 
@@ -6851,12 +7172,467 @@ mod tests {
             rch_common::BuildLocation::Remote,
         );
 
-        let response = handle_restart_admission(&ctx, true).await;
+        let fence = MaintenanceFence {
+            daemon_incarnation: restart_admission_snapshot(&ctx, false)
+                .await
+                .daemon_incarnation,
+            token: Uuid::new_v4().to_string(),
+        };
+        let response = handle_restart_admission(
+            &ctx,
+            &fence,
+            MaintenanceAction::Acquire {
+                purpose: "restart".into(),
+                owner_identity: rch_common::process_identity::current_process_identity().unwrap(),
+            },
+            MaintenancePeer::capture(i32::try_from(std::process::id()).ok()).as_ref(),
+        )
+        .await;
 
         assert!(!response.restart_permitted);
         assert_eq!(response.active_build_ids, vec![active.id]);
         assert!(response.queued_build_ids.is_empty());
-        assert!(*ctx.admission_barrier.read().await);
+        assert!(ctx.admission_barrier.read().await.is_closed());
+    }
+
+    async fn acquire_test_maintenance(ctx: &DaemonContext) -> MaintenanceFence {
+        let fence = MaintenanceFence {
+            daemon_incarnation: restart_admission_snapshot(ctx, false)
+                .await
+                .daemon_incarnation,
+            token: Uuid::new_v4().to_string(),
+        };
+        let peer = MaintenancePeer::capture(i32::try_from(std::process::id()).ok())
+            .expect("the test process must have a durable kernel identity");
+        ctx.admission_barrier
+            .write()
+            .await
+            .acquire(
+                &fence,
+                Some(&peer),
+                "test-maintenance".into(),
+                Instant::now(),
+                maintenance_wall_ms(),
+            )
+            .unwrap();
+        fence
+    }
+
+    #[tokio::test]
+    async fn restart_admission_scan_timeout_and_cancellation_retain_scan_budget() {
+        for cancel in [false, true] {
+            let scans = Arc::new(tokio::sync::Semaphore::new(1));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let timeout = if cancel {
+                Duration::from_secs(60)
+            } else {
+                Duration::ZERO
+            };
+            let caller = tokio::spawn(run_bounded_client_lease_scan(
+                scans.clone(),
+                timeout,
+                move || {
+                    let _ = started_tx.send(());
+                    // The sender is owned by this test, so unwinding also
+                    // releases this simulated stuck filesystem operation.
+                    let _ = release_rx.recv();
+                    Ok(Vec::new())
+                },
+            ));
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("blocking scanner started")
+                .unwrap();
+            if cancel {
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+            } else {
+                let error = caller.await.unwrap().unwrap_err();
+                assert!(error.to_string().contains("quiescence is unknown"));
+            }
+            assert_eq!(scans.available_permits(), 0);
+            let refused =
+                run_bounded_client_lease_scan(scans.clone(), Duration::from_secs(5), || {
+                    panic!("a pending scan must not start another blocking task")
+                })
+                .await
+                .unwrap_err();
+            assert!(refused.to_string().contains("already in progress"));
+
+            release_tx.send(()).unwrap();
+            let permit = tokio::time::timeout(Duration::from_secs(5), scans.acquire())
+                .await
+                .expect("completed scanner returns its budget")
+                .unwrap();
+            drop(permit);
+            assert_eq!(
+                run_bounded_client_lease_scan(scans, Duration::from_secs(5), || {
+                    Ok(vec!["live-wrapper".into()])
+                })
+                .await
+                .unwrap(),
+                vec!["live-wrapper"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_admission_lifecycle_logging_releases_lock_before_output() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        // Other daemon tests install subscribers while exercising the same
+        // callsites. Isolate their process-global interest-cache changes from
+        // this test's exact event counts, while retaining the real log sink and
+        // its assertion that lifecycle output never holds the admission lock.
+        const CHILD_ROOT: &str = "RCH_RESTART_ADMISSION_LOG_TEST_ROOT";
+        const TEST: &str =
+            "api::tests::restart_admission_lifecycle_logging_releases_lock_before_output";
+        let child_root = if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            std::path::PathBuf::from(root)
+        } else {
+            let root = tempfile::tempdir().unwrap();
+            let output = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_ROOT, root.path())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("isolated admission lifecycle logging test timed out")
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated admission lifecycle logging failed: {output:?}"
+            );
+            assert!(
+                root.path().join("completed").is_file(),
+                "isolated admission lifecycle logging did not run all assertions: {output:?}"
+            );
+            return;
+        };
+
+        struct CheckUnlocked {
+            admission: Arc<tokio::sync::RwLock<RestartAdmissionState>>,
+            events: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[derive(Default)]
+        struct Message(String);
+
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CheckUnlocked {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event
+                    .metadata()
+                    .fields()
+                    .field("daemon_incarnation")
+                    .is_some()
+                {
+                    assert!(
+                        self.admission.try_write().is_ok(),
+                        "a blocked lifecycle log sink must not hold the admission lock"
+                    );
+                    let mut message = Message::default();
+                    event.record(&mut message);
+                    self.events.lock().unwrap().push(message.0);
+                }
+            }
+        }
+
+        let ctx = make_test_context(WorkerPool::new());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CheckUnlocked {
+            admission: ctx.admission_barrier.clone(),
+            events: events.clone(),
+        });
+        let assert_events = |count, stage| {
+            let observed = events.lock().unwrap();
+            assert_eq!(observed.len(), count, "{stage}: {observed:?}");
+        };
+        async {
+            let first = acquire_test_maintenance(&ctx).await;
+            // A cancelled request may leave an acquired event for the independent
+            // recovery task; emitting it must also happen after releasing the lock.
+            recover_restart_admission(&ctx).await;
+            assert_events(1, "first acquisition");
+            let peer_pid = i32::try_from(std::process::id()).ok();
+            let peer = MaintenancePeer::capture(peer_pid).unwrap();
+            let released =
+                handle_restart_admission(&ctx, &first, MaintenanceAction::Release, Some(&peer))
+                    .await;
+            assert!(released.success);
+            assert_events(2, "explicit release");
+
+            let expired = MaintenanceFence {
+                token: Uuid::new_v4().to_string(),
+                ..first
+            };
+            ctx.admission_barrier
+                .write()
+                .await
+                .acquire(
+                    &expired,
+                    Some(&peer),
+                    "expired request".into(),
+                    Instant::now() - crate::restart_admission::MAINTENANCE_TTL,
+                    maintenance_wall_ms(),
+                )
+                .unwrap();
+            recover_restart_admission(&ctx).await;
+            assert_events(4, "expired acquisition and recovery");
+            assert!(
+                !restart_admission_snapshot(&ctx, false)
+                    .await
+                    .admission_closed
+            );
+
+            let shutting_down = acquire_test_maintenance(&ctx).await;
+            recover_restart_admission(&ctx).await;
+            assert_events(5, "shutdown acquisition");
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let committed = handle_shutdown(&ctx, &shutting_down, true, Some(&peer), &sender).await;
+            assert!(committed.success && committed.shutdown_committed);
+            receiver.try_recv().unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+        assert_events(6, "committed shutdown");
+        std::fs::write(
+            child_root.join("completed"),
+            "six lifecycle events checked\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_admission_api_unknown_peer_cannot_close_admission() {
+        let ctx = make_test_context(WorkerPool::new());
+        let fence = MaintenanceFence {
+            daemon_incarnation: restart_admission_snapshot(&ctx, false)
+                .await
+                .daemon_incarnation,
+            token: Uuid::new_v4().to_string(),
+        };
+        let response = handle_restart_admission(
+            &ctx,
+            &fence,
+            MaintenanceAction::Acquire {
+                purpose: "restart".into(),
+                owner_identity: rch_common::process_identity::current_process_identity().unwrap(),
+            },
+            None,
+        )
+        .await;
+        assert!(!response.success);
+        assert_eq!(response.status, "maintenance_peer_identity_unknown");
+        assert!(!response.admission_closed);
+        assert!(response.maintenance_owner.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_admission_recycled_connection_identity_cannot_mutate_barrier() {
+        use rch_common::process_identity::ProcessStart;
+
+        let ctx = make_test_context(WorkerPool::new());
+        let mut recycled =
+            MaintenancePeer::capture(i32::try_from(std::process::id()).ok()).unwrap();
+        let ProcessStart::Linux { ticks } = &mut recycled.identity.start else {
+            panic!("Linux birth marker expected");
+        };
+        *ticks = ticks.saturating_add(1);
+        let candidate = MaintenanceFence {
+            daemon_incarnation: restart_admission_snapshot(&ctx, false)
+                .await
+                .daemon_incarnation,
+            token: Uuid::new_v4().to_string(),
+        };
+        let refused = handle_restart_admission(
+            &ctx,
+            &candidate,
+            MaintenanceAction::Acquire {
+                purpose: "delayed connection".into(),
+                owner_identity: recycled.identity.clone(),
+            },
+            Some(&recycled),
+        )
+        .await;
+        assert!(!refused.success && !refused.admission_closed);
+        assert_eq!(refused.status, "maintenance_peer_identity_unknown");
+
+        // A socket may already have waited in the accept backlog when the
+        // original PID was recycled. Even a currently live peer observation
+        // cannot replace the caller's pre-connect birth witness.
+        let live_peer = MaintenancePeer::capture(i32::try_from(std::process::id()).ok()).unwrap();
+        for (owner_identity, reason) in [
+            (
+                recycled.identity.clone(),
+                "maintenance_owner_identity_mismatch",
+            ),
+            (
+                ProcessIdentity {
+                    boot_id: "0e9306b2-57d4-42c2-85b7-ec00aa52fe86".into(),
+                    ..live_peer.identity.clone()
+                },
+                "maintenance_owner_identity_mismatch",
+            ),
+            (
+                ProcessIdentity {
+                    boot_id: String::new(),
+                    ..live_peer.identity.clone()
+                },
+                "maintenance_owner_identity_unknown",
+            ),
+        ] {
+            let refused = handle_restart_admission(
+                &ctx,
+                &candidate,
+                MaintenanceAction::Acquire {
+                    purpose: "backlogged connection".into(),
+                    owner_identity,
+                },
+                Some(&live_peer),
+            )
+            .await;
+            assert!(!refused.success && !refused.admission_closed, "{refused:?}");
+            assert_eq!(refused.status, reason);
+        }
+
+        let owner = acquire_test_maintenance(&ctx).await;
+        for action in [MaintenanceAction::Renew, MaintenanceAction::Release] {
+            let refused = handle_restart_admission(&ctx, &owner, action, Some(&recycled)).await;
+            assert!(!refused.success && refused.admission_closed);
+            assert_eq!(refused.status, "maintenance_peer_identity_unknown");
+            assert_eq!(refused.maintenance_owner.unwrap().token, owner.token);
+        }
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let refused = handle_shutdown(&ctx, &owner, true, Some(&recycled), &sender).await;
+        assert!(!refused.success && !refused.shutdown_committed);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_admission_api_concurrent_release_and_recovery_leave_live_owner_closed() {
+        let ctx = make_test_context(WorkerPool::new());
+        let first = acquire_test_maintenance(&ctx).await;
+        let second = MaintenanceFence {
+            token: Uuid::new_v4().to_string(),
+            ..first.clone()
+        };
+        let peer = MaintenancePeer::capture(i32::try_from(std::process::id()).ok());
+        for (fence, action) in [
+            (&second, MaintenanceAction::Release),
+            (&second, MaintenanceAction::Renew),
+            (&first, MaintenanceAction::Recover),
+        ] {
+            let refused = handle_restart_admission(&ctx, fence, action, peer.as_ref()).await;
+            assert!(!refused.success);
+            assert!(refused.admission_closed);
+            assert_eq!(refused.maintenance_owner.unwrap().token, first.token);
+        }
+        let released =
+            handle_restart_admission(&ctx, &first, MaintenanceAction::Release, peer.as_ref()).await;
+        assert!(released.success && !released.admission_closed);
+        let verified = restart_admission_snapshot(&ctx, false).await;
+        assert!(!verified.admission_closed && verified.maintenance_owner.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_admission_shutdown_delivery_error_can_be_released_and_verified() {
+        let ctx = make_test_context(WorkerPool::new());
+        let fence = acquire_test_maintenance(&ctx).await;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let peer = MaintenancePeer::capture(i32::try_from(std::process::id()).ok());
+        let failed = handle_shutdown(&ctx, &fence, true, peer.as_ref(), &sender).await;
+        assert!(!failed.success);
+        assert_eq!(failed.status, "shutdown_delivery_failed");
+        assert!(failed.admission_closed && !failed.shutdown_committed);
+        let released =
+            handle_restart_admission(&ctx, &fence, MaintenanceAction::Release, peer.as_ref()).await;
+        assert!(released.success && !released.admission_closed);
+        assert!(
+            !restart_admission_snapshot(&ctx, false)
+                .await
+                .admission_closed
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_admission_shutdown_commits_before_notify_and_rejects_late_release() {
+        let ctx = make_test_context(WorkerPool::new());
+        let fence = acquire_test_maintenance(&ctx).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let peer = MaintenancePeer::capture(i32::try_from(std::process::id()).ok());
+        let committed = handle_shutdown(&ctx, &fence, true, peer.as_ref(), &sender).await;
+        assert!(committed.success && committed.shutdown_committed && committed.admission_closed);
+        assert_eq!(committed.status, "shutting_down");
+        receiver
+            .try_recv()
+            .expect("shutdown notification was delivered");
+        let refused =
+            handle_restart_admission(&ctx, &fence, MaintenanceAction::Release, peer.as_ref()).await;
+        assert!(!refused.success);
+        assert_eq!(refused.status, "shutdown_committed");
+        assert!(refused.admission_closed && refused.shutdown_committed);
+    }
+
+    #[tokio::test]
+    async fn restart_admission_release_does_not_report_open_after_history_write_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let non_directory = directory.path().join("not-a-directory");
+        std::fs::write(&non_directory, "a regular file").unwrap();
+        let mut ctx = make_test_context(WorkerPool::new());
+        ctx.history =
+            Arc::new(BuildHistory::new(10).with_persistence(non_directory.join("history.jsonl")));
+        let failure = ctx
+            .history
+            .try_start_active_build_with_wrapper(
+                "test-project".into(),
+                "test-worker".into(),
+                "cargo test".into(),
+                std::process::id(),
+                Some("rchw-test".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+            )
+            .unwrap_err();
+        let fence = acquire_test_maintenance(&ctx).await;
+        let response = handle_restart_admission(
+            &ctx,
+            &fence,
+            MaintenanceAction::Release,
+            MaintenancePeer::capture(i32::try_from(std::process::id()).ok()).as_ref(),
+        )
+        .await;
+        assert!(!response.success && response.admission_closed && response.ownership_failed);
+        assert_eq!(response.status, "ownership_failed");
+        assert!(!response.maintenance_closed && response.maintenance_owner.is_none());
+        assert_eq!(
+            response.ownership_error.as_deref(),
+            Some(failure.to_string().as_str())
+        );
+        let verified = restart_admission_snapshot(&ctx, false).await;
+        assert!(verified.ownership_failed && verified.admission_closed);
+        assert_eq!(verified.ownership_error, response.ownership_error);
     }
 
     #[tokio::test]
@@ -7758,25 +8534,105 @@ mod tests {
     #[test]
     fn test_parse_request_shutdown() {
         let _guard = test_guard!();
-        let req = parse_request("POST /shutdown").unwrap();
-        assert!(matches!(req, ApiRequest::Shutdown));
+        assert!(parse_request("POST /shutdown").is_err());
+        let query = format!(
+            "daemon_incarnation={}&token={}",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let req = parse_request(&format!("POST /shutdown?{query}")).unwrap();
+        assert!(matches!(req, ApiRequest::Shutdown { force: false, .. }));
+        let req = parse_request(&format!("POST /shutdown?{query}&force=true")).unwrap();
+        assert!(matches!(req, ApiRequest::Shutdown { force: true, .. }));
     }
 
     #[test]
     fn test_parse_request_restart_admission_routes() {
         let _guard = test_guard!();
+        let query = format!(
+            "daemon_incarnation={}&token={}",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let owner_record = "6a5a0649-d23a-4d74-b542-85f5e69de721:42";
+        assert!(parse_request("POST /restart-admission").is_err());
+        assert!(parse_request("POST /restart-admission/release").is_err());
+        assert!(parse_request(&format!("POST /restart-admission?{query}")).is_err());
         assert!(matches!(
-            parse_request("POST /restart-admission").unwrap(),
-            ApiRequest::RestartAdmission { close: true }
+            parse_request(&format!(
+                "POST /restart-admission?{query}&owner_identity={owner_record}"
+            ))
+            .unwrap(),
+            ApiRequest::RestartAdmission {
+                action: MaintenanceAction::Acquire { owner_identity, .. },
+                ..
+            } if owner_identity.to_record().as_deref() == Some(owner_record)
         ));
         assert!(matches!(
-            parse_request("POST /restart-admission/release").unwrap(),
-            ApiRequest::RestartAdmission { close: false }
+            parse_request(&format!("POST /restart-admission/release?{query}")).unwrap(),
+            ApiRequest::RestartAdmission {
+                action: MaintenanceAction::Release,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_request(&format!("POST /restart-admission/renew?{query}")).unwrap(),
+            ApiRequest::RestartAdmission {
+                action: MaintenanceAction::Renew,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_request(&format!("POST /restart-admission/recover?{query}")).unwrap(),
+            ApiRequest::RestartAdmission {
+                action: MaintenanceAction::Recover,
+                ..
+            }
         ));
         assert!(matches!(
             parse_request("GET /restart-admission").unwrap(),
             ApiRequest::RestartAdmissionStatus
         ));
+        assert!(
+            parse_request(&format!(
+                "POST /restart-admission?{query}&token={}",
+                Uuid::new_v4()
+            ))
+            .is_err()
+        );
+        assert!(parse_request("POST /restart-admission?daemon_incarnation=bad&token=bad").is_err());
+        for record in [
+            "",
+            "unknown",
+            "6a5a0649-d23a-4d74-b542-85f5e69de721:042",
+            "6a5a0649-d23a-4d74-b542-85f5e69de721:darwin:100:1000000",
+        ] {
+            assert!(
+                parse_request(&format!(
+                    "POST /restart-admission?{query}&owner_identity={record}"
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            parse_request(&format!(
+                "POST /restart-admission?{query}&owner_identity={owner_record}&owner_identity={owner_record}"
+            ))
+            .is_err()
+        );
+        for endpoint in [
+            "/shutdown",
+            "/restart-admission/renew",
+            "/restart-admission/release",
+            "/restart-admission/recover",
+        ] {
+            assert!(
+                parse_request(&format!(
+                    "POST {endpoint}?{query}&owner_identity={owner_record}"
+                ))
+                .is_err()
+            );
+        }
     }
 
     #[test]

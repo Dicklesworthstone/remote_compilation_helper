@@ -13075,7 +13075,8 @@ async fn a_finished_restart_admission_wait_hands_the_lease_back_to_admission() {
         ),
     )
     .await
-    .expect("one closed poll must finish");
+    .expect("one closed poll must finish")
+    .expect("wait ownership must be durable");
     server.await.unwrap();
     assert_eq!(outcome, RestartAdmissionWait::Open);
     let snapshot = lease.snapshot();
@@ -13084,6 +13085,158 @@ async fn a_finished_restart_admission_wait_hands_the_lease_back_to_admission() {
         snapshot.heartbeat_unix_ms > 0,
         "the hand-back is a heartbeat"
     );
+}
+
+#[tokio::test]
+async fn restart_admission_wait_publication_failure_prevents_the_first_probe() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let lease_dir = retained.join("leases");
+    std::fs::create_dir(&lease_dir).unwrap();
+    let lease = queued_selection_test_lease(lease_dir.join("lease.json"));
+    let before = lease.snapshot();
+    // Preserve the real journal, but make its publication pathname unusable.
+    // This fails even when tests run as root; it does not rely on permissions.
+    let preserved = retained.join("preserved-leases");
+    std::fs::rename(&lease_dir, &preserved).unwrap();
+    std::fs::write(&lease_dir, b"not a directory").unwrap();
+    assert!(
+        await_restart_admission(
+            socket.to_str().unwrap(),
+            &lease,
+            &HookReporter::new(OutputVisibility::None),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(lease.snapshot(), before);
+    let durable: DurableJobLease =
+        serde_json::from_slice(&std::fs::read(preserved.join("lease.json")).unwrap()).unwrap();
+    assert_eq!(durable, before);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn restart_admission_open_probe_cannot_bypass_a_failed_durable_phase_handoff() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let lease_dir = retained.join("leases");
+    std::fs::create_dir(&lease_dir).unwrap();
+    let lease = queued_selection_test_lease(lease_dir.join("lease.json"));
+    let preserved = retained.join("preserved-leases");
+    let server_preserved = preserved.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut request = String::new();
+        TokioBufReader::new(reader)
+            .read_line(&mut request)
+            .await
+            .unwrap();
+        assert!(request.starts_with("GET /restart-admission"));
+        std::fs::rename(&lease_dir, &server_preserved).unwrap();
+        std::fs::write(&lease_dir, b"not a directory").unwrap();
+        writer
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"admission_closed\":false}")
+            .await
+            .unwrap();
+    });
+    let result = await_restart_admission(
+        socket.to_str().unwrap(),
+        &lease,
+        &HookReporter::new(OutputVisibility::None),
+    )
+    .await;
+    server.await.unwrap();
+    assert!(
+        result.is_err(),
+        "IPC readiness cannot replace durable phase publication"
+    );
+    let durable: DurableJobLease =
+        serde_json::from_slice(&std::fs::read(preserved.join("lease.json")).unwrap()).unwrap();
+    assert_eq!(durable.phase, "restart_admission_wait");
+    assert_eq!(lease.snapshot(), durable);
+    assert!(durable.identity.remote_build_id.is_none() && durable.worker_id.is_none());
+}
+
+#[tokio::test]
+async fn an_interrupted_restart_admission_probe_keeps_only_preadmission_wait_ownership() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let lease = queued_selection_test_lease(retained.join("lease.json"));
+    let waiting_lease = lease.clone();
+    let waiting = tokio::spawn(async move {
+        await_restart_admission(
+            socket.to_str().unwrap(),
+            &waiting_lease,
+            &HookReporter::new(OutputVisibility::None),
+        )
+        .await
+    });
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("hook must issue its first admission probe")
+        .unwrap();
+    let mut request = String::new();
+    let mut reader = TokioBufReader::new(stream);
+    reader.read_line(&mut request).await.unwrap();
+    assert!(request.starts_with("GET /restart-admission"));
+    let observed = read_retry_lease(&lease);
+    assert_eq!(observed.phase, "restart_admission_wait");
+    assert!(observed.identity.remote_build_id.is_none());
+    assert!(observed.worker_id.is_none() && observed.recovery.is_none());
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert_eq!(read_retry_lease(&lease), observed);
+    assert!(
+        !observed.terminal_acknowledged,
+        "interruption is not completion evidence"
+    );
+}
+
+#[test]
+fn restart_wait_cannot_conceal_active_or_uncertain_source_ownership() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    for scenario in ["admitted", "source", "pending", "unconfirmed", "terminal"] {
+        let lease = queued_selection_test_lease(retained.join(format!("{scenario}.json")));
+        match scenario {
+            "admitted" => lease.admit(42, &WorkerId::new("builder")).unwrap(),
+            "source" => lease
+                .set_recovery(serde_json::json!({"source_released": false}))
+                .unwrap(),
+            "pending" => lease.heartbeat("selection_pending").unwrap(),
+            "unconfirmed" => lease.heartbeat("selection_unconfirmed").unwrap(),
+            "terminal" => lease.confirm_failed_before_admission().unwrap(),
+            _ => unreachable!(),
+        }
+        let before = read_retry_lease(&lease);
+        assert!(lease.begin_restart_admission_wait().is_err(), "{scenario}");
+        assert_eq!(read_retry_lease(&lease), before, "{scenario}");
+    }
+}
+
+#[test]
+fn refused_restart_preadmission_wait_retires_the_lease_without_a_remote_exit() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let lease = queued_selection_test_lease(retained.join("lease.json"));
+    lease.begin_restart_admission_wait().unwrap();
+    lease.confirm_failed_before_admission().unwrap();
+    let terminal = read_retry_lease(&lease);
+    assert_eq!(
+        terminal.state,
+        rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission
+    );
+    assert!(terminal.terminal_acknowledged);
+    assert!(terminal.exit_code.is_none());
+    assert!(terminal.identity.remote_build_id.is_none());
+    assert!(lease.begin_restart_admission_wait().is_err());
 }
 
 #[test]

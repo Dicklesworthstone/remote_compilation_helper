@@ -27,11 +27,24 @@ if '--rch' in sys.argv:
     del sys.argv[position:position + 2]
 
 DAEMON = r'''
-import json, os, signal, socket, sys, time
-path, mode, ready, marker = sys.argv[1:]
+import json, os, signal, socket, struct, sys, time, uuid
+from urllib.parse import parse_qs
+path, mode, ready, marker, prepared = sys.argv[1:]
+incarnation = str(uuid.uuid4())
+maintenance_owner = None
+shutdown_committed = prepared == 'true'
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 listener.bind(path)
 listener.listen(8)
+def admission_snapshot():
+    state = 'shutting_down' if shutdown_committed else 'owned' if maintenance_owner else 'open'
+    return {'success': True, 'status': state, 'message': None,
+        'daemon_incarnation': incarnation, 'admission_closed': maintenance_owner is not None or shutdown_committed,
+        'maintenance_closed': maintenance_owner is not None, 'ownership_failed': False,
+        'ownership_error': None, 'shutdown_committed': shutdown_committed,
+        'maintenance_owner': maintenance_owner, 'last_recovery': None,
+        'restart_permitted': False, 'active_build_ids': [41], 'queued_build_ids': [],
+        'client_lease_ids': [], 'client_lease_scan_error': None}
 def term(_sig, _frame):
     with open(marker, 'a') as output:
         output.write('TERM\n')
@@ -45,8 +58,14 @@ def term(_sig, _frame):
             output.write('replacement evidence')
     sys.exit(0)
 signal.signal(signal.SIGTERM, term)
-with open(ready, 'w') as output:
-    output.write(str(os.getpid()))
+with open(ready + '-pending', 'w') as output:
+    with open('/proc/sys/kernel/random/boot_id') as source:
+        boot = source.read().strip()
+    with open('/proc/self/stat') as source:
+        ticks = int(source.read().rsplit(')', 1)[1].split()[19])
+    json.dump({'pid': os.getpid(), 'identity': '%s:%d' % (boot, ticks),
+               'incarnation': incarnation}, output)
+os.rename(ready + '-pending', ready)
 while True:
     peer, _ = listener.accept()
     try:
@@ -56,8 +75,33 @@ while True:
             if not chunk:
                 break
             request.extend(chunk)
-        if request == b'POST /restart-admission\n':
-            peer.sendall(b'HTTP/1.1 200 OK\r\n\r\n{"restart_permitted":false,"active_build_ids":[41],"queued_build_ids":[],"client_lease_ids":[]}')
+        method, target = request.decode().strip().split(' ', 1)
+        route, _, query = target.partition('?')
+        if route.startswith('/restart-admission') or route == '/shutdown':
+            params = parse_qs(query)
+            if method == 'POST':
+                assert params['daemon_incarnation'] == [incarnation]
+                token = params['token'][0]
+                peer_pid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+                if route == '/restart-admission':
+                    with open('/proc/sys/kernel/random/boot_id') as source:
+                        boot = source.read().strip()
+                    with open('/proc/%d/stat' % peer_pid) as source:
+                        ticks = int(source.read().rsplit(')', 1)[1].split()[19])
+                    assert params['owner_identity'] == ['%s:%d' % (boot, ticks)]
+                    maintenance_owner = {'token': token, 'pid': peer_pid, 'purpose': 'stop',
+                        'generation': 1, 'acquired_unix_ms': 1, 'deadline_unix_ms': 9999999999999,
+                        'remaining_ms': 30000, 'owner_presence': 'live',
+                        'process_identity': {'boot_id': boot, 'start': {'platform': 'linux', 'ticks': ticks}}}
+                else:
+                    assert maintenance_owner['token'] == token and maintenance_owner['pid'] == peer_pid
+                    if route == '/restart-admission/release':
+                        maintenance_owner = None
+                    elif route == '/shutdown':
+                        assert params.get('force') == ['true']
+                        shutdown_committed = True
+            admission = admission_snapshot()
+            peer.sendall(b'HTTP/1.1 200 OK\r\n\r\n' + json.dumps(admission).encode())
             continue
         if request != b'GET /status\n':
             raise RuntimeError('unexpected mutating request: ' + repr(request))
@@ -74,6 +118,7 @@ while True:
                'workers': [], 'active_builds': [], 'recent_builds': [], 'issues': [],
                'stats': {'total_builds': 0, 'success_count': 0, 'failure_count': 0,
                          'remote_count': 0, 'local_count': 0, 'avg_duration_ms': 0}}
+        obj['admission'] = admission_snapshot()
         if mode == 'wrong_pid': obj['daemon']['pid'] = pid + 1
         if mode == 'zero_pid': obj['daemon']['pid'] = 0
         if mode == 'boolean_pid': obj['daemon']['pid'] = True
@@ -99,13 +144,13 @@ while True:
 
 
 class Fixture:
-    def __init__(self, directory, mode='normal', name='daemon.sock'):
+    def __init__(self, directory, mode='normal', name='daemon.sock', committed=True):
         self.path = Path(directory) / name
         self.ready = Path(directory) / (name + '-ready')
         self.marker = Path(directory) / (name + '-signals')
         self.child = subprocess.Popen(
             [sys.executable, '-I', '-S', '-c', DAEMON, str(self.path), mode,
-             str(self.ready), str(self.marker)],
+             str(self.ready), str(self.marker), str(committed).lower()],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 5
         while not self.ready.exists():
@@ -115,6 +160,9 @@ class Fixture:
                 self.close()
                 raise AssertionError('fixture startup deadline')
             time.sleep(.005)
+        evidence = json.loads(self.ready.read_text())
+        self.identity = evidence['identity']
+        self.incarnation = evidence['incarnation']
 
     def close(self):
         if self.child.poll() is None:
@@ -130,7 +178,8 @@ class Fixture:
 
 
 def bounded_stop(fixture):
-    return force.stop(str(fixture.path), fixture.child.pid, .2, .3)
+    return force.stop(str(fixture.path), fixture.child.pid, fixture.identity,
+                      fixture.incarnation, .2, .3)
 
 
 @unittest.skipUnless(sys.platform == 'linux' and hasattr(os, 'pidfd_open'), 'Linux pidfd required')
@@ -151,7 +200,7 @@ class NativeForceStop(unittest.TestCase):
                     script = guarded / name
                     script.write_text('#!/bin/sh\nprintf attempted >> "$RCH_TEST_GUARD"\nexit 99\n')
                     script.chmod(0o700)
-                with Fixture(root, mode) as daemon, Fixture(root, name='peer.sock') as peer:
+                with Fixture(root, mode, committed=False) as daemon, Fixture(root, name='peer.sock') as peer:
                     env = {'PATH': str(guarded), 'HOME': str(root),
                            'RCH_CONFIG_DIR': str(config), 'RCH_SOCKET_PATH': str(daemon.path),
                            'RCH_TEST_GUARD': str(log), 'XDG_CONFIG_HOME': str(root / 'xdg'),
@@ -190,7 +239,8 @@ class NativeForceStop(unittest.TestCase):
     def test_cli_emits_only_the_bound_terminal_receipt(self):
         with tempfile.TemporaryDirectory() as root, Fixture(root) as daemon:
             output = subprocess.run([sys.executable, '-I', '-S', str(HELPER), str(daemon.path),
-                                     str(daemon.child.pid)], capture_output=True, timeout=20)
+                                     str(daemon.child.pid), daemon.identity, daemon.incarnation],
+                                    capture_output=True, timeout=20)
             self.assertEqual(output.returncode, 0, output.stderr)
             self.assertEqual(output.stderr, b'')
             self.assertEqual(output.stdout, f'RCH_DAEMON_STOPPED_V1:{daemon.child.pid}\n'.encode())
@@ -210,17 +260,54 @@ class NativeForceStop(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             with Fixture(root) as daemon, Fixture(root, name='other.sock') as other:
                 with self.assertRaisesRegex(ValueError, 'another process'):
-                    force.stop(str(daemon.path), other.child.pid, .2, .3)
+                    force.stop(str(daemon.path), other.child.pid, other.identity,
+                               other.incarnation, .2, .3)
                 for process in (daemon, other):
                     self.assertIsNone(process.child.poll())
                     self.assertFalse(process.marker.exists())
                     self.assertTrue(process.path.exists())
 
+    def test_recycled_pid_or_old_boot_identity_cannot_signal_the_live_replacement(self):
+        with tempfile.TemporaryDirectory() as root, Fixture(root) as daemon:
+            boot, ticks = daemon.identity.split(':')
+            previous_boot = ('00000000-0000-0000-0000-000000000001'
+                             if boot != '00000000-0000-0000-0000-000000000001'
+                             else '00000000-0000-0000-0000-000000000002')
+            for abandoned in [f'{boot}:{int(ticks) + 1}', f'{previous_boot}:{ticks}']:
+                with self.subTest(identity=abandoned), self.assertRaises(ValueError):
+                    force.stop(str(daemon.path), daemon.child.pid, abandoned,
+                               daemon.incarnation, .2, .3)
+                self.assertIsNone(daemon.child.poll())
+                self.assertFalse(daemon.marker.exists())
+                self.assertTrue(daemon.path.exists())
+
+    def test_other_incarnation_or_uncommitted_shutdown_never_authorizes_a_signal(self):
+        with tempfile.TemporaryDirectory() as root, Fixture(root) as daemon:
+            with self.assertRaises(ValueError):
+                force.stop(str(daemon.path), daemon.child.pid, daemon.identity,
+                           '00000000-0000-0000-0000-000000000001', .2, .3)
+            self.assertIsNone(daemon.child.poll())
+            self.assertFalse(daemon.marker.exists())
+        with tempfile.TemporaryDirectory() as root, Fixture(root, committed=False) as daemon:
+            with self.assertRaises(ValueError):
+                bounded_stop(daemon)
+            self.assertIsNone(daemon.child.poll())
+            self.assertFalse(daemon.marker.exists())
+
+    def test_uncertain_birth_identity_never_authorizes_a_signal(self):
+        with tempfile.TemporaryDirectory() as root, Fixture(root) as daemon:
+            for unknown in ['', 'unknown', '0:1', daemon.identity.split(':')[0] + ':unknown']:
+                with self.subTest(identity=unknown), self.assertRaises(ValueError):
+                    force.stop(str(daemon.path), daemon.child.pid, unknown,
+                               daemon.incarnation, .2, .3)
+            self.assertIsNone(daemon.child.poll())
+            self.assertFalse(daemon.marker.exists())
+
     def test_special_pids_cannot_select_a_process_group_or_the_invoker(self):
         with tempfile.TemporaryDirectory() as root, Fixture(root) as daemon:
             for pid in [0, 1, -1, -daemon.child.pid, os.getpid(), os.getppid(), True]:
                 with self.subTest(pid=pid), self.assertRaises(ValueError):
-                    force.stop(str(daemon.path), pid, .2, .3)
+                    force.stop(str(daemon.path), pid, daemon.identity, daemon.incarnation, .2, .3)
             self.assertIsNone(daemon.child.poll())
             self.assertFalse(daemon.marker.exists())
 
@@ -238,7 +325,7 @@ class NativeForceStop(unittest.TestCase):
                     signal.pidfd_send_signal(handle, signal.SIGTERM, None, 0)
                 self.assertIsNone(daemon.child.poll())
                 with self.assertRaises(ProcessLookupError):
-                    force.stop(str(daemon.path), pid, .2, .3)
+                    force.stop(str(daemon.path), pid, daemon.identity, daemon.incarnation, .2, .3)
                 self.assertFalse(daemon.marker.exists())
         finally:
             os.close(handle)
@@ -248,7 +335,7 @@ class NativeForceStop(unittest.TestCase):
             link = Path(root) / 'link.sock'
             link.symlink_to(daemon.path)
             with self.assertRaises(ValueError):
-                force.stop(str(link), daemon.child.pid, .2, .3)
+                force.stop(str(link), daemon.child.pid, daemon.identity, daemon.incarnation, .2, .3)
             self.assertTrue(link.is_symlink())
             self.assertFalse(daemon.marker.exists())
         with tempfile.TemporaryDirectory() as root, Fixture(root, 'replace_before_term') as daemon:
@@ -286,7 +373,8 @@ class NativeForceStop(unittest.TestCase):
                                         (str(daemon.path), .2, float('nan')),
                                         (str(daemon.path) + '\n', .2, .3)]:
                 with self.assertRaises(ValueError):
-                    force.stop(path, daemon.child.pid, request, wait)
+                    force.stop(path, daemon.child.pid, daemon.identity, daemon.incarnation,
+                               request, wait)
             saved = force.os.pidfd_open
             del force.os.pidfd_open
             try:

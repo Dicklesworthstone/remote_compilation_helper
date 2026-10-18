@@ -1388,7 +1388,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
+            admission_barrier: Arc::new(tokio::sync::RwLock::new(
+                crate::restart_admission::RestartAdmissionState::default(),
+            )),
         }
     }
 
