@@ -134,10 +134,28 @@ The fixture starts the real wrapper, daemon, TLS worker and rustc. It compares
 every result's metadata, dep-info and diagnostics with stock rustc under the
 same Cargo-shaped invocation, uses durable worker receipts to distinguish
 remote production from cache replay, and checks later sampling and an
-environment-driven key change. It invokes the actual wrapper with Cargo-shaped
-arguments; the operator command above exercises Cargo itself. The fixture is
-explicitly ignored by default and must be run to establish execution evidence
-for a particular host; its presence does not assert a successful remote run.
+environment-driven key change.
+
+A second fixture lets actual Cargo choose the compiler arguments, working
+directory, jobserver and loader environment. It builds a generated vendored
+registry dependency and a consuming library entirely offline:
+
+```sh
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test prepared_operation_live \
+    actual_offline_cargo_check_uses_remote_leaf_then_replays \
+    -- --ignored --nocapture
+```
+
+That case compares both crates' metadata and dep-info bytes with stock Cargo at
+the same output paths, follows Cargo's artifact messages across target layouts,
+and requires actual remote worker receipts followed by qualified cache replay.
+It selects the installed Cargo and its matching compiler explicitly; ordinary
+rustup-based Cargo use can select that compiler itself. Both integration
+fixtures are ignored by default and must be run on the supported host to
+establish execution evidence. Their presence alone does not assert a successful
+RABS remote run.
 
 ## Run one delivery
 

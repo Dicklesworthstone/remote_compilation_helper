@@ -519,3 +519,316 @@ fn live_wrapper_remote_leaf_matches_stock_and_samples_replay() {
     );
     live.daemon.terminate();
 }
+
+const CARGO_CONSUMER: &str = "cargo_remote_consumer";
+
+struct CargoRun {
+    leaf: Run,
+    files: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    diagnostics: Vec<Value>,
+}
+
+impl CargoRun {
+    fn matches_stock(&self, stock: &Self) {
+        assert_eq!(
+            self.files, stock.files,
+            "actual Cargo changed the leaf or its consuming crate's metadata/dep-info"
+        );
+        assert_eq!(
+            self.diagnostics, stock.diagnostics,
+            "actual Cargo compiler diagnostics changed"
+        );
+    }
+}
+
+impl LiveFixture {
+    fn prepare_cargo_consumer(&mut self) {
+        let root = self.fixture.owner.path();
+        let vendor = root.join("vendor");
+        fs::create_dir(&vendor).unwrap();
+        let package = vendor.join("remote_leaf-1.0.0");
+        fs::rename(&self.package, &package).unwrap();
+        self.package = package;
+        // The same valid offline directory-source setup is exercised by
+        // rabs-wrap/tests/live_cargo_worktrees.rs. Its empty checksum map is
+        // not a source identity: the daemon still retains every package file.
+        fs::write(
+            self.package.join(".cargo-checksum.json"),
+            "{\"files\":{}}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("home")).unwrap();
+        fs::write(
+            root.join("cargo-home/config.toml"),
+            format!(
+                "[source.crates-io]\nreplace-with='fixture'\n\
+                 [source.fixture]\ndirectory={}\n[net]\noffline=true\n",
+                serde_json::to_string(vendor.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        let consumer = root.join("consumer");
+        fs::create_dir_all(consumer.join("src")).unwrap();
+        fs::write(
+            consumer.join("Cargo.toml"),
+            format!(
+                "[package]\nname='{CARGO_CONSUMER}'\nversion='0.1.0'\nedition='2024'\n\
+                 [dependencies]\nremote_leaf='=1.0.0'\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            consumer.join("src/lib.rs"),
+            b"pub const FLAVOR: &str = remote_leaf::FLAVOR;\n\
+              pub const JOBS: Option<&str> = remote_leaf::JOBS;\n\
+              pub const MANIFEST: &str = remote_leaf::MANIFEST;\n\
+              pub const HERE: &str = remote_leaf::HERE;\n\
+              pub const INCLUDED: &str = remote_leaf::INCLUDED;\n\
+              const _: [(); remote_leaf::INCLUDED.len()] = [(); 32];\n",
+        )
+        .unwrap();
+    }
+
+    fn cargo_check(&self, wrapped: bool) -> CargoRun {
+        let number = self.sequence.get();
+        self.sequence.set(number + 1);
+        let root = self.fixture.owner.path();
+        let target = root.join("consumer/target");
+        // Recreate the whole target so Cargo must schedule the leaf again.
+        // Keep its original path, source paths and lockfile fixed; archives are
+        // outside every target/loader root, including Cargo's per-unit layouts.
+        fs::rename(&target, root.join(format!("cargo-target-{number}"))).unwrap();
+        fs::create_dir(&target).unwrap();
+        let toolchain = self.compiler.parent().and_then(Path::parent).unwrap();
+        let mut cargo = Command::new(toolchain.join("bin/cargo"));
+        cargo
+            .current_dir(root.join("consumer"))
+            .args(["check", "--offline", "--jobs=1", "--message-format=json"])
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", root.join("home"))
+            .env("CARGO_HOME", root.join("cargo-home"))
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TERM_COLOR", "never")
+            .env("LANG", "C.UTF-8")
+            .env("DEPENDENCY_FLAVOR", FLAVOR)
+            .env("LD_LIBRARY_PATH", toolchain.join("lib"))
+            // This fixture invokes the installed Cargo directly. Explicitly
+            // select its matching compiler instead of depending on a rustup
+            // shim in the test runner's inherited PATH.
+            .env("RUSTC", &self.compiler);
+        for (name, value) in self.environment(FLAVOR) {
+            if name.starts_with("RABS_") {
+                cargo.env(name, value);
+            }
+        }
+        if wrapped {
+            cargo.env("RUSTC_WRAPPER", &self.wrapper);
+        }
+        let before = self.events().len();
+        let mut process = Process::spawn(root, &format!("actual-cargo-{number}"), &mut cargo);
+        assert!(
+            process.wait(Duration::from_secs(660)).success(),
+            "cargo={}; daemon={}; worker={}",
+            String::from_utf8_lossy(&read_log(&process.stderr)),
+            String::from_utf8_lossy(&read_log(&self.daemon.stderr)),
+            String::from_utf8_lossy(&read_log(&self.worker.stderr))
+        );
+        let messages: Vec<Value> = String::from_utf8(read_log(&process.stdout))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("actual Cargo JSON message"))
+            .collect();
+        let finished: Vec<_> = messages
+            .iter()
+            .filter(|message| message["reason"] == "build-finished")
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0]["success"], true);
+
+        // Follow Cargo's artifact JSON instead of guessing target/debug/deps:
+        // newer Cargo also uses target/debug/build/<crate>/<unit>/out.
+        let mut files = std::collections::BTreeMap::new();
+        let mut leaf_metadata = None;
+        for name in [PACKAGE_NAME, CARGO_CONSUMER] {
+            let artifacts: Vec<_> = messages
+                .iter()
+                .filter(|message| {
+                    message["reason"] == "compiler-artifact" && message["target"]["name"] == name
+                })
+                .collect();
+            assert_eq!(
+                artifacts.len(),
+                1,
+                "missing actual Cargo artifact for {name}"
+            );
+            assert_eq!(
+                artifacts[0]["fresh"], false,
+                "the clean target must schedule {name}, not Cargo's own fresh reuse"
+            );
+            let metadata: Vec<_> = artifacts[0]["filenames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "rmeta")
+                })
+                .collect();
+            assert_eq!(metadata.len(), 1);
+            let metadata = &metadata[0];
+            let stem = metadata
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_prefix("lib"))
+                .and_then(|name| name.strip_suffix(".rmeta"))
+                .expect("Cargo's real library metadata filename");
+            let dep_info = metadata.with_file_name(format!("{stem}.d"));
+            for path in [metadata, &dep_info] {
+                let bytes = fs::read(path).unwrap();
+                assert!(!bytes.is_empty(), "empty actual compiler output: {path:?}");
+                if name == PACKAGE_NAME && path == metadata {
+                    leaf_metadata = Some(bytes.clone());
+                }
+                let relative = path
+                    .strip_prefix(&target)
+                    .expect("Cargo output belongs to its configured target")
+                    .to_path_buf();
+                assert!(files.insert(relative, bytes).is_none());
+            }
+        }
+        assert_eq!(files.len(), 4);
+        let diagnostics = messages
+            .into_iter()
+            .filter(|message| message["reason"] == "compiler-message")
+            .collect();
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let events = loop {
+            let all_events = self.events();
+            let current = &all_events[before..];
+            let leaf_keys: std::collections::BTreeSet<_> = current
+                .iter()
+                .filter(|event| event["crate"] == PACKAGE_NAME)
+                .filter_map(|event| event["key"].as_str())
+                .collect();
+            let events: Vec<_> = current
+                .iter()
+                .filter(|event| {
+                    // Admission logs name the crate, while terminal publication
+                    // and serving logs carry only its action key.
+                    (event["kind"] == "rabsd-live-dependency"
+                        && (event["crate"] == PACKAGE_NAME
+                            || event["key"]
+                                .as_str()
+                                .is_some_and(|key| leaf_keys.contains(key))))
+                        || matches!(
+                            event["kind"].as_str(),
+                            Some(
+                                "rabsd-remote-dependency-executed"
+                                    | "rabsd-remote-dependency-failed"
+                                    | "rabsd-remote-dependency-install-failed"
+                            )
+                        )
+                })
+                .cloned()
+                .collect();
+            let local = events.iter().any(|event| event["decision"] == "execute");
+            let settled = events.iter().any(|event| {
+                matches!(
+                    event["decision"].as_str(),
+                    Some("committed" | "verified" | "quarantined" | "not-published" | "refused")
+                )
+            });
+            if !local || settled {
+                break events;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Cargo leaf did not settle: {events:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed")
+            )),
+            "actual Cargo remote failure is not a successful oracle: {events:?}"
+        );
+        CargoRun {
+            leaf: Run {
+                events,
+                metadata: leaf_metadata.unwrap(),
+            },
+            files,
+            diagnostics,
+        }
+    }
+}
+
+/// Run with the same prebuilt worker/wrapper prerequisites as the first oracle:
+///
+///     cargo test -p rabsd --test prepared_operation_live \
+///       actual_offline_cargo_check_uses_remote_leaf_then_replays \
+///       -- --ignored --nocapture
+///
+/// This invokes actual Cargo, which chooses rustc argv, cwd, jobserver and
+/// loader environment. It makes no hand-built compiler invocation.
+#[test]
+#[ignore = "requires Linux isolation and matching RABS_TEST_WORKER_BIN/RABS_TEST_WRAP_BIN; actual offline Cargo plus daemon/worker"]
+fn actual_offline_cargo_check_uses_remote_leaf_then_replays() {
+    let mut live = LiveFixture::new();
+    live.prepare_cargo_consumer();
+    let stock = live.cargo_check(false);
+    assert!(stock.leaf.events.is_empty());
+
+    let until = Instant::now() + Duration::from_secs(1200);
+    let first = loop {
+        let run = live.cargo_check(true);
+        run.matches_stock(&stock);
+        if run.leaf.remote_key().is_some() {
+            break run;
+        }
+        assert!(
+            run.leaf.events.iter().any(|event| {
+                event["decision"] == "remote-ineligible"
+                    && event["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("warming"))
+            }),
+            "actual Cargo never reached toolchain preparation/remote admission: {:?}",
+            run.leaf.events
+        );
+        assert!(
+            Instant::now() < until,
+            "actual Cargo toolchain never warmed"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let key = first.leaf.assert_remote(None).to_owned();
+    let mut receipt = live.worker_receipt();
+    for _ in 0..2 {
+        let run = live.cargo_check(true);
+        run.matches_stock(&stock);
+        run.leaf.assert_remote(Some(&key));
+        let next = live.worker_receipt();
+        assert!(
+            next["request_id"].as_u64().unwrap() > receipt["request_id"].as_u64().unwrap(),
+            "each qualification observation must execute the actual worker"
+        );
+        receipt = next;
+    }
+    let hit = live.cargo_check(true);
+    hit.matches_stock(&stock);
+    hit.leaf.assert_hit(&key);
+    assert_eq!(
+        live.worker_receipt(),
+        receipt,
+        "qualified Cargo replay unexpectedly executed a worker"
+    );
+    live.daemon.terminate();
+}
