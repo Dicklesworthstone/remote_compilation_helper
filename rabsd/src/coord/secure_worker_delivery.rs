@@ -54,7 +54,7 @@ pub type WorkerAdmissionHook =
 
 /// Negotiation tag for the dependency execution extension. Keeping the
 /// transport selector here lets older workers refuse safely before upload.
-pub(crate) const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v1";
+pub(crate) use rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION;
 
 const ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFER_BUDGET: Duration = Duration::from_secs(5 * 60);
@@ -277,11 +277,16 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
             && self.expected_operation.get("dependency_context").is_some();
         if dependency_context {
             require(
-                self.expected_operation["dependency_context"]["version"] == DEPENDENCY_CONTEXT_VERSION
-                    && hello["dependency_contexts"].as_array().is_some_and(|versions| {
-                        versions.iter().any(|version| version == DEPENDENCY_CONTEXT_VERSION)
-                    }),
-                "worker lacks required dependency-exec-v1 execution context",
+                self.expected_operation["dependency_context"]["version"]
+                    == DEPENDENCY_CONTEXT_VERSION
+                    && hello["dependency_contexts"]
+                        .as_array()
+                        .is_some_and(|versions| {
+                            versions
+                                .iter()
+                                .any(|version| version == DEPENDENCY_CONTEXT_VERSION)
+                        }),
+                "worker lacks the required dependency execution context",
             )?;
         }
         require(
@@ -1772,8 +1777,19 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(peer.authentication().is_some());
-        assert!(peer.inner.sent.iter().any(|frame| frame["kind"] == "source-begin"));
-        assert!(!peer.inner.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+        assert!(
+            peer.inner
+                .sent
+                .iter()
+                .any(|frame| frame["kind"] == "source-begin")
+        );
+        assert!(
+            !peer
+                .inner
+                .sent
+                .iter()
+                .any(|frame| frame["kind"] == "canonical-exec")
+        );
         assert!(peer.negotiate(&offered, &grant()).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         peer.send(&request).unwrap();
@@ -1803,7 +1819,8 @@ mod tests {
             "worker",
             &delivery.path().join("private-delivery"),
             DeliveryMode::Execute,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(!error.execution_may_have_run);
         assert!(!error.transport_interrupted);
         assert!(error.detail.contains("live action lease was superseded"));
@@ -1811,7 +1828,11 @@ mod tests {
         assert!(peer.authentication().is_none());
         assert!(peer.send(&request).is_err());
         assert_eq!(
-            peer.inner.sent.iter().map(|frame| frame["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+            peer.inner
+                .sent
+                .iter()
+                .map(|frame| frame["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             ["session-challenge"]
         );
         assert!(peer.negotiate(&offered, &grant()).is_err());
@@ -1853,7 +1874,12 @@ mod tests {
             let offered = peer.receive().unwrap();
             assert!(peer.negotiate(&offered, &grant()).is_err(), "case {case}");
             assert_eq!(calls.load(Ordering::SeqCst), 0, "case {case}");
-            assert!(peer.inner.sent.iter().all(|frame| frame["kind"] == "session-challenge"));
+            assert!(
+                peer.inner
+                    .sent
+                    .iter()
+                    .all(|frame| frame["kind"] == "session-challenge")
+            );
             assert!(peer.send(&request).is_err());
         }
     }
@@ -1946,7 +1972,7 @@ mod tests {
                 1 => script.replies[0]["dependency_contexts"] = json!(["dependency-exec-v0"]),
                 2 => {
                     script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
-                    request["dependency_context"]["version"] = json!("dependency-exec-v2");
+                    request["dependency_context"]["version"] = json!("dependency-exec-v999");
                 }
                 _ => script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]),
             }
@@ -1970,8 +1996,16 @@ mod tests {
                 outcome.unwrap();
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 assert_eq!(peer.inner.sent[1]["kind"], "session-ok");
-                assert_eq!(peer.inner.sent[1]["dependency_context"], DEPENDENCY_CONTEXT_VERSION);
-                assert!(peer.inner.sent.iter().any(|frame| frame["kind"] == "source-begin"));
+                assert_eq!(
+                    peer.inner.sent[1]["dependency_context"],
+                    DEPENDENCY_CONTEXT_VERSION
+                );
+                assert!(
+                    peer.inner
+                        .sent
+                        .iter()
+                        .any(|frame| frame["kind"] == "source-begin")
+                );
                 peer.send(&request).unwrap();
                 assert_eq!(peer.inner.sent.last().unwrap(), &request);
             }

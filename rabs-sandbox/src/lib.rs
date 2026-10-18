@@ -43,6 +43,7 @@ pub mod equality_suite;
 pub mod external_inputs;
 pub mod layout;
 pub mod leak_scanner;
+pub mod loader_directories;
 pub mod metadata_policy;
 pub mod network_isolation;
 pub mod observation;

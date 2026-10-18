@@ -176,39 +176,84 @@ pub fn parse_dependency_context(
     if request.get("command_context").is_some() {
         return Err("dependency_context and command_context are mutually exclusive".to_owned());
     }
-    let object = value.as_object().ok_or("dependency_context must be an object")?;
+    let object = value
+        .as_object()
+        .ok_or("dependency_context must be an object")?;
     const REQUIRED: &[&str] = &[
-        "version", "source_root", "cwd", "toolchain_root", "compiler", "out_dir", "env",
+        "version",
+        "source_root",
+        "cwd",
+        "toolchain_root",
+        "compiler",
+        "out_dir",
+        "env",
         "runtime_cohort_sha256",
     ];
     if REQUIRED.iter().any(|field| !object.contains_key(*field))
-        || object.keys().any(|field| !REQUIRED.contains(&field.as_str()) && field != "dependency_dirs")
-        || object.get("version").and_then(serde_json::Value::as_str) != Some(DEPENDENCY_CONTEXT_VERSION)
+        || object.keys().any(|field| {
+            !REQUIRED.contains(&field.as_str())
+                && field != "dependency_dirs"
+                && field != "loader_dirs"
+        })
+        || object.get("version").and_then(serde_json::Value::as_str)
+            != Some(DEPENDENCY_CONTEXT_VERSION)
     {
         return Err("dependency_context requires supported exact fields".to_owned());
     }
     let text = |field: &str| -> Result<String, String> {
-        object.get(field).and_then(serde_json::Value::as_str).map(str::to_owned)
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
             .ok_or_else(|| format!("dependency_context {field} must be a string"))
     };
-    let env = object.get("env").and_then(serde_json::Value::as_array)
+    let env = object
+        .get("env")
+        .and_then(serde_json::Value::as_array)
         .filter(|values| values.len() <= MAX_DEPENDENCY_ENV_ENTRIES)
         .ok_or("dependency_context env must be a bounded array of name/value pairs")?
-        .iter().map(|value| {
-            let pair = value.as_array().filter(|pair| pair.len() == 2)
+        .iter()
+        .map(|value| {
+            let pair = value
+                .as_array()
+                .filter(|pair| pair.len() == 2)
                 .ok_or("dependency_context env requires name/value pairs")?;
-            Ok((pair[0].as_str().ok_or("dependency environment name must be a string")?.to_owned(),
-                pair[1].as_str().ok_or("dependency environment value must be a string")?.to_owned()))
-        }).collect::<Result<Vec<_>, String>>()?;
-    let dirs = match object.get("dependency_dirs") {
-        None => Vec::new(),
-        Some(value) => value.as_array().filter(|paths| paths.len() <= MAX_DEPENDENCY_DIRS)
-            .ok_or("dependency_dirs must be a bounded array")?.iter().map(|path| {
-                path.as_str().map(str::to_owned).ok_or_else(|| "dependency directory must be a string".to_owned())
-            }).collect::<Result<Vec<_>, _>>()?,
+            Ok((
+                pair[0]
+                    .as_str()
+                    .ok_or("dependency environment name must be a string")?
+                    .to_owned(),
+                pair[1]
+                    .as_str()
+                    .ok_or("dependency environment value must be a string")?
+                    .to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let directories = |field: &str| -> Result<Vec<String>, String> {
+        match object.get(field) {
+            None => Ok(Vec::new()),
+            Some(value) => value
+                .as_array()
+                .filter(|paths| paths.len() <= MAX_DEPENDENCY_DIRS)
+                .ok_or_else(|| format!("{field} must be a bounded array"))?
+                .iter()
+                .map(|path| {
+                    path.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("{field} entries must be strings"))
+                })
+                .collect(),
+        }
     };
+    let dirs = directories("dependency_dirs")?;
+    let loader_dirs = directories("loader_dirs")?;
     let digest = text("runtime_cohort_sha256")?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err("dependency runtime cohort must be lowercase SHA-256".to_owned());
     }
     let mut runtime_cohort = [0u8; 32];
@@ -216,9 +261,19 @@ pub fn parse_dependency_context(
         *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
-    DependencyExecContext::new(text("source_root")?, text("cwd")?, text("toolchain_root")?,
-        text("compiler")?, text("out_dir")?, dirs, env, runtime_cohort)
-        .map(Some).map_err(|error| error.to_string())
+    DependencyExecContext::new_with_loader_dirs(
+        text("source_root")?,
+        text("cwd")?,
+        text("toolchain_root")?,
+        text("compiler")?,
+        text("out_dir")?,
+        dirs,
+        loader_dirs,
+        env,
+        runtime_cohort,
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 /// The result of one canonical execution — an OFFER, never a commit.
@@ -465,10 +520,16 @@ fn verify_dependency_runtime(
     artifacts: Option<&PreparedArtifacts>,
 ) -> Result<(), String> {
     let artifacts = artifacts.ok_or("dependency runtime check lacks private output storage")?;
-    let loader_paths = context.loader_search_paths(toolchain.root()).map_err(|error| error.to_string())?;
+    let loader_paths = context
+        .loader_search_paths(toolchain.root())
+        .map_err(|error| error.to_string())?;
     let observed = rabs_sandbox::runtime_cohort::observe_runtime_cohort(
-        &toolchain.root().join("bin/rustc"), toolchain.root(), &loader_paths, artifacts.backing(),
-    ).map_err(|error| error.to_string())?;
+        &toolchain.root().join("bin/rustc"),
+        toolchain.root(),
+        &loader_paths,
+        artifacts.backing(),
+    )
+    .map_err(|error| error.to_string())?;
     if observed.bytes != *context.runtime_cohort_sha256() {
         return Err("measured host runtime differs from the dependency context".to_owned());
     }
@@ -521,11 +582,13 @@ fn execute_canonical_inner(
         })
     );
     if request.dependency_context.is_some()
-        && (source.is_none() || request.toolchain_identity.is_none()
+        && (source.is_none()
+            || request.toolchain_identity.is_none()
             || request.command_context != CommandContext::default())
     {
         let _ = control.retain_outputs(Err(
-            "dependency execution requires owned source, pinned toolchain and exclusive context".to_owned(),
+            "dependency execution requires owned source, pinned toolchain and exclusive context"
+                .to_owned(),
         ));
         return exec_error(request.request_id);
     }
@@ -547,24 +610,34 @@ fn execute_canonical_inner(
     // persistent canonical HOME by a prior command. Only this fresh owner and
     // its jobserver FIFO are visible at the runtime mount, until drains resolve.
     let dependency_home = if request.dependency_context.is_some() {
-        match tempfile::Builder::new().prefix("rabs-dependency-home-").tempdir() {
+        match tempfile::Builder::new()
+            .prefix("rabs-dependency-home-")
+            .tempdir()
+        {
             Ok(directory) => Some(directory),
             Err(error) => {
-                let _ = control.retain_outputs(Err(format!("dependency runtime preparation: {error}")));
+                let _ =
+                    control.retain_outputs(Err(format!("dependency runtime preparation: {error}")));
                 return exec_error(request.request_id);
             }
         }
     } else {
         None
     };
-    let execution_home = dependency_home.as_ref().map_or(home_backing, |directory| directory.path());
+    let execution_home = dependency_home
+        .as_ref()
+        .map_or(home_backing, |directory| directory.path());
     // This fresh empty tree is a separate owner: exposing it under writable
     // HOME as well would let a compiler populate a supposedly empty input.
     let dependency_empty = if request.dependency_context.is_some() {
-        match tempfile::Builder::new().prefix("rabs-dependency-empty-").tempdir() {
+        match tempfile::Builder::new()
+            .prefix("rabs-dependency-empty-")
+            .tempdir()
+        {
             Ok(directory) => Some(directory),
             Err(error) => {
-                let _ = control.retain_outputs(Err(format!("dependency search preparation: {error}")));
+                let _ =
+                    control.retain_outputs(Err(format!("dependency search preparation: {error}")));
                 return exec_error(request.request_id);
             }
         }
@@ -574,31 +647,57 @@ fn execute_canonical_inner(
     let prepared_spec = (|| -> Result<_, String> {
         if let Some(context) = &request.dependency_context {
             let source = source.ok_or("dependency execution lacks its source owner")?;
-            let artifacts = artifacts.as_ref().ok_or("dependency execution requires declared outputs")?;
-            let empty = dependency_empty.as_ref().ok_or("dependency execution lacks its empty search owner")?;
-            let source_root = source.dependency_root(request.request_id).map_err(|error| error.to_string())?;
+            let artifacts = artifacts
+                .as_ref()
+                .ok_or("dependency execution requires declared outputs")?;
+            let empty = dependency_empty
+                .as_ref()
+                .ok_or("dependency execution lacks its empty search owner")?;
+            let source_root = source
+                .dependency_root(request.request_id)
+                .map_err(|error| error.to_string())?;
             // The runtime cohort probes the output materialization filesystem.
             // Both fresh trees normally share the temp parent; explicitly refuse
             // a different source filesystem instead of assuming its lookup rules.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                let source_device = std::fs::metadata(source_root).map_err(|error| error.to_string())?.dev();
-                let output_device = std::fs::metadata(artifacts.backing()).map_err(|error| error.to_string())?.dev();
+                let source_device = std::fs::metadata(source_root)
+                    .map_err(|error| error.to_string())?
+                    .dev();
+                let output_device = std::fs::metadata(artifacts.backing())
+                    .map_err(|error| error.to_string())?
+                    .dev();
                 if source_device != output_device {
-                    return Err("dependency source and output materialization filesystems differ".to_owned());
+                    return Err(
+                        "dependency source and output materialization filesystems differ"
+                            .to_owned(),
+                    );
                 }
             }
-            let spec = context.namespace(
-                source_root, toolchain.root(), artifacts.backing(), empty.path(), execution_home,
-            ).map_err(|error| error.to_string())?;
-            source.protect_dependency(request.request_id, context, &spec)
+            context
+                .prepare_empty_backings(empty.path())
+                .map_err(|error| format!("dependency loader mountpoints: {error}"))?;
+            let spec = context
+                .namespace(
+                    source_root,
+                    toolchain.root(),
+                    artifacts.backing(),
+                    empty.path(),
+                    execution_home,
+                )
+                .map_err(|error| error.to_string())?;
+            source
+                .protect_dependency(request.request_id, context, &spec)
                 .map_err(|error| format!("dependency source isolation: {error}"))?;
-            toolchain.validate_dependency_namespace(&spec, context)
+            toolchain
+                .validate_dependency_namespace(&spec, context)
                 .map_err(|error| format!("dependency toolchain isolation: {error}"))?;
-            let empty_root = std::fs::canonicalize(empty.path()).map_err(|error| error.to_string())?;
+            let empty_root =
+                std::fs::canonicalize(empty.path()).map_err(|error| error.to_string())?;
             for bind in &spec.rw_binds {
-                let root = std::fs::canonicalize(&bind.backing).map_err(|error| error.to_string())?;
+                let root =
+                    std::fs::canonicalize(&bind.backing).map_err(|error| error.to_string())?;
                 if root.starts_with(&empty_root) || empty_root.starts_with(&root) {
                     return Err("writable mount aliases empty dependency search storage".to_owned());
                 }
@@ -606,19 +705,26 @@ fn execute_canonical_inner(
             Ok(spec)
         } else {
             let mut plan = CanonicalMountPlan::new(
-                toolchain.root(), &request.workspace_backing, cargo_home_backing, home_backing,
+                toolchain.root(),
+                &request.workspace_backing,
+                cargo_home_backing,
+                home_backing,
             );
             if let Some(artifacts) = &artifacts {
                 plan.out_units.push(artifacts.mount());
             }
             let mut spec = plan.to_spec().map_err(|error| error.to_string())?;
-            request.command_context.apply_to(&mut spec)
+            request
+                .command_context
+                .apply_to(&mut spec)
                 .map_err(|error| format!("command context: {error}"))?;
             if let Some(source) = source {
-                source.protect_workspace(request.request_id, &mut spec)
+                source
+                    .protect_workspace(request.request_id, &mut spec)
                     .map_err(|error| format!("source mount isolation: {error}"))?;
             }
-            toolchain.validate_namespace(&spec)
+            toolchain
+                .validate_namespace(&spec)
                 .map_err(|error| format!("toolchain mount isolation: {error}"))?;
             Ok(spec)
         }
@@ -642,7 +748,11 @@ fn execute_canonical_inner(
     let launch = if let Some(context) = &request.dependency_context {
         crate::jobserver::JobserverBridge::apply_dependency(&mut spec.env, &bridge);
         rabs_sandbox::dependency_context::build_dependency_argv(
-            context, &spec, &support, &request.program, &request.args,
+            context,
+            &spec,
+            &support,
+            &request.program,
+            &request.args,
         )
     } else {
         crate::jobserver::JobserverBridge::apply(&mut spec.env, &bridge);
@@ -678,7 +788,9 @@ fn execute_canonical_inner(
     if let Some(context) = &request.dependency_context
         && let Err(error) = verify_dependency_runtime(context, &toolchain, artifacts.as_ref())
     {
-        let _ = control.retain_outputs(Err(format!("dependency runtime pre-execution verification: {error}")));
+        let _ = control.retain_outputs(Err(format!(
+            "dependency runtime pre-execution verification: {error}"
+        )));
         return exec_error(request.request_id);
     }
     // Verification may have spent the remaining lease or execution budget.
@@ -719,10 +831,13 @@ fn execute_canonical_inner(
             }
             if control.reason().is_none()
                 && let Some(context) = &request.dependency_context
-                && let Err(error) = verify_dependency_runtime(context, &toolchain, artifacts.as_ref())
+                && let Err(error) =
+                    verify_dependency_runtime(context, &toolchain, artifacts.as_ref())
                 && control.reason().is_none()
             {
-                let _ = control.retain_outputs(Err(format!("dependency runtime post-execution verification: {error}")));
+                let _ = control.retain_outputs(Err(format!(
+                    "dependency runtime post-execution verification: {error}"
+                )));
                 return exec_error(request.request_id);
             }
             // Cleanup precedes both diagnostic and artifact capture. The outer
@@ -756,9 +871,8 @@ fn execute_canonical_inner(
                 match (stream_digest(&output.stdout), stream_digest(&output.stderr)) {
                     (Ok(s), Ok(e)) => (s, e),
                     (Err(error), _) | (_, Err(error)) => {
-                        let _ = control.retain_outputs(Err(format!(
-                            "diagnostic digest capture: {error}"
-                        )));
+                        let _ = control
+                            .retain_outputs(Err(format!("diagnostic digest capture: {error}")));
                         return exec_error(request.request_id);
                     }
                 }

@@ -1,4 +1,4 @@
-//! Real daemon/worker/TLS oracle for the dependency-exec-v1 contract.
+//! Real daemon/worker/TLS oracle for the dependency-exec-v2 contract.
 //!
 //! Run on Linux with usable bubblewrap/user namespaces and OpenSSL:
 //!
@@ -58,31 +58,41 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
 
     let fixture = Fixture::new();
     let source = fixture.owner.path().join("dependency-source");
-    let out = fixture.owner.path().join("dependency-target");
+    let out = fixture.owner.path().join("dependency-target/debug/deps");
+    let loader_parent = out.parent().unwrap().to_path_buf();
     let empty_search = fixture.owner.path().join("empty-dependency-search");
     fs::create_dir_all(source.join("src")).unwrap();
-    fs::create_dir(&out).unwrap();
+    fs::create_dir_all(&out).unwrap();
     fs::create_dir(&empty_search).unwrap();
     for (relative, bytes) in FILES {
         fs::write(source.join(relative), bytes).unwrap();
     }
     let loader = toolchain.join("lib");
     let environment = vec![
-        ("CARGO_MANIFEST_DIR".to_owned(), source.to_str().unwrap().to_owned()),
-        ("DEPENDENCY_FLAVOR".to_owned(), "spaces \"quotes\" $HOME\n雪".to_owned()),
-        ("LD_LIBRARY_PATH".to_owned(), loader.to_str().unwrap().to_owned()),
+        (
+            "CARGO_MANIFEST_DIR".to_owned(),
+            source.to_str().unwrap().to_owned(),
+        ),
+        (
+            "DEPENDENCY_FLAVOR".to_owned(),
+            "spaces \"quotes\" $HOME\n雪".to_owned(),
+        ),
+        (
+            "LD_LIBRARY_PATH".to_owned(),
+            format!(
+                "{}:{}:{}",
+                out.display(),
+                loader_parent.display(),
+                loader.display()
+            ),
+        ),
     ];
     assert!(
         environment.iter().all(|(name, _)| name != "NUM_JOBS"),
         "the actual worker must preserve the absent option_env! observation"
     );
-    let cohort = observe_runtime_cohort(
-        &compiler,
-        &toolchain,
-        std::slice::from_ref(&loader),
-        &out,
-    )
-    .expect("the real host runtime must be representable by the measured cohort");
+    let cohort = observe_runtime_cohort(&compiler, &toolchain, std::slice::from_ref(&loader), &out)
+        .expect("the real host runtime must be representable by the measured cohort");
     let cohort_hex: String = cohort
         .bytes
         .iter()
@@ -110,7 +120,11 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
         .envs(environment.iter().map(|(name, value)| (name, value)))
         .current_dir(&source)
         .args(&args);
-    let mut stock = Process::spawn(fixture.owner.path(), "stock-dependency-rustc", &mut stock_command);
+    let mut stock = Process::spawn(
+        fixture.owner.path(),
+        "stock-dependency-rustc",
+        &mut stock_command,
+    );
     assert!(
         stock.wait(Duration::from_secs(90)).success(),
         "stock compiler failed: {}",
@@ -128,7 +142,7 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
     // directory empty before dispatch. The worker must bind its private output
     // here and must never write this subscriber-owned physical directory.
     fs::rename(&out, fixture.owner.path().join("retained-stock-target")).unwrap();
-    fs::create_dir(&out).unwrap();
+    fs::create_dir_all(&out).unwrap();
 
     let job = Job {
         id: format!("{:032x}", 5_u64),
@@ -154,6 +168,7 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
             "compiler":compiler,
             "out_dir":out,
             "dependency_dirs":[out, empty_search],
+            "loader_dirs":[out, loader_parent],
             "env":environment,
             "runtime_cohort_sha256":cohort_hex,
         },
@@ -164,11 +179,23 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
     assert_eq!(prepared["publication_authorized"], false);
     let request_bytes = fs::read(job.bundle.join("request.json")).unwrap();
     let request: Value = serde_json::from_slice(&request_bytes).unwrap();
-    assert_eq!(request["dependency_context"], specification["dependency_context"]);
+    assert_eq!(
+        request["dependency_context"],
+        specification["dependency_context"]
+    );
     assert_eq!(request["program"], specification["program"]);
     assert_eq!(request["args"], specification["args"]);
-    for field in ["source_files", "toolchain_source", "workspace_backing", "toolchain_backing", "command_context"] {
-        assert!(request.get(field).is_none(), "unexpected execution field {field}");
+    for field in [
+        "source_files",
+        "toolchain_source",
+        "workspace_backing",
+        "toolchain_backing",
+        "command_context",
+    ] {
+        assert!(
+            request.get(field).is_none(),
+            "unexpected execution field {field}"
+        );
     }
     assert!(request["toolchain_transfer"].is_string());
     assert!(request["toolchain_identity"].is_object());
@@ -200,10 +227,20 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
             fixture.owner.path().join("dependency-worker-state"),
         )
         .env("RABS_WORKER_TLS_CA", &fixture.certificates.worker.ca)
-        .env("RABS_WORKER_TLS_CERT", &fixture.certificates.worker.certificate)
-        .env("RABS_WORKER_TLS_KEY", &fixture.certificates.worker.private_key)
+        .env(
+            "RABS_WORKER_TLS_CERT",
+            &fixture.certificates.worker.certificate,
+        )
+        .env(
+            "RABS_WORKER_TLS_KEY",
+            &fixture.certificates.worker.private_key,
+        )
         .env("RABS_WORKER_TLS_SERVER_NAME", "localhost");
-    let mut worker = Process::spawn(fixture.owner.path(), "dependency-worker", &mut worker_command);
+    let mut worker = Process::spawn(
+        fixture.owner.path(),
+        "dependency-worker",
+        &mut worker_command,
+    );
     let completed = fixture.wait_for(&job, Duration::from_secs(360), |status| {
         !matches!(
             status["state"].as_str(),
@@ -260,8 +297,14 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
         fixture.operation(&fixture.submission(&job))["state"],
         "completed"
     );
-    assert_eq!(fs::read(job.bundle.join("request.json")).unwrap(), request_bytes);
-    assert_eq!(fs::read(job.delivery.join("delivery.json")).unwrap(), receipt);
+    assert_eq!(
+        fs::read(job.bundle.join("request.json")).unwrap(),
+        request_bytes
+    );
+    assert_eq!(
+        fs::read(job.delivery.join("delivery.json")).unwrap(),
+        receipt
+    );
     for (name, bytes) in expected {
         assert_eq!(fs::read(job.output.join(name)).unwrap(), bytes);
     }

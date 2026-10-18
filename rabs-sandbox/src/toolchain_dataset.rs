@@ -655,7 +655,10 @@ mod linux {
             source: &Path,
             stopped: &impl Fn() -> bool,
         ) -> io::Result<()> {
-            require(source == self.root_path, "toolchain source witness names another root")?;
+            require(
+                source == self.root_path,
+                "toolchain source witness names another root",
+            )?;
             self.verify(stopped)?;
             // Stamp checks cover all regular bytes without reading them again.
             // Keep link text explicit because it defines the exported alias
@@ -673,7 +676,8 @@ mod linux {
                     require(
                         target.to_bytes() == expected.as_bytes()
                             && Stamp::of(&held.metadata()?) == entry.stamp
-                            && Stamp::of(&self.open(path, OFlags::PATH)?.metadata()?) == entry.stamp,
+                            && Stamp::of(&self.open(path, OFlags::PATH)?.metadata()?)
+                                == entry.stamp,
                         "toolchain source alias changed during validation",
                     )?;
                 }
@@ -693,7 +697,10 @@ mod linux {
                 }
             }
             checkpoint(stopped)?;
-            let original = self.entries.get("").ok_or_else(|| invalid("missing toolchain root stamp"))?;
+            let original = self
+                .entries
+                .get("")
+                .ok_or_else(|| invalid("missing toolchain root stamp"))?;
             require(
                 Stamp::of(&fs::symlink_metadata(source)?) == original.stamp,
                 "toolchain source root changed during validation",

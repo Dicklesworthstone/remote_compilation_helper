@@ -386,44 +386,69 @@ fn real_dependency_rustc_preserves_paths_env_and_stock_metadata() {
     fn wait(mut task: ExecutionTask) -> Result<ExecutionCompletion, String> {
         struct Signal(std::thread::Thread);
         impl Wake for Signal {
-            fn wake(self: Arc<Self>) { self.0.unpark(); }
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
         }
         let waker = Waker::from(Arc::new(Signal(std::thread::current())));
         let mut context = Context::from_waker(&waker);
         let mut future = std::pin::pin!(task.wait());
         let deadline = Instant::now() + Duration::from_secs(300);
         loop {
-            if let Poll::Ready(result) = future.as_mut().poll(&mut context) { return result; }
-            assert!(Instant::now() < deadline, "dependency worker execution timed out");
+            if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
+                return result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dependency worker execution timed out"
+            );
             std::thread::park_timeout(Duration::from_millis(10));
         }
     }
 
-    if !namespace_supported() { return; }
-    let cargo = std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo supplies its path")).unwrap();
+    if !namespace_supported() {
+        return;
+    }
+    let cargo =
+        std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo supplies its path")).unwrap();
     let host_toolchain = cargo.parent().and_then(Path::parent).unwrap();
     let toolchain = stage_minimal_rustc(host_toolchain);
-    let identity = fingerprint_toolchain(toolchain.path(), &ToolchainLimits::default(), || false).unwrap();
+    let identity =
+        fingerprint_toolchain(toolchain.path(), &ToolchainLimits::default(), || false).unwrap();
     let source = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
+    let output_owner = tempfile::tempdir().unwrap();
+    let out = output_owner.path().join("target/debug/deps");
+    std::fs::create_dir_all(&out).unwrap();
+    let loader_parent = out.parent().unwrap().to_path_buf();
     let empty_search = tempfile::tempdir().unwrap();
     std::fs::create_dir(source.path().join("src")).unwrap();
     let files: [(&str, &[u8]); 2] = [
-        ("src/lib.rs", br#"pub const FLAVOR: &str = env!("DEPENDENCY_FLAVOR");
+        (
+            "src/lib.rs",
+            br#"pub const FLAVOR: &str = env!("DEPENDENCY_FLAVOR");
 pub const JOBS: Option<&str> = option_env!("NUM_JOBS");
 pub const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 pub const HERE: &str = file!();
 pub const INCLUDED: &str = include_str!("message.txt");
-"#),
+"#,
+        ),
         ("src/message.txt", b"immutable included source\n"),
     ];
     for (name, bytes) in files {
         std::fs::write(source.path().join(name), bytes).unwrap();
     }
-    let manifest = SourceManifest::new(files.iter().map(|(path, bytes)| SourceFile {
-        path:(*path).to_owned(), len:bytes.len() as u64,
-        sha256:Sha256::digest(bytes).into(), executable:false,
-    }).collect()).unwrap();
+    let manifest = SourceManifest::new(
+        files
+            .iter()
+            .map(|(path, bytes)| SourceFile {
+                path: (*path).to_owned(),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(bytes).into(),
+                executable: false,
+            })
+            .collect(),
+    )
+    .unwrap();
     let manifest_json = json!({
         "manifest_sha256":hex(&manifest.digest()),
         "files":files.iter().map(|(path, bytes)| json!({
@@ -431,74 +456,173 @@ pub const INCLUDED: &str = include_str!("message.txt");
         })).collect::<Vec<_>>(),
     });
     let visible_toolchain = toolchain.path().to_str().unwrap().to_owned();
-    let compiler = toolchain.path().join("bin/rustc").to_str().unwrap().to_owned();
+    let compiler = toolchain
+        .path()
+        .join("bin/rustc")
+        .to_str()
+        .unwrap()
+        .to_owned();
     let visible_source = source.path().to_str().unwrap().to_owned();
-    let visible_out = out.path().to_str().unwrap().to_owned();
+    let visible_out = out.as_path().to_str().unwrap().to_owned();
     let visible_empty = empty_search.path().to_str().unwrap().to_owned();
     let loader = toolchain.path().join("lib");
-    let cohort = observe_runtime_cohort(Path::new(&compiler), toolchain.path(), std::slice::from_ref(&loader), out.path()).unwrap();
+    let cohort = observe_runtime_cohort(
+        Path::new(&compiler),
+        toolchain.path(),
+        std::slice::from_ref(&loader),
+        out.as_path(),
+    )
+    .unwrap();
     let args = vec![
-        "--crate-name".to_owned(), "dependency_fixture".to_owned(), "--crate-type".to_owned(), "lib".to_owned(),
-        "--edition=2024".to_owned(), "--emit=dep-info,metadata".to_owned(),
-        "-L".to_owned(), format!("dependency={visible_out}"),
-        "-L".to_owned(), format!("dependency={visible_empty}"),
-        "--out-dir".to_owned(), visible_out.clone(), "src/lib.rs".to_owned(),
+        "--crate-name".to_owned(),
+        "dependency_fixture".to_owned(),
+        "--crate-type".to_owned(),
+        "lib".to_owned(),
+        "--edition=2024".to_owned(),
+        "--emit=dep-info,metadata".to_owned(),
+        "-L".to_owned(),
+        format!("dependency={visible_out}"),
+        "-L".to_owned(),
+        format!("dependency={visible_empty}"),
+        "--out-dir".to_owned(),
+        visible_out.clone(),
+        "src/lib.rs".to_owned(),
     ];
     for (iteration, number) in [None, Some(""), Some("19")].into_iter().enumerate() {
         let mut env = vec![
             ("CARGO_MANIFEST_DIR".to_owned(), visible_source.clone()),
-            ("DEPENDENCY_FLAVOR".to_owned(), "spaces \"quotes\" $HOME\n雪".to_owned()),
-            ("LD_LIBRARY_PATH".to_owned(), loader.to_str().unwrap().to_owned()),
+            (
+                "DEPENDENCY_FLAVOR".to_owned(),
+                "spaces \"quotes\" $HOME\n雪".to_owned(),
+            ),
+            (
+                "LD_LIBRARY_PATH".to_owned(),
+                format!(
+                    "{}:{}:{}",
+                    out.display(),
+                    loader_parent.display(),
+                    loader.display()
+                ),
+            ),
         ];
-        if let Some(number) = number { env.push(("NUM_JOBS".to_owned(), number.to_owned())); }
-        let stock = std::process::Command::new(&compiler).args(&args).env_clear()
-            .envs(env.iter().map(|(name, value)| (name, value))).current_dir(source.path()).output().unwrap();
-        assert!(stock.status.success(), "{}", String::from_utf8_lossy(&stock.stderr));
-        let expected = ["dependency_fixture.d", "libdependency_fixture.rmeta"].into_iter()
-            .map(|name| (name.to_owned(), std::fs::read(out.path().join(name)).unwrap()))
+        if let Some(number) = number {
+            env.push(("NUM_JOBS".to_owned(), number.to_owned()));
+        }
+        let stock = std::process::Command::new(&compiler)
+            .args(&args)
+            .env_clear()
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .current_dir(source.path())
+            .output()
+            .unwrap();
+        assert!(
+            stock.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stock.stderr)
+        );
+        let expected = ["dependency_fixture.d", "libdependency_fixture.rmeta"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    std::fs::read(out.as_path().join(name)).unwrap(),
+                )
+            })
             .collect::<Vec<_>>();
         let request_id = 425_000 + iteration as u64;
         let wire = json!({"kind":"canonical-exec","request_id":request_id,"source_manifest":manifest_json});
         let mut transfer = SourceTransferState::default();
-        transfer.handle(&json!({"kind":"source-begin","request_id":request_id,"manifest":manifest_json}), true, false).unwrap();
+        transfer
+            .handle(
+                &json!({"kind":"source-begin","request_id":request_id,"manifest":manifest_json}),
+                true,
+                false,
+            )
+            .unwrap();
         for (name, bytes) in files {
             transfer.handle(&json!({"kind":"source-chunk","request_id":request_id,
                 "manifest_sha256":hex(&manifest.digest()),"path":name,"offset":0,"data_hex":hex(bytes),
                 "chunk_sha256":hex(&Sha256::digest(bytes))}), true, false).unwrap();
         }
-        transfer.handle(&json!({"kind":"source-seal","request_id":request_id,
-            "manifest_sha256":hex(&manifest.digest())}), true, false).unwrap();
+        transfer
+            .handle(
+                &json!({"kind":"source-seal","request_id":request_id,
+            "manifest_sha256":hex(&manifest.digest())}),
+                true,
+                false,
+            )
+            .unwrap();
         let source_owner = transfer.take_prepared(&wire).unwrap().unwrap();
-        let context = DependencyExecContext::new(
-            visible_source.clone(), visible_source.clone(), visible_toolchain.clone(),
-            compiler.clone(), visible_out.clone(), vec![visible_out.clone(), visible_empty.clone()],
-            env, cohort.bytes,
-        ).unwrap();
+        let context = DependencyExecContext::new_with_loader_dirs(
+            visible_source.clone(),
+            visible_source.clone(),
+            visible_toolchain.clone(),
+            compiler.clone(),
+            visible_out.clone(),
+            vec![visible_out.clone(), visible_empty.clone()],
+            vec![
+                visible_out.clone(),
+                loader_parent.to_str().unwrap().to_owned(),
+            ],
+            env,
+            cohort.bytes,
+        )
+        .unwrap();
         let request = CanonicalExecRequest {
-            request_id, program:compiler.clone(), args:args.clone(),
-            command_context:CommandContext::default(), dependency_context:Some(context),
-            toolchain_backing:visible_toolchain.clone(), toolchain_identity:Some(identity),
-            workspace_backing:String::new(), jobserver_grant:Some(3),
+            request_id,
+            program: compiler.clone(),
+            args: args.clone(),
+            command_context: CommandContext::default(),
+            dependency_context: Some(context),
+            toolchain_backing: visible_toolchain.clone(),
+            toolchain_identity: Some(identity),
+            workspace_backing: String::new(),
+            jobserver_grant: Some(3),
         };
         let cargo_home = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let spills = tempfile::tempdir().unwrap();
-        let task = ExecutionTask::spawn_with_artifacts(request_id, Duration::from_secs(240),
-            ArtifactPlan::new("dependency-fixture".into(), expected.iter().map(|(name, _)| name.clone()).collect()).unwrap(),
+        let task = ExecutionTask::spawn_with_artifacts(
+            request_id,
+            Duration::from_secs(240),
+            ArtifactPlan::new(
+                "dependency-fixture".into(),
+                expected.iter().map(|(name, _)| name.clone()).collect(),
+            )
+            .unwrap(),
             move |control| {
                 control.request_output_capture();
-                execute_uploaded_canonical_controlled(&request, cargo_home.path(), home.path(),
-                    4, spills.path(), &control, &source_owner)
-            }).unwrap();
+                execute_uploaded_canonical_controlled(
+                    &request,
+                    cargo_home.path(),
+                    home.path(),
+                    4,
+                    spills.path(),
+                    &control,
+                    &source_owner,
+                )
+            },
+        )
+        .unwrap();
         let mut completion = wait(task).expect("complete worker execution");
         assert!(completion.result.executed, "{:?}", completion.result);
         assert_eq!(completion.result.exit_code, 0);
         assert_eq!(completion.result.residual_group_members, 0);
-        let captured = completion.artifacts.as_mut().expect("private artifact capture");
+        let captured = completion
+            .artifacts
+            .as_mut()
+            .expect("private artifact capture");
         for (name, bytes) in expected {
-            assert_eq!(captured.read_chunk(&name, 0, bytes.len()).unwrap(), bytes, "{name} differs from stock rustc");
-            assert_eq!(std::fs::read(out.path().join(&name)).unwrap(), bytes,
-                "worker must not write the subscriber output directory");
+            assert_eq!(
+                captured.read_chunk(&name, 0, bytes.len()).unwrap(),
+                bytes,
+                "{name} differs from stock rustc"
+            );
+            assert_eq!(
+                std::fs::read(out.as_path().join(&name)).unwrap(),
+                bytes,
+                "worker must not write the subscriber output directory"
+            );
         }
     }
 }

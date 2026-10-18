@@ -45,16 +45,26 @@ impl fmt::Display for RuntimeCohortError {
 impl std::error::Error for RuntimeCohortError {}
 
 impl From<io::Error> for RuntimeCohortError {
-    fn from(error: io::Error) -> Self { Self::Io(error) }
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 /// Observe the host runtime used by one retained compiler.
 ///
-/// Paths are physical local paths. The loader search list contains only
-/// ordered directories inside the toolchain root, translated from the admitted
-/// invocation's LD_LIBRARY_PATH; private empty output/dependency entries are
-/// omitted. The adapter must refuse empty loader components, other LD_*
-/// controls and GLIBC_TUNABLES before supplying the actual execution environment.
+/// Paths are physical local paths. On the edge, supply the complete original
+/// ordered LD_LIBRARY_PATH alongside the original compiler/toolchain root,
+/// including independently witnessed safe output and parent directories.
+/// This preserves actual loader failures and selection: no source component
+/// is silently stripped before probing. Missing directories require a fresh
+/// absence check and remain in the probe's search string. On the worker,
+/// toolchain entries are rebased to its retained physical root; witnessed
+/// private-empty namespace aliases may be omitted from the physical probe.
+///
+/// Any library actually resolved outside the toolchain must still be in the
+/// read-only /usr runtime view. The adapter must separately refuse empty loader
+/// components, other LD_* controls and GLIBC_TUNABLES, and must retain and
+/// revalidate every non-toolchain loader-directory witness through execution.
 ///
 /// The filesystem root is a writable private staging directory on the source
 /// and output materialization filesystem. An owned child probes actual case,
@@ -75,11 +85,25 @@ pub fn observe_runtime_cohort(
     filesystem_root: &Path,
 ) -> Result<TypedDigest, RuntimeCohortError> {
     #[cfg(target_os = "linux")]
-    { linux::observe(compiler, toolchain_root, loader_search_paths, filesystem_root) }
+    {
+        linux::observe(
+            compiler,
+            toolchain_root,
+            loader_search_paths,
+            filesystem_root,
+        )
+    }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (compiler, toolchain_root, loader_search_paths, filesystem_root);
-        Err(RuntimeCohortError::Unsupported("Linux ELF runtime required"))
+        let _ = (
+            compiler,
+            toolchain_root,
+            loader_search_paths,
+            filesystem_root,
+        );
+        Err(RuntimeCohortError::Unsupported(
+            "Linux ELF runtime required",
+        ))
     }
 }
 
@@ -138,6 +162,48 @@ mod linux {
         bounded_read(crate::regular_input::open(Path::new(path))?, maximum).map_err(Into::into)
     }
 
+    fn validated_search_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RuntimeCohortError> {
+        if paths.len() > 128 {
+            return Err(invalid("too many loader search directories"));
+        }
+        let mut search = Vec::with_capacity(paths.len());
+        for path in paths {
+            let text = path
+                .to_str()
+                .ok_or_else(|| invalid("non-UTF-8 loader search directory"))?;
+            if !text.starts_with('/')
+                || text.len() <= 1
+                || text.len() > 4096
+                || text.contains(['\0', ':'])
+                || text[1..]
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(invalid(
+                    "loader search directory is not normalized and absolute",
+                ));
+            }
+            match fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err(invalid("loader search entry is not a directory")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // ENOENT through a dangling/foreign alias is not a retained
+                    // absence witness. The shared no-symlink observer confirms
+                    // missing input paths before ldd receives the exact list.
+                    crate::loader_directories::observe_loader_directories(
+                        &[text.to_owned()],
+                        || false,
+                    )?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            // Keep the original spelling and order. Canonicalizing/omitting a
+            // search entry here could change the compiler's actual lookup.
+            search.push(path.clone());
+        }
+        Ok(search)
+    }
+
     fn probe_targets(compiler: &Path, root: &Path) -> Result<Vec<PathBuf>, RuntimeCohortError> {
         // Backend DSOs may be dlopen-loaded even by a metadata-only compile.
         // Include their DT_NEEDED closure instead of assuming that ldd rustc
@@ -149,13 +215,18 @@ mod linux {
         match fs::read_dir(&rustlib) {
             Ok(entries) => {
                 for entry in entries {
-                    entries_left = entries_left.checked_sub(1)
+                    entries_left = entries_left
+                        .checked_sub(1)
                         .ok_or_else(|| invalid("runtime enumeration entry budget exhausted"))?;
                     let path = entry?.path().join("codegen-backends");
                     match fs::metadata(&path) {
                         Ok(metadata) if metadata.is_dir() => directories.push(path),
                         Ok(_) => return Err(invalid("codegen backend root is not a directory")),
-                        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                            ) => {}
                         Err(error) => return Err(error.into()),
                     }
                     if directories.len() > 128 {
@@ -173,18 +244,25 @@ mod linux {
                 Err(error) => return Err(error.into()),
             };
             for entry in entries {
-                entries_left = entries_left.checked_sub(1)
+                entries_left = entries_left
+                    .checked_sub(1)
                     .ok_or_else(|| invalid("runtime enumeration entry budget exhausted"))?;
                 let entry = entry?;
                 let name = entry.file_name();
-                let name = name.to_str().ok_or_else(|| invalid("non-UTF-8 runtime member name"))?;
-                if !name.starts_with("lib") || !name.contains(".so") { continue; }
+                let name = name
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF-8 runtime member name"))?;
+                if !name.starts_with("lib") || !name.contains(".so") {
+                    continue;
+                }
                 let path = fs::canonicalize(entry.path())?;
                 if !path.starts_with(root) || !fs::metadata(&path)?.is_file() {
                     return Err(invalid("runtime DSO leaves the retained toolchain"));
                 }
                 targets.insert(path);
-                if targets.len() > 32 { return Err(invalid("too many retained runtime DSOs")); }
+                if targets.len() > 32 {
+                    return Err(invalid("too many retained runtime DSOs"));
+                }
             }
         }
         Ok(targets.into_iter().collect())
@@ -232,8 +310,14 @@ mod linux {
             );
         }
         let mut child = command.spawn()?;
-        let stdout = child.stdout.take().ok_or_else(|| invalid("missing probe stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| invalid("missing probe stderr"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| invalid("missing probe stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| invalid("missing probe stderr"))?;
         let output_reader = std::thread::spawn(move || bounded_read(stdout, MAX_PROBE_BYTES));
         let error_reader = std::thread::spawn(move || bounded_read(stderr, MAX_PROBE_BYTES));
         let status = child.wait();
@@ -245,7 +329,9 @@ mod linux {
             return Err(invalid("ELF loader probe failed or exceeded its deadline"));
         }
         if !errors.is_empty() {
-            return Err(invalid("ELF loader probe reported unresolved runtime evidence"));
+            return Err(invalid(
+                "ELF loader probe reported unresolved runtime evidence",
+            ));
         }
         without_probe_headers(&output, targets)
     }
@@ -259,20 +345,32 @@ mod linux {
     fn libraries(stdout: &[u8]) -> Result<Vec<Library>, RuntimeCohortError> {
         let stdout = std::str::from_utf8(stdout).map_err(|_| invalid("non-UTF-8 loader output"))?;
         let mut result = BTreeMap::new();
-        for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let (entry, address) = line.rsplit_once(" (")
+        for line in stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let (entry, address) = line
+                .rsplit_once(" (")
                 .ok_or_else(|| invalid("unresolved or unsupported ELF loader output"))?;
-            address.strip_suffix(')')
+            address
+                .strip_suffix(')')
                 .and_then(|value| value.strip_prefix("0x"))
-                .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .filter(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
                 .ok_or_else(|| invalid("invalid ELF loader address"))?;
             if matches!(entry, "linux-vdso.so.1" | "linux-gate.so.1") {
                 continue; // Actual kernel ABI is bound below; ASLR is not.
             }
             let (name, path) = entry.split_once(" => ").unwrap_or((entry, entry));
-            if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_whitespace())
-                || !path.starts_with('/') || path.len() > 4096
-                || path.bytes().any(|byte| byte.is_ascii_whitespace() || byte == 0)
+            if name.is_empty()
+                || name.bytes().any(|byte| byte.is_ascii_whitespace())
+                || !path.starts_with('/')
+                || path.len() > 4096
+                || path
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte == 0)
             {
                 return Err(invalid("nonabsolute or unrepresentable ELF library path"));
             }
@@ -289,7 +387,10 @@ mod linux {
         if result.is_empty() {
             return Err(invalid("ELF loader did not report a runtime closure"));
         }
-        Ok(result.into_iter().map(|(name, path)| Library { name, path }).collect())
+        Ok(result
+            .into_iter()
+            .map(|(name, path)| Library { name, path })
+            .collect())
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -305,8 +406,11 @@ mod linux {
     impl Stamp {
         fn of(metadata: &fs::Metadata) -> Self {
             Self {
-                device: metadata.dev(), inode: metadata.ino(), size: metadata.len(),
-                mode: metadata.mode(), modified: (metadata.mtime(), metadata.mtime_nsec()),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+                mode: metadata.mode(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
                 changed: (metadata.ctime(), metadata.ctime_nsec()),
             }
         }
@@ -324,13 +428,17 @@ mod linux {
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let count = held.read(&mut buffer)?;
-            if count == 0 { break; }
-            copied = copied.checked_add(count as u64)
+            if count == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(count as u64)
                 .filter(|count| *count <= before.size)
                 .ok_or_else(|| invalid("runtime library grew during observation"))?;
             hasher.update(&buffer[..count]);
         }
-        if copied != before.size || Stamp::of(&held.metadata()?) != before
+        if copied != before.size
+            || Stamp::of(&held.metadata()?) != before
             || Stamp::of(&fs::metadata(path)?) != before
         {
             return Err(invalid("runtime library changed during observation"));
@@ -352,15 +460,34 @@ mod linux {
                 return Err(invalid("toolchain runtime member is not regular"));
             }
             append(&mut record, b"retained-toolchain");
-            append(&mut record, relative.to_str().ok_or_else(|| invalid("non-UTF-8 toolchain member"))?.as_bytes());
+            append(
+                &mut record,
+                relative
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF-8 toolchain member"))?
+                    .as_bytes(),
+            );
             if !library.name.starts_with('/') {
                 append(&mut record, library.name.as_bytes());
             }
         } else {
             append(&mut record, b"host-runtime");
             append(&mut record, library.name.as_bytes());
-            append(&mut record, library.path.to_str().ok_or_else(|| invalid("non-UTF-8 runtime path"))?.as_bytes());
-            append(&mut record, resolved.to_str().ok_or_else(|| invalid("non-UTF-8 resolved runtime path"))?.as_bytes());
+            append(
+                &mut record,
+                library
+                    .path
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF-8 runtime path"))?
+                    .as_bytes(),
+            );
+            append(
+                &mut record,
+                resolved
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF-8 resolved runtime path"))?
+                    .as_bytes(),
+            );
             append(&mut record, &external_bytes(&resolved, budget)?);
         }
         if fs::canonicalize(&library.path)? != resolved {
@@ -372,19 +499,44 @@ mod linux {
     fn cpu_profile(raw: &[u8]) -> Result<Vec<u8>, RuntimeCohortError> {
         let text = std::str::from_utf8(raw).map_err(|_| invalid("non-UTF-8 CPU identity"))?;
         let fields: &[&str] = match std::env::consts::ARCH {
-            "x86_64" => &["vendor_id", "cpu family", "model", "stepping", "model name", "flags"],
-            "aarch64" => &["CPU implementer", "CPU architecture", "CPU variant", "CPU part", "CPU revision", "Features"],
-            _ => return Err(RuntimeCohortError::Unsupported("unsupported CPU architecture")),
+            "x86_64" => &[
+                "vendor_id",
+                "cpu family",
+                "model",
+                "stepping",
+                "model name",
+                "flags",
+            ],
+            "aarch64" => &[
+                "CPU implementer",
+                "CPU architecture",
+                "CPU variant",
+                "CPU part",
+                "CPU revision",
+                "Features",
+            ],
+            _ => {
+                return Err(RuntimeCohortError::Unsupported(
+                    "unsupported CPU architecture",
+                ));
+            }
         };
         let mut profiles = BTreeSet::new();
         for block in text.split("\n\n") {
             let mut values = BTreeMap::new();
             for line in block.lines() {
-                let Some((name, value)) = line.split_once(':') else { continue };
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
                 let name = name.trim();
                 if fields.contains(&name) {
                     let normalized = if matches!(name, "flags" | "Features") {
-                        value.split_whitespace().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(" ")
+                        value
+                            .split_whitespace()
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .join(" ")
                     } else {
                         value.split_whitespace().collect::<Vec<_>>().join(" ")
                     };
@@ -393,7 +545,9 @@ mod linux {
                     }
                 }
             }
-            if values.is_empty() { continue; }
+            if values.is_empty() {
+                continue;
+            }
             if fields.iter().any(|name| !values.contains_key(name)) {
                 return Err(invalid("incomplete CPU model or feature identity"));
             }
@@ -409,7 +563,9 @@ mod linux {
         }
         let mut result = Vec::new();
         append(&mut result, std::env::consts::ARCH.as_bytes());
-        for profile in profiles { append(&mut result, &profile); }
+        for profile in profiles {
+            append(&mut result, &profile);
+        }
         Ok(result)
     }
 
@@ -418,11 +574,16 @@ mod linux {
     impl ProbeDirectory {
         fn new(parent: &Path) -> Result<Self, RuntimeCohortError> {
             if !parent.is_absolute() || !fs::metadata(parent)?.is_dir() {
-                return Err(invalid("filesystem probe requires a private absolute directory"));
+                return Err(invalid(
+                    "filesystem probe requires a private absolute directory",
+                ));
             }
             for _ in 0..64 {
                 let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
-                let path = parent.join(format!(".rabs-runtime-fs-{}-{sequence}", std::process::id()));
+                let path = parent.join(format!(
+                    ".rabs-runtime-fs-{}-{sequence}",
+                    std::process::id()
+                ));
                 match fs::DirBuilder::new().mode(0o700).create(&path) {
                     Ok(()) => return Ok(Self(path)),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -443,22 +604,41 @@ mod linux {
     fn filesystem_profile(root: &Path) -> Result<Vec<u8>, RuntimeCohortError> {
         let directory = ProbeDirectory::new(root)?;
         let path = directory.0.join("case");
-        let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
         if directory.0.join("CASE").try_exists()? {
-            return Err(RuntimeCohortError::Unsupported("case-sensitive filesystem required"));
+            return Err(RuntimeCohortError::Unsupported(
+                "case-sensitive filesystem required",
+            ));
         }
         let unicode = directory.0.join("u\u{e9}");
-        let _unicode_file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(unicode)?;
+        let _unicode_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(unicode)?;
         if directory.0.join("ue\u{301}").try_exists()? {
-            return Err(RuntimeCohortError::Unsupported("byte-distinct Unicode filenames required"));
+            return Err(RuntimeCohortError::Unsupported(
+                "byte-distinct Unicode filenames required",
+            ));
         }
-        let modified = UNIX_EPOCH + Duration::from_secs(1_600_000_000) + Duration::from_nanos(123_456_789);
+        let modified =
+            UNIX_EPOCH + Duration::from_secs(1_600_000_000) + Duration::from_nanos(123_456_789);
         file.set_times(FileTimes::new().set_modified(modified))?;
-        let observed = file.metadata()?.modified()?.duration_since(UNIX_EPOCH)
+        let observed = file
+            .metadata()?
+            .modified()?
+            .duration_since(UNIX_EPOCH)
             .map_err(|_| invalid("filesystem timestamp is not representable"))?;
         let statistics = rustix::fs::statfs(&directory.0).map_err(io::Error::from)?;
         let mut profile = Vec::new();
-        append(&mut profile, b"case-sensitive.unicode-bytes.regular-files.v1");
+        append(
+            &mut profile,
+            b"case-sensitive.unicode-bytes.regular-files.v1",
+        );
         append(&mut profile, statistics.f_type.to_string().as_bytes());
         append(&mut profile, statistics.f_namelen.to_string().as_bytes());
         append(&mut profile, &observed.as_secs().to_le_bytes());
@@ -472,7 +652,10 @@ mod linux {
         loader_search_paths: &[PathBuf],
         filesystem_root: &Path,
     ) -> Result<TypedDigest, RuntimeCohortError> {
-        if !compiler.is_absolute() || !toolchain_root.is_absolute() || loader_search_paths.len() > 128 {
+        if !compiler.is_absolute()
+            || !toolchain_root.is_absolute()
+            || loader_search_paths.len() > 128
+        {
             return Err(invalid("runtime paths must be absolute and bounded"));
         }
         let root = fs::canonicalize(toolchain_root)?;
@@ -485,24 +668,21 @@ mod linux {
         let mut magic = [0_u8; 4];
         executable.read_exact(&mut magic)?;
         if magic != *b"\x7fELF" {
-            return Err(RuntimeCohortError::Unsupported("compiler is not an ELF binary"));
+            return Err(RuntimeCohortError::Unsupported(
+                "compiler is not an ELF binary",
+            ));
         }
         match read_system("/etc/ld.so.preload", MAX_PROBE_BYTES) {
-            Ok(bytes) if bytes.iter().any(|byte| !byte.is_ascii_whitespace()) =>
-                return Err(RuntimeCohortError::Unsupported("global loader preloads are not exposed in the action namespace")),
+            Ok(bytes) if bytes.iter().any(|byte| !byte.is_ascii_whitespace()) => {
+                return Err(RuntimeCohortError::Unsupported(
+                    "global loader preloads are not exposed in the action namespace",
+                ));
+            }
             Ok(_) => {}
             Err(RuntimeCohortError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let mut search = Vec::new();
-        for path in loader_search_paths {
-            if !path.is_absolute() { return Err(invalid("loader search directory is not absolute")); }
-            let resolved = fs::canonicalize(path)?;
-            if !resolved.starts_with(&root) || !fs::metadata(&resolved)?.is_dir() {
-                return Err(invalid("loader search directory leaves the retained toolchain"));
-            }
-            search.push(resolved);
-        }
+        let search = validated_search_paths(loader_search_paths)?;
         let targets = probe_targets(&compiler, &root)?;
         let libraries = libraries(&probe(&targets, &search)?)?;
         let mut records = Vec::new();
@@ -510,21 +690,32 @@ mod linux {
         for library in libraries {
             let resolved = fs::canonicalize(&library.path)?;
             if !resolved.starts_with(&root) && !resolved.starts_with("/usr") {
-                return Err(RuntimeCohortError::Unsupported("external library is not in the worker's read-only /usr view"));
+                return Err(RuntimeCohortError::Unsupported(
+                    "external library is not in the worker's read-only /usr view",
+                ));
             }
             records.push(library_record(&library, &root, &mut budget)?);
         }
         records.sort();
         let mut observed = Vec::new();
         append(&mut observed, b"elf-host-cohort-v1");
-        for record in records { append(&mut observed, &record); }
+        for record in records {
+            append(&mut observed, &record);
+        }
         for path in ["/proc/sys/kernel/ostype", "/proc/sys/kernel/osrelease"] {
             let raw = read_system(path, 4096)?;
-            let value = std::str::from_utf8(&raw).map_err(|_| invalid("non-UTF-8 kernel identity"))?.trim();
-            if value.is_empty() { return Err(invalid("empty kernel identity")); }
+            let value = std::str::from_utf8(&raw)
+                .map_err(|_| invalid("non-UTF-8 kernel identity"))?
+                .trim();
+            if value.is_empty() {
+                return Err(invalid("empty kernel identity"));
+            }
             append(&mut observed, value.as_bytes());
         }
-        append(&mut observed, &cpu_profile(&read_system("/proc/cpuinfo", MAX_CPUINFO_BYTES)?)?);
+        append(
+            &mut observed,
+            &cpu_profile(&read_system("/proc/cpuinfo", MAX_CPUINFO_BYTES)?)?,
+        );
         append(&mut observed, &filesystem_profile(filesystem_root)?);
         if Stamp::of(&executable.metadata()?) != compiler_stamp
             || Stamp::of(&fs::metadata(&compiler)?) != compiler_stamp
@@ -549,7 +740,9 @@ mod linux {
                 b"statically linked\n",
                 b"libc.so => /lib/libc.so (invalid)\n",
                 b"linux-vdso.so.1 (0x1234)\n",
-            ] { assert!(libraries(bad).is_err(), "{bad:?}"); }
+            ] {
+                assert!(libraries(bad).is_err(), "{bad:?}");
+            }
         }
 
         #[test]
@@ -562,12 +755,19 @@ mod linux {
             let compiler = root.join("bin/rustc");
             let driver = root.join("lib/librustc_driver.so");
             let codegen = backend.join("librustc_codegen_llvm.so");
-            for path in [&compiler, &driver, &codegen] { fs::write(path, b"fixture").unwrap(); }
+            for path in [&compiler, &driver, &codegen] {
+                fs::write(path, b"fixture").unwrap();
+            }
             let targets = probe_targets(&compiler, &root).unwrap();
             assert_eq!(targets.len(), 3);
-            for path in [&compiler, &driver, &codegen] { assert!(targets.contains(path)); }
-            let raw = format!("{}:\nlibc.so => /lib/libc.so (0x1234)\n{}:\nlibz.so => /lib/libz.so (0x2345)\n",
-                compiler.display(), codegen.display());
+            for path in [&compiler, &driver, &codegen] {
+                assert!(targets.contains(path));
+            }
+            let raw = format!(
+                "{}:\nlibc.so => /lib/libc.so (0x1234)\n{}:\nlibz.so => /lib/libz.so (0x2345)\n",
+                compiler.display(),
+                codegen.display()
+            );
             let flattened = without_probe_headers(raw.as_bytes(), &targets).unwrap();
             assert_eq!(libraries(&flattened).unwrap().len(), 2);
             assert!(without_probe_headers(b"/unrequested/compiler:\n", &targets).is_err());
@@ -580,7 +780,10 @@ mod linux {
             fs::create_dir(&root).unwrap();
             let path = directory.path().join("libexternal.so");
             fs::write(&path, b"first runtime bytes").unwrap();
-            let library = Library { name: "libexternal.so".into(), path: path.clone() };
+            let library = Library {
+                name: "libexternal.so".into(),
+                path: path.clone(),
+            };
             let mut budget = MAX_EXTERNAL_BYTES;
             let first = library_record(&library, &root, &mut budget).unwrap();
             fs::write(path, b"different runtime bytes").unwrap();
@@ -600,7 +803,17 @@ mod linux {
                 let path = root.join("lib/libinternal.so");
                 fs::write(&path, b"same retained bytes").unwrap();
                 let mut budget = MAX_EXTERNAL_BYTES;
-                records.push(library_record(&Library { name: "libinternal.so".into(), path }, &root, &mut budget).unwrap());
+                records.push(
+                    library_record(
+                        &Library {
+                            name: "libinternal.so".into(),
+                            path,
+                        },
+                        &root,
+                        &mut budget,
+                    )
+                    .unwrap(),
+                );
             }
             assert_eq!(records[0], records[1]);
         }
@@ -609,7 +822,10 @@ mod linux {
         fn actual_filesystem_measurement_is_stable_across_private_roots() {
             let left = tempfile::tempdir().unwrap();
             let right = tempfile::tempdir().unwrap();
-            assert_eq!(filesystem_profile(left.path()).unwrap(), filesystem_profile(right.path()).unwrap());
+            assert_eq!(
+                filesystem_profile(left.path()).unwrap(),
+                filesystem_profile(right.path()).unwrap()
+            );
             assert_eq!(fs::read_dir(left.path()).unwrap().count(), 0);
             assert_eq!(fs::read_dir(right.path()).unwrap().count(), 0);
         }
@@ -620,9 +836,58 @@ mod linux {
             let a = b"processor: 0\nvendor_id: GenuineIntel\ncpu family: 6\nmodel: 143\nstepping: 8\nmodel name: Example CPU\ncpu MHz: 900\nflags: sse avx avx2\n";
             let b = b"processor: 19\nvendor_id: GenuineIntel\ncpu family: 6\nmodel: 143\nstepping: 8\nmodel name: Example CPU\ncpu MHz: 3600\nflags: avx2 sse avx\n";
             assert_eq!(cpu_profile(a).unwrap(), cpu_profile(b).unwrap());
-            let changed = String::from_utf8(b.to_vec()).unwrap().replace("avx2", "avx512f");
-            assert_ne!(cpu_profile(a).unwrap(), cpu_profile(changed.as_bytes()).unwrap());
+            let changed = String::from_utf8(b.to_vec())
+                .unwrap()
+                .replace("avx2", "avx512f");
+            assert_ne!(
+                cpu_profile(a).unwrap(),
+                cpu_profile(changed.as_bytes()).unwrap()
+            );
             assert!(cpu_profile(b"processor: 0\nflags: sse\n").is_err());
+        }
+
+        #[test]
+        fn complete_edge_loader_paths_preserve_empty_missing_and_invalid_candidate_behavior() {
+            let compiler = std::env::current_exe().unwrap();
+            let root = compiler.parent().unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            let loader = tempfile::tempdir().unwrap();
+            let missing = loader.path().join("not-yet-created");
+            let search = vec![loader.path().to_path_buf(), missing];
+            assert_eq!(validated_search_paths(&search).unwrap(), search);
+            let baseline = observe(&compiler, root, &[], scratch.path()).unwrap();
+            assert_eq!(
+                observe(&compiler, root, &search, scratch.path()).unwrap(),
+                baseline
+            );
+
+            let needed = libraries(&probe(&[compiler.clone()], &[]).unwrap())
+                .unwrap()
+                .into_iter()
+                .find(|library| !library.name.starts_with('/'))
+                .unwrap();
+            fs::write(loader.path().join(needed.name), b"invalid dynamic library").unwrap();
+            assert!(
+                observe(&compiler, root, &search, scratch.path()).is_err(),
+                "the edge probe must see a candidate that breaks the actual compiler loader"
+            );
+        }
+
+        #[test]
+        fn loader_path_validation_refuses_relative_nondirectory_and_dangling_aliases() {
+            let scratch = tempfile::tempdir().unwrap();
+            let file = scratch.path().join("regular");
+            fs::write(&file, b"not a directory").unwrap();
+            for path in [
+                PathBuf::from("relative"),
+                PathBuf::from("/tmp/../other"),
+                file,
+            ] {
+                assert!(validated_search_paths(&[path]).is_err());
+            }
+            let alias = scratch.path().join("dangling");
+            std::os::unix::fs::symlink(scratch.path().join("missing"), &alias).unwrap();
+            assert!(validated_search_paths(&[alias]).is_err());
         }
 
         #[test]

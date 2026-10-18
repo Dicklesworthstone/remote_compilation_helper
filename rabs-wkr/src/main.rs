@@ -1132,7 +1132,10 @@ where
     if dependency_context_enabled
         && !(source_transfer_enabled && toolchain_transfer_enabled && artifact_transfer_enabled)
     {
-        return Err("dependency execution requires negotiated source, toolchain and artifact transfer".to_owned());
+        return Err(
+            "dependency execution requires negotiated source, toolchain and artifact transfer"
+                .to_owned(),
+        );
     }
     let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
@@ -1285,8 +1288,12 @@ where
                                 }
                                 let id = request_id.ok_or("resume requires request_id")?;
                                 let original = value.get("request").ok_or("resume requires original request")?;
+                                // Recovery is version-neutral: the journal verifies
+                                // the full original fingerprint and recipient before
+                                // exposing retained bytes. A newer execution decoder
+                                // must not strand a valid result from an older context.
                                 if original["kind"] != "canonical-exec"
-                                    || parse_exec_request(original)?.request_id != id
+                                    || original["request_id"].as_u64() != Some(id)
                                 {
                                     return Err("resume request identity mismatch".to_owned());
                                 }
@@ -1657,7 +1664,12 @@ async fn session_loop(
                 toolchain_transfer::selected_reuse(&ack, local_identity.is_some(), toolchain)?;
             let preview = output_preview_requested(&ack)?;
             let dependency_context = dependency_context_selection(
-                &ack, local_identity.is_some(), output, artifacts, source, toolchain,
+                &ack,
+                local_identity.is_some(),
+                output,
+                artifacts,
+                source,
+                toolchain,
             )?;
             let lease = execution_lease_selection(
                 &ack,
@@ -1669,7 +1681,15 @@ async fn session_loop(
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
             Ok::<_, String>((
-                output, artifacts, retain, source, toolchain, reuse, preview, lease, dependency_context,
+                output,
+                artifacts,
+                retain,
+                source,
+                toolchain,
+                reuse,
+                preview,
+                lease,
+                dependency_context,
             ))
         },
     )
@@ -1814,12 +1834,16 @@ fn dependency_context_selection(
     source: bool,
     toolchain: bool,
 ) -> Result<bool, String> {
-    let value: serde_json::Value = serde_json::from_str(frame).map_err(|error| error.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(frame).map_err(|error| error.to_string())?;
     match value.get("dependency_context") {
         None => Ok(false),
         Some(selected) if selected.as_str() == Some(DEPENDENCY_CONTEXT_VERSION) => {
             if !(authenticated && output && artifacts && source && toolchain) {
-                return Err("dependency context requires authenticated input and complete result transfer".to_owned());
+                return Err(
+                    "dependency context requires authenticated input and complete result transfer"
+                        .to_owned(),
+                );
             }
             Ok(true)
         }
@@ -1885,11 +1909,16 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
     let transferred_toolchain = toolchain_transfer::request_identity(value)?;
     let toolchain_identity = rabs_wkr::session::parse_toolchain_identity(value)?;
     if let Some(context) = &dependency_context
-        && (program != context.compiler() || source_manifest.is_none()
-            || transferred_toolchain.is_none() || toolchain_identity.is_none()
+        && (program != context.compiler()
+            || source_manifest.is_none()
+            || transferred_toolchain.is_none()
+            || toolchain_identity.is_none()
             || value.get("cargo_home").is_some())
     {
-        return Err("dependency execution requires its exact compiler and plain transferred inputs".to_owned());
+        return Err(
+            "dependency execution requires its exact compiler and plain transferred inputs"
+                .to_owned(),
+        );
     }
     // A source-bearing request has no worker path on the wire. Only the live
     // admission path can fill this slot from the exact sealed source owner.
@@ -1930,9 +1959,9 @@ mod tests {
     use std::task::{Context, Wake, Waker};
     use std::time::Instant;
 
+    mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;
-    mod dependency_tests;
 
     #[derive(Default)]
     struct WireState {
