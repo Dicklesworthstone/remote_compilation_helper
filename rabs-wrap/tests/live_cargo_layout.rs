@@ -130,6 +130,15 @@ impl Fixture {
     }
 
     fn build(&self, layout: &Layout, wrapped: bool) -> Output {
+        self.build_with_env(layout, wrapped, &[])
+    }
+
+    fn build_with_env(
+        &self,
+        layout: &Layout,
+        wrapped: bool,
+        overrides: &[(&str, &str)],
+    ) -> Output {
         let mut command = timed(env!("CARGO"));
         command
             .current_dir(&layout.workspace)
@@ -144,6 +153,13 @@ impl Fixture {
             .env(VARIABLES[2], &layout.intermediate)
             .env("RABS_SOCKET_PATH", self.root().join("d.sock"))
             .env("RABS_BREAKER_FILE", self.root().join("breaker"))
+            // Real shells supply these per-worktree/process hints. They must
+            // reach rustc without splitting keys when no source reads them.
+            .env("PWD", &layout.workspace)
+            .env("OLDPWD", self.root())
+            .env("SHLVL", "2")
+            .env("_", env!("CARGO"))
+            .envs(overrides.iter().copied())
             .args(["build", "--offline", "--jobs=1", "--message-format=json"]);
         if wrapped {
             command.env("RUSTC_WRAPPER", WRAPPER);
@@ -286,7 +302,8 @@ fn real_cargo_split_layouts_share_verified_artifacts_and_remain_fresh() {
     let fixture = Fixture::new();
     fixture.source("pub fn message() -> &'static str { \"layout fixture\" }\n");
     let stock = fixture.layout("stock");
-    let stock_build = fixture.build(&stock, false);
+    let stock_build =
+        fixture.build_with_env(&stock, false, &[("RCH_BUILD_SOURCE", "stock-workspace")]);
     let expected = app_stdout(&stock, &stock_build);
     assert_eq!(expected, b"layout fixture\n");
     let expected_artifacts = library_bytes(&stock);
@@ -300,7 +317,7 @@ fn real_cargo_split_layouts_share_verified_artifacts_and_remain_fresh() {
     ] {
         let layout = fixture.layout(name);
         let mark = daemon.decisions().len();
-        let build = fixture.build(&layout, true);
+        let build = fixture.build_with_env(&layout, true, &[("RCH_BUILD_SOURCE", name)]);
         let decisions = daemon.settled(mark, terminal);
         assert_eq!(count(&decisions, terminal), 1, "{decisions:?}");
         assert_eq!(count(&decisions, "execute"), executions, "{decisions:?}");
@@ -325,7 +342,8 @@ fn real_cargo_split_layouts_share_verified_artifacts_and_remain_fresh() {
             // A cache installation must satisfy Cargo freshness, not just let
             // this one compile/link finish with plausible files.
             let mark = daemon.decisions().len();
-            let rebuild = fixture.build(&layout, true);
+            let rebuild =
+                fixture.build_with_env(&layout, true, &[("RCH_BUILD_SOURCE", name)]);
             assert!(artifacts(&rebuild).iter().any(|record| {
                 record["target"]["name"] == "layout_dep" && record["fresh"] == true
             }));
@@ -373,4 +391,105 @@ fn real_environment_reads_keep_each_layouts_value_and_never_replay() {
     let decisions = daemon.decisions();
     assert_eq!(count(&decisions, "committed"), 0, "{decisions:?}");
     assert_eq!(count(&decisions, "verified"), 0, "{decisions:?}");
+}
+
+#[test]
+fn real_cargo_custom_environment_values_preserve_stock_behavior_and_cache_identity() {
+    let fixture = Fixture::new();
+    fixture.source(
+        "pub fn message() -> String {\n\
+         format!(\"{}|{:?}\", env!(\"DEPENDENCY_FLAVOR\"), option_env!(\"DEPENDENCY_OPTION\"))\n\
+         }\n",
+    );
+    let daemon = Daemon::start(&fixture);
+    let mut distinct_keys = Vec::new();
+    for (index, flavor, optional, expected) in [
+        (0, "vanilla", None, "vanilla|None\n"),
+        (1, "vanilla", Some(""), "vanilla|Some(\"\")\n"),
+        (2, "vanilla", Some("extra"), "vanilla|Some(\"extra\")\n"),
+        (
+            3,
+            "spiced = balanced",
+            Some("extra"),
+            "spiced = balanced|Some(\"extra\")\n",
+        ),
+    ] {
+        let mut variables = vec![("DEPENDENCY_FLAVOR", flavor)];
+        if let Some(value) = optional {
+            variables.push(("DEPENDENCY_OPTION", value));
+        }
+        let stock = fixture.layout(&format!("env-{index}-stock"));
+        let stock_build = fixture.build_with_env(&stock, false, &variables);
+        assert_eq!(app_stdout(&stock, &stock_build), expected.as_bytes());
+        let expected_artifacts = library_bytes(&stock);
+        let mut action_key: Option<String> = None;
+        for (round, terminal, executions) in [
+            ("cold", "committed", 1),
+            ("verify-one", "verified", 1),
+            ("verify-two", "verified", 1),
+            ("served", "served", 0),
+        ] {
+            let layout = fixture.layout(&format!("env-{index}-{round}"));
+            let mark = daemon.decisions().len();
+            let build = fixture.build_with_env(&layout, true, &variables);
+            let decisions = daemon.settled(mark, terminal);
+            assert_eq!(count(&decisions, terminal), 1, "{decisions:?}");
+            assert_eq!(count(&decisions, "execute"), executions, "{decisions:?}");
+            assert_eq!(count(&decisions, "hit"), usize::from(executions == 0));
+            let key = decisions
+                .iter()
+                .find(|record| record["decision"] == terminal)
+                .and_then(|record| record["key"].as_str())
+                .unwrap();
+            if let Some(expected_key) = &action_key {
+                assert_eq!(key, expected_key.as_str(), "unchanged semantic environment");
+            } else {
+                assert!(
+                    !distinct_keys.iter().any(|previous| previous == key),
+                    "changed custom value or absent/empty option_env! reused an old action"
+                );
+                action_key = Some(key.to_owned());
+            }
+            assert_eq!(app_stdout(&layout, &build), expected.as_bytes());
+            assert_eq!(library_bytes(&layout), expected_artifacts);
+        }
+        distinct_keys.push(action_key.unwrap());
+    }
+}
+
+#[test]
+fn real_cargo_unkeyed_control_reads_preserve_values_and_never_publish_absence() {
+    let fixture = Fixture::new();
+    let daemon = Daemon::start(&fixture);
+    for (index, name) in [
+        "RABS_TEST_HINT",
+        "CARGO_RABS_TEST_HINT",
+        "RCH_BUILD_SOURCE",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixture.source(&format!(
+            "pub fn message() -> String {{ format!(\"{{:?}}\", option_env!(\"{name}\")) }}\n"
+        ));
+        for (round, value, expected) in [
+            ("absent", None, "None\n"),
+            ("empty", Some(""), "Some(\"\")\n"),
+            ("present", Some("exact control"), "Some(\"exact control\")\n"),
+        ] {
+            let variables: Vec<_> = value.map(|value| (name, value)).into_iter().collect();
+            let stock = fixture.layout(&format!("control-{index}-{round}-stock"));
+            let stock_build = fixture.build_with_env(&stock, false, &variables);
+            assert_eq!(app_stdout(&stock, &stock_build), expected.as_bytes());
+            let layout = fixture.layout(&format!("control-{index}-{round}-wrapped"));
+            let mark = daemon.decisions().len();
+            let build = fixture.build_with_env(&layout, true, &variables);
+            assert_eq!(app_stdout(&layout, &build), expected.as_bytes());
+            assert_eq!(library_bytes(&layout), library_bytes(&stock));
+            let decisions = daemon.settled(mark, "not-published");
+            assert_eq!(count(&decisions, "execute"), 1, "{decisions:?}");
+            assert_eq!(count(&decisions, "hit"), 0, "{decisions:?}");
+            assert_eq!(count(&decisions, "committed"), 0, "{decisions:?}");
+        }
+    }
 }

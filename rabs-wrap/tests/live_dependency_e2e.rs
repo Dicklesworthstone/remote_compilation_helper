@@ -194,7 +194,7 @@ impl World {
             ("CARGO_PKG_VERSION".into(), "1.0.0".into()),
             ("CARGO_CRATE_NAME".into(), name.into()),
             ("CARGO_MAKEFLAGS".into(), "-j --jobserver-fds=3,4".into()),
-            // Scrubbed by dependency-env-v1: must never key or reach rustc.
+            // Preserved and keyed by dependency-env-v2, like custom env! inputs.
             ("TERM".into(), "xterm".into()),
             ("RABS_SOCKET_PATH".into(), self.socket.display().to_string()),
             (
@@ -562,9 +562,14 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
     let output = world.wrapped("leaf", &out_e, &[], &[("CARGO_PKG_VERSION", "1.0.1")]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(trail(&daemon, mark), ["execute", "committed"]);
-    // A scrubbed one is not: still a hit.
+    // An unread wrapper control remains unkeyed: still a hit.
     let mark = daemon.decisions().len();
-    let output = world.wrapped("leaf", &world.out_dir("wt-f"), &[], &[("TERM", "dumb")]);
+    let output = world.wrapped(
+        "leaf",
+        &world.out_dir("wt-f"),
+        &[],
+        &[("RABS_INSTALL_WAIT_MS", "30000")],
+    );
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(trail(&daemon, mark), ["hit", "served"]);
 

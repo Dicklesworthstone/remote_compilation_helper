@@ -162,9 +162,10 @@ pub fn capture_stdout(stdout: &str) -> BuildScriptCapture {
 /// Call only after binding this record to the plan's generated-input tree, and
 /// pass the SAME record to `live_dependency_key`. The record is input evidence,
 /// not an instruction to overwrite the request: every declared value must
-/// already be present in Cargo's request. Undeclared ambient variables remain
-/// absent, and descriptor authority and loader injection are never promoted.
-/// Both execution and the environment key receive the same additional values.
+/// already be present in Cargo's request. The live environment preserves and
+/// keys undeclared ambient values too; this binder validates declared values
+/// against captured evidence. Descriptor authority and loader injection are
+/// never promoted. Both execution and the key receive any additional values.
 /// Validation finishes before either environment is modified.
 ///
 /// # Errors
@@ -428,7 +429,7 @@ mod environment_binding_tests {
     }
 
     #[test]
-    fn declared_values_reach_execution_and_keys_but_ambient_values_stay_absent() {
+    fn declared_and_ambient_values_reach_execution_and_keys() {
         let record = b"cargo:rustc-env=BUILD_LABEL=left side=right\ncargo::rustc-env=EMPTY=\n";
         let (mut plan, env) = fixture(&[
             ("BUILD_LABEL", "left side=right"),
@@ -436,8 +437,8 @@ mod environment_binding_tests {
             ("UNDECLARED", "private"),
         ]);
         assert!(
-            key(&plan, record).is_err(),
-            "baseline refuses a scrubbed rustc-env"
+            key(&plan, record).is_ok(),
+            "the complete environment already keys custom rustc-env values"
         );
         bind_rustc_environment(&mut plan, Some(record), &env).unwrap();
         for pair in [
@@ -447,7 +448,14 @@ mod environment_binding_tests {
             assert!(plan.execution_env.contains(&pair));
             assert!(plan.keyed_env.contains(&pair));
         }
-        assert!(!plan.execution_env.iter().any(|(n, _)| n == "UNDECLARED"));
+        assert!(
+            plan.execution_env
+                .contains(&("UNDECLARED".into(), "private".into()))
+        );
+        assert!(
+            plan.keyed_env
+                .contains(&("UNDECLARED".into(), "private".into()))
+        );
         assert!(!plan.keyed_env.iter().any(|(n, _)| n == "CARGO_MAKEFLAGS"));
         assert!(
             plan.execution_env

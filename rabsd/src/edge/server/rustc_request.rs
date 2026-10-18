@@ -1035,10 +1035,9 @@ mod tests {
                 .contains(&("BUILD_LABEL".into(), "pinned".into()))
         );
         assert!(
-            !attempt
+            attempt
                 .execution_env()
-                .iter()
-                .any(|(name, _)| name == "UNDECLARED")
+                .contains(&("UNDECLARED".into(), "ambient".into()))
         );
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["compiler_skip_authorized"], false);
