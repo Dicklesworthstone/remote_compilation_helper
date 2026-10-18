@@ -7,10 +7,12 @@
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use rch_common::WorkerConfig;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::super::ssh::{run_offload_ssh_command_with_stdin, wrap_remote_source_activity};
 
@@ -107,6 +109,71 @@ fn unsuitable(roots: &[PathBuf], states: Vec<Status>) -> Vec<(PathBuf, String)> 
             )),
         })
         .collect()
+}
+
+fn local_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(SCRIPT);
+    command
+}
+
+async fn bounded_stream(reader: impl AsyncRead + Unpin, maximum: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take((maximum + 1) as u64).read_to_end(&mut bytes).await?;
+    if bytes.len() > maximum {
+        return Err(std::io::Error::other("repository status stream exceeded its bound"));
+    }
+    Ok(bytes)
+}
+
+async fn local_batch(
+    mut command: tokio::process::Command,
+    roots: &[PathBuf],
+    allowance: Duration,
+) -> Result<Vec<Status>> {
+    let payload = request(roots)?;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("cannot start local repository status census")?;
+    let mut input = child.stdin.take().context("missing census stdin")?;
+    let output = child.stdout.take().context("missing census stdout")?;
+    let diagnostic = child.stderr.take().context("missing census stderr")?;
+    // Feed and drain concurrently: a large closure cannot deadlock with a
+    // full output pipe. One deadline includes write, both reads and process
+    // completion. Dropping the future kills its directly owned shell child;
+    // this does not claim process-tree cancellation of arbitrary Git helpers.
+    let exchange = async {
+        let write = async {
+            input.write_all(&payload).await?;
+            input.shutdown().await?;
+            drop(input);
+            Ok::<_, std::io::Error>(())
+        };
+        let ((), bytes, _) = tokio::try_join!(
+            write,
+            bounded_stream(output, MAX_RESPONSE_BYTES),
+            bounded_stream(diagnostic, MAX_RESPONSE_BYTES),
+        )?;
+        let status = child.wait().await?;
+        ensure!(status.success(), "local repository status census failed: {status}");
+        response(&bytes, roots.len())
+    };
+    tokio::time::timeout(allowance, exchange)
+        .await
+        .context("local repository status census timed out")?
+}
+
+pub(super) async fn local(roots: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
+    let mut rejected = Vec::new();
+    for batch in roots.chunks(MAX_ROOTS) {
+        let states = local_batch(local_command(), batch, budget(batch.len())).await?;
+        rejected.extend(unsuitable(batch, states));
+    }
+    Ok(rejected)
 }
 
 pub(super) async fn remote(
@@ -220,5 +287,73 @@ mod tests {
             .output()
             .expect("Python 3 is required by the native repository status regressions");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
+    async fn local_pipeline_observes_real_git_without_losing_unknown_roots() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let home = retained.join("home");
+        std::fs::create_dir(&home).unwrap();
+        let root = retained.join(std::ffi::OsString::from_vec(b"repo-'\xff\n".to_vec()));
+        std::fs::create_dir(&root).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let init = tokio::process::Command::new("git")
+            .arg("init").arg("-q").arg(&root)
+            .env_clear().env("PATH", &path).env("HOME", &home)
+            .kill_on_drop(true).status().await.unwrap();
+        assert!(init.success());
+        let member = root.join("member");
+        std::fs::create_dir(&member).unwrap();
+        let roots = [root.clone(), member, retained.join("missing")];
+        for dirty in [false, true] {
+            if dirty {
+                std::fs::write(root.join("untracked"), b"new source\n").unwrap();
+            }
+            let mut command = local_command();
+            command.env_clear().env("PATH", &path).env("HOME", &home);
+            let states = local_batch(command, &roots, Duration::from_secs(5)).await.unwrap();
+            let state = if dirty { Status::Dirty } else { Status::Clean };
+            assert_eq!(states, [state, state, Status::Unavailable]);
+            let rejected = unsuitable(&roots, states);
+            assert_eq!(rejected.len(), if dirty { 3 } else { 1 });
+            assert_eq!(rejected.last().unwrap().0, roots[2]);
+        }
+        assert!(local(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_pipeline_requires_successful_exit_and_bounded_complete_streams() {
+        for script in [
+            "cat >/dev/null; printf 'RCH_REPO_STATUS_V1\\n0 clean\\n'",
+            "cat >/dev/null; printf 'RCH_REPO_STATUS_V1\\n0 clean\\nRCH_REPO_STATUS_END 1\\n'; exit 1",
+            "cat >/dev/null; printf '%4097s' ''",
+            "cat >/dev/null; printf '%4097s' '' >&2",
+        ] {
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg(script);
+            let result = local_batch(command, &[PathBuf::from("/fixture")], Duration::from_secs(2)).await;
+            assert!(result.is_err(), "{script}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_pipeline_deadline_drops_the_owned_stalled_process() {
+        let mut command = tokio::process::Command::new("sh");
+        // exec keeps the directly owned process as the stalled child, rather
+        // than claiming an unqualified descendant/process-group kill policy.
+        command.arg("-c").arg("exec sleep 30");
+        let roots = [PathBuf::from("/fixture")];
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            local_batch(command, &roots, Duration::from_millis(50)),
+        ).await.expect("local census escaped its deadline");
+        assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn local_pipeline_refuses_invalid_roots_before_spawning() {
+        let command = tokio::process::Command::new("/no-such-rch-status-fixture");
+        let result = local_batch(command, &[PathBuf::from("relative")], Duration::from_secs(1)).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("absolute"));
     }
 }

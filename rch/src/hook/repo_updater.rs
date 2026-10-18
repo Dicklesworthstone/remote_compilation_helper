@@ -22,7 +22,7 @@
 //! drives (`run_offload_ssh_command`, `should_skip_remote_preflight`) live in
 //! the sibling `ssh` submodule and are imported explicitly below. The sync-root
 //! detection helpers (`collect_repo_updater_roots_and_specs`,
-//! `detect_dirty_sync_roots`, `detect_remote_unsuitable_sync_roots`) and their
+//! `status_probe::local`, `detect_remote_unsuitable_sync_roots`) and their
 //! `RepoUpdaterSyncRoots` carrier are local to this module. Only the symbols
 //! consumed from outside the moved set (`execute_remote_compilation` and the
 //! hook test suite) are `pub(super)`; everything else stays private.
@@ -618,15 +618,26 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
         return Ok(());
     }
 
-    let dirty_roots = detect_dirty_sync_roots(&repo_updater_roots.roots).await;
+    let dirty_roots = match status_probe::local(&repo_updater_roots.roots).await {
+        Ok(roots) => roots,
+        Err(err) => {
+            // Unknown local state is not a clean checkout. This optional
+            // convergence pass must not mutate repositories on that basis;
+            // the normal source sync still performs its own integrity checks.
+            reporter.verbose(&format!(
+                "[RCH] repo_updater pre-sync skipped (local status unconfirmed: {err})"
+            ));
+            return Ok(());
+        }
+    };
     if !dirty_roots.is_empty() {
         let joined = dirty_roots
             .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|(path, reason)| format!("{} ({reason})", path.display()))
             .collect::<Vec<_>>()
             .join(", ");
         reporter.verbose(&format!(
-            "[RCH] repo_updater pre-sync skipped (dirty local sync roots: {joined})"
+            "[RCH] repo_updater pre-sync skipped (dirty/unavailable local sync roots: {joined})"
         ));
         return Ok(());
     }
@@ -804,34 +815,6 @@ pub(super) async fn collect_repo_updater_roots_and_specs(
         roots,
         specs: specs.into_iter().collect(),
     }
-}
-
-async fn detect_dirty_sync_roots(sync_roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut dirty = Vec::new();
-
-    for root in sync_roots {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .arg("status")
-            .arg("--porcelain")
-            .output()
-            .await;
-
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-
-        let status = String::from_utf8_lossy(&output.stdout);
-        if !status.trim().is_empty() {
-            dirty.push(root.clone());
-        }
-    }
-
-    dirty
 }
 
 async fn detect_remote_unsuitable_sync_roots(
