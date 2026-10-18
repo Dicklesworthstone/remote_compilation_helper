@@ -273,6 +273,9 @@ pub fn derive_output_declarations(
 /// split-debug sidecars and unmodeled unstable output modes cannot use this
 /// adapter. Cargo's `-Z embed-metadata=no` is modeled only with explicit
 /// separate metadata emission, so the required `.rmeta` remains declared.
+/// Explicit positive `-Z threads=N` counts are output-neutral and retained
+/// verbatim in invocation/toolchain identity; no cross-count equivalence is
+/// assumed. This does not select threads or override the caller's jobserver.
 /// The general naming helper remains available for non-serving consumers.
 ///
 /// This derives outputs only. It does not establish immutable inputs, validate
@@ -331,13 +334,6 @@ pub fn derive_dependency_output_declarations(
     {
         return Err(DerivationRefusal::UnsafeOutputName(name.to_owned()));
     }
-    for kind in emit_kinds(invocation)? {
-        if !matches!(kind.as_str(), "link" | "metadata" | "dep-info") {
-            return Err(DerivationRefusal::UnsupportedOutputOption(format!(
-                "--emit={kind}"
-            )));
-        }
-    }
     check_dependency_output_options(invocation)?;
     let declarations = derive_output_declarations(invocation, host_target)?;
     // Knowing the output names does not close the compiler's input reads.
@@ -367,19 +363,51 @@ pub fn derive_dependency_output_declarations(
     Ok(declarations)
 }
 
-fn check_dependency_output_options(
+/// Check the host-independent output-option subset of the live adapter.
+///
+/// This is shared with the edge's rejection-only preflight so an unservable
+/// output mode does not first consume the cold toolchain preparation budget.
+/// Success does NOT derive outputs or admit a cacheable action: compiler/source
+/// shape, mandatory read evidence, target naming, paths and input facts still
+/// require [`derive_dependency_output_declarations`] and the live planner.
+///
+/// # Errors
+/// An emit destination, codegen/unstable control or passthrough option is outside
+/// the explicitly modeled output contract. No option is removed or rewritten.
+pub fn check_dependency_output_options(
     invocation: &NormalizedRustcInvocation,
 ) -> Result<(), DerivationRefusal> {
+    for kind in emit_kinds(invocation)? {
+        if !matches!(kind.as_str(), "link" | "metadata" | "dep-info") {
+            return Err(DerivationRefusal::UnsupportedOutputOption(format!(
+                "--emit={kind}"
+            )));
+        }
+    }
     for (name, value) in &invocation.unstable {
         // Current Cargo can omit metadata from the rlib while requesting
         // a separate rmeta. This changes artifact bytes, already bound by
         // the normalized invocation, but not the declared file set. Never
         // admit this mode without the explicit metadata output, and do not
-        // infer output neutrality for any other unstable control.
-        if name != "embed-metadata"
-            || value.as_deref() != Some("no")
-            || !invocation.emit.iter().any(|kind| kind == "metadata")
-        {
+        // infer output neutrality for arbitrary unstable controls.
+        let modeled = match name.as_str() {
+            "embed-metadata" => {
+                value.as_deref() == Some("no")
+                    && invocation.emit.iter().any(|kind| kind == "metadata")
+            }
+            // This selects rustc's frontend pool, not another output mode.
+            // Keep the user's exact flag in both existing key components:
+            // parallel and serial compiles must earn their own comparisons.
+            // Zero asks rustc to discover the host's available parallelism;
+            // that implicit resource input is not modeled by this profile.
+            "threads" => value.as_deref().is_some_and(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.parse::<u32>().is_ok_and(|count| count != 0)
+            }),
+            _ => false,
+        };
+        if !modeled {
             return Err(DerivationRefusal::UnsupportedOutputOption(format!(
                 "-Z {name}"
             )));
@@ -903,6 +931,277 @@ mod tests {
             assert!(
                 derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu").is_err()
             );
+        }
+    }
+
+    #[test]
+    fn explicit_frontend_threads_preserve_complete_cargo_output_declarations() {
+        for host in [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+        ] {
+            for count in ["1", "2", "8", "16", "128"] {
+                let option = format!("threads={count}");
+                let joined = format!("-Z{option}");
+                for args in [vec!["-Z", option.as_str()], vec![joined.as_str()]] {
+                    for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
+                        let mut baseline = dependency(&[]);
+                        baseline.emit = emit.split(',').map(str::to_owned).collect();
+                        let mut threaded = dependency(&args);
+                        threaded.emit = baseline.emit.clone();
+                        let original = threaded.clone();
+                        let expected = derive_dependency_output_declarations(&baseline, host)
+                            .unwrap();
+                        let actual = derive_dependency_output_declarations(&threaded, host)
+                            .unwrap();
+                        assert_eq!(actual, expected, "{host}: {args:?} {emit}");
+                        assert_eq!(threaded, original, "admission must not rewrite rustc argv");
+                        assert_ne!(threaded.canonical_bytes(), baseline.canonical_bytes());
+                        threaded.unstable.push(("embed-metadata".into(), Some("no".into())));
+                        assert_eq!(
+                            derive_dependency_output_declarations(&threaded, host).unwrap(),
+                            expected,
+                            "threading must compose with detached metadata without losing it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frontend_threads_do_not_admit_implicit_counts_or_unmodeled_outputs() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("auto"),
+            Some("-1"),
+            Some("+8"),
+            Some(" 8"),
+            Some("8 "),
+            Some("1.5"),
+            Some("8x"),
+            Some("８"),
+            Some("4294967296"),
+        ] {
+            let mut inv = dependency(&[]);
+            inv.unstable.push(("threads".into(), value.map(str::to_owned)));
+            assert!(
+                matches!(
+                    derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu"),
+                    Err(DerivationRefusal::UnsupportedOutputOption(option)) if option == "-Z threads"
+                ),
+                "unmodeled count: {value:?}"
+            );
+        }
+        for args in [
+            vec!["-Zthreads=8", "-Zno-codegen"],
+            vec!["-Zno-codegen", "-Zthreads=8"],
+            vec!["-Zthreads=8", "-Zunstable-options"],
+            vec!["-Zthreads=8", "-Cincremental=/unmodeled/state"],
+            vec!["-Zthreads=8", "-Csave-temps=yes"],
+            vec!["-Zthreads=8", "-Csplit-debuginfo=unpacked"],
+            vec!["-Zthreads=8", "--emit=metadata=/elsewhere/metadata"],
+        ] {
+            assert!(
+                derive_dependency_output_declarations(
+                    &dependency(&args),
+                    "x86_64-unknown-linux-gnu"
+                )
+                .is_err(),
+                "thread selection must not bypass another refusal: {args:?}"
+            );
+        }
+        let mut missing_evidence = dependency(&["-Zthreads=8"]);
+        missing_evidence.emit = vec!["metadata".into(), "link".into()];
+        assert!(
+            derive_dependency_output_declarations(&missing_evidence, "x86_64-unknown-linux-gnu")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn frontend_thread_count_is_bound_to_the_full_live_key_and_toolchain_profile() {
+        use crate::live_dependency::{
+            LiveRustcRequest, ToolchainFacts, dep_info_closure_violation,
+            live_dependency_key, plan_dependency_action,
+        };
+        use crate::typed_digest::compute;
+        use rabs_protocol::input_evidence::{
+            ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        };
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+
+        const HOST: &str = "x86_64-unknown-linux-gnu";
+        const PACKAGE: &str = "/cargo/registry/src/index/leaf-1.0.0";
+        let env = vec![
+            ("CARGO_HOME".into(), "/cargo".into()),
+            ("CARGO_MANIFEST_DIR".into(), PACKAGE.into()),
+            ("CARGO_PKG_NAME".into(), "leaf".into()),
+            ("CARGO_MAKEFLAGS".into(), "-j --jobserver-auth=3,4".into()),
+        ];
+        let identity = compute("rabs.test.threaded-toolchain.v1", b"one observed compiler");
+        let toolchain = ToolchainFacts {
+            compiler_binary_digest: identity.clone(),
+            verbose_version: format!("rustc fixture\nhost: {HOST}\n"),
+            sysroot_root_digest: identity,
+            runtime_libraries: Vec::new(),
+        };
+        let key = |extra: &[&str]| {
+            let mut argv: Vec<String> = [
+                "/toolchain/bin/rustc",
+                "--crate-name=leaf",
+                "--crate-type=lib",
+                "--edition=2021",
+                "--emit=dep-info,metadata,link",
+                "--out-dir=/target/deps",
+                "--cap-lints=allow",
+                "--error-format=json",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_owned)
+            .collect();
+            argv.push(format!("{PACKAGE}/src/lib.rs"));
+            let plan = plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: PACKAGE,
+                    env: &env,
+                },
+                HOST,
+            )
+            .unwrap();
+            let inputs = ActionInputManifest {
+                schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+                inputs: vec![PositiveInput {
+                    virtual_path: RawBytes::new(plan.input_virtual_path("src/lib.rs").into_bytes()),
+                    object: ObjectId(compute("rabs.test.threaded-source.v1", b"pub fn leaf() {}")),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: Vec::new(),
+                }],
+                ..ActionInputManifest::default()
+            };
+            // Threading does not excuse a source/include escape or a tracked
+            // read of the jobserver environment that deliberately is not keyed.
+            assert!(
+                dep_info_closure_violation(
+                    &plan,
+                    b"/target/deps/leaf.d: /outside/unobserved.rs\n",
+                    |_| true
+                )
+                .is_some()
+            );
+            assert!(
+                dep_info_closure_violation(&plan, b"# env-dep:CARGO_MAKEFLAGS=-j\n", |_| true)
+                    .is_some()
+            );
+            live_dependency_key(&plan, &toolchain, &[], &[], None, &inputs).unwrap()
+        };
+        let implicit = key(&[]);
+        let one = key(&["-Zthreads=1"]);
+        let eight = key(&["-Zthreads=8"]);
+        let split_eight = key(&["-Z", "threads=8"]);
+        assert_eq!(eight, split_eight);
+        assert_ne!(implicit.action_key, one.action_key);
+        assert_ne!(one.action_key, eight.action_key);
+        assert_ne!(
+            one.descriptor.normalized_invocation,
+            eight.descriptor.normalized_invocation
+        );
+        assert_ne!(one.descriptor.toolchain, eight.descriptor.toolchain);
+        assert_eq!(
+            one.descriptor.output_declarations,
+            eight.descriptor.output_declarations
+        );
+        assert_eq!(
+            implicit.descriptor.sandbox_semantic_policy,
+            eight.descriptor.sandbox_semantic_policy
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn threaded_cargo_declarations_match_real_rustc_outputs() {
+        use std::collections::BTreeSet;
+        use std::process::Command;
+
+        let version = Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .expect("run pinned rustc");
+        assert!(version.status.success(), "rustc identity probe failed");
+        let version = String::from_utf8(version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("lib.rs");
+        std::fs::write(
+            &source,
+            "pub fn twice<T: Copy + std::ops::Add<Output = T>>(x: T) -> T { x + x }\n\
+             pub fn answer() -> u32 { twice(21) }\n",
+        )
+        .unwrap();
+        for count in ["1", "2", "8"] {
+            for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
+                let out = temporary.path().join(format!("threads-{count}-{emit}"));
+                std::fs::create_dir(&out).unwrap();
+                let argv = vec![
+                    "rustc".into(),
+                    "--crate-name=threaded".into(),
+                    "--crate-type=lib".into(),
+                    "--edition=2021".into(),
+                    format!("--emit={emit}"),
+                    "--cap-lints=allow".into(),
+                    "--error-format=json".into(),
+                    "-Cextra-filename=-test".into(),
+                    "-Cembed-bitcode=no".into(),
+                    format!("-Zthreads={count}"),
+                    "--out-dir".into(),
+                    out.to_str().unwrap().into(),
+                    source.to_str().unwrap().into(),
+                ];
+                let inv = parse(&argv, None).unwrap();
+                let expected: BTreeSet<_> = derive_dependency_output_declarations(&inv, host)
+                    .unwrap()
+                    .declarations
+                    .into_iter()
+                    .map(|output| output.virtual_path)
+                    .collect();
+                // No RUSTC_BOOTSTRAP, shadow compiler, source rewriting, or
+                // --print=file-names shortcut. This must execute nightly rustc.
+                let result = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "threads={count}, emit={emit}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert!(result.stdout.is_empty());
+                let actual: BTreeSet<_> = std::fs::read_dir(&out)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        assert!(entry.file_type().unwrap().is_file());
+                        entry.file_name().into_string().unwrap()
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "threads={count}, emit={emit}");
+                let report = std::fs::read_to_string(out.join("threaded-test.d")).unwrap();
+                assert!(
+                    report.contains(source.to_str().unwrap()),
+                    "actual dep-info is required"
+                );
+            }
         }
     }
 
