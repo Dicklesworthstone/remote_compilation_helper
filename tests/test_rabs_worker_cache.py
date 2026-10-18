@@ -93,7 +93,16 @@ class WorkerCacheTests(unittest.TestCase):
         self.assertEqual(value["cwd"], str(self.root))
         self.assertEqual(len(self.fixture.starts()), 1)
         self.assertEqual(self.fixture.starts()[0]["live"], "1")
+        self.assertEqual(self.fixture.starts()[0]["layout"], "1")
+        self.assertNotIn("RABS_REUSE_CARGO_LAYOUT", value["env"],
+                         "worker-only default must not become a Cargo/build-script input")
         self.assertEqual(completed.stderr, b"cargo's own stderr\n")
+
+    def test_explicit_layout_projection_override_is_preserved(self):
+        value = self.result(self.run_worker(
+            ["check"], {"RABS_REUSE_CARGO_LAYOUT": "0"})[0])
+        self.assertEqual(self.fixture.starts()[0]["layout"], "0")
+        self.assertEqual(value["env"]["RABS_REUSE_CARGO_LAYOUT"], "0")
 
     def test_multiple_builds_reuse_one_daemon_and_existing_state(self):
         self.result(self.run_worker(["check"])[0])

@@ -132,10 +132,19 @@ pending; this does not assert a hard wall-clock filesystem or process bound.
 
 RABS still checks exact input keys, output custody, publication, trust,
 sampling and materialization. Readiness is not a hit. Unsupported units and
-required verification executions compile normally. No serving policy, default
-projection, target ownership rule or RCH artifact-delivery path is relaxed.
-Separate workers retain separate caches; reuse is limited by the existing
-live dependency class and its path/input contracts.
+required verification executions compile normally. The worker-cache profile
+defaults a newly started daemon to `RABS_REUSE_CARGO_LAYOUT=1`, using the
+existing tracked-read-safe projection for `CARGO_TARGET_DIR`,
+`CARGO_BUILD_TARGET_DIR`, and `CARGO_BUILD_BUILD_DIR`. An explicit
+`RABS_REUSE_CARGO_LAYOUT` value is preserved instead. When the adapter supplies
+the default itself, it removes that variable again before Cargo is execed, so
+the optimization does not create a new Cargo/build-script environment input.
+An already-running daemon is never reconfigured. The projection keeps Cargo's
+real paths and retains its policy identity and tracked-read publication veto.
+
+No serving policy, target ownership rule or RCH artifact-delivery path is
+relaxed. Separate workers retain separate caches; reuse is limited by the
+existing live dependency class and its path/input contracts.
 
 ## Validation boundaries
 

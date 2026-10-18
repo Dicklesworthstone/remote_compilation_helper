@@ -99,7 +99,8 @@ if sys.argv[1:] == ["--check-config"]:
     sys.exit(0)
 with open(root / "starts", "a") as f:
     f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgrp(),
-                        "live": os.environ.get("RABS_LIVE_DEPENDENCY")}) + "\n")
+                        "live": os.environ.get("RABS_LIVE_DEPENDENCY"),
+                        "layout": os.environ.get("RABS_REUSE_CARGO_LAYOUT")}) + "\n")
 if os.environ.get("TEST_START_GATE"):
     gate = pathlib.Path(os.environ["TEST_START_GATE"])
     deadline = time.monotonic() + 10

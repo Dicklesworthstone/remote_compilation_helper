@@ -99,9 +99,20 @@ def prepared_environment(original):
         prepare = load_prepare(launcher)
         candidate = dict(original)
         candidate[ACTIVE] = "1"
+        # Worker-cache mode is already an explicit acceleration opt-in. Give a
+        # newly started worker daemon the proven Cargo-layout projection so
+        # RCH's private target/build directories do not split identical
+        # dependency actions. Preserve any explicit operator value exactly.
+        # If we supplied the default, remove it before Cargo/build scripts can
+        # observe a new environment variable.
+        injected_layout = "RABS_REUSE_CARGO_LAYOUT" not in original
+        if injected_layout:
+            candidate["RABS_REUSE_CARGO_LAYOUT"] = "1"
         prepared = prepare(candidate, no_start=False)
         if not valid_environment(prepared):
             raise RuntimeError("installed cargo-rabs returned an invalid environment")
+        if injected_layout:
+            prepared.pop("RABS_REUSE_CARGO_LAYOUT", None)
         return prepared
     except Exception as error:
         # Preparation only: no Cargo/rustc or output writer has started. Keep
