@@ -317,12 +317,16 @@ pub(crate) enum RestartAdmissionWait {
 /// `on_wait` runs before each sleep (the caller heartbeats and reports).
 /// After a closed observation, later probes share the remaining wait budget;
 /// a stalled socket cannot extend that budget by its independent I/O timeout.
-pub(crate) async fn wait_for_restart_admission(
-    mut probe: impl AsyncFnMut() -> anyhow::Result<bool>,
+pub(crate) async fn wait_for_restart_admission<F, Fut>(
+    mut probe: F,
     bound: Duration,
     poll: Duration,
     mut on_wait: impl FnMut() -> anyhow::Result<()>,
-) -> anyhow::Result<RestartAdmissionWait> {
+) -> anyhow::Result<RestartAdmissionWait>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
     let started = tokio::time::Instant::now();
     let mut saw_closed = false;
     loop {
@@ -1602,12 +1606,13 @@ mod bounded_ipc_tests {
             let mut probes = 0;
             let mut waits = 0;
             let outcome = wait_for_restart_admission(
-                async || {
+                || {
                     probes += 1;
-                    match script.pop_front().unwrap_or(Some(true)) {
+                    let result = match script.pop_front().unwrap_or(Some(true)) {
                         Some(closed) => Ok(closed),
                         None => Err(anyhow::anyhow!("socket missing")),
-                    }
+                    };
+                    std::future::ready(result)
                 },
                 Duration::from_millis(bound_ms),
                 Duration::from_millis(1),
@@ -1652,12 +1657,15 @@ mod bounded_ipc_tests {
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             wait_for_restart_admission(
-                async || {
+                || {
                     probes += 1;
-                    if probes == 1 {
-                        Ok(true)
-                    } else {
-                        std::future::pending::<anyhow::Result<bool>>().await
+                    let first = probes == 1;
+                    async move {
+                        if first {
+                            Ok(true)
+                        } else {
+                            std::future::pending::<anyhow::Result<bool>>().await
+                        }
                     }
                 },
                 Duration::from_millis(100),
@@ -1676,9 +1684,9 @@ mod bounded_ipc_tests {
     async fn restart_admission_wait_stops_on_unrecorded_wait_ownership() {
         let mut probes = 0;
         let error = wait_for_restart_admission(
-            async || {
+            || {
                 probes += 1;
-                Ok(true)
+                std::future::ready(Ok(true))
             },
             Duration::from_secs(30),
             Duration::from_secs(1),

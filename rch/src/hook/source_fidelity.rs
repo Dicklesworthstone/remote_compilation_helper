@@ -39,9 +39,27 @@ pub(super) struct SourceContentFilterPolicy {
     checksum_transfer: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SourceContentEntryKind {
+    #[default]
+    Regular,
+    Symlink,
+}
+
+impl SourceContentEntryKind {
+    const fn is_regular(&self) -> bool {
+        matches!(self, Self::Regular)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) struct SourceContentFile {
     path: String,
+    #[serde(skip_serializing_if = "SourceContentEntryKind::is_regular")]
+    kind: SourceContentEntryKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symlink_target: Option<String>,
     sha256: String,
     byte_count: u64,
     executable: bool,
@@ -171,6 +189,160 @@ fn hash_file(path: &Path) -> anyhow::Result<(String, u64, bool)> {
     Ok((hex_lower(&hasher.finalize()), byte_count, executable))
 }
 
+fn validate_symlink_lexical(relative_link: &Path, target: &str) -> anyhow::Result<PathBuf> {
+    if target.is_empty()
+        || target.starts_with('/')
+        || target.contains('\\')
+        || target.chars().any(char::is_control)
+    {
+        anyhow::bail!(
+            "source-content proof refuses unsafe symlink target: {} -> {:?}",
+            relative_link.display(),
+            target
+        );
+    }
+    let mut resolved = relative_link
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => {
+                if !resolved.pop() {
+                    anyhow::bail!(
+                        "source-content proof refuses symlink escaping root: {} -> {}",
+                        relative_link.display(),
+                        target
+                    );
+                }
+            }
+            _ => resolved.push(segment),
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_symlink_within_root(
+    root: &Path,
+    relative_link: &Path,
+    target: &str,
+) -> anyhow::Result<()> {
+    validate_symlink_lexical(relative_link, target)?;
+    let mut resolved = relative_link
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let mut pending: std::collections::VecDeque<String> =
+        target.split('/').map(ToOwned::to_owned).collect();
+    let mut hops = 0_usize;
+    while let Some(segment) = pending.pop_front() {
+        match segment.as_str() {
+            "" | "." => continue,
+            ".." => {
+                if !resolved.pop() {
+                    anyhow::bail!(
+                        "source-content proof refuses symlink escaping root: {} -> {}",
+                        relative_link.display(),
+                        target
+                    );
+                }
+            }
+            _ => {
+                resolved.push(&segment);
+                let candidate = root.join(&resolved);
+                if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
+                    && metadata.file_type().is_symlink()
+                {
+                    hops += 1;
+                    if hops > 64 {
+                        anyhow::bail!(
+                            "source-content proof refuses symlink cycle or hop limit: {}",
+                            relative_link.display()
+                        );
+                    }
+                    let next_raw = std::fs::read_link(&candidate).with_context(|| {
+                        format!(
+                            "read chained source-content symlink {}",
+                            candidate.display()
+                        )
+                    })?;
+                    let next_target = next_raw.to_str().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "source-content symlink target is not UTF-8: {}",
+                            candidate.display()
+                        )
+                    })?;
+                    validate_symlink_lexical(&resolved, next_target)?;
+                    let mut next_pending: std::collections::VecDeque<String> =
+                        next_target.split('/').map(ToOwned::to_owned).collect();
+                    next_pending.append(&mut pending);
+                    pending = next_pending;
+                    resolved.pop();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_source_entry(
+    root: &Path,
+    relative: &Path,
+    path_str: &str,
+) -> anyhow::Result<SourceContentFile> {
+    if let Some(parent) = relative.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let expected_parent = root.join(parent);
+        let canonical_parent = expected_parent.canonicalize().with_context(|| {
+            format!(
+                "canonicalize source-content parent directory {}",
+                expected_parent.display()
+            )
+        })?;
+        if canonical_parent != expected_parent {
+            anyhow::bail!(
+                "source-content path traverses a symlinked directory: {}",
+                relative.display()
+            );
+        }
+    }
+    let full_path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&full_path)
+        .with_context(|| format!("stat source-content entry {}", full_path.display()))?;
+    if metadata.file_type().is_symlink() {
+        let raw_target = std::fs::read_link(&full_path)
+            .with_context(|| format!("read source-content symlink {}", full_path.display()))?;
+        let target = raw_target.to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "source-content symlink target is not UTF-8: {}",
+                full_path.display()
+            )
+        })?;
+        validate_symlink_within_root(root, relative, target)?;
+        let byte_count = target.len() as u64;
+        let sha256 = sha256_hex(target.as_bytes());
+        return Ok(SourceContentFile {
+            path: path_str.to_owned(),
+            kind: SourceContentEntryKind::Symlink,
+            symlink_target: Some(target.to_owned()),
+            sha256,
+            byte_count,
+            executable: false,
+        });
+    }
+    let (sha256, byte_count, executable) = hash_file(&full_path)?;
+    Ok(SourceContentFile {
+        path: path_str.to_owned(),
+        kind: SourceContentEntryKind::Regular,
+        symlink_target: None,
+        sha256,
+        byte_count,
+        executable,
+    })
+}
+
 fn canonical_root_path(path: &Path) -> anyhow::Result<String> {
     let canonical = path
         .canonicalize()
@@ -217,9 +389,9 @@ async fn capture_manifest(
             if path.chars().any(char::is_control) {
                 anyhow::bail!("source-content relative path contains control characters");
             }
-            let (sha256, byte_count, executable) = hash_file(&hash_root.join(&relative))?;
+            let entry_file = hash_source_entry(&hash_root, &relative, path)?;
             total_bytes = total_bytes
-                .checked_add(byte_count)
+                .checked_add(entry_file.byte_count)
                 .ok_or_else(|| anyhow::anyhow!("source-content byte count overflow"))?;
             if total_bytes > MAX_SOURCE_CONTENT_BYTES {
                 anyhow::bail!(
@@ -228,12 +400,7 @@ async fn capture_manifest(
                     MAX_SOURCE_CONTENT_BYTES
                 );
             }
-            files.push(SourceContentFile {
-                path: path.to_string(),
-                sha256,
-                byte_count,
-                executable,
-            });
+            files.push(entry_file);
         }
         Ok::<_, anyhow::Error>((files, total_bytes))
     })
@@ -323,7 +490,13 @@ fn ensure_coalesced_selection(
             Path::new(&file.path).strip_prefix(prefix).ok().map(|path| {
                 (
                     path.to_path_buf(),
-                    (&file.sha256, file.byte_count, file.executable),
+                    (
+                        file.kind,
+                        file.symlink_target.as_deref(),
+                        &file.sha256,
+                        file.byte_count,
+                        file.executable,
+                    ),
                 )
             })
         })
@@ -335,7 +508,13 @@ fn ensure_coalesced_selection(
         .map(|file| {
             (
                 PathBuf::from(&file.path),
-                (&file.sha256, file.byte_count, file.executable),
+                (
+                    file.kind,
+                    file.symlink_target.as_deref(),
+                    &file.sha256,
+                    file.byte_count,
+                    file.executable,
+                ),
             )
         })
         .collect();
@@ -625,39 +804,73 @@ pub(super) fn validate_owned_source_content_closure(
             );
             let local = local_root.join(relative);
             let selected = projection.join(relative);
-            let contents = if is_selected_cargo_metadata(relative) {
-                metadata_bytes = metadata_bytes
-                    .checked_add(file.byte_count)
-                    .filter(|total| *total <= MAX_REMOTE_MANIFEST_BYTES as u64)
-                    .ok_or_else(|| anyhow::anyhow!("selected Cargo metadata byte cap exceeded"))?;
-                let metadata = std::fs::symlink_metadata(&local)
-                    .with_context(|| format!("stat captured Cargo metadata {}", local.display()))?;
-                anyhow::ensure!(
-                    metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && local.canonicalize()? == local,
-                    "captured Cargo metadata is no longer a regular literal path: {}",
-                    local.display()
-                );
-                let mut bytes = Vec::new();
-                File::open(&local)?
-                    .take(file.byte_count + 1)
-                    .read_to_end(&mut bytes)?;
-                anyhow::ensure!(
-                    bytes.len() as u64 == file.byte_count && sha256_hex(&bytes) == file.sha256,
-                    "captured Cargo metadata changed: {}",
-                    local.display()
-                );
-                Some(String::from_utf8(bytes).with_context(|| {
-                    format!("captured Cargo metadata is not UTF-8: {}", local.display())
-                })?)
-            } else {
-                None
+            let entry = match file.kind {
+                SourceContentEntryKind::Symlink => {
+                    let target = file.symlink_target.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("captured symlink missing target: {}", file.path)
+                    })?;
+                    anyhow::ensure!(
+                        !file.executable
+                            && file.byte_count == target.len() as u64
+                            && file.sha256 == sha256_hex(target.as_bytes()),
+                        "captured symlink manifest fields are inconsistent: {}",
+                        file.path
+                    );
+                    validate_symlink_within_root(local_root, relative, target)?;
+                    let metadata = std::fs::symlink_metadata(&local)
+                        .with_context(|| format!("stat captured symlink {}", local.display()))?;
+                    anyhow::ensure!(
+                        metadata.file_type().is_symlink()
+                            && std::fs::read_link(&local)? == Path::new(target),
+                        "captured symlink changed: {}",
+                        local.display()
+                    );
+                    SelectedCargoEntry::Symlink(target.to_owned())
+                }
+                SourceContentEntryKind::Regular => {
+                    anyhow::ensure!(
+                        file.symlink_target.is_none(),
+                        "captured regular file cannot declare a symlink target: {}",
+                        file.path
+                    );
+                    let contents = if is_selected_cargo_metadata(relative) {
+                        metadata_bytes = metadata_bytes
+                            .checked_add(file.byte_count)
+                            .filter(|total| *total <= MAX_REMOTE_MANIFEST_BYTES as u64)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("selected Cargo metadata byte cap exceeded")
+                            })?;
+                        let metadata = std::fs::symlink_metadata(&local).with_context(|| {
+                            format!("stat captured Cargo metadata {}", local.display())
+                        })?;
+                        anyhow::ensure!(
+                            metadata.is_file()
+                                && !metadata.file_type().is_symlink()
+                                && local.canonicalize()? == local,
+                            "captured Cargo metadata is no longer a regular literal path: {}",
+                            local.display()
+                        );
+                        let mut bytes = Vec::new();
+                        File::open(&local)?
+                            .take(file.byte_count + 1)
+                            .read_to_end(&mut bytes)?;
+                        anyhow::ensure!(
+                            bytes.len() as u64 == file.byte_count
+                                && sha256_hex(&bytes) == file.sha256,
+                            "captured Cargo metadata changed: {}",
+                            local.display()
+                        );
+                        Some(String::from_utf8(bytes).with_context(|| {
+                            format!("captured Cargo metadata is not UTF-8: {}", local.display())
+                        })?)
+                    } else {
+                        None
+                    };
+                    SelectedCargoEntry::File(contents)
+                }
             };
             anyhow::ensure!(
-                entries
-                    .insert(selected.clone(), SelectedCargoEntry::File(contents))
-                    .is_none()
+                entries.insert(selected.clone(), entry).is_none()
                     && local_files.insert(local, selected).is_none(),
                 "owned source closure has overlapping captured files"
             );
@@ -864,6 +1077,9 @@ pub(super) fn guard_owned_source_content_cargo_config(
     let mut allowed = std::collections::BTreeSet::new();
     for root in prepared {
         for file in &root.manifest.files {
+            if file.kind != SourceContentEntryKind::Regular {
+                continue;
+            }
             let path = Path::new(&file.path);
             if path
                 .parent()
@@ -962,14 +1178,34 @@ fn remote_manifest_payload(manifest: &SourceContentRootManifest) -> anyhow::Resu
         if file.path.chars().any(|ch| matches!(ch, '\t' | '\n' | '\r')) {
             anyhow::bail!("unsafe source-content manifest path: {:?}", file.path);
         }
+        let mode_token = match file.kind {
+            SourceContentEntryKind::Regular => {
+                if file.symlink_target.is_some() {
+                    anyhow::bail!(
+                        "regular source-content entry cannot carry symlink_target: {:?}",
+                        file.path
+                    );
+                }
+                if file.executable { "1" } else { "0" }
+            }
+            SourceContentEntryKind::Symlink => {
+                if file.executable {
+                    anyhow::bail!(
+                        "symlink source-content entry cannot be executable: {:?}",
+                        file.path
+                    );
+                }
+                if let Some(target) = &file.symlink_target {
+                    validate_symlink_lexical(Path::new(&file.path), target)?;
+                }
+                "L"
+            }
+        };
         use std::io::Write as _;
         writeln!(
             payload,
             "{}\t{}\t{}\t{}",
-            file.sha256,
-            file.byte_count,
-            u8::from(file.executable),
-            file.path
+            file.sha256, file.byte_count, mode_token, file.path
         )?;
         if payload.len() > MAX_REMOTE_MANIFEST_BYTES {
             anyhow::bail!(
@@ -1009,32 +1245,68 @@ try:
         if not line.endswith(b"\n"):
             refuse(67, "count")
         expected_hash, expected_bytes, expected_exec, relative = line[:-1].split(b"\t", 3)
-        relative.decode("utf-8")
+        relative_str = relative.decode("utf-8")
         if not relative:
             refuse(62, "empty_path")
         file = root + b"/" + relative
-        try:
-            metadata = os.lstat(file)
-        except OSError:
-            refuse(63, "not_regular", relative)
-        if not stat.S_ISREG(metadata.st_mode):
-            refuse(63, "not_regular", relative)
-        hasher = hashlib.sha256()
-        actual_bytes = 0
-        with open(file, "rb") as source:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                actual_bytes += len(chunk)
-                hasher.update(chunk)
-        if str(actual_bytes).encode("ascii") != expected_bytes:
-            refuse(64, "size", relative)
-        if hasher.hexdigest().encode("ascii") != expected_hash:
-            refuse(65, "sha256", relative)
-        actual_exec = b"1" if os.access(file, os.X_OK, effective_ids=True) else b"0"
-        if actual_exec != expected_exec:
-            refuse(66, "mode", relative)
+        if expected_exec == b"L":
+            try:
+                metadata = os.lstat(file)
+            except OSError:
+                refuse(63, "not_symlink", relative)
+            if not stat.S_ISLNK(metadata.st_mode):
+                refuse(63, "not_symlink", relative)
+            target = os.readlink(file)
+            target_str = target.decode("utf-8")
+            if (
+                not target_str
+                or target_str.startswith("/")
+                or "\\" in target_str
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in target_str)
+            ):
+                refuse(63, "unsafe_symlink", relative)
+            parts = [
+                part
+                for part in relative_str.split("/")[:-1]
+                if part and part != "."
+            ]
+            for part in target_str.split("/"):
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    if not parts:
+                        refuse(63, "symlink_escape", relative)
+                    parts.pop()
+                else:
+                    parts.append(part)
+            actual_bytes = len(target)
+            if str(actual_bytes).encode("ascii") != expected_bytes:
+                refuse(64, "size", relative)
+            if hashlib.sha256(target).hexdigest().encode("ascii") != expected_hash:
+                refuse(65, "sha256", relative)
+        else:
+            try:
+                metadata = os.lstat(file)
+            except OSError:
+                refuse(63, "not_regular", relative)
+            if not stat.S_ISREG(metadata.st_mode):
+                refuse(63, "not_regular", relative)
+            hasher = hashlib.sha256()
+            actual_bytes = 0
+            with open(file, "rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    actual_bytes += len(chunk)
+                    hasher.update(chunk)
+            if str(actual_bytes).encode("ascii") != expected_bytes:
+                refuse(64, "size", relative)
+            if hasher.hexdigest().encode("ascii") != expected_hash:
+                refuse(65, "sha256", relative)
+            actual_exec = b"1" if os.access(file, os.X_OK, effective_ids=True) else b"0"
+            if actual_exec != expected_exec:
+                refuse(66, "mode", relative)
         count += 1
         total += actual_bytes
     if str(count) != expected_count:
@@ -1052,19 +1324,50 @@ fn remote_verify_command(manifest: &SourceContentRootManifest) -> String {
     format!(
         "set -eu; root={root}; tab=$(printf '\\t'); count=0; total=0; \
          if command -v python3 >/dev/null 2>&1; then exec python3 -I -c {python} \"$root\" {file_count} {byte_count}; fi; \
-         if command -v sha256sum >/dev/null 2>&1; then hash_file() {{ sha256sum -- \"$1\" | awk '{{print $1}}'; }}; \
-         elif command -v shasum >/dev/null 2>&1; then hash_file() {{ shasum -a 256 -- \"$1\" | awk '{{print $1}}'; }}; \
+         if command -v sha256sum >/dev/null 2>&1; then hash_file() {{ sha256sum -- \"$1\" | awk '{{print $1}}'; }}; hash_stdin() {{ sha256sum | awk '{{print $1}}'; }}; \
+         elif command -v shasum >/dev/null 2>&1; then hash_file() {{ shasum -a 256 -- \"$1\" | awk '{{print $1}}'; }}; hash_stdin() {{ shasum -a 256 | awk '{{print $1}}'; }}; \
          else printf 'RCH_SOURCE_CONTENT_ERROR:sha256_tool_missing\\n' >&2; exit 61; fi; \
          while IFS=\"$tab\" read -r expected_hash expected_bytes expected_exec relative; do \
            [ -n \"$relative\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:empty_path\\n' >&2; exit 62; }}; \
            file=\"$root/$relative\"; \
-           [ -f \"$file\" ] && [ ! -L \"$file\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_regular:%s\\n' \"$relative\" >&2; exit 63; }}; \
-           actual_bytes=$(wc -c < \"$file\" | tr -d '[:space:]'); \
-           [ \"$actual_bytes\" = \"$expected_bytes\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:size:%s\\n' \"$relative\" >&2; exit 64; }}; \
-           actual_hash=$(hash_file \"$file\"); \
-           [ \"$actual_hash\" = \"$expected_hash\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:sha256:%s\\n' \"$relative\" >&2; exit 65; }}; \
-           actual_exec=0; [ -x \"$file\" ] && actual_exec=1; \
-           [ \"$actual_exec\" = \"$expected_exec\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:mode:%s\\n' \"$relative\" >&2; exit 66; }}; \
+           if [ \"$expected_exec\" = L ]; then \
+             [ -L \"$file\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_symlink:%s\\n' \"$relative\" >&2; exit 63; }}; \
+             link_target=$(readlink \"$file\") || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_symlink:%s\\n' \"$relative\" >&2; exit 63; }}; \
+             [ -n \"$link_target\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:unsafe_symlink:%s\\n' \"$relative\" >&2; exit 63; }}; \
+             case \"$link_target\" in \
+               /*|*\\\\*) printf 'RCH_SOURCE_CONTENT_ERROR:unsafe_symlink:%s\\n' \"$relative\" >&2; exit 63 ;; \
+             esac; \
+             depth=0; rel_rest=$relative; \
+             while :; do \
+               case \"$rel_rest\" in \
+                 */*) seg=${{rel_rest%%/*}}; rel_rest=${{rel_rest#*/}}; \
+                      if [ -n \"$seg\" ] && [ \"$seg\" != . ]; then depth=$((depth + 1)); fi ;; \
+                 *) break ;; \
+               esac; \
+             done; \
+             tgt_rest=\"$link_target/\"; \
+             while [ -n \"$tgt_rest\" ]; do \
+               seg=${{tgt_rest%%/*}}; tgt_rest=${{tgt_rest#*/}}; \
+               case \"$seg\" in \
+                 \"\"|.) ;; \
+                 ..) if [ \"$depth\" -le 0 ]; then printf 'RCH_SOURCE_CONTENT_ERROR:symlink_escape:%s\\n' \"$relative\" >&2; exit 63; fi; \
+                     depth=$((depth - 1)) ;; \
+                 *) depth=$((depth + 1)) ;; \
+               esac; \
+             done; \
+             actual_bytes=$(printf '%s' \"$link_target\" | wc -c | tr -d '[:space:]'); \
+             [ \"$actual_bytes\" = \"$expected_bytes\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:size:%s\\n' \"$relative\" >&2; exit 64; }}; \
+             actual_hash=$(printf '%s' \"$link_target\" | hash_stdin); \
+             [ \"$actual_hash\" = \"$expected_hash\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:sha256:%s\\n' \"$relative\" >&2; exit 65; }}; \
+           else \
+             [ -f \"$file\" ] && [ ! -L \"$file\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_regular:%s\\n' \"$relative\" >&2; exit 63; }}; \
+             actual_bytes=$(wc -c < \"$file\" | tr -d '[:space:]'); \
+             [ \"$actual_bytes\" = \"$expected_bytes\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:size:%s\\n' \"$relative\" >&2; exit 64; }}; \
+             actual_hash=$(hash_file \"$file\"); \
+             [ \"$actual_hash\" = \"$expected_hash\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:sha256:%s\\n' \"$relative\" >&2; exit 65; }}; \
+             actual_exec=0; [ -x \"$file\" ] && actual_exec=1; \
+             [ \"$actual_exec\" = \"$expected_exec\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:mode:%s\\n' \"$relative\" >&2; exit 66; }}; \
+           fi; \
            count=$((count + 1)); total=$((total + actual_bytes)); \
          done; \
          [ \"$count\" -eq {file_count} ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:count:%s\\n' \"$count\" >&2; exit 67; }}; \
@@ -2158,6 +2461,8 @@ mod tests {
         };
         let file = SourceContentFile {
             path: "src/lib.rs".to_string(),
+            kind: SourceContentEntryKind::Regular,
+            symlink_target: None,
             sha256: "a".repeat(64),
             byte_count: 7,
             executable: false,
@@ -2239,6 +2544,8 @@ mod tests {
             byte_count: 3,
             files: vec![SourceContentFile {
                 path: "src/lib.rs".to_string(),
+                kind: SourceContentEntryKind::Regular,
+                symlink_target: None,
                 sha256: "f".repeat(64),
                 byte_count: 3,
                 executable: false,
@@ -2248,6 +2555,23 @@ mod tests {
         assert_eq!(
             String::from_utf8(remote_manifest_payload(&manifest).unwrap()).unwrap(),
             format!("{}\t3\t0\tsrc/lib.rs\n", "f".repeat(64))
+        );
+        let mut with_symlink = manifest.clone();
+        with_symlink.files.push(SourceContentFile {
+            path: "WORKSPACE_README.md".to_string(),
+            kind: SourceContentEntryKind::Symlink,
+            symlink_target: Some("README.md".to_string()),
+            sha256: sha256_hex(b"README.md"),
+            byte_count: 9,
+            executable: false,
+        });
+        assert_eq!(
+            String::from_utf8(remote_manifest_payload(&with_symlink).unwrap()).unwrap(),
+            format!(
+                "{}\t3\t0\tsrc/lib.rs\n{}\t9\tL\tWORKSPACE_README.md\n",
+                "f".repeat(64),
+                sha256_hex(b"README.md")
+            )
         );
         let mut invalid = manifest;
         invalid.files[0].path = "src\tlib.rs".to_string();
@@ -2315,11 +2639,22 @@ mod tests {
             let (sha256, byte_count, executable) = hash_file(&path).unwrap();
             files.push(SourceContentFile {
                 path: name.to_owned(),
+                kind: SourceContentEntryKind::Regular,
+                symlink_target: None,
                 sha256,
                 byte_count,
                 executable,
             });
         }
+        std::os::unix::fs::symlink("ordinary.rs", root.join("WORKSPACE_README.md")).unwrap();
+        files.push(
+            hash_source_entry(
+                &root.canonicalize().unwrap(),
+                Path::new("WORKSPACE_README.md"),
+                "WORKSPACE_README.md",
+            )
+            .unwrap(),
+        );
         // A compiler source tree cannot replace the verifier's standard
         // library imports. Python's isolated mode must ignore this module.
         std::fs::write(
@@ -2377,6 +2712,12 @@ mod tests {
         let mut symlink = manifest.clone();
         std::os::unix::fs::symlink("ordinary.rs", root.join("symlink.rs")).unwrap();
         symlink.files[0].path = "symlink.rs".to_owned();
+        let mut regular_as_symlink = manifest.clone();
+        regular_as_symlink.files[4].path = "ordinary.rs".to_owned();
+        let mut wrong_symlink_size = manifest.clone();
+        wrong_symlink_size.files[4].byte_count += 1;
+        let mut wrong_symlink_hash = manifest.clone();
+        wrong_symlink_hash.files[4].sha256 = "0".repeat(64);
         let mut short = manifest.clone();
         short.files.pop();
         let mut extra = manifest.clone();
@@ -2391,6 +2732,9 @@ mod tests {
             (missing, 63),
             (directory, 63),
             (symlink, 63),
+            (regular_as_symlink, 63),
+            (wrong_symlink_size, 64),
+            (wrong_symlink_hash, 65),
             (short, 67),
             (extra, 67),
             (wrong_total, 68),
@@ -2408,6 +2752,28 @@ mod tests {
                 output
             );
         }
+        std::os::unix::fs::symlink("../outside.rs", root.join("escape_link.rs")).unwrap();
+        let mut escaping_payload = remote_manifest_payload(&manifest).unwrap();
+        let escape_target = b"../outside.rs";
+        let escape_line = format!(
+            "{}\t{}\tL\tescape_link.rs\n",
+            sha256_hex(escape_target),
+            escape_target.len()
+        );
+        escaping_payload.extend_from_slice(escape_line.as_bytes());
+        let mut escaping_manifest = manifest.clone();
+        escaping_manifest.file_count += 1;
+        escaping_manifest.byte_count += escape_target.len() as u64;
+        let output = run_source_verifier(&escaping_manifest, &escaping_payload, path_override);
+        assert_eq!(output.status.code(), Some(63), "{:?}", output);
+        assert!(output.stdout.is_empty(), "{:?}", output);
+        assert!(
+            output
+                .stderr
+                .starts_with(b"RCH_SOURCE_CONTENT_ERROR:symlink_escape:"),
+            "{:?}",
+            output
+        );
         for truncated in [&payload[..payload.len() - 1], &payload[..0]] {
             let output = run_source_verifier(&manifest, truncated, path_override);
             assert_eq!(output.status.code(), Some(67), "{:?}", output);
@@ -2459,7 +2825,7 @@ mod tests {
             };
             let bin = tempfile::tempdir().expect("private portable verifier PATH");
             for (name, path) in std::iter::once((hash_tool, hash_path)).chain(
-                ["awk", "wc", "tr"].into_iter().map(|name| {
+                ["awk", "wc", "tr", "readlink"].into_iter().map(|name| {
                     (
                         name,
                         resolve(name).expect("portable verifier utility must be present"),
@@ -2477,6 +2843,129 @@ mod tests {
         assert!(
             verified_hash_tools > 0,
             "portable verification must execute with a genuine SHA-256 tool"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_manifest_records_typed_symlinks_and_refuses_root_escapes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("crates/app/src")).unwrap();
+        std::fs::write(root.join("README.md"), "# music_theory_data_tool\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/app/src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::os::unix::fs::symlink("README.md", root.join("WORKSPACE_README.md")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../README.md",
+            root.join("crates/app/WORKSPACE_README.md"),
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+        let entry = SyncClosurePlanEntry {
+            local_root: root.clone(),
+            remote_root: "/data/tmp/rch/owned/projects/project".to_owned(),
+            project_id: "project".to_owned(),
+            root_hash: "a".repeat(64),
+            is_primary: true,
+            mode: SyncClosureMode::Full,
+        };
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "project".to_owned(),
+            "a".repeat(64),
+            rch_common::TransferConfig::default(),
+        )
+        .with_remote_path_override(entry.remote_root.clone())
+        .with_owned_source_materialization();
+        let prepared = prepare_source_content_root(0, &entry, &pipeline)
+            .await
+            .expect("in-root symlinks should be captured");
+        let root_link = prepared
+            .manifest
+            .files
+            .iter()
+            .find(|file| file.path == "WORKSPACE_README.md")
+            .expect("WORKSPACE_README.md symlink captured");
+        assert_eq!(root_link.kind, SourceContentEntryKind::Symlink);
+        assert_eq!(root_link.symlink_target.as_deref(), Some("README.md"));
+        assert_eq!(root_link.byte_count, 9);
+        assert_eq!(root_link.sha256, sha256_hex(b"README.md"));
+        assert!(!root_link.executable);
+
+        let policy = PathTopologyPolicy::new(
+            temp.path().canonicalize().unwrap(),
+            temp.path().canonicalize().unwrap(),
+        );
+        validate_owned_source_content_closure(
+            &[prepared],
+            "/data/tmp/rch/owned",
+            &root,
+            None,
+            "cargo check --workspace",
+            &policy,
+        )
+        .expect("owned closure should admit contained symlinks");
+
+        // Direct relative escape out of root must be refused.
+        let escape_root = temp.path().join("escape-direct");
+        std::fs::create_dir_all(&escape_root).unwrap();
+        std::fs::write(escape_root.join("README.md"), "ok\n").unwrap();
+        std::os::unix::fs::symlink("../outside.md", escape_root.join("WORKSPACE_README.md"))
+            .unwrap();
+        let escape_entry = SyncClosurePlanEntry {
+            local_root: escape_root.clone(),
+            ..entry.clone()
+        };
+        let escape_pipeline = TransferPipeline::new(
+            escape_root,
+            "project".to_owned(),
+            "a".repeat(64),
+            rch_common::TransferConfig::default(),
+        )
+        .with_owned_source_materialization();
+        let err = prepare_source_content_root(0, &escape_entry, &escape_pipeline)
+            .await
+            .err()
+            .expect("direct escape symlink must refuse");
+        assert!(
+            err.to_string().contains("refuses symlink escaping root"),
+            "{err:#}"
+        );
+
+        // Two-hop indirect symlink escape (`sub/up -> ..` then `sneaky -> sub/up/../outside`) must be refused.
+        let hop_root = temp.path().join("escape-indirect");
+        std::fs::create_dir_all(hop_root.join("sub")).unwrap();
+        std::fs::write(hop_root.join("README.md"), "ok\n").unwrap();
+        std::os::unix::fs::symlink("..", hop_root.join("sub/up")).unwrap();
+        std::os::unix::fs::symlink("sub/up/../outside", hop_root.join("sneaky")).unwrap();
+        let hop_entry = SyncClosurePlanEntry {
+            local_root: hop_root.clone(),
+            ..entry.clone()
+        };
+        let hop_pipeline = TransferPipeline::new(
+            hop_root,
+            "project".to_owned(),
+            "a".repeat(64),
+            rch_common::TransferConfig::default(),
+        )
+        .with_owned_source_materialization();
+        let err = prepare_source_content_root(0, &hop_entry, &hop_pipeline)
+            .await
+            .err()
+            .expect("indirect symlink escape must refuse");
+        assert!(
+            err.to_string().contains("refuses symlink escaping root"),
+            "{err:#}"
         );
     }
 

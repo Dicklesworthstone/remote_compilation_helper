@@ -747,7 +747,7 @@ async fn await_restart_admission(
     durable_lease.begin_restart_admission_wait()?;
     let mut polls: u32 = 0;
     let outcome = wait_for_restart_admission(
-        async || restart_admission_is_closed(socket_path).await,
+        || restart_admission_is_closed(socket_path),
         restart_admission_wait_bound(),
         std::time::Duration::from_secs(1),
         || {

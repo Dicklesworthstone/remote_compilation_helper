@@ -4185,19 +4185,20 @@ impl TransferPipeline {
         }
     }
 
-    /// Enumerate the exact regular-file universe selected by the upload's
-    /// rsync filters without creating or changing a destination tree.
+    /// Enumerate the exact regular-file and symlink universe selected by the
+    /// upload's rsync filters without creating or changing a destination tree.
     ///
     /// Reusing rsync for selection is deliberate: a second glob interpreter
     /// would eventually drift from rsync's first-match-wins semantics and let a
-    /// receipt authenticate a different set of files than the transfer itself.
+    /// receipt authenticate a different set of entries than the transfer itself.
     #[cfg(test)]
     pub(crate) async fn enumerate_source_content_files(&self) -> Result<Vec<PathBuf>> {
         Ok(self.enumerate_source_content_selection().await?.0)
     }
 
     /// Files and directories from the same rsync invocation. Empty directories
-    /// are transfer inputs too, although the receipt hashes regular files only.
+    /// are transfer inputs too, although the receipt hashes regular files and
+    /// root-confined symlinks only.
     pub(crate) async fn enumerate_source_content_selection(
         &self,
     ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
@@ -4209,7 +4210,7 @@ impl TransferPipeline {
 
     // Selection runs entirely locally. Windows include-only tar uploads must
     // use the same rsync filters as POSIX uploads, without enabling the separate
-    // remote source-content receipt protocol on Windows.
+    // remote source-content receipt protocol or symlinks on Windows.
     async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
         Ok(self.enumerate_source_upload_selection(false).await?.0)
     }
@@ -4264,11 +4265,15 @@ impl TransferPipeline {
             let (itemized, raw_path) = line.split_once('\t').ok_or_else(|| {
                 anyhow::anyhow!("unexpected source-content enumeration line: {line:?}")
             })?;
-            let directory = itemized.as_bytes().get(1) == Some(&b'd');
+            let item_type = itemized.as_bytes().get(1).copied();
+            let directory = item_type == Some(b'd');
             if directory && (!collect_directories || raw_path == "./") {
                 continue;
             }
-            if !directory && itemized.as_bytes().get(1) != Some(&b'f') {
+            let allowed = directory
+                || item_type == Some(b'f')
+                || (collect_directories && item_type == Some(b'L'));
+            if !allowed {
                 anyhow::bail!(
                     "source-content proof refuses non-regular rsync item {itemized:?} at {raw_path:?}"
                 );
