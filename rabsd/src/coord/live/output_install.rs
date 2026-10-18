@@ -418,6 +418,7 @@ pub(super) fn select_for_install(
     .map_err(ServeError::Materialize)
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn stage_for_install(
     selected: SelectedActionOutputs,
     plan: &PreparedOutputs,

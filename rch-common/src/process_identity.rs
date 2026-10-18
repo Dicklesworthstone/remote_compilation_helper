@@ -108,19 +108,36 @@ fn decimal(value: &str) -> Option<u64> {
 /// Only call this with the PID whose identity was recorded in the journal.
 /// The result authorizes observation/recovery, never an unfenced kill(pid).
 pub fn owner_presence(pid: u32, expected: Option<&ProcessIdentity>) -> OwnerPresence {
-    if pid <= 1 || i32::try_from(pid).is_err() {
-        // A boot mismatch proves absence even for reserved PIDs. For normal
-        // PIDs observe_process already supplies boot evidence in one probe.
-        // Failed inspection (including foreign procfs) proves nothing.
-        if let Some(expected) = expected.filter(|identity| identity.is_valid())
-            && let Some(current) = current_process_identity()
-            && expected.boot_id != current.boot_id
-        {
-            return OwnerPresence::Absent;
-        }
-        return OwnerPresence::Unknown;
+    let presence = if pid <= 1 || i32::try_from(pid).is_err() {
+        OwnerPresence::Unknown
+    } else {
+        observed_owner_presence(expected, &observe_process(pid))
+    };
+    if presence != OwnerPresence::Unknown {
+        return presence;
     }
-    observed_owner_presence(expected, &observe_process(pid))
+    // A different kernel boot proves the recorded owner is gone even if its
+    // old PID now names init or is inaccessible. Obtain the boot witness from
+    // our own verified process identity: foreign or unreadable procfs remains
+    // inconclusive. Normal live/recycled PIDs already resolve in one probe.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if expected.is_some_and(ProcessIdentity::is_valid)
+        && let Some(current) = current_process_identity()
+        && owner_from_previous_boot(expected, Some(&current.boot_id))
+    {
+        return OwnerPresence::Absent;
+    }
+    OwnerPresence::Unknown
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn owner_from_previous_boot(expected: Option<&ProcessIdentity>, boot: Option<&str>) -> bool {
+    let (Some(expected), Some(boot)) = (expected, boot) else {
+        return false;
+    };
+    expected.is_valid()
+        && uuid::Uuid::parse_str(boot).is_ok_and(|uuid| uuid.to_string() == boot)
+        && expected.boot_id != boot
 }
 
 fn observed_owner_presence(
@@ -589,6 +606,76 @@ mod tests {
             observed_owner_presence(None, &ProcessObservation::Present(current)),
             OwnerPresence::Unknown
         );
+    }
+
+    #[test]
+    fn old_boot_is_independent_proof_but_missing_or_malformed_boots_are_not() {
+        let owner = ProcessIdentity::from_record(&format!("{BOOT}:123")).unwrap();
+        let next_boot = "00000000-0000-0000-0000-000000000001";
+        assert!(owner_from_previous_boot(Some(&owner), Some(next_boot)));
+        assert!(!owner_from_previous_boot(Some(&owner), Some(BOOT)));
+        assert!(!owner_from_previous_boot(Some(&owner), None));
+        assert!(!owner_from_previous_boot(None, Some(next_boot)));
+        assert!(!owner_from_previous_boot(Some(&owner), Some("unreadable")));
+        assert!(!owner_from_previous_boot(
+            Some(&owner),
+            Some(&BOOT.to_uppercase())
+        ));
+        let malformed = ProcessIdentity {
+            boot_id: "unverified-boot".into(),
+            start: ProcessStart::Linux { ticks: 123 },
+        };
+        assert!(!owner_from_previous_boot(Some(&malformed), Some(next_boot)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_real_identity_distinguishes_live_recycled_and_previous_boot_owners() {
+        let identity = current_process_identity().expect("Linux procfs must expose our identity");
+        let pid = std::process::id();
+        assert_eq!(owner_presence(pid, Some(&identity)), OwnerPresence::Live);
+        assert_eq!(owner_presence(pid, None), OwnerPresence::Unknown);
+        assert_eq!(owner_presence(0, Some(&identity)), OwnerPresence::Unknown);
+        assert_eq!(owner_presence(1, Some(&identity)), OwnerPresence::Unknown);
+
+        let mut recycled = identity.clone();
+        let ProcessStart::Linux { ticks } = &mut recycled.start else {
+            panic!("Linux must record kernel start ticks");
+        };
+        *ticks = ticks.saturating_add(1);
+        assert_eq!(owner_presence(pid, Some(&recycled)), OwnerPresence::Absent);
+
+        let mut rebooted = identity;
+        rebooted.boot_id = if rebooted.boot_id == "00000000-0000-0000-0000-000000000001" {
+            "00000000-0000-0000-0000-000000000002".into()
+        } else {
+            "00000000-0000-0000-0000-000000000001".into()
+        };
+        for reused_pid in [pid, 1, 0, u32::MAX] {
+            assert_eq!(
+                owner_presence(reused_pid, Some(&rebooted)),
+                OwnerPresence::Absent,
+                "a previous boot is independent of the current occupant of PID {reused_pid}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reaped_child_is_absent_with_its_recorded_birth_identity() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("start test-owned process");
+        let pid = child.id();
+        let observation = observe_process(pid);
+        // Always retire our child before asserting, including a failed probe.
+        child.kill().expect("stop test-owned process");
+        child.wait().expect("reap test-owned process");
+        let ProcessObservation::Present(identity) = observation else {
+            panic!("expected live Linux child identity, got {observation:?}");
+        };
+        assert_eq!(owner_presence(pid, Some(&identity)), OwnerPresence::Absent);
     }
 
     #[test]

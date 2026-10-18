@@ -9,6 +9,7 @@
 
 use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
 use rabs_key::live_dependency::{LiveRefusal, LiveRustcRequest};
+use rabs_key::output_derivation::check_dependency_output_options;
 
 #[path = "sysroot_preflight.rs"]
 mod sysroot_preflight;
@@ -120,6 +121,14 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
     }
     dependency_inputs_rejection(&invocation)
         .or_else(|| sysroot_preflight::rejection(&invocation))
+        // Use the SAME option model as final derivation, not a second flag
+        // list or a fabricated host triple. Supported threaded compiles keep
+        // going; incremental/save-temps/unknown modes never start cold hashing.
+        .or_else(|| {
+            check_dependency_output_options(&invocation)
+                .err()
+                .map(|error| LiveRefusal::Outputs(error.to_string()))
+        })
 }
 
 fn dependency_inputs_rejection(invocation: &NormalizedRustcInvocation) -> Option<LiveRefusal> {
@@ -500,6 +509,127 @@ mod tests {
                     assert_eq!(rejection(request), None, "{kind} {emit} on {host}");
                     assert!(plan_dependency_action(request, host).is_ok());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn threaded_cargo_frontends_preserve_the_full_planner_path() {
+        for host in [
+            HOST,
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+        ] {
+            for options in [
+                vec!["-Zthreads=1"],
+                vec!["-Z", "threads=8"],
+                vec!["-Zthreads=8", "-Zembed-metadata=no"],
+            ] {
+                let (mut argv, env) = fixture(PACKAGE);
+                argv.extend(options.iter().map(|option| (*option).to_owned()));
+                let original = argv.clone();
+                let request = LiveRustcRequest {
+                    argv: &argv,
+                    cwd: PACKAGE,
+                    env: &env,
+                };
+                assert_eq!(rejection(request), None, "{options:?} on {host}");
+                let plan = plan_dependency_action(request, host).unwrap();
+                assert_eq!(argv, original, "admission must not rewrite the command");
+                assert!(
+                    plan.invocation.unstable.iter().any(|(name, _)| name == "threads")
+                );
+                assert!(plan.output_names().iter().any(|name| name.ends_with(".d")));
+            }
+        }
+    }
+
+    #[test]
+    fn output_option_preflight_refusals_agree_with_the_full_planner() {
+        for options in [
+            vec!["-Cincremental=/target/incremental"],
+            vec!["-C", "save-temps=yes"],
+            vec!["-Csplit-debuginfo=unpacked"],
+            vec!["-Zthreads=0"],
+            vec!["-Z", "threads=auto"],
+            vec!["-Zthreads=8", "-Zno-codegen"],
+            vec!["-Zno-codegen", "-Zthreads=8"],
+            vec!["--emit=dep-info,obj"],
+            vec!["--emit=dep-info=/unmodeled/report"],
+            vec!["--test"],
+            vec!["--print=file-names"],
+            vec!["--future-output-option"],
+        ] {
+            let (mut argv, env) = fixture(PACKAGE);
+            argv.extend(options.iter().map(|option| (*option).to_owned()));
+            let request = LiveRustcRequest {
+                argv: &argv,
+                cwd: PACKAGE,
+                env: &env,
+            };
+            let actual = rejection(request);
+            assert!(
+                matches!(&actual, Some(LiveRefusal::Outputs(_))),
+                "{options:?}"
+            );
+            assert_eq!(
+                actual,
+                plan_dependency_action(request, HOST).err(),
+                "{options:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_edge_rejects_unmodeled_output_controls_without_cold_preparation() {
+        use super::super::{Decided, LiveEdge, decide};
+        use crate::coord::live::CoordLive;
+        use crate::coord::live_dependency::LiveDependencyLane;
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let temporary = crate::test_util::private_tempdir();
+        let root = temporary.path().canonicalize().unwrap();
+        let compiler = root.join("toolchain/bin/rustc");
+        let marker = root.join("probed");
+        std::fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        std::fs::write(
+            &compiler,
+            format!("#!/bin/sh\nprintf invoked > '{}'\nexit 99\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cas = Arc::new(crate::janitor::store::mount_and_reconcile(&root.join("cas")).unwrap());
+        let coord = Arc::new(CoordLive::with_cas(cas));
+        coord
+            .acquire_boot_authority("output-controls-preflight")
+            .unwrap();
+        coord.mark_up();
+        let live = LiveEdge::new(LiveDependencyLane::new(coord));
+        for may_wait in [false, true] {
+            for option in [
+                "-Zthreads=0",
+                "-Zno-codegen",
+                "-Cincremental=/target/incremental",
+                "-Csave-temps=yes",
+                "--emit=dep-info,obj",
+                "--test",
+            ] {
+                let (mut argv, env) = fixture(PACKAGE);
+                argv[0] = compiler.to_str().unwrap().into();
+                argv.push(option.into());
+                let request = json!({
+                    "kind": "rustc-request", "argv": argv, "cwd": PACKAGE,
+                    "env": env, "wait_for_inflight": may_wait,
+                });
+                let Decided::Shadow(observed) = decide(&live, &request) else {
+                    panic!("{option} must bypass, not warm facts for an impossible cache hit");
+                };
+                assert_eq!(observed.argv, argv);
+                assert!(!marker.exists(), "an unsupported output control started rustc");
             }
         }
     }

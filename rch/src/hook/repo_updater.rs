@@ -32,6 +32,8 @@ use super::ssh::{
 };
 use super::*;
 
+mod status_probe;
+
 fn repo_updater_timeout_for(
     contract: &RepoUpdaterAdapterContract,
     command: RepoUpdaterAdapterCommand,
@@ -837,6 +839,12 @@ async fn detect_remote_unsuitable_sync_roots(
     sync_roots: &[PathBuf],
     source_identity: Option<&str>,
 ) -> anyhow::Result<Vec<(PathBuf, String)>> {
+    if !crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
+        return status_probe::remote(worker, sync_roots, source_identity).await;
+    }
+    // Windows uses stdin for the control script itself, not a second data
+    // stream. Retain its existing transport until the batch protocol has a
+    // separately qualified Windows framing path.
     let mut unsuitable = Vec::new();
 
     for root in sync_roots {
