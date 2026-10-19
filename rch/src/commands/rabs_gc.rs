@@ -1039,12 +1039,18 @@ fn record_and_verify_release_verdict(
     store
         .record_release_verdict(verdict)
         .map_err(|e| anyhow::anyhow!("record release verdict: {e:?}"))?;
-    build_release_verdict_receipt(store, cas_root, &verdict.build, now_unix_micros, clock_epoch)
+    build_release_verdict_receipt(
+        store,
+        cas_root,
+        &verdict.build,
+        now_unix_micros,
+        clock_epoch,
+    )
 }
 
 fn open_or_init_store(cas_root: &Path) -> anyhow::Result<SqlMetadataStore<RusqliteEngine>> {
-    let _ = rabs_cas::layout::CasLayout::init(cas_root)
-        .map_err(|e| anyhow::anyhow!("initialize CAS layout at {}: {e:?}", cas_root.display()))?;
+    std::fs::create_dir_all(cas_root)
+        .map_err(|e| anyhow::anyhow!("create CAS root directory {}: {e}", cas_root.display()))?;
     let meta = cas_root.join("meta.sqlite");
     let engine =
         RusqliteEngine::open(&meta).map_err(|e| anyhow::anyhow!("metadata engine: {e:?}"))?;
@@ -1626,10 +1632,10 @@ mod tests {
     fn release_verdict_show_and_record_round_trip_and_enforce_evidence_and_expiry() {
         let mut ts = fresh_store("release-verdict");
         let build = rabs_protocol::release_authorization::default_build_identity();
-        let root = ts.dir.path();
+        let root = ts._dir.path().to_path_buf();
 
         let initial =
-            build_release_verdict_receipt(&mut ts.store, root, &build, 1_000, 0).expect("show");
+            build_release_verdict_receipt(&mut ts.store, &root, &build, 1_000, 0).expect("show");
         assert_eq!(initial.standing, "absent");
         assert!(initial.permits_advisory);
         assert!(!initial.permits_required);
@@ -1648,7 +1654,7 @@ mod tests {
             },
         };
         assert!(
-            record_and_verify_release_verdict(&mut ts.store, root, &zero_replayed, 1_000, 0)
+            record_and_verify_release_verdict(&mut ts.store, &root, &zero_replayed, 1_000, 0)
                 .is_err(),
             "zero-replayed verdicts must be refused at record time"
         );
@@ -1665,7 +1671,7 @@ mod tests {
                 coordinator_clock_epoch: 0,
             },
         };
-        let recorded = record_and_verify_release_verdict(&mut ts.store, root, &valid, 2_000, 0)
+        let recorded = record_and_verify_release_verdict(&mut ts.store, &root, &valid, 2_000, 0)
             .expect("record");
         assert_eq!(recorded.standing, "authorized");
         assert!(recorded.permits_advisory);
@@ -1676,7 +1682,7 @@ mod tests {
             "{recorded:?}"
         );
 
-        let expired = build_release_verdict_receipt(&mut ts.store, root, &build, 25_000, 0)
+        let expired = build_release_verdict_receipt(&mut ts.store, &root, &build, 25_000, 0)
             .expect("show expired");
         assert_eq!(expired.standing, "expired");
         assert!(expired.permits_advisory);

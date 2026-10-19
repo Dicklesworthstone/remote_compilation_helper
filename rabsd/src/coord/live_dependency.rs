@@ -151,6 +151,7 @@ fn known_installed_output(path: &Path, expected: &TypedDigest) -> Result<KnownOu
 
 /// The lane's answer to one request.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum LiveDecision {
     /// Every gate passes and the complete output plan is prepared; nothing
     /// is written until the subscriber commits to waiting for the install

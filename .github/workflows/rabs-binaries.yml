@@ -148,6 +148,11 @@ jobs:
           cargo test --release -p rabs-wrap --test live_cargo_layout --locked -- --nocapture
       - name: Real Cargo worktrees receive served dependencies (M4)
         run: cargo test --release -p rabs-wrap --test live_cargo_worktrees --locked -- --nocapture
+      - name: Stock differential release gate and durable verdict authorization (T011 / bd-dockb)
+        run: |
+          cargo test --release -p rabs-protocol --lib release_authorization --locked
+          cargo test --release -p rabs-replay --lib release_gate --locked
+          cargo test --release -p rabsd --test coord_commit_live the_release_gate_governs_serving_promotion_for_the_whole_build --locked
       - name: Doctor + wrapper overhead gate (release, enforcing)
         run: |
           cargo test --release -p rabsd --test doctor_live

@@ -39,6 +39,7 @@ impl Drop for RemoteWork {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Waited {
     Completed(Result<RemoteResult, WorkError>),
     CallerLost,

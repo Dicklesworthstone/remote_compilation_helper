@@ -606,8 +606,8 @@ impl PendingRemote {
             .map_err(settled)?;
         let manifest = captured.offer.manifest.clone();
         let manifest_key = captured.manifest_key.clone();
-        let canonical_transcript =
-            canonicalize_placements(&report.stderr, &attempt.request.plan).map_err(settled)?;
+        let canonical_transcript = canonicalize_placements(&report.stderr, &attempt.request.plan)
+            .map_err(|e| settled(e.to_owned()))?;
         // Capture streams can take time. Recheck the complete original dataset
         // and measured runtime after them, before crossing publication.
         invocation
@@ -754,6 +754,7 @@ fn verify_receipt(
 
 /// No caller output was touched by either alternative.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum RemoteResult {
     /// Complete private result awaiting a second, manifest-specific consent.
     Ready(PendingRemoteInstall),
