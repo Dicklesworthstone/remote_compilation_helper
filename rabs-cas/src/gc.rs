@@ -166,7 +166,7 @@ pub struct GcExecutionReceipt {
     pub planned: usize,
     /// Locations actually reclaimed.
     pub reclaimed: Vec<LocationRef>,
-    /// Planned locations that could not be reclaimed (already gone).
+    /// Planned locations that are now pin-protected or already gone.
     pub skipped: Vec<LocationRef>,
 }
 
@@ -294,21 +294,39 @@ pub fn plan_gc(
     })
 }
 
-/// Execute a plan: reclaim exactly the planned locations and record the
-/// planned-vs-actual receipt. A planned row that no longer exists is a
-/// SKIP in the receipt, never a silent success.
+/// Execute a plan after rechecking its durable pin roots and reachability.
+/// A newly protected or missing location is a SKIP in the receipt, never a
+/// deletion or a fabricated success. Execution never expands the plan.
+///
+/// The caller must serialize this pass with other metadata writers. Store
+/// methods are individually transactional; the snapshot and removals below
+/// are not one database transaction. Runtime-only protections and policy
+/// changes require a fresh `GcWorld` through [`unlink_due`] instead. These
+/// functions retire metadata locations; they do not unlink filesystem bytes.
 ///
 /// # Errors
-/// Store errors; the receipt row is recorded even when some reclaims
-/// skipped.
+/// A failed protection snapshot aborts before any location is removed.
+/// Later store errors may leave partial progress. A completed pass records
+/// its receipt even when some or all planned locations were skipped.
 pub fn execute_gc(
     store: &mut dyn RabsMetadataStore,
     plan: &GcPlan,
 ) -> Result<GcExecutionReceipt, StoreError> {
+    // A plan can outlive a publication, transfer pin, or newly added edge.
+    // The raw location-removal primitive does not check those protections.
+    // Read the CURRENT roots/closure once under the caller's write exclusion,
+    // not once per location. Empty plans need no extra full-index scan.
+    let preserved = if plan.reclaim.is_empty() {
+        BTreeSet::new()
+    } else {
+        preserved_set(&store.gc_snapshot(plan.seq)?)
+    };
     let mut reclaimed = Vec::new();
     let mut skipped = Vec::new();
     for location in &plan.reclaim {
-        if store.remove_location_by_key(&location.object_key, &location.store_path)? {
+        if !preserved.contains(&location.object_key)
+            && store.remove_location_by_key(&location.object_key, &location.store_path)?
+        {
             reclaimed.push(location.clone());
         } else {
             skipped.push(location.clone());
@@ -708,6 +726,164 @@ mod tests {
         let mut candidate =
             SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq")).unwrap()).unwrap();
         assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+    }
+
+    fn late_pin_plan(store: &mut dyn RabsMetadataStore, mode: GcMode) -> GcPlan {
+        install_world(store);
+        for tag in [6, 8] {
+            store
+                .add_location(
+                    &digest(tag),
+                    &format!("/cas/{tag}-replica"),
+                    Some(1),
+                    "raw",
+                    true,
+                )
+                .unwrap();
+        }
+        let mut w = world();
+        w.reconciliation_complete = true;
+        let plan = plan_gc(store, &w, mode, 100).unwrap();
+        assert_eq!(plan.reclaim.len(), if mode == GcMode::Normal { 6 } else { 8 });
+
+        // All changes happen AFTER the plan. Even an expired-looking lease
+        // remains a root until the authority-scoped retirement releases it.
+        store
+            .create_pin(
+                77,
+                &digest(9),
+                "reader-service",
+                "materialization",
+                Some(10),
+                None,
+                false,
+                "late unreleased pin",
+            )
+            .unwrap();
+        for (parent, child) in [(9, 6), (6, 9), (1, 7)] {
+            store
+                .add_object_edge(&digest(parent), &digest(child), "late-edge")
+                .unwrap();
+        }
+        assert!(
+            store
+                .remove_location_by_key(&key(8), "/cas/8-replica")
+                .unwrap()
+        );
+        plan
+    }
+
+    fn check_late_pin_execution(store: &mut dyn RabsMetadataStore, plan: &GcPlan) {
+        use crate::metadata_store::SqlValue;
+
+        let location = |tag, path: &str| LocationRef {
+            object_key: key(tag),
+            store_path: path.into(),
+        };
+        let receipt = execute_gc(store, plan).unwrap();
+        let mut expected = vec![location(8, "/cas/8")];
+        if plan.mode == GcMode::Emergency {
+            expected.extend([location(10, "/cas/10"), location(11, "/cas/11")]);
+        }
+        assert_eq!(receipt.reclaimed, expected);
+        assert_eq!(receipt.planned, plan.reclaim.len());
+        assert_eq!(
+            receipt.skipped,
+            vec![
+                location(6, "/cas/6"),
+                location(6, "/cas/6-replica"),
+                location(7, "/cas/7"),
+                location(8, "/cas/8-replica"),
+                location(9, "/cas/9"),
+            ]
+        );
+        let rows = store
+            .query(
+                "SELECT planned, reclaimed, skipped FROM gc_receipts WHERE seq = 100",
+                &[],
+            )
+            .unwrap();
+        let expected_planned = if plan.mode == GcMode::Normal { 6 } else { 8 };
+        let expected_reclaimed = if plan.mode == GcMode::Normal { 1 } else { 3 };
+        assert!(matches!(rows.as_slice(), [row] if matches!(row.as_slice(),
+            [SqlValue::Int(planned), SqlValue::Int(reclaimed), SqlValue::Int(5)]
+                if *planned == expected_planned && *reclaimed == expected_reclaimed)));
+        for tag in [1, 2, 3, 4, 5, 6, 7, 9] {
+            assert!(store.object_located(&digest(tag)).unwrap(), "lost object {tag}");
+        }
+        assert_eq!(store.object_locations(&digest(6)).unwrap().len(), 2);
+
+        // Replaying a stale plan cannot consume either late root or its
+        // transitive closure, and missing rows are not reported reclaimed.
+        let replay = execute_gc(store, plan).unwrap();
+        assert!(replay.reclaimed.is_empty());
+        assert_eq!(replay.skipped, plan.reclaim);
+
+        // The check is live, not an indefinite retention cache: an explicit
+        // release permits only the formerly pinned, still-planned copies.
+        store.release_pin(77, "reader-service").unwrap();
+        let released = execute_gc(store, plan).unwrap();
+        assert_eq!(
+            released.reclaimed,
+            vec![
+                location(6, "/cas/6"),
+                location(6, "/cas/6-replica"),
+                location(9, "/cas/9")
+            ]
+        );
+        assert!(store.object_located(&digest(7)).unwrap());
+    }
+
+    #[test]
+    fn h014_stale_execution_preserves_late_roots_edges_and_replicas_in_both_modes() {
+        for mode in [GcMode::Normal, GcMode::Emergency] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            let plan = late_pin_plan(&mut store, mode);
+            check_late_pin_execution(&mut store, &plan);
+        }
+    }
+
+    #[test]
+    fn h014_stale_execution_rechecks_pins_after_store_reopen() {
+        let path = fresh_path("late-pin-reopen");
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        let plan = late_pin_plan(&mut store, GcMode::Normal);
+        drop(store);
+        let mut reopened = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        check_late_pin_execution(&mut reopened, &plan);
+    }
+
+    #[test]
+    fn h014_stale_execution_differential_reference_vs_frankensqlite() {
+        fn scenario(store: &mut dyn RabsMetadataStore, mode: GcMode) -> Vec<String> {
+            let plan = late_pin_plan(store, mode);
+            check_late_pin_execution(store, &plan);
+            store.differential_snapshot().unwrap()
+        }
+        for mode in [GcMode::Normal, GcMode::Emergency] {
+            let mut reference =
+                SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("late-ref")).unwrap())
+                    .unwrap();
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("late-fsq")).unwrap())
+                    .unwrap();
+            assert_eq!(scenario(&mut reference, mode), scenario(&mut candidate, mode));
+        }
+    }
+
+    #[test]
+    fn h014_execution_snapshot_error_precedes_every_location_removal() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        install_world(&mut store);
+        let mut plan = plan_gc(&mut store, &world(), GcMode::Normal, 100).unwrap();
+        assert!(!plan.reclaim.is_empty());
+        // The SQL snapshot rejects an unrepresentable sequence. Previously
+        // execution deleted the locations and only then failed its receipt.
+        plan.seq = u64::MAX;
+        let before = store.differential_snapshot().unwrap();
+        assert!(execute_gc(&mut store, &plan).is_err());
+        assert_eq!(store.differential_snapshot().unwrap(), before);
     }
 
     #[test]
