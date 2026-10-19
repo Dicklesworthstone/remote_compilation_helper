@@ -29,8 +29,8 @@ mod output_install;
 mod produced_result_tests;
 
 use crate::coord::action_actor::{
-    ActionActor, AttemptPurpose, JoinReceipt, JoinRequest, OpenGenerationReceipt, RegisterAttempt,
-    RegisterAttemptReceipt, SubscriptionRequirements,
+    ActionActor, AttemptPurpose, CancelReceipt, JoinReceipt, JoinRequest, OpenGenerationReceipt,
+    PromoteReceipt, RegisterAttempt, RegisterAttemptReceipt, SubscriptionRequirements,
 };
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::{BundleId, DestinationArbiter, reserve_scoped};
@@ -1066,6 +1066,26 @@ impl EdgeSubscriber {
     ) -> Result<SubmissionReceipt, SubmissionRefusal> {
         self.coord
             .submit_action(input, request, now_unix_micros, clock_epoch)
+    }
+
+    /// Detach a subscriber's interest from an in-flight action (bead G005).
+    pub fn cancel_subscriber(
+        &self,
+        action_key: &TypedDigest,
+        operation: BuildOperationId,
+    ) -> Result<CancelReceipt, SubmissionRefusal> {
+        self.coord.cancel_subscriber(action_key, operation)
+    }
+
+    /// Promote an attached subscriber's interest in place (bead Q005 / G004).
+    pub fn promote_subscriber(
+        &self,
+        action_key: &TypedDigest,
+        operation: BuildOperationId,
+        deadline_unix_micros: Option<i64>,
+    ) -> Result<PromoteReceipt, SubmissionRefusal> {
+        self.coord
+            .promote_subscriber(action_key, operation, deadline_unix_micros)
     }
 
     pub fn serve_action(
@@ -2393,6 +2413,87 @@ impl CoordLive {
             actor_created: true,
             join,
         })
+    }
+
+    /// Detach a subscriber's interest from an in-flight action (bead G005).
+    ///
+    /// - When other subscribers remain attached, the action and its active
+    ///   attempt/generation survive without interruption.
+    /// - When the last subscriber detaches, the active generation is drained
+    ///   and tombstoned in the durable store so no in-flight worker attempt can
+    ///   publish after cancellation.
+    pub fn cancel_subscriber(
+        &self,
+        key: &TypedDigest,
+        operation: BuildOperationId,
+    ) -> Result<CancelReceipt, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        let active_generation_id = entry
+            .actor
+            .active_generation()
+            .map(|generation| generation.generation_id.0);
+        let receipt = entry.actor.cancel_subscriber(operation);
+        if receipt == CancelReceipt::LastInterestCancelledGeneration {
+            if matches!(
+                entry.state,
+                DispatchState::Claimed(_) | DispatchState::Started(_)
+            ) {
+                entry.state = DispatchState::Queued;
+            }
+            if let Some(generation_id) = active_generation_id
+                && let Some(cas) = self.cas.as_ref()
+            {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| SubmissionRefusal::Unavailable)?;
+                store.tombstone_generation(generation_id).map_err(|error| {
+                    SubmissionRefusal::Admission(format!(
+                        "last-subscriber drain generation tombstone: {error:?}"
+                    ))
+                })?;
+            }
+        }
+        Ok(receipt)
+    }
+
+    /// Promote an attached subscriber's interest in place without creating a
+    /// duplicate actor or execution attempt (bead Q005 / G004).
+    pub fn promote_subscriber(
+        &self,
+        key: &TypedDigest,
+        operation: BuildOperationId,
+        deadline_unix_micros: Option<i64>,
+    ) -> Result<PromoteReceipt, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        let was_optional_only = !entry.actor.has_foreground_interest();
+        let receipt = entry
+            .actor
+            .promote_with_deadline(operation, deadline_unix_micros);
+        if was_optional_only && entry.actor.has_foreground_interest() {
+            entry.promoted_from_speculation = true;
+        }
+        Ok(receipt)
     }
 
     /// Claim at most one pending execution, atomically with registry mutation.
@@ -5255,6 +5356,69 @@ mod tests {
         assert_eq!(
             pull_receipt.nearest_ancestor_commit_oid.as_deref(),
             Some("commit-ci-pushed-1")
+        );
+    }
+
+    #[test]
+    fn g005_q005_live_coord_promote_and_cancel_subscriber_drains_and_tombstones_last_interest() {
+        let (_state, coord) = submission_coordinator();
+        let coord = Arc::new(coord);
+        let (_live, source, manifest, descriptor) = source_fixture();
+        let worker = worker_offer(1, 0x101);
+        coord.admit_worker_session(&worker).unwrap();
+
+        let edge = coord.edge_subscriber();
+        let sub1 = edge
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(701, SubscriberKind::Speculative, 120),
+                1_000,
+                0,
+            )
+            .unwrap();
+        assert!(sub1.actor_created);
+        let key = sub1.action_key.clone();
+
+        // Promote speculative subscriber in place to Foreground without creating a new actor.
+        assert_eq!(
+            edge.promote_subscriber(&key, BuildOperationId(701), Some(80_000))
+                .unwrap(),
+            PromoteReceipt::Promoted
+        );
+
+        // Attach a second subscriber to the same action.
+        let sub2 = edge
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(702, SubscriberKind::ForegroundAgent, 210),
+                1_020,
+                0,
+            )
+            .unwrap();
+        assert!(!sub2.actor_created);
+
+        // Claim and begin dispatch on the worker.
+        let mut dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let _authority = dispatch.begin(&worker, 60_000).unwrap().clone();
+
+        // Cancel subscriber 701; subscriber 702 keeps the action and attempt alive.
+        assert_eq!(
+            edge.cancel_subscriber(&key, BuildOperationId(701)).unwrap(),
+            CancelReceipt::SharedWorkContinues { retained: 1 }
+        );
+        let actor_mid = coord.submitted_actor(&key).unwrap().unwrap();
+        assert!(actor_mid.active_generation().is_some());
+
+        // Cancel the last subscriber 702; active generation drains and is tombstoned in the store.
+        assert_eq!(
+            edge.cancel_subscriber(&key, BuildOperationId(702)).unwrap(),
+            CancelReceipt::LastInterestCancelledGeneration
+        );
+        let actor_after = coord.submitted_actor(&key).unwrap().unwrap();
+        assert!(actor_after.active_generation().is_none());
+        assert_eq!(
+            actor_after.slot(),
+            rabs_action::state_machines::PublicationSlotState::Absent
         );
     }
 }

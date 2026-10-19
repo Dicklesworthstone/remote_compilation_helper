@@ -640,6 +640,7 @@ pub struct ActionActor {
     serving: Option<ActionServingStateRecord>,
 
     subscribers: BTreeMap<u128, Subscriber>,
+    preserved_frontiers: BTreeMap<u128, ExposureFrontiers>,
     attempts: BTreeMap<u128, AttemptEntry>,
     selection_receipts: Vec<SelectionReceipt>,
 
@@ -683,6 +684,7 @@ impl ActionActor {
             history: Vec::new(),
             serving: None,
             subscribers: BTreeMap::new(),
+            preserved_frontiers: BTreeMap::new(),
             attempts: BTreeMap::new(),
             selection_receipts: Vec::new(),
             winner: None,
@@ -905,6 +907,18 @@ impl ActionActor {
     /// same actor, same key, same generation; priority rises; brownout
     /// lifts; promotion is recorded in provenance.
     pub fn promote(&mut self, operation: BuildOperationId) -> PromoteReceipt {
+        self.promote_with_deadline(operation, None)
+    }
+
+    /// Promote a background subscriber to foreground interest with an optional
+    /// foreground deadline (§21.2; bead Q005): keeps the same actor, action key,
+    /// and generation, raises priority to at least [`FOREGROUND_QUEUE_PRIORITY`],
+    /// tightens the deadline, suspends brownout, and records [`EventKind::Promoted`].
+    pub fn promote_with_deadline(
+        &mut self,
+        operation: BuildOperationId,
+        deadline_unix_micros: Option<i64>,
+    ) -> PromoteReceipt {
         let Some(subscriber) = self.subscribers.get_mut(&operation.0) else {
             return PromoteReceipt::UnknownSubscriber;
         };
@@ -913,6 +927,11 @@ impl ActionActor {
         }
         subscriber.kind = SubscriberKind::ForegroundAgent;
         subscriber.queue_priority = subscriber.queue_priority.max(FOREGROUND_QUEUE_PRIORITY);
+        subscriber.deadline_unix_micros =
+            match (subscriber.deadline_unix_micros, deadline_unix_micros) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
         self.foreground_interest = true;
         self.push(EventKind::Promoted);
         PromoteReceipt::Promoted
@@ -1033,10 +1052,13 @@ impl ActionActor {
         RequirementDecision::Served
     }
 
-    /// Remove ONE subscriber's retained interest (§21.3): closes only that
-    /// subscriber's delivery obligation. Shared work continues while any
-    /// interest remains; the last cancellation consults policy — finish a
+    /// Remove ONE subscriber's retained interest (§21.3; bead G005): closes
+    /// only that subscriber's delivery obligation. Shared work continues while
+    /// any interest remains; the last cancellation consults policy — finish a
     /// near-complete cache-populating generation, else cancel and drain.
+    /// Already-exposed frontiers (`stateful_intent_recorded` or
+    /// `transcript_exposed`) are preserved across cancellation so fallback
+    /// classification can never regress to `SeamlessNonpublishing`.
     pub fn cancel_subscriber(&mut self, operation: BuildOperationId) -> CancelReceipt {
         let Some(subscriber) = self.subscribers.get_mut(&operation.0) else {
             return CancelReceipt::UnknownSubscriber;
@@ -1049,7 +1071,12 @@ impl ActionActor {
             self.push(EventKind::Cancelled);
             return CancelReceipt::InterestDecremented { remaining };
         }
-        self.subscribers.remove(&operation.0);
+        if let Some(removed) = self.subscribers.remove(&operation.0)
+            && (removed.frontiers.stateful_intent_recorded || removed.frontiers.transcript_exposed)
+        {
+            self.preserved_frontiers
+                .insert(operation.0, removed.frontiers);
+        }
         self.foreground_interest = self
             .subscribers
             .values()
@@ -1080,7 +1107,23 @@ impl ActionActor {
         CancelReceipt::LastInterestCancelledGeneration
     }
 
-    /// Advance one subscriber's independent delivery state.
+    /// Inspect preserved exposure frontiers for a detached subscriber that had
+    /// already crossed `stateful_intent_recorded` or `transcript_exposed` before
+    /// cancellation (bead G005; invariant I30).
+    #[must_use]
+    pub fn preserved_exposed_frontiers(
+        &self,
+        operation: &BuildOperationId,
+    ) -> Option<ExposureFrontiers> {
+        self.subscribers
+            .get(&operation.0)
+            .map(|s| s.frontiers)
+            .or_else(|| self.preserved_frontiers.get(&operation.0).copied())
+    }
+
+    /// Advance one subscriber's independent delivery state, monotonically
+    /// latching exposure frontiers when transcript or stateful emission states
+    /// are entered (bead G005; invariant I30).
     ///
     /// # Errors
     /// The current state and requested state when the delivery machine
@@ -1097,6 +1140,21 @@ impl ActionActor {
             return Err((subscriber.delivery, to));
         }
         subscriber.delivery = to;
+        if matches!(
+            to,
+            SubscriberDeliveryState::EmittingTranscript
+                | SubscriberDeliveryState::TranscriptDeliveryUncertain
+        ) {
+            subscriber.frontiers.transcript_exposed = true;
+        }
+        if matches!(
+            to,
+            SubscriberDeliveryState::EmittingStatefulObservable
+                | SubscriberDeliveryState::StatefulDeliveryUncertain
+                | SubscriberDeliveryState::DeliveryComplete
+        ) {
+            subscriber.frontiers.stateful_intent_recorded = true;
+        }
         Ok(())
     }
 
@@ -1692,6 +1750,77 @@ impl Actor for ActionActorHost {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             self.core.apply(msg);
+        })
+    }
+}
+
+/// Worker-side attempt actor role (bead G017; invariant I5 / risk R44).
+///
+/// Holds ONLY a single coordinator-issued [`AttemptAuthority`] and local
+/// [`AttemptState`] progression. By construction it owns no [`PublicationSlotState`],
+/// no [`GenerationFence`], and no subscriber registry — it can advance its own
+/// attempt and prepare a [`PreparedCandidateOffer`] to send back to the
+/// authoritative [`ActionActor`], never creating a competing action owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerAttemptActor {
+    authority: rabs_protocol::generation::AttemptAuthority,
+    state: AttemptState,
+}
+
+impl WorkerAttemptActor {
+    /// Construct a worker attempt actor from a coordinator-granted lease.
+    #[must_use]
+    pub const fn new(authority: rabs_protocol::generation::AttemptAuthority) -> Self {
+        Self {
+            authority,
+            state: AttemptState::LeaseOffered,
+        }
+    }
+
+    /// The bound attempt authority.
+    #[must_use]
+    pub const fn authority(&self) -> &rabs_protocol::generation::AttemptAuthority {
+        &self.authority
+    }
+
+    /// Current worker-local attempt state.
+    #[must_use]
+    pub const fn state(&self) -> AttemptState {
+        self.state
+    }
+
+    /// Advance the worker-local attempt state along the A017 state machine.
+    pub fn advance(&mut self, to: AttemptState) -> AdvanceAttemptReceipt {
+        if !AttemptState::may_transition(self.state, to) {
+            return AdvanceAttemptReceipt::RefusedIllegalTransition {
+                from: self.state,
+                to,
+            };
+        }
+        self.state = to;
+        AdvanceAttemptReceipt::Advanced
+    }
+
+    /// Prepare a candidate offer for the coordinator's `ActionActor` once
+    /// local verification reaches `PreparedResultOffered`.
+    #[must_use]
+    pub fn prepare_offer(
+        &self,
+        canonical_result: TypedDigest,
+        deterministic_failure: bool,
+        evidence_bundle: TypedDigest,
+        attestation: ResultAttestation,
+    ) -> Option<PreparedCandidateOffer> {
+        if !self.state.may_offer() {
+            return None;
+        }
+        Some(PreparedCandidateOffer {
+            generation: self.authority.action_generation.generation_id,
+            attempt: self.authority.attempt_id,
+            canonical_result,
+            deterministic_failure,
+            evidence_bundle,
+            attestation,
         })
     }
 }
@@ -3073,5 +3202,187 @@ mod tests {
         assert_eq!(actor.serving(), serving_after.as_ref());
         assert_eq!(actor.evidence().len(), 1);
         assert_eq!(actor.history().len(), 1);
+    }
+
+    #[test]
+    fn cancel_one_subscriber_shared_action_survives() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        assert_eq!(
+            actor.join(
+                JoinRequest {
+                    operation: BuildOperationId(101),
+                    kind: SubscriberKind::ForegroundAgent,
+                    queue_priority: 220,
+                    deadline_unix_micros: Some(50_000),
+                    presentation: d(1),
+                    requirements: SubscriptionRequirements::unrestricted(),
+                },
+                1_000,
+                0,
+            ),
+            JoinReceipt::JoinedExecution
+        );
+        assert_eq!(
+            actor.join(
+                JoinRequest {
+                    operation: BuildOperationId(102),
+                    kind: SubscriberKind::ForegroundAgent,
+                    queue_priority: 210,
+                    deadline_unix_micros: Some(60_000),
+                    presentation: d(2),
+                    requirements: SubscriptionRequirements::unrestricted(),
+                },
+                1_001,
+                0,
+            ),
+            JoinReceipt::JoinedExecution
+        );
+        assert_eq!(
+            actor.cancel_subscriber(BuildOperationId(101)),
+            CancelReceipt::SharedWorkContinues { retained: 1 }
+        );
+        assert!(actor.active_generation().is_some());
+        assert_eq!(
+            actor.attempts().next().unwrap().state,
+            AttemptState::LeaseOffered
+        );
+        drive_to_offer(&mut actor, 1);
+        assert_eq!(
+            actor.offer_candidate(offer(1, 42, false)),
+            OfferReceipt::AcceptedAsWinner
+        );
+        assert_eq!(actor.slot(), PublicationSlotState::Committed);
+    }
+
+    #[test]
+    fn cancel_last_subscriber_drains_everything() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        assert_eq!(
+            actor.join(
+                JoinRequest {
+                    operation: BuildOperationId(201),
+                    kind: SubscriberKind::ForegroundAgent,
+                    queue_priority: 200,
+                    deadline_unix_micros: Some(40_000),
+                    presentation: d(1),
+                    requirements: SubscriptionRequirements::unrestricted(),
+                },
+                1_000,
+                0,
+            ),
+            JoinReceipt::JoinedExecution
+        );
+        actor
+            .advance_delivery(BuildOperationId(201), SubscriberDeliveryState::Waiting)
+            .unwrap();
+        actor
+            .advance_delivery(
+                BuildOperationId(201),
+                SubscriberDeliveryState::EmittingTranscript,
+            )
+            .unwrap();
+        let sub_before = actor.subscriber(&BuildOperationId(201)).unwrap();
+        assert!(sub_before.frontiers.transcript_exposed);
+        assert!(!sub_before.frontiers.stateful_intent_recorded);
+
+        assert_eq!(
+            actor.cancel_subscriber(BuildOperationId(201)),
+            CancelReceipt::LastInterestCancelledGeneration
+        );
+        assert!(actor.active_generation().is_none());
+        assert_eq!(actor.slot(), PublicationSlotState::Absent);
+        assert_eq!(
+            actor.attempts().next().unwrap().state,
+            AttemptState::Draining
+        );
+        let preserved = actor
+            .preserved_exposed_frontiers(&BuildOperationId(201))
+            .expect("already-exposed transcript frontier must be preserved on cancel");
+        assert!(preserved.transcript_exposed);
+        assert!(!preserved.stateful_intent_recorded);
+        assert_eq!(
+            actor.offer_candidate(offer(1, 42, false)),
+            OfferReceipt::RefusedNotOfferable
+        );
+    }
+
+    #[test]
+    fn q005_promotion_to_foreground_and_subsequent_edit_supersession() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        assert_eq!(
+            actor.join(
+                JoinRequest {
+                    operation: BuildOperationId(301),
+                    kind: SubscriberKind::Speculative,
+                    queue_priority: 150,
+                    deadline_unix_micros: Some(90_000),
+                    presentation: d(1),
+                    requirements: SubscriptionRequirements::unrestricted(),
+                },
+                1_000,
+                0,
+            ),
+            JoinReceipt::JoinedExecution
+        );
+        assert!(!actor.has_foreground_interest());
+
+        assert_eq!(
+            actor.promote_with_deadline(BuildOperationId(301), Some(30_000)),
+            PromoteReceipt::Promoted
+        );
+        assert!(actor.has_foreground_interest());
+        let strongest = actor.strongest_interest().unwrap();
+        assert_eq!(strongest.priority, FOREGROUND_QUEUE_PRIORITY);
+        assert_eq!(strongest.earliest_deadline_unix_micros, Some(30_000));
+
+        // Subsequent edit supersedes the foreground subscriber; last interest cancels and drains cleanly.
+        assert_eq!(
+            actor.cancel_subscriber(BuildOperationId(301)),
+            CancelReceipt::LastInterestCancelledGeneration
+        );
+        assert!(!actor.has_foreground_interest());
+        assert!(actor.active_generation().is_none());
+        assert_eq!(actor.slot(), PublicationSlotState::Absent);
+    }
+
+    #[test]
+    fn g017_role_separation_worker_attempt_actor_cannot_self_commit_or_open_generations() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        let reg = registration(1, 11, 111, AttemptPurpose::Primary);
+        let mut worker_actor = WorkerAttemptActor::new(reg.validated.authority().clone());
+        assert_eq!(worker_actor.state(), AttemptState::LeaseOffered);
+
+        let spine = [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+            AttemptState::ProcessExited,
+            AttemptState::HarvestingOutputs,
+            AttemptState::UploadingOutputs,
+            AttemptState::VerifyingOutputs,
+            AttemptState::PreparedResultOffered,
+        ];
+        for step in spine {
+            assert_eq!(
+                worker_actor.advance(step),
+                AdvanceAttemptReceipt::Advanced,
+                "worker attempt advances along legal spine"
+            );
+            actor.apply(ActionActorMsg::AdvanceAttempt {
+                attempt: AttemptId(1),
+                to: step,
+            });
+        }
+
+        let candidate_offer = worker_actor
+            .prepare_offer(d(42), false, d(142), attestation())
+            .expect("worker attempt can only prepare offer at PreparedResultOffered");
+        actor.apply(ActionActorMsg::OfferCandidate(Box::new(candidate_offer)));
+        assert_eq!(actor.slot(), PublicationSlotState::Committed);
     }
 }
