@@ -93,7 +93,9 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let cas = Arc::new(mount_and_reconcile(&root.path().join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
-        let authority = coord.acquire_boot_authority("class-safety-fixture").unwrap();
+        let authority = coord
+            .acquire_boot_authority("class-safety-fixture")
+            .unwrap();
         coord.mark_up();
         // Reuse the shared worker-enrollment/authority fixture. Its unused
         // sample action has no class receipt and grants no replay authority.
@@ -147,7 +149,11 @@ impl Fixture {
                 })
                 .unwrap();
             store
-                .create_generation(&authority_digest(&coordinator), self.serial, action)
+                .create_bound_generation(
+                    &authority_digest(&coordinator),
+                    &offer.authority.action_generation,
+                    action,
+                )
                 .unwrap();
             store
                 .record_decision_receipt(
@@ -240,7 +246,10 @@ fn a_real_publication_conflict_stops_peer_replay_and_survives_coordinator_restar
     );
     {
         let mut store = fixture.cas.store().lock().unwrap();
-        assert_eq!(store.published_manifest_key(&requested).unwrap(), publication);
+        assert_eq!(
+            store.published_manifest_key(&requested).unwrap(),
+            publication
+        );
         assert_eq!(
             store
                 .serving_disposition_key(&digest_key(&requested))
@@ -269,7 +278,9 @@ fn a_real_publication_conflict_stops_peer_replay_and_survives_coordinator_restar
     drop(cas);
     let cas = Arc::new(mount_and_reconcile(&root.path().join("cas")).unwrap());
     let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
-    coord.acquire_boot_authority("class-safety-fixture").unwrap();
+    coord
+        .acquire_boot_authority("class-safety-fixture")
+        .unwrap();
     coord.mark_up();
     let refused = root.path().join("after-restart");
     assert_eq!(
@@ -322,6 +333,11 @@ fn interrupted_peer_quarantine_blocks_live_install_before_incident_feedback() {
                 .unwrap()
                 .is_empty()
         );
-        assert!(store.list_verification_samples(&culprit).unwrap().is_empty());
+        assert!(
+            store
+                .list_verification_samples(&culprit)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -678,7 +678,8 @@ mod tests {
         std::fs::write(&first, b"first").unwrap();
         std::fs::write(&second, b"second").unwrap();
         let missing = root.join("absent").to_str().unwrap().to_owned();
-        let inventory = OsFilesystem::new(vec![root.clone()], &[missing.clone()]).unwrap();
+        let inventory =
+            OsFilesystem::new(vec![root.clone()], std::slice::from_ref(&missing)).unwrap();
         assert_eq!(inventory.all_paths(), vec![
             first.to_str().unwrap().to_owned(), second.to_str().unwrap().to_owned(),
         ]);

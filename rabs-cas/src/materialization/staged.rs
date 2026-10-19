@@ -35,7 +35,9 @@ struct Identity {
 impl Identity {
     fn file(metadata: &Metadata) -> std::io::Result<Self> {
         if !metadata.is_file() {
-            return Err(std::io::Error::other("prepared object is not a regular file"));
+            return Err(std::io::Error::other(
+                "prepared object is not a regular file",
+            ));
         }
         Ok(Self {
             device: metadata.dev(),
@@ -58,27 +60,56 @@ struct PrivateStage {
     path: PathBuf,
     file: Option<File>,
     identity: Option<Identity>,
+    created_parents: Vec<PathBuf>,
+    installed: bool,
 }
 
 impl PrivateStage {
     fn create(parent: &Path) -> Result<Self, MaterializeError> {
+        let created_parents: Vec<PathBuf> = parent
+            .ancestors()
+            .take_while(|ancestor| !ancestor.as_os_str().is_empty() && !ancestor.exists())
+            .map(Path::to_path_buf)
+            .collect();
         std::fs::create_dir_all(parent).map_err(io_err("create-destination-dir"))?;
+        let cleanup_parents = |parents: &[PathBuf]| {
+            for dir in parents {
+                let _ = std::fs::remove_dir(dir);
+            }
+        };
         for _ in 0..8 {
             let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
             let directory = parent.join(format!(".rabs-stage-{}-{sequence}", std::process::id()));
             match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => {
                     use rustix::fs::{Mode, OFlags, open};
-                    let directory_file = open(
+                    let directory_file = match open(
                         &directory,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC
-                            | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                        OFlags::RDONLY
+                            | OFlags::DIRECTORY
+                            | OFlags::CLOEXEC
+                            | OFlags::NOFOLLOW
+                            | OFlags::NONBLOCK,
                         Mode::empty(),
-                    )
-                    .map(File::from)
-                    .map_err(|error| io_err("open-stage-dir")(error.into()))?;
-                    let held = directory_file.metadata().map_err(io_err("stat-stage-dir"))?;
+                    ) {
+                        Ok(fd) => File::from(fd),
+                        Err(error) => {
+                            let _ = std::fs::remove_dir(&directory);
+                            cleanup_parents(&created_parents);
+                            return Err(io_err("open-stage-dir")(error.into()));
+                        }
+                    };
+                    let held = match directory_file.metadata() {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            let _ = std::fs::remove_dir(&directory);
+                            cleanup_parents(&created_parents);
+                            return Err(io_err("stat-stage-dir")(error));
+                        }
+                    };
                     if held.mode() & 0o077 != 0 {
+                        let _ = std::fs::remove_dir(&directory);
+                        cleanup_parents(&created_parents);
                         return Err(io_err("private-stage-dir")(std::io::Error::other(
                             "staging directory is not private",
                         )));
@@ -90,12 +121,18 @@ impl PrivateStage {
                         path,
                         file: None,
                         identity: None,
+                        created_parents,
+                        installed: false,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(io_err("create-stage-dir")(error)),
+                Err(error) => {
+                    cleanup_parents(&created_parents);
+                    return Err(io_err("create-stage-dir")(error));
+                }
             }
         }
+        cleanup_parents(&created_parents);
         Err(io_err("create-stage-dir")(std::io::Error::other(
             "staging namespace exhausted",
         )))
@@ -114,7 +151,8 @@ impl PrivateStage {
     }
 
     fn retain(&mut self) -> Result<(), MaterializeError> {
-        self.directory_current().map_err(io_err("verify-stage-dir"))?;
+        self.directory_current()
+            .map_err(io_err("verify-stage-dir"))?;
         use rustix::fs::{Mode, OFlags, open};
         let file = open(
             &self.path,
@@ -131,7 +169,8 @@ impl PrivateStage {
     }
 
     fn verify(&self) -> Result<(), MaterializeError> {
-        self.directory_current().map_err(io_err("verify-stage-dir"))?;
+        self.directory_current()
+            .map_err(io_err("verify-stage-dir"))?;
         let file = self.file.as_ref().ok_or_else(|| {
             io_err("verify-prepared-file")(std::io::Error::other("no prepared descriptor"))
         })?;
@@ -157,11 +196,16 @@ impl Drop for PrivateStage {
         }
         // On success the file was renamed out. On failure remove only a
         // retained, unchanged inode; unexpected entries preserve the directory.
-        if self.identity.is_some() && self.verify().is_ok() {
+        if !self.installed && self.identity.is_some() && self.verify().is_ok() {
             self.file.take();
             let _ = std::fs::remove_file(&self.path);
         }
         let _ = std::fs::remove_dir(&self.directory);
+        if !self.installed {
+            for dir in &self.created_parents {
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
     }
 }
 
@@ -227,7 +271,10 @@ impl PreparationFailure {
         {
             error = MaterializeError::Store(format!("{failure:?}"));
         }
-        ActionMaterializeFailure { installed: Vec::new(), error }
+        ActionMaterializeFailure {
+            installed: Vec::new(),
+            error,
+        }
     }
 }
 
@@ -254,17 +301,30 @@ impl SelectedActionOutputs {
             }
             let mut ordered: Vec<_> = outputs.iter().collect();
             ordered.sort_by_key(|output| {
-                (output.role != OutputRole::ProvisionalMetadata, planned_order_key(output))
+                (
+                    output.role != OutputRole::ProvisionalMetadata,
+                    planned_order_key(output),
+                )
             });
-            let selected = ordered.into_iter().map(|output| {
-                Ok(SelectedOutput {
-                    locations: usable_locations(store, &output.object)?,
-                    output: output.clone(),
+            let selected = ordered
+                .into_iter()
+                .map(|output| {
+                    Ok(SelectedOutput {
+                        locations: usable_locations(store, &output.object)?,
+                        output: output.clone(),
+                    })
                 })
-            }).collect::<Result<_, MaterializeError>>()?;
-            Ok(Self { selected, mode, freshness })
+                .collect::<Result<_, MaterializeError>>()?;
+            Ok(Self {
+                selected,
+                mode,
+                freshness,
+            })
         };
-        select().map_err(|error| ActionMaterializeFailure { installed: Vec::new(), error })
+        select().map_err(|error| ActionMaterializeFailure {
+            installed: Vec::new(),
+            error,
+        })
     }
 
     /// Copy, hash, derive and freshness-stamp private files WITHOUT metadata
@@ -277,25 +337,38 @@ impl SelectedActionOutputs {
         self,
         prepare: &impl Fn(&PlannedActionOutput, &File) -> std::io::Result<()>,
     ) -> Result<PreparedActionOutputs, PreparationFailure> {
-        let started = Instant::now();
-        let mut prepared = Vec::with_capacity(self.selected.len());
+        let mut out = PreparedActionOutputs {
+            prepared: Vec::with_capacity(self.selected.len()),
+            started: Instant::now(),
+        };
         for selected in self.selected {
             let output = selected.output;
-            let parent = output.destination.parent().ok_or_else(|| PreparationFailure {
-                error: MaterializeError::UnsafeDestination {
-                    path: output.destination.to_string_lossy().into_owned(),
-                },
-                corrupt: None,
-            })?;
-            let mut last = MaterializeError::NoUsableCopy { object: digest_key(&output.object) };
+            let parent = output
+                .destination
+                .parent()
+                .ok_or_else(|| PreparationFailure {
+                    error: MaterializeError::UnsafeDestination {
+                        path: output.destination.to_string_lossy().into_owned(),
+                    },
+                    corrupt: None,
+                })?;
+            let mut last = MaterializeError::NoUsableCopy {
+                object: digest_key(&output.object),
+            };
             let mut ready = None;
             for source in selected.locations {
-                let mut stage = PrivateStage::create(parent).map_err(|error| PreparationFailure {
-                    error, corrupt: None,
-                })?;
+                let mut stage =
+                    PrivateStage::create(parent).map_err(|error| PreparationFailure {
+                        error,
+                        corrupt: None,
+                    })?;
                 let result = copy_verified(
-                    &source, &output.object, &digest_key(&output.object),
-                    &stage.directory, &stage.path, self.mode,
+                    &source,
+                    &output.object,
+                    &digest_key(&output.object),
+                    &stage.directory,
+                    &stage.path,
+                    self.mode,
                     &|file| {
                         prepare(&output, file)?;
                         file.set_modified(self.freshness)
@@ -303,21 +376,33 @@ impl SelectedActionOutputs {
                 );
                 match result {
                     Ok((bytes, _)) => {
-                        stage.retain().map_err(|error| PreparationFailure { error, corrupt: None })?;
-                        ready = Some(PreparedOutput { output: output.clone(), source, bytes, stage });
+                        stage.retain().map_err(|error| PreparationFailure {
+                            error,
+                            corrupt: None,
+                        })?;
+                        ready = Some(PreparedOutput {
+                            output: output.clone(),
+                            source,
+                            bytes,
+                            stage,
+                        });
                         break;
                     }
                     Err(error @ MaterializeError::ContentMismatch { .. }) => {
                         return Err(PreparationFailure {
-                            error, corrupt: Some((output.object.clone(), source)),
+                            error,
+                            corrupt: Some((output.object.clone(), source)),
                         });
                     }
                     Err(error) => last = error,
                 }
             }
-            prepared.push(ready.ok_or(PreparationFailure { error: last, corrupt: None })?);
+            out.prepared.push(ready.ok_or(PreparationFailure {
+                error: last,
+                corrupt: None,
+            })?);
         }
-        Ok(PreparedActionOutputs { prepared, started })
+        Ok(out)
     }
 }
 
@@ -337,6 +422,14 @@ pub struct PreparedActionOutputs {
     started: Instant,
 }
 
+impl Drop for PreparedActionOutputs {
+    fn drop(&mut self) {
+        while let Some(prepared) = self.prepared.pop() {
+            drop(prepared);
+        }
+    }
+}
+
 impl PreparedActionOutputs {
     /// Recheck every quarantine/location and staged generation before the FIRST
     /// destination write. The caller holds its store lock and destination claim
@@ -344,7 +437,7 @@ impl PreparedActionOutputs {
     /// No payload reads or hashing occur here. A rename failure reports the exact
     /// installed prefix; it NEVER grants fallback execution authority.
     pub fn install(
-        self,
+        mut self,
         store: &mut dyn RabsMetadataStore,
     ) -> Result<ActionMaterializationReceipt, ActionMaterializeFailure> {
         for prepared in &self.prepared {
@@ -356,12 +449,15 @@ impl PreparedActionOutputs {
                 }
                 prepared.stage.verify()
             };
-            validate().map_err(|error| ActionMaterializeFailure { installed: Vec::new(), error })?;
+            validate().map_err(|error| ActionMaterializeFailure {
+                installed: Vec::new(),
+                error,
+            })?;
         }
         let mut installed = Vec::with_capacity(self.prepared.len());
         let mut head_nanos = 0;
         let mut tail_started = None;
-        for prepared in self.prepared {
+        for prepared in &mut self.prepared {
             if prepared.output.role != OutputRole::ProvisionalMetadata && tail_started.is_none() {
                 tail_started = Some(Instant::now());
             }
@@ -372,6 +468,7 @@ impl PreparedActionOutputs {
             }) {
                 return Err(ActionMaterializeFailure { installed, error });
             }
+            prepared.stage.installed = true;
             if prepared.output.role == OutputRole::ProvisionalMetadata {
                 // Include staging and the caller's authorization handoff, not
                 // just the cheap rename. This is not an early-metadata stream.
@@ -379,8 +476,8 @@ impl PreparedActionOutputs {
             }
             installed.push(OutputMaterialized {
                 role: prepared.output.role,
-                virtual_path: prepared.output.virtual_path,
-                destination: prepared.output.destination,
+                virtual_path: std::mem::take(&mut prepared.output.virtual_path),
+                destination: std::mem::take(&mut prepared.output.destination),
                 bytes: prepared.bytes,
                 nanos: began.elapsed().as_nanos(),
             });

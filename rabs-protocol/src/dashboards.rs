@@ -1,6 +1,6 @@
-//! Fleet/cache/latency dashboard panels (bead R007; plan §105).
+//! Fleet/cache/latency dashboard panels (bead R007, `bd-cl8mf`; plan §6, §105).
 //!
-//! The eight panels the plan names, as typed data models built from
+//! The panels the plan names, as typed data models built from
 //! metric inputs by deterministic integer math (nearest-rank
 //! percentiles, permille rates — no floats):
 //!
@@ -8,6 +8,9 @@
 //! - user-visible latency distribution (p50/p95/p99);
 //! - cache effectiveness + miss causes (by stable reason code,
 //!   ranked);
+//! - served-fraction telemetry (`bd-cl8mf`: `rustc` invocations served
+//!   rather than executed from [`DecisionReceipt`]s, long-run `> 90%`
+//!   goal, reported rather than gated until the M16 frontier review);
 //! - top expensive/repeated crates (bounded, sorted);
 //! - action critical paths (bounded, from the I015 estimates);
 //! - transfer/CAS health (dedup ratio in permille);
@@ -15,6 +18,175 @@
 //! - determinism/verification status.
 //!
 //! Empty inputs produce honest zeros, never invented numbers.
+
+use crate::decision_receipt::{CacheLookupDecision, DecisionReceipt};
+use crate::descriptor::ActionClass;
+
+/// Long-run §6 goal for fleet `rustc` invocations served rather than
+/// executed (`> 90%` = strictly greater than `900` permille in warm,
+/// converged workloads).
+pub const LONG_RUN_SERVED_GOAL_PERMILLE: u32 = 900;
+
+/// Governance standing of the §6 served-fraction metric (`bd-cl8mf`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServedFractionStanding {
+    /// Reported on dashboards from [`DecisionReceipt`]s, not a blocking
+    /// release gate until the Phase 5 / M16 frontier review.
+    #[default]
+    ReportedNotGated,
+}
+
+/// Per-action-class served vs executed breakdown from [`DecisionReceipt`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassServedBreakdown {
+    /// Semantic action class.
+    pub action_class: ActionClass,
+    /// Receipts in this class with [`CacheLookupDecision::Hit`].
+    pub served: u64,
+    /// Receipts in this class that executed or were refused cache lookup.
+    pub executed_or_refused: u64,
+    /// Served fraction in permille (`served * 1000 / total`).
+    pub served_permille: u32,
+}
+
+/// Served-fraction telemetry panel computed from [`DecisionReceipt`]s (`bd-cl8mf`).
+///
+/// Tracks both the §6 headline metric ("Fleet `rustc` invocations served
+/// rather than executed", excluding capability probes and non-`rustc` classes
+/// via [`ActionClass::is_rustc_compile`]) and the all-receipts total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedFractionTelemetry {
+    /// Total decision receipts inspected across all action classes.
+    pub total_receipts: u64,
+    /// Total receipts served from cache across all action classes.
+    pub total_served: u64,
+    /// Served rate across all action classes (permille).
+    pub total_served_permille: u32,
+    /// Cacheable `rustc` compile receipts inspected (`ActionClass::is_rustc_compile`).
+    pub rustc_receipts: u64,
+    /// Cacheable `rustc` compile receipts served from cache (`Hit`).
+    pub rustc_served: u64,
+    /// Cacheable `rustc` compile receipts executed or refused (`Miss` / `Refused`).
+    pub rustc_executed: u64,
+    /// Fleet `rustc` invocations served rate in permille (`0..=1000`).
+    pub rustc_served_permille: u32,
+    /// Long-run §6 target threshold in permille (`900` = 90%).
+    pub goal_permille: u32,
+    /// Whether the observed `rustc` served fraction strictly exceeds the
+    /// long-run `> 90%` goal (`rustc_served * 10 > rustc_receipts * 9`).
+    pub meets_long_run_goal: bool,
+    /// Governance standing (`ReportedNotGated` until the M16 frontier review).
+    pub standing: ServedFractionStanding,
+    /// Per-class breakdown sorted deterministically by [`ActionClass`].
+    pub by_class: Vec<ClassServedBreakdown>,
+}
+
+impl Default for ServedFractionTelemetry {
+    fn default() -> Self {
+        Self {
+            total_receipts: 0,
+            total_served: 0,
+            total_served_permille: 0,
+            rustc_receipts: 0,
+            rustc_served: 0,
+            rustc_executed: 0,
+            rustc_served_permille: 0,
+            goal_permille: LONG_RUN_SERVED_GOAL_PERMILLE,
+            meets_long_run_goal: false,
+            standing: ServedFractionStanding::ReportedNotGated,
+            by_class: Vec::new(),
+        }
+    }
+}
+
+/// Compute [`ServedFractionTelemetry`] deterministically from a slice of
+/// [`DecisionReceipt`]s (`bd-cl8mf`).
+#[must_use]
+pub fn served_fraction_from_receipts(receipts: &[DecisionReceipt]) -> ServedFractionTelemetry {
+    let mut total_receipts = 0_u64;
+    let mut total_served = 0_u64;
+    let mut rustc_receipts = 0_u64;
+    let mut rustc_served = 0_u64;
+    let mut rustc_executed = 0_u64;
+    let mut per_class: Vec<(ActionClass, u64, u64)> = Vec::new();
+
+    for receipt in receipts {
+        total_receipts += 1;
+        let is_hit = matches!(receipt.cache_lookup, CacheLookupDecision::Hit);
+        if is_hit {
+            total_served += 1;
+        }
+        if receipt.invocation_class.is_rustc_compile() {
+            rustc_receipts += 1;
+            if is_hit {
+                rustc_served += 1;
+            } else {
+                rustc_executed += 1;
+            }
+        }
+        match per_class
+            .iter_mut()
+            .find(|(c, _, _)| *c == receipt.invocation_class)
+        {
+            Some((_, served, exec)) => {
+                if is_hit {
+                    *served += 1;
+                } else {
+                    *exec += 1;
+                }
+            }
+            None => {
+                let (s, e) = if is_hit { (1, 0) } else { (0, 1) };
+                per_class.push((receipt.invocation_class, s, e));
+            }
+        }
+    }
+
+    per_class.sort_by_key(|(class, _, _)| *class);
+    let by_class = per_class
+        .into_iter()
+        .map(|(action_class, served, executed_or_refused)| {
+            let class_total = served + executed_or_refused;
+            let served_permille =
+                u32::try_from((served * 1_000).checked_div(class_total).unwrap_or(0)).unwrap_or(0);
+            ClassServedBreakdown {
+                action_class,
+                served,
+                executed_or_refused,
+                served_permille,
+            }
+        })
+        .collect();
+
+    let total_served_permille = u32::try_from(
+        (total_served * 1_000)
+            .checked_div(total_receipts)
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let rustc_served_permille = u32::try_from(
+        (rustc_served * 1_000)
+            .checked_div(rustc_receipts)
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let meets_long_run_goal = rustc_receipts > 0
+        && (rustc_served * 1_000) > rustc_receipts * u64::from(LONG_RUN_SERVED_GOAL_PERMILLE);
+
+    ServedFractionTelemetry {
+        total_receipts,
+        total_served,
+        total_served_permille,
+        rustc_receipts,
+        rustc_served,
+        rustc_executed,
+        rustc_served_permille,
+        goal_permille: LONG_RUN_SERVED_GOAL_PERMILLE,
+        meets_long_run_goal,
+        standing: ServedFractionStanding::ReportedNotGated,
+        by_class,
+    }
+}
 
 /// Worker posture states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +284,8 @@ pub struct Dashboard {
     pub latency: LatencyPanel,
     /// Cache effectiveness.
     pub cache: CachePanel,
+    /// Served-fraction telemetry from [`DecisionReceipt`]s (`bd-cl8mf`).
+    pub served_fraction: ServedFractionTelemetry,
     /// Top crates (bounded to 10, sorted by total ms).
     pub top_crates: Vec<CrateRow>,
     /// Top critical paths (bounded to 10): (target label, chain ms).
@@ -142,6 +316,8 @@ pub struct MetricInputs {
     pub latencies_ms: Vec<u64>,
     /// Cache lookups: `Ok(())` hit, `Err(reason)` miss.
     pub lookups: Vec<Result<(), &'static str>>,
+    /// Decision receipts feeding served-fraction telemetry (`bd-cl8mf`).
+    pub receipts: Vec<DecisionReceipt>,
     /// Per-crate (name, ms, compiles).
     pub crates: Vec<(String, u64, u64)>,
     /// Critical paths: (label, chain ms).
@@ -201,6 +377,7 @@ pub fn build(inputs: &MetricInputs) -> Dashboard {
         }
     }
     causes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let served_fraction = served_fraction_from_receipts(&inputs.receipts);
     // Top crates, bounded and sorted.
     let mut top_crates: Vec<CrateRow> = inputs
         .crates
@@ -231,6 +408,7 @@ pub fn build(inputs: &MetricInputs) -> Dashboard {
             hit_rate_permille,
             miss_causes: causes,
         },
+        served_fraction,
         top_crates,
         critical_paths,
         transfer: TransferPanel {
@@ -254,6 +432,54 @@ pub fn build(inputs: &MetricInputs) -> Dashboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision_receipt::{
+        PublicationDecision, RECEIPT_SCHEMA_VERSION, ReceiptStore, SingleflightDecision,
+        VerificationDecision,
+    };
+    use crate::result_identity::{DigestAlgorithm, TypedDigest};
+    use std::path::Path;
+
+    fn sample_digest(tag: u8) -> TypedDigest {
+        TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: "rabs.object.v1",
+            bytes: [tag; 32],
+        }
+    }
+
+    fn receipt_with(
+        request_id: u64,
+        invocation_class: ActionClass,
+        cache_lookup: CacheLookupDecision,
+    ) -> DecisionReceipt {
+        DecisionReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            request_id,
+            invocation_class,
+            key_breakdown_digest: sample_digest(1),
+            snapshot_root: sample_digest(2),
+            closure_object_count: 10,
+            cache_lookup,
+            singleflight: SingleflightDecision::Leader,
+            subscriber_count: 1,
+            worker_candidates: Vec::new(),
+            selected_worker: Some(1),
+            selection_reasons: vec!["BEST_HEALTH"],
+            transfer_objects: 0,
+            transfer_bytes_estimate: 0,
+            priority_class_tag: 1,
+            budget_ms: 10_000,
+            attempt_authority: sample_digest(3),
+            lifecycle_events: Vec::new(),
+            provisional_events: Vec::new(),
+            verification: VerificationDecision::NotRequired,
+            publication: PublicationDecision::Published,
+            latency_ms: 25,
+            cpu_ms: 20,
+            fallback_reason: None,
+            non_claims: Vec::new(),
+        }
+    }
 
     fn fixture_fleet() -> MetricInputs {
         MetricInputs {
@@ -271,6 +497,33 @@ mod tests {
                 Err("WHY_KEY_COMPONENT_CHANGED"),
                 Err("WHY_KEY_COMPONENT_CHANGED"),
                 Err("CACHE_REFUSED_BENCHMARK_OBSERVATION"),
+            ],
+            receipts: vec![
+                receipt_with(
+                    1,
+                    ActionClass::RustcDependencyCompile,
+                    CacheLookupDecision::Hit,
+                ),
+                receipt_with(
+                    2,
+                    ActionClass::RustcDependencyCompile,
+                    CacheLookupDecision::Hit,
+                ),
+                receipt_with(
+                    3,
+                    ActionClass::RustcWorkspaceCompile,
+                    CacheLookupDecision::Hit,
+                ),
+                receipt_with(
+                    4,
+                    ActionClass::RustcWorkspaceCompile,
+                    CacheLookupDecision::Miss,
+                ),
+                receipt_with(
+                    5,
+                    ActionClass::ToolchainProbe,
+                    CacheLookupDecision::Refused("PROBE_PASSTHROUGH"),
+                ),
             ],
             crates: vec![
                 ("serde".into(), 40_000, 12),
@@ -310,6 +563,25 @@ mod tests {
             ],
             "miss causes ranked by count with stable codes"
         );
+        // Served-fraction telemetry from decision receipts (bd-cl8mf):
+        // 4 rustc compile receipts (3 Hit, 1 Miss) = 750 permille;
+        // ToolchainProbe is excluded from the rustc denominator but counted in total_receipts (3/5 = 600 permille).
+        assert_eq!(dash.served_fraction.total_receipts, 5);
+        assert_eq!(dash.served_fraction.total_served, 3);
+        assert_eq!(dash.served_fraction.total_served_permille, 600);
+        assert_eq!(dash.served_fraction.rustc_receipts, 4);
+        assert_eq!(dash.served_fraction.rustc_served, 3);
+        assert_eq!(dash.served_fraction.rustc_executed, 1);
+        assert_eq!(dash.served_fraction.rustc_served_permille, 750);
+        assert_eq!(
+            dash.served_fraction.goal_permille,
+            LONG_RUN_SERVED_GOAL_PERMILLE
+        );
+        assert!(!dash.served_fraction.meets_long_run_goal);
+        assert_eq!(
+            dash.served_fraction.standing,
+            ServedFractionStanding::ReportedNotGated
+        );
         // Top crates by total ms, not by compile count.
         assert_eq!(dash.top_crates[0].name, "tokio");
         assert_eq!(dash.top_crates[1].name, "serde");
@@ -329,8 +601,174 @@ mod tests {
         assert_eq!(dash.latency.p99_ms, 0);
         assert_eq!(dash.cache.hit_rate_permille, 0);
         assert!(dash.cache.miss_causes.is_empty());
+        assert_eq!(dash.served_fraction.total_receipts, 0);
+        assert_eq!(dash.served_fraction.rustc_receipts, 0);
+        assert_eq!(dash.served_fraction.rustc_served_permille, 0);
+        assert!(!dash.served_fraction.meets_long_run_goal);
+        assert_eq!(
+            dash.served_fraction.standing,
+            ServedFractionStanding::ReportedNotGated
+        );
+        assert!(dash.served_fraction.by_class.is_empty());
         assert!(dash.top_crates.is_empty());
         assert_eq!(dash.transfer.dedup_savings_permille, 0);
+    }
+
+    #[test]
+    fn served_fraction_from_receipt_store_enforces_strict_90_percent_goal() {
+        let mut store = ReceiptStore::default();
+        // 9 hits + 1 miss = 900 permille (exactly 90.0%, NOT "> 90%").
+        for id in 1..=9 {
+            store
+                .append(receipt_with(
+                    id,
+                    ActionClass::RustcDependencyCompile,
+                    CacheLookupDecision::Hit,
+                ))
+                .expect("valid v1 receipt");
+        }
+        store
+            .append(receipt_with(
+                10,
+                ActionClass::RustcWorkspaceCompile,
+                CacheLookupDecision::Miss,
+            ))
+            .expect("valid v1 receipt");
+
+        let exact_90 = served_fraction_from_receipts(store.as_slice());
+        assert_eq!(exact_90.rustc_served_permille, 900);
+        assert!(
+            !exact_90.meets_long_run_goal,
+            "sec6 specifies '> 90%', so 900 permille does not yet cross the threshold"
+        );
+
+        // Add one more served rustc compile -> 10/11 = 909 permille (> 90%).
+        store
+            .append(receipt_with(
+                11,
+                ActionClass::ClippyCompile,
+                CacheLookupDecision::Hit,
+            ))
+            .expect("valid v1 receipt");
+        let above_90 = served_fraction_from_receipts(store.as_slice());
+        assert_eq!(above_90.rustc_receipts, 11);
+        assert_eq!(above_90.rustc_served, 10);
+        assert_eq!(above_90.rustc_served_permille, 909);
+        assert!(above_90.meets_long_run_goal);
+        assert_eq!(above_90.standing, ServedFractionStanding::ReportedNotGated);
+        assert_eq!(above_90.by_class.len(), 3);
+    }
+
+    #[test]
+    fn gate_ledger_covers_every_section_6_target() {
+        // bd-cl8mf rule: "benchmarks/GATE_LEDGER.md: one row per sec6 target
+        // with status ENFORCING/PENDING(phase), owning gate bead, last result,
+        // evidence link... a target absent from the ledger is a defect."
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let master_plan = std::fs::read_to_string(
+            repo_root.join("COMPREHENSIVE_MASTER_PLAN_FOR_RABS_ASUPERSYNC_NATIVE.md"),
+        )
+        .expect("read master plan");
+        let ledger = std::fs::read_to_string(repo_root.join("benchmarks/GATE_LEDGER.md"))
+            .expect("read benchmarks/GATE_LEDGER.md");
+
+        // Extract every target metric from §6 of the master plan.
+        let sec6 = master_plan
+            .split("## 6. Quantitative product targets")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## 7.").next())
+            .expect("locate §6 in master plan");
+        let sec6_metrics: Vec<&str> = sec6
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if !trimmed.starts_with('|') {
+                    return None;
+                }
+                let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
+                if cols.len() < 3 {
+                    return None;
+                }
+                let metric = cols[1];
+                if metric.is_empty() || metric == "Metric" || metric.starts_with("---") {
+                    return None;
+                }
+                Some(metric)
+            })
+            .collect();
+        assert_eq!(
+            sec6_metrics.len(),
+            11,
+            "expected 11 §6 quantitative targets in master plan"
+        );
+
+        // Parse rows from benchmarks/GATE_LEDGER.md.
+        let mut ledger_rows: Vec<(String, String, String, String, String)> = Vec::new();
+        for line in ledger.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('|') {
+                continue;
+            }
+            let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
+            if cols.len() < 7 {
+                continue;
+            }
+            let metric = cols[1];
+            if metric.is_empty() || metric == "Metric" || metric.starts_with("---") {
+                continue;
+            }
+            let status = cols[3].trim_matches('`');
+            let owning_bead = cols[4];
+            let last_result = cols[5];
+            let evidence = cols[6];
+            assert!(
+                status == "ENFORCING"
+                    || (status.starts_with("PENDING(Phase ") && status.ends_with(')')),
+                "invalid status `{status}` for metric `{metric}` in GATE_LEDGER.md"
+            );
+            assert!(
+                !owning_bead.is_empty(),
+                "missing owning gate bead for `{metric}` in GATE_LEDGER.md"
+            );
+            assert!(
+                !last_result.is_empty(),
+                "missing last result for `{metric}` in GATE_LEDGER.md"
+            );
+            assert!(
+                evidence.contains("]("),
+                "missing markdown evidence link for `{metric}` in GATE_LEDGER.md"
+            );
+            for segment in evidence.split("](").skip(1) {
+                let rel_link = segment.split(')').next().unwrap_or("");
+                let resolved = repo_root.join("benchmarks").join(rel_link);
+                assert!(
+                    resolved.exists(),
+                    "evidence link `{rel_link}` for `{metric}` does not exist at {}",
+                    resolved.display()
+                );
+            }
+            ledger_rows.push((
+                metric.to_string(),
+                status.to_string(),
+                owning_bead.to_string(),
+                last_result.to_string(),
+                evidence.to_string(),
+            ));
+        }
+
+        for expected in &sec6_metrics {
+            assert!(
+                ledger_rows.iter().any(|(m, _, _, _, _)| m == expected),
+                "§6 target `{expected}` is absent from benchmarks/GATE_LEDGER.md (defect per bd-cl8mf)"
+            );
+        }
+        assert_eq!(
+            ledger_rows.len(),
+            sec6_metrics.len(),
+            "GATE_LEDGER.md must have exactly one row per §6 target"
+        );
     }
 
     #[test]

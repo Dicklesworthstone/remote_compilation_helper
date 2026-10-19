@@ -28,7 +28,7 @@ use crate::wire_time::{DeadlineBudget, PeerId};
 /// The semantic action classes (plan §15). Purpose/priority are NOT
 /// classes — a speculative and a foreground compile with identical
 /// semantics must share one key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(missing_docs)] // Variant names are the plan's own vocabulary.
 pub enum ActionClass {
     CargoWholeCommandBounded,
@@ -52,6 +52,43 @@ pub enum ActionClass {
     BenchmarkRun,
     ToolchainProbe,
     WorkerProbe,
+}
+
+impl ActionClass {
+    /// Whether this action class is a cacheable `rustc` compile invocation
+    /// counted in the §6 "Fleet rustc invocations served rather than executed"
+    /// denominator (`bd-cl8mf`).
+    ///
+    /// Capability probes (`ToolchainProbe`, `WorkerProbe`), whole-Cargo
+    /// wrappers, link/run steps, and native C/C++ steps are excluded from the
+    /// `rustc`-invocation denominator. Exhaustive match ensures any future
+    /// `ActionClass` variant requires an explicit denominator decision.
+    #[must_use]
+    pub const fn is_rustc_compile(self) -> bool {
+        match self {
+            Self::RustcDependencyCompile
+            | Self::RustcWorkspaceCompile
+            | Self::BuildScriptCompile
+            | Self::DoctestCompile
+            | Self::ClippyCompile
+            | Self::BenchmarkCompile => true,
+            Self::CargoWholeCommandBounded
+            | Self::RustdocCompile
+            | Self::Link
+            | Self::BuildScriptRun
+            | Self::NativeCompileC
+            | Self::NativeCompileCxx
+            | Self::NativeArchive
+            | Self::BindgenGeneration
+            | Self::CodeGeneratorRun
+            | Self::NextestTestCase
+            | Self::TestBinaryBatch
+            | Self::DoctestRun
+            | Self::BenchmarkRun
+            | Self::ToolchainProbe
+            | Self::WorkerProbe => false,
+        }
+    }
 }
 
 /// The immutable semantic descriptor: its fields are EXACTLY the action-key

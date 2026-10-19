@@ -630,7 +630,7 @@ fn cargo_dependency_events_bind_terminal_records_to_each_crate() {
     assert_eq!(middle, [events[1].clone(), events[3].clone()]);
     assert!(cargo_dependency_events(&events, CARGO_TOP).is_empty());
     let preparing = json!({"decision":"preparing", "reason":"dependency-facts-pending"});
-    assert!(cargo_dependency_warming(&[preparing.clone()]));
+    assert!(cargo_dependency_warming(std::slice::from_ref(&preparing)));
     assert!(!cargo_dependency_warming(&[
         preparing,
         json!({"decision":"remote-ineligible", "reason":"REMOTE_DEP_DIRECTORY_NOT_EMPTY"}),
