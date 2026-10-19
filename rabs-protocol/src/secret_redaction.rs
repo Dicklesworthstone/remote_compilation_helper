@@ -118,6 +118,131 @@ impl core::fmt::Display for SecretValue {
     }
 }
 
+/// Domain separator for trusted opaque secret HMAC digests generated
+/// outside the untrusted action over `(value, version, scope)` (bead S013; R56).
+pub const OPAQUE_SECRET_HMAC_DOMAIN: &str = "rabs.secret-hmac.sha256.v1";
+
+/// Where an opaque secret digest was generated (bead S013; risk R56).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretDerivationOrigin {
+    /// Generated outside the untrusted action by a trusted secret authority.
+    TrustedExternalAuthority {
+        /// Identifier of the external secret authority.
+        authority_id: String,
+    },
+    /// Generated inside or self-reported by the untrusted action (never
+    /// trusted for cache keying; forces noncacheable/nonshareable fallback).
+    UntrustedActionInternal,
+}
+
+/// Authority-issued opaque HMAC binding over `(secret value, version, scope)` (bead S013; R56).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueSecretBinding {
+    /// Logical capability slot name.
+    pub slot: String,
+    /// Monotonic secret version (> 0); rotating the version or value MUST change the key.
+    pub secret_version: u64,
+    /// Least-privilege capability scope bound into the HMAC.
+    pub scope: String,
+    /// Where the HMAC digest was generated.
+    pub origin: SecretDerivationOrigin,
+    /// Opaque HMAC digest over `(value, version, scope)` in [`OPAQUE_SECRET_HMAC_DOMAIN`].
+    pub hmac_digest: TypedDigest,
+}
+
+/// Reason an output-affecting secret fell back to noncacheable/nonshareable (bead S013; R56).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretFallbackReason {
+    /// No opaque HMAC binding was supplied for an output-affecting secret.
+    NoOpaqueDigestProvided,
+    /// The digest was computed inside or claimed by the untrusted action itself.
+    DerivedInsideUntrustedAction,
+    /// The external authority identifier was empty.
+    EmptyAuthorityIdentity,
+    /// Secret version zero is invalid.
+    ZeroSecretVersion,
+    /// Secret scope was empty.
+    EmptyScope,
+    /// Binding slot did not match the requested capability slot.
+    SlotMismatch,
+    /// The digest did not carry [`OPAQUE_SECRET_HMAC_DOMAIN`].
+    InvalidDigestDomain,
+}
+
+/// S013 classification of an output-affecting secret: either a verified
+/// external opaque HMAC digest participates in the action key, or the action
+/// falls back to noncacheable and nonshareable (R56).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretFallbackClassification {
+    /// Trusted external HMAC over `(value, version, scope)` enters the key.
+    CacheableShareableWithOpaqueDigest(TypedDigest),
+    /// Action cannot be cached or shared across principals/workers.
+    NonCacheableNonShareable {
+        /// Logical secret slot that triggered fallback.
+        slot: String,
+        /// Exact fallback reason.
+        reason: SecretFallbackReason,
+    },
+}
+
+/// Evaluate an output-affecting secret binding under S013 (R56):
+/// only a trusted external HMAC over `(value, version, scope)` in
+/// [`OPAQUE_SECRET_HMAC_DOMAIN`] may key a cacheable action; otherwise
+/// the action falls back to [`SecretFallbackClassification::NonCacheableNonShareable`].
+#[must_use]
+pub fn classify_secret_keying_or_fallback(
+    slot: &str,
+    binding: Option<&OpaqueSecretBinding>,
+) -> SecretFallbackClassification {
+    let Some(binding) = binding else {
+        return SecretFallbackClassification::NonCacheableNonShareable {
+            slot: slot.to_owned(),
+            reason: SecretFallbackReason::NoOpaqueDigestProvided,
+        };
+    };
+    if binding.slot != slot {
+        return SecretFallbackClassification::NonCacheableNonShareable {
+            slot: slot.to_owned(),
+            reason: SecretFallbackReason::SlotMismatch,
+        };
+    }
+    match &binding.origin {
+        SecretDerivationOrigin::UntrustedActionInternal => {
+            return SecretFallbackClassification::NonCacheableNonShareable {
+                slot: slot.to_owned(),
+                reason: SecretFallbackReason::DerivedInsideUntrustedAction,
+            };
+        }
+        SecretDerivationOrigin::TrustedExternalAuthority { authority_id } => {
+            if authority_id.trim().is_empty() {
+                return SecretFallbackClassification::NonCacheableNonShareable {
+                    slot: slot.to_owned(),
+                    reason: SecretFallbackReason::EmptyAuthorityIdentity,
+                };
+            }
+        }
+    }
+    if binding.secret_version == 0 {
+        return SecretFallbackClassification::NonCacheableNonShareable {
+            slot: slot.to_owned(),
+            reason: SecretFallbackReason::ZeroSecretVersion,
+        };
+    }
+    if binding.scope.trim().is_empty() {
+        return SecretFallbackClassification::NonCacheableNonShareable {
+            slot: slot.to_owned(),
+            reason: SecretFallbackReason::EmptyScope,
+        };
+    }
+    if binding.hmac_digest.domain != OPAQUE_SECRET_HMAC_DOMAIN {
+        return SecretFallbackClassification::NonCacheableNonShareable {
+            slot: slot.to_owned(),
+            reason: SecretFallbackReason::InvalidDigestDomain,
+        };
+    }
+    SecretFallbackClassification::CacheableShareableWithOpaqueDigest(binding.hmac_digest.clone())
+}
+
 /// How an output-affecting secret participates in the action key.
 /// There is NO arm carrying plaintext — the rule is structural.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,5 +431,86 @@ mod tests {
         // Idempotent.
         s.wipe();
         assert!(s.is_wiped());
+    }
+
+    #[test]
+    fn s013_external_opaque_secret_binding_and_nonshareable_fallback_classification() {
+        let valid_digest = TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: OPAQUE_SECRET_HMAC_DOMAIN,
+            bytes: [0x42; 32],
+        };
+        let valid_binding = OpaqueSecretBinding {
+            slot: "cargo-registry-token".into(),
+            secret_version: 3,
+            scope: "registry:crates-io/v1".into(),
+            origin: SecretDerivationOrigin::TrustedExternalAuthority {
+                authority_id: "fleet-secret-authority-1".into(),
+            },
+            hmac_digest: valid_digest.clone(),
+        };
+        assert_eq!(
+            classify_secret_keying_or_fallback("cargo-registry-token", Some(&valid_binding)),
+            SecretFallbackClassification::CacheableShareableWithOpaqueDigest(valid_digest)
+        );
+
+        // Missing binding -> NonCacheableNonShareable fallback.
+        assert_eq!(
+            classify_secret_keying_or_fallback("cargo-registry-token", None),
+            SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "cargo-registry-token".into(),
+                reason: SecretFallbackReason::NoOpaqueDigestProvided,
+            }
+        );
+
+        // Derived inside untrusted action -> NonCacheableNonShareable fallback.
+        let mut internal_binding = valid_binding.clone();
+        internal_binding.origin = SecretDerivationOrigin::UntrustedActionInternal;
+        assert_eq!(
+            classify_secret_keying_or_fallback("cargo-registry-token", Some(&internal_binding)),
+            SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "cargo-registry-token".into(),
+                reason: SecretFallbackReason::DerivedInsideUntrustedAction,
+            }
+        );
+
+        // Zero version, empty scope, slot mismatch, or wrong domain -> NonCacheableNonShareable fallback.
+        let mut zero_version = valid_binding.clone();
+        zero_version.secret_version = 0;
+        assert_eq!(
+            classify_secret_keying_or_fallback("cargo-registry-token", Some(&zero_version)),
+            SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "cargo-registry-token".into(),
+                reason: SecretFallbackReason::ZeroSecretVersion,
+            }
+        );
+
+        let mut empty_scope = valid_binding.clone();
+        empty_scope.scope = "   ".into();
+        assert_eq!(
+            classify_secret_keying_or_fallback("cargo-registry-token", Some(&empty_scope)),
+            SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "cargo-registry-token".into(),
+                reason: SecretFallbackReason::EmptyScope,
+            }
+        );
+
+        assert_eq!(
+            classify_secret_keying_or_fallback("other-slot", Some(&valid_binding)),
+            SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "other-slot".into(),
+                reason: SecretFallbackReason::SlotMismatch,
+            }
+        );
+
+        let mut wrong_domain = valid_binding;
+        wrong_domain.hmac_digest.domain = "rabs.wrong-domain.v1";
+        assert_eq!(
+            classify_secret_keying_or_fallback("cargo-registry-token", Some(&wrong_domain)),
+            SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "cargo-registry-token".into(),
+                reason: SecretFallbackReason::InvalidDigestDomain,
+            }
+        );
     }
 }

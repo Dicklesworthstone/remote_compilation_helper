@@ -861,7 +861,7 @@ mod linux {
                 baseline
             );
 
-            let needed = libraries(&probe(&[compiler.clone()], &[]).unwrap())
+            let needed = libraries(&probe(std::slice::from_ref(&compiler), &[]).unwrap())
                 .unwrap()
                 .into_iter()
                 .find(|library| !library.name.starts_with('/'))

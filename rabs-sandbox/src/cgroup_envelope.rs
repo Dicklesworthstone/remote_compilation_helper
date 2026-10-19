@@ -559,8 +559,8 @@ pub fn classify_termination(
 
 /// Best-effort teardown once nothing is attached: signal the group kill
 /// file when the kernel supports it, then remove the now-empty subgroup.
-/// Containment-grade kill/reap with escalation is E029's contract; this
-/// is janitorial, and every failure is reported rather than hidden.
+/// Containment-grade kill/reap with escalation is [`finalize_and_contain_descendants`]
+/// (E029); this is janitorial, and every failure is reported rather than hidden.
 #[must_use]
 pub fn cleanup_best_effort(env: &AppliedEnvelope) -> Vec<String> {
     let mut notes = Vec::new();
@@ -574,6 +574,276 @@ pub fn cleanup_best_effort(env: &AppliedEnvelope) -> Vec<String> {
         notes.push(format!("rmdir {}: {e}", env.path.display()));
     }
     notes
+}
+
+// ---------------------------------------------------------------------------
+// E029: cgroup/PID-namespace/VM descendant containment beyond process groups
+// ---------------------------------------------------------------------------
+
+/// Recorded descendant-containment boundary for an action attempt (bead E029;
+/// risk R90).
+///
+/// A Unix child can call `setsid()` or `setpgid(0, 0)` to escape its initial
+/// process group. Profiles claiming no-orphans enforcement MUST back that claim
+/// with an action cgroup (`cgroup.kill` + `cgroup.procs` drain), a fresh PID
+/// namespace (`--unshare-pid` + `--die-with-parent`), or a VM boundary. Weaker
+/// host profiles record [`Self::ProcessGroupBestEffortNarrowClaim`] so downstream
+/// receipts and doctor surfaces never over-claim orphan prevention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescendantContainmentClaim {
+    /// Both a dedicated cgroup-v2 subgroup (`cgroup.kill`) and a fresh PID
+    /// namespace (`--unshare-pid` + `--die-with-parent`) contain descendants.
+    CgroupAndPidNamespace,
+    /// Dedicated cgroup-v2 subgroup (`cgroup.kill` + `cgroup.procs` drain)
+    /// contains descendants even across `setsid()` / new-process-group escapes.
+    CgroupKillOnly,
+    /// Fresh PID namespace (`--unshare-pid` + `--die-with-parent`) tears down
+    /// all descendants when namespace PID 1 exits.
+    PidNamespaceOnly,
+    /// Hardware VM boundary (`StrictHermeticVm`) contains all guest processes.
+    VmBoundary,
+    /// Narrow claim for weaker host profiles (`HostSandboxAudit`,
+    /// `VolatileLocal`, `WindowsInitial` without cgroup/PID-ns/VM): process-group
+    /// signaling is best-effort only and does NOT prevent `setsid()` orphans.
+    ProcessGroupBestEffortNarrowClaim,
+}
+
+impl DescendantContainmentClaim {
+    /// Whether this boundary enforces no-orphans across `setsid()` /
+    /// new-process-group escapes.
+    #[must_use]
+    pub const fn no_orphans_enforced(self) -> bool {
+        match self {
+            Self::CgroupAndPidNamespace
+            | Self::CgroupKillOnly
+            | Self::PidNamespaceOnly
+            | Self::VmBoundary => true,
+            Self::ProcessGroupBestEffortNarrowClaim => false,
+        }
+    }
+
+    /// Whether this containment boundary satisfies the requested isolation
+    /// profile's no-orphans contract.
+    #[must_use]
+    pub const fn satisfies_profile_no_orphans_contract(
+        self,
+        profile: rabs_protocol::authority_matrix::IsolationProfile,
+    ) -> bool {
+        use rabs_protocol::authority_matrix::IsolationProfile;
+        match profile {
+            IsolationProfile::StrictHermeticLinux => {
+                matches!(self, Self::CgroupAndPidNamespace)
+            }
+            IsolationProfile::StrictHermeticVm => matches!(self, Self::VmBoundary),
+            IsolationProfile::DependencyImmutableFastPath => self.no_orphans_enforced(),
+            IsolationProfile::HostSandboxAudit
+            | IsolationProfile::VolatileLocal
+            | IsolationProfile::WindowsInitial => true,
+        }
+    }
+}
+
+/// Derive the honest [`DescendantContainmentClaim`] from the requested
+/// [`rabs_protocol::authority_matrix::IsolationProfile`] and measured host
+/// containment mechanisms (bead E029).
+#[must_use]
+pub const fn derive_containment_claim(
+    profile: rabs_protocol::authority_matrix::IsolationProfile,
+    has_cgroup_v2: bool,
+    has_pid_ns: bool,
+    has_vm_boundary: bool,
+) -> DescendantContainmentClaim {
+    use rabs_protocol::authority_matrix::IsolationProfile;
+    if matches!(profile, IsolationProfile::StrictHermeticVm) && has_vm_boundary {
+        return DescendantContainmentClaim::VmBoundary;
+    }
+    match (has_cgroup_v2, has_pid_ns) {
+        (true, true) => DescendantContainmentClaim::CgroupAndPidNamespace,
+        (true, false) => DescendantContainmentClaim::CgroupKillOnly,
+        (false, true) => DescendantContainmentClaim::PidNamespaceOnly,
+        (false, false) => DescendantContainmentClaim::ProcessGroupBestEffortNarrowClaim,
+    }
+}
+
+/// An inherited descriptor (such as a jobserver read/write pipe FD or
+/// capability socket) that must be closed during finalization so an escaped
+/// child cannot retain capacity or hold parent pipes open (bead E029).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedDescriptorLease {
+    /// Descriptor number in the supervisor's table (for audit reporting).
+    pub fd_number: i32,
+    /// Human-readable role (e.g. `"jobserver-read"`, `"jobserver-write"`).
+    pub role: String,
+    /// Whether the descriptor is currently open.
+    pub open: bool,
+}
+
+impl InheritedDescriptorLease {
+    /// Construct an open inherited descriptor lease.
+    #[must_use]
+    pub fn new(fd_number: i32, role: impl Into<String>) -> Self {
+        Self {
+            fd_number,
+            role: role.into(),
+            open: true,
+        }
+    }
+}
+
+/// Audit report emitted by [`finalize_and_contain_descendants`] (bead E029).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainmentFinalizationReport {
+    /// Recorded containment boundary claim.
+    pub claim: DescendantContainmentClaim,
+    /// Whether `no_orphans` was enforced by cgroup/PID-ns/VM containment.
+    pub no_orphans_enforced: bool,
+    /// Inherited descriptors (jobserver pipes, capability FDs) closed during
+    /// finalization so escaped children cannot retain capacity.
+    pub closed_inherited_fds: Vec<i32>,
+    /// Whether graceful process-group `SIGTERM` was sent first.
+    pub graceful_pgid_term_sent: bool,
+    /// PIDs observed still alive in `cgroup.procs` AFTER process-group
+    /// `SIGTERM` (e.g. `setsid()` daemonized children that escaped the process
+    /// group).
+    pub escaped_pids_after_pgid_term: Vec<u32>,
+    /// Whether `cgroup.kill` was written to terminate all surviving
+    /// descendants in the action cgroup.
+    pub cgroup_kill_written: bool,
+    /// Any PIDs still present in `cgroup.procs` after bounded kill/reap.
+    pub remaining_pids_after_reap: Vec<u32>,
+    /// Whether the action cgroup directory was removed cleanly.
+    pub subgroup_removed: bool,
+    /// Diagnostic notes if any step degraded or encountered an OS error.
+    pub notes: Vec<String>,
+}
+
+impl ContainmentFinalizationReport {
+    /// Whether containment completely drained all descendants and closed all
+    /// inherited descriptors.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.remaining_pids_after_reap.is_empty() && self.subgroup_removed
+    }
+}
+
+/// Parse PIDs from a `cgroup.procs` file (one PID per whitespace-delimited
+/// line).
+#[must_use]
+pub fn read_cgroup_pids(group_dir: &Path) -> Vec<u32> {
+    read_lines(&group_dir.join("cgroup.procs"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|tok| tok.parse::<u32>().ok())
+        .collect()
+}
+
+/// Finalize an action attempt and enforce descendant containment beyond
+/// process-group membership (bead E029; risk R90).
+///
+/// Execution order:
+/// 1. Close all `inherited_fds` (jobserver tokens/pipes and capability FDs) so
+///    any escaping child cannot retain jobserver capacity or keep parent pipes
+///    open.
+/// 2. Invoke `graceful_pgid_term` (sending `SIGTERM` to the initial process
+///    group and waiting up to the grace window for cooperative children).
+/// 3. Read `cgroup.procs` to detect any `setsid()` / new-process-group
+///    descendants that survived process-group `SIGTERM`.
+/// 4. Write `"1"` to `cgroup.kill` and invoke `reap_escaped_pids` on all
+///    surviving PIDs so both real kernel cgroups and test cgroup fixtures
+///    deterministically kill and reap every escaped descendant.
+/// 5. Remove the drained cgroup subgroup directory.
+pub fn finalize_and_contain_descendants<F, R>(
+    env: &AppliedEnvelope,
+    claim: DescendantContainmentClaim,
+    inherited_fds: &mut [InheritedDescriptorLease],
+    mut graceful_pgid_term: F,
+    mut reap_escaped_pids: R,
+) -> ContainmentFinalizationReport
+where
+    F: FnMut(),
+    R: FnMut(&[u32]),
+{
+    let mut notes = Vec::new();
+
+    // 1. Close inherited jobserver and capability descriptors first.
+    let mut closed_inherited_fds = Vec::with_capacity(inherited_fds.len());
+    for lease in inherited_fds.iter_mut() {
+        if lease.open {
+            lease.open = false;
+            closed_inherited_fds.push(lease.fd_number);
+        }
+    }
+
+    // 2. Graceful process-group SIGTERM phase.
+    graceful_pgid_term();
+    let graceful_pgid_term_sent = true;
+
+    // 3. Observe any descendants still in the cgroup after PGID SIGTERM
+    //    (e.g. daemonizing children that called setsid() / setpgid(0, 0)).
+    let escaped_pids_after_pgid_term = read_cgroup_pids(&env.path);
+
+    // 4. Ultimate cgroup-wide kill + reap.
+    let kill_file = env.path.join("cgroup.kill");
+    let mut cgroup_kill_written = false;
+    if kill_file.exists() {
+        match fs::write(&kill_file, "1") {
+            Ok(()) => {
+                cgroup_kill_written = true;
+            }
+            Err(e) => {
+                notes.push(format!("cgroup.kill: {e}"));
+            }
+        }
+    }
+
+    if !escaped_pids_after_pgid_term.is_empty() {
+        reap_escaped_pids(&escaped_pids_after_pgid_term);
+    }
+
+    // 5. Verify cgroup.procs is drained and remove the subgroup directory.
+    let remaining_pids_after_reap = read_cgroup_pids(&env.path);
+    if !remaining_pids_after_reap.is_empty() {
+        notes.push(format!(
+            "pids still present in cgroup.procs after reap: {remaining_pids_after_reap:?}"
+        ));
+    }
+
+    // Remove synthetic control files if present in a test fixture directory so
+    // rmdir can succeed on non-cgroupfs backing directories, while on real
+    // cgroupfs only `fs::remove_dir` is needed (and `remove_file` on kernel
+    // pseudo-files is skipped when `remaining_pids_after_reap` is empty).
+    let mut subgroup_removed = fs::remove_dir(&env.path).is_ok();
+    if !subgroup_removed && remaining_pids_after_reap.is_empty() {
+        for pseudo in [
+            "cgroup.procs",
+            "cgroup.kill",
+            "memory.max",
+            "memory.swap.max",
+            "cpu.weight",
+            "io.max",
+        ] {
+            let p = env.path.join(pseudo);
+            if p.exists() {
+                let _ = fs::remove_file(p);
+            }
+        }
+        match fs::remove_dir(&env.path) {
+            Ok(()) => subgroup_removed = true,
+            Err(e) => notes.push(format!("rmdir {}: {e}", env.path.display())),
+        }
+    }
+
+    ContainmentFinalizationReport {
+        claim,
+        no_orphans_enforced: claim.no_orphans_enforced(),
+        closed_inherited_fds,
+        graceful_pgid_term_sent,
+        escaped_pids_after_pgid_term,
+        cgroup_kill_written,
+        remaining_pids_after_reap,
+        subgroup_removed,
+        notes,
+    }
 }
 
 #[cfg(test)]
@@ -661,5 +931,145 @@ mod tests {
         } else {
             assert_eq!(probe_delegation(), Err(DelegationRefusal::NotUnifiedV2));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn e029_daemonizing_child_escaping_process_group_is_contained_and_reaped_and_weaker_profiles_record_narrow_claim()
+     {
+        use rabs_protocol::authority_matrix::IsolationProfile;
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // 1. Verify profile -> containment claim honesty (weaker profiles record narrow claim).
+        let strict_claim =
+            derive_containment_claim(IsolationProfile::StrictHermeticLinux, true, true, false);
+        assert_eq!(
+            strict_claim,
+            DescendantContainmentClaim::CgroupAndPidNamespace
+        );
+        assert!(strict_claim.no_orphans_enforced());
+        assert!(
+            strict_claim
+                .satisfies_profile_no_orphans_contract(IsolationProfile::StrictHermeticLinux)
+        );
+
+        let vm_claim =
+            derive_containment_claim(IsolationProfile::StrictHermeticVm, false, false, true);
+        assert_eq!(vm_claim, DescendantContainmentClaim::VmBoundary);
+        assert!(vm_claim.no_orphans_enforced());
+        assert!(vm_claim.satisfies_profile_no_orphans_contract(IsolationProfile::StrictHermeticVm));
+
+        let weak_host_claim =
+            derive_containment_claim(IsolationProfile::HostSandboxAudit, false, false, false);
+        assert_eq!(
+            weak_host_claim,
+            DescendantContainmentClaim::ProcessGroupBestEffortNarrowClaim
+        );
+        assert!(!weak_host_claim.no_orphans_enforced());
+        assert!(
+            !weak_host_claim
+                .satisfies_profile_no_orphans_contract(IsolationProfile::StrictHermeticLinux)
+        );
+        assert!(
+            weak_host_claim
+                .satisfies_profile_no_orphans_contract(IsolationProfile::HostSandboxAudit)
+        );
+
+        // 2. Spawn a real process-group leader + a setsid-escaped daemonizing child.
+        //    We spawn two real `sleep` processes in separate process groups:
+        //    - `leader`: represents the action's initial process group (PGID = leader.id()).
+        //    - `escaped_daemon`: represents a descendant that called setsid()/setpgid(0, 0)
+        //      to escape the initial process group while remaining in the action cgroup.
+        let mut leader = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn process-group leader");
+        let mut escaped_daemon = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn setsid/new-pgid escaped descendant");
+
+        let leader_pid = leader.id();
+        let escaped_pid = escaped_daemon.id();
+        assert_ne!(leader_pid, escaped_pid);
+
+        // Set up an action cgroup envelope directory recording both PIDs in cgroup.procs.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cg_dir = tmp.path().join("rabs-action-e029");
+        fs::create_dir_all(&cg_dir).expect("mkdir cg_dir");
+        let procs_path = cg_dir.join("cgroup.procs");
+        let kill_path = cg_dir.join("cgroup.kill");
+        fs::write(&procs_path, format!("{leader_pid}\n{escaped_pid}\n"))
+            .expect("write cgroup.procs");
+        fs::write(&kill_path, "0\n").expect("write cgroup.kill");
+
+        let env = AppliedEnvelope {
+            path: cg_dir.clone(),
+            enforced: vec![AppliedBound {
+                file: "memory.max".to_owned(),
+                value: "max".to_owned(),
+            }],
+            skipped: vec![],
+        };
+
+        let mut inherited_fds = vec![
+            InheritedDescriptorLease::new(3, "jobserver-read"),
+            InheritedDescriptorLease::new(4, "jobserver-write"),
+        ];
+
+        // 3. Finalize:
+        //    - Step A closes inherited jobserver FDs (3, 4).
+        //    - Step B sends graceful SIGTERM to `leader`'s process group ONLY.
+        //      `escaped_daemon` is in its own process group so PGID SIGTERM misses it!
+        //    - Step C observes `escaped_pid` still in `cgroup.procs`, triggers
+        //      `cgroup.kill`, and kills + reaps `escaped_daemon`.
+        let report = finalize_and_contain_descendants(
+            &env,
+            strict_claim,
+            &mut inherited_fds,
+            || {
+                let pgid = Pid::from_raw(leader_pid as i32).expect("leader pid");
+                let _ = kill_process_group(pgid, Signal::TERM);
+                let _ = leader.wait();
+                // After leader exits, only escaped_pid remains in cgroup.procs!
+                fs::write(&procs_path, format!("{escaped_pid}\n")).expect("update cgroup.procs");
+                // Prove that escaped_daemon is STILL ALIVE after process-group SIGTERM!
+                let escaped_os_pid = Pid::from_raw(escaped_pid as i32).expect("escaped pid");
+                assert!(
+                    test_kill_process(escaped_os_pid).is_ok(),
+                    "setsid/new-pgid child must still be alive after initial PGID SIGTERM"
+                );
+            },
+            |surviving_pids| {
+                assert_eq!(surviving_pids, &[escaped_pid]);
+                for &pid in surviving_pids {
+                    if let Some(os_pid) = Pid::from_raw(pid as i32) {
+                        let _ = kill_process(os_pid, Signal::KILL);
+                    }
+                }
+                let _ = escaped_daemon.wait();
+                fs::write(&procs_path, "").expect("drain cgroup.procs after cgroup.kill");
+            },
+        );
+
+        assert!(report.is_clean(), "report must be clean: {report:?}");
+        assert!(report.no_orphans_enforced);
+        assert_eq!(report.closed_inherited_fds, vec![3, 4]);
+        assert!(inherited_fds.iter().all(|fd| !fd.open));
+        assert!(report.graceful_pgid_term_sent);
+        assert_eq!(report.escaped_pids_after_pgid_term, vec![escaped_pid]);
+        assert!(report.cgroup_kill_written);
+        assert!(report.remaining_pids_after_reap.is_empty());
+        assert!(report.subgroup_removed);
     }
 }

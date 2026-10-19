@@ -373,7 +373,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().to_str().unwrap().to_owned();
         assert_eq!(
-            observe_loader_directories(&[directory.clone()], || true)
+            observe_loader_directories(std::slice::from_ref(&directory), || true)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Interrupted

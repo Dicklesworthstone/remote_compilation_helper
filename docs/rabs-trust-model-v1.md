@@ -27,6 +27,8 @@ stable code (the same strings ride `DecisionReceipt.non_claims`):
 | `NO_CLAIM_CROSS_USER_ISOLATION` | Isolation between distinct human users inside the domain beyond ordinary OS accounts. |
 | `NO_CLAIM_UNTRUSTED_CODE_CONFINEMENT` | Confinement of actively malicious build scripts/proc-macros against a determined attacker. Sandboxing (E002/E004) reduces accident surface; it is not a security boundary against the fleet operator's own workloads. |
 | `NO_CLAIM_BYZANTINE_WORKER_TOLERANCE` | Correctness under workers that lie in their attestations. Verification (F024, O-series) catches drift, not coordinated deception. |
+| `NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS` | Cache/compilation equivalence proving application semantic correctness (S012). `ProjectReleaseEligible` is a project policy decision layered on evidence tiers, never an application correctness guarantee. |
+| `NO_CLAIM_SOFTWARE_IDENTITY_ANTI_CLONING` | Anti-cloning legitimacy proof from software-only worker identities (S023; I54; R114). Incarnation fencing detects duplicate/competing sessions and fails closed (`RejectCloneAmbiguity`), but cannot identify which clone is legitimate without hardware-bound enrollment or operator re-enrollment. |
 
 Cross-user/multi-tenant isolation is a **separate future program**
 with its own design, review gates, and threat model; nothing in V1
@@ -38,5 +40,7 @@ multi-tenant posture is a typed refusal at admission
 
 - `trust_domain::evaluate_deployment` — the fail-closed gate.
 - `trust_domain::v1_non_claims()` — the receipt/non-claim registry.
+- `serving::evaluate_project_release_eligibility` — S012 project release policy + non-claim enforcement.
+- `worker_fence::evaluate_clone_legitimacy_and_enrollment` — S023 clone-race fail-closed + hardware/operator enrollment gate.
 - A015 authority matrix (`authority_matrix.rs`) — per-profile serving
   authority with explicit claim boundaries per cell.

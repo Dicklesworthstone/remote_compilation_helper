@@ -63,6 +63,18 @@ pub const PROVENANCE_RECEIPT_FRAMING_DOMAIN: &str = "rabs.provenance-receipt.sha
 pub const NO_CLAIM_WORKER_IDENTITY_GRANTS_COMMIT_AUTHORITY: &str =
     "NO_CLAIM_WORKER_IDENTITY_GRANTS_COMMIT_AUTHORITY";
 
+/// Explicit non-claim carried by project release-eligibility decisions and
+/// receipts (bead S012): cache/compilation equivalence never proves
+/// application semantic correctness.
+pub const NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS: &str =
+    "NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS";
+
+/// Explicit non-claim for software-only worker identities (bead S023; I54; R114):
+/// incarnation fencing detects duplicate sessions and fails closed, but does
+/// not prove which clone is legitimate without hardware-bound enrollment or
+/// operator re-enrollment.
+pub const NO_CLAIM_SOFTWARE_IDENTITY_ANTI_CLONING: &str = "NO_CLAIM_SOFTWARE_IDENTITY_ANTI_CLONING";
+
 /// Bound on minimal-closure references (bounded collections rule).
 pub const MAX_CLOSURE_REFS: usize = 4096;
 /// Bound on recorded capability-use entries.
@@ -321,6 +333,11 @@ const fn is_registered_non_claim(code: &str) -> bool {
         i += 1;
     }
     str_eq(NO_CLAIM_WORKER_IDENTITY_GRANTS_COMMIT_AUTHORITY, code)
+        || str_eq(
+            NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS,
+            code,
+        )
+        || str_eq(NO_CLAIM_SOFTWARE_IDENTITY_ANTI_CLONING, code)
 }
 
 /// `const fn` string equality (loop-and-compare; no traits in const ctx).

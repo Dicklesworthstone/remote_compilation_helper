@@ -14,8 +14,13 @@
 //! epoch discontinuity, or uncertainty that crosses the not-after bound
 //! expires serving **conservatively** (deny), never optimistically.
 
-use crate::provenance_receipt::{MAX_AUTHENTICATOR_BYTES, VerificationLevel};
+use crate::authority_matrix::IsolationProfile;
+use crate::provenance_receipt::{
+    MAX_AUTHENTICATOR_BYTES, NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS,
+    VerificationLevel,
+};
 use crate::result_identity::{DigestAlgorithm, ObjectId, TypedDigest};
+use crate::wire_time::PeerId;
 
 /// Current serving disposition for one committed publication (plan §178).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +214,19 @@ impl ActionTrustEvaluationRecord {
             evidence_set_digest: context.expected_evidence_set_digest.clone(),
             evaluated_tier: TrustEvidenceTier::CiPolicyApproved,
             evaluated_causal_sequence: context.coordinator_causal_sequence,
+        }
+    }
+
+    fn project_release_eligible(
+        canonical_result_manifest_id: ObjectId,
+        evidence_set_digest: TypedDigest,
+        evaluated_causal_sequence: u64,
+    ) -> Self {
+        Self {
+            canonical_result_manifest_id,
+            evidence_set_digest,
+            evaluated_tier: TrustEvidenceTier::ProjectReleaseEligible,
+            evaluated_causal_sequence,
         }
     }
 }
@@ -1099,6 +1117,522 @@ fn ci_put_digest(out: &mut Vec<u8>, digest: &TypedDigest) {
     ci_put_u8(out, digest_algorithm_tag(digest.algorithm));
     ci_put_str(out, digest.domain);
     ci_put_field(out, &digest.bytes);
+}
+
+// ---------------------------------------------------------------------------
+// S012: Project-defined release-eligibility policy + explicit non-claim
+// ---------------------------------------------------------------------------
+
+/// Schema version for project release-eligibility policies (bead S012).
+pub const PROJECT_RELEASE_POLICY_SCHEMA_VERSION: u32 = 1;
+
+/// Project-defined release-eligibility policy (bead S012).
+///
+/// `ProjectReleaseEligible` is a project policy decision layered on top of
+/// observed/CI evidence tiers; RABS never claims that cache/compilation
+/// equivalence proves application semantic correctness
+/// ([`NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectReleaseEligibilityPolicy {
+    /// Policy schema version ([`PROJECT_RELEASE_POLICY_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// Project identifier governed by this policy.
+    pub project_id: String,
+    /// Monotonic policy revision (`> 0`).
+    pub policy_version: u32,
+    /// Whether this policy revision is revoked.
+    pub revoked: bool,
+    /// Minimum prerequisite tier (`>= ReproducibleCrossWorker` or `CiPolicyApproved`).
+    pub minimum_prerequisite_tier: TrustEvidenceTier,
+    /// Minimum verification level required before release eligibility.
+    pub minimum_verification: VerificationLevel,
+}
+
+/// Coordinator-verified input to [`evaluate_project_release_eligibility`] (bead S012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectReleaseEligibilityInput {
+    /// Project requesting release eligibility.
+    pub project_id: String,
+    /// Action key being evaluated.
+    pub action_key: TypedDigest,
+    /// Canonical result manifest being evaluated.
+    pub canonical_result_manifest_id: ObjectId,
+    /// Canonical evidence-set digest.
+    pub evidence_set_digest: TypedDigest,
+    /// Prerequisite trust evaluation record already achieved.
+    pub prerequisite_evaluation: ActionTrustEvaluationRecord,
+    /// Independently observed verification level.
+    pub observed_verification: VerificationLevel,
+    /// Coordinator causal sequence for the new evaluation (`> prerequisite_evaluation.evaluated_causal_sequence()`).
+    pub coordinator_causal_sequence: u64,
+    /// Non-claims carried on the release receipt/evaluation (must include
+    /// [`NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS`]).
+    pub receipt_non_claims: Vec<&'static str>,
+}
+
+/// Auditable approval granting [`TrustEvidenceTier::ProjectReleaseEligible`] (bead S012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectReleaseApproval {
+    /// Project identifier.
+    pub project_id: String,
+    /// Policy revision applied.
+    pub policy_version: u32,
+    /// Action key approved for project release.
+    pub action_key: TypedDigest,
+    /// Immutable trust evaluation record at [`TrustEvidenceTier::ProjectReleaseEligible`].
+    pub evaluation: ActionTrustEvaluationRecord,
+    /// Explicit non-claims carried by the approval receipt (always includes
+    /// [`NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS`]).
+    pub non_claims: Vec<&'static str>,
+}
+
+/// Typed refusal from [`evaluate_project_release_eligibility`] (bead S012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectReleaseRefusal {
+    /// Policy schema version is unsupported.
+    UnsupportedPolicySchema,
+    /// Policy version zero or empty project identifier.
+    MalformedPolicy,
+    /// Policy revision is revoked.
+    PolicyRevoked,
+    /// Policy sets a prerequisite floor weaker than `ReproducibleCrossWorker`.
+    WeakPrerequisitePolicyFloor,
+    /// Input project ID does not match the policy's project ID.
+    ProjectIdMismatch,
+    /// Input manifest or evidence set does not match the prerequisite evaluation.
+    PrerequisiteBindingMismatch,
+    /// Coordinator causal sequence does not strictly advance past the prerequisite evaluation.
+    NonMonotonicEvaluationSequence,
+    /// Prerequisite tier is below the policy's minimum prerequisite tier.
+    InsufficientPrerequisiteTier {
+        /// Required prerequisite tier.
+        required: TrustEvidenceTier,
+        /// Presented prerequisite tier.
+        presented: TrustEvidenceTier,
+    },
+    /// Observed verification level is below the policy's minimum verification level.
+    InsufficientVerification {
+        /// Required verification level.
+        required: VerificationLevel,
+        /// Presented verification level.
+        presented: VerificationLevel,
+    },
+    /// Receipt non-claims omitted [`NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS`].
+    MissingApplicationCorrectnessNonClaim,
+}
+
+/// Evaluate project-defined release eligibility and emit a
+/// [`TrustEvidenceTier::ProjectReleaseEligible`] evaluation carrying the
+/// mandatory [`NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS`] non-claim (bead S012).
+///
+/// # Errors
+/// [`ProjectReleaseRefusal`] if the policy is malformed/revoked, prerequisite
+/// evidence is insufficient, or the explicit application-correctness non-claim is absent.
+pub fn evaluate_project_release_eligibility(
+    policy: &ProjectReleaseEligibilityPolicy,
+    input: &ProjectReleaseEligibilityInput,
+) -> Result<ProjectReleaseApproval, ProjectReleaseRefusal> {
+    if policy.schema_version != PROJECT_RELEASE_POLICY_SCHEMA_VERSION {
+        return Err(ProjectReleaseRefusal::UnsupportedPolicySchema);
+    }
+    if policy.policy_version == 0
+        || policy.project_id.trim().is_empty()
+        || !valid_verification_level(policy.minimum_verification)
+    {
+        return Err(ProjectReleaseRefusal::MalformedPolicy);
+    }
+    if policy.revoked {
+        return Err(ProjectReleaseRefusal::PolicyRevoked);
+    }
+    if policy.minimum_prerequisite_tier < TrustEvidenceTier::ReproducibleCrossWorker {
+        return Err(ProjectReleaseRefusal::WeakPrerequisitePolicyFloor);
+    }
+    if input.project_id != policy.project_id {
+        return Err(ProjectReleaseRefusal::ProjectIdMismatch);
+    }
+    if input.prerequisite_evaluation.canonical_result_manifest_id()
+        != &input.canonical_result_manifest_id
+        || input.prerequisite_evaluation.evidence_set_digest() != &input.evidence_set_digest
+    {
+        return Err(ProjectReleaseRefusal::PrerequisiteBindingMismatch);
+    }
+    if input.coordinator_causal_sequence
+        <= input.prerequisite_evaluation.evaluated_causal_sequence()
+    {
+        return Err(ProjectReleaseRefusal::NonMonotonicEvaluationSequence);
+    }
+    let presented_tier = input.prerequisite_evaluation.evaluated_tier();
+    if presented_tier < policy.minimum_prerequisite_tier {
+        return Err(ProjectReleaseRefusal::InsufficientPrerequisiteTier {
+            required: policy.minimum_prerequisite_tier,
+            presented: presented_tier,
+        });
+    }
+    if !verification_meets(input.observed_verification, policy.minimum_verification) {
+        return Err(ProjectReleaseRefusal::InsufficientVerification {
+            required: policy.minimum_verification,
+            presented: input.observed_verification,
+        });
+    }
+    if !input
+        .receipt_non_claims
+        .contains(&NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS)
+    {
+        return Err(ProjectReleaseRefusal::MissingApplicationCorrectnessNonClaim);
+    }
+
+    Ok(ProjectReleaseApproval {
+        project_id: policy.project_id.clone(),
+        policy_version: policy.policy_version,
+        action_key: input.action_key.clone(),
+        evaluation: ActionTrustEvaluationRecord::project_release_eligible(
+            input.canonical_result_manifest_id.clone(),
+            input.evidence_set_digest.clone(),
+            input.coordinator_causal_sequence,
+        ),
+        non_claims: input.receipt_non_claims.clone(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// S018: Compromised-worker threat verification + cross-worker/stock policy (R79)
+// ---------------------------------------------------------------------------
+
+/// Release-tier verification policy addressing compromised-worker threats (bead S018; risk R79).
+///
+/// A cryptographically authenticated worker is still a semantic trust principal:
+/// digests prove transport/storage integrity, not honest execution. Higher-trust
+/// and release serving therefore require independent cross-worker consensus,
+/// stock toolchain differential execution, or authorized CI approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseVerificationPolicy {
+    /// Require at least `minimum_distinct_workers` (>= 2) independent authenticated workers
+    /// to produce identical observable digests.
+    TwoOrMoreIndependentWorkers {
+        /// Minimum distinct authenticated workers (>= 2).
+        minimum_distinct_workers: u8,
+    },
+    /// Require differential execution against a stock local toolchain run.
+    StockDifferentialExecution,
+    /// Require an authorized CI canonical-writer approval (`CiPolicyApproved`).
+    CiApprovalRequired,
+    /// Accept any of: >= 2 independent authenticated workers, stock differential execution,
+    /// or authorized CI approval. Never accepts a single worker's uncorroborated execution.
+    AnyHighTrustReleaseProof,
+}
+
+/// One worker execution observation compared by [`evaluate_release_verification_and_compromise`] (bead S018).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerAttemptObservation {
+    /// Executing worker identity.
+    pub worker_peer_id: PeerId,
+    /// Whether the worker's transport/key identity was cryptographically authenticated.
+    pub authenticated: bool,
+    /// Observable output digest produced by this execution.
+    pub observable_output_digest: TypedDigest,
+}
+
+/// Verdict of S018 release-tier verification and compromised-worker detection (risk R79).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompromisedWorkerVerdict {
+    /// All observations matched and satisfied the release verification policy.
+    VerifiedReleaseEligible {
+        /// Derived verification level.
+        verification_level: VerificationLevel,
+        /// Count of distinct authenticated workers that agreed.
+        distinct_authenticated_workers: u8,
+    },
+    /// No divergence occurred, but a single worker's execution (even cryptographically
+    /// authenticated) does not meet the release verification policy (R79).
+    InsufficientReleaseVerification {
+        /// Derived verification level so far.
+        observed_verification: VerificationLevel,
+        /// Count of distinct authenticated workers observed.
+        distinct_authenticated_workers: u8,
+    },
+    /// Worker output diverged from peer/stock verification: malicious or broken worker caught!
+    /// Immediately revokes publication eligibility for the diverging worker(s) and quarantines the action.
+    MaliciousOrDivergentWorkerDetected {
+        /// Workers whose outputs diverged from the reference/consensus digest.
+        revoked_workers: Vec<PeerId>,
+        /// Whether authoritative publication eligibility is immediately revoked.
+        publication_eligibility_revoked: bool,
+        /// Whether the action is quarantined from serving.
+        action_quarantined: bool,
+        /// Stable incident reason code.
+        reason: &'static str,
+    },
+}
+
+/// Evaluate worker execution observations, optional stock-toolchain digest, and optional
+/// CI approval against [`ReleaseVerificationPolicy`] (bead S018; risk R79).
+///
+/// Any digest mismatch between workers or against a stock toolchain reference immediately
+/// returns [`CompromisedWorkerVerdict::MaliciousOrDivergentWorkerDetected`] and revokes
+/// authoritative publication eligibility for the diverging worker(s).
+#[must_use]
+pub fn evaluate_release_verification_and_compromise(
+    policy: ReleaseVerificationPolicy,
+    observations: &[WorkerAttemptObservation],
+    stock_toolchain_digest: Option<&TypedDigest>,
+    ci_approved: bool,
+) -> CompromisedWorkerVerdict {
+    use std::collections::BTreeSet;
+
+    let Some(first) = observations.first() else {
+        return CompromisedWorkerVerdict::InsufficientReleaseVerification {
+            observed_verification: VerificationLevel::None,
+            distinct_authenticated_workers: 0,
+        };
+    };
+
+    let reference_digest = stock_toolchain_digest.unwrap_or(&first.observable_output_digest);
+    let mut diverging_workers = Vec::new();
+    let mut distinct_authenticated = BTreeSet::new();
+
+    for obs in observations {
+        if &obs.observable_output_digest != reference_digest {
+            if !diverging_workers.contains(&obs.worker_peer_id) {
+                diverging_workers.push(obs.worker_peer_id.clone());
+            }
+        } else if obs.authenticated {
+            distinct_authenticated.insert(obs.worker_peer_id.0.clone());
+        }
+    }
+
+    if !diverging_workers.is_empty() {
+        // If no stock digest anchored the comparison, every worker involved in a
+        // conflicting multi-worker disagreement is removed from publication eligibility
+        // until audited.
+        if stock_toolchain_digest.is_none() {
+            for obs in observations {
+                if !diverging_workers.contains(&obs.worker_peer_id) {
+                    diverging_workers.push(obs.worker_peer_id.clone());
+                }
+            }
+        }
+        return CompromisedWorkerVerdict::MaliciousOrDivergentWorkerDetected {
+            revoked_workers: diverging_workers,
+            publication_eligibility_revoked: true,
+            action_quarantined: true,
+            reason: "r79-semantic-divergence-detected-publication-eligibility-revoked",
+        };
+    }
+
+    let distinct_count = u8::try_from(distinct_authenticated.len()).unwrap_or(u8::MAX);
+    let observed_verification = if stock_toolchain_digest.is_some() && distinct_count >= 1 {
+        VerificationLevel::StockToolchainComparison
+    } else if distinct_count >= 2 {
+        VerificationLevel::CrossWorkerConsensus {
+            distinct_workers: distinct_count,
+        }
+    } else if distinct_count == 1 {
+        VerificationLevel::CoordinatorDigestRecompute
+    } else {
+        VerificationLevel::None
+    };
+
+    let satisfied = match policy {
+        ReleaseVerificationPolicy::TwoOrMoreIndependentWorkers {
+            minimum_distinct_workers,
+        } => {
+            let required = minimum_distinct_workers.max(2);
+            distinct_count >= required
+        }
+        ReleaseVerificationPolicy::StockDifferentialExecution => {
+            matches!(
+                observed_verification,
+                VerificationLevel::StockToolchainComparison
+            )
+        }
+        ReleaseVerificationPolicy::CiApprovalRequired => ci_approved && distinct_count >= 1,
+        ReleaseVerificationPolicy::AnyHighTrustReleaseProof => {
+            distinct_count >= 2
+                || matches!(
+                    observed_verification,
+                    VerificationLevel::StockToolchainComparison
+                )
+                || (ci_approved && distinct_count >= 1)
+        }
+    };
+
+    if satisfied {
+        CompromisedWorkerVerdict::VerifiedReleaseEligible {
+            verification_level: observed_verification,
+            distinct_authenticated_workers: distinct_count,
+        }
+    } else {
+        CompromisedWorkerVerdict::InsufficientReleaseVerification {
+            observed_verification,
+            distinct_authenticated_workers: distinct_count,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S021: Per-subscriber minimum evidence/isolation/privacy requirements + re-evaluation (I42)
+// ---------------------------------------------------------------------------
+
+/// Per-subscriber minimum serving requirements (bead S021; invariant I42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriberServingRequirements {
+    /// Subscribing principal.
+    pub subscriber_id: PeerId,
+    /// Minimum trust evidence tier required by this subscriber.
+    pub minimum_tier: TrustEvidenceTier,
+    /// Minimum verification level required by this subscriber.
+    pub minimum_verification: VerificationLevel,
+    /// Minimum isolation profile required by this subscriber.
+    pub required_isolation: IsolationProfile,
+    /// Required privacy/secret scope (if `Some(scope)`, publication must match `scope`).
+    pub required_privacy_scope: Option<String>,
+    /// Whether this subscriber requires redacted diagnostics.
+    pub require_redacted_diagnostics: bool,
+}
+
+/// Current committed publication and serving posture evaluated for a subscriber (bead S021; I42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedPublicationPosture {
+    /// Action key of the committed publication.
+    pub action_key: TypedDigest,
+    /// Immutable committed result manifest ID.
+    pub canonical_result_manifest_id: ObjectId,
+    /// Current mutable serving state record.
+    pub serving_state: ActionServingStateRecord,
+    /// Latest versioned trust evaluation record (under the latest non-revoked policy).
+    pub latest_trust_evaluation: ActionTrustEvaluationRecord,
+    /// Current verification level achieved by appended evidence.
+    pub observed_verification: VerificationLevel,
+    /// Isolation profile enforced when the result was produced.
+    pub enforced_isolation: IsolationProfile,
+    /// Optional privacy/secret scope of the publication.
+    pub privacy_scope: Option<String>,
+    /// Whether child diagnostics were scrubbed/redacted cleanly.
+    pub diagnostics_redacted: bool,
+}
+
+/// Per-subscriber serving eligibility decision (bead S021; invariant I42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscriberEligibilityDecision {
+    /// Committed result meets all of this subscriber's evidence, isolation, and privacy requirements.
+    Eligible {
+        /// Trust tier satisfied at evaluation time.
+        satisfied_tier: TrustEvidenceTier,
+        /// Causal sequence of the [`ActionTrustEvaluationRecord`] that authorized serving.
+        evaluation_causal_sequence: u64,
+    },
+    /// Committed result exists and is healthy, but its current evidence tier or verification
+    /// level is below this subscriber's minimum: the coordinator can launch/join a verification
+    /// attempt, append evidence, emit a new [`ActionTrustEvaluationRecord`], and re-evaluate.
+    IneligibleNeedsVerificationAttempt {
+        /// Current evaluated tier.
+        current_tier: TrustEvidenceTier,
+        /// Subscriber's required minimum tier.
+        required_tier: TrustEvidenceTier,
+        /// Current verification level.
+        current_verification: VerificationLevel,
+        /// Subscriber's required minimum verification level.
+        required_verification: VerificationLevel,
+    },
+    /// Publication's isolation profile does not satisfy the subscriber's required isolation.
+    IneligibleIsolationProfile {
+        /// Enforced isolation profile.
+        enforced: IsolationProfile,
+        /// Subscriber's required isolation profile.
+        required: IsolationProfile,
+    },
+    /// Publication's privacy scope or diagnostic-redaction posture does not satisfy the subscriber.
+    IneligiblePrivacyPosture {
+        /// Reason code.
+        reason: &'static str,
+    },
+    /// Serving state is currently not eligible (quarantined, expired TTL, or objects unavailable).
+    IneligibleServingState {
+        /// Current serving disposition.
+        disposition: ActionServingDisposition,
+    },
+}
+
+const fn isolation_rank(profile: IsolationProfile) -> u8 {
+    match profile {
+        IsolationProfile::VolatileLocal => 0,
+        IsolationProfile::WindowsInitial | IsolationProfile::HostSandboxAudit => 1,
+        IsolationProfile::DependencyImmutableFastPath => 2,
+        IsolationProfile::StrictHermeticVm | IsolationProfile::StrictHermeticLinux => 3,
+    }
+}
+
+/// Evaluate whether a committed publication is eligible for a specific subscriber's
+/// evidence, isolation, and privacy requirements at `(now_unix_micros, now_epoch)` (bead S021; I42).
+#[must_use]
+pub fn evaluate_subscriber_serving_eligibility(
+    posture: &CommittedPublicationPosture,
+    requirements: &SubscriberServingRequirements,
+    now_unix_micros: i64,
+    now_epoch: u64,
+) -> SubscriberEligibilityDecision {
+    if !posture
+        .serving_state
+        .may_serve_now(now_unix_micros, now_epoch)
+        && !matches!(
+            posture.serving_state.disposition,
+            ActionServingDisposition::EvidencePending
+        )
+    {
+        return SubscriberEligibilityDecision::IneligibleServingState {
+            disposition: posture.serving_state.disposition,
+        };
+    }
+    if posture
+        .latest_trust_evaluation
+        .canonical_result_manifest_id()
+        != &posture.canonical_result_manifest_id
+    {
+        return SubscriberEligibilityDecision::IneligibleServingState {
+            disposition: ActionServingDisposition::Quarantined,
+        };
+    }
+    if isolation_rank(posture.enforced_isolation) < isolation_rank(requirements.required_isolation)
+    {
+        return SubscriberEligibilityDecision::IneligibleIsolationProfile {
+            enforced: posture.enforced_isolation,
+            required: requirements.required_isolation,
+        };
+    }
+    if requirements.require_redacted_diagnostics && !posture.diagnostics_redacted {
+        return SubscriberEligibilityDecision::IneligiblePrivacyPosture {
+            reason: "unredacted-diagnostics-refused-by-subscriber",
+        };
+    }
+    if requirements.required_privacy_scope != posture.privacy_scope {
+        return SubscriberEligibilityDecision::IneligiblePrivacyPosture {
+            reason: "privacy-scope-mismatch",
+        };
+    }
+
+    let current_tier = posture.latest_trust_evaluation.evaluated_tier();
+    if current_tier < requirements.minimum_tier
+        || !verification_meets(
+            posture.observed_verification,
+            requirements.minimum_verification,
+        )
+        || matches!(
+            posture.serving_state.disposition,
+            ActionServingDisposition::EvidencePending
+        )
+    {
+        return SubscriberEligibilityDecision::IneligibleNeedsVerificationAttempt {
+            current_tier,
+            required_tier: requirements.minimum_tier,
+            current_verification: posture.observed_verification,
+            required_verification: requirements.minimum_verification,
+        };
+    }
+
+    SubscriberEligibilityDecision::Eligible {
+        satisfied_tier: current_tier,
+        evaluation_causal_sequence: posture.latest_trust_evaluation.evaluated_causal_sequence(),
+    }
 }
 
 #[cfg(test)]
@@ -2175,5 +2709,295 @@ mod tests {
             approval.verified_claim().authenticator.bytes,
             vec![0xa5; 64]
         );
+    }
+
+    #[test]
+    fn s012_project_release_eligibility_policy_requires_prerequisite_tier_and_explicit_non_claim() {
+        const TRUST_DOC: &str = include_str!("../../docs/rabs-trust-model-v1.md");
+        assert!(
+            TRUST_DOC.contains(NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS),
+            "docs/rabs-trust-model-v1.md must document NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS"
+        );
+
+        let manifest = object(41);
+        let ev_set = evidence_set(42);
+        let action = action_key(43);
+
+        // Ordinary observed-evidence constructor cannot mint ProjectReleaseEligible directly.
+        assert_eq!(
+            ActionTrustEvaluationRecord::from_observed_evidence(
+                manifest.clone(),
+                ev_set.clone(),
+                TrustEvidenceTier::ProjectReleaseEligible,
+                10,
+            ),
+            Err(TrustEvaluationConstructionRefusal::PolicyApprovalRequired)
+        );
+
+        let policy = ProjectReleaseEligibilityPolicy {
+            schema_version: PROJECT_RELEASE_POLICY_SCHEMA_VERSION,
+            project_id: "rch-release-lane".into(),
+            policy_version: 2,
+            revoked: false,
+            minimum_prerequisite_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+            minimum_verification: VerificationLevel::CrossWorkerConsensus {
+                distinct_workers: 2,
+            },
+        };
+
+        let cross_worker_prereq = ActionTrustEvaluationRecord::from_observed_evidence(
+            manifest.clone(),
+            ev_set.clone(),
+            TrustEvidenceTier::ReproducibleCrossWorker,
+            20,
+        )
+        .unwrap();
+
+        let valid_input = ProjectReleaseEligibilityInput {
+            project_id: "rch-release-lane".into(),
+            action_key: action.clone(),
+            canonical_result_manifest_id: manifest.clone(),
+            evidence_set_digest: ev_set.clone(),
+            prerequisite_evaluation: cross_worker_prereq,
+            observed_verification: VerificationLevel::CrossWorkerConsensus {
+                distinct_workers: 2,
+            },
+            coordinator_causal_sequence: 21,
+            receipt_non_claims: vec![NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS],
+        };
+
+        let approval = evaluate_project_release_eligibility(&policy, &valid_input).unwrap();
+        assert_eq!(
+            approval.evaluation.evaluated_tier(),
+            TrustEvidenceTier::ProjectReleaseEligible
+        );
+        assert_eq!(approval.evaluation.evaluated_causal_sequence(), 21);
+        assert!(
+            approval
+                .non_claims
+                .contains(&NO_CLAIM_CACHE_EQUIVALENCE_PROVES_APPLICATION_CORRECTNESS)
+        );
+
+        // Omitting the application-correctness non-claim is refused.
+        let mut missing_non_claim = valid_input.clone();
+        missing_non_claim.receipt_non_claims.clear();
+        assert_eq!(
+            evaluate_project_release_eligibility(&policy, &missing_non_claim),
+            Err(ProjectReleaseRefusal::MissingApplicationCorrectnessNonClaim)
+        );
+
+        // Prerequisite tier below policy floor is refused.
+        let mut weak_prereq = valid_input;
+        weak_prereq.prerequisite_evaluation = ActionTrustEvaluationRecord::from_observed_evidence(
+            manifest,
+            ev_set,
+            TrustEvidenceTier::ShadowMatched,
+            20,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_project_release_eligibility(&policy, &weak_prereq),
+            Err(ProjectReleaseRefusal::InsufficientPrerequisiteTier {
+                required: TrustEvidenceTier::ReproducibleCrossWorker,
+                presented: TrustEvidenceTier::ShadowMatched,
+            })
+        );
+    }
+
+    #[test]
+    fn s018_compromised_worker_caught_by_cross_worker_or_stock_verification_and_revoked() {
+        let honest_digest = digest(0x70);
+        let malicious_digest = digest(0x99);
+
+        let wkr_a = WorkerAttemptObservation {
+            worker_peer_id: PeerId("wkr-honest-a".into()),
+            authenticated: true,
+            observable_output_digest: honest_digest.clone(),
+        };
+        let wkr_b_honest = WorkerAttemptObservation {
+            worker_peer_id: PeerId("wkr-honest-b".into()),
+            authenticated: true,
+            observable_output_digest: honest_digest.clone(),
+        };
+        let wkr_malicious = WorkerAttemptObservation {
+            worker_peer_id: PeerId("wkr-compromised-c".into()),
+            authenticated: true,
+            observable_output_digest: malicious_digest,
+        };
+
+        // 1. A single cryptographically authenticated worker is still a semantic trust principal (R79):
+        // its uncorroborated digest is insufficient for release verification.
+        assert_eq!(
+            evaluate_release_verification_and_compromise(
+                ReleaseVerificationPolicy::TwoOrMoreIndependentWorkers {
+                    minimum_distinct_workers: 2,
+                },
+                std::slice::from_ref(&wkr_a),
+                None,
+                false,
+            ),
+            CompromisedWorkerVerdict::InsufficientReleaseVerification {
+                observed_verification: VerificationLevel::CoordinatorDigestRecompute,
+                distinct_authenticated_workers: 1,
+            }
+        );
+
+        // 2. Two independent honest workers satisfy TwoOrMoreIndependentWorkers.
+        assert_eq!(
+            evaluate_release_verification_and_compromise(
+                ReleaseVerificationPolicy::TwoOrMoreIndependentWorkers {
+                    minimum_distinct_workers: 2,
+                },
+                &[wkr_a.clone(), wkr_b_honest],
+                None,
+                false,
+            ),
+            CompromisedWorkerVerdict::VerifiedReleaseEligible {
+                verification_level: VerificationLevel::CrossWorkerConsensus {
+                    distinct_workers: 2,
+                },
+                distinct_authenticated_workers: 2,
+            }
+        );
+
+        // 3. Stock differential execution catches a compromised worker and revokes its publication eligibility.
+        assert_eq!(
+            evaluate_release_verification_and_compromise(
+                ReleaseVerificationPolicy::StockDifferentialExecution,
+                &[wkr_a.clone(), wkr_malicious.clone()],
+                Some(&honest_digest),
+                false,
+            ),
+            CompromisedWorkerVerdict::MaliciousOrDivergentWorkerDetected {
+                revoked_workers: vec![PeerId("wkr-compromised-c".into())],
+                publication_eligibility_revoked: true,
+                action_quarantined: true,
+                reason: "r79-semantic-divergence-detected-publication-eligibility-revoked",
+            }
+        );
+
+        // 4. Cross-worker divergence without a stock anchor revokes both contending workers until audited.
+        assert_eq!(
+            evaluate_release_verification_and_compromise(
+                ReleaseVerificationPolicy::AnyHighTrustReleaseProof,
+                &[wkr_a, wkr_malicious],
+                None,
+                false,
+            ),
+            CompromisedWorkerVerdict::MaliciousOrDivergentWorkerDetected {
+                revoked_workers: vec![
+                    PeerId("wkr-compromised-c".into()),
+                    PeerId("wkr-honest-a".into()),
+                ],
+                publication_eligibility_revoked: true,
+                action_quarantined: true,
+                reason: "r79-semantic-divergence-detected-publication-eligibility-revoked",
+            }
+        );
+    }
+
+    #[test]
+    fn s021_per_subscriber_requirements_and_versioned_trust_reevaluation() {
+        let action = action_key(80);
+        let manifest = object(81);
+        let ev_v1 = evidence_set(82);
+        let ev_v2 = evidence_set(83);
+
+        let eval_v1 = ActionTrustEvaluationRecord::from_observed_evidence(
+            manifest.clone(),
+            ev_v1,
+            TrustEvidenceTier::ShadowMatched,
+            100,
+        )
+        .unwrap();
+
+        let mut posture = CommittedPublicationPosture {
+            action_key: action,
+            canonical_result_manifest_id: manifest.clone(),
+            serving_state: ActionServingStateRecord {
+                publication_record_id: manifest.clone(),
+                disposition: ActionServingDisposition::Eligible,
+                blocking_quarantine_ids: Vec::new(),
+                state_revision: 1,
+                coordinator_authority_digest: digest(1),
+                validity: ServingValidity {
+                    evaluated_at_unix_micros: 1_000,
+                    maximum_age_micros: None,
+                    clock_uncertainty_micros: 0,
+                    coordinator_clock_epoch: 1,
+                },
+            },
+            latest_trust_evaluation: eval_v1,
+            observed_verification: VerificationLevel::IndependentReplay,
+            enforced_isolation: IsolationProfile::StrictHermeticLinux,
+            privacy_scope: Some("team-core".into()),
+            diagnostics_redacted: true,
+        };
+
+        let dev_subscriber = SubscriberServingRequirements {
+            subscriber_id: PeerId("sub-dev-1".into()),
+            minimum_tier: TrustEvidenceTier::ShadowMatched,
+            minimum_verification: VerificationLevel::IndependentReplay,
+            required_isolation: IsolationProfile::StrictHermeticLinux,
+            required_privacy_scope: Some("team-core".into()),
+            require_redacted_diagnostics: true,
+        };
+        let release_subscriber = SubscriberServingRequirements {
+            subscriber_id: PeerId("sub-release-2".into()),
+            minimum_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+            minimum_verification: VerificationLevel::CrossWorkerConsensus {
+                distinct_workers: 2,
+            },
+            required_isolation: IsolationProfile::StrictHermeticLinux,
+            required_privacy_scope: Some("team-core".into()),
+            require_redacted_diagnostics: true,
+        };
+
+        // 1. Committed result is immediately eligible for dev_subscriber, but ineligible
+        // for release_subscriber (needs verification attempt).
+        assert_eq!(
+            evaluate_subscriber_serving_eligibility(&posture, &dev_subscriber, 2_000, 1),
+            SubscriberEligibilityDecision::Eligible {
+                satisfied_tier: TrustEvidenceTier::ShadowMatched,
+                evaluation_causal_sequence: 100,
+            }
+        );
+        assert_eq!(
+            evaluate_subscriber_serving_eligibility(&posture, &release_subscriber, 2_000, 1),
+            SubscriberEligibilityDecision::IneligibleNeedsVerificationAttempt {
+                current_tier: TrustEvidenceTier::ShadowMatched,
+                required_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+                current_verification: VerificationLevel::IndependentReplay,
+                required_verification: VerificationLevel::CrossWorkerConsensus {
+                    distinct_workers: 2,
+                },
+            }
+        );
+
+        // 2. Coordinator runs a verification attempt on a second worker, appends evidence,
+        // and emits a new versioned ActionTrustEvaluationRecord (seq 105) without mutating
+        // canonical_result_manifest_id (I42).
+        let eval_v2 = ActionTrustEvaluationRecord::from_observed_evidence(
+            manifest.clone(),
+            ev_v2,
+            TrustEvidenceTier::ReproducibleCrossWorker,
+            105,
+        )
+        .unwrap();
+        posture.latest_trust_evaluation = eval_v2;
+        posture.observed_verification = VerificationLevel::CrossWorkerConsensus {
+            distinct_workers: 2,
+        };
+        posture.serving_state.state_revision = 2;
+
+        // Re-evaluating release_subscriber now succeeds against the new evaluation record!
+        assert_eq!(
+            evaluate_subscriber_serving_eligibility(&posture, &release_subscriber, 2_000, 1),
+            SubscriberEligibilityDecision::Eligible {
+                satisfied_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+                evaluation_causal_sequence: 105,
+            }
+        );
+        assert_eq!(posture.canonical_result_manifest_id, manifest);
     }
 }

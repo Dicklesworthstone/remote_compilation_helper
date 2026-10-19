@@ -20,6 +20,7 @@
 
 use crate::authority_matrix::IsolationProfile;
 use crate::descriptor::ActionClass;
+use crate::result_identity::TypedDigest;
 use crate::serving::TrustEvidenceTier;
 
 /// Network posture for a class.
@@ -192,9 +193,273 @@ pub fn policy_for(class: ActionClass) -> &'static ActionClassPolicy {
         .expect("registry totality is test-enforced")
 }
 
+/// Domain separator for signing-identity digests (bead S016; risk R74).
+pub const SIGNING_IDENTITY_DIGEST_DOMAIN: &str = "rabs.signing-identity.sha256.v1";
+/// Domain separator for captured reproducible signing/notarization/TSA responses (bead S016; risk R74).
+pub const CAPTURED_RELEASE_RESPONSE_DOMAIN: &str = "rabs.release-response.sha256.v1";
+
+/// Separate credentialed release/signing step kinds (bead S016; risk R74).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseCredentialStepKind {
+    /// Cryptographic code signing with a credentialed signing identity.
+    CodeSigning,
+    /// Apple notarization service submission/stapling.
+    AppleNotarization,
+    /// Registry/package publication (e.g. crates.io, OCI, apt/rpm repo).
+    PackagePublication,
+    /// External RFC 3161 / timestamp-authority signing call.
+    TimestampAuthorityCall,
+}
+
+/// Signing posture of an action step (bead S016; risk R74).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningActionPosture {
+    /// Ordinary compilation/link intermediate with no signing credentials.
+    UnsignedIntermediate {
+        /// Underlying compilation/link action class.
+        class: ActionClass,
+        /// Whether any private signing key material was attached to the request.
+        carries_private_signing_key: bool,
+    },
+    /// Unsigned/ad-hoc intermediate (such as Darwin `codesign -s -`), cacheable
+    /// in the shared cache when policy permits and no private key is present.
+    AdHocIntermediate {
+        /// Underlying compilation/link action class.
+        class: ActionClass,
+        /// Canonical ad-hoc identifier entering the action key.
+        ad_hoc_identifier: String,
+        /// Whether any private signing key material was attached to the request.
+        carries_private_signing_key: bool,
+    },
+    /// Credentialed signing, notarization, publication, or timestamp-authority action.
+    CredentialedReleaseStep {
+        /// Specific credentialed step kind.
+        kind: ReleaseCredentialStepKind,
+        /// Digest of the exact signing/release credential identity.
+        signing_identity_digest: TypedDigest,
+        /// Optional digest of a captured deterministic response/ticket/timestamp token.
+        captured_response_digest: Option<TypedDigest>,
+        /// Whether the signature/output is deterministic given the identity + captured response.
+        reproducible_signature: bool,
+        /// Whether raw private signing key material is injected into the worker environment.
+        injects_raw_private_key_into_worker: bool,
+    },
+}
+
+/// Worker role with respect to signing/release credentials (bead S016; risk R74).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCredentialRole {
+    /// Ordinary compiler/linker worker in the shared build fleet.
+    OrdinaryCompilerWorker,
+    /// Dedicated isolated signing/release worker authorized for specific signing identities.
+    DedicatedSigningWorker {
+        /// Signing identity digests this isolated release worker may exercise.
+        authorized_signing_identities: Vec<TypedDigest>,
+    },
+}
+
+/// Cache namespace scope for an action's outputs (bead S016; risk R74).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheNamespaceScope {
+    /// Shared compilation/link cache namespace across the fleet.
+    SharedCompilationCache,
+    /// Namespace scoped strictly to one exact signing identity and captured response.
+    SigningIdentityScopedCache {
+        /// Exact signing identity scoping the namespace.
+        signing_identity_digest: TypedDigest,
+    },
+    /// Noncacheable side-effecting release step (never enters any result cache).
+    NonCacheableReleaseStep,
+}
+
+/// Admitted execution and caching disposition under S016 signing separation (risk R74).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningActionDecision {
+    /// Unsigned or policy-admitted ad-hoc intermediate cached in the shared compilation namespace.
+    SharedIntermediateCacheable {
+        /// Underlying compilation/link class.
+        class: ActionClass,
+        /// Optional ad-hoc identifier mixed into the action key.
+        keyed_ad_hoc_identifier: Option<String>,
+    },
+    /// Reproducible credentialed signature cached ONLY in the signing-identity-scoped namespace,
+    /// keyed by exact signing identity + captured response digest.
+    IdentityScopedCredentialCacheable {
+        /// Credentialed step kind.
+        kind: ReleaseCredentialStepKind,
+        /// Exact signing identity digest.
+        signing_identity_digest: TypedDigest,
+        /// Captured response digest bound into the key.
+        captured_response_digest: TypedDigest,
+    },
+    /// Noncacheable side-effecting release step (e.g., package publication, live notarization/TSA
+    /// without reproducible captured response).
+    NonCacheableSideEffectingReleaseStep {
+        /// Credentialed step kind.
+        kind: ReleaseCredentialStepKind,
+        /// Reason the step is noncacheable.
+        reason: &'static str,
+    },
+}
+
+/// Typed refusal when signing/notarization/publication separation is violated (bead S016; risk R74).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningSeparationRefusal {
+    /// Private signing key material was presented to an ordinary compiler worker or intermediate compile/link.
+    PrivateSigningKeyInOrdinaryCompileOrWorker,
+    /// A credentialed signing/notarization/publication/TSA step was routed to an ordinary compiler worker.
+    CredentialedStepOnOrdinaryWorker,
+    /// A credentialed release step attempted to read/write the shared compilation cache namespace.
+    CredentialedStepInSharedCacheNamespace,
+    /// Ad-hoc intermediate caching was requested when disabled by project policy, or with an empty identifier.
+    AdHocIntermediateNotPermitted,
+    /// Malformed signing-identity or captured-response digest domain.
+    MalformedSigningOrResponseDigestDomain,
+    /// Dedicated signing worker is not authorized for the requested signing identity.
+    SigningIdentityNotAuthorizedOnWorker,
+    /// Scoped cache namespace identity does not match the step's signing identity.
+    CacheNamespaceIdentityMismatch,
+}
+
+/// Enforce S016 separation of signing/notarization/publication credentials and effects
+/// from ordinary compilation/link caching (risk R74).
+///
+/// # Errors
+/// Returns [`SigningSeparationRefusal`] if private keys enter ordinary workers or shared
+/// compilation caches, or if credentialed steps violate identity/namespace scoping.
+pub fn evaluate_signing_action_separation(
+    posture: &SigningActionPosture,
+    worker_role: &WorkerCredentialRole,
+    requested_namespace: &CacheNamespaceScope,
+    allow_ad_hoc_intermediate_caching: bool,
+) -> Result<SigningActionDecision, SigningSeparationRefusal> {
+    match posture {
+        SigningActionPosture::UnsignedIntermediate {
+            class,
+            carries_private_signing_key,
+        } => {
+            if *carries_private_signing_key {
+                return Err(SigningSeparationRefusal::PrivateSigningKeyInOrdinaryCompileOrWorker);
+            }
+            if !matches!(
+                requested_namespace,
+                CacheNamespaceScope::SharedCompilationCache
+            ) {
+                return Err(SigningSeparationRefusal::CacheNamespaceIdentityMismatch);
+            }
+            Ok(SigningActionDecision::SharedIntermediateCacheable {
+                class: *class,
+                keyed_ad_hoc_identifier: None,
+            })
+        }
+        SigningActionPosture::AdHocIntermediate {
+            class,
+            ad_hoc_identifier,
+            carries_private_signing_key,
+        } => {
+            if *carries_private_signing_key {
+                return Err(SigningSeparationRefusal::PrivateSigningKeyInOrdinaryCompileOrWorker);
+            }
+            if !allow_ad_hoc_intermediate_caching || ad_hoc_identifier.trim().is_empty() {
+                return Err(SigningSeparationRefusal::AdHocIntermediateNotPermitted);
+            }
+            if !matches!(
+                requested_namespace,
+                CacheNamespaceScope::SharedCompilationCache
+            ) {
+                return Err(SigningSeparationRefusal::CacheNamespaceIdentityMismatch);
+            }
+            Ok(SigningActionDecision::SharedIntermediateCacheable {
+                class: *class,
+                keyed_ad_hoc_identifier: Some(ad_hoc_identifier.clone()),
+            })
+        }
+        SigningActionPosture::CredentialedReleaseStep {
+            kind,
+            signing_identity_digest,
+            captured_response_digest,
+            reproducible_signature,
+            injects_raw_private_key_into_worker,
+        } => {
+            if *injects_raw_private_key_into_worker {
+                return Err(SigningSeparationRefusal::PrivateSigningKeyInOrdinaryCompileOrWorker);
+            }
+            if signing_identity_digest.domain != SIGNING_IDENTITY_DIGEST_DOMAIN {
+                return Err(SigningSeparationRefusal::MalformedSigningOrResponseDigestDomain);
+            }
+            if let Some(resp) = captured_response_digest
+                && resp.domain != CAPTURED_RELEASE_RESPONSE_DOMAIN
+            {
+                return Err(SigningSeparationRefusal::MalformedSigningOrResponseDigestDomain);
+            }
+            let WorkerCredentialRole::DedicatedSigningWorker {
+                authorized_signing_identities,
+            } = worker_role
+            else {
+                return Err(SigningSeparationRefusal::CredentialedStepOnOrdinaryWorker);
+            };
+            if !authorized_signing_identities.contains(signing_identity_digest) {
+                return Err(SigningSeparationRefusal::SigningIdentityNotAuthorizedOnWorker);
+            }
+            if matches!(
+                requested_namespace,
+                CacheNamespaceScope::SharedCompilationCache
+            ) {
+                return Err(SigningSeparationRefusal::CredentialedStepInSharedCacheNamespace);
+            }
+
+            // Package publication is always an external side-effecting release step.
+            if matches!(kind, ReleaseCredentialStepKind::PackagePublication) {
+                return Ok(
+                    SigningActionDecision::NonCacheableSideEffectingReleaseStep {
+                        kind: *kind,
+                        reason: "package-publication-is-external-side-effect",
+                    },
+                );
+            }
+
+            // Credentialed signatures/notarization/TSA calls are cacheable ONLY when reproducible
+            // AND paired with a captured response digest inside an identity-scoped namespace.
+            if *reproducible_signature && let Some(captured) = captured_response_digest {
+                match requested_namespace {
+                    CacheNamespaceScope::SigningIdentityScopedCache {
+                        signing_identity_digest: ns_identity,
+                    } => {
+                        if ns_identity != signing_identity_digest {
+                            return Err(SigningSeparationRefusal::CacheNamespaceIdentityMismatch);
+                        }
+                        Ok(SigningActionDecision::IdentityScopedCredentialCacheable {
+                            kind: *kind,
+                            signing_identity_digest: signing_identity_digest.clone(),
+                            captured_response_digest: captured.clone(),
+                        })
+                    }
+                    CacheNamespaceScope::NonCacheableReleaseStep => Ok(
+                        SigningActionDecision::NonCacheableSideEffectingReleaseStep {
+                            kind: *kind,
+                            reason: "operator-requested-noncacheable-release-step",
+                        },
+                    ),
+                    CacheNamespaceScope::SharedCompilationCache => {
+                        Err(SigningSeparationRefusal::CredentialedStepInSharedCacheNamespace)
+                    }
+                }
+            } else {
+                Ok(
+                    SigningActionDecision::NonCacheableSideEffectingReleaseStep {
+                        kind: *kind,
+                        reason: "nonreproducible-or-uncaptured-external-authority-response",
+                    },
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::result_identity::DigestAlgorithm;
 
     const ALL_CLASSES: [ActionClass; 21] = [
         ActionClass::CargoWholeCommandBounded,
@@ -300,6 +565,191 @@ mod tests {
                     policy.class
                 );
             }
+        }
+    }
+
+    #[test]
+    fn s016_signing_notarization_publication_separation_fixtures() {
+        let signing_id = TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: SIGNING_IDENTITY_DIGEST_DOMAIN,
+            bytes: [0x11; 32],
+        };
+        let other_signing_id = TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: SIGNING_IDENTITY_DIGEST_DOMAIN,
+            bytes: [0x22; 32],
+        };
+        let captured_response = TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: CAPTURED_RELEASE_RESPONSE_DOMAIN,
+            bytes: [0x33; 32],
+        };
+        let dedicated_worker = WorkerCredentialRole::DedicatedSigningWorker {
+            authorized_signing_identities: vec![signing_id.clone()],
+        };
+
+        // 1. Unsigned intermediate link action caches normally in SharedCompilationCache.
+        let unsigned_link = SigningActionPosture::UnsignedIntermediate {
+            class: ActionClass::Link,
+            carries_private_signing_key: false,
+        };
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &unsigned_link,
+                &WorkerCredentialRole::OrdinaryCompilerWorker,
+                &CacheNamespaceScope::SharedCompilationCache,
+                true,
+            ),
+            Ok(SigningActionDecision::SharedIntermediateCacheable {
+                class: ActionClass::Link,
+                keyed_ad_hoc_identifier: None,
+            })
+        );
+
+        // 2. Ad-hoc signed intermediate caches when policy allows, and refuses when disabled.
+        let ad_hoc_link = SigningActionPosture::AdHocIntermediate {
+            class: ActionClass::Link,
+            ad_hoc_identifier: "com.example.rch.dev-adhoc".into(),
+            carries_private_signing_key: false,
+        };
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &ad_hoc_link,
+                &WorkerCredentialRole::OrdinaryCompilerWorker,
+                &CacheNamespaceScope::SharedCompilationCache,
+                true,
+            ),
+            Ok(SigningActionDecision::SharedIntermediateCacheable {
+                class: ActionClass::Link,
+                keyed_ad_hoc_identifier: Some("com.example.rch.dev-adhoc".into()),
+            })
+        );
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &ad_hoc_link,
+                &WorkerCredentialRole::OrdinaryCompilerWorker,
+                &CacheNamespaceScope::SharedCompilationCache,
+                false,
+            ),
+            Err(SigningSeparationRefusal::AdHocIntermediateNotPermitted)
+        );
+
+        // 3. Private signing keys NEVER enter ordinary compiler workers or ordinary compile/link steps.
+        let poisoned_link = SigningActionPosture::UnsignedIntermediate {
+            class: ActionClass::Link,
+            carries_private_signing_key: true,
+        };
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &poisoned_link,
+                &WorkerCredentialRole::OrdinaryCompilerWorker,
+                &CacheNamespaceScope::SharedCompilationCache,
+                true,
+            ),
+            Err(SigningSeparationRefusal::PrivateSigningKeyInOrdinaryCompileOrWorker)
+        );
+
+        // 4. Reproducible credentialed code signing is refused on ordinary compiler workers
+        // and refused in SharedCompilationCache, but admitted on a dedicated signing worker
+        // in SigningIdentityScopedCache keyed to exact signing identity + captured response.
+        let code_signing = SigningActionPosture::CredentialedReleaseStep {
+            kind: ReleaseCredentialStepKind::CodeSigning,
+            signing_identity_digest: signing_id.clone(),
+            captured_response_digest: Some(captured_response.clone()),
+            reproducible_signature: true,
+            injects_raw_private_key_into_worker: false,
+        };
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &code_signing,
+                &WorkerCredentialRole::OrdinaryCompilerWorker,
+                &CacheNamespaceScope::SigningIdentityScopedCache {
+                    signing_identity_digest: signing_id.clone(),
+                },
+                true,
+            ),
+            Err(SigningSeparationRefusal::CredentialedStepOnOrdinaryWorker)
+        );
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &code_signing,
+                &dedicated_worker,
+                &CacheNamespaceScope::SharedCompilationCache,
+                true,
+            ),
+            Err(SigningSeparationRefusal::CredentialedStepInSharedCacheNamespace)
+        );
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &code_signing,
+                &dedicated_worker,
+                &CacheNamespaceScope::SigningIdentityScopedCache {
+                    signing_identity_digest: other_signing_id,
+                },
+                true,
+            ),
+            Err(SigningSeparationRefusal::CacheNamespaceIdentityMismatch)
+        );
+        assert_eq!(
+            evaluate_signing_action_separation(
+                &code_signing,
+                &dedicated_worker,
+                &CacheNamespaceScope::SigningIdentityScopedCache {
+                    signing_identity_digest: signing_id.clone(),
+                },
+                true,
+            ),
+            Ok(SigningActionDecision::IdentityScopedCredentialCacheable {
+                kind: ReleaseCredentialStepKind::CodeSigning,
+                signing_identity_digest: signing_id.clone(),
+                captured_response_digest: captured_response.clone(),
+            })
+        );
+
+        // 5. Apple notarization without captured ticket, TSA call without captured response,
+        // and package publication classify as NonCacheableSideEffectingReleaseStep.
+        for (kind, captured, reproducible, expected_reason) in [
+            (
+                ReleaseCredentialStepKind::AppleNotarization,
+                None,
+                false,
+                "nonreproducible-or-uncaptured-external-authority-response",
+            ),
+            (
+                ReleaseCredentialStepKind::TimestampAuthorityCall,
+                None,
+                false,
+                "nonreproducible-or-uncaptured-external-authority-response",
+            ),
+            (
+                ReleaseCredentialStepKind::PackagePublication,
+                Some(captured_response),
+                true,
+                "package-publication-is-external-side-effect",
+            ),
+        ] {
+            let step = SigningActionPosture::CredentialedReleaseStep {
+                kind,
+                signing_identity_digest: signing_id.clone(),
+                captured_response_digest: captured,
+                reproducible_signature: reproducible,
+                injects_raw_private_key_into_worker: false,
+            };
+            assert_eq!(
+                evaluate_signing_action_separation(
+                    &step,
+                    &dedicated_worker,
+                    &CacheNamespaceScope::NonCacheableReleaseStep,
+                    true,
+                ),
+                Ok(
+                    SigningActionDecision::NonCacheableSideEffectingReleaseStep {
+                        kind,
+                        reason: expected_reason,
+                    }
+                )
+            );
         }
     }
 }
