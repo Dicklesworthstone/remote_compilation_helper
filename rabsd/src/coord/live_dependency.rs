@@ -198,6 +198,26 @@ pub enum InstallResult {
     Fault(String),
 }
 
+/// Finish only after the synchronous materializer and output verification have
+/// returned. Dependency observations exclude this action's exact declared
+/// output names, so its own writes are permitted while changed input bytes or
+/// candidate membership must still prevent a successful compiler skip.
+fn finish_installation(
+    dependencies: &DependencyFacts,
+    transcript: Vec<u8>,
+    installed: Vec<KnownOutput>,
+) -> InstallResult {
+    if let Err(reason) = dependencies.verify_unchanged() {
+        return InstallResult::Fault(format!(
+            "dependency inputs changed during installation: {reason}"
+        ));
+    }
+    InstallResult::Served {
+        transcript,
+        installed,
+    }
+}
+
 impl PendingServe {
     /// The exact action key.
     #[must_use]
@@ -270,10 +290,11 @@ impl PendingServe {
                 {
                     return InstallResult::Fault(reason);
                 }
-                InstallResult::Served {
-                    transcript: render_placements(&self.canonical_transcript, plan),
+                finish_installation(
+                    &self.request.dependencies,
+                    render_placements(&self.canonical_transcript, plan),
                     installed,
-                }
+                )
             }
             Ok(other) => InstallResult::Declined(format!("{other:?}")),
             Err(error) => InstallResult::Fault(error.to_string()),
@@ -1231,6 +1252,194 @@ impl Drop for ExecutionAttempt {
 #[cfg(test)]
 mod installed_output_tests {
     use super::*;
+    use crate::edge::live_facts::LiveFacts;
+    use crate::janitor::store::{LiveCas, mount_and_reconcile};
+    use rabs_cas::materialization::{
+        MaterializationMode, PlannedActionOutput, materialize_action_outputs_prepared,
+    };
+    use rabs_key::live_dependency::{LiveRustcRequest, plan_dependency_action};
+
+    struct SharedDirectoryInstall {
+        _directory: tempfile::TempDir,
+        input: PathBuf,
+        dependencies: Arc<DependencyFacts>,
+        cas: LiveCas,
+        outputs: Vec<PlannedActionOutput>,
+    }
+
+    impl SharedDirectoryInstall {
+        fn new() -> Self {
+            let directory = crate::test_util::private_tempdir();
+            let cargo = directory.path().join("cargo");
+            let package = cargo.join("registry/src/install-index/consumer-1.0.0");
+            let out = directory.path().join("target/debug/deps");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::create_dir_all(&out).unwrap();
+            let input = out.join("libupstream.rmeta");
+            std::fs::write(&input, b"retained upstream metadata").unwrap();
+            // Old outputs already present are excluded by the plan, just as
+            // their replacements will be after verified materialization.
+            std::fs::write(out.join("libconsumer.rmeta"), b"previous output").unwrap();
+            let argv = vec![
+                "/toolchain/bin/rustc".into(),
+                package.join("lib.rs").to_str().unwrap().into(),
+                "--crate-name=consumer".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--error-format=json".into(),
+                format!("--out-dir={}", out.display()),
+                "-L".into(),
+                format!("dependency={}", out.display()),
+                "--extern".into(),
+                format!("upstream={}", input.display()),
+            ];
+            let env = vec![
+                ("CARGO_HOME".into(), cargo.to_str().unwrap().into()),
+                (
+                    "CARGO_MANIFEST_DIR".into(),
+                    package.to_str().unwrap().into(),
+                ),
+                ("CARGO_PKG_NAME".into(), "consumer".into()),
+            ];
+            let plan = plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package.to_str().unwrap(),
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let dependencies = LiveFacts::new().dependencies(&plan).unwrap();
+            assert_eq!(dependencies.directories[0].artifacts.len(), 1);
+            let cas = mount_and_reconcile(&directory.path().join("cas")).unwrap();
+            let outputs = plan
+                .outputs
+                .declarations
+                .iter()
+                .map(|declaration| {
+                    let bytes = if declaration.class == OutputClass::DepInfo {
+                        b"libconsumer.rmeta: lib.rs\n".as_slice()
+                    } else {
+                        b"verified replacement metadata".as_slice()
+                    };
+                    let object = object_id(bytes).unwrap();
+                    let mut store = cas.store().lock().unwrap();
+                    put_if_absent(
+                        cas.layout(),
+                        &mut *store,
+                        &object,
+                        &mut &bytes[..],
+                        PutLimits::default(),
+                        DurabilityPolicy::FULL,
+                    )
+                    .unwrap();
+                    PlannedActionOutput {
+                        role: output_role(declaration.class),
+                        virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
+                        object,
+                        destination: out.join(&declaration.virtual_path),
+                    }
+                })
+                .collect();
+            Self {
+                _directory: directory,
+                input,
+                dependencies,
+                cas,
+                outputs,
+            }
+        }
+
+        fn install(&self, during_tail: impl Fn()) -> InstallResult {
+            self.dependencies.verify_unchanged().unwrap();
+            let mut store = self.cas.store().lock().unwrap();
+            let receipt = materialize_action_outputs_prepared(
+                &mut *store,
+                &self.outputs,
+                MaterializationMode::PrivateCopy,
+                std::time::SystemTime::now(),
+                &|output, _| {
+                    if output.role == OutputRole::DepInfo {
+                        // The actual materializer has installed metadata and
+                        // is still preparing dep-info. Change inputs inside
+                        // this interval without timing-dependent threads.
+                        assert_eq!(
+                            std::fs::read(self.input.with_file_name("libconsumer.rmeta")).unwrap(),
+                            b"verified replacement metadata"
+                        );
+                        during_tail();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(receipt.installed.len(), 2);
+            drop(store);
+            let installed = self
+                .outputs
+                .iter()
+                .filter(|output| output.role != OutputRole::DepInfo)
+                .map(|output| known_installed_output(&output.destination, &output.object).unwrap())
+                .collect();
+            finish_installation(
+                &self.dependencies,
+                b"compiler transcript\n".to_vec(),
+                installed,
+            )
+        }
+    }
+
+    #[test]
+    fn materialized_owned_outputs_preserve_shared_dependency_installation() {
+        let fixture = SharedDirectoryInstall::new();
+        let InstallResult::Served {
+            transcript,
+            installed,
+        } = fixture.install(|| {})
+        else {
+            panic!("this action's own declared writes must remain servable");
+        };
+        assert_eq!(transcript, b"compiler transcript\n");
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            std::fs::read(&fixture.input).unwrap(),
+            b"retained upstream metadata"
+        );
+        assert_eq!(
+            std::fs::read(&installed[0].path).unwrap(),
+            b"verified replacement metadata"
+        );
+    }
+
+    #[test]
+    fn dependency_mutation_during_materialization_cannot_return_served() {
+        for change_existing in [true, false] {
+            let fixture = SharedDirectoryInstall::new();
+            let result = fixture.install(|| {
+                let path = if change_existing {
+                    fixture.input.clone()
+                } else {
+                    fixture.input.with_file_name("libnew_candidate.rmeta")
+                };
+                std::fs::write(path, b"dependency changed during installation").unwrap();
+            });
+            assert!(
+                matches!(result, InstallResult::Fault(ref reason)
+                    if reason.contains("dependency inputs changed during installation")),
+                "completed writes with changed inputs must fail, never decline as unwritten or serve: {result:?}"
+            );
+            // The copy completed; rejection means no transcript replay or
+            // known-output memo is returned under the stale dependency key.
+            assert!(
+                fixture
+                    .outputs
+                    .iter()
+                    .all(|output| output.destination.is_file())
+            );
+        }
+    }
 
     #[test]
     fn installed_output_digest_and_signature_describe_the_same_bytes() {

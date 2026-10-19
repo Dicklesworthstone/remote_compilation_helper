@@ -460,10 +460,7 @@ impl PendingRemote {
         // execution was accepted, on this bounded blocking lane. The observer
         // checks every byte digest and both inventory fences; the upload then
         // owns these bytes without reopening the caller's mutable target tree.
-        let dependency_artifacts = request
-            .dependencies
-            .retained_artifacts()
-            .map_err(settled)?;
+        let dependency_artifacts = request.dependencies.retained_artifacts().map_err(settled)?;
         let upload = SourceUpload::from_snapshot(
             Arc::clone(&request.package.snapshot),
             PACKAGE_ROOT,
@@ -710,8 +707,9 @@ fn original_loader_search_paths(plan: &DependencyActionPlan) -> Vec<PathBuf> {
 }
 
 fn verify_runtime(request: &LiveDependencyRequest, expected: &TypedDigest) -> Result<(), String> {
-    // Installation intentionally creates outputs in a dependency search root.
-    // Its pre-install inventory check must not be repeated after those writes.
+    // Runtime observation is separate from the dependency inventory. The
+    // installer's final inventory check excludes only this action's exact
+    // declared outputs and still detects changed inputs after those writes.
     request.verify_toolchain()?;
     let root = request.toolchain.sysroot();
     let loader = original_loader_search_paths(&request.plan);
@@ -837,10 +835,11 @@ impl PendingRemoteInstall {
                 if let Err(reason) = self.validation.verify(request) {
                     return InstallResult::Fault(reason);
                 }
-                InstallResult::Served {
-                    transcript: render_placements(&self.canonical_transcript, plan),
+                super::finish_installation(
+                    &request.dependencies,
+                    render_placements(&self.canonical_transcript, plan),
                     installed,
-                }
+                )
             }
             Ok(other) => InstallResult::Declined(format!("remote install: {other:?}")),
             Err(error) => InstallResult::Fault(format!("remote install: {error}")),
