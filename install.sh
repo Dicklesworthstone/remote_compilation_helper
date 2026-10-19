@@ -629,7 +629,7 @@ verify_worker_toolchain() {
 create_directories() {
     info "Creating directories..."
 
-    mkdir -p "$INSTALL_DIR"
+    mkdir -m 0755 -p "$INSTALL_DIR"
     mkdir -p "$CONFIG_DIR"
 
     local runtime_dir="${RUNTIME_DIR:-${RCH_RUNTIME_DIR:-${TMPDIR:-/tmp}/rch}}"

@@ -151,7 +151,7 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(self.bin.exists())
 
     def test_unmanaged_existing_binary_is_not_overwritten(self):
-        self.bin.mkdir()
+        self.bin.mkdir(mode=0o755)
         old = self.bin / "rabsd"
         old.write_bytes(b"existing operator installation")
         with self.assertRaisesRegex(installer.InstallError, "unmanaged entry"):
@@ -160,7 +160,7 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.bin / installer.VERSIONS).exists())
 
     def test_unmanaged_symlinks_are_not_retargeted(self):
-        self.bin.mkdir()
+        self.bin.mkdir(mode=0o755)
         for name, target in [("rabsd", "../other-rabsd"),
                              (installer.CURRENT, "../other-generation")]:
             with self.subTest(name=name):
@@ -252,7 +252,7 @@ class InstallTests(unittest.TestCase):
         member = tarfile.TarInfo("rch")
         member.size = 4
         path = self.archive(extra=(member, b"core"))
-        self.bin.mkdir()
+        self.bin.mkdir(mode=0o755)
         core = self.bin / "rch"
         core.write_bytes(b"existing core")
         args = ["--from-archive", str(path), "--bin-dir", str(self.bin)]
@@ -459,7 +459,7 @@ class MainInstallerTests(unittest.TestCase):
                 self.assertEqual((self.bin / installer.CURRENT).resolve(), before)
 
     def test_unmanaged_tool_is_preserved_and_separate_directory_is_supported(self):
-        self.bin.mkdir()
+        self.bin.mkdir(mode=0o755)
         previous = self.bin / "rabsd"
         previous.write_bytes(b"previous unmanaged daemon")
         archive = self.archive()
@@ -529,7 +529,7 @@ esac
                         if failing_package else ""))
         body = ("MODE=worker\nVERSION_EXPLICIT=false\nWITH_RABS="
                 + ("true" if with_rabs else "false")
-                + '\nmkdir -p "$INSTALL_DIR"\nbuild_from_source\n')
+                + '\nmkdir -m 0755 -p "$INSTALL_DIR"\nbuild_from_source\n')
         return self.shell(body, cwd=project), builds
 
     def test_source_opt_in_installs_from_both_profiles_with_the_launcher(self):
@@ -555,7 +555,7 @@ esac
         builds = self.root / "cloned-build-commands"
         self.command("cargo", "printf '%s\\n' \"$*\" >> " + shlex.quote(str(builds)) + "\n")
         result = self.shell('MODE=worker\nWITH_RABS=true\nREPO_URL="$1"\n'
-                            'mkdir -p "$INSTALL_DIR"\nclone_and_build_from_source\n',
+                            'mkdir -m 0755 -p "$INSTALL_DIR"\nclone_and_build_from_source\n',
                             [project.as_uri()])
         self.assert_success(result)
         self.assert_complete_generation()
