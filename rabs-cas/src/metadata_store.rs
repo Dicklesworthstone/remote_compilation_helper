@@ -9584,4 +9584,205 @@ mod tests {
             "failure publication must appear in action_publications with its result kind"
         );
     }
+
+    fn t042_authority_digest_mismatch_high_water_rollback_and_edge_handoff_overlap<E: SqlEngine>(
+        open: fn(&std::path::Path) -> Result<E, StoreError>,
+        tag: &str,
+    ) {
+        let path = fresh_path(tag);
+        let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+        let active_row = bound_authority_row();
+        store.acquire_authority(&active_row).unwrap();
+        let active = active_row.digest.clone();
+
+        // 1. R117: Action-generation authority-digest mismatch:
+        //    - Creating a bound generation whose `created_under_authority_digest` disagrees with
+        //      the active coordinator authority is rejected with `AttemptAuthorityMismatch`.
+        //    - Admitting an attempt lease whose `coordinator` authority disagrees with
+        //      `action_generation.created_under_authority_digest` is rejected with
+        //      `AttemptAuthorityMismatch`.
+        let action_key = digest("rabs.action-key.sha256.v1", 7);
+        store
+            .upsert_action_entry(&ActionEntryRow {
+                action_key: action_key.clone(),
+                key_epoch: 1,
+                projection_epoch: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("lease-worker", 3, 99), 10),
+            Ok(WorkerAdmission::AdmitNewGeneration)
+        );
+
+        let mismatched_gen = ActionGeneration {
+            generation_id: ActionGenerationId(10),
+            per_key_ordinal: 1,
+            created_under_authority_digest: digest("rabs.coordinator-authority.v1", 0xEE),
+        };
+        assert_eq!(
+            store.create_bound_generation(&active, &mismatched_gen, &action_key),
+            Err(StoreError::AttemptAuthorityMismatch)
+        );
+
+        let valid_attempt = bound_attempt_authority();
+        store
+            .create_bound_generation(&active, &valid_attempt.action_generation, &action_key)
+            .unwrap();
+        let mut disagreed_coord_attempt = valid_attempt.clone();
+        disagreed_coord_attempt.coordinator.term = 2;
+        assert_eq!(
+            store.admit_attempt_lease(&disagreed_coord_attempt, 11, 500),
+            Err(StoreError::NotActiveAuthority)
+        );
+        let mut disagreed_gen_digest_attempt = valid_attempt.clone();
+        disagreed_gen_digest_attempt
+            .action_generation
+            .created_under_authority_digest = digest("rabs.coordinator-authority.v1", 0xEE);
+        assert_eq!(
+            store.admit_attempt_lease(&disagreed_gen_digest_attempt, 11, 500),
+            Err(StoreError::AttemptAuthorityMismatch)
+        );
+        store.admit_attempt_lease(&valid_attempt, 12, 500).unwrap();
+
+        // 2. R88 / S020 / S024: Lexicographic peer high-water rollback & operator reset proof:
+        //    - Record (credential_generation=2, term=10, incarnation=500).
+        //    - Lower credential_generation (1, term=999) is rejected (`StalePeerAuthority`).
+        //    - Same credential_generation, lower term (2, term=9) is rejected (`StalePeerAuthority`).
+        //    - Same (2, 10) with different incarnation (501) is rejected (`StalePeerAuthority`).
+        //    - Higher credential_generation (3, term=1) opens a new term namespace and succeeds.
+        //    - Rolling back to (2, 50) or (3, 1, incarnation=777) without reset fails, and
+        //      recovering via `apply_operator_reset_to_peer` with a cluster-root-signed proof
+        //      succeeds once and rejects replayed reset generations.
+        store
+            .record_peer_authority_high_water(&active, "edge-peer-1", 2, 10, 500, 100)
+            .unwrap();
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "edge-peer-1", 1, 999, 500, 101),
+            Err(StoreError::StalePeerAuthority)
+        );
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "edge-peer-1", 2, 9, 500, 102),
+            Err(StoreError::StalePeerAuthority)
+        );
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "edge-peer-1", 2, 10, 501, 103),
+            Err(StoreError::StalePeerAuthority)
+        );
+        store
+            .record_peer_authority_high_water(&active, "edge-peer-1", 3, 1, 600, 104)
+            .unwrap();
+        assert_eq!(
+            store.peer_authority_high_water("edge-peer-1").unwrap(),
+            Some((3, 1, 104))
+        );
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "edge-peer-1", 2, 999, 600, 105),
+            Err(StoreError::StalePeerAuthority)
+        );
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "edge-peer-1", 3, 1, 777, 106),
+            Err(StoreError::StalePeerAuthority)
+        );
+
+        let root_key = digest("rabs.cluster-root-key.sha256.v1", 0x77);
+        let fenced_coord = CoordinatorAuthority {
+            cluster_id: ClusterId("cluster-a".to_owned()),
+            credential_generation: 3,
+            term: 1,
+            incarnation_id: CoordinatorIncarnationId(600),
+        };
+        let reset_coord = CoordinatorAuthority {
+            cluster_id: ClusterId("cluster-a".to_owned()),
+            credential_generation: 3,
+            term: 1,
+            incarnation_id: CoordinatorIncarnationId(777),
+        };
+        let signed_reset = rabs_key::authority_binding::ClusterRootSignedOperatorResetProof::sign(
+            &root_key,
+            rabs_protocol::authority::OperatorResetGeneration(1),
+            &fenced_coord,
+            reset_coord.clone(),
+        );
+        let hw = rabs_protocol::authority::PeerAuthorityHighWaterMark {
+            cluster_id: ClusterId("cluster-a".to_owned()),
+            credential_generation: 3,
+            highest_term_within_generation: 1,
+            last_incarnation_id: CoordinatorIncarnationId(600),
+            operator_reset_generation: rabs_protocol::authority::OperatorResetGeneration(0),
+        };
+        let verified_reset_gen = signed_reset
+            .verify(&root_key, &hw, &reset_coord)
+            .expect("cluster-root operator reset proof verifies");
+        store
+            .apply_operator_reset_to_peer(
+                &active,
+                "edge-peer-1",
+                verified_reset_gen.0,
+                reset_coord.credential_generation,
+                reset_coord.term,
+                reset_coord.incarnation_id.0,
+            )
+            .unwrap();
+        assert_eq!(
+            store.apply_operator_reset_to_peer(&active, "edge-peer-1", 1, 3, 2, 888),
+            Err(StoreError::StaleOperatorReset)
+        );
+
+        // 3. R118 / S024: Bounded predecessor-naming edge-handoff overlap:
+        //    - Fence edge at incarnation 50.
+        //    - Handoff naming wrong predecessor (49 != 50) -> `EdgeHandoffPredecessorMismatch`.
+        //    - Handoff with non-advancing incarnation (50 -> 50) -> `StaleEdgeIncarnation`.
+        //    - Begin handoff (active=51, predecessor=50) succeeds and is idempotent for (51, 50).
+        //    - Overlapping handoff beyond the admitted pair (active=52, predecessor=50 or 51)
+        //      is rejected with `EdgeHandoffActive`.
+        //    - Resolving handoff atomically advances `edge_incarnation_fences` to 51.
+        store.advance_edge_fence(&active, "edge-1", 50).unwrap();
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 51, 49, 200),
+            Err(StoreError::EdgeHandoffPredecessorMismatch)
+        );
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 50, 50, 200),
+            Err(StoreError::StaleEdgeIncarnation)
+        );
+        store
+            .begin_edge_handoff(&active, "edge-1", 51, 50, 200)
+            .unwrap();
+        store
+            .begin_edge_handoff(&active, "edge-1", 51, 50, 200)
+            .unwrap();
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 52, 50, 201),
+            Err(StoreError::EdgeHandoffActive)
+        );
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 52, 51, 201),
+            Err(StoreError::EdgeHandoffActive)
+        );
+        assert_eq!(
+            store.resolve_edge_handoff(&active, "edge-1", 52),
+            Err(StoreError::UnknownEdgeHandoff)
+        );
+        store.resolve_edge_handoff(&active, "edge-1", 51).unwrap();
+        assert_eq!(store.active_edge_handoff("edge-1").unwrap(), None);
+        assert_eq!(store.edge_fence("edge-1").unwrap(), Some(51));
+    }
+
+    #[test]
+    fn t042_authority_digest_mismatch_lexicographic_high_water_rollback_and_edge_handoff_overlap_reference()
+     {
+        t042_authority_digest_mismatch_high_water_rollback_and_edge_handoff_overlap(
+            RusqliteEngine::open,
+            "t042-ref",
+        );
+    }
+
+    #[test]
+    fn t042_authority_digest_mismatch_lexicographic_high_water_rollback_and_edge_handoff_overlap_frankensqlite()
+     {
+        t042_authority_digest_mismatch_high_water_rollback_and_edge_handoff_overlap(
+            FsqliteEngine::open,
+            "t042-fsq",
+        );
+    }
 }
