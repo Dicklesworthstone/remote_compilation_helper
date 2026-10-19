@@ -752,4 +752,206 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn l010_cmake_and_meson_launcher_integration_admits_proven_configs_and_bypasses_unsafe_configs()
+    {
+        let safe_cmake = NativeLauncherConfig {
+            system: NativeBuildSystemKind::CMake,
+            compiler_class: ActionClass::NativeCompileC,
+            compile_commands_canonicalized: true,
+            depfile_emission_verified: true,
+            uses_precompiled_headers_or_cxx20_modules: false,
+            uses_unity_or_jumbo_build: false,
+            mutates_source_tree_in_place: false,
+        };
+        let decision = evaluate_native_launcher_integration(&safe_cmake);
+        assert_eq!(
+            decision,
+            NativeLauncherDisposition::AdmittedFineGrainedLauncher {
+                system: NativeBuildSystemKind::CMake,
+                class: ActionClass::NativeCompileC,
+                launcher_env_var: "CMAKE_C_COMPILER_LAUNCHER",
+            }
+        );
+
+        let safe_meson_cxx = NativeLauncherConfig {
+            system: NativeBuildSystemKind::Meson,
+            compiler_class: ActionClass::NativeCompileCxx,
+            compile_commands_canonicalized: true,
+            depfile_emission_verified: true,
+            uses_precompiled_headers_or_cxx20_modules: false,
+            uses_unity_or_jumbo_build: false,
+            mutates_source_tree_in_place: false,
+        };
+        assert_eq!(
+            evaluate_native_launcher_integration(&safe_meson_cxx),
+            NativeLauncherDisposition::AdmittedFineGrainedLauncher {
+                system: NativeBuildSystemKind::Meson,
+                class: ActionClass::NativeCompileCxx,
+                launcher_env_var: "RABS_MESON_CXX_LAUNCHER",
+            }
+        );
+
+        // Unsafe configs must bypass fine-grained launcher caching and stay inside the parent action:
+        let mut pch_config = safe_cmake.clone();
+        pch_config.uses_precompiled_headers_or_cxx20_modules = true;
+        assert_eq!(
+            evaluate_native_launcher_integration(&pch_config),
+            NativeLauncherDisposition::BypassToParentActionUncached {
+                system: NativeBuildSystemKind::CMake,
+                reason: NativeLauncherBypassReason::PrecompiledHeadersOrCxxModules,
+            }
+        );
+
+        let mut unity_config = safe_meson_cxx.clone();
+        unity_config.uses_unity_or_jumbo_build = true;
+        assert_eq!(
+            evaluate_native_launcher_integration(&unity_config),
+            NativeLauncherDisposition::BypassToParentActionUncached {
+                system: NativeBuildSystemKind::Meson,
+                reason: NativeLauncherBypassReason::UnityOrJumboBuildEnabled,
+            }
+        );
+
+        let mut mutating_config = safe_cmake.clone();
+        mutating_config.mutates_source_tree_in_place = true;
+        assert_eq!(
+            evaluate_native_launcher_integration(&mutating_config),
+            NativeLauncherDisposition::BypassToParentActionUncached {
+                system: NativeBuildSystemKind::CMake,
+                reason: NativeLauncherBypassReason::InPlaceSourceTreeMutation,
+            }
+        );
+
+        let mut uncanonical_config = safe_cmake;
+        uncanonical_config.compile_commands_canonicalized = false;
+        assert_eq!(
+            evaluate_native_launcher_integration(&uncanonical_config),
+            NativeLauncherDisposition::BypassToParentActionUncached {
+                system: NativeBuildSystemKind::CMake,
+                reason: NativeLauncherBypassReason::MissingCanonicalIncludeOrDepfileProof,
+            }
+        );
+    }
+}
+
+/// Native build system driving subcompiles inside a build script or native target (bead L010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeBuildSystemKind {
+    /// CMake (`CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER`).
+    CMake,
+    /// Meson (`[binaries]` compiler wrapper / launcher).
+    Meson,
+}
+
+/// Why a CMake/Meson native build configuration bypasses fine-grained launcher caching
+/// and remains uncached within the parent action (bead L010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLauncherBypassReason {
+    /// Action class is not a C/C++ translation-unit compile (`NativeCompileC` / `NativeCompileCxx`).
+    UnsupportedActionClass,
+    /// Include paths, `-ffile-prefix-map`, or `-MD -MF` depfile emission are not proven canonical.
+    MissingCanonicalIncludeOrDepfileProof,
+    /// Precompiled headers (`.pch`/`.gch`) or C++20 modules (`.pcm`/BMI) carry cross-TU state.
+    PrecompiledHeadersOrCxxModules,
+    /// CMake `CMAKE_UNITY_BUILD` or Meson `unity=on` dynamically amalgamates sources.
+    UnityOrJumboBuildEnabled,
+    /// Custom target/command mutates the source tree in place rather than writing to the build dir.
+    InPlaceSourceTreeMutation,
+}
+
+/// Configuration and compatibility proof inputs for CMake/Meson launcher interception (bead L010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeLauncherConfig {
+    /// Build system (`CMake` or `Meson`).
+    pub system: NativeBuildSystemKind,
+    /// Target compilation class (`NativeCompileC` or `NativeCompileCxx`).
+    pub compiler_class: ActionClass,
+    /// Whether `compile_commands.json` / flags are proven free of non-canonical host paths.
+    pub compile_commands_canonicalized: bool,
+    /// Whether deterministic `-MD -MF` depfile emission is verified.
+    pub depfile_emission_verified: bool,
+    /// Whether PCH or C++20 module state is active.
+    pub uses_precompiled_headers_or_cxx20_modules: bool,
+    /// Whether Unity/Jumbo source amalgamation is active.
+    pub uses_unity_or_jumbo_build: bool,
+    /// Whether the build mutates the source tree in place.
+    pub mutates_source_tree_in_place: bool,
+}
+
+/// Decision for CMake/Meson compiler launcher integration (bead L010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLauncherDisposition {
+    /// Compatibility proof holds: enable fine-grained `rabs-wrap` compiler launcher interception.
+    AdmittedFineGrainedLauncher {
+        /// Build system.
+        system: NativeBuildSystemKind,
+        /// Admitted compilation class.
+        class: ActionClass,
+        /// Launcher variable injected into the build system environment.
+        launcher_env_var: &'static str,
+    },
+    /// Unsafe configuration: bypass fine-grained launcher caching and keep native compilation
+    /// uncached inside the parent `BuildScriptRun` / whole-command action.
+    BypassToParentActionUncached {
+        /// Build system.
+        system: NativeBuildSystemKind,
+        /// Exact bypass reason.
+        reason: NativeLauncherBypassReason,
+    },
+}
+
+/// Evaluate whether a CMake or Meson native build may use fine-grained `rabs-wrap`
+/// compiler launcher interception, or must bypass to uncached execution within the
+/// parent action (bead L010).
+#[must_use]
+pub const fn evaluate_native_launcher_integration(
+    config: &NativeLauncherConfig,
+) -> NativeLauncherDisposition {
+    let launcher_env_var = match (config.system, config.compiler_class) {
+        (NativeBuildSystemKind::CMake, ActionClass::NativeCompileC) => "CMAKE_C_COMPILER_LAUNCHER",
+        (NativeBuildSystemKind::CMake, ActionClass::NativeCompileCxx) => {
+            "CMAKE_CXX_COMPILER_LAUNCHER"
+        }
+        (NativeBuildSystemKind::Meson, ActionClass::NativeCompileC) => "RABS_MESON_CC_LAUNCHER",
+        (NativeBuildSystemKind::Meson, ActionClass::NativeCompileCxx) => "RABS_MESON_CXX_LAUNCHER",
+        _ => {
+            return NativeLauncherDisposition::BypassToParentActionUncached {
+                system: config.system,
+                reason: NativeLauncherBypassReason::UnsupportedActionClass,
+            };
+        }
+    };
+
+    if config.uses_precompiled_headers_or_cxx20_modules {
+        return NativeLauncherDisposition::BypassToParentActionUncached {
+            system: config.system,
+            reason: NativeLauncherBypassReason::PrecompiledHeadersOrCxxModules,
+        };
+    }
+    if config.uses_unity_or_jumbo_build {
+        return NativeLauncherDisposition::BypassToParentActionUncached {
+            system: config.system,
+            reason: NativeLauncherBypassReason::UnityOrJumboBuildEnabled,
+        };
+    }
+    if config.mutates_source_tree_in_place {
+        return NativeLauncherDisposition::BypassToParentActionUncached {
+            system: config.system,
+            reason: NativeLauncherBypassReason::InPlaceSourceTreeMutation,
+        };
+    }
+    if !config.compile_commands_canonicalized || !config.depfile_emission_verified {
+        return NativeLauncherDisposition::BypassToParentActionUncached {
+            system: config.system,
+            reason: NativeLauncherBypassReason::MissingCanonicalIncludeOrDepfileProof,
+        };
+    }
+
+    NativeLauncherDisposition::AdmittedFineGrainedLauncher {
+        system: config.system,
+        class: config.compiler_class,
+        launcher_env_var,
+    }
 }
