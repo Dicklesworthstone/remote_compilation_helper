@@ -30,7 +30,7 @@ mod produced_result_tests;
 
 use crate::coord::action_actor::{
     ActionActor, AttemptPurpose, JoinReceipt, JoinRequest, OpenGenerationReceipt, RegisterAttempt,
-    RegisterAttemptReceipt,
+    RegisterAttemptReceipt, SubscriptionRequirements,
 };
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::{BundleId, DestinationArbiter, reserve_scoped};
@@ -40,7 +40,9 @@ use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
 use rabs_cas::materialization::ActionMaterializeFailure;
-use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key};
+use rabs_cas::metadata_store::{
+    AuthorityRow, RabsMetadataStore, SqlValue, StoreError, TrustEvaluationRow, digest_key,
+};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
     OfferPreparedActionResult, OfferRefusal, PublicationOutcome, SEMANTIC_PROJECTION_DOMAIN,
@@ -51,6 +53,7 @@ use rabs_cas::serving_sample_gate::{
     class_safety_refusal, serving_sample_decision,
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
+use rabs_cas::trust_evidence::{DISPOSITION_SERVABLE, evidence_set_digest};
 use rabs_key::action_key::{action_input_manifest_digest, compute_action_key};
 use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
@@ -61,6 +64,7 @@ use rabs_protocol::dashboards::{
     evaluate_speculation_default_on_gate,
 };
 use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
+use rabs_protocol::durable_ids::BuildOperationId;
 use rabs_protocol::generation::{
     AttemptAuthority, AttemptId, ExecutionLeaseId, LeaseRenewal, LeaseRenewalSeq,
     WorkerIncarnationId,
@@ -69,7 +73,13 @@ use rabs_protocol::input_evidence::{ActionInputManifest, InputFileType};
 use rabs_protocol::release_authorization::{
     ReleaseAuthorization, ReleaseAuthorizationMode, authorization as release_standing,
 };
-use rabs_protocol::result_identity::{CanonicalActionResultManifest, DigestAlgorithm, TypedDigest};
+use rabs_protocol::result_identity::{
+    CanonicalActionResultManifest, DigestAlgorithm, ObjectId, TypedDigest,
+};
+use rabs_protocol::serving::{
+    CiCanonicalWriterClaim, CiCanonicalWriterPolicy, CiEvaluationContext, CiPolicyApproval,
+    CiPolicyRefusal, TrustEvidenceTier, evaluate_ci_canonical_writer_claim,
+};
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
@@ -1104,6 +1114,180 @@ impl EdgeSubscriber {
 /// speculation gate is evaluated (`rabsd::coord::live`).
 pub const SPECULATION_DEFAULT_ON_RECEIPT_KIND: &str = "speculation_default_on_gate";
 
+/// Durable `decision_receipts` kind written whenever a Q007 git/worktree
+/// prewarm event is handled (`rabsd::coord::live`).
+pub const GIT_PREWARM_RECEIPT_KIND: &str = "q007_git_prewarm_event";
+
+/// Durable `decision_receipts` kind written whenever a Q008 CI canonical
+/// prewarm publication is promoted (`rabsd::coord::live`).
+pub const CI_CANONICAL_PREWARM_RECEIPT_KIND: &str = "q008_ci_canonical_prewarm";
+
+/// Git / workspace lifecycle event triggering prewarm (bead Q007; plan §15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitPrewarmEventKind {
+    /// `git checkout <branch>` or `git switch`.
+    BranchCheckout,
+    /// `HEAD` moved within the active worktree.
+    HeadChange,
+    /// `git pull`, `git rebase`, or `git merge`.
+    PullRebaseMerge,
+    /// `git worktree add` created a new worktree.
+    WorktreeCreation,
+    /// `Cargo.lock` or package lockfile updated.
+    LockfileUpdate,
+    /// `rust-toolchain.toml` or compiler version changed.
+    ToolchainChange,
+    /// Commit pushed to CI canonical prewarm pipeline.
+    CiPush,
+}
+
+impl GitPrewarmEventKind {
+    /// Stable machine token for durable receipts and logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BranchCheckout => "branch-checkout",
+            Self::HeadChange => "head-change",
+            Self::PullRebaseMerge => "pull-rebase-merge",
+            Self::WorktreeCreation => "worktree-creation",
+            Self::LockfileUpdate => "lockfile-update",
+            Self::ToolchainChange => "toolchain-change",
+            Self::CiPush => "ci-push",
+        }
+    }
+}
+
+/// Outcome for one critical-path or test-subset action during a Q007 prewarm event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrewarmStageOutcome {
+    /// Action is already committed and servable in CAS (or warm from nearest ancestor / CI).
+    AlreadyWarm {
+        /// Semantic action key.
+        action_key: TypedDigest,
+    },
+    /// Action was queued in the coordinator under `SubscriberKind::GitPrewarm`.
+    QueuedPrewarm {
+        /// Semantic action key.
+        action_key: TypedDigest,
+        /// Whether this prewarm created a new `ActionActor` or joined an existing one.
+        actor_created: bool,
+    },
+    /// Prewarm stopped immediately due to foreground pressure or brownout.
+    StoppedUnderForegroundPressure {
+        /// Semantic action key skipped when foreground pressure interrupted prewarm.
+        action_key: TypedDigest,
+    },
+}
+
+/// Structured input event for Q007 git checkout/HEAD/worktree prewarm.
+#[derive(Debug)]
+pub struct GitPrewarmEvent {
+    /// Unique event identifier for durable receipt correlation.
+    pub event_id: String,
+    /// Triggering git / worktree lifecycle event kind.
+    pub kind: GitPrewarmEventKind,
+    /// Target `HEAD` commit OID being warmed.
+    pub head_commit_oid: String,
+    /// Candidate ancestor commit OIDs ordered nearest-first.
+    pub parent_commit_oids: Vec<String>,
+    /// Worktree identifier.
+    pub worktree_id: String,
+    /// Digest of the lockfile state.
+    pub lockfile_digest: TypedDigest,
+    /// Digest of the active toolchain state.
+    pub toolchain_digest: TypedDigest,
+    /// Dependency critical-path actions to prewarm first.
+    pub dependency_critical_path: Vec<ActionSubmission>,
+    /// Workspace critical-path actions to prewarm second.
+    pub workspace_critical_path: Vec<ActionSubmission>,
+    /// Optional canonical test subset to prewarm after compile critical paths.
+    pub canonical_test_subset: Vec<ActionSubmission>,
+    /// Candidate worker peers to seed for this prewarm wave.
+    pub likely_workers: Vec<PeerId>,
+    /// Base `BuildOperationId` used to mint distinct subscriber IDs per prewarmed action.
+    pub operation_base_id: u128,
+    /// Timestamp (Unix microseconds).
+    pub now_unix_micros: i64,
+    /// Coordinator clock epoch.
+    pub clock_epoch: u64,
+}
+
+/// Auditable receipt emitted by [`CoordLive::handle_git_prewarm_event`] (bead Q007).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPrewarmReceipt {
+    /// Event identifier.
+    pub event_id: String,
+    /// Event kind.
+    pub kind: GitPrewarmEventKind,
+    /// Target `HEAD` commit OID.
+    pub head_commit_oid: String,
+    /// Nearest warm ancestor commit located from coordinator/CI state, if any.
+    pub nearest_ancestor_commit_oid: Option<String>,
+    /// Per-action outcomes along the dependency critical path.
+    pub dependency_actions: Vec<PrewarmStageOutcome>,
+    /// Per-action outcomes along the workspace critical path.
+    pub workspace_actions: Vec<PrewarmStageOutcome>,
+    /// Per-action outcomes for the optional canonical test subset.
+    pub canonical_test_actions: Vec<PrewarmStageOutcome>,
+    /// Admitted non-ambiguous workers seeded for this prewarm event.
+    pub seeded_workers: Vec<PeerId>,
+    /// Whether prewarm stopped early due to foreground pressure.
+    pub stopped_under_foreground_pressure: bool,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Auditable receipt emitted when a CI canonical profile publication is promoted to
+/// `TrustEvidenceTier::CiPolicyApproved` and registered for developer pull prewarm (bead Q008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiCanonicalPrewarmReceipt {
+    /// Pushed commit OID that CI prebuilt.
+    pub commit_oid: String,
+    /// Canonical profile name (e.g. `"check"`, `"test"`, `"clippy"`, `"release"`).
+    pub profile_name: String,
+    /// Content-addressed semantic action key (identical for local agent and CI builds).
+    pub action_key: TypedDigest,
+    /// Verified S011 CI policy approval record.
+    pub approval: CiPolicyApproval,
+    /// Assigned trust tier (`TrustEvidenceTier::CiPolicyApproved`).
+    pub assigned_tier: TrustEvidenceTier,
+    /// Version appended to `action_trust_evaluations`.
+    pub trust_ledger_version: u32,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Access/publication policy decision when consulting an action under a required
+/// [`TrustEvidenceTier`] (bead Q008).
+///
+/// Trust tier is publication/access policy, NEVER content identity: local agent
+/// results and CI canonical results share the same [`TypedDigest`] action key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustAccessDecision {
+    /// The action's evaluated trust tier meets or exceeds `required_tier`.
+    Permitted {
+        /// Current evaluated tier on the action's trust ledger.
+        observed_tier: TrustEvidenceTier,
+        /// Minimum tier demanded by the caller/lane.
+        required_tier: TrustEvidenceTier,
+    },
+    /// The action is useful for lower-tier (e.g. local developer/agent) use,
+    /// but requires additional verification or CI policy approval before
+    /// serving a higher-tier (e.g. release) lane.
+    NeedsAdditionalVerification {
+        /// Current evaluated tier on the action's trust ledger.
+        observed_tier: TrustEvidenceTier,
+        /// Minimum tier demanded by the caller/lane.
+        required_tier: TrustEvidenceTier,
+    },
+}
+
+#[derive(Default)]
+struct PrewarmCoordinatorState {
+    warm_commits: BTreeMap<String, BTreeSet<String>>,
+    receipts: Vec<GitPrewarmReceipt>,
+}
+
 #[derive(Default)]
 struct SpeculationGateState {
     posture: SpeculationDefaultOnPosture,
@@ -1126,6 +1310,7 @@ pub struct CoordLive {
     speculation_provenance: Mutex<SpeculationProvenance>,
     speculation_runs: Mutex<Vec<SpeculationRunRecord>>,
     speculation_gate: Mutex<SpeculationGateState>,
+    prewarm_state: Mutex<PrewarmCoordinatorState>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -1603,6 +1788,468 @@ impl CoordLive {
             ));
         }
         self.submit_action(input, request, now_unix_micros, clock_epoch)
+    }
+
+    fn has_queued_foreground_pressure(&self) -> Result<bool, SubmissionRefusal> {
+        let submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        Ok(submissions.entries.values().any(|entry| {
+            entry.state == DispatchState::Queued && entry.actor.has_foreground_interest()
+        }))
+    }
+
+    fn is_action_already_warm_in_store(
+        &self,
+        action_key: &TypedDigest,
+        now_unix_micros: i64,
+        clock_epoch: u64,
+    ) -> Result<bool, SubmissionRefusal> {
+        let Some(cas) = self.cas.as_ref() else {
+            return Ok(false);
+        };
+        let key_str = digest_key(action_key);
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        declare_coordinator_domains(&mut *store);
+        Ok(matches!(
+            serving_gate(&mut *store, &key_str, now_unix_micros, clock_epoch),
+            Ok(ServeDecision::Servable)
+        ))
+    }
+
+    /// Handle a Q007 git checkout / HEAD / worktree / lockfile / toolchain / CI push
+    /// prewarm event:
+    ///
+    /// 1. Locate the nearest warm ancestor state from `event.parent_commit_oids`.
+    /// 2. Prewarm the dependency critical path, workspace critical path, and optional
+    ///    canonical test subset in priority order (`190`, `180`, `170`).
+    /// 3. Stop instantly if foreground pressure (`Soft`/`Hard` band or queued foreground
+    ///    work) is active before or during submission.
+    /// 4. Seed admitted, non-ambiguous `likely_workers`.
+    /// 5. Emit a structured [`GitPrewarmReceipt`] and append a durable row to
+    ///    `decision_receipts` (`GIT_PREWARM_RECEIPT_KIND`).
+    pub fn handle_git_prewarm_event(
+        &self,
+        event: GitPrewarmEvent,
+    ) -> Result<GitPrewarmReceipt, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let (nearest_ancestor_commit_oid, mut head_warm_keys) = {
+            let prewarm = self
+                .prewarm_state
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            let found = event.parent_commit_oids.iter().find_map(|parent| {
+                prewarm
+                    .warm_commits
+                    .get(parent)
+                    .map(|keys| (parent.clone(), keys.clone()))
+            });
+            match found {
+                Some((ancestor, keys)) => (Some(ancestor), keys),
+                None => (None, BTreeSet::new()),
+            }
+        };
+
+        let mut op_cursor = event.operation_base_id;
+        let mut stopped_under_foreground_pressure = false;
+        let presentation = rabs_key::typed_digest::compute("rabs.presentation.v1", b"git-prewarm");
+
+        let mut process_stage = |submissions: Vec<ActionSubmission>,
+                                 priority: u8|
+         -> Result<Vec<PrewarmStageOutcome>, SubmissionRefusal> {
+            let mut outcomes = Vec::with_capacity(submissions.len());
+            for submission in submissions {
+                let action_key = submission.key();
+                let key_str = digest_key(&action_key);
+                if stopped_under_foreground_pressure
+                    || !self.optional_admitted()?
+                    || self.has_queued_foreground_pressure()?
+                {
+                    stopped_under_foreground_pressure = true;
+                    outcomes
+                        .push(PrewarmStageOutcome::StoppedUnderForegroundPressure { action_key });
+                    continue;
+                }
+                if head_warm_keys.contains(&key_str)
+                    || self.is_action_already_warm_in_store(
+                        &action_key,
+                        event.now_unix_micros,
+                        event.clock_epoch,
+                    )?
+                {
+                    head_warm_keys.insert(key_str);
+                    outcomes.push(PrewarmStageOutcome::AlreadyWarm { action_key });
+                    continue;
+                }
+                let op_id = op_cursor;
+                op_cursor = op_cursor.saturating_add(1);
+                let request = JoinRequest {
+                    operation: BuildOperationId(op_id),
+                    kind: SubscriberKind::GitPrewarm,
+                    queue_priority: priority,
+                    deadline_unix_micros: None,
+                    presentation: presentation.clone(),
+                    requirements: SubscriptionRequirements::unrestricted(),
+                };
+                match self.submit_action(
+                    submission,
+                    request,
+                    event.now_unix_micros,
+                    event.clock_epoch,
+                ) {
+                    Ok(receipt) => {
+                        head_warm_keys.insert(key_str);
+                        outcomes.push(PrewarmStageOutcome::QueuedPrewarm {
+                            action_key: receipt.action_key,
+                            actor_created: receipt.actor_created,
+                        });
+                    }
+                    Err(SubmissionRefusal::Brownout) => {
+                        stopped_under_foreground_pressure = true;
+                        outcomes.push(PrewarmStageOutcome::StoppedUnderForegroundPressure {
+                            action_key,
+                        });
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            Ok(outcomes)
+        };
+
+        let dependency_actions = process_stage(event.dependency_critical_path, 190)?;
+        let workspace_actions = process_stage(event.workspace_critical_path, 180)?;
+        let canonical_test_actions = process_stage(event.canonical_test_subset, 170)?;
+
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let receipt_seq = self.next_seq();
+        let mut seeded_workers = Vec::new();
+        {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            for worker in &event.likely_workers {
+                let admitted = store
+                    .worker_incarnation_fence(worker)
+                    .map_err(|error| {
+                        SubmissionRefusal::Admission(format!("worker fence lookup: {error:?}"))
+                    })?
+                    .is_some_and(|fence| !fence.clone_ambiguous);
+                if admitted && !seeded_workers.contains(worker) {
+                    seeded_workers.push(worker.clone());
+                }
+            }
+            let decision_token = if stopped_under_foreground_pressure {
+                "stopped-foreground-pressure"
+            } else {
+                "prewarm-dispatched"
+            };
+            let summary = format!(
+                "kind={};head={};ancestor={};worktree={};lockfile={};toolchain={};dep={};ws={};tests={};workers={}",
+                event.kind.as_str(),
+                event.head_commit_oid,
+                nearest_ancestor_commit_oid.as_deref().unwrap_or("none"),
+                event.worktree_id,
+                digest_key(&event.lockfile_digest),
+                digest_key(&event.toolchain_digest),
+                dependency_actions.len(),
+                workspace_actions.len(),
+                canonical_test_actions.len(),
+                seeded_workers.len(),
+            );
+            store
+                .record_decision_receipt(
+                    GIT_PREWARM_RECEIPT_KIND,
+                    &event.event_id,
+                    receipt_seq,
+                    decision_token,
+                    &summary,
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("git prewarm receipt: {error:?}"))
+                })?;
+        }
+
+        let receipt = GitPrewarmReceipt {
+            event_id: event.event_id,
+            kind: event.kind,
+            head_commit_oid: event.head_commit_oid.clone(),
+            nearest_ancestor_commit_oid,
+            dependency_actions,
+            workspace_actions,
+            canonical_test_actions,
+            seeded_workers,
+            stopped_under_foreground_pressure,
+            receipt_seq,
+        };
+        {
+            let mut prewarm = self
+                .prewarm_state
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            prewarm
+                .warm_commits
+                .insert(event.head_commit_oid, head_warm_keys);
+            prewarm.receipts.push(receipt.clone());
+        }
+        Ok(receipt)
+    }
+
+    /// Snapshot of recorded Q007 git/worktree prewarm receipts.
+    pub fn prewarm_receipts(&self) -> Result<Vec<GitPrewarmReceipt>, SubmissionRefusal> {
+        Ok(self
+            .prewarm_state
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .receipts
+            .clone())
+    }
+
+    /// Promote a committed canonical profile build from a CI writer lane to
+    /// [`TrustEvidenceTier::CiPolicyApproved`] via the S011 policy evaluator and
+    /// register its commit/action in the prewarm ledger so developer pulls receive
+    /// guaranteed-warm artifacts (bead Q008; depends on Q007 + S011).
+    ///
+    /// Trust tier is publication/access policy, NEVER content identity: the
+    /// `action_key` is unchanged from a local-agent build of the same descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_ci_canonical_prewarm<P, F>(
+        &self,
+        commit_oid: &str,
+        profile_name: &str,
+        expected_policy_id: &TypedDigest,
+        policy_history: &[CiCanonicalWriterPolicy],
+        claim: &CiCanonicalWriterClaim,
+        independently_observed_verification: rabs_protocol::provenance_receipt::VerificationLevel,
+        verify_policy_content: P,
+        verify_signature: F,
+    ) -> Result<CiCanonicalPrewarmReceipt, SubmissionRefusal>
+    where
+        P: FnOnce(&TypedDigest, &[u8]) -> bool,
+        F: FnOnce(
+            rabs_protocol::serving::CiSignatureAlgorithm,
+            &TypedDigest,
+            u64,
+            &[u8],
+            &[u8],
+        ) -> bool,
+    {
+        if !self.available() || self.cas.is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let held = self.authority().ok_or(SubmissionRefusal::Unavailable)?;
+        let held_digest = authority_digest(&held);
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+
+        let active_policy = policy_history
+            .iter()
+            .filter(|p| &p.policy_id == expected_policy_id)
+            .max_by_key(|p| p.version)
+            .ok_or_else(|| {
+                SubmissionRefusal::Admission(format!(
+                    "ci policy refusal: {:?}",
+                    CiPolicyRefusal::NoCurrentPolicy
+                ))
+            })?;
+
+        let (approval, ledger_version, receipt_seq) = {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            declare_coordinator_domains(&mut *store);
+            match store.active_authority().map_err(|error| {
+                SubmissionRefusal::Admission(format!("active authority: {error:?}"))
+            })? {
+                Some(active) if active.digest == held_digest => {}
+                _ => return Err(SubmissionRefusal::Unavailable),
+            }
+            let action_key_str = digest_key(&claim.action_key);
+            let quarantined = !store
+                .query(
+                    "SELECT 1 FROM quarantines WHERE scope = 'action-entry' AND subject = ?1 LIMIT 1",
+                    &[SqlValue::Text(action_key_str.clone())],
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("quarantine check: {error:?}"))
+                })?
+                .is_empty();
+            if quarantined {
+                return Err(SubmissionRefusal::Admission(
+                    "cannot promote quarantined action to CiPolicyApproved".to_owned(),
+                ));
+            }
+            let manifest_key = store
+                .published_manifest_key(&claim.action_key)
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("published manifest lookup: {error:?}"))
+                })?
+                .ok_or_else(|| {
+                    SubmissionRefusal::Admission(
+                        "action has no committed publication to approve".to_owned(),
+                    )
+                })?;
+            let manifest_digest = object_id_from_key(&manifest_key).ok_or_else(|| {
+                SubmissionRefusal::Admission("invalid published manifest key".to_owned())
+            })?;
+            let evidence_keys = store
+                .list_evidence_keys(&claim.action_key)
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("evidence keys lookup: {error:?}"))
+                })?;
+            let expected_evidence_set_digest = evidence_set_digest(&evidence_keys);
+            let latest_eval =
+                store
+                    .latest_trust_evaluation(&claim.action_key)
+                    .map_err(|error| {
+                        SubmissionRefusal::Admission(format!("trust ledger lookup: {error:?}"))
+                    })?;
+            let trust_ledger_high_water = latest_eval.as_ref().map_or(0, |row| row.evaluated_seq);
+            let publication_causal_sequence = trust_ledger_high_water.max(1);
+            let ledger_version = latest_eval
+                .as_ref()
+                .map_or(Some(1), |row| row.version.checked_add(1))
+                .ok_or(SubmissionRefusal::IdentityExhausted)?;
+
+            let context = CiEvaluationContext {
+                expected_policy_id: expected_policy_id.clone(),
+                expected_policy_version: active_policy.version,
+                expected_policy_content_digest: active_policy.policy_content_digest.clone(),
+                expected_action_key: claim.action_key.clone(),
+                expected_canonical_result_manifest_id: ObjectId(manifest_digest),
+                expected_evidence_set_digest,
+                independently_observed_verification,
+                coordinator_causal_sequence: claim.evaluated_causal_sequence,
+                publication_causal_sequence,
+                trust_ledger_high_water,
+            };
+            let approval = evaluate_ci_canonical_writer_claim(
+                policy_history,
+                claim,
+                &context,
+                verify_policy_content,
+                verify_signature,
+            )
+            .map_err(|refusal| {
+                SubmissionRefusal::Admission(format!("ci policy refusal: {refusal:?}"))
+            })?;
+
+            store
+                .append_trust_evaluation(
+                    &held_digest,
+                    &claim.action_key,
+                    &TrustEvaluationRow {
+                        version: ledger_version,
+                        state: "ci-policy-approved".to_owned(),
+                        reason: format!(
+                            "ci-lane={};policy-v={};commit={};profile={}",
+                            approval.lane_id(),
+                            approval.policy_version(),
+                            commit_oid,
+                            profile_name,
+                        ),
+                        evaluated_seq: claim.evaluated_causal_sequence,
+                    },
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("append trust evaluation: {error:?}"))
+                })?;
+            store
+                .set_serving_disposition_key(&action_key_str, DISPOSITION_SERVABLE)
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("set serving disposition: {error:?}"))
+                })?;
+            let receipt_seq = self.next_seq();
+            store
+                .record_decision_receipt(
+                    CI_CANONICAL_PREWARM_RECEIPT_KIND,
+                    &format!("{commit_oid}:{profile_name}"),
+                    receipt_seq,
+                    "ci-policy-approved",
+                    &action_key_str,
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("ci prewarm decision receipt: {error:?}"))
+                })?;
+            (approval, ledger_version, receipt_seq)
+        };
+
+        {
+            let mut prewarm = self
+                .prewarm_state
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            prewarm
+                .warm_commits
+                .entry(commit_oid.to_owned())
+                .or_default()
+                .insert(digest_key(&claim.action_key));
+        }
+
+        Ok(CiCanonicalPrewarmReceipt {
+            commit_oid: commit_oid.to_owned(),
+            profile_name: profile_name.to_owned(),
+            action_key: claim.action_key.clone(),
+            assigned_tier: approval.evaluation().evaluated_tier(),
+            approval,
+            trust_ledger_version: ledger_version,
+            receipt_seq,
+        })
+    }
+
+    /// Evaluate whether a committed action satisfies `required_tier` under
+    /// publication/access policy (bead Q008).
+    ///
+    /// Local agent results (e.g. `UnverifiedCandidate` or `ShadowMatched`)
+    /// remain immediately useful for developer/agent tiers, while release or
+    /// CI-gated lanes require `TrustEvidenceTier::CiPolicyApproved` or higher
+    /// verification without changing the content-addressed `action_key`.
+    pub fn evaluate_trust_tier_access(
+        &self,
+        action_key: &TypedDigest,
+        required_tier: TrustEvidenceTier,
+    ) -> Result<TrustAccessDecision, SubmissionRefusal> {
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        declare_coordinator_domains(&mut *store);
+        if !store.has_publication(action_key).map_err(|error| {
+            SubmissionRefusal::Admission(format!("publication check: {error:?}"))
+        })? {
+            return Err(SubmissionRefusal::Admission(
+                "action has no committed publication".to_owned(),
+            ));
+        }
+        let latest = store
+            .latest_trust_evaluation(action_key)
+            .map_err(|error| SubmissionRefusal::Admission(format!("trust lookup: {error:?}")))?;
+        let observed_tier = match latest.as_ref().map(|row| row.state.as_str()) {
+            Some("project-release-eligible") => TrustEvidenceTier::ProjectReleaseEligible,
+            Some("ci-policy-approved") => TrustEvidenceTier::CiPolicyApproved,
+            Some("reproducible-cross-worker") => TrustEvidenceTier::ReproducibleCrossWorker,
+            Some("reproducible-same-worker") => TrustEvidenceTier::ReproducibleSameWorker,
+            Some("shadow-matched") => TrustEvidenceTier::ShadowMatched,
+            _ => TrustEvidenceTier::UnverifiedCandidate,
+        };
+        if observed_tier >= required_tier {
+            Ok(TrustAccessDecision::Permitted {
+                observed_tier,
+                required_tier,
+            })
+        } else {
+            Ok(TrustAccessDecision::NeedsAdditionalVerification {
+                observed_tier,
+                required_tier,
+            })
+        }
     }
 
     fn optional_admitted(&self) -> Result<bool, SubmissionRefusal> {
@@ -4303,5 +4950,311 @@ mod tests {
             SpeculationDefaultOnPosture::DefaultOff
         );
         assert!(!regressed_gate.permits_default_on());
+    }
+
+    #[test]
+    fn q007_git_prewarm_events_locate_ancestor_seed_workers_and_stop_under_foreground_pressure() {
+        let (_state, coord) = submission_coordinator();
+        let (_live, source, manifest, base_descriptor) = source_fixture();
+        let worker_ok = worker_offer(1, 0x101);
+        coord.admit_worker_session(&worker_ok).unwrap();
+
+        let desc_with_tag = |tag: u8| {
+            let mut d = base_descriptor.clone();
+            d.normalized_invocation.bytes[0] = tag;
+            d
+        };
+
+        let dep_desc = desc_with_tag(11);
+        let ws_desc = desc_with_tag(12);
+        let test_desc = desc_with_tag(13);
+        let lockfile_digest = rabs_key::typed_digest::compute("rabs.lockfile.v1", b"Cargo.lock-v1");
+        let toolchain_digest =
+            rabs_key::typed_digest::compute("rabs.toolchain.v1", b"nightly-2026-06-06");
+
+        // 1. Initial branch checkout warms dep, workspace, and canonical test subset.
+        let checkout_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-checkout-1".to_owned(),
+                kind: GitPrewarmEventKind::BranchCheckout,
+                head_commit_oid: "commit-a1".to_owned(),
+                parent_commit_oids: vec!["commit-root".to_owned()],
+                worktree_id: "wt-main".to_owned(),
+                lockfile_digest: lockfile_digest.clone(),
+                toolchain_digest: toolchain_digest.clone(),
+                dependency_critical_path: vec![submission(&source, &manifest, &dep_desc)],
+                workspace_critical_path: vec![submission(&source, &manifest, &ws_desc)],
+                canonical_test_subset: vec![submission(&source, &manifest, &test_desc)],
+                likely_workers: vec![
+                    worker_ok.worker_peer_id.clone(),
+                    PeerId("unadmitted-worker".to_owned()),
+                ],
+                operation_base_id: 500,
+                now_unix_micros: 10_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert_eq!(checkout_receipt.nearest_ancestor_commit_oid, None);
+        assert!(!checkout_receipt.stopped_under_foreground_pressure);
+        assert_eq!(
+            checkout_receipt.seeded_workers,
+            vec![worker_ok.worker_peer_id.clone()]
+        );
+        assert!(matches!(
+            checkout_receipt.dependency_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            checkout_receipt.workspace_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            checkout_receipt.canonical_test_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+
+        // 2. Child commit locates `commit-a1` as nearest warm ancestor: dep is AlreadyWarm, new ws2 queues.
+        let ws2_desc = desc_with_tag(14);
+        let head_change_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-head-2".to_owned(),
+                kind: GitPrewarmEventKind::HeadChange,
+                head_commit_oid: "commit-a2".to_owned(),
+                parent_commit_oids: vec!["commit-a1".to_owned(), "commit-root".to_owned()],
+                worktree_id: "wt-main".to_owned(),
+                lockfile_digest: lockfile_digest.clone(),
+                toolchain_digest: toolchain_digest.clone(),
+                dependency_critical_path: vec![submission(&source, &manifest, &dep_desc)],
+                workspace_critical_path: vec![submission(&source, &manifest, &ws2_desc)],
+                canonical_test_subset: Vec::new(),
+                likely_workers: vec![worker_ok.worker_peer_id.clone()],
+                operation_base_id: 600,
+                now_unix_micros: 20_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            head_change_receipt.nearest_ancestor_commit_oid.as_deref(),
+            Some("commit-a1")
+        );
+        assert!(matches!(
+            head_change_receipt.dependency_actions.as_slice(),
+            [PrewarmStageOutcome::AlreadyWarm { .. }]
+        ));
+        assert!(matches!(
+            head_change_receipt.workspace_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+
+        // 3. Submit a foreground action -> queued foreground demand causes subsequent prewarm to stop instantly.
+        let fg_desc = desc_with_tag(15);
+        coord
+            .submit_action(
+                submission(&source, &manifest, &fg_desc),
+                request(700, SubscriberKind::ForegroundAgent, 200),
+                25_000,
+                0,
+            )
+            .unwrap();
+
+        let ws3_desc = desc_with_tag(16);
+        let pressured_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-worktree-3".to_owned(),
+                kind: GitPrewarmEventKind::WorktreeCreation,
+                head_commit_oid: "commit-a3".to_owned(),
+                parent_commit_oids: vec!["commit-a2".to_owned()],
+                worktree_id: "wt-feature".to_owned(),
+                lockfile_digest,
+                toolchain_digest,
+                dependency_critical_path: Vec::new(),
+                workspace_critical_path: vec![submission(&source, &manifest, &ws3_desc)],
+                canonical_test_subset: Vec::new(),
+                likely_workers: Vec::new(),
+                operation_base_id: 800,
+                now_unix_micros: 30_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert!(pressured_receipt.stopped_under_foreground_pressure);
+        assert!(matches!(
+            pressured_receipt.workspace_actions.as_slice(),
+            [PrewarmStageOutcome::StoppedUnderForegroundPressure { .. }]
+        ));
+        assert_eq!(coord.prewarm_receipts().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn q008_ci_canonical_prewarm_promotes_trust_tier_and_warms_developer_pulls() {
+        use rabs_cas::test_support::{install_admission_world, install_offer_closure};
+        use rabs_protocol::provenance_receipt::VerificationLevel;
+        use rabs_protocol::serving::{
+            CI_CANONICAL_WRITER_POLICY_SCHEMA_VERSION, CI_POLICY_CLAIM_SCHEMA_VERSION,
+            CI_POLICY_CONTENT_DOMAIN, CI_POLICY_ID_DOMAIN, CI_SIGNER_FINGERPRINT_DOMAIN,
+            CiActionKeyScope, CiClaimAuthenticator, CiLaneAuthorization, CiLaneRole,
+            CiSignatureAlgorithm,
+        };
+
+        let (_state, coord) = submission_coordinator();
+        let held = coord.authority().unwrap();
+        let offer = offer_under(&held);
+        let action_key = offer.manifest.action_key.clone();
+        {
+            let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+            install_admission_world(&mut *store, &held);
+            install_offer_closure(&mut *store, &offer);
+        }
+        assert!(matches!(
+            coord
+                .commit_offer(&offer, &sample_expected_descriptor())
+                .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+
+        // 1. Local/initial publication is immediately useful for UnverifiedCandidate tier,
+        //    but requires additional verification for CiPolicyApproved / release lanes.
+        assert_eq!(
+            coord
+                .evaluate_trust_tier_access(&action_key, TrustEvidenceTier::UnverifiedCandidate)
+                .unwrap(),
+            TrustAccessDecision::Permitted {
+                observed_tier: TrustEvidenceTier::UnverifiedCandidate,
+                required_tier: TrustEvidenceTier::UnverifiedCandidate,
+            }
+        );
+        assert_eq!(
+            coord
+                .evaluate_trust_tier_access(&action_key, TrustEvidenceTier::CiPolicyApproved)
+                .unwrap(),
+            TrustAccessDecision::NeedsAdditionalVerification {
+                observed_tier: TrustEvidenceTier::UnverifiedCandidate,
+                required_tier: TrustEvidenceTier::CiPolicyApproved,
+            }
+        );
+
+        // 2. Build a signed S011 CI canonical writer policy + claim for the exact same action_key.
+        let policy_id = rabs_key::typed_digest::compute(CI_POLICY_ID_DOMAIN, b"ci-main-policy");
+        let signer_fp =
+            rabs_key::typed_digest::compute(CI_SIGNER_FINGERPRINT_DOMAIN, b"ci-ed25519-key-1");
+        let mut policy = CiCanonicalWriterPolicy {
+            schema_version: CI_CANONICAL_WRITER_POLICY_SCHEMA_VERSION,
+            policy_id: policy_id.clone(),
+            policy_content_digest: rabs_key::typed_digest::compute(
+                CI_POLICY_CONTENT_DOMAIN,
+                b"placeholder",
+            ),
+            version: 1,
+            revoked: false,
+            authorizations: vec![CiLaneAuthorization {
+                lane_id: "github-actions-main".to_owned(),
+                signer_fingerprint: signer_fp.clone(),
+                signer_generation: 1,
+                signature_algorithm: CiSignatureAlgorithm::Ed25519V1,
+                action_key_scope: CiActionKeyScope::Exact(action_key.clone()),
+                role: CiLaneRole::Producer,
+                minimum_verification: VerificationLevel::CoordinatorDigestRecompute,
+                revoked: false,
+            }],
+        };
+        policy.policy_content_digest =
+            rabs_key::typed_digest::compute(CI_POLICY_CONTENT_DOMAIN, &policy.canonical_bytes());
+
+        let (evidence_digest, high_water) = {
+            let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+            let keys = store.list_evidence_keys(&action_key).unwrap();
+            let high_water = store
+                .latest_trust_evaluation(&action_key)
+                .unwrap()
+                .map_or(0, |r| r.evaluated_seq);
+            (evidence_set_digest(&keys), high_water)
+        };
+
+        let claim = CiCanonicalWriterClaim {
+            schema_version: CI_POLICY_CLAIM_SCHEMA_VERSION,
+            policy_version: 1,
+            policy_id: policy_id.clone(),
+            policy_content_digest: policy.policy_content_digest.clone(),
+            lane_id: "github-actions-main".to_owned(),
+            signer_fingerprint: signer_fp,
+            signer_generation: 1,
+            action_key: action_key.clone(),
+            canonical_result_manifest_id: offer.manifest_id.clone(),
+            evidence_set_digest: evidence_digest,
+            role: CiLaneRole::Producer,
+            verification: VerificationLevel::CoordinatorDigestRecompute,
+            evaluated_causal_sequence: high_water + 10,
+            authenticator: CiClaimAuthenticator {
+                algorithm: CiSignatureAlgorithm::Ed25519V1,
+                bytes: vec![0xAA; 64],
+            },
+        };
+
+        let ci_receipt = coord
+            .publish_ci_canonical_prewarm(
+                "commit-ci-pushed-1",
+                "release",
+                &policy_id,
+                std::slice::from_ref(&policy),
+                &claim,
+                VerificationLevel::CoordinatorDigestRecompute,
+                |expected, canonical| {
+                    *expected
+                        == rabs_key::typed_digest::compute(CI_POLICY_CONTENT_DOMAIN, canonical)
+                },
+                |_alg, _fp, _gen, _body, sig| sig == [0xAA; 64],
+            )
+            .unwrap();
+        assert_eq!(
+            ci_receipt.assigned_tier,
+            TrustEvidenceTier::CiPolicyApproved
+        );
+        assert_eq!(ci_receipt.action_key, action_key);
+
+        // 3. After CI canonical writer promotion, CiPolicyApproved access is permitted on the same action_key.
+        assert_eq!(
+            coord
+                .evaluate_trust_tier_access(&action_key, TrustEvidenceTier::CiPolicyApproved)
+                .unwrap(),
+            TrustAccessDecision::Permitted {
+                observed_tier: TrustEvidenceTier::CiPolicyApproved,
+                required_tier: TrustEvidenceTier::CiPolicyApproved,
+            }
+        );
+
+        // 4. Developer pull (`PullRebaseMerge`) referencing `commit-ci-pushed-1` locates the CI prewarm state.
+        let pull_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-dev-pull-1".to_owned(),
+                kind: GitPrewarmEventKind::PullRebaseMerge,
+                head_commit_oid: "commit-ci-pushed-1".to_owned(),
+                parent_commit_oids: vec!["commit-ci-pushed-1".to_owned()],
+                worktree_id: "wt-dev".to_owned(),
+                lockfile_digest: rabs_key::typed_digest::compute("rabs.lockfile.v1", b"lock"),
+                toolchain_digest: rabs_key::typed_digest::compute("rabs.toolchain.v1", b"tc"),
+                dependency_critical_path: Vec::new(),
+                workspace_critical_path: Vec::new(),
+                canonical_test_subset: Vec::new(),
+                likely_workers: Vec::new(),
+                operation_base_id: 900,
+                now_unix_micros: 50_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            pull_receipt.nearest_ancestor_commit_oid.as_deref(),
+            Some("commit-ci-pushed-1")
+        );
     }
 }
