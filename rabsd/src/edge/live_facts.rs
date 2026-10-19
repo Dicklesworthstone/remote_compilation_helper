@@ -482,6 +482,67 @@ pub struct DependencyFacts {
 }
 
 impl DependencyFacts {
+    /// Retain the exact candidate bytes for a remote metadata action.
+    ///
+    /// Paths are relative to the shared source transfer manifest:
+    /// `dependencies/{first-use-directory-index:04}/{basename}`. Empty roots
+    /// contribute no files but keep their index, so the execution context can
+    /// reproduce every original search directory without reordering it.
+    ///
+    /// This acquisition runs after remote acceptance in the bounded execution
+    /// lane. It does not borrow cached digests as permission to upload newer
+    /// bytes: each descriptor, path, content digest and complete inventory is
+    /// checked against the observation used to compute this action's key.
+    pub fn retained_artifacts(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.verify_unchanged()?;
+        if self.roots.len() != self.members.len() || self.roots.len() != self.directories.len() {
+            return Err("retained dependency inventory is incomplete".into());
+        }
+        let mut retained = Vec::new();
+        let mut remaining = MAX_DEPENDENCY_BYTES;
+        for (index, ((root, _, _), (members, directory))) in self
+            .roots
+            .iter()
+            .zip(self.members.iter().zip(&self.directories))
+            .enumerate()
+        {
+            if root.to_str() != Some(directory.path.as_str())
+                || members.len() != directory.artifacts.len()
+            {
+                return Err("retained dependency facts differ from the captured inventory".into());
+            }
+            for ((name, signature), fact) in members.iter().zip(&directory.artifacts) {
+                if retained.len() >= MAX_DEPENDENCY_FILES {
+                    return Err("retained dependency file count exceeds its bound".into());
+                }
+                let path = root.join(name);
+                if path.to_str() != Some(fact.path.as_str()) {
+                    return Err("retained dependency candidate path differs from its key".into());
+                }
+                remaining = remaining
+                    .checked_sub(signature.size)
+                    .ok_or("retained dependency bytes exceed their bound")?;
+                let (_, bytes) = stable_file::read_at(&path, *signature, signature.size)
+                    .map_err(|error| format!("retaining dependency candidate: {error}"))?;
+                let mut writer =
+                    StreamingObjectWriter::new(DigestRequest::default(), Some(signature.size));
+                writer
+                    .write(&bytes)
+                    .map_err(|error| format!("hashing retained dependency: {error:?}"))?;
+                let digest = writer
+                    .finish()
+                    .map_err(|error| format!("sealing retained dependency: {error:?}"))?
+                    .atp_content_id;
+                if digest != fact.content_digest {
+                    return Err("retained dependency bytes differ from the keyed content".into());
+                }
+                retained.push((format!("dependencies/{index:04}/{name}"), bytes));
+            }
+        }
+        self.verify_unchanged()?;
+        Ok(retained)
+    }
+
     /// Refuse changes to any candidate, member name, root or root type.
     pub fn verify_unchanged(&self) -> Result<(), String> {
         let (members, _) = walk_dependencies(&self.roots)?;
@@ -2092,6 +2153,117 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn retained_dependency_fixture() -> (tempfile::TempDir, DependencyFacts) {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = directory.path().join("empty");
+        let first = directory.path().join("z-first");
+        let second = directory.path().join("a-second");
+        for root in [&empty, &first, &second] {
+            std::fs::create_dir(root).unwrap();
+        }
+        std::fs::write(first.join("libmiddle.rmeta"), [0, 255, 10, 128]).unwrap();
+        std::fs::write(first.join("libtransitive.rmeta"), b"transitive metadata").unwrap();
+        std::fs::write(first.join("middle.d"), b"ignored dependency placement").unwrap();
+        std::fs::write(
+            second.join("libarchive.rlib"),
+            b"complete archive object bytes",
+        )
+        .unwrap();
+        std::fs::write(second.join("libarchive.rmeta"), b"archive metadata only").unwrap();
+        // A direct archive stays whole even when its metadata sibling exists.
+        let roots = vec![
+            (empty, Vec::new(), Vec::new()),
+            (first, Vec::new(), Vec::new()),
+            (second, Vec::new(), vec!["libarchive.rlib".into()]),
+        ];
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let captured = capture_dependencies(
+            &LiveFacts::new(),
+            roots,
+            members,
+            (directory.path().join("out"), Vec::new()),
+            None,
+        )
+        .unwrap();
+        (directory, captured)
+    }
+
+    #[test]
+    fn retained_dependencies_preserve_first_use_roots_and_exact_complete_artifacts() {
+        let (_directory, captured) = retained_dependency_fixture();
+        let retained = captured.retained_artifacts().unwrap();
+        assert_eq!(
+            retained,
+            [
+                (
+                    "dependencies/0001/libmiddle.rmeta".into(),
+                    vec![0, 255, 10, 128],
+                ),
+                (
+                    "dependencies/0001/libtransitive.rmeta".into(),
+                    b"transitive metadata".to_vec(),
+                ),
+                (
+                    "dependencies/0002/libarchive.rlib".into(),
+                    b"complete archive object bytes".to_vec(),
+                ),
+                (
+                    "dependencies/0002/libarchive.rmeta".into(),
+                    b"archive metadata only".to_vec(),
+                ),
+            ]
+        );
+        // Acquisition owns the bytes: a later source mutation cannot change
+        // this upload, and cannot obtain another upload under the original key.
+        std::fs::write(
+            &captured.directories[2].artifacts[0].path,
+            b"changed archive object bytes",
+        )
+        .unwrap();
+        assert_eq!(retained[2].1, b"complete archive object bytes");
+        assert!(captured.retained_artifacts().is_err());
+    }
+
+    #[test]
+    fn retained_dependencies_require_key_facts_to_match_the_observed_inventory() {
+        for corruption in 0..3 {
+            let (_directory, mut captured) = retained_dependency_fixture();
+            match corruption {
+                0 => {
+                    captured.directories[1].artifacts[0].content_digest =
+                        compute("rabs.test.v1", b"not the candidate content identity")
+                }
+                1 => {
+                    captured.directories[1].artifacts[0].path = "/unobserved/libother.rmeta".into()
+                }
+                2 => {
+                    captured.directories[1].artifacts.pop();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                captured.retained_artifacts().is_err(),
+                "altered key facts must not authorize an upload: {corruption}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_dependencies_refuse_new_candidates_or_replaced_roots() {
+        for replace_root in [false, true] {
+            let (directory, captured) = retained_dependency_fixture();
+            let root = directory.path().join("z-first");
+            if replace_root {
+                let moved = directory.path().join("retained-original");
+                std::fs::rename(&root, &moved).unwrap();
+                std::os::unix::fs::symlink(&moved, &root).unwrap();
+            } else {
+                std::fs::write(root.join("libnew.rmeta"), b"new transitive candidate").unwrap();
+            }
+            assert!(captured.retained_artifacts().is_err());
+        }
     }
 
     #[test]

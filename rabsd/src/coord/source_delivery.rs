@@ -366,6 +366,12 @@ enum SourceLayout {
     Root(String),
     /// Each first path component names one root in the SAME captured image.
     Closure,
+    /// Original package plus separately verified compiler dependency artifacts.
+    /// Every retained byte belongs to the same source-transfer manifest.
+    Dependency {
+        root: String,
+        artifacts: Arc<std::collections::BTreeMap<String, Vec<u8>>>,
+    },
 }
 
 fn valid_closure_root(root: &str) -> bool {
@@ -487,12 +493,92 @@ impl SourceUpload {
         })
     }
 
+    /// Bundle one captured package with exact dependency artifacts retained by
+    /// the live action's filesystem observer. The caller must verify these bytes
+    /// against its keyed candidate inventory before selecting them and keep the
+    /// original-input witnesses through execution and installation.
+    ///
+    /// Package members are rooted at package/; dependency paths are exactly
+    /// dependencies/NNNN/basename. Both share the existing bounded, authenticated
+    /// source-files transfer, including its per-file reuse and seal verification.
+    /// This constructor never opens a mutable dependency path on the caller.
+    pub fn with_dependency_artifacts(
+        mut self,
+        artifacts: Vec<(String, Vec<u8>)>,
+    ) -> io::Result<Self> {
+        let SourceLayout::Root(root) = &self.layout else {
+            return Err(invalid("dependency bundle requires one package snapshot"));
+        };
+        require(
+            self.toolchain.is_none(),
+            "dependency bundle must be selected before toolchain attachment",
+        )?;
+        require(
+            artifacts.len() <= MAX_SOURCE_FILES.saturating_sub(self.manifest.files().len()),
+            "dependency bundle exceeds aggregate file count",
+        )?;
+        let root = root.clone();
+        let mut files: Vec<_> = self
+            .manifest
+            .files()
+            .iter()
+            .cloned()
+            .map(|mut file| {
+                file.path = format!("package/{}", file.path);
+                file
+            })
+            .collect();
+        let mut retained = std::collections::BTreeMap::new();
+        for (path, bytes) in artifacts {
+            let components: Vec<_> = path.split('/').collect();
+            require(
+                components.len() == 3
+                    && components[0] == "dependencies"
+                    && components[1].len() == 4
+                    && components[1].bytes().all(|byte| byte.is_ascii_digit())
+                    && components[1]
+                        .parse::<usize>()
+                        .is_ok_and(|index| index < rabs_sandbox::dependency_context::MAX_DEPENDENCY_DIRS)
+                    && components[2].starts_with("lib")
+                    && (components[2].ends_with(".rmeta") || components[2].ends_with(".rlib")),
+                "dependency bundle contains an unsupported artifact path",
+            )?;
+            let file = SourceFile {
+                path: path.clone(),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(&bytes).into(),
+                executable: false,
+            };
+            require(
+                retained.insert(path, bytes).is_none(),
+                "dependency bundle repeats an artifact path",
+            )?;
+            files.push(file);
+        }
+        self.manifest = SourceManifest::new(files)?;
+        self.layout = SourceLayout::Dependency {
+            root,
+            artifacts: Arc::new(retained),
+        };
+        Ok(self)
+    }
+
     fn file_bytes(&self, path: &str) -> io::Result<&[u8]> {
         let (root, relative) = match &self.layout {
             SourceLayout::Root(root) => (root.as_str(), path),
             SourceLayout::Closure => path
                 .split_once('/')
                 .ok_or_else(|| invalid("source closure member lacks its root"))?,
+            SourceLayout::Dependency { root, artifacts } => {
+                if let Some(relative) = path.strip_prefix("package/") {
+                    (root.as_str(), relative)
+                } else {
+                    return artifacts
+                        .get(path)
+                        .map(Vec::as_slice)
+                        .ok_or_else(|| invalid("retained dependency artifact missing"));
+                }
+            }
         };
         self.image
             .file_bytes(root, relative)
@@ -842,6 +928,103 @@ mod tests {
         let request = json!({"kind":"canonical-exec", "request_id":7, "program":"fixture",
             "toolchain_backing":"/tc", "source_manifest":upload.wire_manifest()});
         (upload, request, bytes)
+    }
+
+    #[test]
+    fn dependency_bundle_transfers_retained_package_and_exact_metadata_closure() {
+        let root = tempfile::tempdir().unwrap();
+        let (package, mut request, source_bytes) = fixture(root.path());
+        let metadata: Vec<_> = (0..MAX_SOURCE_CHUNK + 29)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let archive = b"!<arch>\nexact archive input".to_vec();
+        let upload = package
+            .clone()
+            .with_dependency_artifacts(vec![
+                ("dependencies/0000/libdirect.rmeta".into(), metadata.clone()),
+                ("dependencies/0002/libtransitive.rlib".into(), archive.clone()),
+            ])
+            .unwrap();
+        request["source_manifest"] = upload.wire_manifest();
+        upload.validate_request(&request).unwrap();
+        // Later writes cannot change already selected source or artifact bytes.
+        std::fs::write(root.path().join("src/lib.rs"), b"changed after capture").unwrap();
+        let mut peer = ReceiverPeer::new();
+        peer.prefilled
+            .insert("package/src/lib.rs".into(), source_bytes.clone());
+        peer.prefilled
+            .insert("dependencies/0002/libtransitive.rlib".into(), archive.clone());
+        peer.missing = Some(json!(["dependencies/0000/libdirect.rmeta"]));
+        upload.transmit(&mut peer, &request, false).unwrap();
+        let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
+        assert_eq!(
+            std::fs::read(received.join("package/src/lib.rs")).unwrap(),
+            source_bytes
+        );
+        assert_eq!(std::fs::read(received.join("package/empty")).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(received.join("dependencies/0000/libdirect.rmeta")).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            std::fs::read(received.join("dependencies/0002/libtransitive.rlib")).unwrap(),
+            archive
+        );
+        assert!(!received.join("package/not-selected.private").exists());
+        let chunks: Vec<_> = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .collect();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|frame| {
+            frame["path"] == "dependencies/0000/libdirect.rmeta"
+        }));
+        assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
+        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+        let changed = package
+            .with_dependency_artifacts(vec![
+                ("dependencies/0000/libdirect.rmeta".into(), b"other metadata".to_vec()),
+                ("dependencies/0002/libtransitive.rlib".into(), archive),
+            ])
+            .unwrap();
+        assert_ne!(upload.manifest.digest(), changed.manifest.digest());
+        assert!(changed.validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn dependency_bundle_refuses_unmodeled_members_and_duplicate_names() {
+        let root = tempfile::tempdir().unwrap();
+        let (package, _, _) = fixture(root.path());
+        for path in [
+            "package/libdep.rmeta",
+            "dependencies/0000/libproc.so",
+            "dependencies/0000/libnative.a",
+            "dependencies/0000/nested/libdep.rmeta",
+            "dependencies/../libdep.rmeta",
+            "dependencies/0/libdep.rmeta",
+            "dependencies/0064/libdep.rmeta",
+        ] {
+            assert!(
+                package
+                    .clone()
+                    .with_dependency_artifacts(vec![(path.into(), b"data".to_vec())])
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            package
+                .clone()
+                .with_dependency_artifacts(vec![
+                    ("dependencies/0000/libdep.rmeta".into(), b"first".to_vec()),
+                    ("dependencies/0000/libdep.rmeta".into(), b"second".to_vec()),
+                ])
+                .is_err()
+        );
+        let leaf = package.with_dependency_artifacts(Vec::new()).unwrap();
+        assert!(leaf.manifest.files().iter().all(|file| file.path.starts_with("package/")));
+        assert!(leaf.with_dependency_artifacts(Vec::new()).is_err());
     }
 
     struct ReceiverPeer {
