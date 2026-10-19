@@ -134,6 +134,46 @@ fn preparation_requires_a_real_unambiguous_key_before_execution() {
 }
 
 #[test]
+fn a_remote_offer_cannot_change_the_action_key_followed_by_this_waiter() {
+    for changed in [
+        "\"action_key\":\"different\"",
+        "\"action_key\":\"\"",
+        "\"action_key\":\"key\",\"action_key\":\"key\"",
+    ] {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let offer = format!(
+            "{{\"kind\":\"rustc-decision\",\"decision\":\"remote\",{changed},\"remote_protocol\":1,\"capture_protocol\":1,\"compiler_skip_authorized\":false}}\n"
+        );
+        let daemon = std::thread::spawn(move || {
+            let mut peer = BufReader::new(peer);
+            peer.get_mut().write_all(WAIT.as_bytes()).unwrap();
+            let mut retry = String::new();
+            peer.read_line(&mut retry).unwrap();
+            assert_eq!(retry, "original bytes\n");
+            peer.get_mut().write_all(offer.as_bytes()).unwrap();
+            let mut consent = String::new();
+            peer.read_line(&mut consent).unwrap();
+            consent
+        });
+        let outcome = read_with_policy(
+            reader(stream),
+            "original bytes",
+            Duration::from_secs(1),
+            true,
+            policy(3),
+            None,
+            &|| true,
+        );
+        assert!(outcome.is_err(), "a foreign remote offer is not our flight");
+        assert!(
+            daemon.join().unwrap().is_empty(),
+            "the changed action must receive no private-execution ACK"
+        );
+    }
+}
+
+#[test]
 fn preparation_frames_never_smuggle_authority_or_unknown_stages() {
     for bad in [
         PREPARING.replace(

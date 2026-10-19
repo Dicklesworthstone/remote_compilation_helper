@@ -20,7 +20,10 @@
 mod policy;
 
 use super::reply_json::{self, Value};
-use super::{ConsultStream, HELLO, Live, MAX_LIVE_REPLY_BYTES, MAX_REPLY_BYTES, connect_owned, consult_succeeded, live_outcome};
+use super::{
+    ConsultStream, HELLO, Live, MAX_LIVE_REPLY_BYTES, MAX_REPLY_BYTES, connect_owned,
+    consult_succeeded, live_outcome,
+};
 use policy::WaitPolicy;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
@@ -308,7 +311,7 @@ fn read_with_policy(
             // A changing action identity is not the flight we followed. Drop
             // before accepting a hit or executing an admitted attempt. Any
             // reserved attempt is released by the daemon's connection guard.
-            if matches!(decision, Some("hit" | "execute")) && wait_deadline.is_some() {
+            if matches!(decision, Some("hit" | "execute" | "remote")) && wait_deadline.is_some() {
                 let key = action_key(&reply).ok_or(())?;
                 if following_key
                     .as_deref()
@@ -379,14 +382,8 @@ fn read_with_policy(
             // Drop the old follower connection before opening a new one. The
             // edge releases any connection-scoped flight accounting on drop.
             drop(reader);
-            reader = reconnect_waiter(
-                socket,
-                connect_timeout,
-                decision_budget,
-                deadline,
-                owned,
-            )
-            .map_err(|_| ())?;
+            reader = reconnect_waiter(socket, connect_timeout, decision_budget, deadline, owned)
+                .map_err(|_| ())?;
             requests_on_connection = 0;
         }
         let request_deadline = Instant::now()
