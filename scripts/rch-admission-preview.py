@@ -204,7 +204,11 @@ def validate_response(response, request):
         allowed = request.get("preferred_workers", [])
         if allowed and worker["id"] not in allowed:
             fail("worker_outside_requested_set")
-        if worker["slots_available"] < request["estimated_cores"]:
+        # The daemon can deliberately approve an undersized-but-free worker
+        # after all hard admission gates pass. estimated_cores is not a second
+        # client-side minimum: do not veto that selection or alter the request.
+        # Zero free capacity is still inconsistent with an available preview.
+        if worker["slots_available"] == 0:
             fail("observed_capacity_changed")
     diagnostics = selection.get("diagnostics")
     if diagnostics is not None:
@@ -219,6 +223,29 @@ def validate_response(response, request):
         observation = "unknown"
     return {"protocol_version": PROTOCOL_VERSION, "observation": observation,
             "execution_authorized": False, "selection": selection}
+
+
+def credential_in_response(response, token):
+    if token is None:
+        return False
+    # Inspect decoded strings, including diagnostic object keys. A token with
+    # a quote/backslash is escaped by JSON serialization, so searching only the
+    # output bytes does not detect its disclosure. An explicit stack avoids
+    # adding another recursion limit to the bounded, already-decoded document.
+    pending = [response]
+    while pending:
+        value = pending.pop()
+        if type(value) is str:
+            if token in value:
+                return True
+        elif type(value) is dict:
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif type(value) is list:
+            pending.extend(value)
+    # Preserve the previous serialized-byte check too (including literal
+    # appearances outside string values); this is not a relaxation of it.
+    return token.encode("ascii") in encode(response)
 
 
 def transport(packet):
@@ -266,7 +293,7 @@ def transport(packet):
         response = validate_response(decode(data), request)
         # A reflected credential must never be emitted even by a malformed or
         # misconfigured authenticated peer. Diagnostics remain otherwise intact.
-        if token is not None and token.encode("ascii") in encode(response):
+        if credential_in_response(response, token):
             fail("credential_in_response")
         return response
     finally:

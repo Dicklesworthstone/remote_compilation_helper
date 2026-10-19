@@ -79,7 +79,7 @@ including its diagnostics and optional observed project lane, is retained:
 
 | Exit | Observation | Meaning |
 |---|---|---|
-| `0` | `available` | The daemon observed an in-set worker with enough reported slots. |
+| `0` | `available` | The daemon approved an in-set worker with positive reported free capacity. |
 | `1` | `unavailable` | The daemon returned a recognized selection denial; inspect its reason and diagnostics. |
 | `2` | `unknown` | Input, protocol, authentication, transport, timeout, internal selection error, or inconsistent evidence prevented a reliable observation. |
 
@@ -96,6 +96,13 @@ RCH execution/admission path. This client does not queue, retry, choose a local
 fallback, transfer project files, or execute the supplied command. Do not turn
 an unknown observation into permission to build locally.
 
+`estimated_cores` is a scheduling estimate, not a client-enforced minimum.
+The daemon can approve a smaller worker after its hard gates pass; the client
+preserves that approval and the original estimate rather than silently changing
+the request or declaring the fleet unavailable. Zero reported free slots,
+malformed capacity, a worker outside the requested set, and any build ownership
+still produce unknown. The client never changes a daemon denial into approval.
+
 ## Bounds and cancellation
 
 `--timeout` defaults to three seconds and accepts `0.05..30`. After local input
@@ -111,7 +118,9 @@ Kernel scheduling and local input-file reads are not claimed to be hard-real-tim
 Responses are limited to one MiB of uncompressed body bytes. Content decoding,
 ambiguous framing, duplicate JSON fields, non-finite JSON numbers and truncated
 bodies are refused. Error responses are not echoed, and a reflected credential
-in a successful response is refused rather than printed. TLS verification cannot
+in a successful response is refused rather than printed. The reflection check
+covers decoded strings and diagnostic keys, including JSON-escaped token bytes,
+as well as the serialized output. TLS verification cannot
 be disabled by a command-line option. No temporary credential or request file
 is written by the client.
 

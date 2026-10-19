@@ -191,7 +191,7 @@ class PreviewTests(unittest.TestCase):
         owned['selection']['build_id'] = 19
         values.append(owned)
         depleted = reply()
-        depleted['selection']['worker']['slots_available'] = 2
+        depleted['selection']['worker']['slots_available'] = 0
         values.append(depleted)
         for value in values:
             with self.subTest(value=value), Peer(value) as peer:
@@ -200,6 +200,91 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(result['observation'], 'unknown')
             self.assertEqual(len(peer.requests), 1, 'no release or retry is permitted')
             self.assertNotIn('selection', result)
+
+    def test_undersized_worker_approval_preserves_the_daemons_soft_cpu_estimate(self):
+        # The production selector can approve an undersized-but-free worker
+        # for automatic compilation placement after its hard gates pass.
+        # This client must not turn that approval into a new capacity denial.
+        value = request()
+        value['preferred_workers'] = []
+        value['job_mode'] = False
+        for reason in sorted(client.ASSIGNED):
+            approved = reply(reason=reason)
+            approved['selection']['worker']['slots_available'] = 1
+            with self.subTest(reason=reason), Peer(approved) as peer:
+                code, result = self.run_cli(peer.endpoint, value=value)
+            self.assertEqual(code, 0)
+            self.assertEqual(result['observation'], 'available')
+            self.assertEqual(result['selection'], approved['selection'])
+            self.assertEqual(len(peer.requests), 1)
+            self.assertEqual(json.loads(peer.requests[0][3]), value)
+
+    def test_soft_estimate_never_changes_denials_or_accepts_an_unusable_worker(self):
+        value = request()
+        value['preferred_workers'] = []
+        value['job_mode'] = False
+        for free in [0, -1, True, 1.5, 2 ** 32]:
+            approved = reply()
+            approved['selection']['worker']['slots_available'] = free
+            with self.subTest(free=free), Peer(approved) as peer:
+                code, result = self.run_cli(peer.endpoint, value=value)
+            self.assertEqual(code, 2)
+            self.assertEqual(result['observation'], 'unknown')
+            self.assertNotIn('selection', result)
+            self.assertEqual(len(peer.requests), 1)
+        for reason in ['all_workers_busy', {'no_admissible_workers': 'insufficient_total_slots=1'}]:
+            with self.subTest(reason=reason), Peer(reply(None, reason)) as peer:
+                code, result = self.run_cli(peer.endpoint, value=value)
+            self.assertEqual(code, 1)
+            self.assertEqual(result['selection']['reason'], reason)
+            self.assertEqual(len(peer.requests), 1)
+
+    def test_json_escaped_reflected_credentials_never_reach_cli_output(self):
+        # These printable token bytes are accepted by the existing token-file
+        # and header contracts. Searching only serialized JSON misses them.
+        for index, secret in enumerate(['quote"token', r'backslash\token', 'both\\"token']):
+            token_path = self.root / ('escaped-token-' + str(index))
+            token_path.write_text(secret + '\n')
+            token_path.chmod(0o600)
+            for location in ['reason', 'nested_value', 'nested_key']:
+                reflected = reply()
+                if location == 'reason':
+                    reflected = reply(None, {'selection_error': 'peer echoed ' + secret})
+                else:
+                    reflected['selection']['diagnostics'] = {
+                        'required_runtime': 'rust', 'estimated_cores': 3, 'workers': [],
+                        'detail': {secret: 'value'} if location == 'nested_key' else [[secret]],
+                    }
+                with self.subTest(secret=secret, location=location), Peer(reflected) as peer:
+                    completed = subprocess.run(
+                        [sys.executable, str(SCRIPT), '--endpoint', peer.endpoint,
+                         '--token-file', str(token_path)], input=client.encode(request()),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=7, check=False,
+                    )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(json.loads(completed.stdout), {
+                    'protocol_version': 1, 'observation': 'unknown',
+                    'execution_authorized': False, 'error': 'credential_in_response',
+                })
+                self.assertEqual(completed.stderr, b'')
+                self.assertEqual(len(peer.requests), 1)
+                self.assertEqual(peer.requests[0][2]['Authorization'], 'Bearer ' + secret)
+
+    def test_json_sensitive_token_without_reflection_still_observes_the_worker(self):
+        secret = 'quote"and\\slash-private-token'
+        token_path = self.root / 'unreflected-escaped-token'
+        token_path.write_text(secret + '\n')
+        token_path.chmod(0o600)
+        with Peer() as peer:
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPT), '--endpoint', peer.endpoint,
+                 '--token-file', str(token_path)], input=client.encode(request()),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=7, check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)['observation'], 'available')
+        self.assertIs(json.loads(completed.stdout)['execution_authorized'], False)
+        self.assertEqual(len(peer.requests), 1)
 
     def test_old_protocol_bad_json_duplicate_fields_and_nonfinite_data_refuse(self):
         invalid = [client.encode(reply()['selection']), b'{', b'\xff',
