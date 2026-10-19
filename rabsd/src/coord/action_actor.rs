@@ -950,6 +950,48 @@ impl ActionActor {
         self.foreground_interest
     }
 
+    /// Cancel and drain an in-flight low-value speculative generation when
+    /// pressure crosses the hard threshold (bead Q006; plan §78, §84; I012).
+    ///
+    /// Returns `Some(generation_id)` if an active optional-only, non-near-complete
+    /// generation was closed and drained, or `None` if foreground interest suspends
+    /// brownout, no generation is active, or the attempt is already near-complete.
+    pub fn cancel_low_value_speculation_under_pressure(
+        &mut self,
+        pressure: rabs_scheduler::speculation_brownout::PressureBand,
+    ) -> Option<ActionGenerationId> {
+        use rabs_scheduler::speculation_brownout::{BrownoutDecision, WorkCategory, decide};
+        if self.brownout_suspended() {
+            let _ = decide(WorkCategory::Foreground, pressure);
+            return None;
+        }
+        if decide(WorkCategory::RunningLowValueSpeculation, pressure)
+            != BrownoutDecision::CancelAndDrain
+        {
+            return None;
+        }
+        let generation_id = self.active_generation.as_ref()?.generation_id;
+        let process_already_exited = self.attempts.values().any(|attempt| {
+            attempt.generation == generation_id
+                && matches!(
+                    attempt.state,
+                    AttemptState::ProcessExited
+                        | AttemptState::HarvestingOutputs
+                        | AttemptState::UploadingOutputs
+                        | AttemptState::VerifyingOutputs
+                        | AttemptState::HarvestingCanonicalObservations
+                        | AttemptState::VerifyingFailure
+                        | AttemptState::PreparedResultOffered
+                )
+        });
+        if process_already_exited {
+            return None;
+        }
+        self.push(EventKind::Cancelled);
+        self.close_generation(generation_id);
+        Some(generation_id)
+    }
+
     /// Requirement filtering for ONE subscriber against the committed
     /// winner's attestation (G004 acceptance): identity mismatches refuse
     /// outright; an evidence shortfall stays satisfiable through

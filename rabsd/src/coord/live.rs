@@ -55,6 +55,9 @@ use rabs_key::action_key::{action_input_manifest_digest, compute_action_key};
 use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
+use rabs_protocol::dashboards::{
+    SpeculationRoiPanel, SpeculationRunOutcome, SpeculationRunRecord, build_speculation_roi,
+};
 use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
 use rabs_protocol::generation::{
     AttemptAuthority, AttemptId, ExecutionLeaseId, LeaseRenewal, LeaseRenewalSeq,
@@ -68,7 +71,9 @@ use rabs_protocol::result_identity::{CanonicalActionResultManifest, DigestAlgori
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
-use rabs_scheduler::speculation_brownout::{BrownoutDecision, PressureBand, WorkCategory, decide};
+use rabs_scheduler::speculation_brownout::{
+    BrownoutDecision, PressureBand, SpeculationProvenance, WorkCategory, band, decide,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -877,6 +882,16 @@ impl ActionSubmission {
         }
         Ok(backing)
     }
+
+    /// Total projected source bytes across validated inputs (for Q009 transfer/storage cost accounting).
+    #[must_use]
+    pub fn source_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .filter_map(|file| self.source.file_bytes(&file.root, &file.relative))
+            .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add)
+    }
 }
 
 fn source_component(value: &str) -> bool {
@@ -898,6 +913,9 @@ struct SubmittedActor {
     input: Arc<ActionSubmission>,
     state: DispatchState,
     order: u64,
+    started_as_speculative: bool,
+    promoted_from_speculation: bool,
+    started_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -1090,6 +1108,8 @@ pub struct CoordLive {
     /// Actual keyed actors and dispatch ownership; shared by all subscriber kinds.
     submissions: Mutex<ActionSubmissions>,
     speculation_pressure: Mutex<Option<PressureBand>>,
+    speculation_provenance: Mutex<SpeculationProvenance>,
+    speculation_runs: Mutex<Vec<SpeculationRunRecord>>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -1298,17 +1318,145 @@ impl CoordLive {
         }
     }
 
-    /// Set optional-work admission pressure. Foreground joins remain eligible.
-    /// Already-started work is not cancelled here (Q006 owns that policy).
+    /// Set optional-work admission and execution pressure (bead Q006; I012).
+    ///
+    /// - `PressureBand::Soft`: stops admitting new speculative/optional work;
+    ///   already-running speculative work finishes.
+    /// - `PressureBand::Hard`: stops admitting new speculative/optional work
+    ///   AND cancels/drains running low-value speculative work (tombstoning its
+    ///   durable generation in the store), while foreground-promoted work and
+    ///   cleanup/object-integrity work remain unaffected.
     pub fn set_speculation_pressure(
         &self,
         pressure: PressureBand,
     ) -> Result<(), SubmissionRefusal> {
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let mut cancelled_runs: Vec<SpeculationRunRecord> = Vec::new();
+        if decide(WorkCategory::RunningLowValueSpeculation, pressure)
+            == BrownoutDecision::CancelAndDrain
+        {
+            let mut to_tombstone: Vec<u128> = Vec::new();
+            for entry in submissions.entries.values_mut() {
+                if !matches!(entry.state, DispatchState::Started(_)) {
+                    continue;
+                }
+                if let Some(generation_id) = entry
+                    .actor
+                    .cancel_low_value_speculation_under_pressure(pressure)
+                {
+                    to_tombstone.push(generation_id.0);
+                    let elapsed_ms = entry.started_at.take().map_or(1, |started| {
+                        u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX)
+                            .max(1)
+                    });
+                    let bytes = entry.input.source_bytes();
+                    entry.state = DispatchState::Queued;
+                    cancelled_runs.push(SpeculationRunRecord {
+                        outcome: SpeculationRunOutcome::CancelledUnderPressure,
+                        saved_foreground_latency_ms: 0,
+                        execution_cost_ms: elapsed_ms,
+                        transfer_cost_bytes: bytes,
+                        storage_cost_bytes: bytes,
+                    });
+                }
+            }
+            if !to_tombstone.is_empty()
+                && let Some(cas) = self.cas.as_ref()
+            {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| SubmissionRefusal::Unavailable)?;
+                for generation_id in to_tombstone {
+                    store.tombstone_generation(generation_id).map_err(|error| {
+                        SubmissionRefusal::Admission(format!(
+                            "pressure generation cleanup: {error:?}"
+                        ))
+                    })?;
+                }
+            }
+        }
         *self
             .speculation_pressure
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)? = Some(pressure);
+        if !cancelled_runs.is_empty() {
+            let mut provenance = self
+                .speculation_provenance
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            for _ in 0..cancelled_runs.len() {
+                provenance.record(BrownoutDecision::CancelAndDrain, true);
+            }
+            drop(provenance);
+            self.speculation_runs
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?
+                .extend(cancelled_runs);
+        }
         Ok(())
+    }
+
+    /// Classify raw pressure permille against soft/hard thresholds and apply
+    /// the resulting [`PressureBand`] (bead Q006; I012).
+    pub fn apply_speculation_pressure_permille(
+        &self,
+        pressure_permille: u16,
+        soft_threshold: u16,
+        hard_threshold: u16,
+    ) -> Result<PressureBand, SubmissionRefusal> {
+        let classified = band(pressure_permille, soft_threshold, hard_threshold);
+        self.set_speculation_pressure(classified)?;
+        Ok(classified)
+    }
+
+    /// Current speculation pressure band (`PressureBand::Normal` by default).
+    pub fn speculation_pressure(&self) -> Result<PressureBand, SubmissionRefusal> {
+        Ok(self
+            .speculation_pressure
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .unwrap_or(PressureBand::Normal))
+    }
+
+    /// Whether a work category is admitted under current pressure (cleanup and
+    /// object-integrity work remain required at every band; bead Q006 / I012).
+    pub fn work_category_admitted(
+        &self,
+        category: WorkCategory,
+    ) -> Result<bool, SubmissionRefusal> {
+        let pressure = self.speculation_pressure()?;
+        Ok(decide(category, pressure) == BrownoutDecision::Admit)
+    }
+
+    /// Snapshot of speculation brownout provenance accounting (bead Q006 / I012).
+    pub fn speculation_provenance(&self) -> Result<SpeculationProvenance, SubmissionRefusal> {
+        Ok(*self
+            .speculation_provenance
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?)
+    }
+
+    /// Snapshot of recorded speculation run provenance records (bead Q009).
+    pub fn speculation_runs(&self) -> Result<Vec<SpeculationRunRecord>, SubmissionRefusal> {
+        Ok(self
+            .speculation_runs
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .clone())
+    }
+
+    /// Build the [`SpeculationRoiPanel`] from live speculation provenance runs (bead Q009).
+    pub fn speculation_roi_panel(&self) -> Result<SpeculationRoiPanel, SubmissionRefusal> {
+        let runs = self
+            .speculation_runs
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        Ok(build_speculation_roi(&runs))
     }
 
     fn optional_admitted(&self) -> Result<bool, SubmissionRefusal> {
@@ -1320,6 +1468,24 @@ impl CoordLive {
             WorkCategory::NewSpeculation,
             pressure.unwrap_or(PressureBand::Normal),
         ) == BrownoutDecision::Admit)
+    }
+
+    fn record_brownout_refusal(&self) -> Result<(), SubmissionRefusal> {
+        self.speculation_provenance
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .record(BrownoutDecision::StopAdmitting, false);
+        self.speculation_runs
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .push(SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::AdmissionRefusedBrownout,
+                saved_foreground_latency_ms: 0,
+                execution_cost_ms: 0,
+                transfer_cost_bytes: 0,
+                storage_cost_bytes: 0,
+            });
+        Ok(())
     }
 
     /// Submit a cache-miss demand to the ONE coordinator actor registry. Both
@@ -1342,6 +1508,7 @@ impl CoordLive {
             SubscriberKind::Speculative | SubscriberKind::GitPrewarm
         );
         if optional && !self.optional_admitted()? {
+            self.record_brownout_refusal()?;
             return Err(SubmissionRefusal::Brownout);
         }
         // Caller-provided numeric priority cannot make optional work compete in
@@ -1373,7 +1540,11 @@ impl CoordLive {
             {
                 return Err(SubmissionRefusal::ChangedRequirements);
             }
+            let was_optional_only = !entry.actor.has_foreground_interest();
             let join = entry.actor.join(request, now_unix_micros, clock_epoch);
+            if was_optional_only && entry.actor.has_foreground_interest() {
+                entry.promoted_from_speculation = true;
+            }
             return Ok(SubmissionReceipt {
                 action_key: key,
                 actor_created: false,
@@ -1419,6 +1590,9 @@ impl CoordLive {
                 input: Arc::new(input),
                 state: DispatchState::Queued,
                 order,
+                started_as_speculative: optional,
+                promoted_from_speculation: false,
+                started_at: None,
             },
         );
         Ok(SubmissionReceipt {
@@ -1505,6 +1679,7 @@ impl CoordLive {
             return Err(SubmissionRefusal::StaleDispatch);
         }
         if !entry.actor.has_foreground_interest() && !self.optional_admitted()? {
+            self.record_brownout_refusal()?;
             return Err(SubmissionRefusal::Brownout);
         }
         // Allocate against durable history rather than the process clock. Only
@@ -1577,6 +1752,7 @@ impl CoordLive {
         }
         entry.actor = actor;
         entry.state = DispatchState::Started(serial);
+        entry.started_at = Some(Instant::now());
         Ok(authority)
     }
 
@@ -1675,6 +1851,34 @@ impl CoordLive {
             return Err(SubmissionRefusal::StaleDispatch);
         }
         entry.state = DispatchState::Finished;
+        if entry.started_as_speculative {
+            let elapsed_ms = entry.started_at.take().map_or(1, |started| {
+                u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+            });
+            let bytes = entry.input.source_bytes();
+            let outcome =
+                if entry.promoted_from_speculation || entry.actor.has_foreground_interest() {
+                    SpeculationRunOutcome::PromotedToForeground
+                } else {
+                    SpeculationRunOutcome::SavedCompleted
+                };
+            self.speculation_provenance
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?
+                .record_completed();
+            self.speculation_runs
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?
+                .push(SpeculationRunRecord {
+                    outcome,
+                    saved_foreground_latency_ms: elapsed_ms,
+                    execution_cost_ms: elapsed_ms,
+                    transfer_cost_bytes: bytes,
+                    storage_cost_bytes: bytes,
+                });
+        }
         Ok(())
     }
 
@@ -1748,6 +1952,16 @@ impl CoordLive {
             .submissions
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let pressure = self
+            .speculation_pressure
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .unwrap_or(PressureBand::Normal);
+        debug_assert_eq!(
+            decide(WorkCategory::Cleanup, pressure),
+            BrownoutDecision::Admit,
+            "cleanup work must remain required under every pressure band"
+        );
         if !submissions
             .entries
             .get(key)
@@ -3652,5 +3866,228 @@ mod tests {
                 expires_at_own_monotonic_ms: 600,
             })
         );
+    }
+
+    #[test]
+    fn speculation_browns_out_before_foreground() {
+        use rabs_action::state_machines::AttemptState;
+
+        let (_state, coord) = submission_coordinator();
+        let (_live, source, manifest, base_descriptor) = source_fixture();
+        let worker = worker_offer(1, 1);
+        coord.admit_worker_session(&worker).unwrap();
+        let lease_ttl_ms = 60_000;
+
+        let desc_with_tag = |tag: u8| {
+            let mut d = base_descriptor.clone();
+            d.normalized_invocation.bytes[0] = tag;
+            d
+        };
+
+        // 1. Normal pressure: speculative S1 starts and finishes before pressure (saved).
+        assert_eq!(
+            coord
+                .apply_speculation_pressure_permille(100, 600, 850)
+                .unwrap(),
+            PressureBand::Normal
+        );
+        let s1_desc = desc_with_tag(1);
+        let s1 = coord
+            .submit_action(
+                submission(&source, &manifest, &s1_desc),
+                request(1, SubscriberKind::Speculative, 10),
+                1,
+                0,
+            )
+            .unwrap();
+        let mut s1_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let _s1_auth = s1_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+            AttemptState::ProcessExited,
+            AttemptState::Draining,
+            AttemptState::Finished,
+        ] {
+            s1_dispatch.advance(state).unwrap();
+        }
+        s1_dispatch.complete().unwrap();
+
+        // Start S2 (speculative, then joined by ForegroundAgent -> promoted) and S3 (low-value speculative).
+        let s2_desc = desc_with_tag(2);
+        let s2 = coord
+            .submit_action(
+                submission(&source, &manifest, &s2_desc),
+                request(2, SubscriberKind::Speculative, 10),
+                2,
+                0,
+            )
+            .unwrap();
+        let mut s2_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let _s2_auth = s2_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+        ] {
+            s2_dispatch.advance(state).unwrap();
+        }
+        // Foreground subscriber joins S2 while running -> suspends brownout on S2.
+        let s2_fg = coord
+            .submit_action(
+                submission(&source, &manifest, &s2_desc),
+                request(20, SubscriberKind::ForegroundAgent, 200),
+                3,
+                0,
+            )
+            .unwrap();
+        assert!(!s2_fg.actor_created);
+
+        let s3_desc = desc_with_tag(3);
+        let s3 = coord
+            .submit_action(
+                submission(&source, &manifest, &s3_desc),
+                request(3, SubscriberKind::Speculative, 10),
+                4,
+                0,
+            )
+            .unwrap();
+        let mut s3_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let s3_auth = s3_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        s3_dispatch.advance(AttemptState::LeaseAccepted).unwrap();
+
+        // 2. Soft pressure: new speculation stops admitting; running S3 survives; foreground admits.
+        assert_eq!(
+            coord
+                .apply_speculation_pressure_permille(650, 600, 850)
+                .unwrap(),
+            PressureBand::Soft
+        );
+        let s4_desc = desc_with_tag(4);
+        assert_eq!(
+            coord
+                .submit_action(
+                    submission(&source, &manifest, &s4_desc),
+                    request(4, SubscriberKind::Speculative, 10),
+                    5,
+                    0,
+                )
+                .unwrap_err(),
+            SubmissionRefusal::Brownout
+        );
+        // Running S3 is NOT cancelled at Soft: it can still advance.
+        s3_dispatch.advance(AttemptState::AwaitingInputs).unwrap();
+        s3_dispatch.advance(AttemptState::Materializing).unwrap();
+        s3_dispatch.advance(AttemptState::Running).unwrap();
+
+        // Foreground F1 admits and starts under Soft pressure.
+        let f1_desc = desc_with_tag(5);
+        let f1 = coord
+            .submit_action(
+                submission(&source, &manifest, &f1_desc),
+                request(5, SubscriberKind::ForegroundAgent, 200),
+                6,
+                0,
+            )
+            .unwrap();
+        let mut f1_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        assert_eq!(f1_dispatch.input().key(), f1.action_key);
+        let _f1_auth = f1_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+        ] {
+            f1_dispatch.advance(state).unwrap();
+        }
+
+        // 3. Hard pressure: low-value running speculation S3 cancels and drains;
+        //    promoted S2, foreground F1, and cleanup/integrity work remain unaffected.
+        assert_eq!(
+            coord
+                .apply_speculation_pressure_permille(900, 600, 850)
+                .unwrap(),
+            PressureBand::Hard
+        );
+        assert!(
+            coord
+                .work_category_admitted(WorkCategory::Foreground)
+                .unwrap()
+        );
+        assert!(coord.work_category_admitted(WorkCategory::Cleanup).unwrap());
+        assert!(
+            coord
+                .work_category_admitted(WorkCategory::ObjectIntegrity)
+                .unwrap()
+        );
+
+        // S3's attempt was transitioned to Draining, its generation closed and durably tombstoned.
+        let s3_actor = coord.submitted_actor(&s3.action_key).unwrap().unwrap();
+        assert!(s3_actor.active_generation().is_none());
+        assert_eq!(
+            s3_actor.attempts().next().unwrap().state,
+            AttemptState::Draining
+        );
+        assert_eq!(
+            s3_dispatch
+                .advance(AttemptState::ProcessExited)
+                .unwrap_err(),
+            SubmissionRefusal::StaleDispatch
+        );
+        assert!(matches!(
+            coord.renew_attempt_lease(
+                &s3_auth,
+                LeaseRenewal {
+                    lease: s3_auth.execution_lease_id,
+                    seq: LeaseRenewalSeq(1),
+                },
+                lease_ttl_ms,
+            ),
+            Err(AttemptLeaseRefusal::Store(StoreError::GenerationTombstoned))
+        ));
+        drop(s3_dispatch);
+
+        // Promoted S2 and foreground F1 continue and complete cleanly under Hard pressure.
+        for state in [
+            AttemptState::ProcessExited,
+            AttemptState::Draining,
+            AttemptState::Finished,
+        ] {
+            s2_dispatch.advance(state).unwrap();
+            f1_dispatch.advance(state).unwrap();
+        }
+        s2_dispatch.complete().unwrap();
+        f1_dispatch.complete().unwrap();
+
+        // Cleanup (`retire_finished_action`) succeeds under Hard pressure.
+        assert!(coord.retire_finished_action(&s1.action_key).unwrap());
+        assert!(coord.retire_finished_action(&s2.action_key).unwrap());
+        assert!(coord.retire_finished_action(&f1.action_key).unwrap());
+
+        // Provenance and Q009 ROI dashboard reflect exact runs (1 saved completed,
+        // 1 promoted to foreground, 1 cancelled under pressure, 1 admission refused).
+        let provenance = coord.speculation_provenance().unwrap();
+        assert_eq!(
+            provenance,
+            SpeculationProvenance {
+                wasted_cancelled: 1,
+                saved_completed: 2,
+                admissions_refused: 1,
+            }
+        );
+        let roi = coord.speculation_roi_panel().unwrap();
+        assert_eq!(roi.promoted, 1);
+        assert_eq!(roi.cancelled, 1);
+        assert_eq!(roi.wasted, 1);
+        assert_eq!(roi.saved, 2);
+        assert_eq!(roi.admissions_refused, 1);
+        assert!(roi.saved_foreground_latency_ms >= 2);
+        assert!(roi.wasted_execution_cost_ms >= 1);
+        assert!(roi.wasted_transfer_cost_bytes > 0);
+        assert!(roi.wasted_storage_cost_bytes > 0);
     }
 }

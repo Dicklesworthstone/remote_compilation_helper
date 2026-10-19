@@ -275,6 +275,187 @@ pub struct VerificationPanel {
     pub divergences: u64,
 }
 
+/// Terminal provenance disposition of one speculative action run (bead Q009; plan §78, §97).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculationRunOutcome {
+    /// Speculation completed before foreground demand or pressure and saved foreground latency.
+    SavedCompleted,
+    /// Speculation was joined or promoted by a foreground subscriber in flight without restart.
+    PromotedToForeground,
+    /// Speculation was cancelled mid-flight under hard pressure (wasted execution/transfer/storage).
+    CancelledUnderPressure,
+    /// Speculation completed or expired without ever serving a foreground subscriber (wasted work).
+    WastedUnused,
+    /// Speculative admission was shed at the soft/hard brownout gate before starting (zero cost).
+    AdmissionRefusedBrownout,
+}
+
+/// Provenance accounting record for one speculative action run feeding the ROI dashboard (bead Q009).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculationRunRecord {
+    /// Terminal provenance disposition of the speculative run.
+    pub outcome: SpeculationRunOutcome,
+    /// Foreground wall-clock latency saved by this run (ms); 0 when wasted/cancelled/refused.
+    pub saved_foreground_latency_ms: u64,
+    /// Execution time spent by this speculative attempt (ms).
+    pub execution_cost_ms: u64,
+    /// Network/IPC transfer bytes consumed by this speculative attempt.
+    pub transfer_cost_bytes: u64,
+    /// CAS/staging storage bytes consumed by this speculative attempt.
+    pub storage_cost_bytes: u64,
+}
+
+/// Speculation ROI dashboard panel (bead Q009; plan §78, §97, §164, R16).
+///
+/// Accounts for saved foreground latency vs wasted execution/transfer/storage
+/// cost and promoted/cancelled/wasted/saved counts from provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeculationRoiPanel {
+    /// Speculative runs promoted to foreground interest in flight.
+    pub promoted: u64,
+    /// Speculative runs cancelled mid-flight under pressure.
+    pub cancelled: u64,
+    /// Total wasted speculative runs (`CancelledUnderPressure` + `WastedUnused`).
+    pub wasted: u64,
+    /// Total saved speculative runs (`SavedCompleted` + `PromotedToForeground`).
+    pub saved: u64,
+    /// Speculative admissions refused at the brownout gate before execution.
+    pub admissions_refused: u64,
+    /// Total foreground latency saved across saved/promoted runs (ms).
+    pub saved_foreground_latency_ms: u64,
+    /// Nearest-rank p50 of saved foreground latency across executed speculative runs (ms).
+    pub saved_p50_ms: u64,
+    /// Nearest-rank p95 of saved foreground latency across executed speculative runs (ms).
+    pub saved_p95_ms: u64,
+    /// Total execution time spent across all executed speculative runs (ms).
+    pub total_execution_cost_ms: u64,
+    /// Execution time spent on cancelled or unused speculative runs (ms).
+    pub wasted_execution_cost_ms: u64,
+    /// Transfer bytes spent on cancelled or unused speculative runs.
+    pub wasted_transfer_cost_bytes: u64,
+    /// Storage bytes spent on cancelled or unused speculative runs.
+    pub wasted_storage_cost_bytes: u64,
+    /// Net latency minus wasted execution cost (`saved_foreground_latency_ms - wasted_execution_cost_ms`).
+    pub net_saved_minus_wasted_exec_ms: i64,
+    /// Useful speculative work rate in permille (`saved * 1000 / (saved + wasted)`).
+    pub useful_work_permille: u32,
+    /// Whether speculation delivered strictly positive p95 value and positive net ROI (feeds Q010).
+    pub positive_p95_value: bool,
+}
+
+/// Compute [`SpeculationRoiPanel`] deterministically from provenance run records (bead Q009).
+#[must_use]
+pub fn build_speculation_roi(runs: &[SpeculationRunRecord]) -> SpeculationRoiPanel {
+    let mut promoted = 0_u64;
+    let mut cancelled = 0_u64;
+    let mut wasted = 0_u64;
+    let mut saved = 0_u64;
+    let mut admissions_refused = 0_u64;
+    let mut saved_foreground_latency_ms = 0_u64;
+    let mut total_execution_cost_ms = 0_u64;
+    let mut wasted_execution_cost_ms = 0_u64;
+    let mut wasted_transfer_cost_bytes = 0_u64;
+    let mut wasted_storage_cost_bytes = 0_u64;
+    let mut net_samples_ms: Vec<i64> = Vec::new();
+
+    for run in runs {
+        match run.outcome {
+            SpeculationRunOutcome::SavedCompleted => {
+                saved += 1;
+                saved_foreground_latency_ms =
+                    saved_foreground_latency_ms.saturating_add(run.saved_foreground_latency_ms);
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                net_samples_ms
+                    .push(i64::try_from(run.saved_foreground_latency_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::PromotedToForeground => {
+                promoted += 1;
+                saved += 1;
+                saved_foreground_latency_ms =
+                    saved_foreground_latency_ms.saturating_add(run.saved_foreground_latency_ms);
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                net_samples_ms
+                    .push(i64::try_from(run.saved_foreground_latency_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::CancelledUnderPressure => {
+                cancelled += 1;
+                wasted += 1;
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_execution_cost_ms =
+                    wasted_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_transfer_cost_bytes =
+                    wasted_transfer_cost_bytes.saturating_add(run.transfer_cost_bytes);
+                wasted_storage_cost_bytes =
+                    wasted_storage_cost_bytes.saturating_add(run.storage_cost_bytes);
+                net_samples_ms.push(-i64::try_from(run.execution_cost_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::WastedUnused => {
+                wasted += 1;
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_execution_cost_ms =
+                    wasted_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_transfer_cost_bytes =
+                    wasted_transfer_cost_bytes.saturating_add(run.transfer_cost_bytes);
+                wasted_storage_cost_bytes =
+                    wasted_storage_cost_bytes.saturating_add(run.storage_cost_bytes);
+                net_samples_ms.push(-i64::try_from(run.execution_cost_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::AdmissionRefusedBrownout => {
+                admissions_refused += 1;
+            }
+        }
+    }
+
+    let mut saved_samples: Vec<u64> =
+        runs.iter()
+            .filter(|r| !matches!(r.outcome, SpeculationRunOutcome::AdmissionRefusedBrownout))
+            .map(|r| match r.outcome {
+                SpeculationRunOutcome::SavedCompleted
+                | SpeculationRunOutcome::PromotedToForeground => r.saved_foreground_latency_ms,
+                SpeculationRunOutcome::CancelledUnderPressure
+                | SpeculationRunOutcome::WastedUnused => 0,
+                SpeculationRunOutcome::AdmissionRefusedBrownout => 0,
+            })
+            .collect();
+    saved_samples.sort_unstable();
+    let saved_p50_ms = percentile(&saved_samples, 50);
+    let saved_p95_ms = percentile(&saved_samples, 95);
+
+    net_samples_ms.sort_unstable();
+    // Lower-tail (5th percentile, i.e. 95% of executed speculative runs do at least this well)
+    // and net ROI check for Q010 gating.
+    let executed_total = saved + wasted;
+    let useful_work_permille =
+        u32::try_from((saved * 1_000).checked_div(executed_total).unwrap_or(0)).unwrap_or(0);
+    let net_saved_minus_wasted_exec_ms = i64::try_from(saved_foreground_latency_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::try_from(wasted_execution_cost_ms).unwrap_or(i64::MAX));
+    let positive_p95_value =
+        saved_p95_ms > 0 && net_saved_minus_wasted_exec_ms > 0 && useful_work_permille >= 500;
+
+    SpeculationRoiPanel {
+        promoted,
+        cancelled,
+        wasted,
+        saved,
+        admissions_refused,
+        saved_foreground_latency_ms,
+        saved_p50_ms,
+        saved_p95_ms,
+        total_execution_cost_ms,
+        wasted_execution_cost_ms,
+        wasted_transfer_cost_bytes,
+        wasted_storage_cost_bytes,
+        net_saved_minus_wasted_exec_ms,
+        useful_work_permille,
+        positive_p95_value,
+    }
+}
+
 /// The dashboard: every panel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Dashboard {
@@ -296,6 +477,8 @@ pub struct Dashboard {
     pub storage: StoragePanel,
     /// Verification status.
     pub verification: VerificationPanel,
+    /// Speculation ROI accounting (bead Q009).
+    pub speculation_roi: SpeculationRoiPanel,
 }
 
 /// Nearest-rank percentile over sorted samples.
@@ -328,6 +511,8 @@ pub struct MetricInputs {
     pub storage: (u64, u64, u64),
     /// Verification (runs, passed, divergences).
     pub verification: (u64, u64, u64),
+    /// Provenance speculation run records feeding [`SpeculationRoiPanel`] (bead Q009).
+    pub speculation_runs: Vec<SpeculationRunRecord>,
 }
 
 /// Build every panel from the inputs.
@@ -426,6 +611,7 @@ pub fn build(inputs: &MetricInputs) -> Dashboard {
             passed: inputs.verification.1,
             divergences: inputs.verification.2,
         },
+        speculation_roi: build_speculation_roi(&inputs.speculation_runs),
     }
 }
 
@@ -534,6 +720,7 @@ mod tests {
             transfer: (10_000_000, 2_500_000),
             storage: (4_000_000_000, 120, 2),
             verification: (500, 499, 1),
+            speculation_runs: Vec::new(),
         }
     }
 
@@ -796,5 +983,65 @@ mod tests {
         assert_eq!(percentile(&[7], 50), 7);
         assert_eq!(percentile(&[1, 2, 3, 4], 50), 2);
         assert_eq!(percentile(&[1, 2, 3, 4], 99), 4);
+    }
+
+    #[test]
+    fn q009_speculation_roi_dashboard_accounts_saved_promoted_cancelled_wasted() {
+        let inputs = MetricInputs {
+            speculation_runs: vec![
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::SavedCompleted,
+                    saved_foreground_latency_ms: 420,
+                    execution_cost_ms: 420,
+                    transfer_cost_bytes: 16_384,
+                    storage_cost_bytes: 32_768,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::PromotedToForeground,
+                    saved_foreground_latency_ms: 280,
+                    execution_cost_ms: 500,
+                    transfer_cost_bytes: 8_192,
+                    storage_cost_bytes: 16_384,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::CancelledUnderPressure,
+                    saved_foreground_latency_ms: 0,
+                    execution_cost_ms: 90,
+                    transfer_cost_bytes: 4_096,
+                    storage_cost_bytes: 2_048,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::WastedUnused,
+                    saved_foreground_latency_ms: 0,
+                    execution_cost_ms: 60,
+                    transfer_cost_bytes: 1_024,
+                    storage_cost_bytes: 1_024,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::AdmissionRefusedBrownout,
+                    saved_foreground_latency_ms: 0,
+                    execution_cost_ms: 0,
+                    transfer_cost_bytes: 0,
+                    storage_cost_bytes: 0,
+                },
+            ],
+            ..MetricInputs::default()
+        };
+        let dash = build(&inputs);
+        let roi = &dash.speculation_roi;
+        assert_eq!(roi.promoted, 1);
+        assert_eq!(roi.cancelled, 1);
+        assert_eq!(roi.wasted, 2);
+        assert_eq!(roi.saved, 2);
+        assert_eq!(roi.admissions_refused, 1);
+        assert_eq!(roi.saved_foreground_latency_ms, 700);
+        assert_eq!(roi.total_execution_cost_ms, 1070);
+        assert_eq!(roi.wasted_execution_cost_ms, 150);
+        assert_eq!(roi.wasted_transfer_cost_bytes, 5_120);
+        assert_eq!(roi.wasted_storage_cost_bytes, 3_072);
+        assert_eq!(roi.net_saved_minus_wasted_exec_ms, 550);
+        assert_eq!(roi.useful_work_permille, 500);
+        assert_eq!(roi.saved_p95_ms, 420);
+        assert!(roi.positive_p95_value);
     }
 }
