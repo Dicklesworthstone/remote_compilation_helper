@@ -160,21 +160,33 @@ remote production from cache replay, and checks later sampling and an
 environment-driven key change.
 
 A second fixture lets actual Cargo choose the compiler arguments, working
-directory, jobserver and loader environment. It builds a generated vendored
-registry dependency and a consuming library entirely offline:
+directory, jobserver and loader environment. It builds an entirely offline
+vendored registry graph: leaf, middle, top, then the primary consumer. Top
+depends directly only on middle but constructs a type defined in leaf and
+re-exported by middle, requiring rustc to resolve transitive metadata:
 
 ```sh
 RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
 RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
   cargo test -p rabsd --test prepared_operation_live \
-    actual_offline_cargo_check_uses_remote_leaf_then_replays \
+    actual_offline_cargo_check_uses_remote_dependency_dag_then_replays \
     -- --ignored --nocapture
 ```
 
-That case compares both crates' metadata and dep-info bytes with stock Cargo at
-the same output paths, follows Cargo's artifact messages across target layouts,
-and requires actual remote worker receipts followed by qualified cache replay.
-It selects the installed Cargo and its matching compiler explicitly; ordinary
+That case compares all eight metadata and dep-info outputs with stock Cargo at
+the same paths and follows Cargo's artifact messages to locate each result.
+It tracks each dependency's distinct action key, requires three actual remote
+qualification observations per dependency, and then requires a complete Cargo
+run serving all three from cache without advancing the worker's durable
+receipt. Terminal events are associated with the crate that admitted their
+action key; one crate's successful execution cannot stand in for another's.
+Toolchain warmup may let different nodes start qualification on different runs.
+
+This DAG oracle requires Cargo's supported disjoint input/output layout.
+A Cargo layout sharing one populated dependency/output directory is currently
+outside the remote class and fails the oracle's remote-admission assertion.
+The fixture does not rewrite compiler arguments to hide that limitation. It
+selects the installed Cargo and its matching compiler explicitly; ordinary
 rustup-based Cargo use can select that compiler itself. Both integration
 fixtures are ignored by default and must be run on the supported host to
 establish execution evidence. Their presence alone does not assert a successful
