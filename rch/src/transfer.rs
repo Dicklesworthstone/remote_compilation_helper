@@ -830,8 +830,9 @@ fn pooled_target_prune_max_age_mins(idle_hours: u32) -> Option<u64> {
 /// `.rch-target-*-pool-*` stores cannot grow without bound or feed stale
 /// manifests into later builds (bd-wfumv). All sweeps are age-bounded
 /// `-maxdepth 1` finds; age alone is not proof that a job has stopped using a
-/// directory. Durable source-granted uploads omit this prefix entirely via
-/// `source_sync_prune_prefix`, as they also omit sibling-target pruning.
+/// directory. Durable source-granted uploads omit this prefix via
+/// `source_sync_prune_prefix`, as they also omit sibling-target pruning; they
+/// get only [`worker_tmp_guarded_prune_prefix`] for their `.rch-tmp/`.
 /// Transfers without durable source grants retain these configured sweeps.
 /// Failures are swallowed — pruning is opportunistic and must never fail a transfer.
 fn worker_cache_prune_rsync_path_prefix(
@@ -864,6 +865,42 @@ fn worker_cache_prune_rsync_path_prefix(
         }
     }
     prefix
+}
+
+/// Minimum minutes between two guarded TMPDIR sweeps of one durable mirror.
+const WORKER_TMP_GUARDED_PRUNE_INTERVAL_MINS: u64 = 60;
+
+/// TMPDIR-only sweep for uploads that carry a durable source grant.
+///
+/// Those uploads skip [`worker_cache_prune_rsync_path_prefix`], because a
+/// source grant does not authorize age-based reclamation of retained data
+/// (pooled targets, durable Cargo caches, sources). Their `.rch-tmp/` is
+/// still per-job TMPDIR scratch, though, and with no sweep at all the test
+/// temp dirs that suites leak piled up in every long-lived mirror: ~158 GB
+/// across 14 workers between 2026-10-11 and 2026-10-19 (music_theory_data_tool
+/// alone 8-19 GB per worker). The operator approved restoring the 24 h
+/// TMPDIR floor for these mirrors, with stronger guards than the ungranted
+/// sweep because the mirror outlives every job:
+///
+/// - only top-level `.rch-tmp/` entries idle 24 h, never `rch-cargo-cache-*`;
+/// - nothing anywhere inside the entry modified within 24 h;
+/// - no `.sbh-protect` marker inside the entry;
+/// - no process (as visible to this user) with a cwd or open fd inside it;
+/// - at most once per [`WORKER_TMP_GUARDED_PRUNE_INTERVAL_MINS`] per mirror,
+///   via a `.rch-prune-stamp` file, so the /proc scan stays off the hot path.
+///
+/// Without /proc (non-Linux workers) the open-file guard sees nothing, so the
+/// age, inner-mtime and marker guards remain. Failures are swallowed — the
+/// sweep must never fail a transfer.
+fn worker_tmp_guarded_prune_prefix(escaped_remote_path: &str) -> String {
+    const TEMPLATE: &str = r#"__rt=@ROOT@/.rch-tmp; if [ -d "$__rt" ] && [ -z "$(find "$__rt/.rch-prune-stamp" -mmin -@INTERVAL@ 2>/dev/null)" ]; then touch "$__rt/.rch-prune-stamp" 2>/dev/null; __rb=$(find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null | grep -F -- "$__rt/" | while IFS= read -r __l; do __r=${__l#"$__rt"/}; printf '%s\n' "${__r%%/*}"; done | sort -u); find "$__rt" -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' ! -name '.rch-prune-stamp' -mmin +@AGE@ -print 2>/dev/null | while IFS= read -r __e; do printf '%s\n' "$__rb" | grep -qxF -- "${__e##*/}" && continue; [ -n "$(find "$__e" \( -mmin -@AGE@ -o -name .sbh-protect \) -print -quit 2>/dev/null)" ] && continue; rm -rf -- "$__e" 2>/dev/null; done; fi; "#;
+    TEMPLATE
+        .replace("@ROOT@", escaped_remote_path)
+        .replace(
+            "@INTERVAL@",
+            &WORKER_TMP_GUARDED_PRUNE_INTERVAL_MINS.to_string(),
+        )
+        .replace("@AGE@", &WORKER_TMP_PRUNE_MAX_AGE_MINS.to_string())
 }
 
 /// Wall-clock budget for the whole post-timeout remote group-kill attempt
@@ -2894,11 +2931,19 @@ impl TransferPipeline {
     }
 
     /// A durable source grant is not permission for opportunistic cache
-    /// reclamation. Keep all transfer-start sweeps out of its activity; source
-    /// synchronization and the explicit retirement protocol remain separate.
+    /// reclamation. Keep the pool and cache sweeps out of its activity; only
+    /// its TMPDIR scratch is swept, under the guards of
+    /// [`worker_tmp_guarded_prune_prefix`]. A fresh owned materialization
+    /// prunes nothing. Source synchronization and the explicit retirement
+    /// protocol remain separate.
     fn source_sync_prune_prefix(&self, escaped_remote_path: &str) -> String {
-        if self.source_authority_prefix.is_some() || self.owned_source_materialization {
+        if self.owned_source_materialization {
             return String::new();
+        }
+        // A durable grant still gets its TMPDIR scratch swept, under guards;
+        // retained data (pools, durable caches, sources) stays untouched.
+        if self.source_authority_prefix.is_some() {
+            return worker_tmp_guarded_prune_prefix(escaped_remote_path);
         }
         worker_cache_prune_rsync_path_prefix(
             escaped_remote_path,
@@ -5105,8 +5150,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Create remote directory implicitly using rsync-path wrapper
         // This saves a separate SSH handshake for 'mkdir -p'. The same remote
-        // shell invocation includes pruning only without a durable
-        // source grant (bd-wfumv); ownership-bound transfers omit all sweeps.
+        // shell invocation includes the configured sweeps only without a
+        // durable source grant (bd-wfumv); granted transfers sweep only their
+        // TMPDIR under guards, and owned materializations sweep nothing.
         cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
             self.source_sync_prune_prefix(escaped_remote_path),
@@ -5166,8 +5212,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
 
         // Create remote directory implicitly using rsync-path wrapper; the
-        // same remote shell invocation includes pruning only without a
-        // durable source grant (bd-wfumv); ownership-bound transfers omit it.
+        // same remote shell invocation includes the configured sweeps only
+        // without a durable source grant (bd-wfumv); granted transfers sweep
+        // only their TMPDIR under guards, owned materializations nothing.
         cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
             self.source_sync_prune_prefix(escaped_remote_path),
@@ -12842,7 +12889,7 @@ Number of files transferred: 42
 
     #[cfg(unix)]
     #[test]
-    fn source_grant_does_not_authorize_transfer_start_or_sibling_pruning() {
+    fn source_grant_sweeps_only_guarded_tmpdir_not_sibling_pools() {
         let directory = tempfile::tempdir().unwrap().keep();
         let pipeline = TransferPipeline::new(
             directory,
@@ -12892,7 +12939,108 @@ Number of files transferred: 42
                 !wrapper.contains("find /worker/sources/current"),
                 "{wrapper}"
             );
+            // Only the guarded TMPDIR sweep: durable caches are excluded, never aged out.
+            assert!(
+                wrapper.contains("__rt=/worker/sources/current/.rch-tmp"),
+                "{wrapper}"
+            );
+            assert!(wrapper.contains(".rch-prune-stamp"), "{wrapper}");
+            assert!(wrapper.contains(".sbh-protect"), "{wrapper}");
+            assert!(wrapper.contains("rch-cargo-cache-*"), "{wrapper}");
+            assert_eq!(wrapper.matches("-mmin +").count(), 1, "{wrapper}");
+            assert!(
+                !wrapper.contains(&format!("-mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}")),
+                "{wrapper}"
+            );
         }
+    }
+
+    /// Runs the guarded TMPDIR sweep against a real directory tree (no rsync,
+    /// no worker): what it removes and what every guard keeps.
+    #[cfg(unix)]
+    #[test]
+    fn guarded_tmpdir_sweep_removes_only_idle_unguarded_entries() {
+        use std::time::{Duration, SystemTime};
+        let old = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+        let age = |path: &Path| {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        let root = tempfile::tempdir().unwrap();
+        let tmp = root.path().join(".rch-tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let file = |name: &str| {
+            let path = tmp.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            path
+        };
+        let dir = |name: &str, inner: &str| {
+            let path = tmp.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join(inner), b"x").unwrap();
+            path
+        };
+        let idle_file = file("idle-file");
+        let idle_dir = dir("idle-dir", "out.log");
+        let fresh_inside = dir("idle-top-fresh-inside", "still-writing");
+        let protected = dir("idle-protected", ".sbh-protect");
+        let cache = dir("rch-cargo-cache-abc", "registry");
+        let fresh = dir("fresh-dir", "out.log");
+        let busy = dir("idle-busy", "out.log");
+        for path in [&idle_file, &protected, &cache] {
+            age(path);
+        }
+        for path in [&idle_dir, &busy] {
+            age(&path.join("out.log"));
+        }
+        age(&protected.join(".sbh-protect"));
+        age(&cache.join("registry"));
+        for path in [&idle_dir, &fresh_inside, &protected, &cache, &busy] {
+            age(path);
+        }
+        // A live process whose cwd is inside `idle-busy` (seen via /proc).
+        let mut holder = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&busy)
+            .spawn()
+            .unwrap();
+
+        let escaped = escape(Cow::from(root.path().to_str().unwrap())).into_owned();
+        let sweep = || {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{}true", worker_tmp_guarded_prune_prefix(&escaped)))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        sweep();
+        holder.kill().ok();
+        holder.wait().ok();
+
+        assert!(!idle_file.exists(), "idle file must be swept");
+        assert!(!idle_dir.exists(), "idle dir must be swept");
+        assert!(fresh_inside.exists(), "a write inside within 24h keeps it");
+        assert!(protected.exists(), ".sbh-protect inside keeps it");
+        assert!(cache.exists(), "durable cargo caches are never swept here");
+        assert!(fresh.exists(), "entries younger than 24h are kept");
+        if cfg!(target_os = "linux") {
+            assert!(busy.exists(), "a process cwd inside keeps it");
+        }
+        assert!(tmp.join(".rch-prune-stamp").exists());
+
+        // Throttle: a fresh stamp suppresses the next sweep...
+        let late = file("idle-after-stamp");
+        age(&late);
+        sweep();
+        assert!(late.exists(), "a sweep within the interval must not run");
+        // ...and an expired stamp lets it run again.
+        age(&tmp.join(".rch-prune-stamp"));
+        sweep();
+        assert!(!late.exists(), "an expired stamp re-enables the sweep");
+        assert!(cache.exists() && protected.exists());
     }
 
     #[cfg(unix)]
@@ -12976,7 +13124,9 @@ Number of files transferred: 42
                             assert!(wrapper.contains(&format!("ab12 {mode} sh -c ")));
                             assert!(wrapper.contains("source grant is not active"));
                             assert!(wrapper.contains("source grant content changed"));
-                            assert!(!wrapper.contains("-mmin +"));
+                            // The guarded TMPDIR age filter is the only aged sweep.
+                            assert_eq!(wrapper.matches("-mmin +").count(), 1, "{wrapper}");
+                            assert!(wrapper.contains(".rch-prune-stamp"));
                             assert!(!wrapper.contains("find /worker/pools"));
                         }
                     }
