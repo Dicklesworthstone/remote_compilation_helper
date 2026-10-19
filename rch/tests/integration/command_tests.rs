@@ -1908,8 +1908,9 @@ impl FallbackGateRun {
 ///
 /// With `resolved_toolchain` the client resolves a Rust toolchain, so the
 /// run reaches the daemon socket and takes the daemon-unavailable exit.
-/// Without it no rustup/rustc is reachable, the client refuses to request a
-/// worker, and the run takes the no-admissible-worker exit.
+/// Without it the project declares no channel and no rustup/rustc is
+/// reachable, so the client refuses to request a worker and the run takes the
+/// no-admissible-worker exit.
 #[cfg(unix)]
 fn run_exec_against_absent_daemon(
     allow_local_fallback: bool,
@@ -1937,6 +1938,16 @@ fn run_exec_against_absent_daemon(
     )
     .unwrap();
     std::fs::write(project.join("src/lib.rs"), "").unwrap();
+    if !resolved_toolchain {
+        // A channel-less declaration shadows any rust-toolchain file above the
+        // temp dir. Under an offloaded run TMPDIR sits inside the synced
+        // checkout, whose own pin would otherwise resolve a toolchain.
+        std::fs::write(
+            project.join("rust-toolchain.toml"),
+            "[toolchain]\ncomponents = [\"rustfmt\"]\n",
+        )
+        .unwrap();
+    }
     let sentinel = root.join("local-cargo-ran");
     let cargo = bin.join("cargo");
     std::fs::write(
