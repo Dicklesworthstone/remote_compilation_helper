@@ -266,6 +266,16 @@ it before worker reservation instead of ignoring the requirement.
 A required tool no worker has verified admits no
 worker at all; selection reports
 `capability_missing:tool:<name>:probe_failed` or `...:not_declared`.
+
+`required_tools` and `--require-tool` (alias `--require-toolchain`) also take
+exact runtime versions, `node@MAJOR.MINOR.PATCH` and `bun@MAJOR.MINOR.PATCH`
+(for example `required_tools = ["node@22.11.0"]`). They match the version in
+the worker's reported capabilities exactly; ranges, partial versions and
+aliases are refused, and a mismatch reports
+`capability_missing:runtime_version:node:required=<v>:observed=<v>`. Rust has
+no such form: pin it with an exact `rust-toolchain.toml` channel, which RCH
+preflights on the worker (`rustup run <toolchain> rustc --version`) before
+selecting it.
 These cached presence probes do not identify the actual compiler or SDK bytes
 used in a particular build. `rch admit --require-tool NAME -- <command>` is a
 static requirement preview, not live worker or release qualification.
