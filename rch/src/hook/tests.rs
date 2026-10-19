@@ -10755,6 +10755,7 @@ fn test_build_socket_failure_incident_records_reason_and_mismatch() {
         "demo-project",
         "cargo build --release",
         false,
+        true,
         1_700_000_000_000,
     );
     assert_eq!(
@@ -10902,6 +10903,125 @@ fn test_local_fallback_incident_records_reason_and_redacts_command() {
 }
 
 #[test]
+fn remote_failure_local_policy_honours_require_remote_and_allow_local_fallback() {
+    // #114: the one decision every remote-failure exit in `run_exec` uses.
+    use super::RemoteFailureLocalPolicy as Policy;
+    for (require_remote, allow_local_fallback, expected) in [
+        (false, true, Policy::RunLocal),
+        (false, false, Policy::RefuseFallbackDisabled),
+        // Remote-required wins, so its typed (retryable) refusal is reported.
+        (true, true, Policy::RefuseRemoteRequired),
+        (true, false, Policy::RefuseRemoteRequired),
+    ] {
+        assert_eq!(
+            super::remote_failure_local_policy(require_remote, allow_local_fallback),
+            expected,
+            "require_remote={require_remote} allow_local_fallback={allow_local_fallback}"
+        );
+    }
+}
+
+#[test]
+fn disabled_local_fallback_refusal_incident_records_the_config_gate() {
+    // #114: a refusal by `compilation.allow_local_fallback = false` must be
+    // visible in the ledger as a refusal, not as an allowed local fallback.
+    let event = super::build_disabled_local_fallback_incident(
+        "GITHUB_TOKEN=ghp_supersecretvalue123456 cargo test -p app",
+        "dependency preflight failed: missing source_entrypoint crates/build/Cargo.toml",
+        1_700_000_000_020,
+        Some("w1: preflight evidence"),
+    );
+    assert_eq!(
+        event.reason_code,
+        rch_common::IncidentReasonCode::ProofRefusal
+    );
+    assert_eq!(event.reason_code.code(), "RCH-I012");
+    assert_eq!(event.selected_mode, rch_common::SelectedMode::Local);
+    assert!(!event.local_fallback_allowed);
+    assert_eq!(
+        event.details.get("policy").map(String::as_str),
+        Some("compilation.allow_local_fallback=false")
+    );
+    assert_eq!(
+        event.details.get("reason").map(String::as_str),
+        Some("dependency preflight failed: missing source_entrypoint crates/build/Cargo.toml")
+    );
+    assert_eq!(
+        event.details.get("error").map(String::as_str),
+        Some("w1: preflight evidence")
+    );
+    // Config gate, not proof mode / RCH_REQUIRE_REMOTE.
+    assert!(!event.control.strict_remote_policy);
+    assert!(!event.command_fingerprint.contains("supersecretvalue"));
+}
+
+#[test]
+fn socket_failure_incident_reports_local_fallback_disabled_by_config() {
+    // #114: the RCH-I010 record must not claim a local fallback is allowed
+    // when `compilation.allow_local_fallback = false` forbids it.
+    for (strict_remote, allow_local_fallback, expected) in [
+        (false, true, true),
+        (false, false, false),
+        (true, true, false),
+        (true, false, false),
+    ] {
+        let event = super::build_socket_failure_incident(
+            super::SocketFailureKind::Refused,
+            None,
+            "demo",
+            "cargo check",
+            strict_remote,
+            allow_local_fallback,
+            1_700_000_000_021,
+        );
+        assert_eq!(
+            event.local_fallback_allowed, expected,
+            "strict_remote={strict_remote} allow_local_fallback={allow_local_fallback}"
+        );
+        assert_eq!(event.control.strict_remote_policy, strict_remote);
+    }
+}
+
+#[test]
+fn run_exec_routes_every_local_exit_after_remote_placement_through_the_gate() {
+    // #114: once `run_exec` has started remote placement (the durable lease
+    // exists), any way out that could run the command on the orchestrator
+    // must go through `exit_with_gated_local_fallback`, which honours both
+    // remote-required mode and `compilation.allow_local_fallback = false`.
+    // The deliberate policy-local exits (non-compilation, config, force_local
+    // / disabled / allowlist, topology, speed gate) all precede the lease.
+    // This guards against a new remote-failure branch calling an ungated
+    // helper; the gate's own behaviour is covered by the tests above and the
+    // binary-level `rch exec` tests.
+    let source = include_str!("../hook.rs");
+    let start = source
+        .find("pub async fn run_exec(")
+        .expect("run_exec in hook.rs");
+    let body = &source[start..];
+    let end = body
+        .find("\nstruct HookReporter")
+        .expect("run_exec is followed by HookReporter");
+    let body = &body[..end];
+    let placement = body
+        .find("DurableLeaseWriter::create(")
+        .expect("run_exec creates the durable lease before selection");
+    let after_placement = &body[placement..];
+    for ungated in [
+        "exit_with_local_fallback(",
+        "exit_with_local_fallback_recording(",
+        "exit_with_local_run(",
+        "local_fallback_command(",
+        "local_fallback_command_for_policy(",
+    ] {
+        assert!(
+            !after_placement.contains(ungated),
+            "run_exec calls `{ungated}` after remote placement began; route it through exit_with_gated_local_fallback"
+        );
+    }
+    assert!(after_placement.contains("exit_with_gated_local_fallback("));
+}
+
+#[test]
 fn test_socket_failure_incident_durably_appends_to_ledger() {
     // End-to-end durable record: build the incident the hook emits, append
     // it to a temp ledger, and read it back — proving the structured
@@ -10913,6 +11033,7 @@ fn test_socket_failure_incident_durably_appends_to_ledger() {
         None,
         "demo",
         "cargo check",
+        true,
         true,
         1_700_000_000_003,
     );
