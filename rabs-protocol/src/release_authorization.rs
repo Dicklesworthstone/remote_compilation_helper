@@ -197,6 +197,66 @@ pub fn authorization(
     }
 }
 
+/// Compile-time commit environment variables inspected in order when deriving
+/// [`default_build_identity`].
+pub const BUILD_COMMIT_ENV_VARS: &[&str] = &[
+    "RCH_GIT_COMMIT",
+    "VERGEN_GIT_SHA",
+    "GIT_COMMIT",
+    "GITHUB_SHA",
+];
+
+fn is_valid_commit_stamp(value: &str) -> bool {
+    fn is_commit_hash(value: &str) -> bool {
+        (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+    is_commit_hash(value)
+        || value.strip_suffix("-dirty").is_some_and(is_commit_hash)
+        || value
+            .split_once("-overlay-")
+            .is_some_and(|(commit, fingerprint)| {
+                is_commit_hash(commit)
+                    && fingerprint.len() == 64
+                    && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+}
+
+/// Format a deterministic RABS build identity from a package version and an
+/// optional commit stamp.
+///
+/// Only validated commit stamps (7..=64 ASCII hex digits, optionally suffixed
+/// `-dirty` or `-overlay-<64 hex>`) are included; invalid or empty commit
+/// strings fall back to `"rabs-{version}"`.
+#[must_use]
+pub fn format_build_identity(version: &str, commit: Option<&str>) -> String {
+    match commit.map(str::trim).filter(|c| is_valid_commit_stamp(c)) {
+        Some(commit) => format!("rabs-{version}+{commit}"),
+        None => format!("rabs-{version}"),
+    }
+}
+
+/// Derive the canonical build identity for the running RABS binary.
+///
+/// Combines `CARGO_PKG_VERSION` with the first validated compile-time commit
+/// environment variable from [`BUILD_COMMIT_ENV_VARS`], if present. Because
+/// `rabsd` and `rch` link this crate from the same workspace build, both
+/// derive the exact same default identity without an operator having to
+/// supply a string by hand (`bd-dockb`).
+#[must_use]
+pub fn default_build_identity() -> String {
+    let commit = [
+        option_env!("RCH_GIT_COMMIT"),
+        option_env!("VERGEN_GIT_SHA"),
+        option_env!("GIT_COMMIT"),
+        option_env!("GITHUB_SHA"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| is_valid_commit_stamp(value));
+    format_build_identity(env!("CARGO_PKG_VERSION"), commit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +408,27 @@ mod tests {
         .collect();
         let unique: std::collections::BTreeSet<&str> = tokens.iter().copied().collect();
         assert_eq!(unique.len(), tokens.len(), "tokens collided: {tokens:?}");
+    }
+
+    #[test]
+    fn derived_build_identity_uses_version_and_validated_commit() {
+        assert_eq!(format_build_identity("2.1.34", None), "rabs-2.1.34");
+        assert_eq!(
+            format_build_identity("2.1.34", Some("not-a-commit")),
+            "rabs-2.1.34"
+        );
+        assert_eq!(
+            format_build_identity("2.1.34", Some(" 1e31c8ae ")),
+            "rabs-2.1.34+1e31c8ae"
+        );
+        assert_eq!(
+            format_build_identity("2.1.34", Some("1e31c8ae-dirty")),
+            "rabs-2.1.34+1e31c8ae-dirty"
+        );
+        let derived = default_build_identity();
+        assert!(
+            derived.starts_with(&format!("rabs-{}", env!("CARGO_PKG_VERSION"))),
+            "unexpected derived identity: {derived}"
+        );
     }
 }

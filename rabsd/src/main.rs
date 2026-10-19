@@ -37,6 +37,11 @@ struct RabsConfig {
     /// wrapper request in shadow mode (plan §154 rollout: observation →
     /// shadow → opt-in sampled serving).
     live_dependency: bool,
+    /// Running build identity consulted against durable release verdicts (`bd-dockb`).
+    build_identity: String,
+    /// Release authorization mode (`advisory` by default; `required` refuses
+    /// unproven builds).
+    release_authorization: rabs_protocol::release_authorization::ReleaseAuthorizationMode,
 }
 
 impl Default for RabsConfig {
@@ -45,12 +50,28 @@ impl Default for RabsConfig {
             socket_path: default_under_home(".cache/rch/rabsd.sock"),
             log_level: "info".to_string(),
             live_dependency: false,
+            build_identity: rabs_protocol::release_authorization::default_build_identity(),
+            release_authorization:
+                rabs_protocol::release_authorization::ReleaseAuthorizationMode::default(),
         }
     }
 }
 
 fn default_under_home(rel: &str) -> String {
     std::env::var("HOME").map_or_else(|_| format!("/tmp/{rel}"), |h| format!("{h}/{rel}"))
+}
+
+fn parse_release_authorization_mode(
+    raw: &str,
+    source: &str,
+) -> Result<rabs_protocol::release_authorization::ReleaseAuthorizationMode, String> {
+    match raw {
+        "advisory" => Ok(rabs_protocol::release_authorization::ReleaseAuthorizationMode::Advisory),
+        "required" => Ok(rabs_protocol::release_authorization::ReleaseAuthorizationMode::Required),
+        other => Err(format!(
+            "{source}={other:?}: expected \"advisory\" or \"required\""
+        )),
+    }
 }
 
 /// Parse the `[rabs]` table. Unknown keys refuse loudly.
@@ -80,10 +101,28 @@ fn parse_config(text: &str) -> Result<RabsConfig, String> {
                         .as_bool()
                         .ok_or_else(|| "rabs.live_dependency must be a boolean".to_string())?;
                 }
+                "build_identity" => {
+                    let id = entry
+                        .as_str()
+                        .ok_or_else(|| "rabs.build_identity must be a string".to_string())?
+                        .trim();
+                    if id.is_empty() {
+                        return Err("rabs.build_identity must not be empty".to_string());
+                    }
+                    config.build_identity = id.to_string();
+                }
+                "release_authorization" => {
+                    let raw = entry
+                        .as_str()
+                        .ok_or_else(|| "rabs.release_authorization must be a string".to_string())?;
+                    config.release_authorization =
+                        parse_release_authorization_mode(raw, "rabs.release_authorization")?;
+                }
                 unknown => {
                     return Err(format!(
                         "unknown [rabs] config key {unknown:?} — refusing (config drift \
-                         must be loud); known keys: socket_path, log_level, live_dependency"
+                         must be loud); known keys: socket_path, log_level, live_dependency, \
+                         build_identity, release_authorization"
                     ));
                 }
             }
@@ -114,6 +153,17 @@ fn load_config() -> Result<RabsConfig, String> {
             ));
         }
         Err(_) => {}
+    }
+    if let Ok(build_id) = std::env::var("RABS_BUILD_ID") {
+        let trimmed = build_id.trim();
+        if trimmed.is_empty() {
+            return Err("RABS_BUILD_ID must not be empty".to_string());
+        }
+        config.build_identity = trimmed.to_string();
+    }
+    if let Ok(mode) = std::env::var("RABS_RELEASE_AUTHORIZATION") {
+        config.release_authorization =
+            parse_release_authorization_mode(&mode, "RABS_RELEASE_AUTHORIZATION")?;
     }
     Ok(config)
 }
@@ -422,9 +472,21 @@ fn main() {
         }
         Some("--check-config") => match load_config() {
             Ok(config) => {
+                let release_mode = match config.release_authorization {
+                    rabs_protocol::release_authorization::ReleaseAuthorizationMode::Advisory => {
+                        "advisory"
+                    }
+                    rabs_protocol::release_authorization::ReleaseAuthorizationMode::Required => {
+                        "required"
+                    }
+                };
                 println!(
-                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\",\"live_dependency\":{}}}",
-                    config.socket_path, config.log_level, config.live_dependency
+                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\",\"live_dependency\":{},\"build_identity\":\"{}\",\"release_authorization\":\"{}\"}}",
+                    config.socket_path,
+                    config.log_level,
+                    config.live_dependency,
+                    config.build_identity.replace('"', "'"),
+                    release_mode
                 );
                 return;
             }
@@ -462,6 +524,7 @@ fn main() {
         "rabsd-boot",
         &[
             ("version", VERSION),
+            ("build_identity", &config.build_identity),
             ("socket_path", &config.socket_path),
             ("log_level", &config.log_level),
             (
@@ -489,10 +552,13 @@ fn main() {
     // The live coordinator (S6): shared edge<->coord in-process, with
     // the structural authority split intact — the coord region owns its
     // availability; the edge only consults it.
-    let coord = std::sync::Arc::new(match &mounted {
-        Ok(cas) => rabsd::coord::live::CoordLive::with_cas(std::sync::Arc::clone(cas)),
-        Err(_) => rabsd::coord::live::CoordLive::new(),
-    });
+    let coord = std::sync::Arc::new(
+        match &mounted {
+            Ok(cas) => rabsd::coord::live::CoordLive::with_cas(std::sync::Arc::clone(cas)),
+            Err(_) => rabsd::coord::live::CoordLive::new(),
+        }
+        .with_release_authorization(&config.build_identity, config.release_authorization),
+    );
     let prepared_operations = if mounted.is_ok() {
         match rabsd::coord::prepared_operation::PreparedOperationStore::open(
             &state_dir.join("prepared-operations"),

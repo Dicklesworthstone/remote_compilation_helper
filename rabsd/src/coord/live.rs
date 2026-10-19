@@ -1168,6 +1168,7 @@ impl CoordLive {
             boot_nonce: boot_micros(),
             next_seq: AtomicU64::new(boot_micros()),
             lease_clock: OnceLock::from(Instant::now()),
+            build_identity: rabs_protocol::release_authorization::default_build_identity(),
             ..Self::default()
         }
     }
@@ -1202,6 +1203,24 @@ impl CoordLive {
             release_mode,
             ..self
         }
+    }
+
+    /// T011 (`bd-dockb`): set the release-authorization mode while keeping
+    /// the coordinator's derived [`default_build_identity`].
+    ///
+    /// [`default_build_identity`]: rabs_protocol::release_authorization::default_build_identity
+    #[must_use]
+    pub fn with_release_mode(self, release_mode: ReleaseAuthorizationMode) -> Self {
+        Self {
+            release_mode,
+            ..self
+        }
+    }
+
+    /// The running build identity consulted against durable release verdicts.
+    #[must_use]
+    pub fn build_identity(&self) -> &str {
+        &self.build_identity
     }
 
     /// T011: this coordinator's standing with the stock differential
@@ -2531,12 +2550,13 @@ impl CoordLive {
              \"lease_registry_mounted\":{lease_holders},\"destination_arbiter_mounted\":{reservations},\
              \"cas_mounted\":{},\"authority_held\":{},\"authority_term\":{},\
              \"closed_prior_authority_generations\":{},\
-             \"release_mode\":\"{}\",\"release_standing\":\"{}\"}}",
+             \"build_identity\":\"{}\",\"release_mode\":\"{}\",\"release_standing\":\"{}\"}}",
             self.available(),
             self.cas.is_some(),
             authority.is_some(),
             authority.map_or(0, |a| a.term),
             self.closed_prior_generations(),
+            self.build_identity.replace('"', "'"),
             match self.release_mode {
                 ReleaseAuthorizationMode::Advisory => "advisory",
                 ReleaseAuthorizationMode::Required => "required",

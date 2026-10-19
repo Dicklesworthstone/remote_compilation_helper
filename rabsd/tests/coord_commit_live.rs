@@ -1338,6 +1338,36 @@ fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
         "advisory must never refuse on release grounds"
     );
 
+    // bd-dockb: CoordLive derives default_build_identity() automatically, so
+    // `with_release_mode(Required)` matches a verdict recorded for the binary's
+    // own derived identity without a hand-supplied build string.
+    let derived_required =
+        CoordLive::with_cas(Arc::clone(&cas)).with_release_mode(ReleaseAuthorizationMode::Required);
+    assert_eq!(
+        derived_required.build_identity(),
+        rabs_protocol::release_authorization::default_build_identity()
+    );
+    let derived_verdict = ReleaseVerdict {
+        build: rabs_protocol::release_authorization::default_build_identity(),
+        ..verdict.clone()
+    };
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        store
+            .record_release_verdict(&derived_verdict)
+            .expect("record derived verdict");
+    }
+    let target = next_worktree();
+    assert!(
+        matches!(
+            derived_required
+                .serve_action(&sample_action_key(), &target, &expected(), now, 0)
+                .expect("serve with derived build identity"),
+            ServeOutcome::Served { .. }
+        ),
+        "derived build identity must authorize Required mode when recorded"
+    );
+
     // Unused-variable guard: the verdict type is the crossing point
     // between the harness and the coordinator, so name it once more.
     let _: ReleaseVerdict = verdict;
