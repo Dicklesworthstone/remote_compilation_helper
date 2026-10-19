@@ -41,6 +41,7 @@ pub mod edit_watcher;
 pub mod env_builder;
 pub mod equality_suite;
 pub mod external_inputs;
+pub mod generated_source;
 pub mod layout;
 pub mod leak_scanner;
 pub mod loader_directories;
