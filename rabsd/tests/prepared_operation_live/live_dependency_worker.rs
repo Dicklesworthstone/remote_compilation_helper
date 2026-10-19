@@ -544,7 +544,9 @@ impl CargoRun {
     }
 
     fn dependency(&self, name: &str) -> &Run {
-        self.dependencies.get(name).expect("observed Cargo dependency")
+        self.dependencies
+            .get(name)
+            .expect("observed Cargo dependency")
     }
 }
 
@@ -554,19 +556,14 @@ impl CargoRun {
 fn cargo_dependency_events(current: &[Value], name: &str) -> Vec<Value> {
     let keys: std::collections::BTreeSet<_> = current
         .iter()
-        .filter(|event| {
-            event["kind"] == "rabsd-live-dependency" && event["crate"] == name
-        })
+        .filter(|event| event["kind"] == "rabsd-live-dependency" && event["crate"] == name)
         .filter_map(|event| event["key"].as_str())
         .collect();
     current
         .iter()
         .filter(|event| {
-            let matching_key = event["key"]
-                .as_str()
-                .is_some_and(|key| keys.contains(key));
-            (event["kind"] == "rabsd-live-dependency"
-                && (event["crate"] == name || matching_key))
+            let matching_key = event["key"].as_str().is_some_and(|key| keys.contains(key));
+            (event["kind"] == "rabsd-live-dependency" && (event["crate"] == name || matching_key))
                 || (matching_key
                     && matches!(
                         event["kind"].as_str(),
@@ -633,7 +630,7 @@ fn cargo_dependency_events_bind_terminal_records_to_each_crate() {
     assert!(cargo_dependency_warming(std::slice::from_ref(&preparing)));
     assert!(!cargo_dependency_warming(&[
         preparing,
-        json!({"decision":"remote-ineligible", "reason":"REMOTE_DEP_DIRECTORY_NOT_EMPTY"}),
+        json!({"decision":"remote-ineligible", "reason":"REMOTE_DEP_NATIVE_INPUTS"}),
     ]));
     assert!(!cargo_dependency_warming(&[
         json!({"decision":"preparing", "reason":"unknown-facts"}),
@@ -794,7 +791,11 @@ impl LiveFixture {
                     message["reason"] == "compiler-artifact" && message["target"]["name"] == name
                 })
                 .collect();
-            assert_eq!(artifacts.len(), 1, "missing actual Cargo artifact for {name}");
+            assert_eq!(
+                artifacts.len(),
+                1,
+                "missing actual Cargo artifact for {name}"
+            );
             assert_eq!(
                 artifacts[0]["fresh"], false,
                 "the clean target must schedule {name}, not Cargo's own fresh reuse"
@@ -823,7 +824,11 @@ impl LiveFixture {
                 let bytes = fs::read(path).unwrap();
                 assert!(!bytes.is_empty(), "empty actual compiler output: {path:?}");
                 if CARGO_DEPENDENCIES.contains(&name) && path == metadata {
-                    assert!(metadata_by_crate.insert(name.to_owned(), bytes.clone()).is_none());
+                    assert!(
+                        metadata_by_crate
+                            .insert(name.to_owned(), bytes.clone())
+                            .is_none()
+                    );
                 }
                 let relative = path
                     .strip_prefix(&target)
@@ -851,7 +856,9 @@ impl LiveFixture {
                 let settled = events.iter().any(|event| {
                     matches!(
                         event["decision"].as_str(),
-                        Some("committed" | "verified" | "quarantined" | "not-published" | "refused")
+                        Some(
+                            "committed" | "verified" | "quarantined" | "not-published" | "refused"
+                        )
                     )
                 });
                 pending |= local && !settled;
@@ -899,17 +906,16 @@ impl LiveFixture {
 /// Actual Cargo chooses argv, cwd, jobserver and loader environment. The graph
 /// is leaf -> middle -> top -> consumer; top has no direct leaf dependency but
 /// must resolve leaf's RemoteToken through middle's metadata. This fixture
-/// requires the supported disjoint input/output layout, never treats local
-/// fallback as evidence of a working remote DAG, and performs no argv rewriting.
+/// supports shared or disjoint input/output directories under dependency-exec-v4,
+/// never treats local fallback as evidence of a working remote DAG, and performs
+/// no argv rewriting.
 #[test]
 #[ignore = "requires Linux isolation and matching RABS_TEST_WORKER_BIN/RABS_TEST_WRAP_BIN; actual offline Cargo dependency DAG plus daemon/worker"]
 fn actual_offline_cargo_check_uses_remote_dependency_dag_then_replays() {
     let mut live = LiveFixture::new();
     live.prepare_cargo_consumer();
     let stock = live.cargo_check(false);
-    assert!(
-        stock.dependencies.values().all(|run| run.events.is_empty())
-    );
+    assert!(stock.dependencies.values().all(|run| run.events.is_empty()));
 
     let until = Instant::now() + Duration::from_secs(1200);
     let mut observations: std::collections::BTreeMap<String, (String, usize)> =

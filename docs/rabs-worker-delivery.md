@@ -109,28 +109,36 @@ invalidates that identity. The daemon captures and verifies those exact bytes
 after the wrapper accepts private execution, then retains them throughout
 transfer without reopening mutable target paths.
 
-A populated dependency search directory must be disjoint from the action's
-output directory. Layouts sharing one populated input/output directory
-currently use the local lane. Bare toolchain externs, proc macros,
-build-script/generated inputs, native libraries and linker output also remain
-local. These limits apply to each compiler action; they do not prevent Cargo
-from continuing with other units.
+A populated dependency search directory may be disjoint from the action's
+output directory or may be that same directory. In the shared case, the worker
+places each retained dependency file above its private writable output mount
+as a separate read-only bind. Bare toolchain externs, proc macros,
+build-script/generated inputs, native libraries and linker output remain local.
+These limits apply to each compiler action; they do not prevent Cargo from
+continuing with other units.
 
 The worker keeps the original source, output and toolchain path spellings and
-full compiler environment inside private mounts. The `dependency-exec-v3`
+full compiler environment inside private mounts. The `dependency-exec-v4`
 context binds an explicit list of populated dependency roots to their
 first-use directory indices. A single sealed source transfer contains
 `package/<source-path>` and `dependencies/NNNN/<artifact-basename>`; only the
 declared package and retained candidate files may appear. The worker verifies
-that inventory and mounts each populated dependency root read-only. Empty
-dependency roots and loader parents receive private empty backings with only
-declared child mountpoints. The original target tree is never mounted.
+that inventory and mounts each disjoint populated dependency root read-only.
+For a shared input/output root, it rechecks the sealed input bytes and creates
+exclusive, empty mountpoint files in its owned output backing. A dependency
+name that collides with a declared output is refused before execution. The
+worker retains descriptors for both the inputs and their mountpoint files,
+verifies their ownership and identity before launch and after output capture,
+and excludes only those verified mountpoint files from the returned artifacts.
+Replacing or modifying them prevents successful capture. Empty dependency
+roots and loader parents receive private empty backings with only declared
+child mountpoints. The original target tree is never mounted.
 
 Cargo's `target/debug/deps` and `target/debug` loader search paths still require
 fresh bounded checks excluding loadable files, symlinks and hardware-capability
 subdirectories. Unsupported loader paths or changing source, artifact,
 toolchain or runtime observations refuse remote admission or installation.
-The launcher requires a daemon advertising `dependency-exec-v3`; old execution
+The launcher requires a daemon advertising `dependency-exec-v4`; old execution
 contexts cannot admit new work. Already sealed results from older contexts can
 still resume against their exact saved request fingerprint.
 
@@ -182,15 +190,28 @@ receipt. Terminal events are associated with the crate that admitted their
 action key; one crate's successful execution cannot stand in for another's.
 Toolchain warmup may let different nodes start qualification on different runs.
 
-This DAG oracle requires Cargo's supported disjoint input/output layout.
-A Cargo layout sharing one populated dependency/output directory is currently
-outside the remote class and fails the oracle's remote-admission assertion.
-The fixture does not rewrite compiler arguments to hide that limitation. It
-selects the installed Cargo and its matching compiler explicitly; ordinary
-rustup-based Cargo use can select that compiler itself. Both integration
-fixtures are ignored by default and must be run on the supported host to
-establish execution evidence. Their presence alone does not assert a successful
-RABS remote run.
+With `dependency-exec-v4`, this DAG oracle can use shared or disjoint dependency
+and output directories. It performs no compiler-argument rewriting and never
+treats local fallback as evidence of remote admission. It selects the installed
+Cargo and its matching compiler explicitly; ordinary rustup-based Cargo use
+can select that compiler itself. Both integration fixtures are ignored by
+default and must be run on the supported host to establish execution evidence.
+Their presence alone does not assert a successful RABS remote run.
+
+A worker-level native fixture explicitly exercises a populated shared directory
+with both metadata and archive direct externs, transitive metadata resolution,
+and exact output capture:
+
+```sh
+cargo test -p rabs-wkr --test process_tree_linux \
+  real_dependency_rustc_reads_shared_output_metadata_dag -- --nocapture
+```
+
+That fixture compares the real worker rustc result with stock rustc using the
+same paths, arguments and complete dependency inventory. It also checks that
+retained inputs and mountpoint files do not become output artifacts. It needs
+the supported Linux isolation environment, including a private `/proc` mount;
+an unsupported-host skip does not establish remote execution evidence.
 
 ## Run one delivery
 

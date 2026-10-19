@@ -180,6 +180,131 @@ pub struct SourceOwner {
     prepared_cargo_home: Option<PreparedCargoHome>,
 }
 
+/// Exact input mountpoints inside one private writable output directory. The
+/// underlying placeholders remain empty while the compiler sees separately
+/// retained read-only input files mounted over them. After namespace teardown,
+/// only these descriptor-verified names may be excluded from output capture.
+#[derive(Debug)]
+pub(crate) struct DependencyOutputInputs {
+    backing: std::path::PathBuf,
+    directory: std::fs::File,
+    directory_metadata: std::fs::Metadata,
+    files: std::collections::BTreeMap<String, DependencyOutputInput>,
+}
+
+#[derive(Debug)]
+struct DependencyOutputInput {
+    placeholder: std::fs::File,
+    placeholder_metadata: std::fs::Metadata,
+    retained_path: std::path::PathBuf,
+    retained: std::fs::File,
+    retained_metadata: std::fs::Metadata,
+}
+
+fn dependency_same_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino() && left.mode() == right.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn dependency_same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.is_file()
+            && right.is_file()
+            && dependency_same_identity(left, right)
+            && left.len() == right.len()
+            && left.nlink() == 1
+            && right.nlink() == 1
+            && left.mtime() == right.mtime()
+            && left.mtime_nsec() == right.mtime_nsec()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+impl DependencyOutputInputs {
+    fn new(backing: &std::path::Path) -> io::Result<Self> {
+        let entry = std::fs::symlink_metadata(backing)?;
+        if !backing.is_absolute() || !entry.is_dir() || std::fs::canonicalize(backing)? != backing {
+            return Err(io::Error::other(
+                "dependency output backing is not a real private root",
+            ));
+        }
+        let directory = std::fs::File::open(backing)?;
+        let directory_metadata = directory.metadata()?;
+        if !dependency_same_identity(&entry, &directory_metadata) {
+            return Err(io::Error::other(
+                "dependency output root changed during acquisition",
+            ));
+        }
+        Ok(Self {
+            backing: backing.to_path_buf(),
+            directory,
+            directory_metadata,
+            files: std::collections::BTreeMap::new(),
+        })
+    }
+
+    /// Input basenames from the sealed manifest, never an arbitrary exclusion
+    /// list supplied by a request. Capture must call verify on its own backing
+    /// both before and after excluding these entries.
+    pub(crate) fn relative_paths(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    /// Refuse replaced, changed, linked or missing placeholders and retained
+    /// inputs. The directory's own mtime may change when rustc creates outputs;
+    /// its held inode and every immutable file generation must remain unchanged.
+    pub(crate) fn verify(&self, output_backing: &std::path::Path) -> io::Result<()> {
+        let refuse = || io::Error::other("dependency input mountpoint or retained backing changed");
+        if output_backing != self.backing
+            || std::fs::canonicalize(output_backing)? != self.backing
+            || !dependency_same_identity(&self.directory_metadata, &self.directory.metadata()?)
+            || !dependency_same_identity(
+                &self.directory_metadata,
+                &std::fs::symlink_metadata(output_backing)?,
+            )
+        {
+            return Err(refuse());
+        }
+        for (name, input) in &self.files {
+            if input.placeholder_metadata.len() != 0
+                || !dependency_same_file(
+                    &input.placeholder_metadata,
+                    &input.placeholder.metadata()?,
+                )
+                || !dependency_same_file(
+                    &input.placeholder_metadata,
+                    &std::fs::symlink_metadata(self.backing.join(name))?,
+                )
+                || std::fs::canonicalize(&input.retained_path)? != input.retained_path
+                || !dependency_same_file(&input.retained_metadata, &input.retained.metadata()?)
+                || !dependency_same_file(
+                    &input.retained_metadata,
+                    &std::fs::symlink_metadata(&input.retained_path)?,
+                )
+            {
+                return Err(refuse());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SourceOwner {
     /// The transferred, verified package root for original-path dependency
     /// execution. Every other member must belong to an explicitly declared
@@ -227,7 +352,9 @@ impl SourceOwner {
                     || !(name.ends_with(".rmeta") || name.ends_with(".rlib"))
                     || file.executable
                 {
-                    return Err(refuse("dependency bundle contains an unsupported artifact member"));
+                    return Err(refuse(
+                        "dependency bundle contains an unsupported artifact member",
+                    ));
                 }
                 artifact_present[index] = true;
                 declared = true;
@@ -241,14 +368,163 @@ impl SourceOwner {
             return Err(refuse("dependency bundle is missing a declared input root"));
         }
         let package = bundle.join("package");
-        for root in std::iter::once(package.clone())
-            .chain(context.artifact_roots().iter().map(|root| bundle.join(&root.prefix)))
-        {
+        for root in std::iter::once(package.clone()).chain(
+            context
+                .artifact_roots()
+                .iter()
+                .map(|root| bundle.join(&root.prefix)),
+        ) {
             if !std::fs::symlink_metadata(root)?.is_dir() {
-                return Err(refuse("dependency bundle root is not a retained real directory"));
+                return Err(refuse(
+                    "dependency bundle root is not a retained real directory",
+                ));
             }
         }
         Ok(package)
+    }
+
+    /// Install only this sealed bundle's shared output inputs. Mountpoints are
+    /// exclusively created in the worker-owned output root; an existing output,
+    /// directory, symlink or earlier placeholder is a collision, never reused.
+    /// The returned guard must outlive execution, descendant drain and capture.
+    pub(crate) fn prepare_dependency_output(
+        &self,
+        request_id: u64,
+        context: &rabs_sandbox::dependency_context::DependencyExecContext,
+        spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+    ) -> io::Result<DependencyOutputInputs> {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use std::io::Read;
+        use std::path::Path;
+
+        let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        let package = self.dependency_root(request_id, context)?;
+        let mut output = spec
+            .rw_binds
+            .iter()
+            .filter(|bind| bind.visible == Path::new(context.out_dir()));
+        let backing = output
+            .next()
+            .ok_or_else(|| refuse("dependency output lacks its writable mount"))?
+            .backing
+            .clone();
+        if output.next().is_some() {
+            return Err(refuse("dependency output has duplicate writable mounts"));
+        }
+        let mut inputs = DependencyOutputInputs::new(&backing)?;
+        let Some(shared) = context
+            .artifact_roots()
+            .iter()
+            .find(|root| root.path == context.out_dir())
+        else {
+            return Ok(inputs);
+        };
+        if spec
+            .ro_binds
+            .iter()
+            .any(|bind| bind.visible.starts_with(context.out_dir()))
+        {
+            return Err(refuse(
+                "dependency output already has read-only child mounts",
+            ));
+        }
+        let bundle = package
+            .parent()
+            .ok_or_else(|| refuse("dependency bundle parent is missing"))?;
+        for expected in self.receiver.manifest().files() {
+            let Some(name) = expected
+                .path
+                .strip_prefix(shared.prefix.as_str())
+                .and_then(|suffix| suffix.strip_prefix('/'))
+            else {
+                continue;
+            };
+            let retained_path = bundle.join(&expected.path);
+            if std::fs::canonicalize(&retained_path)? != retained_path {
+                return Err(refuse("retained dependency input has a filesystem alias"));
+            }
+            let mut retained = rabs_sandbox::regular_input::open(&retained_path)?;
+            let retained_metadata = retained.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if retained_metadata.permissions().mode() & 0o111 != 0 {
+                    return Err(refuse(
+                        "retained dependency input became executable after its seal",
+                    ));
+                }
+            }
+            if retained_metadata.len() != expected.len
+                || !dependency_same_file(
+                    &retained_metadata,
+                    &std::fs::symlink_metadata(&retained_path)?,
+                )
+            {
+                return Err(refuse(
+                    "retained dependency input differs from its sealed member",
+                ));
+            }
+            let mut hasher = Sha256::new();
+            let mut remaining = expected.len;
+            let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+            while remaining != 0 {
+                let count = usize::try_from(remaining.min(buffer.len() as u64))
+                    .map_err(|_| refuse("retained dependency input exceeds a chunk"))?;
+                retained.read_exact(&mut buffer[..count])?;
+                hasher.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            match retained.read_exact(&mut buffer[..1]) {
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                Err(error) => return Err(error),
+                Ok(()) => return Err(refuse("retained dependency input grew after its seal")),
+            }
+            let digest: [u8; 32] = hasher.finalize().into();
+            if digest != expected.sha256
+                || !dependency_same_file(&retained_metadata, &retained.metadata()?)
+                || !dependency_same_file(
+                    &retained_metadata,
+                    &std::fs::symlink_metadata(&retained_path)?,
+                )
+            {
+                return Err(refuse("retained dependency bytes changed after their seal"));
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let placeholder = options.open(backing.join(name))?;
+            let placeholder_metadata = placeholder.metadata()?;
+            if placeholder_metadata.len() != 0
+                || !dependency_same_file(
+                    &placeholder_metadata,
+                    &std::fs::symlink_metadata(backing.join(name))?,
+                )
+            {
+                return Err(refuse(
+                    "dependency input placeholder changed during creation",
+                ));
+            }
+            inputs.files.insert(
+                name.to_owned(),
+                DependencyOutputInput {
+                    placeholder,
+                    placeholder_metadata,
+                    retained_path: retained_path.clone(),
+                    retained,
+                    retained_metadata,
+                },
+            );
+            spec.ro_binds.push(Bind::new(
+                retained_path,
+                Path::new(context.out_dir()).join(name),
+            ));
+        }
+        inputs.verify(&backing)?;
+        Ok(inputs)
     }
 
     /// Require the exact sealed package and artifact backings at their declared
@@ -263,9 +539,8 @@ impl SourceOwner {
         let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
         let root = self.dependency_root(request_id, context)?;
         let visible = Path::new(context.source_root());
-        let overlap = |left: &Path, right: &Path| {
-            left.starts_with(right) || right.starts_with(left)
-        };
+        let overlap =
+            |left: &Path, right: &Path| left.starts_with(right) || right.starts_with(left);
         let mut owned = 0;
         for bind in &spec.ro_binds {
             if bind.visible == visible && bind.backing == root {
@@ -275,13 +550,63 @@ impl SourceOwner {
             }
         }
         if owned != 1 {
-            return Err(refuse("dependency source lacks its retained read-only mount"));
+            return Err(refuse(
+                "dependency source lacks its retained read-only mount",
+            ));
         }
         let bundle = root
             .parent()
             .ok_or_else(|| refuse("dependency bundle parent is missing"))?;
         for artifact in context.artifact_roots() {
             let visible = Path::new(&artifact.path);
+            if artifact.path == context.out_dir() {
+                let expected: std::collections::BTreeMap<_, _> = self
+                    .receiver
+                    .manifest()
+                    .files()
+                    .iter()
+                    .filter_map(|file| {
+                        file.path
+                            .strip_prefix(artifact.prefix.as_str())
+                            .and_then(|suffix| suffix.strip_prefix('/'))
+                            .map(|name| (visible.join(name), bundle.join(&file.path)))
+                    })
+                    .collect();
+                let mut found = std::collections::BTreeSet::new();
+                for bind in &spec.ro_binds {
+                    if bind.visible.starts_with(visible) {
+                        if expected.get(&bind.visible) != Some(&bind.backing)
+                            || !found.insert(bind.visible.clone())
+                        {
+                            return Err(refuse("mount changes the exact shared dependency inputs"));
+                        }
+                    } else if visible.starts_with(&bind.visible)
+                        && !context
+                            .loader_dirs()
+                            .iter()
+                            .any(|loader| bind.visible == Path::new(loader))
+                    {
+                        return Err(refuse("parent mount shadows shared dependency inputs"));
+                    }
+                }
+                if expected.is_empty() || found.len() != expected.len() {
+                    return Err(refuse(
+                        "shared dependency inputs lack their exact file mounts",
+                    ));
+                }
+                if spec
+                    .rw_binds
+                    .iter()
+                    .filter(|bind| bind.visible == visible)
+                    .count()
+                    != 1
+                {
+                    return Err(refuse(
+                        "shared dependency output lacks its single writable root",
+                    ));
+                }
+                continue;
+            }
             let backing = bundle.join(&artifact.prefix);
             let mut owned = 0;
             for bind in &spec.ro_binds {
@@ -292,7 +617,9 @@ impl SourceOwner {
                 }
             }
             if owned != 1 {
-                return Err(refuse("dependency artifacts lack their retained read-only mount"));
+                return Err(refuse(
+                    "dependency artifacts lack their retained read-only mount",
+                ));
             }
         }
         let canonical_bundle = std::fs::canonicalize(bundle)?;
@@ -300,6 +627,8 @@ impl SourceOwner {
             if overlap(&bind.visible, visible)
                 || context.artifact_roots().iter().any(|root| {
                     overlap(&bind.visible, Path::new(&root.path))
+                        && !(root.path == context.out_dir()
+                            && bind.visible == Path::new(context.out_dir()))
                 })
                 || overlap(&std::fs::canonicalize(&bind.backing)?, &canonical_bundle)
             {
@@ -819,6 +1148,376 @@ mod tests {
         state.take_prepared(&request).unwrap().unwrap()
     }
 
+    struct SharedDependencyFixture {
+        owner: SourceOwner,
+        context: rabs_sandbox::dependency_context::DependencyExecContext,
+        spec: rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        output: tempfile::TempDir,
+        _toolchain: tempfile::TempDir,
+        _empty: tempfile::TempDir,
+        _home: tempfile::TempDir,
+    }
+
+    impl SharedDependencyFixture {
+        fn new() -> Self {
+            use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
+
+            let owner = uploaded_dependency_bundle(&[
+                (
+                    "package/src/lib.rs",
+                    b"pub fn answer() -> u8 { 42 }\n",
+                    false,
+                ),
+                (
+                    "dependencies/0000/libleaf.rmeta",
+                    b"retained metadata",
+                    false,
+                ),
+                (
+                    "dependencies/0000/libarchive.rlib",
+                    b"retained full archive",
+                    false,
+                ),
+                (
+                    "dependencies/0001/libexternal.rmeta",
+                    b"other directory input",
+                    false,
+                ),
+            ]);
+            let context = DependencyExecContext::new_with_artifacts(
+                "/source/package".to_owned(),
+                "/source/package".to_owned(),
+                "/toolchains/pinned".to_owned(),
+                "/toolchains/pinned/bin/rustc".to_owned(),
+                "/target/deps".to_owned(),
+                vec!["/target/deps".to_owned(), "/target/external".to_owned()],
+                vec!["/target".to_owned()],
+                vec![
+                    DependencyArtifactRoot {
+                        path: "/target/deps".to_owned(),
+                        prefix: "dependencies/0000".to_owned(),
+                    },
+                    DependencyArtifactRoot {
+                        path: "/target/external".to_owned(),
+                        prefix: "dependencies/0001".to_owned(),
+                    },
+                ],
+                Vec::new(),
+                [7; 32],
+            )
+            .unwrap();
+            let toolchain = tempfile::tempdir().unwrap();
+            let output = tempfile::tempdir().unwrap();
+            let empty = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            context.prepare_empty_backings(empty.path()).unwrap();
+            let package = owner.dependency_root(91, &context).unwrap();
+            let spec = context
+                .namespace(
+                    &package,
+                    toolchain.path(),
+                    output.path(),
+                    empty.path(),
+                    home.path(),
+                )
+                .unwrap();
+            Self {
+                owner,
+                context,
+                spec,
+                output,
+                _toolchain: toolchain,
+                _empty: empty,
+                _home: home,
+            }
+        }
+
+        fn prepare(&mut self) -> io::Result<DependencyOutputInputs> {
+            self.owner
+                .prepare_dependency_output(91, &self.context, &mut self.spec)
+        }
+    }
+
+    #[test]
+    fn shared_output_retains_exact_input_bytes_over_exclusive_empty_mountpoints() {
+        use rabs_sandbox::dependency_context::build_dependency_argv;
+        use std::path::Path;
+
+        let mut fixture = SharedDependencyFixture::new();
+        let guard = fixture.prepare().unwrap();
+        assert_eq!(
+            guard.relative_paths().collect::<Vec<_>>(),
+            ["libarchive.rlib", "libleaf.rmeta"]
+        );
+        for (name, bytes) in [
+            ("libarchive.rlib", b"retained full archive".as_slice()),
+            ("libleaf.rmeta", b"retained metadata".as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(fixture.output.path().join(name)).unwrap(),
+                b""
+            );
+            let visible = Path::new(fixture.context.out_dir()).join(name);
+            let binding = fixture
+                .spec
+                .ro_binds
+                .iter()
+                .find(|bind| bind.visible == visible)
+                .unwrap();
+            assert_eq!(std::fs::read(&binding.backing).unwrap(), bytes);
+        }
+        fixture
+            .owner
+            .protect_dependency(91, &fixture.context, &fixture.spec)
+            .unwrap();
+        guard.verify(fixture.output.path()).unwrap();
+        // New output entries are legitimate changes to the directory, but may
+        // not alter any of the retained mountpoint identities.
+        std::fs::write(
+            fixture.output.path().join("libproduced.rmeta"),
+            b"new output",
+        )
+        .unwrap();
+        guard.verify(fixture.output.path()).unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        assert!(guard.verify(unrelated.path()).is_err());
+
+        let support = rabs_sandbox::canonical_namespace::HostIsolationSupport {
+            bubblewrap: Some("test".to_owned()),
+            unprivileged_userns: true,
+            overlayfs: false,
+            cgroup_v2: false,
+            landlock: false,
+        };
+        let launch = build_dependency_argv(
+            &fixture.context,
+            &fixture.spec,
+            &support,
+            fixture.context.compiler(),
+            &[],
+        )
+        .unwrap();
+        let args: Vec<_> = launch
+            .argv
+            .iter()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        let writable = args
+            .windows(3)
+            .position(|args| args[0] == "--bind" && args[2] == fixture.context.out_dir())
+            .unwrap();
+        for name in guard.relative_paths() {
+            let visible = format!("{}/{name}", fixture.context.out_dir());
+            let retained = args
+                .windows(3)
+                .position(|args| args[0] == "--ro-bind" && args[2] == visible)
+                .unwrap();
+            assert!(
+                writable < retained,
+                "input must cover the writable mountpoint"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_input_guards_refuse_mutation_replacement_links_and_backing_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mutation in [
+            "bytes",
+            "replacement",
+            "hardlink",
+            "permissions",
+            "retained",
+        ] {
+            let mut fixture = SharedDependencyFixture::new();
+            let guard = fixture.prepare().unwrap();
+            let placeholder = fixture.output.path().join("libleaf.rmeta");
+            match mutation {
+                "bytes" => std::fs::write(&placeholder, b"untrusted output").unwrap(),
+                "replacement" => {
+                    std::fs::rename(&placeholder, fixture.output.path().join("saved-input"))
+                        .unwrap();
+                    std::fs::write(&placeholder, b"").unwrap();
+                }
+                "hardlink" => {
+                    std::fs::hard_link(&placeholder, fixture.output.path().join("linked-input"))
+                        .unwrap();
+                }
+                "permissions" => {
+                    std::fs::set_permissions(&placeholder, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+                "retained" => {
+                    let binding = fixture
+                        .spec
+                        .ro_binds
+                        .iter()
+                        .find(|bind| {
+                            bind.visible == std::path::Path::new("/target/deps/libleaf.rmeta")
+                        })
+                        .unwrap();
+                    std::fs::set_permissions(
+                        &binding.backing,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                    std::fs::write(&binding.backing, b"changed metadata!").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(guard.verify(fixture.output.path()).is_err(), "{mutation}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_output_preparation_never_reuses_a_file_directory_or_symlink() {
+        for existing in ["file", "directory", "symlink"] {
+            let mut fixture = SharedDependencyFixture::new();
+            let collision = fixture.output.path().join("libarchive.rlib");
+            match existing {
+                "file" => std::fs::write(&collision, b"prior output").unwrap(),
+                "directory" => std::fs::create_dir(&collision).unwrap(),
+                "symlink" => std::os::unix::fs::symlink("missing-target", &collision).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(fixture.prepare().is_err(), "{existing}");
+            if existing == "file" {
+                assert_eq!(std::fs::read(&collision).unwrap(), b"prior output");
+            }
+        }
+        let mut fixture = SharedDependencyFixture::new();
+        let _guard = fixture.prepare().unwrap();
+        assert!(
+            fixture.prepare().is_err(),
+            "a prepared namespace cannot be reused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_output_preparation_rehashes_the_sealed_member_before_mounting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = SharedDependencyFixture::new();
+        let package = fixture.owner.dependency_root(91, &fixture.context).unwrap();
+        let member = package
+            .parent()
+            .unwrap()
+            .join("dependencies/0000/libarchive.rlib");
+        std::fs::set_permissions(&member, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&member, b"changed full archive!").unwrap();
+        assert!(fixture.prepare().is_err());
+        assert!(
+            std::fs::read_dir(fixture.output.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_output_guard_retains_the_directory_identity() {
+        let mut fixture = SharedDependencyFixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        fixture
+            .spec
+            .rw_binds
+            .iter_mut()
+            .find(|bind| bind.visible == std::path::Path::new(fixture.context.out_dir()))
+            .unwrap()
+            .backing = output.clone();
+        let guard = fixture.prepare().unwrap();
+        std::fs::rename(&output, root.path().join("retained-output")).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        for name in guard.relative_paths() {
+            std::fs::write(output.join(name), b"").unwrap();
+        }
+        assert!(guard.verify(&output).is_err());
+    }
+
+    #[test]
+    fn shared_dependency_protection_requires_the_complete_unaliased_file_set() {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use std::path::Path;
+
+        let mut fixture = SharedDependencyFixture::new();
+        let _guard = fixture.prepare().unwrap();
+        fixture
+            .owner
+            .protect_dependency(91, &fixture.context, &fixture.spec)
+            .unwrap();
+        let input = Path::new("/target/deps/libleaf.rmeta");
+        let original = fixture
+            .spec
+            .ro_binds
+            .iter()
+            .find(|bind| bind.visible == input)
+            .unwrap();
+        let mut missing = fixture.spec.clone();
+        missing.ro_binds.retain(|bind| bind.visible != input);
+        assert!(
+            fixture
+                .owner
+                .protect_dependency(91, &fixture.context, &missing)
+                .is_err()
+        );
+        for extra in [
+            original.clone(),
+            Bind::new(&original.backing, "/target/deps/libundeclared.rmeta"),
+            Bind::new(&original.backing, "/target/deps/libleaf.rmeta/shadow"),
+            Bind::new(&original.backing, "/target/deps"),
+            Bind::new(&original.backing, "/"),
+        ] {
+            let mut shadowed = fixture.spec.clone();
+            shadowed.ro_binds.push(extra);
+            assert!(
+                fixture
+                    .owner
+                    .protect_dependency(91, &fixture.context, &shadowed)
+                    .is_err()
+            );
+        }
+        let mut redirected = fixture.spec.clone();
+        redirected
+            .ro_binds
+            .iter_mut()
+            .find(|bind| bind.visible == input)
+            .unwrap()
+            .backing = fixture.output.path().join("libleaf.rmeta");
+        assert!(
+            fixture
+                .owner
+                .protect_dependency(91, &fixture.context, &redirected)
+                .is_err()
+        );
+        let bundle = fixture
+            .owner
+            .dependency_root(91, &fixture.context)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        for extra in [
+            Bind::new(fixture.output.path(), input),
+            Bind::new(&bundle, "/unrelated/alias"),
+            Bind::new(fixture.output.path(), fixture.context.out_dir()),
+        ] {
+            let mut writable = fixture.spec.clone();
+            writable.rw_binds.push(extra);
+            assert!(
+                fixture
+                    .owner
+                    .protect_dependency(91, &fixture.context, &writable)
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn dependency_bundle_projects_only_owned_package_and_exact_candidate_roots() {
         use rabs_sandbox::canonical_namespace::Bind;
@@ -826,9 +1525,21 @@ mod tests {
         use std::path::Path;
 
         let owner = uploaded_dependency_bundle(&[
-            ("package/src/lib.rs", b"pub fn answer() -> u8 { 42 }\n", false),
-            ("dependencies/0000/libleaf.rmeta", b"retained metadata", false),
-            ("dependencies/0001/libarchive.rlib", b"retained archive", false),
+            (
+                "package/src/lib.rs",
+                b"pub fn answer() -> u8 { 42 }\n",
+                false,
+            ),
+            (
+                "dependencies/0000/libleaf.rmeta",
+                b"retained metadata",
+                false,
+            ),
+            (
+                "dependencies/0001/libarchive.rlib",
+                b"retained archive",
+                false,
+            ),
         ]);
         let context = DependencyExecContext::new_with_artifacts(
             "/source/package".to_owned(),
@@ -873,7 +1584,7 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         context.prepare_empty_backings(empty.path()).unwrap();
-        let spec = context
+        let mut spec = context
             .namespace(
                 &package,
                 toolchain.path(),
@@ -882,11 +1593,17 @@ mod tests {
                 home.path(),
             )
             .unwrap();
+        let guard = owner
+            .prepare_dependency_output(91, &context, &mut spec)
+            .unwrap();
+        assert!(guard.relative_paths().next().is_none());
+        guard.verify(output.path()).unwrap();
+        std::fs::write(output.path().join("libproduced.rmeta"), b"new output").unwrap();
+        guard.verify(output.path()).unwrap();
         owner.protect_dependency(91, &context, &spec).unwrap();
         for root in context.artifact_roots() {
             assert!(spec.ro_binds.iter().any(|bind| {
-                bind.visible == Path::new(&root.path)
-                    && bind.backing == bundle.join(&root.prefix)
+                bind.visible == Path::new(&root.path) && bind.backing == bundle.join(&root.prefix)
             }));
         }
         let other = tempfile::tempdir().unwrap();
@@ -903,9 +1620,15 @@ mod tests {
         assert!(owner.protect_dependency(91, &context, &writable).is_err());
         let mut visible_alias = spec.clone();
         visible_alias.rw_binds[0].visible = "/target/z-first".into();
-        assert!(owner.protect_dependency(91, &context, &visible_alias).is_err());
+        assert!(
+            owner
+                .protect_dependency(91, &context, &visible_alias)
+                .is_err()
+        );
         let mut shadowed = spec;
-        shadowed.ro_binds.push(Bind::new(other.path(), "/target/z-first/shadow"));
+        shadowed
+            .ro_binds
+            .push(Bind::new(other.path(), "/target/z-first/shadow"));
         assert!(owner.protect_dependency(91, &context, &shadowed).is_err());
     }
 
@@ -930,17 +1653,28 @@ mod tests {
         )
         .unwrap();
         let package: (&str, &[u8], bool) = ("package/src/lib.rs", b"source", false);
-        let artifact: (&str, &[u8], bool) =
-            ("dependencies/0000/libleaf.rmeta", b"metadata", false);
+        let artifact: (&str, &[u8], bool) = ("dependencies/0000/libleaf.rmeta", b"metadata", false);
         let cases: Vec<Vec<(&str, &[u8], bool)>> = vec![
-            vec![package, ("dependencies/0001/libleaf.rmeta", b"metadata", false)],
-            vec![package, ("dependencies/0000/nested/libleaf.rmeta", b"metadata", false)],
+            vec![
+                package,
+                ("dependencies/0001/libleaf.rmeta", b"metadata", false),
+            ],
+            vec![
+                package,
+                ("dependencies/0000/nested/libleaf.rmeta", b"metadata", false),
+            ],
             vec![package, ("dependencies/0000/libleaf.so", b"dynamic", false)],
-            vec![package, ("dependencies/0000/libleaf.rmeta", b"metadata", true)],
+            vec![
+                package,
+                ("dependencies/0000/libleaf.rmeta", b"metadata", true),
+            ],
             vec![package],
             vec![artifact],
             vec![package, artifact, ("unmapped/extra", b"extra", false)],
-            vec![package, ("dependencies/0000/leaf.rmeta", b"metadata", false)],
+            vec![
+                package,
+                ("dependencies/0000/leaf.rmeta", b"metadata", false),
+            ],
         ];
         for files in cases {
             let owner = uploaded_dependency_bundle(&files);

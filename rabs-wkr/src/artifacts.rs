@@ -8,6 +8,7 @@
 //! diagnostic-range storage. This is a transport offer, not a CAS publication.
 
 use crate::output::{CapturedStream, MAX_OUTPUT_CHUNK_BYTES, MAX_RETAINED_STREAM_BYTES};
+use crate::source_transfer::DependencyOutputInputs;
 use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
 };
@@ -172,15 +173,60 @@ impl PreparedArtifacts {
     /// Tree mode captures all regular files and admits only closed internal hard
     /// links, copying aliases independently; it never follows symlinks or mounts.
     pub fn capture(self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
+        self.capture_with_dependency_inputs(None, stopped)
+    }
+
+    /// A shared Cargo input/output directory contains owned mountpoints for
+    /// retained dependency files. These may never collide with output names,
+    /// become required parent directories, or silently enter a tree result.
+    pub(crate) fn validate_dependency_inputs(
+        &self,
+        inputs: &DependencyOutputInputs,
+    ) -> io::Result<()> {
+        inputs.verify(self.backing())?;
+        for name in inputs.relative_paths() {
+            if self.plan.tree {
+                return Err(invalid(
+                    "shared dependency inputs require an exact artifact declaration",
+                ));
+            }
+            if self.plan.files.contains(name) || self.plan.directories.contains(name) {
+                return Err(invalid("dependency input collides with a declared output"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Exclude only placeholders held by the source owner's verified input
+    /// guard. Arbitrary undeclared files remain errors. The original output
+    /// directory stays owned until both capture and the final guard check end.
+    pub(crate) fn capture_with_dependency_inputs(
+        self,
+        dependency_inputs: Option<&DependencyOutputInputs>,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        if let Some(inputs) = dependency_inputs {
+            self.validate_dependency_inputs(inputs)?;
+        }
         if self.plan.tree {
             #[cfg(target_os = "linux")]
-            return self.capture_tree(stopped);
+            {
+                let captured = self.capture_tree(stopped)?;
+                if let Some(inputs) = dependency_inputs {
+                    inputs.verify(self.backing())?;
+                }
+                return Ok(captured);
+            }
             #[cfg(not(target_os = "linux"))]
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "artifact tree capture requires Linux",
             ));
         }
+        let excluded: BTreeSet<_> = dependency_inputs
+            .into_iter()
+            .flat_map(DependencyOutputInputs::relative_paths)
+            .collect();
         let mut pending = vec![PathBuf::new()];
         let mut found = BTreeSet::new();
         let mut entries = 0_usize;
@@ -209,6 +255,9 @@ impl PreparedArtifacts {
                     pending.push(path);
                 } else {
                     regular_private_file(&metadata)?;
+                    if excluded.contains(name) {
+                        continue;
+                    }
                     if !self.plan.files.contains(name) {
                         return Err(invalid(format!("undeclared artifact: {name}")));
                     }
@@ -254,11 +303,15 @@ impl PreparedArtifacts {
                 "artifact capture interrupted",
             ));
         }
-        finish_capture(self.plan.clone(), files)
+        let captured = finish_capture(self.plan.clone(), files)?;
+        if let Some(inputs) = dependency_inputs {
+            inputs.verify(self.backing())?;
+        }
+        Ok(captured)
     }
 
     #[cfg(target_os = "linux")]
-    fn capture_tree(self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
+    fn capture_tree(&self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         use std::os::unix::fs::PermissionsExt;
 
@@ -640,6 +693,246 @@ mod tests {
 
     fn plan(paths: &[&str]) -> ArtifactPlan {
         ArtifactPlan::new("dep".into(), paths.iter().map(|s| (*s).into()).collect()).unwrap()
+    }
+
+    /// Exercise the real transfer seal and source-owner handoff. The guard is
+    /// obtained from production preparation, never constructed from names by
+    /// the capture test. Source and output owners remain alive through capture.
+    fn shared_input_capture(
+        plan: ArtifactPlan,
+    ) -> io::Result<(
+        PreparedArtifacts,
+        crate::source_transfer::SourceOwner,
+        DependencyOutputInputs,
+    )> {
+        use crate::source_transfer::{SourceTransferState, hex};
+        use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
+        use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+        use serde_json::json;
+
+        let inputs = [
+            (
+                "package/src/lib.rs",
+                b"pub fn answer() -> u8 { 42 }\n".as_slice(),
+            ),
+            (
+                "dependencies/0000/libleaf.rmeta",
+                b"retained metadata\0\xff".as_slice(),
+            ),
+            (
+                "dependencies/0000/libarchive.rlib",
+                b"retained full archive\0\xfe".as_slice(),
+            ),
+        ];
+        let manifest = SourceManifest::new(
+            inputs
+                .iter()
+                .map(|(path, bytes)| SourceFile {
+                    path: (*path).to_owned(),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let wire_manifest = json!({
+            "manifest_sha256":hex(&manifest.digest()),
+            "files":inputs.iter().map(|(path, bytes)| json!({
+                "path":path,"bytes":bytes.len(),"sha256":hex(&Sha256::digest(bytes)),
+                "executable":false,
+            })).collect::<Vec<_>>(),
+        });
+        let request_id = 591;
+        let request = json!({
+            "kind":"canonical-exec","request_id":request_id,
+            "source_manifest":wire_manifest,
+        });
+        let mut transfer = SourceTransferState::default();
+        transfer
+            .handle(
+                &json!({
+                    "kind":"source-begin","request_id":request_id,"manifest":wire_manifest,
+                }),
+                true,
+                false,
+            )
+            .unwrap();
+        for (path, bytes) in inputs {
+            transfer
+                .handle(
+                    &json!({
+                        "kind":"source-chunk","request_id":request_id,
+                        "manifest_sha256":hex(&manifest.digest()),"path":path,"offset":0,
+                        "data_hex":hex(bytes),"chunk_sha256":hex(&Sha256::digest(bytes)),
+                    }),
+                    true,
+                    false,
+                )
+                .unwrap();
+        }
+        transfer
+            .handle(
+                &json!({
+                    "kind":"source-seal","request_id":request_id,
+                    "manifest_sha256":hex(&manifest.digest()),
+                }),
+                true,
+                false,
+            )
+            .unwrap();
+        let source = transfer.take_prepared(&request).unwrap().unwrap();
+        let context = DependencyExecContext::new_with_artifacts(
+            "/source/package".to_owned(),
+            "/source/package".to_owned(),
+            "/toolchains/pinned".to_owned(),
+            "/toolchains/pinned/bin/rustc".to_owned(),
+            "/target/deps".to_owned(),
+            vec!["/target/deps".to_owned()],
+            Vec::new(),
+            vec![DependencyArtifactRoot {
+                path: "/target/deps".to_owned(),
+                prefix: "dependencies/0000".to_owned(),
+            }],
+            Vec::new(),
+            [7; 32],
+        )
+        .unwrap();
+        let output = PreparedArtifacts::new(plan)?;
+        let toolchain = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        context.prepare_empty_backings(empty.path()).unwrap();
+        let mut spec = context
+            .namespace(
+                &source.dependency_root(request_id, &context).unwrap(),
+                toolchain.path(),
+                output.backing(),
+                empty.path(),
+                home.path(),
+            )
+            .unwrap();
+        let guard = source.prepare_dependency_output(request_id, &context, &mut spec)?;
+        source.protect_dependency(request_id, &context, &spec)?;
+        Ok((output, source, guard))
+    }
+
+    #[test]
+    fn shared_input_capture_exports_only_declared_outputs_and_keeps_exact_bytes() {
+        let (prepared, _source, guard) =
+            shared_input_capture(plan(&["top.d", "libtop.rmeta"])).unwrap();
+        prepared.validate_dependency_inputs(&guard).unwrap();
+        for name in ["libleaf.rmeta", "libarchive.rlib"] {
+            assert_eq!(fs::read(prepared.backing().join(name)).unwrap(), b"");
+        }
+        let metadata = b"compiled metadata\0\xff";
+        let dep_info = b"libtop.rmeta: src/lib.rs\n";
+        fs::write(prepared.backing().join("libtop.rmeta"), metadata).unwrap();
+        fs::write(prepared.backing().join("top.d"), dep_info).unwrap();
+        let mut captured = prepared
+            .capture_with_dependency_inputs(Some(&guard), || false)
+            .unwrap();
+        assert_eq!(
+            captured.plan().files().collect::<Vec<_>>(),
+            ["libtop.rmeta", "top.d"]
+        );
+        assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            captured.total_bytes(),
+            (metadata.len() + dep_info.len()) as u64
+        );
+        assert_eq!(
+            captured.read_chunk("libtop.rmeta", 0, 128).unwrap(),
+            metadata
+        );
+        assert_eq!(captured.read_chunk("top.d", 0, 128).unwrap(), dep_info);
+        for name in ["libleaf.rmeta", "libarchive.rlib"] {
+            assert!(captured.file_identity(name).is_none());
+            assert!(captured.read_chunk(name, 0, 1).is_err());
+        }
+
+        // Neither a familiar suffix nor an absent guard makes another file
+        // eligible for exclusion from the exact output declaration.
+        for unguarded in [false, true] {
+            let (prepared, _source, guard) = shared_input_capture(plan(&["libtop.rmeta"])).unwrap();
+            fs::write(prepared.backing().join("libtop.rmeta"), metadata).unwrap();
+            if unguarded {
+                assert!(prepared.capture(|| false).is_err());
+            } else {
+                fs::write(prepared.backing().join("libunmapped.rmeta"), b"unexpected").unwrap();
+                assert!(
+                    prepared
+                        .capture_with_dependency_inputs(Some(&guard), || false)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_input_capture_refuses_output_collisions_before_execution() {
+        for name in ["libleaf.rmeta", "libarchive.rlib"] {
+            let (prepared, _source, guard) = shared_input_capture(plan(&[name])).unwrap();
+            guard.verify(prepared.backing()).unwrap();
+            let refused = prepared.validate_dependency_inputs(&guard).unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("collides with a declared output")
+            );
+            assert_eq!(fs::read(prepared.backing().join(name)).unwrap(), b"");
+            assert!(
+                prepared
+                    .capture_with_dependency_inputs(Some(&guard), || false)
+                    .is_err()
+            );
+        }
+        assert!(
+            shared_input_capture(plan(&["libarchive.rlib/nested.out"])).is_err(),
+            "an input file cannot become a declared output parent directory"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let tree =
+                ArtifactPlan::new_tree("dep".to_owned(), vec!["libtop.rmeta".to_owned()]).unwrap();
+            let (prepared, _source, guard) = shared_input_capture(tree).unwrap();
+            assert!(prepared.validate_dependency_inputs(&guard).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_input_capture_detects_placeholder_changes_after_initial_validation() {
+        use std::cell::Cell;
+
+        for replace in [false, true] {
+            let (prepared, _source, guard) = shared_input_capture(plan(&["libtop.rmeta"])).unwrap();
+            fs::write(prepared.backing().join("libtop.rmeta"), b"compiled output").unwrap();
+            let placeholder = prepared.backing().join("libleaf.rmeta");
+            let retained = tempfile::tempdir().unwrap();
+            let mutated = Cell::new(false);
+            // The ordinary cancellation callback supplies a deterministic
+            // interleaving after the guard's initial validation. Cancellation
+            // stays false: only the changed input identity may reject capture.
+            let captured = prepared.capture_with_dependency_inputs(Some(&guard), || {
+                if !mutated.replace(true) {
+                    if replace {
+                        fs::rename(&placeholder, retained.path().join("original-input")).unwrap();
+                        fs::write(&placeholder, b"").unwrap();
+                    } else {
+                        fs::write(&placeholder, b"unexpected replacement bytes").unwrap();
+                    }
+                }
+                false
+            });
+            assert!(mutated.get());
+            let refused = captured.unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("dependency input mountpoint or retained backing changed"),
+                "changed or replaced input escaped the final capture guard: {refused}"
+            );
+        }
     }
 
     #[test]

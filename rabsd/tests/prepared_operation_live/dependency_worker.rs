@@ -1,4 +1,4 @@
-//! Real daemon/worker/TLS oracle for the dependency-exec-v3 contract.
+//! Real daemon/worker/TLS oracle for the dependency-exec-v4 contract.
 //!
 //! Run on Linux with usable bubblewrap/user namespaces and OpenSSL:
 //!

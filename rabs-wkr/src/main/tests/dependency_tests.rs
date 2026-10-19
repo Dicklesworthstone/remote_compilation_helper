@@ -93,11 +93,15 @@ fn cargo_loader_parent_is_explicit_and_old_context_versions_cannot_ignore_it() {
             .env()
             .contains(&("LD_LIBRARY_PATH".to_owned(), value.to_owned()))
     );
-    for version in ["dependency-exec-v1", "dependency-exec-v2"] {
+    for version in [
+        "dependency-exec-v1",
+        "dependency-exec-v2",
+        "dependency-exec-v3",
+    ] {
         request["dependency_context"]["version"] = json!(version);
         assert!(
             parse_exec_request(&request).is_err(),
-            "an old worker contract cannot select v3 execution: {version}"
+            "an old worker contract cannot select v4 execution: {version}"
         );
     }
     request["dependency_context"]["version"] = json!(DEPENDENCY_CONTEXT_VERSION);
@@ -184,7 +188,29 @@ fn dependency_artifact_roots_preserve_first_use_mapping_when_paths_sort_differen
     assert_eq!(roots[0].prefix, "dependencies/0002");
     assert_eq!(roots[1].path, "/work/inputs/z-first");
     assert_eq!(roots[1].prefix, "dependencies/0000");
-    assert_eq!(request, dependency_dag_request(), "decoder changed wire identity");
+    assert_eq!(
+        request,
+        dependency_dag_request(),
+        "decoder changed wire identity"
+    );
+}
+
+#[test]
+fn dependency_artifact_root_parser_admits_shared_output_only_under_v4() {
+    let mut request = dependency_dag_request();
+    // Keep the exact sealed manifest and first-use prefixes. This populated
+    // root now also receives the worker-owned writable output directory.
+    request["dependency_context"]["out_dir"] = json!("/work/inputs/z-first");
+    let parsed = parse_exec_request(&request).unwrap();
+    let context = parsed.dependency_context.unwrap();
+    let shared = context
+        .artifact_roots()
+        .iter()
+        .find(|root| root.path == context.out_dir())
+        .unwrap();
+    assert_eq!(shared.prefix, "dependencies/0000");
+    request["dependency_context"]["version"] = json!("dependency-exec-v3");
+    assert!(parse_exec_request(&request).is_err());
 }
 
 #[test]
@@ -221,7 +247,6 @@ fn dependency_artifact_root_parser_requires_exact_bounded_mapping_records() {
         json!([{"path":"/work/inputs/z-first", "prefix":"dependencies/0000/nested"}]),
         json!([{"path":"/work/inputs/z-first", "prefix":"package"}]),
         json!([{"path":"/work/inputs/unmentioned", "prefix":"dependencies/0003"}]),
-        json!([{"path":"/work/target/debug/deps", "prefix":"dependencies/0001"}]),
     ] {
         let mut request = dependency_dag_request();
         request["dependency_context"]["artifact_roots"] = invalid.clone();
@@ -259,6 +284,7 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
         json!(true),
         json!("dependency-exec-v1"),
         json!("dependency-exec-v2"),
+        json!("dependency-exec-v3"),
         json!("dependency-exec-v999"),
     ] {
         assert!(
@@ -375,6 +401,12 @@ fn retained_v2_dependency_result_remains_recoverable_after_context_upgrade() {
 }
 
 #[cfg(unix)]
+#[test]
+fn retained_v3_dependency_result_remains_recoverable_after_context_upgrade() {
+    assert_retained_dependency_resume("dependency-exec-v3");
+}
+
+#[cfg(unix)]
 fn assert_retained_dependency_resume(version: &str) {
     let root = private_root();
     let mut original = dependency_request();
@@ -387,10 +419,12 @@ fn assert_retained_dependency_resume(version: &str) {
     // exact saved fingerprint still authorizes retrieval-only recovery.
     original["dependency_context"]["version"] = json!(version);
     if version != DEPENDENCY_CONTEXT_VERSION {
-        original["dependency_context"]
-            .as_object_mut()
-            .unwrap()
-            .remove("artifact_roots");
+        if matches!(version, "dependency-exec-v1" | "dependency-exec-v2") {
+            original["dependency_context"]
+                .as_object_mut()
+                .unwrap()
+                .remove("artifact_roots");
+        }
         assert!(parse_exec_request(&original).is_err());
     }
     let id = original["request_id"].as_u64().unwrap();

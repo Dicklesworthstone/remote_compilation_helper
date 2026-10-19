@@ -35,16 +35,18 @@ pub const REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str = "rabs.remote-leaf.isolation
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
-pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v3: \
+pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v4: \
     Linux worker namespace; subscriber paths preserved; complete regular-file \
     dependency source, exact toolchain and complete crate-candidate inventories \
     mounted read-only; explicit rmeta and complete rlib extern bytes retained; \
     no bare extern, proc-macro, generated or native inputs; metadata and dep-info \
-    only; nonempty dependency roots disjoint from outputs; empty inventories \
+    only; shared input/output roots use exact read-only file mounts above private \
+    writable output backing, with owned input placeholders verified and excluded \
+    from exact output capture; declared outputs cannot alias inputs; empty inventories \
     receive private empty backings; outputs private until complete authenticated \
     delivery; network denied; compiler environment preserved by dependency-env-v2 \
     except process-local jobserver descriptors; all loader paths within the exact \
-    toolchain or independently observed dependency-exec-v3 directories without \
+    toolchain or independently observed dependency-exec-v4 directories without \
     dynamic libraries, including Cargo output parents; host ELF runtime, CPU and \
     filesystem cohort observed and independently matched before execution; \
     dep-info closure and tracked-environment checks required before coordinator-only \
@@ -63,8 +65,6 @@ pub enum RemoteDependencyRefusal {
     ExternInputs,
     /// Native input or host-dependent CPU selection.
     NativeInputs,
-    /// A writable output directory also contains dependency input candidates.
-    NonemptyDependencyDirectory(String),
     /// The exact observed compiler/sysroot paths are not the requested ones.
     ToolchainPath(String),
     /// Loader state cannot be reconstructed entirely from retained inputs.
@@ -83,7 +83,6 @@ impl RemoteDependencyRefusal {
             Self::GeneratedInputs => "REMOTE_DEP_GENERATED_INPUTS",
             Self::ExternInputs => "REMOTE_DEP_EXTERN_INPUTS",
             Self::NativeInputs => "REMOTE_DEP_NATIVE_INPUTS",
-            Self::NonemptyDependencyDirectory(_) => "REMOTE_DEP_DIRECTORY_NOT_EMPTY",
             Self::ToolchainPath(_) => "REMOTE_DEP_TOOLCHAIN_PATH",
             Self::LoaderEnvironment(_) => "REMOTE_DEP_LOADER_ENVIRONMENT",
             Self::RuntimeIdentity => "REMOTE_DEP_RUNTIME_IDENTITY",
@@ -95,9 +94,9 @@ impl std::fmt::Display for RemoteDependencyRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local(error) => write!(formatter, "{}: {error}", self.code()),
-            Self::NonemptyDependencyDirectory(path)
-            | Self::ToolchainPath(path)
-            | Self::LoaderEnvironment(path) => write!(formatter, "{}: {path}", self.code()),
+            Self::ToolchainPath(path) | Self::LoaderEnvironment(path) => {
+                write!(formatter, "{}: {path}", self.code())
+            }
             _ => formatter.write_str(self.code()),
         }
     }
@@ -128,7 +127,7 @@ pub fn remote_loader_search_paths(
 
 /// Exact private-empty loader aliases required by the original environment.
 ///
-/// Sorted and deduplicated for the dependency-exec-v2 worker context. This
+/// Sorted and deduplicated for the dependency-exec-v4 worker context. This
 /// includes output/dependency entries and Cargo's output parent. No directory
 /// is silently assumed empty: rabs_sandbox::loader_directories must observe
 /// every returned root, even if its Rust .rlib/.rmeta inventory was empty.
@@ -268,13 +267,6 @@ pub fn remote_dependency_shape(
             LiveRefusal::Facts("declared outputs differ from the invocation".into()).into(),
         );
     }
-    for directory in directories {
-        if directory.path == plan.out_dir && !directory.artifacts.is_empty() {
-            return Err(RemoteDependencyRefusal::NonemptyDependencyDirectory(
-                directory.path.clone(),
-            ));
-        }
-    }
     remote_loader_search_paths(plan, toolchain_root)?;
     Ok(())
 }
@@ -334,8 +326,10 @@ fn remote_extern_facts(
 ///
 /// Directory facts must cover every planned directory in order, even when it
 /// is the output directory. Every nonempty inventory is retained byte-for-byte
-/// and mounted read-only on the worker, and must be disjoint from the writable
-/// output root. Empty inventories receive fresh private worker directories.
+/// and mounted read-only on the worker. Candidates in the output directory
+/// receive individual read-only file mounts over owned placeholders; only
+/// declared new outputs are captured. Empty inventories receive fresh private
+/// worker directories.
 /// Revalidate all original observations through dispatch and installation.
 ///
 /// # Errors
@@ -644,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn every_search_inventory_is_required_and_writable_output_inventory_stays_empty() {
+    fn every_search_inventory_is_required_and_shared_output_inputs_are_keyed() {
         let plan = plan(OUTPUT);
         let runtime = compute(RUNTIME_COHORT_DOMAIN, b"runtime");
         let call = |directories: &[DependencyDirectoryFact]| {
@@ -667,11 +661,18 @@ mod tests {
             path: format!("{OUTPUT}/libhidden.rmeta"),
             content_digest: compute("rabs.test.v1", b"hidden"),
         });
-        assert!(matches!(
-            call(&facts),
-            Err(RemoteDependencyRefusal::NonemptyDependencyDirectory(_))
-        ));
-        assert!(call(&directories(&plan)).is_ok());
+        let populated = call(&facts).unwrap();
+        assert_ne!(
+            populated.action_key,
+            call(&directories(&plan)).unwrap().action_key
+        );
+        facts[0].artifacts[0].content_digest = compute("rabs.test.v1", b"changed hidden");
+        assert_ne!(populated.action_key, call(&facts).unwrap().action_key);
+        facts[0].artifacts[0].path = format!("{OUTPUT}/libleaf.rmeta");
+        assert!(
+            call(&facts).is_err(),
+            "an output cannot also be a retained input"
+        );
     }
 
     fn dag_fixture(out_dir: &str) -> (DependencyActionPlan, Vec<DependencyDirectoryFact>) {
@@ -775,6 +776,67 @@ mod tests {
                 .unwrap()
                 .action_key
         );
+    }
+
+    #[test]
+    fn shared_cargo_output_directory_keys_full_externs_and_transitive_metadata() {
+        let mut plan = plan(OUTPUT);
+        for (name, filename, kind) in [
+            ("archive", "libarchive.rlib", DependencyArtifactKind::Rlib),
+            ("middle", "libmiddle.rmeta", DependencyArtifactKind::Rmeta),
+        ] {
+            let path = format!("{OUTPUT}/{filename}");
+            plan.invocation
+                .externs
+                .push((name.into(), Some(path.clone())));
+            plan.externs.push(PlannedExtern::File {
+                name: name.into(),
+                path,
+                kind,
+            });
+        }
+        let mut directories = directories(&plan);
+        directories[0].artifacts = [
+            ("libarchive.rlib", "full archive bytes"),
+            ("libmiddle.rmeta", "direct metadata"),
+            ("libtransitive.rmeta", "transitive metadata"),
+        ]
+        .into_iter()
+        .map(|(filename, bytes)| ExternFact {
+            path: format!("{OUTPUT}/{filename}"),
+            content_digest: compute("rabs.test.v1", bytes.as_bytes()),
+        })
+        .collect();
+        remote_dependency_shape(&plan, &directories, TOOLCHAIN).unwrap();
+        let original = dag_key(&plan, &directories).unwrap();
+        for index in 0..3 {
+            let mut changed = directories.clone();
+            changed[0].artifacts[index].content_digest =
+                compute("rabs.test.v1", b"changed shared candidate bytes");
+            assert_ne!(
+                original.action_key,
+                dag_key(&plan, &changed).unwrap().action_key
+            );
+        }
+        let mut missing_transitive = directories.clone();
+        missing_transitive[0].artifacts.pop();
+        assert_ne!(
+            original.action_key,
+            dag_key(&plan, &missing_transitive).unwrap().action_key,
+            "search-directory membership participates even without a direct extern",
+        );
+        let mut missing_direct = directories.clone();
+        missing_direct[0].artifacts.remove(1);
+        assert!(dag_key(&plan, &missing_direct).is_err());
+        let mut output_collision = directories;
+        output_collision[0].artifacts.push(ExternFact {
+            path: format!("{OUTPUT}/libleaf.rmeta"),
+            content_digest: compute("rabs.test.v1", b"stale own output"),
+        });
+        output_collision[0]
+            .artifacts
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        assert!(dag_key(&plan, &output_collision).is_err());
     }
 
     #[test]

@@ -12,8 +12,8 @@ use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
-    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
-    MAX_DEPENDENCY_DIRS, MAX_DEPENDENCY_ENV_ENTRIES,
+    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext, MAX_DEPENDENCY_DIRS,
+    MAX_DEPENDENCY_ENV_ENTRIES,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -676,6 +676,10 @@ fn execute_canonical_inner(
     } else {
         None
     };
+    // Hold the exact input mountpoint identities until the process group,
+    // drains and output capture are complete. A name alone cannot authorize
+    // excluding a file from a shared Cargo input/output directory.
+    let mut dependency_inputs = None;
     let prepared_spec = (|| -> Result<_, String> {
         if let Some(context) = &request.dependency_context {
             let source = source.ok_or("dependency execution lacks its source owner")?;
@@ -710,7 +714,7 @@ fn execute_canonical_inner(
             context
                 .prepare_empty_backings(empty.path())
                 .map_err(|error| format!("dependency loader mountpoints: {error}"))?;
-            let spec = context
+            let mut spec = context
                 .namespace(
                     &source_root,
                     toolchain.root(),
@@ -719,6 +723,12 @@ fn execute_canonical_inner(
                     execution_home,
                 )
                 .map_err(|error| error.to_string())?;
+            let inputs = source
+                .prepare_dependency_output(request.request_id, context, &mut spec)
+                .map_err(|error| format!("dependency input mountpoints: {error}"))?;
+            artifacts
+                .validate_dependency_inputs(&inputs)
+                .map_err(|error| format!("dependency input/output collision: {error}"))?;
             source
                 .protect_dependency(request.request_id, context, &spec)
                 .map_err(|error| format!("dependency source isolation: {error}"))?;
@@ -734,6 +744,7 @@ fn execute_canonical_inner(
                     return Err("writable mount aliases empty dependency search storage".to_owned());
                 }
             }
+            dependency_inputs = Some(inputs);
             Ok(spec)
         } else {
             let mut plan = CanonicalMountPlan::new(
@@ -822,6 +833,14 @@ fn execute_canonical_inner(
     {
         let _ = control.retain_outputs(Err(format!(
             "dependency runtime pre-execution verification: {error}"
+        )));
+        return exec_error(request.request_id);
+    }
+    if let (Some(inputs), Some(artifacts)) = (&dependency_inputs, &artifacts)
+        && let Err(error) = inputs.verify(artifacts.backing())
+    {
+        let _ = control.retain_outputs(Err(format!(
+            "dependency input mountpoints changed before execution: {error}"
         )));
         return exec_error(request.request_id);
     }
@@ -914,7 +933,10 @@ fn execute_canonical_inner(
                 && output.residual_group_members == 0
                 && control.reason().is_none()
             {
-                let capture = artifacts.capture(|| control.reason().is_some());
+                let capture = artifacts
+                    .capture_with_dependency_inputs(dependency_inputs.as_ref(), || {
+                        control.reason().is_some()
+                    });
                 // Retain failure as evidence. A zero compiler exit is NOT a
                 // successful completion if its requested artifact set is missing.
                 if control

@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
-pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v3";
+pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v4";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -147,7 +147,9 @@ impl DependencyExecContext {
     /// Include exact retained Rust metadata/archive candidate directories.
     /// Directory order is invocation first-use order, so each retained prefix
     /// has the same identity as the keyed inventory and the source upload.
-    /// Populated search roots must be disjoint from the writable output root.
+    /// A search root may equal the writable output root. Its retained files
+    /// require individually owned read-only mounts over private placeholders;
+    /// the worker supplies that sealed inventory before compiling the namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_artifacts(
         source_root: String,
@@ -202,19 +204,23 @@ impl DependencyExecContext {
             return Err(invalid("too many retained dependency artifact roots"));
         }
         artifact_roots.sort_by(|left, right| left.path.cmp(&right.path));
-        if artifact_roots.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        if artifact_roots
+            .windows(2)
+            .any(|pair| pair[0].path == pair[1].path)
+        {
             return Err(invalid("duplicate retained dependency artifact root"));
         }
         for artifact in &artifact_roots {
-            let Some(index) = dependency_dirs.iter().position(|path| path == &artifact.path) else {
-                return Err(invalid("artifact root is not a declared dependency directory"));
-            };
-            if artifact.path == out_dir
-                || artifact.prefix != format!("dependencies/{index:04}")
-            {
+            let Some(index) = dependency_dirs
+                .iter()
+                .position(|path| path == &artifact.path)
+            else {
                 return Err(invalid(
-                    "artifact root has a wrong prefix or overlaps the writable output",
+                    "artifact root is not a declared dependency directory",
                 ));
+            };
+            if artifact.prefix != format!("dependencies/{index:04}") {
+                return Err(invalid("artifact root has a wrong first-use prefix"));
             }
         }
         if loader_dirs.len() > MAX_DEPENDENCY_DIRS {
@@ -456,6 +462,7 @@ impl DependencyExecContext {
             spec.ro_binds.extend(
                 self.artifact_roots
                     .iter()
+                    .filter(|root| root.path != self.out_dir)
                     .map(|root| Bind::new(bundle.join(&root.prefix), &root.path)),
             );
         }
@@ -486,15 +493,70 @@ pub fn build_dependency_argv(
     let refuse = || IsolationError::InvalidSpec {
         reason: "dependency namespace differs from its validated context".to_owned(),
     };
-    let expected_ro: BTreeSet<_> = [
+    let mut expected_ro: BTreeSet<_> = [
         context.source_root.as_str(),
         context.toolchain_root.as_str(),
     ]
     .into_iter()
     .chain(context.empty_aliases())
-    .chain(context.artifact_roots.iter().map(|root| root.path.as_str()))
+    .chain(
+        context
+            .artifact_roots
+            .iter()
+            .filter(|root| root.path != context.out_dir)
+            .map(|root| root.path.as_str()),
+    )
     .map(PathBuf::from)
     .collect();
+    let mut output_inputs = Vec::new();
+    if let Some(root) = context
+        .artifact_roots
+        .iter()
+        .find(|root| root.path == context.out_dir)
+    {
+        let source = spec
+            .ro_binds
+            .iter()
+            .find(|bind| bind.visible == Path::new(context.source_root()))
+            .ok_or_else(refuse)?;
+        if source.backing.file_name() != Some(std::ffi::OsStr::new("package")) {
+            return Err(refuse());
+        }
+        let retained = source
+            .backing
+            .parent()
+            .ok_or_else(refuse)?
+            .join(&root.prefix);
+        for bind in &spec.ro_binds {
+            if !bind.visible.starts_with(&context.out_dir) {
+                continue;
+            }
+            let name = bind
+                .visible
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(refuse)?;
+            if bind.visible.parent() != Some(Path::new(&context.out_dir))
+                || !name.starts_with("lib")
+                || !(name.ends_with(".rmeta") || name.ends_with(".rlib"))
+                || name.chars().any(char::is_control)
+                || name.contains(['\\', ':'])
+                || bind.backing != retained.join(name)
+            {
+                return Err(refuse());
+            }
+            expected_ro.insert(bind.visible.clone());
+            output_inputs.push(bind.clone());
+        }
+        // The context declares a populated root. Only SourceOwner may derive
+        // this exact set from its sealed manifest and create its placeholders;
+        // this builder separately constrains shape, backing and mount ordering.
+        if output_inputs.is_empty()
+            || output_inputs.len() > crate::source_transfer::MAX_SOURCE_FILES
+        {
+            return Err(refuse());
+        }
+    }
     let expected_rw =
         BTreeSet::from([PathBuf::from(&context.out_dir), PathBuf::from(layout::HOME)]);
     let actual_ro: BTreeSet<_> = spec
@@ -540,11 +602,18 @@ pub fn build_dependency_argv(
     argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
     push_host_usr(&mut argv);
     argv.extend(["--tmpfs", "/tmp", "--tmpfs", layout::TMP].map(OsString::from));
-    let mut ro = spec.ro_binds.clone();
+    let mut ro: Vec<_> = spec
+        .ro_binds
+        .iter()
+        .filter(|bind| !bind.visible.starts_with(&context.out_dir))
+        .cloned()
+        .collect();
     let mut rw = spec.rw_binds.clone();
     ro.sort_by(|left, right| left.visible.cmp(&right.visible));
     rw.sort_by(|left, right| left.visible.cmp(&right.visible));
     push_binds(&mut argv, &ro, &rw);
+    output_inputs.sort_by(|left, right| left.visible.cmp(&right.visible));
+    push_binds(&mut argv, &output_inputs, &[]);
     argv.extend(["--chdir", context.cwd.as_str(), "--", program].map(OsString::from));
     argv.extend(args.iter().map(OsString::from));
     Ok(NamespaceLaunch {
@@ -696,9 +765,12 @@ mod tests {
                 bind.visible == Path::new(&root.path)
                     && bind.backing == Path::new("/private/bundle").join(&root.prefix)
             }));
-            assert!(!spec.rw_binds.iter().any(|bind| {
-                overlaps(&bind.visible, Path::new(&root.path))
-            }));
+            assert!(
+                !spec
+                    .rw_binds
+                    .iter()
+                    .any(|bind| { overlaps(&bind.visible, Path::new(&root.path)) })
+            );
         }
         let support = HostIsolationSupport {
             bubblewrap: Some("test".into()),
@@ -725,7 +797,7 @@ mod tests {
         ] {
             assert!(make(invalid).is_err());
         }
-        assert!(DependencyExecContext::new_with_artifacts(
+        let shared = DependencyExecContext::new_with_artifacts(
             "/source/package".to_owned(),
             "/source/package".to_owned(),
             "/toolchains/pinned".to_owned(),
@@ -740,7 +812,120 @@ mod tests {
             Vec::new(),
             [7; 32],
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(shared.artifact_roots()[0].path, shared.out_dir());
+    }
+
+    #[test]
+    fn shared_output_file_binds_follow_the_writable_root_and_refuse_other_shapes() {
+        let base = context(Vec::new());
+        let context = DependencyExecContext::new_with_artifacts(
+            base.source_root,
+            base.cwd,
+            base.toolchain_root,
+            base.compiler,
+            base.out_dir.clone(),
+            base.dependency_dirs,
+            vec!["/work/build".to_owned()],
+            vec![DependencyArtifactRoot {
+                path: base.out_dir,
+                prefix: "dependencies/0000".to_owned(),
+            }],
+            Vec::new(),
+            [7; 32],
+        )
+        .unwrap();
+        let mut spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        assert!(
+            spec.ro_binds
+                .iter()
+                .all(|bind| { bind.visible != Path::new(context.out_dir()) })
+        );
+        let support = HostIsolationSupport {
+            bubblewrap: Some("test".into()),
+            unprivileged_userns: true,
+            overlayfs: false,
+            cgroup_v2: false,
+            landlock: false,
+        };
+        assert!(build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).is_err());
+        for name in ["libz.rmeta", "liba.rlib"] {
+            spec.ro_binds.push(Bind::new(
+                Path::new("/private/bundle/dependencies/0000").join(name),
+                Path::new(context.out_dir()).join(name),
+            ));
+        }
+        let launch =
+            build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).unwrap();
+        let argv: Vec<_> = launch
+            .argv
+            .iter()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        let parent = argv
+            .windows(3)
+            .position(|args| args[0] == "--ro-bind" && args[2] == "/work/build")
+            .unwrap();
+        let writable = argv
+            .windows(3)
+            .position(|args| args[0] == "--bind" && args[2] == context.out_dir())
+            .unwrap();
+        let archive = argv
+            .windows(3)
+            .position(|args| args[0] == "--ro-bind" && args[2] == "/work/build/deps/liba.rlib")
+            .unwrap();
+        let metadata = argv
+            .windows(3)
+            .position(|args| args[0] == "--ro-bind" && args[2] == "/work/build/deps/libz.rmeta")
+            .unwrap();
+        assert!(parent < writable && writable < archive && archive < metadata);
+        assert!(launch.boundary.proc_private && launch.boundary.net_isolated);
+
+        for bind in [
+            Bind::new("/private/bundle/dependencies/0000", context.out_dir()),
+            Bind::new(
+                "/private/bundle/dependencies/0000/libleaf.rmeta",
+                "/work/build/deps/nested/libleaf.rmeta",
+            ),
+            Bind::new(
+                "/private/bundle/dependencies/0000/libmacro.so",
+                "/work/build/deps/libmacro.so",
+            ),
+            Bind::new(
+                "/private/bundle/dependencies/0000/leaf.rmeta",
+                "/work/build/deps/leaf.rmeta",
+            ),
+            Bind::new(
+                "/private/bundle/dependencies/0001/libother.rmeta",
+                "/work/build/deps/libother.rmeta",
+            ),
+            Bind::new(
+                "/private/bundle/dependencies/0000/liba.rlib",
+                "/work/build/deps/liba.rlib",
+            ),
+        ] {
+            let mut invalid = spec.clone();
+            invalid.ro_binds.push(bind);
+            assert!(
+                build_dependency_argv(&context, &invalid, &support, context.compiler(), &[])
+                    .is_err()
+            );
+        }
+        let mut invalid = spec;
+        invalid
+            .rw_binds
+            .push(Bind::new("/private/alias", "/work/build/deps/liba.rlib"));
+        assert!(
+            build_dependency_argv(&context, &invalid, &support, context.compiler(), &[]).is_err()
+        );
     }
 
     #[test]
