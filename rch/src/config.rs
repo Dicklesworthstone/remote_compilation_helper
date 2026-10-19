@@ -148,12 +148,17 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 //
 // Runtime env and CLI overrides are intentionally applied after cache read.
 // They are not represented in the cache key and must never be memoized.
+//
+// Environment-derived defaults are not memoized either. The built-in
+// `general.socket_path` depends on the process environment
+// (`XDG_RUNTIME_DIR`, then the user cache dir), so the cache records whether
+// that value came from the default and a reader recomputes it (#69).
 
 /// Bumped manually whenever RchConfig (or any nested type) changes shape.
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 3;
+const CACHE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -171,7 +176,44 @@ struct CachedConfig {
     /// Absent source files record zero metadata so a later-appearing file
     /// invalidates the cache.
     source_fingerprints: Vec<SourceFingerprint>,
+    /// No config source set `general.socket_path`: the cached value is the
+    /// built-in default as the writing process computed it. A daemon started
+    /// by `systemd --user` (with `XDG_RUNTIME_DIR`) and an agent shell without
+    /// it resolve different defaults, so the reader recomputes the default
+    /// instead of dialling the writer's socket (#69).
+    socket_path_from_default: bool,
     config: RchConfig,
+}
+
+impl CachedConfig {
+    /// The cached on-disk merge as this process must see it: identical to a
+    /// fresh parse, including environment-derived defaults.
+    fn into_config(self) -> RchConfig {
+        let mut config = self.config;
+        if self.socket_path_from_default {
+            config.general.socket_path = rch_common::default_socket_path();
+        }
+        config
+    }
+}
+
+/// Whether any of these config files sets `general.socket_path`.
+///
+/// Only consulted on a cache miss. A source that cannot be read or parsed
+/// counts as setting it, so the cache keeps the parsed value unchanged.
+fn sources_set_socket_path(paths: &[PathBuf]) -> bool {
+    paths.iter().filter(|path| path.exists()).any(|path| {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return true;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+            return true;
+        };
+        value
+            .get("general")
+            .and_then(|general| general.get("socket_path"))
+            .is_some()
+    })
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -319,13 +361,17 @@ fn try_read_cache() -> Option<RchConfig> {
         bytes = bytes.len(),
         "config.cache.hit",
     );
-    Some(cached.config)
+    Some(cached.into_config())
 }
 
 /// Atomically write the cache via temp+rename so concurrent hooks
 /// never read a torn file. Best-effort: failures are logged and
 /// ignored (the cache is an optimization, never load-bearing).
-fn try_write_cache(config: &RchConfig, source_fingerprints: Vec<SourceFingerprint>) {
+fn try_write_cache(
+    config: &RchConfig,
+    source_fingerprints: Vec<SourceFingerprint>,
+    socket_path_from_default: bool,
+) {
     let Some(path) = cache_file_path() else {
         return;
     };
@@ -343,6 +389,7 @@ fn try_write_cache(config: &RchConfig, source_fingerprints: Vec<SourceFingerprin
     let payload = CachedConfig {
         schema_version: CACHE_SCHEMA_VERSION,
         source_fingerprints,
+        socket_path_from_default,
         config: config.clone(),
     };
     let bytes = match serde_json::to_vec(&payload) {
@@ -457,9 +504,10 @@ pub fn load_config() -> Result<RchConfig> {
     } else {
         let before = current_source_fingerprints();
         let parsed = load_config_uncached()?;
+        let socket_path_from_default = !sources_set_socket_path(&resolved_source_paths());
         let after = current_source_fingerprints();
         if let Some(source_fingerprints) = stable_source_fingerprints(before, after) {
-            try_write_cache(&parsed, source_fingerprints);
+            try_write_cache(&parsed, source_fingerprints, socket_path_from_default);
         } else {
             tracing::debug!(
                 target: "rch::hook::config_cache",
@@ -6188,6 +6236,7 @@ confidence_threshold = 0.80
         // serde will fail this test.
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
+            socket_path_from_default: false,
             source_fingerprints: vec![
                 SourceFingerprint {
                     path: PathBuf::from("/x/a.toml"),
@@ -6216,6 +6265,7 @@ confidence_threshold = 0.80
         let cache_path = dir.path().join("config.cache.json");
         let mut payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION.wrapping_add(1),
+            socket_path_from_default: false,
             source_fingerprints: vec![],
             config: RchConfig::default(),
         };
@@ -6404,6 +6454,7 @@ confidence_threshold = 0.80
         // being removed and pulling massive defaults into the cache file.
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
+            socket_path_from_default: false,
             source_fingerprints: vec![],
             config: RchConfig::default(),
         };
@@ -6426,6 +6477,7 @@ confidence_threshold = 0.80
         let cached_base = RchConfig::default();
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
+            socket_path_from_default: false,
             source_fingerprints: vec![],
             config: cached_base.clone(),
         };
@@ -6445,6 +6497,65 @@ confidence_threshold = 0.80
             runtime_config.general.log_level, "error",
             "runtime env override should still apply after cache lookup"
         );
+    }
+
+    /// #69: a cache written by a process with another environment (say the
+    /// `systemd --user` daemon's, with `XDG_RUNTIME_DIR`) must not hand that
+    /// environment's default socket to this process. A default-derived socket
+    /// is recomputed on read; a configured one is returned as written.
+    #[test]
+    fn cached_default_socket_is_recomputed_for_this_environment() {
+        let mut written = RchConfig::default();
+        written.general.socket_path = "/run/user/4242/another-environment.sock".to_string();
+        written.general.log_level = "debug".to_string();
+        let cached = |socket_path_from_default| CachedConfig {
+            schema_version: CACHE_SCHEMA_VERSION,
+            source_fingerprints: vec![],
+            socket_path_from_default,
+            config: written.clone(),
+        };
+        let roundtrip = |payload: CachedConfig| -> CachedConfig {
+            serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap()
+        };
+
+        let from_default = roundtrip(cached(true)).into_config();
+        assert_eq!(
+            from_default.general.socket_path,
+            rch_common::default_socket_path()
+        );
+        assert_eq!(from_default.general.log_level, "debug");
+
+        let configured = roundtrip(cached(false)).into_config();
+        assert_eq!(
+            configured.general.socket_path,
+            "/run/user/4242/another-environment.sock"
+        );
+    }
+
+    /// #69: only a source that actually sets `general.socket_path` pins it.
+    #[test]
+    fn socket_path_provenance_reads_the_config_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let unrelated = dir.path().join("unrelated.toml");
+        std::fs::write(
+            &unrelated,
+            "[general]\nlog_level = \"debug\"\n\n[transfer]\nsocket_path = \"/not/general\"\n",
+        )
+        .unwrap();
+        let pinned = dir.path().join("pinned.toml");
+        std::fs::write(&pinned, "[general]\nsocket_path = \"/srv/rch.sock\"\n").unwrap();
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "[general\nsocket_path = ").unwrap();
+
+        assert!(!super::sources_set_socket_path(&[]));
+        assert!(!super::sources_set_socket_path(&[
+            missing.clone(),
+            unrelated.clone()
+        ]));
+        assert!(super::sources_set_socket_path(&[unrelated.clone(), pinned]));
+        // Unparsable: keep the parsed value rather than guess a default.
+        assert!(super::sources_set_socket_path(&[missing, broken]));
     }
 
     fn write_project_config(dir: &Path) -> PathBuf {

@@ -14,6 +14,7 @@
 use super::*;
 
 mod discovery;
+pub(crate) use discovery::alternate_default_sockets;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum AutoStartError {

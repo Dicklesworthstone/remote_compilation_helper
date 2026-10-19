@@ -40,6 +40,55 @@ fn configured_or_default_socket_path() -> PathBuf {
         .unwrap_or_else(|_| default_socket_path())
 }
 
+/// A daemon this environment cannot see because it listens on another
+/// environment's default socket (#69). `systemd --user` sets
+/// `XDG_RUNTIME_DIR` and an agent's tool shell often does not, so the two
+/// compute different defaults; the hook recovers such a daemon on its own,
+/// but `rch doctor` used to call it "not running" and `--fix` would start a
+/// second daemon with separate slot accounting.
+///
+/// Only a default-derived socket is second-guessed. An explicit
+/// `general.socket_path` (or `RCH_SOCKET_PATH`) is authoritative.
+#[cfg(unix)]
+fn live_daemon_on_another_default_socket(socket_path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let from_default = crate::config::load_config_with_sources()
+        .map(|loaded| {
+            Path::new(&loaded.config.general.socket_path) == socket_path
+                && matches!(
+                    loaded.sources.get("general.socket_path"),
+                    Some(rch_common::ConfigValueSource::Default)
+                )
+        })
+        .unwrap_or(false);
+    if !from_default {
+        return None;
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    crate::hook::alternate_default_sockets(socket_path, uid)
+        .into_iter()
+        .find(|candidate| {
+            std::fs::symlink_metadata(candidate)
+                .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == uid)
+                && daemon_socket_accepts_connections(candidate)
+        })
+}
+
+#[cfg(not(unix))]
+fn live_daemon_on_another_default_socket(_socket_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// The remedy for [`live_daemon_on_another_default_socket`]: pin the socket
+/// the daemon actually uses, which rchd and every client honor.
+fn pin_socket_command(socket: &Path) -> String {
+    format!(
+        "rch config set general.socket_path '{}'",
+        socket.display().to_string().replace('\'', r"'\''")
+    )
+}
+
 /// Maximum size of a config / settings file we'll read into memory.
 /// Bounds OOM risk if a hostile or corrupted file is gigabytes in size.
 /// Real RCH/Claude config files are well under 1 MB; 16 MB gives an
@@ -3812,7 +3861,15 @@ pub fn run_quick_check() -> QuickCheckResult {
     let mut errors = Vec::new();
 
     if !daemon_running {
-        warnings.push("Daemon is not running".to_string());
+        warnings.push(match live_daemon_on_another_default_socket(&socket_path) {
+            Some(daemon_socket) => format!(
+                "Daemon is running on {}, not on this environment's default {}; pin it with: {}",
+                daemon_socket.display(),
+                socket_path.display(),
+                pin_socket_command(&daemon_socket)
+            ),
+            None => "Daemon is not running".to_string(),
+        });
     }
     if worker_count == 0 {
         warnings.push("No workers configured".to_string());
@@ -5299,6 +5356,11 @@ fn check_daemon(
     let socket_path = configured_or_default_socket_path();
     let socket_exists = socket_path.exists();
     let socket_live = socket_exists && daemon_socket_accepts_connections(&socket_path);
+    let elsewhere = if socket_live {
+        None
+    } else {
+        live_daemon_on_another_default_socket(&socket_path)
+    };
     let mut result = if socket_live {
         CheckResult {
             category: "daemon".to_string(),
@@ -5307,6 +5369,27 @@ fn check_daemon(
             message: "Daemon is accepting connections".to_string(),
             details: Some(socket_path.to_string_lossy().to_string()),
             suggestion: None,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }
+    } else if let Some(daemon_socket) = elsewhere {
+        // Running, just not where this environment looks. Never "fixable":
+        // starting a daemon here would run a second one (#69).
+        CheckResult {
+            category: "daemon".to_string(),
+            name: "daemon_socket".to_string(),
+            status: CheckStatus::Warning,
+            message: "Daemon is running on another environment's default socket".to_string(),
+            details: Some(format!(
+                "daemon listens on {}; this environment resolves {}",
+                daemon_socket.display(),
+                socket_path.display()
+            )),
+            suggestion: Some(format!(
+                "Pin one socket for every environment: {}",
+                pin_socket_command(&daemon_socket)
+            )),
             fixable: false,
             fix_applied: false,
             fix_message: None,
@@ -6125,6 +6208,30 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// #69: the remedy names the daemon's real socket, shell-quoted.
+    #[test]
+    fn pin_socket_command_quotes_the_daemon_socket() {
+        assert_eq!(
+            pin_socket_command(Path::new("/run/user/1000/rch.sock")),
+            "rch config set general.socket_path '/run/user/1000/rch.sock'"
+        );
+        assert_eq!(
+            pin_socket_command(Path::new("/home/o'neil/.cache/rch/rch.sock")),
+            r"rch config set general.socket_path '/home/o'\''neil/.cache/rch/rch.sock'"
+        );
+    }
+
+    /// #69: only a default-derived socket is second-guessed. A socket that is
+    /// not the configured default (an explicit pin or `RCH_SOCKET_PATH`)
+    /// never sends the doctor looking elsewhere.
+    #[test]
+    fn other_default_sockets_are_not_searched_for_an_explicit_socket() {
+        assert_eq!(
+            live_daemon_on_another_default_socket(Path::new("/nonexistent/explicit-rch.sock")),
+            None
+        );
+    }
 
     #[test]
     fn dispatcher_role_shim_check_is_read_only_and_preserves_findings() {

@@ -5176,8 +5176,11 @@ impl HookReporter {
 //
 // The bounded daemon-autostart cluster (lock/cooldown/spawn/health-probe/
 // socket-wait) lives in the `auto_start` submodule. `try_auto_start_daemon`
-// is its only cross-module entry point (called from `run_exec` below).
+// is its cross-module entry point (called from `run_exec` below);
+// `alternate_default_sockets` lets `rch doctor` find a daemon that another
+// environment started on its own default socket (#69).
 mod auto_start;
+pub(crate) use auto_start::alternate_default_sockets;
 
 // The build-heartbeat / progress-reporting cluster (the periodic snapshot, the
 // background loop, the progress-counter bump, and the socket send) lives in the
