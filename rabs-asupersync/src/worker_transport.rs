@@ -29,7 +29,40 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll, ready};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+/// Injectable runtime clock for transport deadlines (bead J011).
+///
+/// By default, [`runtime_transport_now`] queries the active Asupersync task
+/// context (`Cx::current().map(|cx| cx.now())`), which automatically uses the
+/// virtualized clock inside `LabRuntime`, and falls back to the runtime clock
+/// only when polled outside a task context.
+pub type TransportClock = fn() -> asupersync::types::Time;
+
+/// Monotonic transport timestamp in nanoseconds on the active [`TransportClock`] (bead J011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TransportInstant(pub u64);
+
+impl TransportInstant {
+    /// Nanoseconds since the transport clock epoch.
+    #[must_use]
+    pub const fn as_nanos(self) -> u64 {
+        self.0
+    }
+
+    /// Saturating duration elapsed since `earlier`.
+    #[must_use]
+    pub const fn duration_since(self, earlier: Self) -> Duration {
+        Duration::from_nanos(self.0.saturating_sub(earlier.0))
+    }
+}
+
+/// Read the current Asupersync runtime time from the active [`Cx`](asupersync::cx::Cx)
+/// when inside a task/lab context (bead J011).
+#[must_use]
+pub fn runtime_transport_now() -> asupersync::types::Time {
+    asupersync::cx::Cx::current().map_or_else(asupersync::time::wall_now, |cx| cx.now())
+}
 
 /// Both endpoints must negotiate this exact protocol. There is no downgrade.
 pub const WORKER_ALPN: &[u8] = b"rabs-worker-atp/1";
@@ -63,31 +96,30 @@ fn check_task_cancellation() -> io::Result<()> {
     }
 }
 
-/// A native timer supplies wakeups; the monotonic instant also rejects a late
+/// A native timer supplies wakeups; the monotonic runtime timestamp also rejects a late
 /// poll even when bytes are immediately available. Construct the timeout NOW,
-/// not inside the boxed async body, so its first poll cannot restart the clock.
+/// not inside the boxed async body, so its first poll cannot restart the clock (bead J011).
 struct FrameDeadline {
-    until: Instant,
+    until: TransportInstant,
     wake: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 impl FrameDeadline {
-    fn new(budget: Duration) -> Self {
-        let timer = asupersync::time::timeout(
-            asupersync::time::wall_now(),
-            budget,
-            std::future::pending::<()>(),
-        );
+    fn new_with_clock(budget: Duration, clock: TransportClock) -> Self {
+        let now = clock();
+        let budget_nanos = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
+        let until = TransportInstant(now.as_nanos().saturating_add(budget_nanos));
+        let timer = asupersync::time::timeout(now, budget, std::future::pending::<()>());
         Self {
-            until: Instant::now() + budget,
+            until,
             wake: Box::pin(async move {
                 let _ = timer.await;
             }),
         }
     }
 
-    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
-        Instant::now() >= self.until || self.wake.as_mut().poll(cx).is_ready()
+    fn expired(&mut self, cx: &mut Context<'_>, clock: TransportClock) -> bool {
+        TransportInstant(clock().as_nanos()) >= self.until || self.wake.as_mut().poll(cx).is_ready()
     }
 }
 
@@ -108,14 +140,20 @@ pub struct JsonAtpStream<S> {
     output: Vec<u8>,
     output_offset: usize,
     failed: bool,
+    clock: TransportClock,
     read_deadline: Option<FrameDeadline>,
     idle_deadline: Option<FrameDeadline>,
     write_deadline: Option<FrameDeadline>,
 }
 
 impl<S> JsonAtpStream<S> {
-    /// Wrap a stream. Authentication is the enclosing transport's responsibility.
+    /// Wrap a stream using [`runtime_transport_now`]. Authentication is the enclosing transport's responsibility.
     pub fn new(io: S) -> Self {
+        Self::with_clock(io, runtime_transport_now)
+    }
+
+    /// Wrap a stream with an explicitly injected [`TransportClock`] (bead J011).
+    pub fn with_clock(io: S, clock: TransportClock) -> Self {
         Self {
             io,
             decoder: AtpFrameCodec::with_max_frame_size(MAX_WIRE_FRAME as u64),
@@ -127,6 +165,7 @@ impl<S> JsonAtpStream<S> {
             output: Vec::new(),
             output_offset: 0,
             failed: false,
+            clock,
             read_deadline: None,
             idle_deadline: None,
             write_deadline: None,
@@ -148,22 +187,23 @@ impl<S> JsonAtpStream<S> {
         if let Err(error) = check_task_cancellation() {
             return Err(self.poison(error));
         }
+        let clock = self.clock;
         let expired = if self
             .read_deadline
             .as_mut()
-            .is_some_and(|timer| timer.expired(cx))
+            .is_some_and(|timer| timer.expired(cx, clock))
         {
             Some("worker ATP partial-frame deadline exceeded")
         } else if self
             .write_deadline
             .as_mut()
-            .is_some_and(|timer| timer.expired(cx))
+            .is_some_and(|timer| timer.expired(cx, clock))
         {
             Some("worker ATP write/flush deadline exceeded")
         } else if self
             .idle_deadline
             .as_mut()
-            .is_some_and(|timer| timer.expired(cx))
+            .is_some_and(|timer| timer.expired(cx, clock))
         {
             Some("worker ATP idle-read deadline exceeded")
         } else {
@@ -176,8 +216,9 @@ impl<S> JsonAtpStream<S> {
     }
 
     fn begin_write(&mut self) {
+        let clock = self.clock;
         self.write_deadline
-            .get_or_insert_with(|| FrameDeadline::new(FRAME_IO_TIMEOUT));
+            .get_or_insert_with(|| FrameDeadline::new_with_clock(FRAME_IO_TIMEOUT, clock));
     }
 }
 
@@ -287,11 +328,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for JsonAtpStream<S> {
                     ));
                 }
             }
+            let clock = this.clock;
             this.idle_deadline
-                .get_or_insert_with(|| FrameDeadline::new(IDLE_READ_TIMEOUT));
+                .get_or_insert_with(|| FrameDeadline::new_with_clock(IDLE_READ_TIMEOUT, clock));
             if this.boundary_bytes != 0 {
                 this.read_deadline
-                    .get_or_insert_with(|| FrameDeadline::new(FRAME_IO_TIMEOUT));
+                    .get_or_insert_with(|| FrameDeadline::new_with_clock(FRAME_IO_TIMEOUT, clock));
             }
             this.check_live(cx)?;
             // The codec may consume a header while waiting for its payload.
@@ -317,8 +359,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for JsonAtpStream<S> {
                 Ok(()) => {
                     this.boundary_bytes += read.filled().len();
                     this.input.extend_from_slice(read.filled());
-                    this.read_deadline
-                        .get_or_insert_with(|| FrameDeadline::new(FRAME_IO_TIMEOUT));
+                    let clock = this.clock;
+                    this.read_deadline.get_or_insert_with(|| {
+                        FrameDeadline::new_with_clock(FRAME_IO_TIMEOUT, clock)
+                    });
                 }
                 Err(error) => return Poll::Ready(Err(this.poison(error))),
             }
@@ -528,7 +572,7 @@ pub async fn connect_peer(
                 .map_err(|e| format!("coordinator TLS handshake: {e}"))?,
         )
     };
-    asupersync::time::timeout(asupersync::time::wall_now(), CONNECT_TIMEOUT, connect)
+    asupersync::time::timeout(runtime_transport_now(), CONNECT_TIMEOUT, connect)
         .await
         .map_err(|_| "worker connection deadline exceeded".to_owned())?
 }
@@ -627,7 +671,7 @@ async fn connect_worker_inner(address: &str) -> Result<WorkerConnection, String>
             );
         }
         let stream = asupersync::time::timeout(
-            asupersync::time::wall_now(),
+            runtime_transport_now(),
             CONNECT_TIMEOUT,
             TcpStream::connect(address.to_owned()),
         )
@@ -660,7 +704,14 @@ async fn connect_worker_inner(address: &str) -> Result<WorkerConnection, String>
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::Waker;
+
+    static VIRTUAL_CLOCK_NANOS: AtomicU64 = AtomicU64::new(1_000_000_000);
+
+    fn virtual_clock_now() -> asupersync::types::Time {
+        asupersync::types::Time::from_nanos(VIRTUAL_CLOCK_NANOS.load(Ordering::SeqCst))
+    }
 
     struct Wire {
         input: VecDeque<u8>,
@@ -889,7 +940,8 @@ mod tests {
             assert!(read_once(&mut stream).is_pending());
             assert_eq!(stream.read_deadline.as_ref().unwrap().until, until);
         }
-        stream.read_deadline.as_mut().unwrap().until = Instant::now();
+        stream.read_deadline.as_mut().unwrap().until =
+            TransportInstant(runtime_transport_now().as_nanos());
         stream.io.input.extend(&bytes[6..]);
         assert!(matches!(read_once(&mut stream), Poll::Ready(Err(error))
             if error.kind() == io::ErrorKind::TimedOut));
@@ -924,7 +976,8 @@ mod tests {
         assert_eq!(stream.write_deadline.as_ref().unwrap().until, until);
         stream.io.blocked = true;
         assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
-        stream.write_deadline.as_mut().unwrap().until = Instant::now();
+        stream.write_deadline.as_mut().unwrap().until =
+            TransportInstant(runtime_transport_now().as_nanos());
         stream.io.blocked = false;
         assert!(
             matches!(Pin::new(&mut stream).poll_flush(&mut cx), Poll::Ready(Err(error))
@@ -946,7 +999,8 @@ mod tests {
         assert!(read_once(&mut stream).is_pending());
         assert!(stream.read_deadline.is_none());
         let idle = stream.idle_deadline.as_ref().unwrap().until;
-        assert!(idle.duration_since(Instant::now()) > Duration::from_secs(30 * 60));
+        let now_instant = TransportInstant(runtime_transport_now().as_nanos());
+        assert!(idle.duration_since(now_instant) > Duration::from_secs(30 * 60));
         let bytes = encoded(br#"{"kind":"ping"}"#, FrameType::Control);
         stream.io.input.extend(&bytes[..6]);
         assert!(read_once(&mut stream).is_pending());
@@ -956,7 +1010,8 @@ mod tests {
         assert!(stream.read_deadline.is_none());
         assert!(stream.idle_deadline.is_none());
         assert!(read_once(&mut stream).is_pending());
-        stream.idle_deadline.as_mut().unwrap().until = Instant::now();
+        stream.idle_deadline.as_mut().unwrap().until =
+            TransportInstant(runtime_transport_now().as_nanos());
         assert!(matches!(read_once(&mut stream), Poll::Ready(Err(error))
             if error.kind() == io::ErrorKind::TimedOut));
     }
@@ -980,14 +1035,18 @@ mod tests {
                                 Poll::Ready(Ok(3))
                             ));
                             stream.io.blocked = true;
-                            stream.write_deadline =
-                                Some(FrameDeadline::new(Duration::from_millis(30)));
+                            stream.write_deadline = Some(FrameDeadline::new_with_clock(
+                                Duration::from_millis(30),
+                                runtime_transport_now,
+                            ));
                         } else {
                             let bytes = encoded(br#"{"kind":"ping"}"#, FrameType::Control);
                             stream.io.input.push_back(bytes[0]);
                             assert!(read_once(&mut stream).is_pending());
-                            stream.read_deadline =
-                                Some(FrameDeadline::new(Duration::from_millis(30)));
+                            stream.read_deadline = Some(FrameDeadline::new_with_clock(
+                                Duration::from_millis(30),
+                                runtime_transport_now,
+                            ));
                         }
                         // This wire sends no more bytes and supplies no wakeups.
                         // The adapter's native timer must wake its own blocked IO;
@@ -1001,7 +1060,7 @@ mod tests {
                             }
                         };
                         let error = asupersync::time::timeout(
-                            asupersync::time::wall_now(),
+                            runtime_transport_now(),
                             Duration::from_secs(1),
                             operation,
                         )
@@ -1014,5 +1073,52 @@ mod tests {
                 })
                 .await
         });
+    }
+
+    #[test]
+    fn j011_lab_virtualizes_transport_time_and_no_direct_clock_reads_in_core_paths() {
+        // 1. Virtualized clock test: without sleeping a single wall-clock millisecond,
+        //    advancing the injected virtual clock expires partial-frame and idle deadlines
+        //    at the exact nanosecond boundary.
+        VIRTUAL_CLOCK_NANOS.store(1_000_000_000, Ordering::SeqCst);
+        let mut stream = JsonAtpStream::with_clock(Wire::default(), virtual_clock_now);
+        let bytes = encoded(br#"{"kind":"ping"}"#, FrameType::Control);
+        stream.io.input.extend(&bytes[..4]);
+        assert!(read_once(&mut stream).is_pending());
+
+        // Advance virtual time to 1ns before FRAME_IO_TIMEOUT (10s): still live!
+        VIRTUAL_CLOCK_NANOS.store(
+            1_000_000_000 + u64::try_from(FRAME_IO_TIMEOUT.as_nanos()).unwrap() - 1,
+            Ordering::SeqCst,
+        );
+        assert!(read_once(&mut stream).is_pending());
+        assert!(!stream.failed);
+
+        // Advance virtual time by 1ns to cross FRAME_IO_TIMEOUT: expires deterministically!
+        VIRTUAL_CLOCK_NANOS.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            matches!(read_once(&mut stream), Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::TimedOut)
+        );
+        assert!(stream.failed);
+
+        // 2. Lint gate (J011 acceptance): verify no direct `Instant::now(` or `SystemTime::now(`
+        //    clock reads appear in the production (non-`#[cfg(test)]`) code of transport modules.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for rel_path in [
+            "rabs-asupersync/src/worker_transport.rs",
+            "rabs-protocol/src/object_transfer.rs",
+            "rabs-protocol/src/wire_time.rs",
+            "rabs-protocol/src/reconnect.rs",
+        ] {
+            let source =
+                std::fs::read_to_string(workspace.join(rel_path)).expect("read transport source");
+            let prod_source = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            for forbidden in ["Instant::now(", "SystemTime::now("] {
+                assert!(
+                    !prod_source.contains(forbidden),
+                    "J011 lint failure: direct clock read `{forbidden}` found in production path of {rel_path}"
+                );
+            }
+        }
     }
 }
