@@ -654,4 +654,298 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn g016_unified_cancellation_debt_matches_rchd_parity_and_isolates_endpoint_generations() {
+        let mut ledger = UnifiedWorkerCancellationLedger::default();
+        let worker = PeerId("w1".into());
+        let gen1 = WorkerBootGeneration(1);
+        let inc1 = WorkerIncarnationId(101);
+        let now = 1_000_000_000_u64;
+
+        // 1. Parity test vs rchd::cancellation_debt:
+        //    0 events -> 0.0 debt.
+        assert!(
+            ledger
+                .cancellation_debt_f64(&worker, 1, gen1, inc1, now)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // 2. Single graceful TERM->drain cancellation (1 cancel, 0 escalations, cleanup_ok = true):
+        //    rate_debt = 1/5 = 0.2 -> total = 0.2 * 0.4 = 0.08 (exact rchd parity).
+        ledger.record_evidence(TimestampedCancellationEvidence {
+            worker_peer_id: worker.clone(),
+            endpoint_generation: 1,
+            boot_generation: gen1,
+            incarnation: inc1,
+            observed_at_micros: now,
+            escalation_stage: UnifiedCancelEscalationStage::GracefulTerm,
+            escalation_count: 0,
+            cleanup_ok: true,
+            obligation_drained: true,
+        });
+        let single_debt = ledger.cancellation_debt_f64(&worker, 1, gen1, inc1, now);
+        assert!(
+            (single_debt - 0.08).abs() < 1e-9,
+            "single graceful cancel must equal rchd's 0.08, got {single_debt}"
+        );
+
+        // 3. Add 4 more cancellations (total 5), 3 escalations, and 1 cleanup/obligation failure:
+        //    rate_debt = (5/5).min(1.0) = 1.0
+        //    escalation_debt = (3 * 0.2).min(0.6) = 0.6
+        //    cleanup_debt = (1 * 0.3).min(0.6) = 0.3
+        //    total = 1.0 * 0.4 + 0.6 * 0.3 + 0.3 * 0.3 = 0.40 + 0.18 + 0.09 = 0.67.
+        for i in 0..4 {
+            ledger.record_evidence(TimestampedCancellationEvidence {
+                worker_peer_id: worker.clone(),
+                endpoint_generation: 1,
+                boot_generation: gen1,
+                incarnation: inc1,
+                observed_at_micros: now + (i + 1) * 1_000,
+                escalation_stage: if i == 0 {
+                    UnifiedCancelEscalationStage::EscalatedSigkill
+                } else {
+                    UnifiedCancelEscalationStage::GracefulTerm
+                },
+                escalation_count: if i == 0 { 3 } else { 0 },
+                cleanup_ok: i != 0,
+                obligation_drained: i != 0,
+            });
+        }
+        let combined_debt = ledger.cancellation_debt_f64(&worker, 1, gen1, inc1, now + 10_000);
+        assert!(
+            (combined_debt - 0.67).abs() < 1e-9,
+            "5 cancels + 3 escalations + 1 cleanup failure must equal 0.67, got {combined_debt}"
+        );
+        let rel_v1 = ledger.evaluate_reliability(&worker, 1, gen1, inc1, now + 10_000);
+        assert!(rel_v1.penalized_by_debt);
+
+        // 4. Saturation cap at 1.0 when cleanup failures also saturate (2+ cleanup failures):
+        ledger.record_evidence(TimestampedCancellationEvidence {
+            worker_peer_id: worker.clone(),
+            endpoint_generation: 1,
+            boot_generation: gen1,
+            incarnation: inc1,
+            observed_at_micros: now + 20_000,
+            escalation_stage: UnifiedCancelEscalationStage::EscalatedSigkill,
+            escalation_count: 3,
+            cleanup_ok: true,
+            obligation_drained: false, // undrained Asupersync obligation counts as cleanup failure
+        });
+        let saturated = ledger.cancellation_debt_f64(&worker, 1, gen1, inc1, now + 20_000);
+        // rate=1.0*0.4 (0.4) + esc=0.6*0.3 (0.18) + cleanup=0.6*0.3 (0.18) = 0.76
+        assert!((saturated - 0.76).abs() < 1e-9);
+
+        // 5. Window pruning after DEBT_WINDOW_MICROS (5 minutes = 300_000_000 us):
+        let after_window = now + UNIFIED_CANCELLATION_DEBT_WINDOW_MICROS + 50_000;
+        assert!(
+            ledger
+                .cancellation_debt_f64(&worker, 1, gen1, inc1, after_window)
+                .abs()
+                < f64::EPSILON,
+            "events older than 5-minute window must decay to 0.0 debt"
+        );
+
+        // 6. Endpoint reload / new incarnation attribution (G016 integration requirement):
+        //    Reloading worker endpoint to endpoint_generation = 2 or new incarnation = 202
+        //    must NOT inherit active debt or reliability penalty from generation 1 / inc 101,
+        //    while preserving all 6 historical records in diagnostic_history()!
+        let gen2 = WorkerBootGeneration(2);
+        let inc2 = WorkerIncarnationId(202);
+        assert!(
+            ledger
+                .cancellation_debt_f64(&worker, 2, gen1, inc1, now + 20_000)
+                .abs()
+                < f64::EPSILON,
+            "reloaded endpoint_generation=2 must start with 0.0 active debt"
+        );
+        assert!(
+            ledger
+                .cancellation_debt_f64(&worker, 1, gen2, inc2, now + 20_000)
+                .abs()
+                < f64::EPSILON,
+            "new boot generation / incarnation must start with 0.0 active debt"
+        );
+        let rel_v2 = ledger.evaluate_reliability(&worker, 2, gen2, inc2, now + 20_000);
+        assert!(!rel_v2.penalized_by_debt);
+        assert_eq!(
+            ledger.diagnostic_history(&worker).len(),
+            6,
+            "diagnostic history across prior endpoint generations and incarnations must be preserved"
+        );
+    }
+}
+
+/// 5-minute sliding window for cancellation debt in microseconds (`300_000_000` us),
+/// matching `rchd::cancellation::DEBT_WINDOW` (`Duration::from_secs(300)` — bead G016).
+pub const UNIFIED_CANCELLATION_DEBT_WINDOW_MICROS: u64 = 300 * 1_000_000;
+
+/// Escalation stage reached during unified `TERM -> drain -> remote kill -> KILL` cancellation (bead G016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifiedCancelEscalationStage {
+    /// Terminated gracefully within the `SIGTERM` drain budget.
+    GracefulTerm,
+    /// Required remote process-group kill (`RemoteKillSent`).
+    RemoteKillSent,
+    /// Escalated to `SIGKILL` after grace period elapsed.
+    EscalatedSigkill,
+}
+
+/// Timestamped cancellation evidence attributed to a specific worker endpoint generation,
+/// durable boot generation, and process incarnation (bead G016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimestampedCancellationEvidence {
+    /// Durable worker identity.
+    pub worker_peer_id: PeerId,
+    /// Admitted worker endpoint configuration generation (`workers.toml` reload epoch).
+    pub endpoint_generation: u64,
+    /// Admitted worker durable boot generation.
+    pub boot_generation: WorkerBootGeneration,
+    /// Admitted worker process incarnation ID.
+    pub incarnation: WorkerIncarnationId,
+    /// Monotonic timestamp (microseconds) when cancellation completed/failed.
+    pub observed_at_micros: u64,
+    /// Escalation stage reached.
+    pub escalation_stage: UnifiedCancelEscalationStage,
+    /// Number of escalation steps taken (`0` for clean `SIGTERM` drain).
+    pub escalation_count: u32,
+    /// Whether slot/filesystem/cgroup cleanup succeeded.
+    pub cleanup_ok: bool,
+    /// Whether all Asupersync attempt obligations were cleanly resolved/drained.
+    pub obligation_drained: bool,
+}
+
+/// Cached reliability evaluation scoped to the active endpoint generation and incarnation (bead G016).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedWorkerReliabilityState {
+    /// Worker identity.
+    pub worker_peer_id: PeerId,
+    /// Endpoint configuration generation.
+    pub endpoint_generation: u64,
+    /// Worker boot generation.
+    pub boot_generation: WorkerBootGeneration,
+    /// Worker process incarnation.
+    pub incarnation: WorkerIncarnationId,
+    /// Computed cancellation debt (`0.0..=1.0`).
+    pub cancellation_debt: f64,
+    /// Whether debt exceeds the reliability hysteresis threshold (`>= 0.25`).
+    pub penalized_by_debt: bool,
+}
+
+/// Unified cancellation debt and reliability ledger folding `rchd` debt accounting into the
+/// Asupersync obligation/incarnation model (bead G016).
+///
+/// Active debt and reliability hysteresis are keyed to `(worker_peer_id, endpoint_generation,
+/// boot_generation, incarnation)` so reloading a worker endpoint or admitting a new incarnation
+/// never inherits stale debt, while `diagnostic_history` preserves all historical records.
+#[derive(Debug, Clone, Default)]
+pub struct UnifiedWorkerCancellationLedger {
+    history: Vec<TimestampedCancellationEvidence>,
+    cached_reliability: Vec<ScopedWorkerReliabilityState>,
+}
+
+impl UnifiedWorkerCancellationLedger {
+    /// Record a timestamped cancellation outcome in the append-only diagnostic history.
+    pub fn record_evidence(&mut self, evidence: TimestampedCancellationEvidence) {
+        self.history.push(evidence);
+    }
+
+    /// Return the complete diagnostic history for `worker_peer_id` across all endpoint
+    /// generations and incarnations.
+    #[must_use]
+    pub fn diagnostic_history(
+        &self,
+        worker_peer_id: &PeerId,
+    ) -> Vec<&TimestampedCancellationEvidence> {
+        self.history
+            .iter()
+            .filter(|e| &e.worker_peer_id == worker_peer_id)
+            .collect()
+    }
+
+    /// Compute cancellation debt (`0.0..=1.0`) for the exact admitted `(worker_peer_id,
+    /// endpoint_generation, boot_generation, incarnation)` within `UNIFIED_CANCELLATION_DEBT_WINDOW_MICROS`.
+    ///
+    /// Matches `rchd::cancellation::CancellationOrchestrator::cancellation_debt` weights:
+    /// - `rate_debt = (recent_cancellations / 5.0).min(1.0)` (weight `0.4`)
+    /// - `escalation_debt = (recent_escalations * 0.2).min(0.6)` (weight `0.3`)
+    /// - `cleanup_debt = (recent_cleanup_or_obligation_failures * 0.3).min(0.6)` (weight `0.3`)
+    #[must_use]
+    pub fn cancellation_debt_f64(
+        &self,
+        worker_peer_id: &PeerId,
+        endpoint_generation: u64,
+        boot_generation: WorkerBootGeneration,
+        incarnation: WorkerIncarnationId,
+        now_micros: u64,
+    ) -> f64 {
+        let mut recent_cancellations = 0usize;
+        let mut recent_escalations = 0usize;
+        let mut recent_cleanup_failures = 0usize;
+
+        for ev in &self.history {
+            if &ev.worker_peer_id == worker_peer_id
+                && ev.endpoint_generation == endpoint_generation
+                && ev.boot_generation == boot_generation
+                && ev.incarnation == incarnation
+                && now_micros.saturating_sub(ev.observed_at_micros)
+                    < UNIFIED_CANCELLATION_DEBT_WINDOW_MICROS
+            {
+                recent_cancellations += 1;
+                recent_escalations += ev.escalation_count as usize;
+                if !ev.cleanup_ok || !ev.obligation_drained {
+                    recent_cleanup_failures += 1;
+                }
+            }
+        }
+
+        if recent_cancellations == 0 {
+            return 0.0;
+        }
+
+        let rate_debt = (recent_cancellations as f64 / 5.0).min(1.0);
+        let escalation_debt = (recent_escalations as f64 * 0.2).min(0.6);
+        let cleanup_debt = (recent_cleanup_failures as f64 * 0.3).min(0.6);
+
+        (rate_debt * 0.4 + escalation_debt * 0.3 + cleanup_debt * 0.3).clamp(0.0, 1.0)
+    }
+
+    /// Evaluate and cache the reliability hysteresis state for the admitted endpoint generation
+    /// and incarnation, keeping prior generations archived separately.
+    pub fn evaluate_reliability(
+        &mut self,
+        worker_peer_id: &PeerId,
+        endpoint_generation: u64,
+        boot_generation: WorkerBootGeneration,
+        incarnation: WorkerIncarnationId,
+        now_micros: u64,
+    ) -> ScopedWorkerReliabilityState {
+        let debt = self.cancellation_debt_f64(
+            worker_peer_id,
+            endpoint_generation,
+            boot_generation,
+            incarnation,
+            now_micros,
+        );
+        let state = ScopedWorkerReliabilityState {
+            worker_peer_id: worker_peer_id.clone(),
+            endpoint_generation,
+            boot_generation,
+            incarnation,
+            cancellation_debt: debt,
+            penalized_by_debt: debt >= 0.25,
+        };
+        if let Some(existing) = self.cached_reliability.iter_mut().find(|s| {
+            &s.worker_peer_id == worker_peer_id
+                && s.endpoint_generation == endpoint_generation
+                && s.boot_generation == boot_generation
+                && s.incarnation == incarnation
+        }) {
+            *existing = state.clone();
+        } else {
+            self.cached_reliability.push(state.clone());
+        }
+        state
+    }
 }
