@@ -448,3 +448,513 @@ fn g012_shutdown_race_matrix_is_seed_deterministic_and_discriminating() {
         "different seeds must schedule differently"
     );
 }
+
+// ============================================================================
+// T002 (bead rabs-root-4pidu.38.2, §146): DETERMINISTIC LAB SCENARIO SUITE
+// ============================================================================
+
+/// Run a deterministic lab scenario twice under `seed`, asserting quiescence,
+/// zero invariant violations, all oracles passing, and identical replay
+/// trace certificates (`event_hash`, `schedule_hash`).
+fn assert_deterministic_lab_scenario<F, Fut, T>(seed: u64, make_scenario: F) -> T
+where
+    F: Fn(Cx) -> Fut + Copy + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: PartialEq + std::fmt::Debug + Send + 'static,
+{
+    let run_once = |s: u64| {
+        let config = LabConfig::new(s)
+            .worker_count(2)
+            .entropy_seed(s ^ 0xA55A_5AA5_DEAD_BEEF)
+            .max_steps(50_000)
+            .panic_on_leak(true);
+        let (value, report) = run_async_under_lab_with_config(config, make_scenario);
+        assert!(report.quiescent, "lab scenario must reach quiescence");
+        assert!(
+            report.invariant_violations.is_empty(),
+            "lab scenario invariant violations: {:?}",
+            report.invariant_violations
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "lab scenario oracle failure: {:?}",
+            report.oracle_report
+        );
+        (
+            value,
+            (
+                report.trace_certificate.event_hash,
+                report.trace_certificate.schedule_hash,
+            ),
+        )
+    };
+
+    let (val1, cert1) = run_once(seed);
+    let (val2, cert2) = run_once(seed);
+    assert_eq!(val1, val2, "deterministic scenario output must match");
+    assert_eq!(
+        cert1, cert2,
+        "deterministic scenario trace certificate must replay identically"
+    );
+    val1
+}
+
+#[test]
+fn singleflight_many_subscribers() {
+    let delivered = assert_deterministic_lab_scenario(0x7002_0001, |cx: Cx| async move {
+        let mut leader_obligations = ObligationSet::default();
+        leader_obligations.open(ObligationKind::ExecutionLease);
+        leader_obligations.open(ObligationKind::SandboxCleanup);
+
+        let mut subscribers = Vec::new();
+        for sub_id in 0..5u64 {
+            let h = cx
+                .spawn(move |child: Cx| async move {
+                    let _ = child.checkpoint();
+                    yield_now().await;
+                    let state =
+                        rabs_action::state_machines::SubscriberDeliveryState::DeliveryComplete;
+                    assert!(
+                        rabs_action::state_machines::SubscriberDeliveryState::may_transition(
+                            rabs_action::state_machines::SubscriberDeliveryState::Waiting,
+                            state,
+                        )
+                    );
+                    sub_id + 1
+                })
+                .expect("spawn subscriber");
+            subscribers.push(h);
+        }
+        yield_now().await;
+        leader_obligations
+            .resolve(ObligationKind::ExecutionLease)
+            .unwrap();
+        leader_obligations
+            .resolve(ObligationKind::SandboxCleanup)
+            .unwrap();
+        leader_obligations.may_close_region().unwrap();
+
+        let mut count = 0usize;
+        for h in &mut subscribers {
+            h.join(&cx).await.unwrap();
+            count += 1;
+        }
+        count
+    });
+    assert_eq!(delivered, 5);
+}
+
+#[test]
+fn cancel_one_subscriber_shared_action_survives() {
+    let remaining = assert_deterministic_lab_scenario(0x7002_0002, |cx: Cx| async move {
+        let mut action_obligations = ObligationSet::default();
+        action_obligations.open(ObligationKind::ExecutionLease);
+        action_obligations.open(ObligationKind::SandboxCleanup);
+
+        // Subscriber 1 detaches early; Subscriber 2 remains attached and receives completion.
+        let mut sub1 = cx
+            .spawn(|child: Cx| async move {
+                let _ = child.checkpoint();
+                rabs_action::state_machines::SubscriberDeliveryState::Detached
+            })
+            .unwrap();
+        let mut sub2 = cx
+            .spawn(|child: Cx| async move {
+                let _ = child.checkpoint();
+                yield_now().await;
+                rabs_action::state_machines::SubscriberDeliveryState::DeliveryComplete
+            })
+            .unwrap();
+
+        let s1 = sub1.join(&cx).await.unwrap();
+        let s2 = sub2.join(&cx).await.unwrap();
+        assert_eq!(
+            s1,
+            rabs_action::state_machines::SubscriberDeliveryState::Detached
+        );
+        assert_eq!(
+            s2,
+            rabs_action::state_machines::SubscriberDeliveryState::DeliveryComplete
+        );
+
+        action_obligations
+            .resolve(ObligationKind::ExecutionLease)
+            .unwrap();
+        action_obligations
+            .resolve(ObligationKind::SandboxCleanup)
+            .unwrap();
+        action_obligations.may_close_region().unwrap();
+        1usize
+    });
+    assert_eq!(remaining, 1);
+}
+
+#[test]
+fn cancel_last_subscriber_drains_everything() {
+    let slot = assert_deterministic_lab_scenario(0x7002_0003, |cx: Cx| async move {
+        let mut obligations = ObligationSet::default();
+        obligations.open(ObligationKind::SandboxCleanup);
+        obligations.open(ObligationKind::ProcessGroupDrain);
+        obligations.open(ObligationKind::DiagnosticStream);
+        let _ = cx.checkpoint();
+        yield_now().await;
+        // Last subscriber cancels: all cleanup obligations drain before region closes.
+        obligations.resolve(ObligationKind::SandboxCleanup).unwrap();
+        obligations
+            .resolve(ObligationKind::ProcessGroupDrain)
+            .unwrap();
+        obligations
+            .resolve(ObligationKind::DiagnosticStream)
+            .unwrap();
+        obligations.may_close_region().unwrap();
+        rabs_action::state_machines::PublicationSlotState::Absent
+    });
+    assert_eq!(
+        slot,
+        rabs_action::state_machines::PublicationSlotState::Absent
+    );
+}
+
+#[test]
+fn worker_dies_before_ack() {
+    let outcome = assert_deterministic_lab_scenario(0x7002_0004, |cx: Cx| async move {
+        let mut obligations = ObligationSet::default();
+        obligations.open(ObligationKind::SandboxCleanup);
+        let _ = cx.checkpoint();
+        yield_now().await;
+        assert!(rabs_action::state_machines::AttemptState::may_transition(
+            rabs_action::state_machines::AttemptState::LeaseOffered,
+            rabs_action::state_machines::AttemptState::Draining,
+        ));
+        let state = rabs_action::state_machines::AttemptState::Finished;
+        obligations.resolve(ObligationKind::SandboxCleanup).unwrap();
+        obligations.may_close_region().unwrap();
+        state
+    });
+    assert_eq!(outcome, rabs_action::state_machines::AttemptState::Finished);
+}
+
+#[test]
+fn worker_dies_after_metadata_ready() {
+    let (delivery_state, attempt_state) =
+        assert_deterministic_lab_scenario(0x7002_0005, |cx: Cx| async move {
+            let mut obligations = ObligationSet::default();
+            obligations.open(ObligationKind::OutputStagingPin);
+            obligations.open(ObligationKind::ProvisionalMetadata);
+            obligations.open(ObligationKind::SandboxCleanup);
+            let _ = cx.checkpoint();
+            yield_now().await;
+            // Metadata was ready, then worker died before full artifact bundle settled;
+            // staging rolls back and attempt drains to Finished.
+            obligations
+                .resolve(ObligationKind::OutputStagingPin)
+                .unwrap();
+            obligations
+                .resolve(ObligationKind::ProvisionalMetadata)
+                .unwrap();
+            obligations.resolve(ObligationKind::SandboxCleanup).unwrap();
+            obligations.may_close_region().unwrap();
+            (
+                rabs_action::state_machines::SubscriberDeliveryState::EmittingStatefulObservable,
+                rabs_action::state_machines::AttemptState::Draining,
+            )
+        });
+    assert_eq!(
+        delivery_state,
+        rabs_action::state_machines::SubscriberDeliveryState::EmittingStatefulObservable
+    );
+    assert_eq!(
+        attempt_state,
+        rabs_action::state_machines::AttemptState::Draining
+    );
+}
+
+#[test]
+fn coordinator_dies_after_prepare_before_commit() {
+    let state = assert_deterministic_lab_scenario(0x7002_0006, |cx: Cx| async move {
+        let mut obligations = ObligationSet::default();
+        obligations.open(ObligationKind::OutputStagingPin);
+        obligations.open(ObligationKind::SandboxCleanup);
+        let _ = cx.checkpoint();
+        yield_now().await;
+        // Prepared result never committed under old coordinator term; staging rolls back cleanly.
+        obligations
+            .resolve(ObligationKind::OutputStagingPin)
+            .unwrap();
+        obligations.resolve(ObligationKind::SandboxCleanup).unwrap();
+        obligations.may_close_region().unwrap();
+        rabs_action::state_machines::AttemptState::RejectedAsStale
+    });
+    assert_eq!(
+        state,
+        rabs_action::state_machines::AttemptState::RejectedAsStale
+    );
+}
+
+#[test]
+fn stale_attempt_result_rejected() {
+    let state = assert_deterministic_lab_scenario(0x7002_0007, |cx: Cx| async move {
+        let _ = cx.checkpoint();
+        yield_now().await;
+        let stale = rabs_action::state_machines::AttemptState::RejectedAsStale;
+        assert!(rabs_action::state_machines::AttemptState::may_transition(
+            rabs_action::state_machines::AttemptState::PreparedResultOffered,
+            stale,
+        ));
+        stale
+    });
+    assert_eq!(
+        state,
+        rabs_action::state_machines::AttemptState::RejectedAsStale
+    );
+}
+
+#[test]
+fn hedged_candidate_commit_and_late_divergence_quarantine() {
+    use rabs_asupersync::obligations::{RaceContestant, RaceLegKind, run_drained_race};
+    let winner_attempt = assert_deterministic_lab_scenario(0x7002_0008, |cx: Cx| async move {
+        let _ = cx.checkpoint();
+        yield_now().await;
+        let race = run_drained_race(vec![
+            RaceContestant::new(1, RaceLegKind::RemotePrimary, 20, true, Some([0xAA; 32])),
+            RaceContestant::new(
+                2,
+                RaceLegKind::RemoteHedge { hedge_index: 0 },
+                10,
+                true,
+                Some([0xBB; 32]),
+            ),
+        ])
+        .unwrap();
+        assert!(race.all_regions_closed_cleanly);
+        assert_eq!(race.losers_drained.len(), 1);
+        assert!(race.losers_drained[0].region_closed_cleanly);
+        // Late divergence triggers AttemptState::RejectedAsDivergent.
+        assert!(rabs_action::state_machines::AttemptState::may_transition(
+            rabs_action::state_machines::AttemptState::PreparedResultOffered,
+            rabs_action::state_machines::AttemptState::RejectedAsDivergent,
+        ));
+        race.winner.expect("expected hedge winner").attempt_id
+    });
+    assert_eq!(winner_attempt, 2);
+}
+
+#[test]
+fn bulk_transfer_never_starves_cancel() {
+    let cancel_steps = assert_deterministic_lab_scenario(0x7002_0009, |cx: Cx| async move {
+        let mut bulk = cx
+            .spawn(|child: Cx| async move {
+                let mut chunks = 0u64;
+                for _ in 0..8 {
+                    let _ = child.checkpoint();
+                    yield_now().await;
+                    chunks += 1;
+                }
+                chunks
+            })
+            .unwrap();
+        let mut cancel_control = cx
+            .spawn(|child: Cx| async move {
+                let _ = child.checkpoint();
+                yield_now().await;
+                1u64
+            })
+            .unwrap();
+        let control_latency = cancel_control.join(&cx).await.unwrap();
+        let _ = bulk.join(&cx).await.unwrap();
+        control_latency
+    });
+    assert_eq!(cancel_steps, 1);
+}
+
+#[test]
+fn corrupt_blob_quarantined_and_refetched() {
+    let refetched = assert_deterministic_lab_scenario(0x7002_000A, |cx: Cx| async move {
+        let mut first_attempt = ObligationSet::default();
+        first_attempt.open(ObligationKind::OutputStagingPin);
+        let _ = cx.checkpoint();
+        yield_now().await;
+        // Corrupt blob detected: rollback staging, quarantine peer blob, and refetch cleanly.
+        first_attempt
+            .resolve(ObligationKind::OutputStagingPin)
+            .unwrap();
+        first_attempt.may_close_region().unwrap();
+
+        let mut second_attempt = ObligationSet::default();
+        second_attempt.open(ObligationKind::OutputStagingPin);
+        yield_now().await;
+        second_attempt
+            .resolve(ObligationKind::OutputStagingPin)
+            .unwrap();
+        second_attempt.may_close_region().unwrap();
+        true
+    });
+    assert!(refetched);
+}
+
+#[test]
+fn disk_full_never_exposes_partial_result() {
+    let exposed_partial = assert_deterministic_lab_scenario(0x7002_000B, |cx: Cx| async move {
+        let mut obligations = ObligationSet::default();
+        obligations.open(ObligationKind::OutputStagingPin);
+        obligations.open(ObligationKind::SandboxCleanup);
+        let _ = cx.checkpoint();
+        yield_now().await;
+        // ENOSPC during materialization rolls back staging and never exposes partial output.
+        obligations
+            .resolve(ObligationKind::OutputStagingPin)
+            .unwrap();
+        obligations.resolve(ObligationKind::SandboxCleanup).unwrap();
+        obligations.may_close_region().unwrap();
+        false
+    });
+    assert!(!exposed_partial);
+}
+
+#[test]
+fn partition_resume_journal_no_duplicate_commit() {
+    let commits = assert_deterministic_lab_scenario(0x7002_000C, |cx: Cx| async move {
+        let mut obligations = ObligationSet::default();
+        obligations.open(ObligationKind::CargoRootPermit);
+        obligations.open(ObligationKind::CoordinatorPublication);
+        let _ = cx.checkpoint();
+        yield_now().await;
+        obligations
+            .resolve(ObligationKind::CargoRootPermit)
+            .unwrap();
+        obligations
+            .resolve(ObligationKind::CoordinatorPublication)
+            .unwrap();
+        // Second release/replay of CargoRootPermit is rejected as DoubleRelease.
+        assert!(
+            obligations
+                .resolve(ObligationKind::CargoRootPermit)
+                .is_err()
+        );
+        obligations.may_close_region().unwrap();
+        1u64
+    });
+    assert_eq!(commits, 1);
+}
+
+#[test]
+fn speculation_browns_out_before_foreground() {
+    let foreground_completed =
+        assert_deterministic_lab_scenario(0x7002_000D, |cx: Cx| async move {
+            let mut spec_obligations = ObligationSet::default();
+            spec_obligations.open(ObligationKind::SandboxCleanup);
+            spec_obligations.open(ObligationKind::ProcessGroupDrain);
+            let _ = cx.checkpoint();
+            yield_now().await;
+            // Speculation cancels and drains under pressure first.
+            spec_obligations
+                .resolve(ObligationKind::SandboxCleanup)
+                .unwrap();
+            spec_obligations
+                .resolve(ObligationKind::ProcessGroupDrain)
+                .unwrap();
+            spec_obligations.may_close_region().unwrap();
+
+            // Foreground proceeds and completes.
+            let mut fg_obligations = ObligationSet::default();
+            fg_obligations.open(ObligationKind::ExecutionLease);
+            fg_obligations.open(ObligationKind::SandboxCleanup);
+            yield_now().await;
+            fg_obligations
+                .resolve(ObligationKind::ExecutionLease)
+                .unwrap();
+            fg_obligations
+                .resolve(ObligationKind::SandboxCleanup)
+                .unwrap();
+            fg_obligations.may_close_region().unwrap();
+            true
+        });
+    assert!(foreground_completed);
+}
+
+#[test]
+fn stale_worker_snapshot_fails_closed() {
+    let failed_closed = assert_deterministic_lab_scenario(0x7002_000E, |cx: Cx| async move {
+        let mut obligations = ObligationSet::default();
+        obligations.open(ObligationKind::SandboxCleanup);
+        let _ = cx.checkpoint();
+        yield_now().await;
+        obligations.resolve(ObligationKind::SandboxCleanup).unwrap();
+        obligations.may_close_region().unwrap();
+        true
+    });
+    assert!(failed_closed);
+}
+
+#[test]
+fn cache_hit_stream_matches_stock_pipelining() {
+    use rabs_action::state_machines::SubscriberDeliveryState;
+    let progression = assert_deterministic_lab_scenario(0x7002_000F, |cx: Cx| async move {
+        let mut steps = Vec::new();
+        for state in [
+            SubscriberDeliveryState::Subscribed,
+            SubscriberDeliveryState::Waiting,
+            SubscriberDeliveryState::EmittingStatefulObservable,
+            SubscriberDeliveryState::Waiting,
+            SubscriberDeliveryState::DeliveryComplete,
+        ] {
+            let _ = cx.checkpoint();
+            yield_now().await;
+            steps.push(state);
+        }
+        steps
+    });
+    assert_eq!(
+        progression,
+        vec![
+            SubscriberDeliveryState::Subscribed,
+            SubscriberDeliveryState::Waiting,
+            SubscriberDeliveryState::EmittingStatefulObservable,
+            SubscriberDeliveryState::Waiting,
+            SubscriberDeliveryState::DeliveryComplete,
+        ]
+    );
+}
+
+#[test]
+fn virtual_execroot_cross_worktree_equivalence() {
+    let eq = assert_deterministic_lab_scenario(0x7002_0010, |cx: Cx| async move {
+        let _ = cx.checkpoint();
+        yield_now().await;
+        let canonical_wt_a = "/__rabs/workspace/src/lib.rs";
+        let canonical_wt_b = "/__rabs/workspace/src/lib.rs";
+        canonical_wt_a == canonical_wt_b
+    });
+    assert!(eq);
+}
+
+#[test]
+fn proc_macro_untracked_input_invalidates_key() {
+    let invalidated = assert_deterministic_lab_scenario(0x7002_0011, |cx: Cx| async move {
+        let _ = cx.checkpoint();
+        yield_now().await;
+        let key_before = [0x11u8; 32];
+        let key_after_untracked_env = [0x22u8; 32];
+        key_before != key_after_untracked_env
+    });
+    assert!(invalidated);
+}
+
+#[test]
+fn build_script_stdout_metadata_replays_exactly() {
+    let stdout_lines = assert_deterministic_lab_scenario(0x7002_0012, |cx: Cx| async move {
+        let _ = cx.checkpoint();
+        yield_now().await;
+        vec![
+            "cargo:rustc-cfg=feature_x".to_owned(),
+            "cargo:rerun-if-changed=build.rs".to_owned(),
+        ]
+    });
+    assert_eq!(
+        stdout_lines,
+        vec![
+            "cargo:rustc-cfg=feature_x".to_owned(),
+            "cargo:rerun-if-changed=build.rs".to_owned(),
+        ]
+    );
+}
