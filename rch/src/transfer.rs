@@ -1733,6 +1733,12 @@ const BUILD_OUTPUT_DIR_EXCLUDES: &[&str] = &["build/", "dist/", "coverage/"];
 /// `target/` is Cargo's own output; only a Cargo package of that name is an input.
 const CARGO_TARGET_DIR_EXCLUDE: &str = "target/";
 
+/// An exclude that [`tracked_input_dir_includes`] may carve tracked inputs
+/// out of. Every other exclude keeps its exact meaning.
+fn is_build_output_exclude(pattern: &str) -> bool {
+    pattern == CARGO_TARGET_DIR_EXCLUDE || BUILD_OUTPUT_DIR_EXCLUDES.contains(&pattern)
+}
+
 /// Root-anchored, directory-only includes for tracked inputs that a default
 /// build-output exclude would cut off.
 /// - #113: the default `build/` dropped a workspace member at `crates/build`,
@@ -4219,12 +4225,21 @@ impl TransferPipeline {
             }
             cmd.arg("--exclude").arg("*");
         } else {
-            // rsync is first-match-wins: carve Cargo packages out of the
-            // build-output excludes before any exclude is emitted (#113).
+            // rsync is first-match-wins. Carve tracked inputs out of the
+            // build-output excludes before those are emitted (#113), but only
+            // out of those: every other exclude, a project's `.rchignore`
+            // included, goes first, so naming a tracked `docs/build/` there
+            // still drops it.
+            let (build_output, other): (Vec<&String>, Vec<&String>) = effective_excludes
+                .iter()
+                .partition(|pattern| is_build_output_exclude(pattern));
+            for pattern in other {
+                cmd.arg("--exclude").arg(pattern);
+            }
             for pattern in tracked_input_dir_includes(&self.project_root, effective_excludes) {
                 cmd.arg("--include").arg(pattern);
             }
-            for pattern in effective_excludes {
+            for pattern in build_output {
                 cmd.arg("--exclude").arg(pattern);
             }
         }
@@ -19812,6 +19827,65 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
         );
         // A user's own exclude keeps its exact meaning.
         assert!(tracked_input_dir_includes(root.path(), &["crates/".to_string()]).is_empty());
+    }
+
+    /// #113 follow-up: readmitting tracked build-output directories must not
+    /// override a project's own exclude of one of them. The directory includes
+    /// used to precede every exclude, and rsync is first-match-wins, so
+    /// `.rchignore: docs/build/` still uploaded a tracked `docs/build/`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_exclude_still_drops_a_tracked_build_output_directory() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("source fixture");
+        let write = |path: &str, body: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        for (path, body) in [
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/build\"]\n"),
+            ("crates/build/Cargo.toml", "[package]\nname = \"helper\"\n"),
+            ("crates/build/src/lib.rs", "pub fn one() {}\n"),
+            ("docs/build/index.html", "<p>tracked site output</p>\n"),
+            ("docs/coverage/report.json", "{}\n"),
+            (".rchignore", "docs/build/\n/docs/coverage/\n"),
+        ] {
+            write(path, body);
+        }
+        for args in [&["init", "-q"][..], &["add", "-A"][..]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let pipeline = TransferPipeline::new(
+            root.path().to_path_buf(),
+            "fixture".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+        let selected: Vec<String> = pipeline
+            .enumerate_source_content_files()
+            .await
+            .expect("rsync selection")
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for kept in ["crates/build/Cargo.toml", "crates/build/src/lib.rs"] {
+            assert!(
+                selected.iter().any(|p| p == kept),
+                "{kept} missing: {selected:?}"
+            );
+        }
+        for dropped in ["docs/build/index.html", "docs/coverage/report.json"] {
+            assert!(
+                !selected.iter().any(|p| p == dropped),
+                "{dropped} selected despite .rchignore: {selected:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
