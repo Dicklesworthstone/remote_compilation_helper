@@ -941,8 +941,229 @@ fn print_worker_report(report: &rabs_cas::worker_reconcile::WorkerReconcileRepor
     }
 }
 
+/// Schema identifier for `rch rabs release-verdict` receipts (`bd-dockb`).
+const RELEASE_VERDICT_SCHEMA: &str = "rch.rabs-release-verdict.v1";
+
+/// Serialized durable [`rabs_protocol::release_authorization::ReleaseVerdict`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JsonReleaseVerdict {
+    pub build: String,
+    pub corpus: String,
+    pub replayed: u64,
+    pub explained: u64,
+    pub evaluated_at_unix_micros: i64,
+    pub maximum_age_micros: Option<u64>,
+    pub clock_uncertainty_micros: u64,
+    pub coordinator_clock_epoch: u64,
+}
+
+impl From<&rabs_protocol::release_authorization::ReleaseVerdict> for JsonReleaseVerdict {
+    fn from(v: &rabs_protocol::release_authorization::ReleaseVerdict) -> Self {
+        Self {
+            build: v.build.clone(),
+            corpus: v.corpus.clone(),
+            replayed: v.replayed,
+            explained: v.explained,
+            evaluated_at_unix_micros: v.validity.evaluated_at_unix_micros,
+            maximum_age_micros: v.validity.maximum_age_micros,
+            clock_uncertainty_micros: v.validity.clock_uncertainty_micros,
+            coordinator_clock_epoch: v.validity.coordinator_clock_epoch,
+        }
+    }
+}
+
+/// Receipt emitted by `rch rabs release-verdict show` and `record` (`bd-dockb`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseVerdictReceipt {
+    pub schema: &'static str,
+    pub cas_root: String,
+    pub build: String,
+    pub standing: &'static str,
+    pub permits_advisory: bool,
+    pub permits_required: bool,
+    pub evaluated_at_unix_micros: i64,
+    pub clock_epoch: u64,
+    pub verdict: Option<JsonReleaseVerdict>,
+}
+
+fn current_unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
+
+fn build_release_verdict_receipt(
+    store: &mut dyn RabsMetadataStore,
+    cas_root: &Path,
+    build: &str,
+    now_unix_micros: i64,
+    clock_epoch: u64,
+) -> anyhow::Result<ReleaseVerdictReceipt> {
+    use rabs_protocol::release_authorization::{ReleaseAuthorizationMode, authorization};
+
+    let stored = store
+        .release_verdict(build)
+        .map_err(|e| anyhow::anyhow!("read release verdict: {e:?}"))?;
+    let standing = authorization(stored.as_ref(), build, now_unix_micros, clock_epoch);
+    Ok(ReleaseVerdictReceipt {
+        schema: RELEASE_VERDICT_SCHEMA,
+        cas_root: cas_root.display().to_string(),
+        build: build.to_owned(),
+        standing: standing.token(),
+        permits_advisory: standing.permits_serving(ReleaseAuthorizationMode::Advisory),
+        permits_required: standing.permits_serving(ReleaseAuthorizationMode::Required),
+        evaluated_at_unix_micros: now_unix_micros,
+        clock_epoch,
+        verdict: stored.as_ref().map(JsonReleaseVerdict::from),
+    })
+}
+
+fn record_and_verify_release_verdict(
+    store: &mut dyn RabsMetadataStore,
+    cas_root: &Path,
+    verdict: &rabs_protocol::release_authorization::ReleaseVerdict,
+    now_unix_micros: i64,
+    clock_epoch: u64,
+) -> anyhow::Result<ReleaseVerdictReceipt> {
+    if verdict.build.trim().is_empty() {
+        anyhow::bail!("release verdict build identity must not be empty");
+    }
+    if verdict.corpus.trim().is_empty() {
+        anyhow::bail!("release verdict corpus identity must not be empty");
+    }
+    if verdict.replayed == 0 {
+        anyhow::bail!(
+            "release verdict requires replayed > 0 (zero replayed records can never authorize serving)"
+        );
+    }
+    store
+        .record_release_verdict(verdict)
+        .map_err(|e| anyhow::anyhow!("record release verdict: {e:?}"))?;
+    build_release_verdict_receipt(store, cas_root, &verdict.build, now_unix_micros, clock_epoch)
+}
+
+fn open_or_init_store(cas_root: &Path) -> anyhow::Result<SqlMetadataStore<RusqliteEngine>> {
+    let _ = rabs_cas::layout::CasLayout::init(cas_root)
+        .map_err(|e| anyhow::anyhow!("initialize CAS layout at {}: {e:?}", cas_root.display()))?;
+    let meta = cas_root.join("meta.sqlite");
+    let engine =
+        RusqliteEngine::open(&meta).map_err(|e| anyhow::anyhow!("metadata engine: {e:?}"))?;
+    SqlMetadataStore::open(engine).map_err(|e| anyhow::anyhow!("metadata store: {e:?}"))
+}
+
+fn print_release_verdict(receipt: &ReleaseVerdictReceipt) {
+    println!(
+        "release verdict [{}]: build={} standing={} (advisory={}, required={})",
+        receipt.cas_root,
+        receipt.build,
+        receipt.standing,
+        if receipt.permits_advisory {
+            "permitted"
+        } else {
+            "refused"
+        },
+        if receipt.permits_required {
+            "permitted"
+        } else {
+            "refused"
+        },
+    );
+    if let Some(v) = &receipt.verdict {
+        println!(
+            "  corpus={} replayed={} explained={} evaluated_at_us={} max_age_us={:?} epoch={}",
+            v.corpus,
+            v.replayed,
+            v.explained,
+            v.evaluated_at_unix_micros,
+            v.maximum_age_micros,
+            v.coordinator_clock_epoch,
+        );
+    } else {
+        println!(
+            "  no verdict recorded for build {} (run `rch rabs release-verdict record ...`)",
+            receipt.build
+        );
+    }
+}
+
+/// Entry point for `rch rabs release-verdict <action>` (`bd-dockb`).
+///
+/// # Errors
+/// Propagates store and validation failures under the caller's exit-code
+/// convention.
+pub async fn run_release_verdict(
+    action: ReleaseVerdictAction,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    match action {
+        ReleaseVerdictAction::Show {
+            cas_root,
+            build,
+            now_micros,
+            clock_epoch,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let build =
+                build.unwrap_or_else(rabs_protocol::release_authorization::default_build_identity);
+            let now = now_micros.unwrap_or_else(current_unix_micros);
+            let receipt =
+                build_release_verdict_receipt(&mut store, &root, &build, now, clock_epoch)?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs release-verdict show", &receipt))?;
+            } else {
+                print_release_verdict(&receipt);
+            }
+            Ok(())
+        }
+        ReleaseVerdictAction::Record {
+            cas_root,
+            build,
+            corpus,
+            replayed,
+            explained,
+            max_age_secs,
+            evaluated_at_micros,
+            clock_uncertainty_micros,
+            clock_epoch,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_or_init_store(&root)?;
+            let build =
+                build.unwrap_or_else(rabs_protocol::release_authorization::default_build_identity);
+            let evaluated_at = evaluated_at_micros.unwrap_or_else(current_unix_micros);
+            let maximum_age_micros = max_age_secs.map(|s| s.saturating_mul(1_000_000));
+            let verdict = rabs_protocol::release_authorization::ReleaseVerdict {
+                build,
+                corpus,
+                replayed,
+                explained,
+                validity: rabs_protocol::serving::ServingValidity {
+                    evaluated_at_unix_micros: evaluated_at,
+                    maximum_age_micros,
+                    clock_uncertainty_micros,
+                    coordinator_clock_epoch: clock_epoch,
+                },
+            };
+            let receipt = record_and_verify_release_verdict(
+                &mut store,
+                &root,
+                &verdict,
+                evaluated_at,
+                clock_epoch,
+            )?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs release-verdict record", &receipt))?;
+            } else {
+                print_release_verdict(&receipt);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// `rch rabs <group>` command groups (R005 lands `gc`; R006 lands
-/// `worker` + `doctor`).
+/// `worker` + `doctor`; `bd-dockb` lands `release-verdict`).
 #[derive(Debug, Subcommand)]
 pub enum RabsCommand {
     /// Content-addressed store garbage collection (H014 engine)
@@ -986,6 +1207,66 @@ pub enum RabsCommand {
         /// (repeatable; unlisted namespaces collapse into a count)
         #[arg(long, value_name = "NAMESPACE")]
         allow_namespace: Vec<String>,
+    },
+    /// Inspect or record durable T011 release-gate verdicts (`bd-dockb`)
+    #[command(
+        name = "release-verdict",
+        after_help = "EXAMPLES:\n    rch rabs release-verdict show\n    rch rabs release-verdict show --build rabs-2.1.34 --json\n    rch rabs release-verdict record --corpus shadow-ci --replayed 128 --max-age-secs 86400"
+    )]
+    ReleaseVerdict {
+        /// Release-verdict operation
+        #[command(subcommand)]
+        action: ReleaseVerdictAction,
+    },
+}
+
+/// One release-verdict operation (`bd-dockb`).
+#[derive(Debug, Subcommand)]
+pub enum ReleaseVerdictAction {
+    /// Inspect the durable release verdict and standing for a build
+    Show {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Build identity to inspect (default: this binary's derived identity)
+        #[arg(long, value_name = "BUILD")]
+        build: Option<String>,
+        /// Evaluation timestamp in Unix microseconds (default: current wall clock)
+        #[arg(long, value_name = "MICROS")]
+        now_micros: Option<i64>,
+        /// Coordinator clock epoch to evaluate against
+        #[arg(long, value_name = "EPOCH", default_value_t = 0)]
+        clock_epoch: u64,
+    },
+    /// Record a durable release verdict for a build after a passing corpus run
+    Record {
+        /// CAS root directory (default: rabsd's state dir; initialized if absent)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Build identity to authorize (default: this binary's derived identity)
+        #[arg(long, value_name = "BUILD")]
+        build: Option<String>,
+        /// Corpus identifier that produced this verdict
+        #[arg(long, value_name = "CORPUS")]
+        corpus: String,
+        /// Number of records that replayed under both stock and RABS (> 0)
+        #[arg(long, value_name = "N")]
+        replayed: u64,
+        /// Number of divergences explicitly explained by operator policy
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        explained: u64,
+        /// Optional validity window in seconds
+        #[arg(long, value_name = "SECS")]
+        max_age_secs: Option<u64>,
+        /// Evaluation timestamp in Unix microseconds (default: current wall clock)
+        #[arg(long, value_name = "MICROS")]
+        evaluated_at_micros: Option<i64>,
+        /// Conservative clock uncertainty in microseconds
+        #[arg(long, value_name = "MICROS", default_value_t = 0)]
+        clock_uncertainty_micros: u64,
+        /// Coordinator clock epoch
+        #[arg(long, value_name = "EPOCH", default_value_t = 0)]
+        clock_epoch: u64,
     },
 }
 
@@ -1339,5 +1620,66 @@ mod tests {
         };
         assert!(err.to_string().contains(RC_CAS_ROOT_MISSING), "{err}");
         assert!(!root.exists(), "must not create anything");
+    }
+
+    #[test]
+    fn release_verdict_show_and_record_round_trip_and_enforce_evidence_and_expiry() {
+        let mut ts = fresh_store("release-verdict");
+        let build = rabs_protocol::release_authorization::default_build_identity();
+        let root = ts.dir.path();
+
+        let initial =
+            build_release_verdict_receipt(&mut ts.store, root, &build, 1_000, 0).expect("show");
+        assert_eq!(initial.standing, "absent");
+        assert!(initial.permits_advisory);
+        assert!(!initial.permits_required);
+        assert!(initial.verdict.is_none());
+
+        let zero_replayed = rabs_protocol::release_authorization::ReleaseVerdict {
+            build: build.clone(),
+            corpus: "shadow-ci".to_owned(),
+            replayed: 0,
+            explained: 0,
+            validity: rabs_protocol::serving::ServingValidity {
+                evaluated_at_unix_micros: 1_000,
+                maximum_age_micros: Some(10_000),
+                clock_uncertainty_micros: 0,
+                coordinator_clock_epoch: 0,
+            },
+        };
+        assert!(
+            record_and_verify_release_verdict(&mut ts.store, root, &zero_replayed, 1_000, 0)
+                .is_err(),
+            "zero-replayed verdicts must be refused at record time"
+        );
+
+        let valid = rabs_protocol::release_authorization::ReleaseVerdict {
+            build: build.clone(),
+            corpus: "shadow-ci".to_owned(),
+            replayed: 64,
+            explained: 1,
+            validity: rabs_protocol::serving::ServingValidity {
+                evaluated_at_unix_micros: 1_000,
+                maximum_age_micros: Some(10_000),
+                clock_uncertainty_micros: 0,
+                coordinator_clock_epoch: 0,
+            },
+        };
+        let recorded = record_and_verify_release_verdict(&mut ts.store, root, &valid, 2_000, 0)
+            .expect("record");
+        assert_eq!(recorded.standing, "authorized");
+        assert!(recorded.permits_advisory);
+        assert!(recorded.permits_required);
+        assert_eq!(
+            recorded.verdict.as_ref().map(|v| v.replayed),
+            Some(64),
+            "{recorded:?}"
+        );
+
+        let expired = build_release_verdict_receipt(&mut ts.store, root, &build, 25_000, 0)
+            .expect("show expired");
+        assert_eq!(expired.standing, "expired");
+        assert!(expired.permits_advisory);
+        assert!(!expired.permits_required);
     }
 }

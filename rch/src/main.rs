@@ -2430,6 +2430,9 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                         allow_namespace,
                     },
             } => commands::rabs_gc::run_inventory(cas_root, l2_root, allow_namespace, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::ReleaseVerdict { action },
+            } => commands::rabs_gc::run_release_verdict(action, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Gc {
