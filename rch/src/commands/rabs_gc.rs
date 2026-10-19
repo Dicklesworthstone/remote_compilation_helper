@@ -1168,8 +1168,358 @@ pub async fn run_release_verdict(
     }
 }
 
-/// `rch rabs <group>` command groups (R005 lands `gc`; R006 lands
-/// `worker` + `doctor`; `bd-dockb` lands `release-verdict`).
+// ---------------------------------------------------------------------
+// R004: CAS verify, locate, and quarantine list/inspect/release commands
+// ---------------------------------------------------------------------
+
+const VERIFY_SCHEMA: &str = "rch.rabs-cas-verify.v1";
+const LOCATE_SCHEMA: &str = "rch.rabs-cas-locate.v1";
+const QUARANTINE_LIST_SCHEMA: &str = "rch.rabs-quarantine-list.v1";
+const QUARANTINE_INSPECT_SCHEMA: &str = "rch.rabs-quarantine-inspect.v1";
+const QUARANTINE_RELEASE_SCHEMA: &str = "rch.rabs-quarantine-release.v1";
+
+/// Receipt emitted by `rch rabs verify` (R004 / H023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CasVerifyReceipt {
+    pub schema: &'static str,
+    pub cas_root: String,
+    pub scanned_locations: usize,
+    pub healthy_locations: usize,
+    pub quarantined_locations: Vec<String>,
+    pub repaired_locations: Vec<String>,
+    pub escalated_logical_objects: Vec<String>,
+}
+
+/// Replica location row emitted by `rch rabs locate` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocatedReplicaDto {
+    pub store_path: String,
+    pub encoding_profile: String,
+    pub verified_raw: bool,
+    pub quarantined: bool,
+    pub exists_on_disk: bool,
+}
+
+/// Receipt emitted by `rch rabs locate <object_key>` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CasLocateReceipt {
+    pub schema: &'static str,
+    pub object_key: String,
+    pub logical_quarantined: bool,
+    pub replicas: Vec<LocatedReplicaDto>,
+}
+
+/// Serialized quarantine row for `rch rabs quarantine` (R004 / H012).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineEntryDto {
+    pub scope: String,
+    pub subject: String,
+    pub reason: String,
+}
+
+impl From<&rabs_cas::materialization::QuarantineRow> for QuarantineEntryDto {
+    fn from(row: &rabs_cas::materialization::QuarantineRow) -> Self {
+        Self {
+            scope: row.scope.as_str().to_owned(),
+            subject: row.subject.clone(),
+            reason: row.reason.clone(),
+        }
+    }
+}
+
+/// Receipt emitted by `rch rabs quarantine list` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineListReceipt {
+    pub schema: &'static str,
+    pub count: usize,
+    pub entries: Vec<QuarantineEntryDto>,
+}
+
+/// Receipt emitted by `rch rabs quarantine inspect` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineInspectReceipt {
+    pub schema: &'static str,
+    pub scope: String,
+    pub subject: String,
+    pub quarantined: bool,
+    pub entry: Option<QuarantineEntryDto>,
+}
+
+/// Receipt emitted by `rch rabs quarantine release` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineReleaseReceipt {
+    pub schema: &'static str,
+    pub scope: String,
+    pub subject: String,
+    pub repair_receipt_id: String,
+    pub seq: u64,
+    pub released: bool,
+}
+
+fn parse_quarantine_scope(
+    scope: &str,
+) -> anyhow::Result<rabs_cas::metadata_store::QuarantineScope> {
+    rabs_cas::metadata_store::QuarantineScope::from_str_name(&scope.to_ascii_lowercase())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid quarantine scope '{scope}' (expected location|logical-object|action-entry)"
+            )
+        })
+}
+
+/// Compute the `rch rabs verify` receipt over `store` (R004 / H023).
+pub fn verify_cas_receipt(
+    store: &mut dyn RabsMetadataStore,
+    cas_root: &Path,
+) -> anyhow::Result<CasVerifyReceipt> {
+    let seq = next_seq(store).map_err(|e| anyhow::anyhow!("allocate verify seq: {e:?}"))?;
+    let report = rabs_cas::materialization::scrub_and_repair_locations(store, seq)
+        .map_err(|e| anyhow::anyhow!("CAS verify/scrub failed: {e:?}"))?;
+    Ok(CasVerifyReceipt {
+        schema: VERIFY_SCHEMA,
+        cas_root: cas_root.display().to_string(),
+        scanned_locations: report.scanned_locations,
+        healthy_locations: report.healthy_locations,
+        quarantined_locations: report.quarantined_locations,
+        repaired_locations: report.repaired_locations,
+        escalated_logical_objects: report.escalated_logical_objects,
+    })
+}
+
+/// Compute the `rch rabs locate <object_key>` receipt over `store` (R004).
+pub fn locate_object_receipt(
+    store: &mut dyn RabsMetadataStore,
+    object_key: &str,
+) -> anyhow::Result<CasLocateReceipt> {
+    let rows = store
+        .query(
+            "SELECT store_path, encoding, durable, quarantined \
+             FROM object_locations WHERE object_key = ?1 ORDER BY store_path ASC",
+            &[SqlValue::Text(object_key.to_owned())],
+        )
+        .map_err(|e| anyhow::anyhow!("query object_locations: {e:?}"))?;
+    let mut replicas = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let [
+            SqlValue::Text(store_path),
+            SqlValue::Text(encoding_profile),
+            SqlValue::Int(verified_raw),
+            SqlValue::Int(quarantined),
+        ] = row.as_slice()
+        {
+            let exists_on_disk = Path::new(store_path).exists();
+            replicas.push(LocatedReplicaDto {
+                store_path: store_path.clone(),
+                encoding_profile: encoding_profile.clone(),
+                verified_raw: *verified_raw != 0,
+                quarantined: *quarantined != 0,
+                exists_on_disk,
+            });
+        }
+    }
+    let logical_quarantined = rabs_cas::materialization::inspect_quarantine(
+        store,
+        rabs_cas::metadata_store::QuarantineScope::LogicalObject,
+        object_key,
+    )
+    .map_err(|e| anyhow::anyhow!("inspect logical quarantine: {e:?}"))?
+    .is_some();
+
+    Ok(CasLocateReceipt {
+        schema: LOCATE_SCHEMA,
+        object_key: object_key.to_owned(),
+        logical_quarantined,
+        replicas,
+    })
+}
+
+/// Compute the `rch rabs quarantine list` receipt over `store` (R004).
+pub fn quarantine_list_receipt(
+    store: &mut dyn RabsMetadataStore,
+    scope: Option<&str>,
+) -> anyhow::Result<QuarantineListReceipt> {
+    let parsed_scope = match scope {
+        Some(s) => Some(parse_quarantine_scope(s)?),
+        None => None,
+    };
+    let rows = rabs_cas::materialization::list_quarantines(store, parsed_scope)
+        .map_err(|e| anyhow::anyhow!("list quarantines: {e:?}"))?;
+    let entries: Vec<QuarantineEntryDto> = rows.iter().map(QuarantineEntryDto::from).collect();
+    Ok(QuarantineListReceipt {
+        schema: QUARANTINE_LIST_SCHEMA,
+        count: entries.len(),
+        entries,
+    })
+}
+
+/// Compute the `rch rabs quarantine inspect` receipt over `store` (R004).
+pub fn quarantine_inspect_receipt(
+    store: &mut dyn RabsMetadataStore,
+    scope: &str,
+    subject: &str,
+) -> anyhow::Result<QuarantineInspectReceipt> {
+    let parsed_scope = parse_quarantine_scope(scope)?;
+    let row = rabs_cas::materialization::inspect_quarantine(store, parsed_scope, subject)
+        .map_err(|e| anyhow::anyhow!("inspect quarantine: {e:?}"))?;
+    let entry = row.as_ref().map(QuarantineEntryDto::from);
+    Ok(QuarantineInspectReceipt {
+        schema: QUARANTINE_INSPECT_SCHEMA,
+        scope: parsed_scope.as_str().to_owned(),
+        subject: subject.to_owned(),
+        quarantined: entry.is_some(),
+        entry,
+    })
+}
+
+/// Execute `rch rabs quarantine release` over `store` (R004 / H012).
+///
+/// Requires a durable verified repair receipt (`rabs-quarantine-repair-v1`)
+/// matching `(subject, repair_receipt_id)`.
+pub fn quarantine_release_receipt(
+    store: &mut dyn RabsMetadataStore,
+    scope: &str,
+    subject: &str,
+    repair_receipt_id: &str,
+    seq: Option<u64>,
+) -> anyhow::Result<QuarantineReleaseReceipt> {
+    let parsed_scope = parse_quarantine_scope(scope)?;
+    let release_seq = match seq {
+        Some(s) => s,
+        None => next_seq(store).map_err(|e| anyhow::anyhow!("allocate release seq: {e:?}"))?,
+    };
+    let released = store
+        .release_quarantine_with_receipt(parsed_scope, subject, repair_receipt_id, release_seq)
+        .map_err(|e| anyhow::anyhow!("release quarantine refused: {e:?}"))?;
+    Ok(QuarantineReleaseReceipt {
+        schema: QUARANTINE_RELEASE_SCHEMA,
+        scope: parsed_scope.as_str().to_owned(),
+        subject: subject.to_owned(),
+        repair_receipt_id: repair_receipt_id.to_owned(),
+        seq: release_seq,
+        released,
+    })
+}
+
+/// Entry point for `rch rabs verify` (R004).
+pub async fn run_verify(cas_root: Option<PathBuf>, ctx: &OutputContext) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let receipt = verify_cas_receipt(&mut store, &root)?;
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok("rabs verify", &receipt))?;
+    } else {
+        println!(
+            "rabs verify [{}]: scanned={} healthy={} quarantined={} repaired={} escalated={}",
+            receipt.cas_root,
+            receipt.scanned_locations,
+            receipt.healthy_locations,
+            receipt.quarantined_locations.len(),
+            receipt.repaired_locations.len(),
+            receipt.escalated_logical_objects.len(),
+        );
+    }
+    Ok(())
+}
+
+/// Entry point for `rch rabs locate <object_key>` (R004).
+pub async fn run_locate(
+    object_key: String,
+    cas_root: Option<PathBuf>,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let receipt = locate_object_receipt(&mut store, &object_key)?;
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok("rabs locate", &receipt))?;
+    } else {
+        println!(
+            "rabs locate {}: logical_quarantined={} replicas={}",
+            receipt.object_key,
+            receipt.logical_quarantined,
+            receipt.replicas.len()
+        );
+        for r in &receipt.replicas {
+            println!(
+                "  {} profile={} verified_raw={} quarantined={} exists={}",
+                r.store_path, r.encoding_profile, r.verified_raw, r.quarantined, r.exists_on_disk
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Entry point for `rch rabs quarantine <action>` (R004).
+pub async fn run_quarantine(action: QuarantineAction, ctx: &OutputContext) -> anyhow::Result<()> {
+    match action {
+        QuarantineAction::List { cas_root, scope } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let receipt = quarantine_list_receipt(&mut store, scope.as_deref())?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs quarantine list", &receipt))?;
+            } else {
+                println!("rabs quarantine list: count={}", receipt.count);
+                for e in &receipt.entries {
+                    println!("  [{}] {} -> {}", e.scope, e.subject, e.reason);
+                }
+            }
+            Ok(())
+        }
+        QuarantineAction::Inspect {
+            scope,
+            subject,
+            cas_root,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let receipt = quarantine_inspect_receipt(&mut store, &scope, &subject)?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs quarantine inspect", &receipt))?;
+            } else if let Some(entry) = &receipt.entry {
+                println!(
+                    "rabs quarantine inspect: [{}] {} QUARANTINED ({})",
+                    entry.scope, entry.subject, entry.reason
+                );
+            } else {
+                println!(
+                    "rabs quarantine inspect: [{}] {} not quarantined",
+                    receipt.scope, receipt.subject
+                );
+            }
+            Ok(())
+        }
+        QuarantineAction::Release {
+            scope,
+            subject,
+            receipt_id,
+            seq,
+            cas_root,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let receipt =
+                quarantine_release_receipt(&mut store, &scope, &subject, &receipt_id, seq)?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs quarantine release", &receipt))?;
+            } else {
+                println!(
+                    "rabs quarantine release: [{}] {} receipt_id={} seq={} released={}",
+                    receipt.scope,
+                    receipt.subject,
+                    receipt.repair_receipt_id,
+                    receipt.seq,
+                    receipt.released
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `rch rabs <group>` command groups (R004 lands `verify`, `locate`,
+/// `quarantine`; R005 lands `gc`; R006 lands `worker` + `doctor`;
+/// `bd-dockb` lands `release-verdict`).
 #[derive(Debug, Subcommand)]
 pub enum RabsCommand {
     /// Content-addressed store garbage collection (H014 engine)
@@ -1200,6 +1550,27 @@ pub enum RabsCommand {
         #[arg(long, value_name = "SEQS", default_value_t = 1_000)]
         min_seq_lag: u64,
     },
+    /// Scrub and verify physical CAS locations, repairing corrupt copies from healthy replicas (R004 / H023)
+    Verify {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+    },
+    /// Locate physical CAS replicas and quarantine state for an object key (R004)
+    Locate {
+        /// Object digest key (`domain:hex`)
+        #[arg(value_name = "OBJECT_KEY")]
+        object_key: String,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+    },
+    /// List, inspect, or release CAS quarantines with a verified repair receipt (R004 / H012)
+    Quarantine {
+        /// Quarantine operation
+        #[command(subcommand)]
+        action: QuarantineAction,
+    },
     /// What is cached where: edge L1, local L2 projects, toolchains,
     /// store facts — with namespace existence-hiding (K006/K010 ACL)
     Inventory {
@@ -1223,6 +1594,50 @@ pub enum RabsCommand {
         /// Release-verdict operation
         #[command(subcommand)]
         action: ReleaseVerdictAction,
+    },
+}
+
+/// One quarantine operation (R004 / H012).
+#[derive(Debug, Subcommand)]
+pub enum QuarantineAction {
+    /// List active quarantines (optionally filtered by scope)
+    List {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Optional scope filter (`location|logical-object|action-entry`)
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+    },
+    /// Inspect quarantine status for a specific (scope, subject)
+    Inspect {
+        /// Quarantine scope (`location|logical-object|action-entry`)
+        #[arg(value_name = "SCOPE")]
+        scope: String,
+        /// Quarantine subject (store path, object key, or action key)
+        #[arg(value_name = "SUBJECT")]
+        subject: String,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+    },
+    /// Release a quarantine using a verified repair receipt ID (`rabs-quarantine-repair-v1`)
+    Release {
+        /// Quarantine scope (`location|logical-object|action-entry`)
+        #[arg(value_name = "SCOPE")]
+        scope: String,
+        /// Quarantine subject (store path, object key, or action key)
+        #[arg(value_name = "SUBJECT")]
+        subject: String,
+        /// Verified repair receipt ID (`rabs-quarantine-repair-v1`)
+        #[arg(long, value_name = "RECEIPT_ID")]
+        receipt_id: String,
+        /// Optional decision sequence override
+        #[arg(long, value_name = "SEQ")]
+        seq: Option<u64>,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
     },
 }
 
@@ -1687,5 +2102,113 @@ mod tests {
         assert_eq!(expired.standing, "expired");
         assert!(expired.permits_advisory);
         assert!(!expired.permits_required);
+    }
+
+    #[test]
+    fn r004_verify_locate_and_quarantine_list_inspect_release_enforce_receipts() {
+        let mut ts = fresh_store("r004");
+        let root = ts._dir.path().to_path_buf();
+        let bytes = b"r004-verified-cas-payload";
+        let obj = rabs_cas::digest_set::digest_set(
+            bytes,
+            rabs_cas::digest_set::DigestRequest::default(),
+            None,
+        )
+        .expect("digest")
+        .atp_content_id;
+        let obj_key = rabs_cas::metadata_store::digest_key(&obj);
+
+        let replica_path = root.join("replica.bin");
+        std::fs::write(&replica_path, bytes).expect("write replica");
+        let replica_str = replica_path.to_str().expect("utf8").to_owned();
+
+        ts.store
+            .record_object(&obj, bytes.len() as u64)
+            .expect("record object");
+        ts.store
+            .add_location(&obj, &replica_str, Some(1), "raw-v1", true)
+            .expect("add location");
+
+        // 1. Locate healthy replica
+        let located = locate_object_receipt(&mut ts.store, &obj_key).expect("locate");
+        assert!(!located.logical_quarantined);
+        assert_eq!(located.replicas.len(), 1);
+        assert!(!located.replicas[0].quarantined);
+        assert!(located.replicas[0].exists_on_disk);
+
+        // 2. Corrupt the single replica and run `verify` -> escalates to logical-object quarantine
+        std::fs::write(&replica_path, b"corrupt-r004-bytes").expect("corrupt replica");
+        let verify = verify_cas_receipt(&mut ts.store, &root).expect("verify");
+        assert_eq!(verify.scanned_locations, 1);
+        assert_eq!(verify.healthy_locations, 0);
+        assert_eq!(verify.quarantined_locations, vec![replica_str.clone()]);
+        assert_eq!(verify.escalated_logical_objects, vec![obj_key.clone()]);
+
+        // 3. Quarantine list and inspect
+        let list = quarantine_list_receipt(&mut ts.store, None).expect("list");
+        assert_eq!(list.count, 2);
+        let loc_list = quarantine_list_receipt(&mut ts.store, Some("location")).expect("list loc");
+        assert_eq!(loc_list.count, 1);
+        assert_eq!(loc_list.entries[0].subject, replica_str);
+
+        let inspected =
+            quarantine_inspect_receipt(&mut ts.store, "logical-object", &obj_key).expect("inspect");
+        assert!(inspected.quarantined);
+
+        // 4. Release without a verified repair receipt must be refused
+        assert!(
+            quarantine_release_receipt(
+                &mut ts.store,
+                "logical-object",
+                &obj_key,
+                "missing-receipt-id",
+                None,
+            )
+            .is_err(),
+            "quarantine release without a verified repair receipt must be refused"
+        );
+
+        // 5. Restore bytes, record verified repair receipt, and release both quarantines
+        std::fs::write(&replica_path, bytes).expect("restore replica");
+        rabs_cas::materialization::record_verified_repair_receipt(
+            &mut ts.store,
+            &replica_str,
+            "repair-loc-1",
+            "restored-from-source",
+            50,
+        )
+        .expect("loc receipt");
+        rabs_cas::materialization::record_verified_repair_receipt(
+            &mut ts.store,
+            &obj_key,
+            "repair-obj-1",
+            "restored-from-source",
+            51,
+        )
+        .expect("obj receipt");
+
+        let rel_loc = quarantine_release_receipt(
+            &mut ts.store,
+            "location",
+            &replica_str,
+            "repair-loc-1",
+            None,
+        )
+        .expect("release location");
+        assert!(rel_loc.released);
+        let rel_obj = quarantine_release_receipt(
+            &mut ts.store,
+            "logical-object",
+            &obj_key,
+            "repair-obj-1",
+            None,
+        )
+        .expect("release logical object");
+        assert!(rel_obj.released);
+
+        let after_verify = verify_cas_receipt(&mut ts.store, &root).expect("verify after repair");
+        assert_eq!(after_verify.scanned_locations, 1);
+        assert_eq!(after_verify.healthy_locations, 1);
+        assert!(after_verify.quarantined_locations.is_empty());
     }
 }

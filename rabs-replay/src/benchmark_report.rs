@@ -575,6 +575,251 @@ pub fn evaluate_corpus_regression_gate(
     }
 }
 
+/// The four canonical baseline systems required by bead B009 (`plan §140`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BaselineVariantKind {
+    /// Unmodified stock Cargo (`CARGO_INCREMENTAL=0`, no wrapper, no config overlay).
+    Stock,
+    /// Layer-0 configuration pack (`rabs-key::layer0_pack` overlay).
+    Layer0,
+    /// `RUSTC_WRAPPER=sccache` baseline.
+    Sccache,
+    /// Conventional RCH (`rch exec -- cargo ...`) remote/pooled baseline.
+    CurrentRch,
+}
+
+impl BaselineVariantKind {
+    /// Closed set of all four required B009 baseline variants.
+    pub const ALL: [Self; 4] = [Self::Stock, Self::Layer0, Self::Sccache, Self::CurrentRch];
+
+    /// Canonical NDJSON variant string emitted by `scripts/rabs_layer0_bench.sh`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stock => "stock",
+            Self::Layer0 => "layer0",
+            Self::Sccache => "sccache",
+            Self::CurrentRch => "current-rch",
+        }
+    }
+
+    /// Parse from the `"variant"` field of a `layer0-baseline` NDJSON record.
+    #[must_use]
+    pub fn from_variant_str(value: &str) -> Option<Self> {
+        match value {
+            "stock" => Some(Self::Stock),
+            "layer0" => Some(Self::Layer0),
+            "sccache" => Some(Self::Sccache),
+            "current-rch" => Some(Self::CurrentRch),
+            _ => None,
+        }
+    }
+}
+
+/// One parsed line from `benchmarks/baselines/*.ndjson` (`kind = "layer0-baseline"`, v1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer0BaselineRecord {
+    /// Repository identifier (e.g. `"rch-workspace"`, `"asupersync"`).
+    pub repo: String,
+    /// Host identifier (e.g. `"hetzner2"`).
+    pub host: String,
+    /// Toolchain version string.
+    pub toolchain: String,
+    /// Which of the 4 B009 baseline variants ran.
+    pub variant: BaselineVariantKind,
+    /// Scenario name (`"cold-check"`, `"incremental-check"`, `"cold-build"`, `"cold-build-cached"`).
+    pub scenario: String,
+    /// 1-based iteration index.
+    pub iteration: u32,
+    /// Observed wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    /// Process exit code (`0` for success, `-1` for recorded skip).
+    pub exit: i32,
+}
+
+/// Comparative latency summary for one `(repo, scenario)` across the four B009 baselines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineComparisonRow {
+    /// Repository name.
+    pub repo: String,
+    /// Scenario name (`"cold-check"`, `"incremental-check"`, `"cold-build"`).
+    pub scenario: String,
+    /// Median (`p50`) duration in ms for stock Cargo.
+    pub stock_p50_ms: Option<u64>,
+    /// Median (`p50`) duration in ms for the Layer-0 pack.
+    pub layer0_p50_ms: Option<u64>,
+    /// Median (`p50`) duration in ms for sccache.
+    pub sccache_p50_ms: Option<u64>,
+    /// Median (`p50`) duration in ms for current RCH.
+    pub current_rch_p50_ms: Option<u64>,
+}
+
+impl BaselineComparisonRow {
+    /// Whether all four required B009 baseline variants have measured (`exit == 0`) numbers
+    /// for this `(repo, scenario)`.
+    #[must_use]
+    pub const fn has_all_four_variants(&self) -> bool {
+        self.stock_p50_ms.is_some()
+            && self.layer0_p50_ms.is_some()
+            && self.sccache_p50_ms.is_some()
+            && self.current_rch_p50_ms.is_some()
+    }
+}
+
+/// Aggregated B009 baseline comparison summary across repositories and scenarios.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineComparisonSummary {
+    /// Distinct repositories present in the baseline dataset.
+    pub repos: BTreeSet<String>,
+    /// Distinct baseline variants with successful (`exit == 0`) measurements.
+    pub variants_present: BTreeSet<BaselineVariantKind>,
+    /// Per-`(repo, scenario)` comparison rows.
+    pub rows: Vec<BaselineComparisonRow>,
+    /// Count of lines that failed to parse.
+    pub malformed_lines: usize,
+}
+
+impl BaselineComparisonSummary {
+    /// Whether the dataset covers at least `min_repos` repositories and all four required
+    /// B009 baseline variants (`stock`, `layer0`, `sccache`, `current-rch`) across the
+    /// three core scenarios (`cold-check`, `incremental-check`, `cold-build`).
+    #[must_use]
+    pub fn satisfies_b009(&self, min_repos: usize) -> bool {
+        if self.malformed_lines > 0 || self.repos.len() < min_repos {
+            return false;
+        }
+        if !BaselineVariantKind::ALL
+            .iter()
+            .all(|v| self.variants_present.contains(v))
+        {
+            return false;
+        }
+        for repo in &self.repos {
+            for scenario in ["cold-check", "incremental-check", "cold-build"] {
+                let Some(row) = self
+                    .rows
+                    .iter()
+                    .find(|r| r.repo == *repo && r.scenario == scenario)
+                else {
+                    return false;
+                };
+                if !row.has_all_four_variants() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Parse `kind = "layer0-baseline"` NDJSON content into typed [`Layer0BaselineRecord`] rows
+/// and a count of malformed lines.
+#[must_use]
+pub fn parse_layer0_baseline_ndjson(ndjson: &str) -> (Vec<Layer0BaselineRecord>, usize) {
+    let mut records = Vec::new();
+    let mut malformed = 0;
+    for raw_line in ndjson.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            malformed += 1;
+            continue;
+        };
+        if val["v"].as_u64() != Some(1) || val["kind"].as_str() != Some("layer0-baseline") {
+            malformed += 1;
+            continue;
+        }
+        let (
+            Some(repo),
+            Some(host),
+            Some(toolchain),
+            Some(variant_str),
+            Some(scenario),
+            Some(iteration),
+            Some(duration_ms),
+            Some(exit),
+        ) = (
+            val["repo"].as_str(),
+            val["host"].as_str(),
+            val["toolchain"].as_str(),
+            val["variant"].as_str(),
+            val["scenario"].as_str(),
+            val["iteration"].as_u64(),
+            val["duration_ms"].as_u64(),
+            val["exit"].as_i64(),
+        )
+        else {
+            malformed += 1;
+            continue;
+        };
+        let Some(variant) = BaselineVariantKind::from_variant_str(variant_str) else {
+            malformed += 1;
+            continue;
+        };
+        records.push(Layer0BaselineRecord {
+            repo: repo.to_owned(),
+            host: host.to_owned(),
+            toolchain: toolchain.to_owned(),
+            variant,
+            scenario: scenario.to_owned(),
+            iteration: u32::try_from(iteration).unwrap_or(0),
+            duration_ms,
+            exit: i32::try_from(exit).unwrap_or(-1),
+        });
+    }
+    (records, malformed)
+}
+
+/// Summarize parsed [`Layer0BaselineRecord`]s into a [`BaselineComparisonSummary`].
+#[must_use]
+pub fn summarize_baseline_comparison(
+    records: &[Layer0BaselineRecord],
+    malformed_lines: usize,
+) -> BaselineComparisonSummary {
+    let mut repos = BTreeSet::new();
+    let mut variants_present = BTreeSet::new();
+    let mut scenarios_by_repo: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for rec in records {
+        if rec.exit == 0 && rec.scenario != "skipped" {
+            repos.insert(rec.repo.clone());
+            variants_present.insert(rec.variant);
+            scenarios_by_repo.insert((rec.repo.clone(), rec.scenario.clone()));
+        }
+    }
+
+    let mut rows = Vec::with_capacity(scenarios_by_repo.len());
+    for (repo, scenario) in scenarios_by_repo {
+        let p50_for = |variant: BaselineVariantKind| -> Option<u64> {
+            let durations: Vec<u64> = records
+                .iter()
+                .filter(|r| {
+                    r.exit == 0 && r.repo == repo && r.scenario == scenario && r.variant == variant
+                })
+                .map(|r| r.duration_ms)
+                .collect();
+            percentiles(&durations).map(|p| p.p50_ms)
+        };
+        rows.push(BaselineComparisonRow {
+            stock_p50_ms: p50_for(BaselineVariantKind::Stock),
+            layer0_p50_ms: p50_for(BaselineVariantKind::Layer0),
+            sccache_p50_ms: p50_for(BaselineVariantKind::Sccache),
+            current_rch_p50_ms: p50_for(BaselineVariantKind::CurrentRch),
+            repo,
+            scenario,
+        });
+    }
+
+    BaselineComparisonSummary {
+        repos,
+        variants_present,
+        rows,
+        malformed_lines,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,5 +1115,34 @@ mod tests {
         assert!(!expired_verdict.passed);
         let parsed: serde_json::Value = serde_json::from_str(&expired_verdict.to_ndjson()).unwrap();
         assert_eq!(parsed["passed"], false);
+    }
+
+    #[test]
+    fn b009_parses_and_compares_stock_layer0_sccache_and_current_rch_baselines() {
+        let baseline_ndjson =
+            include_str!("../../benchmarks/baselines/hetzner2-nightly-09ee43b2d.ndjson");
+        let (records, malformed) = parse_layer0_baseline_ndjson(baseline_ndjson);
+        assert_eq!(malformed, 0, "canonical baseline NDJSON must parse cleanly");
+        assert!(
+            records.len() >= 34,
+            "expected at least 34 baseline records across two repos and four variants"
+        );
+        let summary = summarize_baseline_comparison(&records, malformed);
+        assert!(
+            summary.satisfies_b009(2),
+            "canonical baseline file must cover >=2 repos and all 4 B009 variants: {summary:?}"
+        );
+        assert!(summary.repos.contains("rch-workspace"));
+        assert!(summary.repos.contains("asupersync"));
+
+        let rch_cold_build = summary
+            .rows
+            .iter()
+            .find(|r| r.repo == "rch-workspace" && r.scenario == "cold-build")
+            .expect("rch-workspace cold-build row");
+        assert_eq!(rch_cold_build.stock_p50_ms, Some(242_194));
+        assert_eq!(rch_cold_build.layer0_p50_ms, Some(137_293));
+        assert_eq!(rch_cold_build.sccache_p50_ms, Some(216_686));
+        assert_eq!(rch_cold_build.current_rch_p50_ms, Some(184_910));
     }
 }

@@ -961,7 +961,7 @@ impl ResultKindTag {
 }
 
 /// Quarantine scope: distinct selection rules per scope (risk R51).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum QuarantineScope {
     /// One stored location is suspect.
     Location,
@@ -972,11 +972,24 @@ pub enum QuarantineScope {
 }
 
 impl QuarantineScope {
-    const fn as_str(self) -> &'static str {
+    /// Canonical SQL/wire scope string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Location => "location",
             Self::LogicalObject => "logical-object",
             Self::ActionEntry => "action-entry",
+        }
+    }
+
+    /// Parse a canonical scope string.
+    #[must_use]
+    pub fn from_str_name(value: &str) -> Option<Self> {
+        match value {
+            "location" => Some(Self::Location),
+            "logical-object" => Some(Self::LogicalObject),
+            "action-entry" => Some(Self::ActionEntry),
+            _ => None,
         }
     }
 }
@@ -1469,6 +1482,20 @@ pub trait RabsMetadataStore {
         subject: &str,
         reason: &str,
     ) -> Result<(), StoreError>;
+
+    /// Release a scoped quarantine row iff a verified repair receipt
+    /// (`kind = "rabs-quarantine-repair-v1"`, `subject`, `decision = repair_receipt_id`)
+    /// is recorded in `decision_receipts` (H012; risk R51). Returns `Ok(true)` when
+    /// a quarantine row was released, `Ok(false)` when no matching quarantine row
+    /// existed, or `Err(StoreError::QuarantineRequiresRepair)` when the repair
+    /// receipt is missing.
+    fn release_quarantine_with_receipt(
+        &mut self,
+        scope: QuarantineScope,
+        subject: &str,
+        repair_receipt_id: &str,
+        seq: u64,
+    ) -> Result<bool, StoreError>;
 
     /// Record a verification sample.
     fn record_verification_sample(
@@ -4229,6 +4256,77 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    fn release_quarantine_with_receipt(
+        &mut self,
+        scope: QuarantineScope,
+        subject: &str,
+        repair_receipt_id: &str,
+        seq: u64,
+    ) -> Result<bool, StoreError> {
+        if repair_receipt_id.trim().is_empty() {
+            return Err(StoreError::QuarantineRequiresRepair);
+        }
+        let seq =
+            i64::try_from(seq).map_err(|_| StoreError::Corruption("seq out of range".into()))?;
+        let scope_str = scope.as_str().to_owned();
+        let subject = subject.to_owned();
+        let receipt_id = repair_receipt_id.to_owned();
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT 1 FROM quarantines WHERE scope = ?1 AND subject = ?2 LIMIT 1",
+                &[
+                    SqlValue::Text(scope_str.clone()),
+                    SqlValue::Text(subject.clone()),
+                ],
+            )?;
+            if existing.is_empty() {
+                return Ok(false);
+            }
+            let repair = engine.query(
+                "SELECT 1 FROM decision_receipts \
+                 WHERE kind = 'rabs-quarantine-repair-v1' AND subject = ?1 AND decision = ?2 LIMIT 1",
+                &[
+                    SqlValue::Text(subject.clone()),
+                    SqlValue::Text(receipt_id.clone()),
+                ],
+            )?;
+            if repair.is_empty() {
+                return Err(StoreError::QuarantineRequiresRepair);
+            }
+            engine.execute(
+                "DELETE FROM quarantines WHERE scope = ?1 AND subject = ?2",
+                &[
+                    SqlValue::Text(scope_str.clone()),
+                    SqlValue::Text(subject.clone()),
+                ],
+            )?;
+            engine.execute(
+                "DELETE FROM serving_blocking_quarantines WHERE scope = ?1 AND subject = ?2",
+                &[
+                    SqlValue::Text(scope_str.clone()),
+                    SqlValue::Text(subject.clone()),
+                ],
+            )?;
+            if scope == QuarantineScope::Location {
+                engine.execute(
+                    "UPDATE object_locations SET quarantined = 0 WHERE store_path = ?1",
+                    &[SqlValue::Text(subject.clone())],
+                )?;
+            }
+            engine.execute(
+                "INSERT OR REPLACE INTO decision_receipts (kind, subject, seq, decision, reason) \
+                 VALUES ('rabs-quarantine-release-v1', ?1, ?2, ?3, ?4)",
+                &[
+                    SqlValue::Text(subject),
+                    SqlValue::Int(seq),
+                    SqlValue::Text(receipt_id),
+                    SqlValue::Text(scope_str),
+                ],
+            )?;
+            Ok(true)
         })
     }
 
