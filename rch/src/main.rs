@@ -2421,6 +2421,19 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                         min_seq_lag,
                     },
             } => commands::rabs_gc::run_doctor(cas_root, min_seq_lag, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::Verify { cas_root },
+            } => commands::rabs_gc::run_verify(cas_root, &ctx).await,
+            Commands::Rabs {
+                action:
+                    commands::rabs_gc::RabsCommand::Locate {
+                        object_key,
+                        cas_root,
+                    },
+            } => commands::rabs_gc::run_locate(object_key, cas_root, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::Quarantine { action },
+            } => commands::rabs_gc::run_quarantine(action, &ctx).await,
             Commands::Why { action } => commands::why::run(action, &ctx).await,
             Commands::Rabs {
                 action:
