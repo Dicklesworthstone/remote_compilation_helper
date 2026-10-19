@@ -4638,62 +4638,63 @@ impl TransferPipeline {
         // SSH ConnectTimeout and the in-loop `command_timeout`, which kill the
         // local `ssh` on expiry; a detached `cargo.exe`/`rustc.exe` can still
         // outlive the channel close. Acceptable for v1 single-Windows-worker use.
-        let execution_command =
-            if let Some(build_id) = self.build_id.filter(|_| !self.worker_platform.is_windows()) {
-                let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
-                let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
-                let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
-                let escaped_run_dir = escape(Cow::from(remote_run_dir));
-                // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
-                // `timeout --foreground` only signals its direct child, so a livelocked
-                // test binary (and its fixtures) that the test harness spawned survive
-                // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
-                // the raw command and arm an in-session watchdog that, at the wall-clock
-                // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
-                // daemon's stuck-detector kills (`cancellation.rs`). One group, both
-                // reapers, entire tree. Killing the group includes the leader `sh -c`,
-                // but that is a child of the ssh `sh -s`, so the outer shell still
-                // reports 137 (128+SIGKILL) for clean timeout exit semantics.
-                let escaped_command = escape(Cow::from(colored_command.as_str()));
-                // The watchdog publishes boot UUID + leader start ticks + build ID
-                // before launching the workload, so daemon recovery rejects an
-                // observed reboot or reused leader before signalling. An abnormal
-                // external leader exit can still race the final proc read and kill.
-                // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
-                // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
-                // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
-                // `-PGID` form works in both dash and bash.
-                // The timer detaches standard I/O and its sleep closes fd 3.
-                // Normal completion stops the timer and waits while it reaps
-                // that sleep, leaving neither an open SSH pipe nor an orphan
-                // group member that would obstruct later recovery. Only the
-                // timer retains fd 3 for its deadline marker before group kill.
-                let watchdog = escape(Cow::Owned(remote_build_watchdog_script()));
+        let execution_command = if let Some(build_id) =
+            self.build_id.filter(|_| !self.worker_platform.is_windows())
+        {
+            let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
+            let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
+            let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
+            let escaped_run_dir = escape(Cow::from(remote_run_dir));
+            // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
+            // `timeout --foreground` only signals its direct child, so a livelocked
+            // test binary (and its fixtures) that the test harness spawned survive
+            // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
+            // the raw command and arm an in-session watchdog that, at the wall-clock
+            // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
+            // daemon's stuck-detector kills (`cancellation.rs`). One group, both
+            // reapers, entire tree. Killing the group includes the leader `sh -c`,
+            // but that is a child of the ssh `sh -s`, so the outer shell still
+            // reports 137 (128+SIGKILL) for clean timeout exit semantics.
+            let escaped_command = escape(Cow::from(colored_command.as_str()));
+            // The watchdog publishes boot UUID + leader start ticks + build ID
+            // before launching the workload, so daemon recovery rejects an
+            // observed reboot or reused leader before signalling. An abnormal
+            // external leader exit can still race the final proc read and kill.
+            // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
+            // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
+            // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
+            // `-PGID` form works in both dash and bash.
+            // The timer detaches standard I/O and its sleep closes fd 3.
+            // Normal completion stops the timer and waits while it reaps
+            // that sleep, leaving neither an open SSH pipe nor an orphan
+            // group member that would obstruct later recovery. Only the
+            // timer retains fd 3 for its deadline marker before group kill.
+            let watchdog = escape(Cow::Owned(remote_build_watchdog_script()));
 
-                // Darwin provides setsid(2), but not setsid(1). Use the same
-                // isolated Python syscall/exec path as the owned-group child;
-                // do not bypass session creation or the supervisor's witnesses.
-                format!(
-                    "case \"$(uname -s)\" in \
+            // Darwin provides setsid(2), but not setsid(1). Use the same
+            // isolated Python syscall/exec path as the owned-group child;
+            // do not bypass session creation or the supervisor's witnesses.
+            format!(
+                "case \"$(uname -s)\" in \
 Darwin) set -- python3 -I -S -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])';; \
 *) set -- setsid;; esac; \
 if ! command -v \"$1\" >/dev/null 2>&1; then \
 printf '\\n%s\\n' {} >&2; exit 125; fi; \
 mkdir -p {} && rm -f {} && \
 \"$@\" sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
-                    self.remote_process_setup_marker(),
-                    escaped_run_dir,
-                    escaped_pgid_file,
-                    watchdog,
-                    escaped_pgid_file,
-                    external_timeout_secs,
-                    self.deadline_marker,
-                    build_id,
-                    escaped_command,
-                )
-            } else {
-                timeout_wrapped_command
-            };
+                self.remote_process_setup_marker(),
+                escaped_run_dir,
+                escaped_pgid_file,
+                watchdog,
+                escaped_pgid_file,
+                external_timeout_secs,
+                self.deadline_marker,
+                build_id,
+                escaped_command,
+            )
+        } else {
+            timeout_wrapped_command
+        };
 
         // Per-job rustc cap (issue #49). Exported in the outer session so
         // explicit worker/command/project settings all still win; see

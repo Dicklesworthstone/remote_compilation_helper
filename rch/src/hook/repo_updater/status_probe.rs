@@ -34,9 +34,7 @@ fn request(roots: &[PathBuf]) -> Result<Vec<u8>> {
     for root in roots {
         let bytes = root.as_os_str().as_bytes();
         ensure!(
-            bytes.first() == Some(&b'/')
-                && bytes.len() <= MAX_PATH_BYTES
-                && !bytes.contains(&0),
+            bytes.first() == Some(&b'/') && bytes.len() <= MAX_PATH_BYTES && !bytes.contains(&0),
             "repository status requires a bounded, absolute non-NUL path"
         );
         for byte in bytes {
@@ -117,11 +115,19 @@ fn local_command() -> tokio::process::Command {
     command
 }
 
-async fn bounded_stream(reader: impl AsyncRead + Unpin, maximum: usize) -> std::io::Result<Vec<u8>> {
+async fn bounded_stream(
+    reader: impl AsyncRead + Unpin,
+    maximum: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader.take((maximum + 1) as u64).read_to_end(&mut bytes).await?;
+    reader
+        .take((maximum + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
     if bytes.len() > maximum {
-        return Err(std::io::Error::other("repository status stream exceeded its bound"));
+        return Err(std::io::Error::other(
+            "repository status stream exceeded its bound",
+        ));
     }
     Ok(bytes)
 }
@@ -159,7 +165,10 @@ async fn local_batch(
             bounded_stream(diagnostic, MAX_RESPONSE_BYTES),
         )?;
         let status = child.wait().await?;
-        ensure!(status.success(), "local repository status census failed: {status}");
+        ensure!(
+            status.success(),
+            "local repository status census failed: {status}"
+        );
         response(&bytes, roots.len())
     };
     tokio::time::timeout(allowance, exchange)
@@ -213,7 +222,10 @@ pub(super) async fn remote(
                 // The legacy unowned diagnostic path may skip repo_updater and
                 // use direct synchronization, but cannot label partial data clean.
                 rejected.extend(batch.iter().map(|root| {
-                    (root.clone(), format!("repository status unavailable: {error}"))
+                    (
+                        root.clone(),
+                        format!("repository status unavailable: {error}"),
+                    )
                 }));
             }
         }
@@ -243,10 +255,18 @@ mod tests {
     #[test]
     fn complete_response_preserves_every_input_in_order() {
         assert_eq!(
-            response(b"RCH_REPO_STATUS_V1\n0 clean\n1 dirty\n2 unavailable\nRCH_REPO_STATUS_END 3\n", 3).unwrap(),
+            response(
+                b"RCH_REPO_STATUS_V1\n0 clean\n1 dirty\n2 unavailable\nRCH_REPO_STATUS_END 3\n",
+                3
+            )
+            .unwrap(),
             [Status::Clean, Status::Dirty, Status::Unavailable]
         );
-        assert!(response(b"RCH_REPO_STATUS_V1\nRCH_REPO_STATUS_END 0\n", 0).unwrap().is_empty());
+        assert!(
+            response(b"RCH_REPO_STATUS_V1\nRCH_REPO_STATUS_END 0\n", 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -271,7 +291,10 @@ mod tests {
     #[test]
     fn unavailable_rows_block_the_adapter_just_like_dirty_rows() {
         let roots = ["/a", "/b", "/c"].map(PathBuf::from);
-        let rejected = unsuitable(&roots, vec![Status::Clean, Status::Unavailable, Status::Dirty]);
+        let rejected = unsuitable(
+            &roots,
+            vec![Status::Clean, Status::Unavailable, Status::Dirty],
+        );
         assert_eq!(rejected.len(), 2);
         assert_eq!(rejected[0].0, roots[1]);
         assert_eq!(rejected[1], (roots[2].clone(), "dirty".to_string()));
@@ -286,7 +309,11 @@ mod tests {
             .arg(script)
             .output()
             .expect("Python 3 is required by the native repository status regressions");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]
@@ -298,9 +325,16 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let path = std::env::var_os("PATH").unwrap_or_default();
         let init = tokio::process::Command::new("git")
-            .arg("init").arg("-q").arg(&root)
-            .env_clear().env("PATH", &path).env("HOME", &home)
-            .kill_on_drop(true).status().await.unwrap();
+            .arg("init")
+            .arg("-q")
+            .arg(&root)
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", &home)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .unwrap();
         assert!(init.success());
         let member = root.join("member");
         std::fs::create_dir(&member).unwrap();
@@ -311,7 +345,9 @@ mod tests {
             }
             let mut command = local_command();
             command.env_clear().env("PATH", &path).env("HOME", &home);
-            let states = local_batch(command, &roots, Duration::from_secs(5)).await.unwrap();
+            let states = local_batch(command, &roots, Duration::from_secs(5))
+                .await
+                .unwrap();
             let state = if dirty { Status::Dirty } else { Status::Clean };
             assert_eq!(states, [state, state, Status::Unavailable]);
             let rejected = unsuitable(&roots, states);
@@ -331,7 +367,12 @@ mod tests {
         ] {
             let mut command = tokio::process::Command::new("sh");
             command.arg("-c").arg(script);
-            let result = local_batch(command, &[PathBuf::from("/fixture")], Duration::from_secs(2)).await;
+            let result = local_batch(
+                command,
+                &[PathBuf::from("/fixture")],
+                Duration::from_secs(2),
+            )
+            .await;
             assert!(result.is_err(), "{script}");
         }
     }
@@ -346,14 +387,21 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             local_batch(command, &roots, Duration::from_millis(50)),
-        ).await.expect("local census escaped its deadline");
+        )
+        .await
+        .expect("local census escaped its deadline");
         assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
     }
 
     #[tokio::test]
     async fn local_pipeline_refuses_invalid_roots_before_spawning() {
         let command = tokio::process::Command::new("/no-such-rch-status-fixture");
-        let result = local_batch(command, &[PathBuf::from("relative")], Duration::from_secs(1)).await;
+        let result = local_batch(
+            command,
+            &[PathBuf::from("relative")],
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(format!("{:#}", result.unwrap_err()).contains("absolute"));
     }
 }
