@@ -130,8 +130,9 @@ pub struct GcWorld {
     /// Whether reconciliation has run since the provisional state was
     /// written (gates aggressive provisional eviction).
     pub reconciliation_complete: bool,
-    /// Maximum locations one run may reclaim (stops before foreground IO
-    /// collapse).
+    /// Maximum candidates planned or attempted in one unlink pass. Missing
+    /// locations consume an attempt too. Snapshot scans and protection-rescue
+    /// writes are not bounded by this candidate-removal budget.
     pub reclaim_budget: usize,
 }
 
@@ -347,17 +348,23 @@ pub fn execute_gc(
     })
 }
 
-/// One unlink pass's outcome (H022): what was unlinked after the final
-/// recheck, and what the recheck RESCUED.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One metadata unlink pass's outcome (H022), distinguishing actual removals
+/// from protection rescues, missing rows, and budget-deferred candidates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnlinkReceipt {
     /// Tombstoned locations whose grace elapsed and whose final recheck
-    /// confirmed no protection: unlinked.
+    /// confirmed no protection: the metadata location was actually removed.
     pub unlinked: Vec<LocationRef>,
     /// Tombstoned locations the final recheck found protected again (a
     /// reader, pin, or edge appeared during grace): tombstone cancelled,
     /// location kept.
     pub rescued: Vec<(LocationRef, ProtectionReason)>,
+    /// Unprotected locations already absent when retirement was attempted.
+    /// Their stale tombstones were consumed, but no removal is claimed.
+    pub missing: Vec<LocationRef>,
+    /// Unprotected candidates beyond this pass's retirement-attempt budget.
+    /// Their locations and original tombstone deadlines are untouched.
+    pub deferred: Vec<LocationRef>,
 }
 
 /// H022 phase 1 — MARK: tombstone every planned location. Nothing is
@@ -391,6 +398,15 @@ pub fn mark_plan(
 /// unlink: such a location is rescued (tombstone cancelled), never
 /// deleted.
 ///
+/// At most `world.reclaim_budget` unprotected locations are attempted, across
+/// ALL due tombstones, including those accumulated by earlier mark passes.
+/// Missing rows consume an attempt so stale tombstones cannot buy unbounded
+/// deletion work. Protected locations are still rescued after the budget is
+/// exhausted, including at zero budget; other tombstones retain their original
+/// grace deadline for a later pass. Scans and rescue writes remain unbounded.
+/// The caller must exclude concurrent metadata writers through this entire
+/// pass, just as for [`execute_gc`]. No filesystem bytes are unlinked here.
+///
 /// # Errors
 /// Store errors; rescues and unlinks already performed stand.
 pub fn unlink_due(
@@ -400,15 +416,15 @@ pub fn unlink_due(
     now_seq: u64,
 ) -> Result<UnlinkReceipt, StoreError> {
     let due = store.due_gc_tombstones(now_seq)?;
-    let mut unlinked = Vec::new();
-    let mut rescued = Vec::new();
+    let mut receipt = UnlinkReceipt::default();
     if due.is_empty() {
-        return Ok(UnlinkReceipt { unlinked, rescued });
+        return Ok(receipt);
     }
     // The FINAL recheck runs on a fresh consistent snapshot, not the one
     // the plan was computed from.
     let snapshot = store.gc_snapshot(now_seq)?;
     let preserved = preserved_set(&snapshot);
+    let mut attempted = 0;
     for tombstone in due {
         let location = LocationRef {
             object_key: tombstone.object_key.clone(),
@@ -422,16 +438,25 @@ pub fn unlink_due(
         match protection_for(&preserved, world, mode, &tombstone.object_key, policy) {
             Some(reason) => {
                 store.remove_gc_tombstone(&tombstone.object_key, &tombstone.store_path)?;
-                rescued.push((location, reason));
+                receipt.rescued.push((location, reason));
+            }
+            None if attempted >= world.reclaim_budget => {
+                receipt.deferred.push(location);
             }
             None => {
-                store.remove_location_by_key(&tombstone.object_key, &tombstone.store_path)?;
+                attempted += 1;
+                let removed =
+                    store.remove_location_by_key(&tombstone.object_key, &tombstone.store_path)?;
                 store.remove_gc_tombstone(&tombstone.object_key, &tombstone.store_path)?;
-                unlinked.push(location);
+                if removed {
+                    receipt.unlinked.push(location);
+                } else {
+                    receipt.missing.push(location);
+                }
             }
         }
     }
-    Ok(UnlinkReceipt { unlinked, rescued })
+    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -1001,6 +1026,211 @@ mod tests {
             assert!(located.contains(&key(tag)), "rescued object kept its copy");
         }
         assert!(store.due_gc_tombstones(u64::MAX).unwrap().is_empty());
+    }
+
+    fn budget_location(tag: u8) -> LocationRef {
+        LocationRef {
+            object_key: key(tag),
+            store_path: format!("/cas/{tag}"),
+        }
+    }
+
+    fn install_unlink_backlog(store: &mut dyn RabsMetadataStore, mode: GcMode) {
+        let mut w = GcWorld {
+            reconciliation_complete: true,
+            reclaim_budget: 2,
+            ..GcWorld::default()
+        };
+        // Two real, separately budgeted mark passes accumulate four due
+        // tombstones. Temporary transfer protections separate the batches.
+        for (first, seq) in [(1_u8, 100_u64), (3, 101)] {
+            for tag in first..first + 2 {
+                store.record_object(&digest(tag), 64).unwrap();
+                store
+                    .add_location(&digest(tag), &format!("/cas/{tag}"), Some(1), "raw", true)
+                    .unwrap();
+            }
+            let plan = plan_gc(store, &w, mode, seq).unwrap();
+            assert_eq!(
+                plan.reclaim,
+                vec![budget_location(first), budget_location(first + 1)]
+            );
+            mark_plan(store, &plan, 10).unwrap();
+            w.protections
+                .transfers
+                .extend(plan.reclaim.iter().map(|location| location.object_key.clone()));
+        }
+        // Transfer owners have finished. One reader has since acquired the
+        // last object, and another copy disappeared independently of GC.
+        store
+            .create_pin(
+                44,
+                &digest(4),
+                "reader",
+                "materialization",
+                Some(100),
+                None,
+                false,
+                "late reader",
+            )
+            .unwrap();
+        assert!(store.remove_location_by_key(&key(2), "/cas/2").unwrap());
+        assert_eq!(store.due_gc_tombstones(111).unwrap().len(), 4);
+    }
+
+    fn defer_unlink_backlog(store: &mut dyn RabsMetadataStore, mode: GcMode) {
+        let receipt = unlink_due(store, &GcWorld::default(), mode, 111).unwrap();
+        assert!(receipt.unlinked.is_empty());
+        assert!(
+            receipt.missing.is_empty(),
+            "zero budget performs no retirement attempts"
+        );
+        assert_eq!(
+            receipt.rescued,
+            vec![(budget_location(4), ProtectionReason::PinnedOrReachable)]
+        );
+        assert_eq!(
+            receipt.deferred,
+            (1..=3).map(budget_location).collect::<Vec<_>>()
+        );
+        let due = store.due_gc_tombstones(111).unwrap();
+        assert_eq!(due.len(), 3);
+        for (row, tag) in due.iter().zip(1..=3) {
+            assert_eq!(row.object_key, key(tag));
+            assert_eq!(row.store_path, format!("/cas/{tag}"));
+            assert_eq!(row.marked_seq, if tag == 3 { 101 } else { 100 });
+            assert_eq!(row.grace_until_seq, if tag == 3 { 111 } else { 110 });
+        }
+        for tag in [1, 3, 4] {
+            assert!(store.object_located(&digest(tag)).unwrap());
+        }
+        assert!(!store.object_located(&digest(2)).unwrap());
+    }
+
+    fn drain_unlink_backlog(store: &mut dyn RabsMetadataStore, mode: GcMode) {
+        let w = GcWorld {
+            reclaim_budget: 1,
+            ..GcWorld::default()
+        };
+        for tag in 1..=3 {
+            let receipt = unlink_due(store, &w, mode, 111).unwrap();
+            assert!(receipt.rescued.is_empty());
+            assert_eq!(
+                receipt.deferred,
+                (tag + 1..=3).map(budget_location).collect::<Vec<_>>()
+            );
+            if tag == 2 {
+                assert!(
+                    receipt.unlinked.is_empty(),
+                    "a missing copy is not a removal"
+                );
+                assert_eq!(receipt.missing, vec![budget_location(tag)]);
+            } else {
+                assert_eq!(receipt.unlinked, vec![budget_location(tag)]);
+                assert!(receipt.missing.is_empty());
+            }
+            assert_eq!(
+                store.due_gc_tombstones(111).unwrap().len(),
+                usize::from(3 - tag)
+            );
+            assert!(store.object_located(&digest(4)).unwrap());
+        }
+        assert_eq!(
+            unlink_due(store, &w, mode, 111).unwrap(),
+            UnlinkReceipt::default()
+        );
+
+        // Rescue cancelled the old grace. A later explicit release needs a
+        // new mark and grace, while budget deferral above needed neither.
+        store.release_pin(44, "reader").unwrap();
+        let plan = plan_gc(store, &w, mode, 200).unwrap();
+        assert_eq!(plan.reclaim, vec![budget_location(4)]);
+        mark_plan(store, &plan, 10).unwrap();
+        assert_eq!(
+            unlink_due(store, &w, mode, 209).unwrap(),
+            UnlinkReceipt::default()
+        );
+        let receipt = unlink_due(store, &w, mode, 210).unwrap();
+        assert_eq!(receipt.unlinked, vec![budget_location(4)]);
+        assert!(
+            receipt.rescued.is_empty() && receipt.missing.is_empty() && receipt.deferred.is_empty()
+        );
+        assert!(store.reconciliation_scan().unwrap().is_empty());
+        assert!(store.due_gc_tombstones(u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn h022_unlink_budget_bounds_backlog_attempts_and_missing_receipts() {
+        for mode in [GcMode::Normal, GcMode::Emergency] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            install_unlink_backlog(&mut store, mode);
+            defer_unlink_backlog(&mut store, mode);
+            drain_unlink_backlog(&mut store, mode);
+        }
+    }
+
+    #[test]
+    fn h022_protection_rescues_do_not_spend_retirement_budget() {
+        for mode in [GcMode::Normal, GcMode::Emergency] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            install_unlink_backlog(&mut store, mode);
+            store
+                .create_pin(45, &digest(1), "reader", "transfer", None, None, false, "hold")
+                .unwrap();
+            let w = GcWorld {
+                reclaim_budget: 1,
+                ..GcWorld::default()
+            };
+            let receipt = unlink_due(&mut store, &w, mode, 111).unwrap();
+            assert!(receipt.unlinked.is_empty());
+            assert_eq!(receipt.missing, vec![budget_location(2)]);
+            assert_eq!(receipt.deferred, vec![budget_location(3)]);
+            assert_eq!(
+                receipt.rescued,
+                vec![
+                    (budget_location(1), ProtectionReason::PinnedOrReachable),
+                    (budget_location(4), ProtectionReason::PinnedOrReachable),
+                ]
+            );
+            let next = unlink_due(&mut store, &w, mode, 111).unwrap();
+            assert_eq!(next.unlinked, vec![budget_location(3)]);
+            assert!(next.rescued.is_empty() && next.missing.is_empty() && next.deferred.is_empty());
+            assert!(store.object_located(&digest(1)).unwrap());
+            assert!(store.object_located(&digest(4)).unwrap());
+            assert!(store.due_gc_tombstones(u64::MAX).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn h022_budget_deferred_tombstones_survive_reopen_without_new_grace() {
+        let path = fresh_path("unlink-budget-reopen");
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        install_unlink_backlog(&mut store, GcMode::Normal);
+        defer_unlink_backlog(&mut store, GcMode::Normal);
+        drop(store);
+        let mut reopened = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        drain_unlink_backlog(&mut reopened, GcMode::Normal);
+    }
+
+    #[test]
+    fn h022_budgeted_unlink_differential_reference_vs_frankensqlite() {
+        fn scenario(store: &mut dyn RabsMetadataStore, mode: GcMode) -> Vec<String> {
+            install_unlink_backlog(store, mode);
+            defer_unlink_backlog(store, mode);
+            drain_unlink_backlog(store, mode);
+            store.differential_snapshot().unwrap()
+        }
+        for mode in [GcMode::Normal, GcMode::Emergency] {
+            let mut reference =
+                SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("budget-ref")).unwrap())
+                    .unwrap();
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("budget-fsq")).unwrap())
+                    .unwrap();
+            assert_eq!(scenario(&mut reference, mode), scenario(&mut candidate, mode));
+        }
     }
 
     /// Deterministic splitmix-style generator: the property suite must
