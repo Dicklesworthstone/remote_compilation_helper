@@ -20,7 +20,7 @@ use crate::coord::remote_dependency_transport::{
 use crate::coord::secure_worker_delivery::OperationCancellation;
 use crate::coord::source_delivery::SourceUpload;
 use crate::coord::worker_delivery::{Delivery, toolchain_identity_value};
-use crate::edge::live_facts::PACKAGE_ROOT;
+use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT};
 use rabs_key::live_dependency::remote::{
     remote_dependency_key, remote_dependency_shape, remote_empty_loader_directories,
 };
@@ -190,6 +190,7 @@ impl RemoteDependencies {
         guard: &ToolchainGuard,
         directories: &[DependencyDirectoryFact],
         inputs: &ActionInputManifest,
+        build_script_output: Option<&[u8]>,
         argv: &[String],
     ) -> Result<(LiveDependencyKey, RemoteInvocation), String> {
         if argv.first().map(String::as_str) != Some(plan.compiler.as_str()) {
@@ -221,6 +222,7 @@ impl RemoteDependencies {
             toolchain,
             directories,
             inputs,
+            build_script_output,
             visible_root,
             &retained.image.identity().sha256,
             &runtime,
@@ -240,7 +242,7 @@ impl RemoteDependencies {
                 prefix: format!("dependencies/{index:04}"),
             })
             .collect();
-        let context = DependencyExecContext::new_with_artifacts(
+        let context = DependencyExecContext::new_with_generated_artifacts(
             plan.source_root.clone(),
             plan.cwd.clone(),
             visible_root.to_owned(),
@@ -249,6 +251,7 @@ impl RemoteDependencies {
             plan.dependency_dirs.clone(),
             loader_witness.directories().to_vec(),
             artifact_roots,
+            plan.generated_root.clone(),
             plan.execution_env.clone(),
             runtime_bytes,
         )
@@ -461,13 +464,30 @@ impl PendingRemote {
         // checks every byte digest and both inventory fences; the upload then
         // owns these bytes without reopening the caller's mutable target tree.
         let dependency_artifacts = request.dependencies.retained_artifacts().map_err(settled)?;
-        let upload = SourceUpload::from_snapshot(
+        let mut upload = SourceUpload::from_snapshot(
             Arc::clone(&request.package.snapshot),
             PACKAGE_ROOT,
             &paths,
         )
-        .and_then(|upload| upload.with_dependency_artifacts(dependency_artifacts))
         .map_err(|error| settled(error.to_string()))?;
+        if request.plan.generated_root.is_some() {
+            let generated_paths = request
+                .package
+                .generated_files
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect::<Vec<_>>();
+            upload = upload
+                .with_generated_snapshot(
+                    Arc::clone(&request.package.snapshot),
+                    GENERATED_ROOT,
+                    &generated_paths,
+                )
+                .map_err(|error| settled(format!("prepare generated inputs: {error}")))?;
+        }
+        let upload = upload
+            .with_dependency_artifacts(dependency_artifacts)
+            .map_err(|error| settled(error.to_string()))?;
         verify_request(&request).map_err(settled)?;
         // The worker persists a request-id high-water mark. The admission owner
         // durably allocates before sending; random ids fail on ordinary reuse.
@@ -639,6 +659,7 @@ fn context_value(context: &DependencyExecContext) -> Value {
     json!({
         "version":DEPENDENCY_CONTEXT_VERSION,
         "source_root":context.source_root(), "cwd":context.cwd(),
+        "generated_root":context.generated_root(),
         "toolchain_root":context.toolchain_root(), "compiler":context.compiler(),
         "out_dir":context.out_dir(), "dependency_dirs":context.dependency_dirs(),
         "loader_dirs":context.loader_dirs(),

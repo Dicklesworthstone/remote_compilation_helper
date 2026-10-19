@@ -393,7 +393,7 @@ fn wait_dependency_execution(
 }
 
 /// A real rustc invocation, retained source owner, pinned toolchain lease,
-/// private output capture and the dependency-exec-v4 alias namespace. The sealed
+/// private output capture and the dependency-exec-v5 alias namespace. The sealed
 /// source bundle uses package/ while rustc retains its original source paths.
 /// This exercises the worker executor; authenticated transport is covered by
 /// its session tests.
@@ -652,6 +652,18 @@ pub const INCLUDED: &str = include_str!("message.txt");
 /// receive identical rustc arguments; only private backing paths differ.
 #[test]
 fn real_dependency_rustc_reads_shared_output_metadata_dag() {
+    dependency_metadata_dag(false);
+}
+
+/// Captured Cargo OUT_DIR files must remain readable beside shared dependency
+/// inputs, including beneath a private loader-parent mount. Both compilers use
+/// the same generated paths and environment, and their actual outputs agree.
+#[test]
+fn real_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag() {
+    dependency_metadata_dag(true);
+}
+
+fn dependency_metadata_dag(with_generated: bool) {
     use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
     use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
     use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceFile, SourceManifest};
@@ -696,12 +708,19 @@ fn real_dependency_rustc_reads_shared_output_metadata_dag() {
     .unwrap();
     // Top has no direct --extern for leaf. Resolving the field on Token and
     // its public return type requires the transitive crate metadata.
-    let top_source = br#"pub fn answer() -> u32 { dag_middle::token().0 }
+    let mut top_source = br#"pub fn answer() -> u32 { dag_middle::token().0 }
 pub fn token() -> dag_middle::Token { dag_middle::token() }
 pub const FLAVOR: &str = env!("SHARED_DAG_FLAVOR");
 pub const SOURCE: &str = file!();
-"#;
-    std::fs::write(source.path().join("src/lib.rs"), top_source).unwrap();
+"#
+    .to_vec();
+    let generated_root = output_owner.path().join("target/debug/build/dag_top/out");
+    let generated_source = b"pub const GENERATED_VALUE: u32 = 73;\npub const GENERATED_FLAVOR: &str = env!(\"BUILD_SCRIPT_FLAVOR\");\npub const GENERATED_SOURCE: &str = file!();\n";
+    if with_generated {
+        std::fs::create_dir_all(generated_root.join("nested")).unwrap();
+        top_source.extend_from_slice(b"include!(concat!(env!(\"OUT_DIR\"), \"/nested/generated.rs\"));\npub const FROM_GENERATOR: u32 = GENERATED_VALUE;\n");
+    }
+    std::fs::write(source.path().join("src/lib.rs"), &top_source).unwrap();
 
     for (name, file) in [("dag_leaf", "leaf.rs"), ("dag_middle", "middle.rs")] {
         let mut command = Command::new(&compiler);
@@ -762,7 +781,7 @@ pub const SOURCE: &str = file!();
             visible_out.clone(),
             "src/lib.rs".to_owned(),
         ];
-        let env = vec![
+        let mut env = vec![
             (
                 "CARGO_MANIFEST_DIR".to_owned(),
                 source.path().to_str().unwrap().to_owned(),
@@ -781,6 +800,17 @@ pub const SOURCE: &str = file!();
                 ),
             ),
         ];
+        if with_generated {
+            std::fs::write(generated_root.join("nested/generated.rs"), generated_source).unwrap();
+            env.push((
+                "OUT_DIR".to_owned(),
+                generated_root.to_str().unwrap().to_owned(),
+            ));
+            env.push((
+                "BUILD_SCRIPT_FLAVOR".to_owned(),
+                "captured Cargo directive".to_owned(),
+            ));
+        }
         let stock = Command::new(&compiler)
             .args(&args)
             .env_clear()
@@ -802,7 +832,7 @@ pub const SOURCE: &str = file!();
             .into_iter()
             .map(|name| (name.to_owned(), std::fs::read(out.join(name)).unwrap()))
             .collect();
-        let retained = BTreeMap::from([
+        let mut retained = BTreeMap::from([
             ("package/src/lib.rs".to_owned(), top_source.to_vec()),
             (
                 "dependencies/0000/libdag_leaf.rmeta".to_owned(),
@@ -821,6 +851,25 @@ pub const SOURCE: &str = file!();
                 std::fs::read(out.join("libdag_middle.rlib")).unwrap(),
             ),
         ]);
+        if with_generated {
+            retained.insert(
+                "generated/nested/generated.rs".to_owned(),
+                generated_source.to_vec(),
+            );
+            // This worker-boundary oracle proves retained bytes are mounted.
+            // The live coordinator separately refuses changed original inputs.
+            std::fs::write(
+                generated_root.join("nested/generated.rs"),
+                b"changed outside retained snapshot",
+            )
+            .unwrap();
+            let dep_info = std::str::from_utf8(&expected["dag_top.d"]).unwrap();
+            assert!(
+                dep_info.contains(generated_root.join("nested/generated.rs").to_str().unwrap())
+            );
+            assert!(dep_info.contains("# env-dep:OUT_DIR="));
+            assert!(dep_info.contains("# env-dep:BUILD_SCRIPT_FLAVOR=captured Cargo directive"));
+        }
         let manifest = SourceManifest::new(
             retained
                 .iter()
@@ -840,7 +889,7 @@ pub const SOURCE: &str = file!();
                 "executable":false,
             })).collect::<Vec<_>>(),
         });
-        let request_id = 426_000 + iteration as u64;
+        let request_id = 426_000 + if with_generated { 1_000 } else { 0 } + iteration as u64;
         let wire = json!({"kind":"canonical-exec", "request_id":request_id,
             "source_manifest":manifest_json});
         let mut transfer = SourceTransferState::default();
@@ -875,7 +924,7 @@ pub const SOURCE: &str = file!();
             )
             .unwrap();
         let source_owner = transfer.take_prepared(&wire).unwrap().unwrap();
-        let context = DependencyExecContext::new_with_artifacts(
+        let context = DependencyExecContext::new_with_generated_artifacts(
             source.path().to_str().unwrap().to_owned(),
             source.path().to_str().unwrap().to_owned(),
             toolchain.path().to_str().unwrap().to_owned(),
@@ -890,6 +939,7 @@ pub const SOURCE: &str = file!();
                 path: visible_out.clone(),
                 prefix: "dependencies/0000".to_owned(),
             }],
+            with_generated.then(|| generated_root.to_str().unwrap().to_owned()),
             env,
             cohort.bytes,
         )
@@ -998,6 +1048,18 @@ pub const SOURCE: &str = file!();
                 std::fs::read(out.join(name)).unwrap(),
                 *bytes,
                 "worker must not change original dependency {name}"
+            );
+        }
+        if with_generated {
+            assert!(
+                captured
+                    .read_chunk("generated/nested/generated.rs", 0, 1)
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(generated_root.join("nested/generated.rs")).unwrap(),
+                b"changed outside retained snapshot",
+                "worker must not write the original generated tree"
             );
         }
     }

@@ -113,17 +113,35 @@ A populated dependency search directory may be disjoint from the action's
 output directory or may be that same directory. In the shared case, the worker
 places each retained dependency file above its private writable output mount
 as a separate read-only bind. Bare toolchain externs, proc macros,
-build-script/generated inputs, native libraries and linker output remain local.
+native libraries and linker output remain local. Build scripts themselves
+also continue to run locally.
 These limits apply to each compiler action; they do not prevent Cargo from
 continuing with other units.
 
-The worker keeps the original source, output and toolchain path spellings and
-full compiler environment inside private mounts. The `dependency-exec-v4`
-context binds an explicit list of populated dependency roots to their
-first-use directory indices. A single sealed source transfer contains
-`package/<source-path>` and `dependencies/NNNN/<artifact-basename>`; only the
-declared package and retained candidate files may appear. The worker verifies
-that inventory and mounts each disjoint populated dependency root read-only.
+Metadata dependency actions may consume a previously completed Cargo build
+script's generated `OUT_DIR` tree. Admission binds the exact captured Cargo
+build-script output record, the original `OUT_DIR` path and every generated
+file, including an explicitly captured empty tree. A tree containing empty
+subdirectories stays on the local protocol because the current file transfer
+cannot reproduce those directories; a truly empty root is supported.
+Generated file contents or membership changes select a different key. The
+captured `rustc-env` directives must agree with the compiler environment. Every
+source or generated path reported by dep-info must belong to the captured
+input closure. This does not cache or replay
+the build script's execution.
+
+The worker keeps the original source, generated-input, output and toolchain
+path spellings and full compiler environment inside private mounts. The
+`dependency-exec-v5` context binds an explicit list of populated dependency
+roots to their first-use directory indices. A single sealed source transfer contains
+`package/<source-path>`, optional `generated/<generated-path>` and
+`dependencies/NNNN/<artifact-basename>`; only the declared package, generated
+and retained candidate files may appear. The worker verifies that inventory
+and mounts the generated tree and each disjoint populated dependency root
+read-only. A captured empty generated tree receives an exclusive empty
+backing. The generated root must match the original `OUT_DIR` environment
+value and cannot overlap source, output, dependency or toolchain roots.
+Generated input files never become returned compiler artifacts.
 For a shared input/output root, it rechecks the sealed input bytes and creates
 exclusive, empty mountpoint files in its owned output backing. A dependency
 name that collides with a declared output is refused before execution. The
@@ -136,9 +154,11 @@ child mountpoints. The original target tree is never mounted.
 
 Cargo's `target/debug/deps` and `target/debug` loader search paths still require
 fresh bounded checks excluding loadable files, symlinks and hardware-capability
-subdirectories. Unsupported loader paths or changing source, artifact,
-toolchain or runtime observations refuse remote admission or installation.
-The launcher requires a daemon advertising `dependency-exec-v4`; old execution
+subdirectories. A loader directory cannot be the generated root or lie inside
+it. Unsupported loader paths or changing source, generated input, build-script
+record, artifact, toolchain or runtime observations refuse remote admission
+or installation.
+The launcher requires a daemon advertising `dependency-exec-v5`; old execution
 contexts cannot admit new work. Already sealed results from older contexts can
 still resume against their exact saved request fingerprint.
 
@@ -190,7 +210,7 @@ receipt. Terminal events are associated with the crate that admitted their
 action key; one crate's successful execution cannot stand in for another's.
 Toolchain warmup may let different nodes start qualification on different runs.
 
-With `dependency-exec-v4`, this DAG oracle can use shared or disjoint dependency
+With `dependency-exec-v5`, this DAG oracle can use shared or disjoint dependency
 and output directories. It performs no compiler-argument rewriting and never
 treats local fallback as evidence of remote admission. It selects the installed
 Cargo and its matching compiler explicitly; ordinary rustup-based Cargo use
@@ -212,6 +232,20 @@ same paths, arguments and complete dependency inventory. It also checks that
 retained inputs and mountpoint files do not become output artifacts. It needs
 the supported Linux isolation environment, including a private `/proc` mount;
 an unsupported-host skip does not establish remote execution evidence.
+
+A related native fixture adds generated Rust input under Cargo's loader
+parent while retaining the shared metadata and archive dependency directory:
+
+```sh
+cargo test -p rabs-wkr --test process_tree_linux \
+  real_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag \
+  -- --nocapture
+```
+
+It compares stock rustc and worker metadata, dep-info and JSON diagnostics at
+the same paths, and checks that generated input files are not returned as
+outputs. This fixture has not yet been run on the supported isolation host;
+the new test alone does not establish execution evidence.
 
 ## Run one delivery
 
