@@ -165,6 +165,12 @@ RCH now includes a deterministic reliability stack for multi-repo and multi-work
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
+The installer also refreshes the `rch` agent skill in `~/.claude/skills/rch`
+and `~/.codex/skills/rch`. It leaves both directories untouched when `jsm`
+reports that it manages an installed `rch` skill, or when you pass
+`--skip-skill` (or set `RCH_SKIP_SKILL=1`, which suits unattended updaters).
+Skipping the skill never affects the binaries, the hook or the daemon.
+
 ### From Source
 
 ```bash

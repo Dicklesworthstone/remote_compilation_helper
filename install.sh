@@ -28,6 +28,7 @@
 #   RCH_SKIP_DAEMON_RESTART Skip rchd restart after install
 #   RCH_NO_COLOR        Disable colored output
 #   RCH_SKIP_DOCTOR     Skip post-install doctor check
+#   RCH_SKIP_SKILL      Set to 1 to leave the Claude/Codex rch skill untouched
 #   HTTP_PROXY          HTTP proxy URL
 #   HTTPS_PROXY         HTTPS proxy URL
 #   NO_PROXY            Comma-separated list of hosts to bypass proxy
@@ -1393,6 +1394,37 @@ _rch_skill_is_full() {
     return 1
 }
 
+# An `rch` skill package installed by jsm (jeffreys-skills.md) belongs to jsm,
+# and copying RCH's tree over it would leave a hybrid of the two distributions
+# (GH#93). Without jsm on PATH this is never true, so behaviour is unchanged.
+# If jsm is present but cannot list its packages, nothing is known about
+# ownership: warn and keep today's behaviour (install), and point at the
+# explicit opt-out, which never depends on this detection.
+_rch_skill_managed_by_jsm() {
+    command_exists jsm || return 1
+    local listing=""
+    local -a runner=()
+    if command_exists timeout; then
+        runner=(timeout 20)
+    elif command_exists gtimeout; then
+        runner=(gtimeout 20)
+    fi
+    # `jsm list --json` reads local installed state. JSM_OFFLINE=true keeps it
+    # off the network; unlike the --offline flag, a jsm release that predates
+    # offline mode ignores the variable instead of rejecting the command.
+    # Its output is {"skills": [{"name": "...", ...}], ...}.
+    # The `+` form keeps an empty runner safe under `set -u` on bash < 4.4.
+    if ! listing=$(JSM_OFFLINE=true ${runner[@]+"${runner[@]}"} jsm list --json 2>/dev/null); then
+        warn "jsm is installed but 'jsm list --json' failed; cannot tell whether jsm manages the rch skill. Set RCH_SKIP_SKILL=1 (or pass --skip-skill) to leave it untouched."
+        return 1
+    fi
+    # Match in-process, not with `printf | grep -q`: grep -q exits at the first
+    # match, and under pipefail the writer's SIGPIPE on a listing larger than a
+    # pipe buffer would turn that match into a miss.
+    local rch_entry='"name"[[:space:]]*:[[:space:]]*"rch"'
+    [[ "$listing" =~ $rch_entry ]]
+}
+
 install_skill() {
     local claude_dest="$HOME/.claude/skills/rch"
     local codex_dest="$HOME/.codex/skills/rch"
@@ -1440,6 +1472,18 @@ install_skill() {
         "scripts/validate-setup.sh"
         "scripts/worker_disk_triage.sh"
     )
+
+    # GH#93: decide before creating, downloading or copying anything, so a skip
+    # leaves both skill trees exactly as they were. Only the companion skill is
+    # skipped; binaries, hook and daemon setup are unaffected.
+    if [[ "${SKIP_SKILL:-false}" == "true" || "${RCH_SKIP_SKILL:-}" == "1" ]]; then
+        info "Skipping the RCH companion skill (RCH_SKIP_SKILL=1 / --skip-skill)"
+        return 0
+    fi
+    if _rch_skill_managed_by_jsm; then
+        info "Skipping the RCH companion skill: jsm manages the installed rch skill (update it with jsm)"
+        return 0
+    fi
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -3029,6 +3073,7 @@ Options:
   --verify-only        Verify existing installation
   --install-service    Enable background service without prompting
   --no-service         Skip systemd/launchd service setup
+  --skip-skill         Leave the Claude/Codex rch skill untouched (same as RCH_SKIP_SKILL=1)
   --uninstall          Remove RCH installation
   --no-gum             Disable Gum UI (use ANSI fallback)
   --yes                Skip confirmation prompts
@@ -3043,9 +3088,16 @@ Environment:
   RCH_SKIP_DOCTOR      Skip post-install doctor check
   RCH_SKIP_DAEMON_RESTART  Skip rchd restart after install
   RCH_SKIP_FLEET_SYNC  Skip worker deploy/health checks after install
+  RCH_SKIP_SKILL       Set to 1 to leave the Claude/Codex rch skill untouched
   HTTP_PROXY           HTTP proxy URL
   HTTPS_PROXY          HTTPS proxy URL
   NO_PROXY             Hosts to bypass proxy
+
+Companion skill:
+  The installer refreshes ~/.claude/skills/rch and ~/.codex/skills/rch. It skips
+  both when jsm reports that it manages an installed rch skill, or when
+  --skip-skill / RCH_SKIP_SKILL=1 is given. Skipping never affects binaries,
+  the hook or the daemon.
 
 Service Setup:
   On Linux:  systemd user service is offered during install (auto-accept in --easy-mode/--yes).
@@ -3086,6 +3138,7 @@ main() {
     INSTALL_SERVICE="false"
     ENABLE_SERVICE="true"
     YES="false"
+    SKIP_SKILL="false"
     OFFLINE_TARBALL=""
 
     while [[ $# -gt 0 ]]; do
@@ -3128,6 +3181,10 @@ main() {
                 ;;
             --no-service)
                 NO_SERVICE="true"
+                shift
+                ;;
+            --skip-skill)
+                SKIP_SKILL="true"
                 shift
                 ;;
             --uninstall)
