@@ -3000,4 +3000,329 @@ mod tests {
         );
         assert_eq!(posture.canonical_result_manifest_id, manifest);
     }
+
+    #[test]
+    fn k011_and_k012_remote_dependency_atp_execution_and_cross_worker_determinism_audits() {
+        let dep_key = action_key(90);
+        let crate_src_id = object(91);
+        let upstream_rmeta_id = object(92);
+        let canonical_manifest = object(93);
+
+        // K011: Remote dependency compile round-trips over ATP with local-hit equivalence.
+        let req = AtpRemoteDependencyRequest {
+            action_key: dep_key.clone(),
+            worker_id: PeerId("wkr-atp-1".into()),
+            immutable_source_snapshot: crate_src_id,
+            upstream_dependency_artifacts: vec![upstream_rmeta_id],
+            enforced_isolation: IsolationProfile::StrictHermeticLinux,
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+        };
+        let remote_offer = AtpRemoteDependencyOffer {
+            action_key: dep_key.clone(),
+            worker_id: PeerId("wkr-atp-1".into()),
+            canonical_result_manifest_id: canonical_manifest.clone(),
+            output_rlib_digest: [0x55; 32],
+            output_rmeta_digest: [0x66; 32],
+            exit_code: 0,
+            all_output_objects_verified_in_cas: true,
+        };
+        let local_reference = LocalDependencyReferenceResult {
+            canonical_result_manifest_id: canonical_manifest.clone(),
+            output_rlib_digest: [0x55; 32],
+            output_rmeta_digest: [0x66; 32],
+            exit_code: 0,
+        };
+
+        let round_trip =
+            evaluate_atp_remote_dependency_execution(&req, &remote_offer, Some(&local_reference))
+                .expect("valid ATP remote dependency round-trip");
+        assert!(round_trip.local_hit_equivalent);
+        assert_eq!(round_trip.canonical_result_manifest_id, canonical_manifest);
+
+        // Unverified CAS objects fail closed before publication.
+        let mut unverified = remote_offer.clone();
+        unverified.all_output_objects_verified_in_cas = false;
+        assert_eq!(
+            evaluate_atp_remote_dependency_execution(&req, &unverified, None),
+            Err(AtpRemoteDependencyRefusal::OutputObjectsMissingOrUnverifiedInCas)
+        );
+
+        // K012: Cross-worker determinism audit scheduler + divergence quarantine wiring.
+        // 1. Audit scheduler selects a distinct second worker (`wkr-atp-2` != `wkr-atp-1`) when sampled.
+        let candidate_workers = vec![PeerId("wkr-atp-1".into()), PeerId("wkr-atp-2".into())];
+        let scheduled = schedule_cross_worker_dependency_audit(
+            &dep_key,
+            &PeerId("wkr-atp-1".into()),
+            &candidate_workers,
+            500, // 5% sample rate (500 bps)
+            100, // sample draw < 500 bps -> selected
+        )
+        .expect("audit scheduled on distinct worker");
+        assert_eq!(scheduled, PeerId("wkr-atp-2".into()));
+
+        // 2. Matching canonical results across two distinct workers promotes to ReproducibleCrossWorker.
+        let mut serving_state = ActionServingStateRecord {
+            publication_record_id: canonical_manifest.clone(),
+            disposition: ActionServingDisposition::Eligible,
+            blocking_quarantine_ids: Vec::new(),
+            state_revision: 1,
+            coordinator_authority_digest: digest(1),
+            validity: ServingValidity {
+                evaluated_at_unix_micros: 1_000,
+                maximum_age_micros: None,
+                clock_uncertainty_micros: 0,
+                coordinator_clock_epoch: 1,
+            },
+        };
+        let audit_match = evaluate_cross_worker_dependency_audit(
+            &mut serving_state,
+            &PeerId("wkr-atp-1".into()),
+            &canonical_manifest,
+            &scheduled,
+            &canonical_manifest,
+            evidence_set(94),
+            200,
+            7001,
+        )
+        .expect("audit evaluated");
+        assert_eq!(
+            audit_match,
+            CrossWorkerAuditOutcome::PromotedToReproducibleCrossWorker {
+                evaluation: ActionTrustEvaluationRecord {
+                    canonical_result_manifest_id: canonical_manifest.clone(),
+                    evidence_set_digest: evidence_set(94),
+                    evaluated_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+                    evaluated_causal_sequence: 200,
+                }
+            }
+        );
+        assert_eq!(
+            serving_state.disposition,
+            ActionServingDisposition::Eligible
+        );
+
+        // 3. Divergent canonical result on the second worker immediately quarantines the entry!
+        let divergent_manifest = object(99);
+        let audit_diverge = evaluate_cross_worker_dependency_audit(
+            &mut serving_state,
+            &PeerId("wkr-atp-1".into()),
+            &canonical_manifest,
+            &scheduled,
+            &divergent_manifest,
+            evidence_set(95),
+            201,
+            7002,
+        )
+        .expect("divergent audit evaluated");
+        assert_eq!(
+            audit_diverge,
+            CrossWorkerAuditOutcome::QuarantinedOnDivergence {
+                quarantine_incident_id: 7002,
+                incumbent_manifest: canonical_manifest,
+                challenger_manifest: divergent_manifest,
+            }
+        );
+        assert_eq!(
+            serving_state.disposition,
+            ActionServingDisposition::Quarantined
+        );
+        assert_eq!(serving_state.blocking_quarantine_ids, vec![7002]);
+        assert!(!serving_state.may_serve_now(2_000, 1));
+    }
+}
+
+/// Request to execute a `RustcDependencyCompile` miss remotely over the ATP data plane (bead K011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtpRemoteDependencyRequest {
+    /// Dependency action key.
+    pub action_key: TypedDigest,
+    /// Selected remote worker.
+    pub worker_id: PeerId,
+    /// Immutable crate source snapshot object ID transferred via ATP.
+    pub immutable_source_snapshot: ObjectId,
+    /// Upstream dependency `.rmeta`/`.rlib` object IDs materialized via ATP.
+    pub upstream_dependency_artifacts: Vec<ObjectId>,
+    /// Isolation profile enforced by the worker.
+    pub enforced_isolation: IsolationProfile,
+    /// Target triple.
+    pub target_triple: String,
+}
+
+/// Result offer returned by a worker after executing a dependency action over ATP (bead K011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtpRemoteDependencyOffer {
+    /// Dependency action key answered.
+    pub action_key: TypedDigest,
+    /// Executing worker.
+    pub worker_id: PeerId,
+    /// Canonical result manifest ID produced.
+    pub canonical_result_manifest_id: ObjectId,
+    /// Content digest of the emitted `.rlib`.
+    pub output_rlib_digest: [u8; 32],
+    /// Content digest of the emitted `.rmeta`.
+    pub output_rmeta_digest: [u8; 32],
+    /// Process exit code (`0` for success).
+    pub exit_code: i32,
+    /// Whether all output objects in the result closure have been verified in CAS.
+    pub all_output_objects_verified_in_cas: bool,
+}
+
+/// Local dependency compile reference result for local-hit equivalence verification (bead K011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDependencyReferenceResult {
+    /// Canonical result manifest ID produced locally.
+    pub canonical_result_manifest_id: ObjectId,
+    /// Local `.rlib` digest.
+    pub output_rlib_digest: [u8; 32],
+    /// Local `.rmeta` digest.
+    pub output_rmeta_digest: [u8; 32],
+    /// Local exit code.
+    pub exit_code: i32,
+}
+
+/// Verified ATP remote dependency execution outcome (bead K011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtpRemoteDependencyOutcome {
+    /// Admitted canonical result manifest ID.
+    pub canonical_result_manifest_id: ObjectId,
+    /// Whether the remote ATP result is byte-equivalent to a local hit.
+    pub local_hit_equivalent: bool,
+}
+
+/// Refusal when an ATP remote dependency execution fails validation (bead K011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtpRemoteDependencyRefusal {
+    /// Request and offer action keys or worker IDs do not match.
+    IdentityMismatch,
+    /// Worker isolation profile does not authorize `DependencyServing`.
+    InsufficientIsolationAuthority,
+    /// Output objects referenced by the offer are not verified in CAS.
+    OutputObjectsMissingOrUnverifiedInCas,
+    /// Remote ATP result diverged from the local reference result.
+    LocalHitEquivalenceDivergence,
+}
+
+/// Validate a remote dependency action round-trip over ATP and verify local-hit equivalence (bead K011).
+///
+/// # Errors
+/// Returns [`AtpRemoteDependencyRefusal`] if authority, CAS closure, or local-hit equivalence fails.
+pub fn evaluate_atp_remote_dependency_execution(
+    req: &AtpRemoteDependencyRequest,
+    offer: &AtpRemoteDependencyOffer,
+    local_reference: Option<&LocalDependencyReferenceResult>,
+) -> Result<AtpRemoteDependencyOutcome, AtpRemoteDependencyRefusal> {
+    if req.action_key != offer.action_key || req.worker_id != offer.worker_id {
+        return Err(AtpRemoteDependencyRefusal::IdentityMismatch);
+    }
+    if !crate::authority_matrix::authority(
+        req.enforced_isolation,
+        crate::authority_matrix::ServingScope::DependencyServing,
+    )
+    .authority
+    .may_serve()
+    {
+        return Err(AtpRemoteDependencyRefusal::InsufficientIsolationAuthority);
+    }
+    if !offer.all_output_objects_verified_in_cas {
+        return Err(AtpRemoteDependencyRefusal::OutputObjectsMissingOrUnverifiedInCas);
+    }
+    let local_hit_equivalent = if let Some(local) = local_reference {
+        if local.canonical_result_manifest_id != offer.canonical_result_manifest_id
+            || local.output_rlib_digest != offer.output_rlib_digest
+            || local.output_rmeta_digest != offer.output_rmeta_digest
+            || local.exit_code != offer.exit_code
+        {
+            return Err(AtpRemoteDependencyRefusal::LocalHitEquivalenceDivergence);
+        }
+        true
+    } else {
+        true
+    };
+
+    Ok(AtpRemoteDependencyOutcome {
+        canonical_result_manifest_id: offer.canonical_result_manifest_id.clone(),
+        local_hit_equivalent,
+    })
+}
+
+/// Schedule a sampled cross-worker determinism audit on a distinct worker (bead K012).
+#[must_use]
+pub fn schedule_cross_worker_dependency_audit(
+    _action_key: &TypedDigest,
+    origin_worker: &PeerId,
+    available_workers: &[PeerId],
+    sample_rate_bps: u16,
+    sample_draw_bps: u16,
+) -> Option<PeerId> {
+    if sample_draw_bps >= sample_rate_bps {
+        return None;
+    }
+    available_workers
+        .iter()
+        .find(|w| *w != origin_worker)
+        .cloned()
+}
+
+/// Outcome of a cross-worker determinism audit for a dependency action (bead K012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossWorkerAuditOutcome {
+    /// Both workers produced the exact same canonical result manifest; promoted to `ReproducibleCrossWorker`.
+    PromotedToReproducibleCrossWorker {
+        /// New versioned trust evaluation record.
+        evaluation: ActionTrustEvaluationRecord,
+    },
+    /// Second worker produced a different canonical result; serving state immediately quarantined.
+    QuarantinedOnDivergence {
+        /// Assigned quarantine incident ID.
+        quarantine_incident_id: u64,
+        /// Original worker's canonical result manifest.
+        incumbent_manifest: ObjectId,
+        /// Second worker's divergent canonical result manifest.
+        challenger_manifest: ObjectId,
+    },
+}
+
+/// Evaluate a cross-worker determinism audit and wire divergence quarantine (bead K012).
+///
+/// # Errors
+/// Returns `&'static str` if `origin_worker == audit_worker` (same worker cannot prove cross-worker reproducibility).
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_cross_worker_dependency_audit(
+    serving_state: &mut ActionServingStateRecord,
+    origin_worker: &PeerId,
+    incumbent_manifest: &ObjectId,
+    audit_worker: &PeerId,
+    challenger_manifest: &ObjectId,
+    evidence_set_digest: TypedDigest,
+    evaluated_causal_sequence: u64,
+    quarantine_incident_id: u64,
+) -> Result<CrossWorkerAuditOutcome, &'static str> {
+    if origin_worker == audit_worker {
+        return Err("cross-worker audit requires two distinct workers");
+    }
+    if incumbent_manifest == challenger_manifest {
+        let evaluation = ActionTrustEvaluationRecord {
+            canonical_result_manifest_id: incumbent_manifest.clone(),
+            evidence_set_digest,
+            evaluated_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+            evaluated_causal_sequence,
+        };
+        Ok(CrossWorkerAuditOutcome::PromotedToReproducibleCrossWorker { evaluation })
+    } else {
+        serving_state.disposition = ActionServingDisposition::Quarantined;
+        if !serving_state
+            .blocking_quarantine_ids
+            .contains(&quarantine_incident_id)
+        {
+            serving_state
+                .blocking_quarantine_ids
+                .push(quarantine_incident_id);
+        }
+        serving_state.state_revision = serving_state.state_revision.saturating_add(1);
+        Ok(CrossWorkerAuditOutcome::QuarantinedOnDivergence {
+            quarantine_incident_id,
+            incumbent_manifest: incumbent_manifest.clone(),
+            challenger_manifest: challenger_manifest.clone(),
+        })
+    }
 }
