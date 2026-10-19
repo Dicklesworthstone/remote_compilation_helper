@@ -335,4 +335,408 @@ mod tests {
         assert_eq!(fifo, est);
         assert_eq!(fifo, 600);
     }
+
+    #[test]
+    fn hedged_candidate_commit_and_late_divergence_quarantine() {
+        // I016 / I022 / T019 acceptance test:
+        // 1. Evaluate hedging eligibility (tail straggler + independent worker +
+        //    safe-to-duplicate + active publication fencing).
+        let inputs = HedgePolicyInputs {
+            generation_id: 0x60,
+            elapsed_ms: 1_800,
+            expected_duration_ms: 1_000,
+            straggler_threshold_permille: 1_500,
+            safe_to_duplicate: true,
+            publication_fencing_active: true,
+            hedges_used: 0,
+            max_hedges: 2,
+            primary_worker_id: "worker-a".to_owned(),
+            candidate_worker_id: "worker-b".to_owned(),
+            candidate_failure_domain_independent: true,
+        };
+        assert_eq!(
+            evaluate_hedge_policy(&inputs),
+            HedgePolicyDecision::SpawnHedge {
+                generation_id: 0x60,
+                hedge_index: 0,
+            }
+        );
+
+        // Refusal checks: same worker, unsafe to duplicate, not yet straggler, no fencing, budget exhausted.
+        let mut same_worker = inputs.clone();
+        same_worker.candidate_worker_id = "worker-a".to_owned();
+        assert_eq!(
+            evaluate_hedge_policy(&same_worker),
+            HedgePolicyDecision::RefusedNotIndependentWorker
+        );
+        let mut not_straggler = inputs.clone();
+        not_straggler.elapsed_ms = 1_200;
+        assert_eq!(
+            evaluate_hedge_policy(&not_straggler),
+            HedgePolicyDecision::RefusedNotTailStraggler
+        );
+        let mut unsafe_dup = inputs.clone();
+        unsafe_dup.safe_to_duplicate = false;
+        assert_eq!(
+            evaluate_hedge_policy(&unsafe_dup),
+            HedgePolicyDecision::RefusedUnsafeToDuplicate
+        );
+
+        // 2. Sibling-lease independence (I31 / T019):
+        // Renewing, expiring, or revoking one sibling's lease NEVER affects
+        // another sibling's lease; only generation supersession fences all.
+        let mut tracker = HedgeGenerationTracker::new(0x60);
+        assert!(tracker.register_sibling(1, 101));
+        assert!(tracker.register_sibling(2, 202));
+        assert!(!tracker.register_sibling(3, 202), "duplicate lease refused");
+
+        assert!(tracker.renew_lease(1, 101, 1));
+        assert_eq!(tracker.sibling_renewal_seq(1), Some(1));
+        assert_eq!(tracker.sibling_renewal_seq(2), Some(0));
+
+        // Expiring/revoking attempt 1's lease leaves attempt 2 active and valid.
+        assert!(tracker.expire_or_revoke_lease(1, 101));
+        assert!(!tracker.is_lease_active(1));
+        assert!(tracker.is_lease_active(2));
+
+        // 3. CAS winner commit, duplicate evidence merge, and late divergence quarantine:
+        // Attempt 2 wins CAS first.
+        let digest_win = [0x42; 32];
+        assert_eq!(
+            tracker.offer_candidate(2, 202, digest_win),
+            HedgeCasOutcome::CommittedWinner {
+                winner_attempt: 2,
+                losers_to_drain: vec![1],
+            }
+        );
+
+        // Register a second hedge (attempt 3, lease 303) that was already in flight before commit:
+        // when it offers the SAME canonical digest, it merges as duplicate confirming evidence.
+        let mut tracker_dup = HedgeGenerationTracker::new(0x61);
+        assert!(tracker_dup.register_sibling(1, 101));
+        assert!(tracker_dup.register_sibling(2, 202));
+        assert!(tracker_dup.register_sibling(3, 303));
+        assert_eq!(
+            tracker_dup.offer_candidate(1, 101, digest_win),
+            HedgeCasOutcome::CommittedWinner {
+                winner_attempt: 1,
+                losers_to_drain: vec![2, 3],
+            }
+        );
+        assert_eq!(
+            tracker_dup.offer_candidate(2, 202, digest_win),
+            HedgeCasOutcome::MergedDuplicateEvidence {
+                confirming_attempt: 2,
+            }
+        );
+        assert!(!tracker_dup.is_quarantined());
+
+        // When late sibling 3 offers a DIFFERENT canonical digest for the same key,
+        // it triggers late divergence quarantine + incident without overwriting winner 1!
+        let digest_divergent = [0x99; 32];
+        assert_eq!(
+            tracker_dup.offer_candidate(3, 303, digest_divergent),
+            HedgeCasOutcome::QuarantinedLateDivergence {
+                winner_attempt: 1,
+                divergent_attempt: 3,
+            }
+        );
+        assert!(tracker_dup.is_quarantined());
+        assert_eq!(tracker_dup.committed_winner(), Some((1, digest_win)));
+
+        // Coordinator generation supersession invalidates all sibling leases at once.
+        tracker_dup.supersede_generation(0x62);
+        assert!(!tracker_dup.is_lease_active(1));
+        assert!(!tracker_dup.is_lease_active(2));
+        assert!(!tracker_dup.is_lease_active(3));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I016 / I022 / T019: Safe hedging policy & sibling-lease CAS tracker
+// ---------------------------------------------------------------------------
+
+/// Inputs to the safe hedging policy evaluator (bead I016; invariant I31).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HedgePolicyInputs {
+    /// Active coordinator generation id.
+    pub generation_id: u128,
+    /// Elapsed wall/monotonic time of the primary attempt (ms).
+    pub elapsed_ms: u64,
+    /// Expected duration of the action (ms).
+    pub expected_duration_ms: u64,
+    /// Tail-straggler threshold in permille of `expected_duration_ms` (e.g. 1500 = 1.5x).
+    pub straggler_threshold_permille: u16,
+    /// Whether the action class is side-effect-free / safe to duplicate.
+    pub safe_to_duplicate: bool,
+    /// Whether active publication fencing is armed on the coordinator.
+    pub publication_fencing_active: bool,
+    /// Number of hedges already spawned in this generation.
+    pub hedges_used: u32,
+    /// Maximum hedges permitted in this generation.
+    pub max_hedges: u32,
+    /// Primary worker peer identifier.
+    pub primary_worker_id: String,
+    /// Candidate hedge worker peer identifier.
+    pub candidate_worker_id: String,
+    /// Whether the candidate worker is in an independent failure/load domain.
+    pub candidate_failure_domain_independent: bool,
+}
+
+/// Decision emitted by [`evaluate_hedge_policy`] (bead I016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HedgePolicyDecision {
+    /// Spawn a sibling hedge attempt under the shared `generation_id` with its own lease.
+    SpawnHedge {
+        /// Shared generation id.
+        generation_id: u128,
+        /// Zero-based hedge index (`hedges_used`).
+        hedge_index: u32,
+    },
+    /// Action is not safe to duplicate.
+    RefusedUnsafeToDuplicate,
+    /// Publication fencing is not active.
+    RefusedNoPublicationFencing,
+    /// Generation hedge budget is exhausted.
+    RefusedHedgeBudgetExhausted,
+    /// Candidate worker is the same as primary or shares a non-independent domain.
+    RefusedNotIndependentWorker,
+    /// Primary attempt has not yet crossed the tail-straggler threshold.
+    RefusedNotTailStraggler,
+}
+
+/// Evaluate whether to spawn a hedged sibling attempt (bead I016).
+#[must_use]
+pub fn evaluate_hedge_policy(inputs: &HedgePolicyInputs) -> HedgePolicyDecision {
+    if !inputs.safe_to_duplicate {
+        return HedgePolicyDecision::RefusedUnsafeToDuplicate;
+    }
+    if !inputs.publication_fencing_active {
+        return HedgePolicyDecision::RefusedNoPublicationFencing;
+    }
+    if inputs.hedges_used >= inputs.max_hedges {
+        return HedgePolicyDecision::RefusedHedgeBudgetExhausted;
+    }
+    if inputs.primary_worker_id == inputs.candidate_worker_id
+        || !inputs.candidate_failure_domain_independent
+    {
+        return HedgePolicyDecision::RefusedNotIndependentWorker;
+    }
+    let baseline = inputs.expected_duration_ms.max(1);
+    let threshold_ms =
+        baseline.saturating_mul(u64::from(inputs.straggler_threshold_permille)) / 1_000;
+    if inputs.elapsed_ms < threshold_ms {
+        return HedgePolicyDecision::RefusedNotTailStraggler;
+    }
+    HedgePolicyDecision::SpawnHedge {
+        generation_id: inputs.generation_id,
+        hedge_index: inputs.hedges_used,
+    }
+}
+
+/// Outcome of a candidate offer across hedged sibling attempts (bead I016 / I022).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HedgeCasOutcome {
+    /// First valid finisher won CAS and committed; all live siblings must drain.
+    CommittedWinner {
+        /// Winning attempt id.
+        winner_attempt: u128,
+        /// Sibling attempt ids ordered to drain.
+        losers_to_drain: Vec<u128>,
+    },
+    /// Late finisher produced byte-identical canonical result; merged as confirming evidence.
+    MergedDuplicateEvidence {
+        /// Confirming sibling attempt id.
+        confirming_attempt: u128,
+    },
+    /// Late finisher produced a DIFFERENT canonical result for the same key;
+    /// quarantines serving and opens a divergence incident without overwriting winner.
+    QuarantinedLateDivergence {
+        /// Original committed winner attempt id.
+        winner_attempt: u128,
+        /// Divergent sibling attempt id.
+        divergent_attempt: u128,
+    },
+    /// Refused because the attempt's lease is expired, revoked, or belongs to a superseded generation.
+    RefusedInactiveLeaseOrGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SiblingLeaseState {
+    attempt_id: u128,
+    lease_id: u128,
+    renewal_seq: u64,
+    active: bool,
+    draining: bool,
+}
+
+/// Tracks sibling attempts under a shared `ActionGenerationId` with strictly
+/// independent execution leases (invariant I31; beads I016, I022, T019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HedgeGenerationTracker {
+    generation_id: u128,
+    superseded: bool,
+    siblings: Vec<SiblingLeaseState>,
+    winner: Option<(u128, [u8; 32])>,
+    confirming_evidence_attempts: Vec<u128>,
+    quarantined_divergence: bool,
+}
+
+impl HedgeGenerationTracker {
+    /// Create a tracker for `generation_id`.
+    #[must_use]
+    pub const fn new(generation_id: u128) -> Self {
+        Self {
+            generation_id,
+            superseded: false,
+            siblings: Vec::new(),
+            winner: None,
+            confirming_evidence_attempts: Vec::new(),
+            quarantined_divergence: false,
+        }
+    }
+
+    /// Register a primary or hedge attempt with its own unique `lease_id` (I31).
+    pub fn register_sibling(&mut self, attempt_id: u128, lease_id: u128) -> bool {
+        if self.superseded
+            || self
+                .siblings
+                .iter()
+                .any(|s| s.attempt_id == attempt_id || s.lease_id == lease_id)
+        {
+            return false;
+        }
+        self.siblings.push(SiblingLeaseState {
+            attempt_id,
+            lease_id,
+            renewal_seq: 0,
+            active: true,
+            draining: false,
+        });
+        true
+    }
+
+    /// Renew one sibling's lease without touching any other sibling's lease (T019).
+    pub fn renew_lease(&mut self, attempt_id: u128, lease_id: u128, new_seq: u64) -> bool {
+        if self.superseded {
+            return false;
+        }
+        let Some(sibling) = self
+            .siblings
+            .iter_mut()
+            .find(|s| s.attempt_id == attempt_id && s.lease_id == lease_id && s.active)
+        else {
+            return false;
+        };
+        if new_seq <= sibling.renewal_seq {
+            return false;
+        }
+        sibling.renewal_seq = new_seq;
+        true
+    }
+
+    /// Expire or revoke ONE sibling's lease; all other siblings remain unaffected (T019).
+    pub fn expire_or_revoke_lease(&mut self, attempt_id: u128, lease_id: u128) -> bool {
+        let Some(sibling) = self
+            .siblings
+            .iter_mut()
+            .find(|s| s.attempt_id == attempt_id && s.lease_id == lease_id && s.active)
+        else {
+            return false;
+        };
+        sibling.active = false;
+        sibling.draining = true;
+        true
+    }
+
+    /// Supersede the entire coordinator generation — the ONLY event that fences all siblings at once.
+    pub fn supersede_generation(&mut self, new_generation_id: u128) {
+        if new_generation_id != self.generation_id {
+            self.superseded = true;
+            for sibling in &mut self.siblings {
+                sibling.active = false;
+                sibling.draining = true;
+            }
+        }
+    }
+
+    /// Inspect a sibling's current renewal sequence.
+    #[must_use]
+    pub fn sibling_renewal_seq(&self, attempt_id: u128) -> Option<u64> {
+        self.siblings
+            .iter()
+            .find(|s| s.attempt_id == attempt_id)
+            .map(|s| s.renewal_seq)
+    }
+
+    /// Whether a sibling's lease is still active.
+    #[must_use]
+    pub fn is_lease_active(&self, attempt_id: u128) -> bool {
+        !self.superseded
+            && self
+                .siblings
+                .iter()
+                .any(|s| s.attempt_id == attempt_id && s.active)
+    }
+
+    /// Offer a prepared candidate result from one sibling attempt.
+    pub fn offer_candidate(
+        &mut self,
+        attempt_id: u128,
+        lease_id: u128,
+        canonical_digest: [u8; 32],
+    ) -> HedgeCasOutcome {
+        if self.superseded {
+            return HedgeCasOutcome::RefusedInactiveLeaseOrGeneration;
+        }
+        let Some(pos) = self
+            .siblings
+            .iter()
+            .position(|s| s.attempt_id == attempt_id && s.lease_id == lease_id && s.active)
+        else {
+            return HedgeCasOutcome::RefusedInactiveLeaseOrGeneration;
+        };
+
+        if let Some((winner_attempt, winner_digest)) = self.winner {
+            self.siblings[pos].active = false;
+            self.siblings[pos].draining = true;
+            if canonical_digest == winner_digest {
+                self.confirming_evidence_attempts.push(attempt_id);
+                HedgeCasOutcome::MergedDuplicateEvidence {
+                    confirming_attempt: attempt_id,
+                }
+            } else {
+                self.quarantined_divergence = true;
+                HedgeCasOutcome::QuarantinedLateDivergence {
+                    winner_attempt,
+                    divergent_attempt: attempt_id,
+                }
+            }
+        } else {
+            self.winner = Some((attempt_id, canonical_digest));
+            let mut losers_to_drain = Vec::new();
+            for (idx, sibling) in self.siblings.iter_mut().enumerate() {
+                if idx != pos {
+                    sibling.draining = true;
+                    losers_to_drain.push(sibling.attempt_id);
+                }
+            }
+            HedgeCasOutcome::CommittedWinner {
+                winner_attempt: attempt_id,
+                losers_to_drain,
+            }
+        }
+    }
+
+    /// Whether serving has been quarantined due to a divergent late hedge offer.
+    #[must_use]
+    pub const fn is_quarantined(&self) -> bool {
+        self.quarantined_divergence
+    }
+
+    /// Committed `(winner_attempt, canonical_digest)`, if any.
+    #[must_use]
+    pub const fn committed_winner(&self) -> Option<(u128, [u8; 32])> {
+        self.winner
+    }
 }
