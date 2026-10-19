@@ -142,3 +142,28 @@ fn test_internals_only_ever_in_dev_dependencies() {
         }
     }
 }
+
+#[test]
+fn a010_ci_blocks_pin_changes_without_attached_adr_007_upgrade_report() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let adr = fs::read_to_string(workspace.join("docs/adr/007-asupersync-revision-pin.md"))
+        .expect("read docs/adr/007-asupersync-revision-pin.md");
+    let deps = runtime_deps_section(&manifest());
+    let dep_line = deps
+        .lines()
+        .find(|l| l.trim_start().starts_with("asupersync ="))
+        .expect("asupersync dependency present");
+    let rev_start = dep_line.find("rev = \"").expect("rev attribute present") + 7;
+    let rev_end = dep_line[rev_start..].find('"').expect("closing quote") + rev_start;
+    let manifest_rev = &dep_line[rev_start..rev_end];
+
+    let expected_adr_marker = format!("Current admitted pin: `{manifest_rev}`");
+    assert!(
+        adr.contains(&expected_adr_marker),
+        "A010 CI gate: docs/adr/007-asupersync-revision-pin.md does not record `{expected_adr_marker}`"
+    );
+    assert!(
+        adr.contains("| Consumed surface | Review and required check |"),
+        "A010 CI gate: docs/adr/007-asupersync-revision-pin.md is missing the A010 adapter surface review table"
+    );
+}
