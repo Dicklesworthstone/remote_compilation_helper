@@ -47,7 +47,6 @@ use rch_common::bypass_recovery::{
 };
 use rch_common::capability_probe::{
     FACT_PREFIX, NamedToolProbe, ProbeSpec, build_capability_probe_script, parse_capability_probe,
-    remote_worker_binary_path,
 };
 use rch_common::ssh::{SshClient, SshOptions};
 use rch_common::{BypassFailureClass, WorkerConfig, WorkerId};
@@ -217,6 +216,25 @@ pub trait RecoveryProber: Send + Sync {
     ) -> impl std::future::Future<Output = CanaryOutcome> + Send;
 }
 
+/// Fresh load facts appended to the capability probe script (`loadavg1`,
+/// `nproc`), read by [`SshRecoveryProber::parse_load_per_core`].
+///
+/// Fail-soft like the rest of the probe: each fact is omitted when it cannot be
+/// measured. Linux `/proc/loadavg` and `nproc` come first, then the BSD/macOS
+/// `sysctl` equivalents (`vm.loadavg` prints `{ 1.20 1.10 1.00 }`, so the
+/// 1-minute figure is the field after the brace). The trailing `:` makes the
+/// script exit 0 whatever was missing. That is load-bearing: the script's exit
+/// status is its last command's, and openssh reports a remote exit status of
+/// 127 as a "remote command not found" error and drops the stdout. macOS has no
+/// `nproc`, so every recovery probe of a macOS worker read as an SSH failure and
+/// the worker was never readmitted (#116).
+const LOAD_PROBE_SCRIPT: &str = " la=$(awk 'NR==1{print $1}' /proc/loadavg 2>/dev/null); \
+     [ -n \"$la\" ] || la=$(sysctl -n vm.loadavg 2>/dev/null | awk '{ if ($1 == \"{\") print $2; else print $1 }'); \
+     [ -n \"$la\" ] && printf '%sloadavg1=%s\\n' \"$P\" \"$la\"; \
+     nc=$(nproc 2>/dev/null); \
+     [ -n \"$nc\" ] || nc=$(sysctl -n hw.ncpu 2>/dev/null); \
+     [ -n \"$nc\" ] && printf '%snproc=%s\\n' \"$P\" \"$nc\"; :";
+
 /// The real prober: a capability probe over SSH plus disk/load/telemetry checks
 /// and an SSH canary command.
 pub struct SshRecoveryProber {
@@ -231,18 +249,14 @@ impl SshRecoveryProber {
         Self { telemetry, config }
     }
 
-    /// Build the exact-path capability [`ProbeSpec`] for a worker. The absolute
-    /// `rch-wkr` path comes from the shared [`remote_worker_binary_path`] (the
-    /// probe script shell-quotes it, so a literal `~` would never expand — the
-    /// single source of truth shared with `rch self-test --smoke`). A wrong path
-    /// simply omits the worker-binary fact, keeping the worker bypassed (the safe
-    /// failure mode — never a false rejoin).
+    /// Build the exact-path capability [`ProbeSpec`] for a worker. The `rch-wkr`
+    /// locations come from [`ProbeSpec::for_worker`], the single source of truth
+    /// shared with `rch self-test --smoke`; the home-relative one expands on the
+    /// worker. A binary at none of them simply omits the worker-binary fact,
+    /// keeping the worker bypassed (the safe failure mode — never a false rejoin).
     fn probe_spec(&self, config: &WorkerConfig) -> ProbeSpec {
         let declared_os = rch_common::declared_os(&config.tags);
-        let mut spec = ProbeSpec::new(
-            config.user.clone(),
-            remote_worker_binary_path(&config.user, declared_os.as_deref()),
-        );
+        let mut spec = ProbeSpec::for_worker(&config.user, declared_os.as_deref());
         spec.disk_roots.clone_from(&self.config.disk_roots);
         // Operator-declared tool probes are part of the worker's capability
         // facts, so a rejoining worker is measured on the same evidence
@@ -452,10 +466,7 @@ impl RecoveryProber for SshRecoveryProber {
         // path, rustup toolchains/targets, df -Pk/-Pi disk+inode roots), plus a
         // fresh load probe the capability script doesn't cover.
         let mut script = build_capability_probe_script(&spec);
-        script.push_str(
-            " la=$(awk 'NR==1{print $1}' /proc/loadavg 2>/dev/null) && printf '%sloadavg1=%s\\n' \"$P\" \"$la\"; \
-             nc=$(nproc 2>/dev/null) && printf '%snproc=%s\\n' \"$P\" \"$nc\"; ",
-        );
+        script.push_str(LOAD_PROBE_SCRIPT);
 
         let Some(stdout) = self.ssh_run(config, &script).await else {
             // SSH/shell never ran -> unreachable; every dimension fails.
@@ -3001,19 +3012,109 @@ mod tests {
         assert_eq!(SshRecoveryProber::parse_load_per_core(""), None);
     }
 
+    /// #116: the recovery probe resolves `rch-wkr` through the worker's own
+    /// `$HOME`, never a guessed `/home/<user>`, for every Unix user and OS
+    /// (macOS homes are `/Users/<user>`, root's is `/var/root`).
     #[test]
-    fn rch_wkr_path_is_absolute_per_user() {
-        assert_eq!(
-            remote_worker_binary_path("ubuntu", None),
-            "/home/ubuntu/.local/bin/rch-wkr"
+    fn recovery_probe_resolves_worker_binary_under_the_real_home() {
+        let prober = SshRecoveryProber::new(
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
+            BypassRecoveryConfig::default(),
         );
-        assert_eq!(
-            remote_worker_binary_path("root", None),
-            "/root/.local/bin/rch-wkr"
+        for (user, os) in [("ubuntu", None), ("root", None), ("alice", Some("darwin"))] {
+            let mut worker = worker_config("unix");
+            worker.user = user.to_string();
+            worker.tags = os.map(rch_common::os_tag).into_iter().collect();
+            let spec = prober.probe_spec(&worker);
+            assert_eq!(
+                spec.rch_wkr_paths,
+                ["/usr/local/bin/rch-wkr", "~/.local/bin/rch-wkr"],
+                "{user} {os:?}"
+            );
+            let script = build_capability_probe_script(&spec);
+            assert!(!script.contains("/home/"), "{user}: {script}");
+            assert!(!script.contains("/root/"), "{user}: {script}");
+        }
+    }
+
+    /// #116: the appended load probe must end on a zero status even where
+    /// `nproc` (macOS) or every tool is missing. openssh turns a remote exit
+    /// status of 127 into an error and drops the stdout, which made every
+    /// recovery probe of a macOS worker read as an SSH failure.
+    #[cfg(unix)]
+    #[test]
+    fn load_probe_exits_zero_without_nproc_or_any_tool() {
+        let empty = tempfile::tempdir().unwrap();
+        let only_awk = tempfile::tempdir().unwrap();
+        let awk = ["/usr/bin/awk", "/bin/awk"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("awk on the test host");
+        std::os::unix::fs::symlink(awk, only_awk.path().join("awk")).unwrap();
+        for path in [empty.path(), only_awk.path()] {
+            let script = format!("set -u; P='{FACT_PREFIX}';{LOAD_PROBE_SCRIPT}");
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .env_clear()
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "PATH={}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("nproc="), "{stdout}");
+            if cfg!(target_os = "linux") && path == only_awk.path() {
+                assert!(stdout.contains("loadavg1="), "{stdout}");
+            }
+        }
+    }
+
+    /// #116: on macOS/BSD the load facts come from `sysctl`, whose
+    /// `vm.loadavg` output is `{ 1m 5m 15m }`. The procfs source is pointed at
+    /// a missing file so the fallback is exercised on any test host, and a
+    /// shell function stands in for `sysctl` with real macOS output (a function,
+    /// not a freshly written executable, so no exec can race the write).
+    #[cfg(unix)]
+    #[test]
+    fn load_probe_reads_darwin_sysctl_when_procfs_and_nproc_are_absent() {
+        let bin = tempfile::tempdir().unwrap();
+        let awk = ["/usr/bin/awk", "/bin/awk"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("awk on the test host");
+        std::os::unix::fs::symlink(awk, bin.path().join("awk")).unwrap();
+        let sysctl = "sysctl() { case \"$2\" in vm.loadavg) echo '{ 4.18 4.02 3.91 }' ;; \
+                      hw.ncpu) echo 8 ;; *) return 1 ;; esac; };";
+        let probe = LOAD_PROBE_SCRIPT.replace("/proc/loadavg", "/nonexistent/rch-loadavg");
+        assert_ne!(
+            probe, LOAD_PROBE_SCRIPT,
+            "the procfs source must be redirected"
         );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("set -u; P='{FACT_PREFIX}'; {sysctl}{probe}"))
+            .env_clear()
+            .env("PATH", bin.path())
+            .output()
+            .unwrap();
         assert_eq!(
-            remote_worker_binary_path("jeffr", Some("windows")),
-            "/c/Users/jeffr/.local/bin/rch-wkr.exe"
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("RCH_FACT loadavg1=4.18\n"), "{stdout}");
+        assert!(stdout.contains("RCH_FACT nproc=8\n"), "{stdout}");
+        assert_eq!(
+            SshRecoveryProber::parse_load_per_core(&stdout),
+            Some(4.18 / 8.0)
         );
     }
 
@@ -3029,7 +3130,10 @@ mod tests {
 
         let spec = prober.probe_spec(&worker);
 
-        assert_eq!(spec.rch_wkr_path, "/c/Users/jeffr/.local/bin/rch-wkr.exe");
+        assert_eq!(
+            spec.rch_wkr_paths,
+            ["/c/Users/jeffr/.local/bin/rch-wkr.exe"]
+        );
     }
 
     #[tokio::test]

@@ -324,7 +324,7 @@ pub use ui::{
 pub use capability_probe::{
     CapabilityRequirement, CapabilityVerdict, EligibilityVerdict, ProbeSpec, ProbedFacts,
     WorkerLiveness, assess_admissibility, assess_worker_eligibility, build_capability_probe_script,
-    parse_capability_probe, remote_worker_binary_path,
+    parse_capability_probe, remote_worker_binary_paths,
 };
 pub use incident::{
     ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,

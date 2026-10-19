@@ -25,7 +25,7 @@ use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
 use rch_common::capability_probe::{
     CapabilityRequirement, CapabilityVerdict, NamedToolProbe, ProbeSpec, assess_admissibility,
-    build_capability_probe_script, parse_capability_probe, remote_worker_binary_path,
+    build_capability_probe_script, parse_capability_probe,
 };
 use rch_common::disk_pressure_report::{
     DiskRootKind, PressureLevel, PressureThresholds, assess_root,
@@ -1190,28 +1190,23 @@ fn now_unix_ms() -> u64 {
 // mock-SSH integration tests below.
 
 /// Exact-user/path capability probe spec for a worker's installed `rch-wkr`. The
-/// path is the exact configured binary location (no PATH resolution), matching
-/// the .7.3 exact-user/path validation discipline.
+/// probe tries the fixed locations RCH deploys to (no PATH resolution), matching
+/// the .7.3 exact-user/path validation discipline. Mirrors the daemon
+/// bypass-recovery prober via [`ProbeSpec::for_worker`]; the home-relative
+/// location expands to the configured user's real `$HOME` on the worker.
 fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
-    // Use the ABSOLUTE binary path: the probe script shell-quotes it, so a
-    // literal `~` would never expand and every worker would look like it has a
-    // missing binary (the live-fleet bug the mock tests masked by injecting an
-    // already-expanded path). Mirrors the daemon bypass-recovery prober.
     let declared_os = rch_common::declared_os(&worker.tags);
-    ProbeSpec::new(
-        worker.user.clone(),
-        remote_worker_binary_path(&worker.user, declared_os.as_deref()),
-    )
-    // Declared tool probes ride along: the smoke scenario should see the same
-    // facts selection will, or a worker can pass the smoke check and still be
-    // inadmissible for a `--require-tool` job. Entries that fail validation are
-    // refused at config load, so any that reach here are usable.
-    .with_tools(
-        worker
-            .tools
-            .iter()
-            .filter_map(|tool| NamedToolProbe::try_from(tool).ok()),
-    )
+    ProbeSpec::for_worker(&worker.user, declared_os.as_deref())
+        // Declared tool probes ride along: the smoke scenario should see the same
+        // facts selection will, or a worker can pass the smoke check and still be
+        // inadmissible for a `--require-tool` job. Entries that fail validation are
+        // refused at config load, so any that reach here are usable.
+        .with_tools(
+            worker
+                .tools
+                .iter()
+                .filter_map(|tool| NamedToolProbe::try_from(tool).ok()),
+        )
 }
 
 /// Execute the WorkerCapabilitiesExactUserPath smoke scenario against a worker:
@@ -1235,7 +1230,8 @@ async fn run_smoke_capabilities_with_runner<R: CommandRunner>(
         return Ok(CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::WrongUserPathWorkerBinary,
             detail: format!(
-                "capability probe at {REMOTE_WORKER_BINARY} produced no parseable facts as user {} (binary missing or unreachable)",
+                "capability probe at {} produced no parseable facts as user {} (binary missing or unreachable)",
+                spec.rch_wkr_paths.join(" or "),
                 worker.user
             ),
         });
@@ -3501,22 +3497,36 @@ RCH_FACT disk=/var/cache;1048576;10240;900000\n";
         }
     }
 
-    // The smoke capability probe must target an ABSOLUTE binary path. The probe
-    // script single-quotes it, so a literal `~/.local/bin/rch-wkr` would never
-    // expand and EVERY real worker would be rejected as binary-missing (the
-    // live-fleet bug the mock tests masked by injecting an expanded path).
+    // The smoke capability probe targets the locations RCH deploys `rch-wkr` to,
+    // with the home-relative one resolved by the worker's own `$HOME` rather than
+    // a guessed `/home/<user>` (wrong on macOS and for accounts homed elsewhere,
+    // #116). The script must expand it: a single-quoted `~/...` never expands,
+    // which would reject EVERY real worker as binary-missing.
     #[test]
-    fn smoke_capability_probe_spec_uses_absolute_path() {
-        let spec = smoke_capability_probe_spec(&smoke_worker()); // user "rch"
-        assert_eq!(spec.rch_wkr_path, "/home/rch/.local/bin/rch-wkr");
-        assert!(!spec.rch_wkr_path.contains('~'));
-        let root = WorkerConfig {
-            user: "root".to_string(),
+    fn smoke_capability_probe_spec_uses_deployed_locations_under_real_home() {
+        for user in ["rch", "root"] {
+            let worker = WorkerConfig {
+                user: user.to_string(),
+                ..Default::default()
+            };
+            let spec = smoke_capability_probe_spec(&worker);
+            assert_eq!(
+                spec.rch_wkr_paths,
+                ["/usr/local/bin/rch-wkr", "~/.local/bin/rch-wkr"]
+            );
+            let script = build_capability_probe_script(&spec);
+            assert!(script.contains("\"${HOME:-}\"'/.local/bin/rch-wkr'"));
+            assert!(!script.contains("'~/"));
+            assert!(!script.contains("/home/"));
+        }
+        let windows = WorkerConfig {
+            user: "jeffr".to_string(),
+            tags: vec![rch_common::os_tag("windows")],
             ..Default::default()
         };
         assert_eq!(
-            smoke_capability_probe_spec(&root).rch_wkr_path,
-            "/root/.local/bin/rch-wkr"
+            smoke_capability_probe_spec(&windows).rch_wkr_paths,
+            ["/c/Users/jeffr/.local/bin/rch-wkr.exe"]
         );
     }
 
