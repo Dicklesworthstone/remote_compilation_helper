@@ -425,4 +425,218 @@ mod tests {
             D::RejectIncarnationConflict
         );
     }
+
+    #[test]
+    fn t015_split_brain_authority_rollback_high_water_and_edge_fail_open_frontier_scenarios() {
+        use crate::local_protocol::{
+            FallbackAction, FallbackConfig, SubscriberFrontierReport, render_boundary_marker,
+        };
+
+        let mut peer_mark = mark(); // gen=2, term=7, incarnation=11, reset_gen=0
+        let request_id = 0xCAFE_u128;
+
+        // 1. Scenario A: Restored/rolled-back coordinator database offering lower term (term=5 < 7)
+        //    while subscriber is at pre-frontier (nothing exposed) -> authority rejected by peer
+        //    high-water mark (RejectStaleTerm) AND edge fails open seamlessly!
+        let rolled_back_db = offered(2, 5, 11);
+        let silent_frontier = SubscriberFrontierReport::default();
+        let outcome_a = evaluate_authority_and_edge_frontier_fallback(
+            &mut peer_mark,
+            &rolled_back_db,
+            None,
+            &silent_frontier,
+            &FallbackConfig::default(),
+            request_id,
+        );
+        assert_eq!(
+            outcome_a,
+            AuthorityFrontierScenarioOutcome::AuthorityRejected {
+                decision: AuthorityDecision::RejectStaleTerm,
+                edge_fallback: FallbackAction::RunOriginalSeamless,
+            }
+        );
+        assert_eq!(peer_mark.highest_term_within_generation, 7);
+
+        // 2. Scenario B: Split-brain / cloned coordinator offering same (gen=2, term=7) with a
+        //    DIFFERENT incarnation (inc=99 != 11) while subscriber has transcript exposed:
+        //    - Default config (labeled_transcript_recovery=false): rejected as
+        //      RejectIncarnationConflict AND edge refuses silent rerun (ReconnectOrFailCoherently).
+        //    - Explicit labeled recovery config: DetachAndRunLabeled with unmistakable boundary marker.
+        let split_brain_clone = offered(2, 7, 99);
+        let transcript_frontier = SubscriberFrontierReport {
+            transcript_exposed: true,
+            transcript_uncertain: false,
+            stateful_intent_recorded: false,
+            stateful_uncertain: false,
+            last_fully_delivered_seq: 4,
+        };
+        let outcome_b_default = evaluate_authority_and_edge_frontier_fallback(
+            &mut peer_mark,
+            &split_brain_clone,
+            None,
+            &transcript_frontier,
+            &FallbackConfig {
+                labeled_transcript_recovery: false,
+            },
+            request_id,
+        );
+        assert_eq!(
+            outcome_b_default,
+            AuthorityFrontierScenarioOutcome::AuthorityRejected {
+                decision: AuthorityDecision::RejectIncarnationConflict,
+                edge_fallback: FallbackAction::ReconnectOrFailCoherently {
+                    reason: "transcript exposed and labeled recovery not configured (R104)",
+                },
+            }
+        );
+
+        let outcome_b_labeled = evaluate_authority_and_edge_frontier_fallback(
+            &mut peer_mark,
+            &split_brain_clone,
+            None,
+            &transcript_frontier,
+            &FallbackConfig {
+                labeled_transcript_recovery: true,
+            },
+            request_id,
+        );
+        assert_eq!(
+            outcome_b_labeled,
+            AuthorityFrontierScenarioOutcome::AuthorityRejected {
+                decision: AuthorityDecision::RejectIncarnationConflict,
+                edge_fallback: FallbackAction::DetachAndRunLabeled {
+                    boundary_marker: render_boundary_marker(request_id, 4),
+                },
+            }
+        );
+
+        // 3. Scenario C: Stale credential generation (gen=1 < 2) while subscriber has a stateful
+        //    commit intent or uncertain stateful item -> rejected as
+        //    RejectStaleCredentialGeneration AND edge NEVER fails open locally even with labeled
+        //    recovery enabled (NoUncoordinatedFallback -> ReconnectOrFailCoherently)!
+        let stale_cred_gen = offered(1, 999, 77);
+        let stateful_frontier = SubscriberFrontierReport {
+            transcript_exposed: true,
+            transcript_uncertain: false,
+            stateful_intent_recorded: true,
+            stateful_uncertain: true,
+            last_fully_delivered_seq: 5,
+        };
+        let outcome_c = evaluate_authority_and_edge_frontier_fallback(
+            &mut peer_mark,
+            &stale_cred_gen,
+            None,
+            &stateful_frontier,
+            &FallbackConfig {
+                labeled_transcript_recovery: true,
+            },
+            request_id,
+        );
+        assert_eq!(
+            outcome_c,
+            AuthorityFrontierScenarioOutcome::AuthorityRejected {
+                decision: AuthorityDecision::RejectStaleCredentialGeneration,
+                edge_fallback: FallbackAction::ReconnectOrFailCoherently {
+                    reason: "stateful commit intent or commit exposed (R97)",
+                },
+            }
+        );
+
+        // 4. Scenario D: Restored coordinator database WITH a fresh cluster-root-signed operator
+        //    reset proof (OperatorResetGeneration(1) > 0) recovers authority and updates the
+        //    peer's durable high-water mark!
+        let outcome_d = evaluate_authority_and_edge_frontier_fallback(
+            &mut peer_mark,
+            &rolled_back_db,
+            Some(OperatorResetGeneration(1)),
+            &stateful_frontier,
+            &FallbackConfig::default(),
+            request_id,
+        );
+        assert_eq!(
+            outcome_d,
+            AuthorityFrontierScenarioOutcome::AuthorityAccepted {
+                decision: AuthorityDecision::AcceptViaOperatorReset,
+            }
+        );
+        assert_eq!(
+            peer_mark.operator_reset_generation,
+            OperatorResetGeneration(1)
+        );
+        assert_eq!(peer_mark.highest_term_within_generation, 5);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T015: Coordinator split-brain / authority-rollback / high-water-mark and
+// edge fail-open delivery frontier evaluation (risk R88, R97, R104)
+// ---------------------------------------------------------------------------
+
+/// Combined outcome of evaluating an offered [`CoordinatorAuthority`] against
+/// a peer's [`PeerAuthorityHighWaterMark`] and, on authority rejection/loss,
+/// determining the edge wrapper's permitted fail-open action at its current
+/// [`crate::local_protocol::SubscriberFrontierReport`] (bead T015; risk R88).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorityFrontierScenarioOutcome {
+    /// Coordinator authority was accepted (and the peer's high-water mark
+    /// updated accordingly); coordinated execution continues.
+    AuthorityAccepted {
+        /// Specific acceptance decision.
+        decision: AuthorityDecision,
+    },
+    /// Coordinator authority was rejected as stale/rolled-back/split-brain;
+    /// the edge takes `edge_fallback` governed strictly by the subscriber's
+    /// delivery frontier.
+    AuthorityRejected {
+        /// Why the offered authority was rejected by the high-water mark.
+        decision: AuthorityDecision,
+        /// Frontier-governed fallback action (`RunOriginalSeamless`,
+        /// `DetachAndRunLabeled`, or `ReconnectOrFailCoherently`).
+        edge_fallback: crate::local_protocol::FallbackAction,
+    },
+}
+
+/// Evaluate an offered [`CoordinatorAuthority`] against `peer_mark` (updating
+/// `peer_mark` on acceptance) and compute the frontier-safe edge fallback
+/// action when authority is rejected (bead T015).
+#[must_use]
+pub fn evaluate_authority_and_edge_frontier_fallback(
+    peer_mark: &mut PeerAuthorityHighWaterMark,
+    offered: &CoordinatorAuthority,
+    reset_proof: Option<OperatorResetGeneration>,
+    frontier: &crate::local_protocol::SubscriberFrontierReport,
+    fallback_config: &crate::local_protocol::FallbackConfig,
+    request_id: u128,
+) -> AuthorityFrontierScenarioOutcome {
+    let decision = peer_mark.evaluate(offered, reset_proof);
+    match decision {
+        AuthorityDecision::AcceptAdvanceTerm | AuthorityDecision::AcceptSameIncarnation => {
+            peer_mark.highest_term_within_generation = offered.term;
+            peer_mark.last_incarnation_id = offered.incarnation_id;
+            AuthorityFrontierScenarioOutcome::AuthorityAccepted { decision }
+        }
+        AuthorityDecision::AcceptViaOperatorReset => {
+            if let Some(reset_gen) = reset_proof {
+                peer_mark.operator_reset_generation = reset_gen;
+            }
+            peer_mark.credential_generation = offered.credential_generation;
+            peer_mark.highest_term_within_generation = offered.term;
+            peer_mark.last_incarnation_id = offered.incarnation_id;
+            AuthorityFrontierScenarioOutcome::AuthorityAccepted { decision }
+        }
+        AuthorityDecision::AcceptNewGenerationPendingCredentialProof => {
+            AuthorityFrontierScenarioOutcome::AuthorityAccepted { decision }
+        }
+        AuthorityDecision::RejectStaleCredentialGeneration
+        | AuthorityDecision::RejectStaleTerm
+        | AuthorityDecision::RejectIncarnationConflict
+        | AuthorityDecision::RejectClusterMismatch => {
+            let edge_fallback =
+                crate::local_protocol::decide_fallback(frontier, fallback_config, request_id);
+            AuthorityFrontierScenarioOutcome::AuthorityRejected {
+                decision,
+                edge_fallback,
+            }
+        }
+    }
 }

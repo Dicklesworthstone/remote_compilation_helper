@@ -132,6 +132,341 @@ pub fn canary_verdict(results: &[bool], required: u32) -> CanaryDecision {
     }
 }
 
+// ============================================================================
+// Bead R012: operator rollback + canary orchestration + 14 feature modes
+// ============================================================================
+
+use crate::descriptor::ActionClass;
+use crate::serving::TrustEvidenceTier;
+
+/// The 14 rollout feature modes (bead R012; plan Part XVII / Part XXIII).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RabsFeatureMode {
+    /// RABS completely disabled; stock RCH path only.
+    Off,
+    /// Record invocation corpus only; no key computation or remote execution.
+    RecordOnly,
+    /// Compute action keys in shadow alongside stock execution.
+    ShadowKey,
+    /// Execute shadow attempts and compare against stock path without serving.
+    ShadowExecute,
+    /// Serve verified third-party dependency compiles (`RustcDependencyCompile`).
+    ServeDependencies,
+    /// Serve selected workspace crates in addition to dependencies.
+    ServeSelectedWorkspace,
+    /// Serve all eligible cacheable compile actions.
+    ServeAllEligible,
+    /// Run coordinator remote-control plane in shadow alongside stock RCH.
+    RemoteControlShadow,
+    /// Enable native ATP control-plane sessions.
+    NativeAtpControl,
+    /// Enable native ATP data-plane object transfer.
+    NativeAtpData,
+    /// Enable bounded speculative execution on slack capacity.
+    SpeculationEnabled,
+    /// Enable cached test execution for eligible deterministic suites.
+    TestsEnabled,
+    /// Enable lineage-verified incremental filesystem snapshots.
+    IncrementalSnapshotsEnabled,
+    /// Require remote RABS execution (refuse silent local fallback except fail-open emergencies).
+    RequireRemote,
+}
+
+/// Complete registry of the 14 RABS rollout feature modes (bead R012).
+pub const ALL_FEATURE_MODES: [RabsFeatureMode; 14] = [
+    RabsFeatureMode::Off,
+    RabsFeatureMode::RecordOnly,
+    RabsFeatureMode::ShadowKey,
+    RabsFeatureMode::ShadowExecute,
+    RabsFeatureMode::ServeDependencies,
+    RabsFeatureMode::ServeSelectedWorkspace,
+    RabsFeatureMode::ServeAllEligible,
+    RabsFeatureMode::RemoteControlShadow,
+    RabsFeatureMode::NativeAtpControl,
+    RabsFeatureMode::NativeAtpData,
+    RabsFeatureMode::SpeculationEnabled,
+    RabsFeatureMode::TestsEnabled,
+    RabsFeatureMode::IncrementalSnapshotsEnabled,
+    RabsFeatureMode::RequireRemote,
+];
+
+impl RabsFeatureMode {
+    /// Canonical CLI/config token for this feature mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::RecordOnly => "record-only",
+            Self::ShadowKey => "shadow-key",
+            Self::ShadowExecute => "shadow-execute",
+            Self::ServeDependencies => "serve-dependencies",
+            Self::ServeSelectedWorkspace => "serve-selected-workspace",
+            Self::ServeAllEligible => "serve-all-eligible",
+            Self::RemoteControlShadow => "remote-control-shadow",
+            Self::NativeAtpControl => "native-atp-control",
+            Self::NativeAtpData => "native-atp-data",
+            Self::SpeculationEnabled => "speculation-enabled",
+            Self::TestsEnabled => "tests-enabled",
+            Self::IncrementalSnapshotsEnabled => "incremental-snapshots-enabled",
+            Self::RequireRemote => "require-remote",
+        }
+    }
+
+    /// Parse a feature mode from its canonical CLI/config token.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        ALL_FEATURE_MODES.into_iter().find(|m| m.as_str() == token)
+    }
+}
+
+/// Independent override scope for feature-mode control (per repo, action class, worker, or trust tier).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureModeScope {
+    /// Repository identifier override.
+    Repo(String),
+    /// Action class override.
+    ActionClass(ActionClass),
+    /// Worker node ID override.
+    Worker(u64),
+    /// Trust evidence tier override.
+    TrustTier(TrustEvidenceTier),
+}
+
+/// Scoped feature-mode matrix with one-command rollback history (bead R012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedFeatureModeMatrix {
+    /// Global default mode.
+    pub default_mode: RabsFeatureMode,
+    /// Prior global mode preserved for one-command rollback.
+    pub prior_default_mode: RabsFeatureMode,
+    /// Scoped overrides evaluated in specificity order (Worker -> TrustTier -> ActionClass -> Repo).
+    pub overrides: Vec<(FeatureModeScope, RabsFeatureMode)>,
+    /// Snapshot of overrides prior to the most recent promotion/edit.
+    pub prior_overrides: Vec<(FeatureModeScope, RabsFeatureMode)>,
+}
+
+impl Default for ScopedFeatureModeMatrix {
+    fn default() -> Self {
+        Self {
+            default_mode: RabsFeatureMode::Off,
+            prior_default_mode: RabsFeatureMode::Off,
+            overrides: Vec::new(),
+            prior_overrides: Vec::new(),
+        }
+    }
+}
+
+impl ScopedFeatureModeMatrix {
+    /// Transition the global mode while checkpointing current state for one-command rollback.
+    pub fn transition_default_mode(&mut self, next_mode: RabsFeatureMode) {
+        self.prior_default_mode = self.default_mode;
+        self.prior_overrides.clone_from(&self.overrides);
+        self.default_mode = next_mode;
+    }
+
+    /// Set or replace a scoped feature-mode override while preserving rollback state.
+    pub fn set_scoped_override(&mut self, scope: FeatureModeScope, mode: RabsFeatureMode) {
+        self.prior_default_mode = self.default_mode;
+        self.prior_overrides.clone_from(&self.overrides);
+        if let Some((_, existing)) = self.overrides.iter_mut().find(|(s, _)| *s == scope) {
+            *existing = mode;
+        } else {
+            self.overrides.push((scope, mode));
+        }
+    }
+
+    /// Resolve the effective feature mode for a `(repo, action_class, worker_id, trust_tier)` tuple.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        repo: &str,
+        action_class: ActionClass,
+        worker_id: u64,
+        trust_tier: TrustEvidenceTier,
+    ) -> RabsFeatureMode {
+        for (scope, mode) in &self.overrides {
+            if matches!(scope, FeatureModeScope::Worker(id) if *id == worker_id) {
+                return *mode;
+            }
+        }
+        for (scope, mode) in &self.overrides {
+            if matches!(scope, FeatureModeScope::TrustTier(t) if *t == trust_tier) {
+                return *mode;
+            }
+        }
+        for (scope, mode) in &self.overrides {
+            if matches!(scope, FeatureModeScope::ActionClass(c) if *c == action_class) {
+                return *mode;
+            }
+        }
+        for (scope, mode) in &self.overrides {
+            if matches!(scope, FeatureModeScope::Repo(r) if r == repo) {
+                return *mode;
+            }
+        }
+        self.default_mode
+    }
+
+    /// Execute a one-command rollback to the prior global mode and scoped override snapshot.
+    pub fn execute_one_command_rollback(&mut self) -> RabsFeatureMode {
+        self.default_mode = self.prior_default_mode;
+        self.overrides.clone_from(&self.prior_overrides);
+        self.default_mode
+    }
+}
+
+/// Incident classes that immediately quarantine the canary and trigger rollback (bead R012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanaryIncidentTrigger {
+    /// Sandbox/process/temp cleanup leak or orphan detected.
+    CleanupIncident,
+    /// CAS object digest mismatch or corruption detected.
+    CorruptionIncident,
+    /// Worker or peer cryptographic identity mismatch detected.
+    IdentityIncident,
+    /// Output or semantic divergence vs baseline RCH path detected.
+    DivergenceIncident,
+    /// Canary latency exceeded the allowed regression ceiling vs baseline RCH path.
+    PerformanceRegression,
+}
+
+/// One differential perf/correctness sample comparing canary execution against current RCH path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanaryComparisonSample {
+    /// Action class executed on the canary path.
+    pub action_class: ActionClass,
+    /// Baseline RCH execution latency in milliseconds.
+    pub baseline_rch_latency_ms: u64,
+    /// Canary RABS execution latency in milliseconds.
+    pub canary_rabs_latency_ms: u64,
+    /// Whether outputs and exit semantics matched the baseline RCH path.
+    pub correctness_matched: bool,
+    /// Whether any cleanup leak occurred.
+    pub cleanup_incident: bool,
+    /// Whether any CAS corruption occurred.
+    pub corruption_incident: bool,
+    /// Whether any worker identity mismatch occurred.
+    pub identity_incident: bool,
+    /// Whether any semantic divergence occurred.
+    pub divergence_incident: bool,
+}
+
+/// Outcome of canary orchestration evaluation (bead R012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanaryOrchestrationOutcome {
+    /// Canary succeeded with low-risk dependency routing and clean perf/correctness; promoted.
+    Promoted {
+        /// Newly active feature mode after promotion.
+        promoted_to: RabsFeatureMode,
+        /// Number of verified canary samples evaluated.
+        samples_evaluated: usize,
+    },
+    /// Canary quarantined and rolled back to the prior mode in one command.
+    QuarantinedAndRolledBack {
+        /// Trigger that caused quarantine and rollback.
+        trigger: CanaryIncidentTrigger,
+        /// Restored feature mode after one-command rollback.
+        restored_mode: RabsFeatureMode,
+        /// Quarantined canary worker IDs.
+        quarantined_workers: Vec<u64>,
+    },
+}
+
+/// Canary coordinator + worker cohort orchestrator (bead R012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanaryOrchestrator {
+    /// Designated canary coordinator ID.
+    pub canary_coordinator_id: u64,
+    /// Designated canary worker IDs.
+    pub canary_worker_ids: Vec<u64>,
+    /// Quarantined worker IDs removed from scheduling on canary incident.
+    pub quarantined_worker_ids: Vec<u64>,
+    /// Maximum allowed canary latency ratio in permille of baseline (`1050` = +5%).
+    pub max_latency_ratio_permille: u32,
+    /// Minimum required clean samples before promotion.
+    pub min_required_samples: usize,
+    /// Scoped feature-mode matrix governed by this orchestrator.
+    pub mode_matrix: ScopedFeatureModeMatrix,
+}
+
+impl CanaryOrchestrator {
+    /// Whether an action + worker pair should route through the canary lane first.
+    ///
+    /// Low-risk third-party dependency compiles (`RustcDependencyCompile`) on designated
+    /// non-quarantined canary workers are routed first.
+    #[must_use]
+    pub fn should_route_to_canary(&self, action_class: ActionClass, worker_id: u64) -> bool {
+        action_class == ActionClass::RustcDependencyCompile
+            && self.canary_worker_ids.contains(&worker_id)
+            && !self.quarantined_worker_ids.contains(&worker_id)
+    }
+
+    /// Evaluate canary comparison samples and either promote to `target_mode` or quarantine
+    /// the canary cohort and execute a one-command rollback.
+    pub fn evaluate_and_orchestrate(
+        &mut self,
+        samples: &[CanaryComparisonSample],
+        target_mode: RabsFeatureMode,
+    ) -> CanaryOrchestrationOutcome {
+        let mut baseline_sum_ms = 0_u64;
+        let mut canary_sum_ms = 0_u64;
+
+        for sample in samples {
+            let trigger = if sample.cleanup_incident {
+                Some(CanaryIncidentTrigger::CleanupIncident)
+            } else if sample.corruption_incident {
+                Some(CanaryIncidentTrigger::CorruptionIncident)
+            } else if sample.identity_incident {
+                Some(CanaryIncidentTrigger::IdentityIncident)
+            } else if sample.divergence_incident || !sample.correctness_matched {
+                Some(CanaryIncidentTrigger::DivergenceIncident)
+            } else {
+                None
+            };
+            if let Some(trigger) = trigger {
+                return self.quarantine_and_rollback(trigger);
+            }
+            baseline_sum_ms = baseline_sum_ms.saturating_add(sample.baseline_rch_latency_ms);
+            canary_sum_ms = canary_sum_ms.saturating_add(sample.canary_rabs_latency_ms);
+        }
+
+        if samples.len() < self.min_required_samples {
+            return self.quarantine_and_rollback(CanaryIncidentTrigger::PerformanceRegression);
+        }
+
+        if baseline_sum_ms > 0
+            && canary_sum_ms.saturating_mul(1_000)
+                > baseline_sum_ms.saturating_mul(u64::from(self.max_latency_ratio_permille))
+        {
+            return self.quarantine_and_rollback(CanaryIncidentTrigger::PerformanceRegression);
+        }
+
+        self.mode_matrix.transition_default_mode(target_mode);
+        CanaryOrchestrationOutcome::Promoted {
+            promoted_to: target_mode,
+            samples_evaluated: samples.len(),
+        }
+    }
+
+    /// Quarantine canary workers and execute a one-command rollback to the prior mode.
+    pub fn quarantine_and_rollback(
+        &mut self,
+        trigger: CanaryIncidentTrigger,
+    ) -> CanaryOrchestrationOutcome {
+        for &worker_id in &self.canary_worker_ids {
+            if !self.quarantined_worker_ids.contains(&worker_id) {
+                self.quarantined_worker_ids.push(worker_id);
+            }
+        }
+        let restored_mode = self.mode_matrix.execute_one_command_rollback();
+        CanaryOrchestrationOutcome::QuarantinedAndRolledBack {
+            trigger,
+            restored_mode,
+            quarantined_workers: self.quarantined_worker_ids.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +607,148 @@ mod tests {
             schema_fingerprint: _,
             wrapper_contract: _,
         } = node(1, 6); // a new field lands here for review first
+    }
+
+    #[test]
+    fn r012_canary_orchestration_feature_modes_and_one_command_rollback_rehearsed() {
+        assert_eq!(ALL_FEATURE_MODES.len(), 14);
+        for mode in ALL_FEATURE_MODES {
+            assert_eq!(RabsFeatureMode::from_token(mode.as_str()), Some(mode));
+        }
+
+        let mut matrix = ScopedFeatureModeMatrix {
+            default_mode: RabsFeatureMode::ShadowExecute,
+            prior_default_mode: RabsFeatureMode::ShadowKey,
+            overrides: Vec::new(),
+            prior_overrides: Vec::new(),
+        };
+        matrix.set_scoped_override(
+            FeatureModeScope::Repo("repo-alpha".to_owned()),
+            RabsFeatureMode::ServeDependencies,
+        );
+        matrix.set_scoped_override(
+            FeatureModeScope::ActionClass(ActionClass::RustcWorkspaceCompile),
+            RabsFeatureMode::ServeSelectedWorkspace,
+        );
+        matrix.set_scoped_override(
+            FeatureModeScope::TrustTier(TrustEvidenceTier::ReproducibleCrossWorker),
+            RabsFeatureMode::ServeAllEligible,
+        );
+        matrix.set_scoped_override(FeatureModeScope::Worker(99), RabsFeatureMode::RecordOnly);
+
+        // Specificity order: Worker -> TrustTier -> ActionClass -> Repo -> default.
+        assert_eq!(
+            matrix.resolve(
+                "repo-alpha",
+                ActionClass::RustcWorkspaceCompile,
+                99,
+                TrustEvidenceTier::ReproducibleCrossWorker,
+            ),
+            RabsFeatureMode::RecordOnly
+        );
+        assert_eq!(
+            matrix.resolve(
+                "repo-alpha",
+                ActionClass::RustcWorkspaceCompile,
+                10,
+                TrustEvidenceTier::ReproducibleCrossWorker,
+            ),
+            RabsFeatureMode::ServeAllEligible
+        );
+        assert_eq!(
+            matrix.resolve(
+                "repo-alpha",
+                ActionClass::RustcWorkspaceCompile,
+                10,
+                TrustEvidenceTier::ShadowMatched,
+            ),
+            RabsFeatureMode::ServeSelectedWorkspace
+        );
+        assert_eq!(
+            matrix.resolve(
+                "repo-alpha",
+                ActionClass::RustcDependencyCompile,
+                10,
+                TrustEvidenceTier::ShadowMatched,
+            ),
+            RabsFeatureMode::ServeDependencies
+        );
+
+        let mut orchestrator = CanaryOrchestrator {
+            canary_coordinator_id: 1,
+            canary_worker_ids: vec![101, 102],
+            quarantined_worker_ids: Vec::new(),
+            max_latency_ratio_permille: 1_050,
+            min_required_samples: 2,
+            mode_matrix: matrix,
+        };
+
+        // Low-risk dependency compiles on canary workers route first; workspace compiles do not.
+        assert!(orchestrator.should_route_to_canary(ActionClass::RustcDependencyCompile, 101));
+        assert!(!orchestrator.should_route_to_canary(ActionClass::RustcWorkspaceCompile, 101));
+        assert!(!orchestrator.should_route_to_canary(ActionClass::RustcDependencyCompile, 202));
+
+        // Clean canary samples promote to ServeDependencies.
+        let clean_samples = [
+            CanaryComparisonSample {
+                action_class: ActionClass::RustcDependencyCompile,
+                baseline_rch_latency_ms: 400,
+                canary_rabs_latency_ms: 360,
+                correctness_matched: true,
+                cleanup_incident: false,
+                corruption_incident: false,
+                identity_incident: false,
+                divergence_incident: false,
+            },
+            CanaryComparisonSample {
+                action_class: ActionClass::RustcDependencyCompile,
+                baseline_rch_latency_ms: 500,
+                canary_rabs_latency_ms: 450,
+                correctness_matched: true,
+                cleanup_incident: false,
+                corruption_incident: false,
+                identity_incident: false,
+                divergence_incident: false,
+            },
+        ];
+        assert_eq!(
+            orchestrator
+                .evaluate_and_orchestrate(&clean_samples, RabsFeatureMode::ServeDependencies),
+            CanaryOrchestrationOutcome::Promoted {
+                promoted_to: RabsFeatureMode::ServeDependencies,
+                samples_evaluated: 2,
+            }
+        );
+        assert_eq!(
+            orchestrator.mode_matrix.default_mode,
+            RabsFeatureMode::ServeDependencies
+        );
+
+        // Next canary wave encounters a divergence incident -> immediate quarantine + one-command rollback.
+        let divergence_samples = [CanaryComparisonSample {
+            action_class: ActionClass::RustcDependencyCompile,
+            baseline_rch_latency_ms: 400,
+            canary_rabs_latency_ms: 350,
+            correctness_matched: false,
+            cleanup_incident: false,
+            corruption_incident: false,
+            identity_incident: false,
+            divergence_incident: true,
+        }];
+        assert_eq!(
+            orchestrator
+                .evaluate_and_orchestrate(&divergence_samples, RabsFeatureMode::ServeAllEligible,),
+            CanaryOrchestrationOutcome::QuarantinedAndRolledBack {
+                trigger: CanaryIncidentTrigger::DivergenceIncident,
+                restored_mode: RabsFeatureMode::ShadowExecute,
+                quarantined_workers: vec![101, 102],
+            }
+        );
+        assert_eq!(
+            orchestrator.mode_matrix.default_mode,
+            RabsFeatureMode::ShadowExecute
+        );
+        // Quarantined canary workers are no longer routed canary work.
+        assert!(!orchestrator.should_route_to_canary(ActionClass::RustcDependencyCompile, 101));
     }
 }

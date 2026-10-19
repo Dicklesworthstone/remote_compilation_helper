@@ -417,4 +417,384 @@ mod tests {
         assert_eq!(edge.check_rights(42), Ok(()));
         assert_eq!(edge.honored_predecessor(), None);
     }
+
+    #[test]
+    fn j030_wire_handoff_negotiation_and_materialization_fencing_rejects_over_admitted_overlap() {
+        use crate::stateful_delivery::StatefulLaneMessage;
+
+        let mut edge = EdgeOwnership::cold_boot("edge-a", 10, 100);
+        let auth = digest(1);
+
+        // 1. Successor (incarnation 101) sends EdgeHandoffOffer naming predecessor 100:
+        let offer_out = apply_edge_handoff_wire_message(
+            &mut edge,
+            &auth,
+            50,
+            EdgeHandoffWireMessage::EdgeHandoffOffer {
+                token: token(100, 101),
+                deadline_seq: 80,
+            },
+        )
+        .expect("offer accepted");
+        assert_eq!(
+            offer_out,
+            vec![EdgeHandoffWireMessage::EdgeHandoffAccepted {
+                edge_id: "edge-a".to_owned(),
+                predecessor_incarnation: 100,
+                successor_incarnation: 101,
+                deadline_seq: 80,
+            }]
+        );
+
+        // 2. Over-admitted overlap (3rd incarnation 102 offering while 100->101 window is open)
+        //    is rejected on the wire:
+        assert_eq!(
+            apply_edge_handoff_wire_message(
+                &mut edge,
+                &auth,
+                51,
+                EdgeHandoffWireMessage::EdgeHandoffOffer {
+                    token: token(100, 102),
+                    deadline_seq: 90,
+                },
+            ),
+            Err(FenceError::HandoffAlreadyActive)
+        );
+
+        // 3. Before EdgeIncarnationFenced is emitted, predecessor 100 STILL owns materialization
+        //    rights alone; successor 101 is fenced from materializing!
+        assert_eq!(verify_materialization_fenced_write(&edge, 100), Ok(()));
+        assert_eq!(
+            verify_materialization_fenced_write(&edge, 101),
+            Err(FenceError::NotSoleOwner {
+                incarnation: 101,
+                owner: 100,
+            })
+        );
+
+        // 4. Predecessor 100 reports its frontier on the wire; completion still waits for 101:
+        let pred_out = apply_edge_handoff_wire_message(
+            &mut edge,
+            &auth,
+            52,
+            EdgeHandoffWireMessage::EdgeFrontierReconcileReport {
+                edge_id: "edge-a".to_owned(),
+                reporting_incarnation: 100,
+                transcript_frontier_seq: 1,
+                stateful_lane_state: StatefulLaneMessage::SubscriberStatefulAcknowledged { seq: 1 },
+            },
+        )
+        .expect("predecessor report accepted");
+        assert!(pred_out.is_empty(), "waiting for successor report");
+
+        // 5. Successor 101 reports its reconciled frontier -> emits EdgeIncarnationFenced FIRST,
+        //    followed by EdgeHandoffCompleted!
+        let complete_out = apply_edge_handoff_wire_message(
+            &mut edge,
+            &auth,
+            55,
+            EdgeHandoffWireMessage::EdgeFrontierReconcileReport {
+                edge_id: "edge-a".to_owned(),
+                reporting_incarnation: 101,
+                transcript_frontier_seq: 1,
+                stateful_lane_state: StatefulLaneMessage::SubscriberStatefulAcknowledged { seq: 1 },
+            },
+        )
+        .expect("handoff completes once both report");
+        assert_eq!(
+            complete_out,
+            vec![
+                EdgeHandoffWireMessage::EdgeIncarnationFenced {
+                    record: EdgeIncarnationFenceRecord {
+                        edge_id: "edge-a".to_owned(),
+                        boot_generation: 11,
+                        owner_incarnation: 101,
+                        fenced_incarnation: 100,
+                        session_set: vec![10, 11],
+                        fenced_at_seq: 55,
+                    },
+                },
+                EdgeHandoffWireMessage::EdgeHandoffCompleted {
+                    edge_id: "edge-a".to_owned(),
+                    boot_generation: 11,
+                    sole_owner_incarnation: 101,
+                    fenced_predecessor_incarnation: 100,
+                },
+            ]
+        );
+
+        // 6. After EdgeIncarnationFenced, predecessor 100 is permanently fenced from
+        //    materializing and successor 101 owns materialization rights alone!
+        assert_eq!(
+            verify_materialization_fenced_write(&edge, 100),
+            Err(FenceError::NotSoleOwner {
+                incarnation: 100,
+                owner: 101,
+            })
+        );
+        assert_eq!(verify_materialization_fenced_write(&edge, 101), Ok(()));
+    }
+
+    #[test]
+    fn t046_transcript_stateful_delivery_and_edge_handoff_fencing_reconnect_fixture_suite() {
+        use crate::stateful_delivery::{
+            DeliveryEngine, DeliveryItemKind, DeliveryPlan, StatefulAckOutcome,
+            StatefulLaneMessage, VisibleWorld, edge_apply_stateful_ack, edge_complete_message,
+            wrapper_uncertainty_message,
+        };
+
+        // Plan: seq 1 = Transcript, seq 2 = StatefulWrite, seq 3 = Terminal
+        let plan = DeliveryPlan::new(vec![
+            DeliveryItemKind::Transcript,
+            DeliveryItemKind::StatefulWrite,
+            DeliveryItemKind::Terminal,
+        ])
+        .expect("valid plan");
+
+        let mut world = VisibleWorld::default();
+        let mut pred_engine = DeliveryEngine::new(plan);
+        let mut edge = EdgeOwnership::cold_boot("edge-a", 1, 500);
+        let auth = digest(1);
+
+        // Step 1: Predecessor incarnation 500 delivers transcript seq 1 and gets ack.
+        pred_engine.begin_expose(1, &mut world).expect("expose 1");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut pred_engine, 1),
+            Ok(StatefulAckOutcome::Acknowledged)
+        );
+
+        // Step 2: Predecessor records write-ahead intent for stateful item seq 2 and exposes it,
+        //         then edge handoff to successor incarnation 501 begins BEFORE seq 2's ack arrives!
+        pred_engine.record_intent(2).expect("intent 2");
+        pred_engine
+            .begin_expose(2, &mut world)
+            .expect("expose 2 lands in visible world");
+
+        let crashed_state = pred_engine.crash();
+        let reconnect_wire_msg = wrapper_uncertainty_message(&crashed_state);
+        assert_eq!(
+            reconnect_wire_msg,
+            StatefulLaneMessage::SubscriberStatefulDeliveryUncertain {
+                last_acked_seq: 1,
+                uncertain_seq: Some(2),
+            }
+        );
+
+        // Step 3: Handoff negotiation on the wire (500 -> 501) carries the exact
+        //         SubscriberStatefulDeliveryUncertain state without conflating it with
+        //         completion or acknowledgement!
+        apply_edge_handoff_wire_message(
+            &mut edge,
+            &auth,
+            10,
+            EdgeHandoffWireMessage::EdgeHandoffOffer {
+                token: token(500, 501),
+                deadline_seq: 20,
+            },
+        )
+        .expect("offer accepted");
+
+        apply_edge_handoff_wire_message(
+            &mut edge,
+            &auth,
+            11,
+            EdgeHandoffWireMessage::EdgeFrontierReconcileReport {
+                edge_id: "edge-a".to_owned(),
+                reporting_incarnation: 500,
+                transcript_frontier_seq: 1,
+                stateful_lane_state: reconnect_wire_msg.clone(),
+            },
+        )
+        .expect("predecessor report");
+
+        let handoff_msgs = apply_edge_handoff_wire_message(
+            &mut edge,
+            &auth,
+            12,
+            EdgeHandoffWireMessage::EdgeFrontierReconcileReport {
+                edge_id: "edge-a".to_owned(),
+                reporting_incarnation: 501,
+                transcript_frontier_seq: 1,
+                stateful_lane_state: reconnect_wire_msg,
+            },
+        )
+        .expect("successor report completes handoff");
+        assert_eq!(handoff_msgs.len(), 2);
+
+        // Step 4: Successor 501 now owns materialization rights alone, inspects destination
+        //         for uncertain seq 2 (EffectLanded), resolves without re-exposure, and
+        //         completes terminal seq 3!
+        verify_materialization_fenced_write(&edge, 501).expect("501 is sole owner");
+        let mut succ_engine = crashed_state;
+        succ_engine
+            .resolve_uncertain(world.inspect(2))
+            .expect("resolve uncertain seq 2 via destination inspection");
+        assert_eq!(succ_engine.acked_frontier(), 2);
+        assert_eq!(edge_complete_message(&succ_engine), None);
+
+        succ_engine
+            .begin_expose(3, &mut world)
+            .expect("expose terminal seq 3");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut succ_engine, 3),
+            Ok(StatefulAckOutcome::Acknowledged)
+        );
+        assert_eq!(
+            edge_complete_message(&succ_engine),
+            Some(StatefulLaneMessage::SubscriberDeliveryComplete { last_seq: 3 })
+        );
+        // Stateful item seq 2 was exposed EXACTLY once across the handoff + reconnect!
+        assert_eq!(world.exposed.iter().filter(|&&s| s == 2).count(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// J030 / T046: Edge incarnation/handoff wire messages and materialization
+// fencing (risk R118, R124)
+// ---------------------------------------------------------------------------
+
+/// Wire messages for edge incarnation handoff negotiation and fencing
+/// (beads J030, T046; risk R118).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeHandoffWireMessage {
+    /// Successor offers a coordinator-authorized [`HandoffToken`] naming the
+    /// exact predecessor incarnation and bounded deadline sequence.
+    EdgeHandoffOffer {
+        /// Coordinator-authorized handoff token.
+        token: HandoffToken,
+        /// Sequence deadline for completing the two-incarnation handoff window.
+        deadline_seq: u64,
+    },
+    /// Coordinator/edge acknowledgement that the bounded two-incarnation
+    /// handoff window is open; predecessor still owns materialization rights
+    /// until `EdgeIncarnationFenced`.
+    EdgeHandoffAccepted {
+        /// Edge identifier.
+        edge_id: String,
+        /// Predecessor incarnation that currently holds sole rights.
+        predecessor_incarnation: u128,
+        /// Successor incarnation reconciling during the window.
+        successor_incarnation: u128,
+        /// Sequence deadline for the window.
+        deadline_seq: u64,
+    },
+    /// Frontier reconciliation report from either the predecessor or successor
+    /// during the open handoff window, carrying both transcript and stateful
+    /// delivery lane truth (beads J030, J031, T046).
+    EdgeFrontierReconcileReport {
+        /// Edge identifier.
+        edge_id: String,
+        /// Incarnation reporting its frontier (`predecessor` or `successor`).
+        reporting_incarnation: u128,
+        /// Last delivered transcript sequence number.
+        transcript_frontier_seq: u64,
+        /// Explicit stateful-lane wire message (`SubscriberStatefulCommitIntent`,
+        /// `SubscriberStatefulAcknowledged`, `SubscriberStatefulDeliveryUncertain`,
+        /// or `SubscriberDeliveryComplete`).
+        stateful_lane_state: crate::stateful_delivery::StatefulLaneMessage,
+    },
+    /// Durable fence message emitted BEFORE the successor assumes sole
+    /// subscriber/materialization rights (bead J030).
+    EdgeIncarnationFenced {
+        /// Durable fence record naming the fenced predecessor and new owner.
+        record: EdgeIncarnationFenceRecord,
+    },
+    /// Final handoff completion message emitted immediately after
+    /// [`Self::EdgeIncarnationFenced`].
+    EdgeHandoffCompleted {
+        /// Edge identifier.
+        edge_id: String,
+        /// Advanced boot generation.
+        boot_generation: u64,
+        /// Successor incarnation that now owns materialization rights alone.
+        sole_owner_incarnation: u128,
+        /// Predecessor incarnation that was fenced out.
+        fenced_predecessor_incarnation: u128,
+    },
+}
+
+/// Verify that `incarnation` is permitted to perform a subscriber
+/// materialization write on `edge` right now (bead J030).
+///
+/// During an open handoff window before [`EdgeHandoffWireMessage::EdgeIncarnationFenced`],
+/// only the predecessor passes; after [`EdgeHandoffWireMessage::EdgeIncarnationFenced`],
+/// only the successor passes.
+///
+/// # Errors
+/// Returns [`FenceError::NotSoleOwner`] if `incarnation` is not the active sole
+/// owner.
+pub const fn verify_materialization_fenced_write(
+    edge: &EdgeOwnership,
+    incarnation: u128,
+) -> Result<(), FenceError> {
+    edge.check_rights(incarnation)
+}
+
+/// Apply an incoming [`EdgeHandoffWireMessage`] to `edge` and return the
+/// resulting outbound wire messages in strict causal order (beads J030, T046).
+///
+/// When both the predecessor and successor have submitted their
+/// [`EdgeHandoffWireMessage::EdgeFrontierReconcileReport`] within the deadline,
+/// this function completes the handoff and emits
+/// `[EdgeIncarnationFenced, EdgeHandoffCompleted]` so the predecessor is always
+/// fenced before the successor owns materialization rights alone.
+///
+/// # Errors
+/// Returns [`FenceError`] on any unauthorized, mismatched, expired, or
+/// over-admitted overlap message.
+pub fn apply_edge_handoff_wire_message(
+    edge: &mut EdgeOwnership,
+    active_authority: &TypedDigest,
+    current_seq: u64,
+    message: EdgeHandoffWireMessage,
+) -> Result<Vec<EdgeHandoffWireMessage>, FenceError> {
+    match message {
+        EdgeHandoffWireMessage::EdgeHandoffOffer {
+            token,
+            deadline_seq,
+        } => {
+            let edge_id = token.edge_id.clone();
+            let predecessor_incarnation = token.predecessor_incarnation;
+            let successor_incarnation = token.successor_incarnation;
+            edge.begin_handoff(token, active_authority, deadline_seq)?;
+            Ok(vec![EdgeHandoffWireMessage::EdgeHandoffAccepted {
+                edge_id,
+                predecessor_incarnation,
+                successor_incarnation,
+                deadline_seq,
+            }])
+        }
+        EdgeHandoffWireMessage::EdgeFrontierReconcileReport {
+            edge_id,
+            reporting_incarnation,
+            ..
+        } => {
+            if edge_id != edge.edge_id {
+                return Err(FenceError::WrongEdge);
+            }
+            edge.report_frontier(reporting_incarnation)?;
+            let both_reported = edge
+                .handoff
+                .as_ref()
+                .is_some_and(|h| h.predecessor_reported && h.successor_reported);
+            if both_reported {
+                let record = edge.complete_handoff(current_seq)?;
+                let completed = EdgeHandoffWireMessage::EdgeHandoffCompleted {
+                    edge_id: record.edge_id.clone(),
+                    boot_generation: record.boot_generation,
+                    sole_owner_incarnation: record.owner_incarnation,
+                    fenced_predecessor_incarnation: record.fenced_incarnation,
+                };
+                Ok(vec![
+                    EdgeHandoffWireMessage::EdgeIncarnationFenced { record },
+                    completed,
+                ])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        EdgeHandoffWireMessage::EdgeHandoffAccepted { .. }
+        | EdgeHandoffWireMessage::EdgeIncarnationFenced { .. }
+        | EdgeHandoffWireMessage::EdgeHandoffCompleted { .. } => Ok(Vec::new()),
+    }
 }
