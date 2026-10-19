@@ -269,6 +269,24 @@ fn waiting_for_admission(lease: &DurableJobLease, owner_alive: bool) -> Result<b
     Ok(true)
 }
 
+/// A spent `--timeout-secs` budget is a timeout, not corrupted internal state
+/// (#112). The journal and every recorded publication are kept and nothing
+/// was replayed, so the remedy is a larger budget, not the generic RCH-E504
+/// advice to restart the daemon and clear lock files.
+#[cfg(unix)]
+fn job_deadline_error(detail: String) -> anyhow::Error {
+    let mut error =
+        rch_common::ApiError::from_code(rch_common::ErrorCode::BuildTimeout).with_details(detail);
+    error.remediation = vec![
+        "Nothing was replayed and the job journal is retained; progress already recorded is kept"
+            .to_owned(),
+        "Rerun the same `rch jobs recover <wrapper-id>` or `rch jobs attach <wrapper-id>` with a larger --timeout-secs; a large artifact set can take minutes to publish"
+            .to_owned(),
+        "Run `rch jobs` to see the job's current phase".to_owned(),
+    ];
+    error.into()
+}
+
 /// Bound the whole observation/recovery operation, not each IPC request
 /// independently. An expired deadline must not even poll a mutating future.
 #[cfg(unix)]
@@ -277,25 +295,27 @@ async fn within_job_deadline<T>(
     operation: &str,
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
-    anyhow::ensure!(
-        Instant::now() < deadline,
-        "same-id job deadline elapsed before {operation}; journal retained; no command replayed"
-    );
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
-        .await
-        .with_context(|| {
-            format!(
-                "same-id job deadline elapsed during {operation}; journal retained; no command replayed"
-            )
-        })?
+    if Instant::now() >= deadline {
+        return Err(job_deadline_error(format!(
+            "same-id job deadline elapsed before {operation}; journal retained; no command replayed"
+        )));
+    }
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(job_deadline_error(format!(
+            "same-id job deadline elapsed during {operation}; journal retained; no command replayed"
+        ))),
+    }
 }
 
 #[cfg(unix)]
 async fn wait_for_job_poll(deadline: Instant) -> Result<()> {
-    anyhow::ensure!(
-        Instant::now() < deadline,
-        "same-id job is still pending; no command replayed (use jobs cancel or recover)"
-    );
+    if Instant::now() >= deadline {
+        return Err(job_deadline_error(
+            "same-id job is still pending; no command replayed (use jobs cancel or recover)"
+                .to_owned(),
+        ));
+    }
     // Never oversleep a short remaining budget. The next iteration can still
     // observe an already-persisted terminal acknowledgement at the boundary.
     let wake = (Instant::now() + Duration::from_secs(1)).min(deadline);
@@ -1300,6 +1320,45 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("deadline elapsed during job status"));
         assert!(error.contains("journal retained"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spent_job_deadline_is_a_typed_timeout_not_internal_state() {
+        // #112: `rch jobs recover --timeout-secs` running out mid-publication
+        // was reported as RCH-E504 "Unexpected internal state" with advice to
+        // restart the daemon and clear lock files.
+        let stalled = within_job_deadline(
+            Instant::now() + Duration::from_millis(10),
+            "artifact recovery",
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        let expired = within_job_deadline(Instant::now(), "artifact recovery", async { Ok(()) })
+            .await
+            .unwrap_err();
+        let still_pending = wait_for_job_poll(Instant::now()).await.unwrap_err();
+        for error in [stalled, expired, still_pending] {
+            let api = crate::top_level_api_error(&error);
+            assert_eq!(api.code, "RCH-E303", "{error:#}");
+            assert!(
+                api.remediation
+                    .iter()
+                    .any(|step| step.contains("larger --timeout-secs")),
+                "{:?}",
+                api.remediation
+            );
+            assert!(
+                !api.remediation
+                    .iter()
+                    .any(|step| step.contains("Restart the daemon")),
+                "{:?}",
+                api.remediation
+            );
+            let details = api.details.unwrap_or_default();
+            assert!(details.contains("no command replayed"), "{details}");
+        }
     }
 
     #[cfg(unix)]
