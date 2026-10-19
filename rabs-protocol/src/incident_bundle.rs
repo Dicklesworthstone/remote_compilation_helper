@@ -701,6 +701,154 @@ pub fn verify_required_documentation_set(
     Ok(())
 }
 
+// ============================================================================
+// Bead T012: Automated failing-trace minimization (lab, chaos, differential)
+// ============================================================================
+
+/// Suite classes producing failing traces eligible for automated minimization (bead T012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailingTraceSuiteClass {
+    /// Deterministic lab scenario (virtual time, interleaving schedule).
+    LabScenario,
+    /// Chaos kill/restart injection scenario.
+    ChaosKill,
+    /// Stock-vs-RABS differential divergence scenario.
+    DifferentialDivergence,
+}
+
+/// Un-minimized failing trace input carrying T053 seed, causal IDs, input manifest,
+/// invocation args, and action/message trace (bead T012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailingTraceCandidate {
+    /// Suite class that produced the failure.
+    pub suite_class: FailingTraceSuiteClass,
+    /// Associated incident class for archiving.
+    pub incident_class: IncidentClass,
+    /// Deterministic replay seed (from T053 structured log).
+    pub replay_seed: u64,
+    /// Originating causal trace IDs.
+    pub causal_ids: Vec<u64>,
+    /// Input manifest entry digests (`[u8; 32]`).
+    pub input_manifest_entries: Vec<[u8; 32]>,
+    /// Normalized invocation argument tokens.
+    pub invocation_args: Vec<String>,
+    /// Ordered sequence of action/message event IDs in the trace.
+    pub trace_events: Vec<u64>,
+}
+
+/// Archived minimized reproduction bundled alongside an [`IncidentBundle`] (bead T012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinimizedTraceArchive {
+    /// Suite class of the minimized failure.
+    pub suite_class: FailingTraceSuiteClass,
+    /// Deterministic replay seed preserved for instant reproduction.
+    pub replay_seed: u64,
+    /// Preserved causal IDs.
+    pub causal_ids: Vec<u64>,
+    /// Bisected minimal input manifest entries required to reproduce the failure.
+    pub minimal_input_manifest: Vec<[u8; 32]>,
+    /// Shrunk invocation argument tokens required to reproduce the failure.
+    pub minimal_invocation_args: Vec<String>,
+    /// Reduced action/message event trace required to reproduce the failure.
+    pub minimal_trace_events: Vec<u64>,
+    /// Number of reduction/re-verification steps executed.
+    pub reduction_steps: u32,
+    /// Paired [`IncidentBundle`] archived alongside the minimized trace.
+    pub incident_bundle: IncidentBundle,
+}
+
+/// Automatically minimize a [`FailingTraceCandidate`] via delta-debugging bisection over
+/// the input manifest, invocation arguments, and action/message trace, re-verifying
+/// deterministic reproduction at every step and archiving alongside an [`IncidentBundle`] (bead T012).
+pub fn minimize_failing_trace_and_archive<F>(
+    candidate: &FailingTraceCandidate,
+    generated_at_seq: u64,
+    mut reproduces: F,
+) -> Option<MinimizedTraceArchive>
+where
+    F: FnMut(&[[u8; 32]], &[String], &[u64]) -> bool,
+{
+    if !reproduces(
+        &candidate.input_manifest_entries,
+        &candidate.invocation_args,
+        &candidate.trace_events,
+    ) {
+        return None;
+    }
+
+    let mut reduction_steps = 0_u32;
+
+    // 1. Bisect / delta-debug the input manifest entries.
+    let mut inputs = candidate.input_manifest_entries.clone();
+    let mut chunk_size = inputs.len() / 2;
+    while chunk_size > 0 {
+        let mut idx = 0;
+        let mut reduced = false;
+        while idx < inputs.len() {
+            let end = (idx + chunk_size).min(inputs.len());
+            let mut trial = inputs.clone();
+            trial.drain(idx..end);
+            reduction_steps = reduction_steps.saturating_add(1);
+            if !trial.is_empty()
+                && reproduces(&trial, &candidate.invocation_args, &candidate.trace_events)
+            {
+                inputs = trial;
+                reduced = true;
+            } else {
+                idx += chunk_size;
+            }
+        }
+        if !reduced {
+            chunk_size /= 2;
+        }
+    }
+
+    // 2. Shrink invocation arguments one-by-one while preserving reproduction.
+    let mut args = candidate.invocation_args.clone();
+    let mut i = 0;
+    while i < args.len() {
+        let mut trial = args.clone();
+        trial.remove(i);
+        reduction_steps = reduction_steps.saturating_add(1);
+        if !trial.is_empty() && reproduces(&inputs, &trial, &candidate.trace_events) {
+            args = trial;
+        } else {
+            i += 1;
+        }
+    }
+
+    // 3. Drop uninvolved actions/messages from the event trace while preserving reproduction.
+    let mut events = candidate.trace_events.clone();
+    let mut j = 0;
+    while j < events.len() {
+        let mut trial = events.clone();
+        trial.remove(j);
+        reduction_steps = reduction_steps.saturating_add(1);
+        if !trial.is_empty() && reproduces(&inputs, &args, &trial) {
+            events = trial;
+        } else {
+            j += 1;
+        }
+    }
+
+    let incident_bundle = generate_bundle(
+        candidate.incident_class,
+        generated_at_seq,
+        candidate.causal_ids.clone(),
+    );
+
+    Some(MinimizedTraceArchive {
+        suite_class: candidate.suite_class,
+        replay_seed: candidate.replay_seed,
+        causal_ids: candidate.causal_ids.clone(),
+        minimal_input_manifest: inputs,
+        minimal_invocation_args: args,
+        minimal_trace_events: events,
+        reduction_steps,
+        incident_bundle,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +961,80 @@ mod tests {
                 documented_fingerprint: DOCUMENTED_SCHEMA_FINGERPRINT,
             })
         );
+    }
+
+    #[test]
+    fn t012_automated_failing_trace_minimization_across_lab_chaos_and_differential_suites() {
+        let suites = [
+            (
+                FailingTraceSuiteClass::LabScenario,
+                IncidentClass::CancellationHang,
+                [0x11_u8; 32],
+                "--cfg=lab_deadlock",
+                404_u64,
+            ),
+            (
+                FailingTraceSuiteClass::ChaosKill,
+                IncidentClass::PublicationFenceViolation,
+                [0x22_u8; 32],
+                "--chaos-kill=publish",
+                505_u64,
+            ),
+            (
+                FailingTraceSuiteClass::DifferentialDivergence,
+                IncidentClass::IncorrectResultDivergence,
+                [0x33_u8; 32],
+                "-Copt-level=3",
+                606_u64,
+            ),
+        ];
+
+        for (suite_class, incident_class, trigger_input, trigger_arg, trigger_event) in suites {
+            let mut input_manifest_entries: Vec<[u8; 32]> = (1..=16_u8).map(|b| [b; 32]).collect();
+            input_manifest_entries.push(trigger_input);
+
+            let invocation_args = vec![
+                "rustc".to_owned(),
+                "--edition=2024".to_owned(),
+                "-Wunused".to_owned(),
+                trigger_arg.to_owned(),
+                "src/lib.rs".to_owned(),
+            ];
+
+            let mut trace_events: Vec<u64> = (100..120).collect();
+            trace_events.push(trigger_event);
+
+            let candidate = FailingTraceCandidate {
+                suite_class,
+                incident_class,
+                replay_seed: 0xDEAD_BEEF_CAFE_0001,
+                causal_ids: vec![9001, 9002],
+                input_manifest_entries,
+                invocation_args,
+                trace_events,
+            };
+
+            let archive =
+                minimize_failing_trace_and_archive(&candidate, 77, |inputs, args, evs| {
+                    inputs.contains(&trigger_input)
+                        && args.iter().any(|a| a == trigger_arg)
+                        && evs.contains(&trigger_event)
+                })
+                .expect("seeded failure reproduces and minimizes");
+
+            assert_eq!(archive.suite_class, suite_class);
+            assert_eq!(archive.minimal_input_manifest, vec![trigger_input]);
+            assert_eq!(
+                archive.minimal_invocation_args,
+                vec![trigger_arg.to_owned()]
+            );
+            assert_eq!(archive.minimal_trace_events, vec![trigger_event]);
+            assert!(archive.reduction_steps > 0);
+            assert_eq!(archive.incident_bundle.class, incident_class);
+            assert_eq!(
+                archive.incident_bundle.involved_request_ids,
+                vec![9001, 9002]
+            );
+        }
     }
 }
