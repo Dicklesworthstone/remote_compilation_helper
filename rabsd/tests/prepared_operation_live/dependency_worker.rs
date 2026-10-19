@@ -1,4 +1,4 @@
-//! Real daemon/worker/TLS oracle for the dependency-exec-v2 contract.
+//! Real daemon/worker/TLS oracle for the dependency-exec-v3 contract.
 //!
 //! Run on Linux with usable bubblewrap/user namespaces and OpenSSL:
 //!
@@ -169,6 +169,7 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
             "out_dir":out,
             "dependency_dirs":[out, empty_search],
             "loader_dirs":[out, loader_parent],
+            "artifact_roots":[],
             "env":environment,
             "runtime_cohort_sha256":cohort_hex,
         },
@@ -199,6 +200,26 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
     }
     assert!(request["toolchain_transfer"].is_string());
     assert!(request["toolchain_identity"].is_object());
+    assert_eq!(
+        request["source_manifest"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        FILES
+            .iter()
+            .map(|(path, _)| format!("package/{path}"))
+            .collect::<Vec<_>>(),
+        "v3 seals one package projection without changing visible source paths"
+    );
+    for (relative, bytes) in FILES {
+        assert_eq!(
+            fs::read(job.bundle.join("source/package").join(relative)).unwrap(),
+            bytes,
+            "the prepared bundle must retain the exact package bytes"
+        );
+    }
 
     // Prepared operations consume their retained source owner. A mutable source
     // change cannot sneak into the remotely executed request after preparation.

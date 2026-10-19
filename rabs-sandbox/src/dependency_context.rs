@@ -17,13 +17,21 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
-pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v2";
+pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v3";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
-/// Maximum empty dependency search roots accepted in this initial leaf mode.
+/// Maximum dependency search roots accepted in this bounded execution mode.
 pub const MAX_DEPENDENCY_DIRS: usize = 64;
 
-/// Validated original paths and complete environment for one leaf rustc action.
+/// One retained candidate directory, mapped by its first-use dependency index.
+/// The prefix names only a subtree of the sealed source-transfer bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyArtifactRoot {
+    pub path: String,
+    pub prefix: String,
+}
+
+/// Validated original paths and complete environment for one rustc action.
 /// Physical source, toolchain, output and jobserver backings never appear here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyExecContext {
@@ -34,6 +42,7 @@ pub struct DependencyExecContext {
     out_dir: String,
     dependency_dirs: Vec<String>,
     loader_dirs: Vec<String>,
+    artifact_roots: Vec<DependencyArtifactRoot>,
     env: Vec<(String, String)>,
     runtime_cohort_sha256: [u8; 32],
 }
@@ -116,8 +125,39 @@ impl DependencyExecContext {
         toolchain_root: String,
         compiler: String,
         out_dir: String,
-        mut dependency_dirs: Vec<String>,
+        dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_with_artifacts(
+            source_root,
+            cwd,
+            toolchain_root,
+            compiler,
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            Vec::new(),
+            env,
+            runtime_cohort_sha256,
+        )
+    }
+
+    /// Include exact retained Rust metadata/archive candidate directories.
+    /// Directory order is invocation first-use order, so each retained prefix
+    /// has the same identity as the keyed inventory and the source upload.
+    /// Populated search roots must be disjoint from the writable output root.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_artifacts(
+        source_root: String,
+        cwd: String,
+        toolchain_root: String,
+        compiler: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
         mut loader_dirs: Vec<String>,
+        mut artifact_roots: Vec<DependencyArtifactRoot>,
         mut env: Vec<(String, String)>,
         runtime_cohort_sha256: [u8; 32],
     ) -> Result<Self, DependencyContextError> {
@@ -142,8 +182,7 @@ impl DependencyExecContext {
         if dependency_dirs.len() > MAX_DEPENDENCY_DIRS {
             return Err(invalid("too many dependency search directories"));
         }
-        dependency_dirs.sort();
-        if dependency_dirs.windows(2).any(|pair| pair[0] == pair[1]) {
+        if dependency_dirs.iter().collect::<BTreeSet<_>>().len() != dependency_dirs.len() {
             return Err(invalid("duplicate dependency search directory"));
         }
         for (index, directory) in dependency_dirs.iter().enumerate() {
@@ -157,6 +196,25 @@ impl DependencyExecContext {
                     .any(|other| overlaps(Path::new(directory), Path::new(other)))
             {
                 return Err(invalid("dependency search directory shadows another mount"));
+            }
+        }
+        if artifact_roots.len() > MAX_DEPENDENCY_DIRS {
+            return Err(invalid("too many retained dependency artifact roots"));
+        }
+        artifact_roots.sort_by(|left, right| left.path.cmp(&right.path));
+        if artifact_roots.windows(2).any(|pair| pair[0].path == pair[1].path) {
+            return Err(invalid("duplicate retained dependency artifact root"));
+        }
+        for artifact in &artifact_roots {
+            let Some(index) = dependency_dirs.iter().position(|path| path == &artifact.path) else {
+                return Err(invalid("artifact root is not a declared dependency directory"));
+            };
+            if artifact.path == out_dir
+                || artifact.prefix != format!("dependencies/{index:04}")
+            {
+                return Err(invalid(
+                    "artifact root has a wrong prefix or overlaps the writable output",
+                ));
             }
         }
         if loader_dirs.len() > MAX_DEPENDENCY_DIRS {
@@ -216,6 +274,7 @@ impl DependencyExecContext {
             out_dir,
             dependency_dirs,
             loader_dirs,
+            artifact_roots,
             env,
             runtime_cohort_sha256,
         };
@@ -244,13 +303,17 @@ impl DependencyExecContext {
     pub fn out_dir(&self) -> &str {
         &self.out_dir
     }
-    /// Empty dependency search directories, including an optional output alias.
+    /// Dependency search directories in invocation first-use order.
     pub fn dependency_dirs(&self) -> &[String] {
         &self.dependency_dirs
     }
     /// Explicitly observed empty loader roots, including supported parents.
     pub fn loader_dirs(&self) -> &[String] {
         &self.loader_dirs
+    }
+    /// Exact retained candidate roots, paired with their sealed bundle prefixes.
+    pub fn artifact_roots(&self) -> &[DependencyArtifactRoot] {
+        &self.artifact_roots
     }
     /// Full exact environment before worker-local descriptor coordination.
     pub fn env(&self) -> &[(String, String)] {
@@ -299,7 +362,10 @@ impl DependencyExecContext {
             .iter()
             .chain(&self.loader_dirs)
             .map(String::as_str)
-            .filter(|path| *path != self.out_dir.as_str())
+            .filter(|path| {
+                *path != self.out_dir.as_str()
+                    && !self.artifact_roots.iter().any(|root| root.path == *path)
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -334,6 +400,7 @@ impl DependencyExecContext {
                 .iter()
                 .copied()
                 .chain(std::iter::once(self.out_dir.as_str()))
+                .chain(self.artifact_roots.iter().map(|root| root.path.as_str()))
             {
                 if let Ok(relative) = Path::new(child).strip_prefix(*alias)
                     && !relative.as_os_str().is_empty()
@@ -379,6 +446,19 @@ impl DependencyExecContext {
             Bind::new(source_backing, &self.source_root),
             Bind::new(toolchain_backing, &self.toolchain_root),
         ];
+        if !self.artifact_roots.is_empty() {
+            if source_backing.file_name() != Some(std::ffi::OsStr::new("package")) {
+                return Err(invalid("dependency source is not a sealed package bundle"));
+            }
+            let bundle = source_backing
+                .parent()
+                .ok_or_else(|| invalid("dependency bundle parent is missing"))?;
+            spec.ro_binds.extend(
+                self.artifact_roots
+                    .iter()
+                    .map(|root| Bind::new(bundle.join(&root.prefix), &root.path)),
+            );
+        }
         spec.ro_binds.extend(
             self.empty_aliases()
                 .into_iter()
@@ -412,6 +492,7 @@ pub fn build_dependency_argv(
     ]
     .into_iter()
     .chain(context.empty_aliases())
+    .chain(context.artifact_roots.iter().map(|root| root.path.as_str()))
     .map(PathBuf::from)
     .collect();
     let expected_rw =
@@ -563,6 +644,103 @@ mod tests {
             .is_err()
         );
         assert!(launch.boundary.net_isolated);
+    }
+
+    #[test]
+    fn retained_candidate_roots_bind_first_use_prefixes_without_reordering_inputs() {
+        let directories = vec!["/target/z-first".to_owned(), "/target/a-second".to_owned()];
+        let roots = vec![
+            DependencyArtifactRoot {
+                path: directories[0].clone(),
+                prefix: "dependencies/0000".to_owned(),
+            },
+            DependencyArtifactRoot {
+                path: directories[1].clone(),
+                prefix: "dependencies/0001".to_owned(),
+            },
+        ];
+        let make = |artifact_roots| {
+            DependencyExecContext::new_with_artifacts(
+                "/source/package".to_owned(),
+                "/source/package".to_owned(),
+                "/toolchains/pinned".to_owned(),
+                "/toolchains/pinned/bin/rustc".to_owned(),
+                "/target/output".to_owned(),
+                directories.clone(),
+                vec!["/target".to_owned()],
+                artifact_roots,
+                Vec::new(),
+                [7; 32],
+            )
+        };
+        let context = make(roots.clone()).unwrap();
+        assert_eq!(context.dependency_dirs(), directories.as_slice());
+        assert_eq!(context.artifact_roots()[0], roots[1]);
+        assert_eq!(context.artifact_roots()[1], roots[0]);
+        let empty = tempfile::tempdir().unwrap();
+        context.prepare_empty_backings(empty.path()).unwrap();
+        for child in ["z-first", "a-second", "output"] {
+            assert!(empty.path().join("search-0000").join(child).is_dir());
+        }
+        let spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                empty.path(),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        for root in &roots {
+            assert!(spec.ro_binds.iter().any(|bind| {
+                bind.visible == Path::new(&root.path)
+                    && bind.backing == Path::new("/private/bundle").join(&root.prefix)
+            }));
+            assert!(!spec.rw_binds.iter().any(|bind| {
+                overlaps(&bind.visible, Path::new(&root.path))
+            }));
+        }
+        let support = HostIsolationSupport {
+            bubblewrap: Some("test".into()),
+            unprivileged_userns: true,
+            overlayfs: false,
+            cgroup_v2: false,
+            landlock: false,
+        };
+        build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).unwrap();
+        for invalid in [
+            vec![DependencyArtifactRoot {
+                path: directories[0].clone(),
+                prefix: "dependencies/0001".to_owned(),
+            }],
+            vec![DependencyArtifactRoot {
+                path: "/target/unowned".to_owned(),
+                prefix: "dependencies/0000".to_owned(),
+            }],
+            vec![DependencyArtifactRoot {
+                path: directories[0].clone(),
+                prefix: "dependencies/../package".to_owned(),
+            }],
+            vec![roots[0].clone(), roots[0].clone()],
+        ] {
+            assert!(make(invalid).is_err());
+        }
+        assert!(DependencyExecContext::new_with_artifacts(
+            "/source/package".to_owned(),
+            "/source/package".to_owned(),
+            "/toolchains/pinned".to_owned(),
+            "/toolchains/pinned/bin/rustc".to_owned(),
+            "/target/output".to_owned(),
+            vec!["/target/output".to_owned()],
+            Vec::new(),
+            vec![DependencyArtifactRoot {
+                path: "/target/output".to_owned(),
+                prefix: "dependencies/0000".to_owned(),
+            }],
+            Vec::new(),
+            [7; 32],
+        )
+        .is_err());
     }
 
     #[test]

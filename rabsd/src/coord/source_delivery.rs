@@ -256,6 +256,21 @@ pub fn prepare_source_bundle(
         })
         .transpose()?;
     let mut upload = inputs.capture()?;
+    if let Some(context) = specification.get("dependency_context") {
+        require(
+            context["version"]
+                == rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION,
+            "unsupported dependency execution context for source preparation",
+        )?;
+        require(
+            context["artifact_roots"].as_array().is_some_and(Vec::is_empty),
+            "dependency artifacts require the live keyed artifact observer",
+        )?;
+        // Operator-prepared dependency leaves use the same package prefix as
+        // live Cargo actions. Arbitrary operator paths cannot stand in for the
+        // live observer's retained and keyed dependency artifact closure.
+        upload = upload.with_dependency_artifacts(Vec::new())?;
+    }
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {

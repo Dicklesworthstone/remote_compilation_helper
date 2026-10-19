@@ -181,46 +181,129 @@ pub struct SourceOwner {
 }
 
 impl SourceOwner {
-    /// The transferred, verified source root for the original-path dependency
-    /// mode. No wire-supplied backing path or Cargo-home projection is admitted.
-    pub(crate) fn dependency_root(&self, request_id: u64) -> io::Result<&std::path::Path> {
+    /// The transferred, verified package root for original-path dependency
+    /// execution. Every other member must belong to an explicitly declared
+    /// retained artifact root; wire paths never select arbitrary host backings.
+    pub(crate) fn dependency_root(
+        &self,
+        request_id: u64,
+        context: &rabs_sandbox::dependency_context::DependencyExecContext,
+    ) -> io::Result<std::path::PathBuf> {
+        let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
         if !self.execution_owned {
             self.within_budget().map_err(io::Error::other)?;
         }
         if self.source_failed || request_id != self.request_id || self.cargo_home.is_some() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "dependency source owner is not the admitted plain source tree"));
+            return Err(refuse(
+                "dependency source owner is not the admitted plain source tree",
+            ));
         }
-        self.receiver.sealed_root().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
-            "dependency execution source is not completely verified"))
+        let bundle = self
+            .receiver
+            .sealed_root()
+            .ok_or_else(|| refuse("dependency execution source is not completely verified"))?;
+        let mut package_present = false;
+        let mut artifact_present = vec![false; context.artifact_roots().len()];
+        for file in self.receiver.manifest().files() {
+            if let Some(relative) = file.path.strip_prefix("package/") {
+                if relative.is_empty() {
+                    return Err(refuse("dependency package member has no relative path"));
+                }
+                package_present = true;
+                continue;
+            }
+            let mut declared = false;
+            for (index, root) in context.artifact_roots().iter().enumerate() {
+                let Some(name) = file
+                    .path
+                    .strip_prefix(root.prefix.as_str())
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                else {
+                    continue;
+                };
+                if name.is_empty()
+                    || name.contains('/')
+                    || !name.starts_with("lib")
+                    || !(name.ends_with(".rmeta") || name.ends_with(".rlib"))
+                    || file.executable
+                {
+                    return Err(refuse("dependency bundle contains an unsupported artifact member"));
+                }
+                artifact_present[index] = true;
+                declared = true;
+                break;
+            }
+            if !declared {
+                return Err(refuse("dependency bundle contains an unmapped member"));
+            }
+        }
+        if !package_present || artifact_present.iter().any(|present| !present) {
+            return Err(refuse("dependency bundle is missing a declared input root"));
+        }
+        let package = bundle.join("package");
+        for root in std::iter::once(package.clone())
+            .chain(context.artifact_roots().iter().map(|root| bundle.join(&root.prefix)))
+        {
+            if !std::fs::symlink_metadata(root)?.is_dir() {
+                return Err(refuse("dependency bundle root is not a retained real directory"));
+            }
+        }
+        Ok(package)
     }
 
-    /// Ensure the source alias remains read-only with no writable physical
-    /// alias. The ordinary canonical workspace method retains its fixed root.
+    /// Require the exact sealed package and artifact backings at their declared
+    /// read-only aliases, with no writable physical alias into the bundle.
     pub(crate) fn protect_dependency(
         &self,
         request_id: u64,
         context: &rabs_sandbox::dependency_context::DependencyExecContext,
         spec: &rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
     ) -> io::Result<()> {
-        let root = self.dependency_root(request_id)?;
-        let visible = std::path::Path::new(context.source_root());
-        let overlap = |left: &std::path::Path, right: &std::path::Path| left.starts_with(right) || right.starts_with(left);
+        use std::path::Path;
+        let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        let root = self.dependency_root(request_id, context)?;
+        let visible = Path::new(context.source_root());
+        let overlap = |left: &Path, right: &Path| {
+            left.starts_with(right) || right.starts_with(left)
+        };
         let mut owned = 0;
         for bind in &spec.ro_binds {
             if bind.visible == visible && bind.backing == root {
                 owned += 1;
             } else if overlap(&bind.visible, visible) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "mount shadows dependency source"));
+                return Err(refuse("mount shadows dependency source"));
             }
         }
         if owned != 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "dependency source lacks its retained read-only mount"));
+            return Err(refuse("dependency source lacks its retained read-only mount"));
         }
-        let root = std::fs::canonicalize(root)?;
+        let bundle = root
+            .parent()
+            .ok_or_else(|| refuse("dependency bundle parent is missing"))?;
+        for artifact in context.artifact_roots() {
+            let visible = Path::new(&artifact.path);
+            let backing = bundle.join(&artifact.prefix);
+            let mut owned = 0;
+            for bind in &spec.ro_binds {
+                if bind.visible == visible && bind.backing == backing {
+                    owned += 1;
+                } else if bind.visible.starts_with(visible) {
+                    return Err(refuse("mount shadows retained dependency artifacts"));
+                }
+            }
+            if owned != 1 {
+                return Err(refuse("dependency artifacts lack their retained read-only mount"));
+            }
+        }
+        let canonical_bundle = std::fs::canonicalize(bundle)?;
         for bind in &spec.rw_binds {
-            if overlap(&bind.visible, visible) || overlap(&std::fs::canonicalize(&bind.backing)?, &root) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "writable mount aliases dependency source"));
+            if overlap(&bind.visible, visible)
+                || context.artifact_roots().iter().any(|root| {
+                    overlap(&bind.visible, Path::new(&root.path))
+                })
+                || overlap(&std::fs::canonicalize(&bind.backing)?, &canonical_bundle)
+            {
+                return Err(refuse("writable mount aliases dependency input bundle"));
             }
         }
         Ok(())
@@ -713,6 +796,158 @@ mod tests {
                     false,
                 )
                 .unwrap();
+        }
+    }
+
+    fn uploaded_dependency_bundle(files: &[(&str, &[u8], bool)]) -> SourceOwner {
+        let manifest = projection(files);
+        let request = json!({
+            "kind":"canonical-exec", "request_id":91, "source_manifest":manifest,
+        });
+        let mut state = SourceTransferState::default();
+        state
+            .handle(
+                &json!({"kind":"source-begin", "request_id":91, "manifest":manifest}),
+                true,
+                false,
+            )
+            .unwrap();
+        for (path, bytes, _) in files {
+            upload(&mut state, &manifest, 91, path, bytes);
+        }
+        state.handle(&seal(&manifest, 91), true, false).unwrap();
+        state.take_prepared(&request).unwrap().unwrap()
+    }
+
+    #[test]
+    fn dependency_bundle_projects_only_owned_package_and_exact_candidate_roots() {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
+        use std::path::Path;
+
+        let owner = uploaded_dependency_bundle(&[
+            ("package/src/lib.rs", b"pub fn answer() -> u8 { 42 }\n", false),
+            ("dependencies/0000/libleaf.rmeta", b"retained metadata", false),
+            ("dependencies/0001/libarchive.rlib", b"retained archive", false),
+        ]);
+        let context = DependencyExecContext::new_with_artifacts(
+            "/source/package".to_owned(),
+            "/source/package".to_owned(),
+            "/toolchains/pinned".to_owned(),
+            "/toolchains/pinned/bin/rustc".to_owned(),
+            "/target/output".to_owned(),
+            vec!["/target/z-first".to_owned(), "/target/a-second".to_owned()],
+            vec!["/target".to_owned()],
+            vec![
+                DependencyArtifactRoot {
+                    path: "/target/z-first".to_owned(),
+                    prefix: "dependencies/0000".to_owned(),
+                },
+                DependencyArtifactRoot {
+                    path: "/target/a-second".to_owned(),
+                    prefix: "dependencies/0001".to_owned(),
+                },
+            ],
+            Vec::new(),
+            [7; 32],
+        )
+        .unwrap();
+        let package = owner.dependency_root(91, &context).unwrap();
+        assert_eq!(package.file_name().unwrap(), "package");
+        assert_eq!(
+            std::fs::read(package.join("src/lib.rs")).unwrap(),
+            b"pub fn answer() -> u8 { 42 }\n"
+        );
+        let bundle = package.parent().unwrap();
+        assert_eq!(
+            std::fs::read(bundle.join("dependencies/0000/libleaf.rmeta")).unwrap(),
+            b"retained metadata"
+        );
+        assert_eq!(
+            std::fs::read(bundle.join("dependencies/0001/libarchive.rlib")).unwrap(),
+            b"retained archive"
+        );
+        assert!(owner.dependency_root(92, &context).is_err());
+        let toolchain = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        context.prepare_empty_backings(empty.path()).unwrap();
+        let spec = context
+            .namespace(
+                &package,
+                toolchain.path(),
+                output.path(),
+                empty.path(),
+                home.path(),
+            )
+            .unwrap();
+        owner.protect_dependency(91, &context, &spec).unwrap();
+        for root in context.artifact_roots() {
+            assert!(spec.ro_binds.iter().any(|bind| {
+                bind.visible == Path::new(&root.path)
+                    && bind.backing == bundle.join(&root.prefix)
+            }));
+        }
+        let other = tempfile::tempdir().unwrap();
+        let mut redirected = spec.clone();
+        redirected
+            .ro_binds
+            .iter_mut()
+            .find(|bind| bind.visible == Path::new("/target/z-first"))
+            .unwrap()
+            .backing = other.path().to_path_buf();
+        assert!(owner.protect_dependency(91, &context, &redirected).is_err());
+        let mut writable = spec.clone();
+        writable.rw_binds[0].backing = package.clone();
+        assert!(owner.protect_dependency(91, &context, &writable).is_err());
+        let mut visible_alias = spec.clone();
+        visible_alias.rw_binds[0].visible = "/target/z-first".into();
+        assert!(owner.protect_dependency(91, &context, &visible_alias).is_err());
+        let mut shadowed = spec;
+        shadowed.ro_binds.push(Bind::new(other.path(), "/target/z-first/shadow"));
+        assert!(owner.protect_dependency(91, &context, &shadowed).is_err());
+    }
+
+    #[test]
+    fn dependency_bundle_rejects_unmapped_missing_nested_or_executable_candidates() {
+        use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
+
+        let context = DependencyExecContext::new_with_artifacts(
+            "/source/package".to_owned(),
+            "/source/package".to_owned(),
+            "/toolchains/pinned".to_owned(),
+            "/toolchains/pinned/bin/rustc".to_owned(),
+            "/target/output".to_owned(),
+            vec!["/target/dependencies".to_owned()],
+            Vec::new(),
+            vec![DependencyArtifactRoot {
+                path: "/target/dependencies".to_owned(),
+                prefix: "dependencies/0000".to_owned(),
+            }],
+            Vec::new(),
+            [7; 32],
+        )
+        .unwrap();
+        let package: (&str, &[u8], bool) = ("package/src/lib.rs", b"source", false);
+        let artifact: (&str, &[u8], bool) =
+            ("dependencies/0000/libleaf.rmeta", b"metadata", false);
+        let cases: Vec<Vec<(&str, &[u8], bool)>> = vec![
+            vec![package, ("dependencies/0001/libleaf.rmeta", b"metadata", false)],
+            vec![package, ("dependencies/0000/nested/libleaf.rmeta", b"metadata", false)],
+            vec![package, ("dependencies/0000/libleaf.so", b"dynamic", false)],
+            vec![package, ("dependencies/0000/libleaf.rmeta", b"metadata", true)],
+            vec![package],
+            vec![artifact],
+            vec![package, artifact, ("unmapped/extra", b"extra", false)],
+            vec![package, ("dependencies/0000/leaf.rmeta", b"metadata", false)],
+        ];
+        for files in cases {
+            let owner = uploaded_dependency_bundle(&files);
+            assert!(
+                owner.dependency_root(91, &context).is_err(),
+                "unsupported sealed input bundle: {files:?}"
+            );
         }
     }
 

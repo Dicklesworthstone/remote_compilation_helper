@@ -28,7 +28,9 @@ use rabs_key::live_dependency::{DependencyDirectoryFact, ToolchainFacts};
 use rabs_protocol::generation::AttemptAuthority;
 use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::OutputRole;
-use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecContext};
+use rabs_sandbox::dependency_context::{
+    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
+};
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
 use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits, capture_toolchain};
@@ -229,7 +231,16 @@ impl RemoteDependencies {
             .as_slice()
             .try_into()
             .map_err(|_| "runtime cohort digest is not SHA-256")?;
-        let context = DependencyExecContext::new_with_loader_dirs(
+        let artifact_roots = directories
+            .iter()
+            .enumerate()
+            .filter(|(_, directory)| !directory.artifacts.is_empty())
+            .map(|(index, directory)| DependencyArtifactRoot {
+                path: directory.path.clone(),
+                prefix: format!("dependencies/{index:04}"),
+            })
+            .collect();
+        let context = DependencyExecContext::new_with_artifacts(
             plan.source_root.clone(),
             plan.cwd.clone(),
             visible_root.to_owned(),
@@ -237,6 +248,7 @@ impl RemoteDependencies {
             plan.out_dir.clone(),
             plan.dependency_dirs.clone(),
             loader_witness.directories().to_vec(),
+            artifact_roots,
             plan.execution_env.clone(),
             runtime_bytes,
         )
@@ -444,12 +456,22 @@ impl PendingRemote {
             .iter()
             .map(|(path, _, _)| path.clone())
             .collect::<Vec<_>>();
+        // Capture the complete keyed candidate inventory only after private
+        // execution was accepted, on this bounded blocking lane. The observer
+        // checks every byte digest and both inventory fences; the upload then
+        // owns these bytes without reopening the caller's mutable target tree.
+        let dependency_artifacts = request
+            .dependencies
+            .retained_artifacts()
+            .map_err(settled)?;
         let upload = SourceUpload::from_snapshot(
             Arc::clone(&request.package.snapshot),
             PACKAGE_ROOT,
             &paths,
         )
+        .and_then(|upload| upload.with_dependency_artifacts(dependency_artifacts))
         .map_err(|error| settled(error.to_string()))?;
+        verify_request(&request).map_err(settled)?;
         // The worker persists a request-id high-water mark. The admission owner
         // durably allocates before sending; random ids fail on ordinary reuse.
         let request_id = reservation
@@ -623,6 +645,9 @@ fn context_value(context: &DependencyExecContext) -> Value {
         "toolchain_root":context.toolchain_root(), "compiler":context.compiler(),
         "out_dir":context.out_dir(), "dependency_dirs":context.dependency_dirs(),
         "loader_dirs":context.loader_dirs(),
+        "artifact_roots":context.artifact_roots().iter().map(|root| json!({
+            "path":root.path, "prefix":root.prefix,
+        })).collect::<Vec<_>>(),
         "env":context.env(), "runtime_cohort_sha256":hex(context.runtime_cohort_sha256()),
     })
 }

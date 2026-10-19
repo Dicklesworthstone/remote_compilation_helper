@@ -99,17 +99,40 @@ external loader libraries and filesystem profile to match the coordinator.
 Both hosts need the supported Linux isolation environment; the worker needs
 working bubblewrap and user namespaces.
 
-This initial remote class accepts metadata-only leaf dependencies:
-`--emit=dep-info,metadata`, no extern crates, build-script/generated inputs,
-native libraries or linker output, and empty dependency-artifact inventories.
-Other Cargo units continue through the ordinary local lane. The worker keeps
-the original source, output and toolchain path spellings and full compiler
-environment inside private mounts. The `dependency-exec-v2` loader policy
-supports Cargo's `target/debug/deps` and `target/debug` search paths after fresh
-bounded checks exclude loadable files, symlinks and hardware-capability
-subdirectories. These aliases receive private empty backings with only declared
-child mountpoints; the original target tree is never mounted. Unsupported
-loader paths or changing toolchain/runtime observations refuse remote admission.
+The remote class accepts metadata-only dependency actions
+(`--emit=dep-info,metadata`), including explicit `--extern name=/path/lib*.rmeta`
+and `--extern name=/path/lib*.rlib` inputs. The key covers each direct extern
+and the complete candidate inventories of every dependency search directory,
+including metadata or archives rustc can discover through transitive
+dependencies. Changing any candidate's bytes or the directory membership
+invalidates that identity. The daemon captures and verifies those exact bytes
+after the wrapper accepts private execution, then retains them throughout
+transfer without reopening mutable target paths.
+
+A populated dependency search directory must be disjoint from the action's
+output directory. Layouts sharing one populated input/output directory
+currently use the local lane. Bare toolchain externs, proc macros,
+build-script/generated inputs, native libraries and linker output also remain
+local. These limits apply to each compiler action; they do not prevent Cargo
+from continuing with other units.
+
+The worker keeps the original source, output and toolchain path spellings and
+full compiler environment inside private mounts. The `dependency-exec-v3`
+context binds an explicit list of populated dependency roots to their
+first-use directory indices. A single sealed source transfer contains
+`package/<source-path>` and `dependencies/NNNN/<artifact-basename>`; only the
+declared package and retained candidate files may appear. The worker verifies
+that inventory and mounts each populated dependency root read-only. Empty
+dependency roots and loader parents receive private empty backings with only
+declared child mountpoints. The original target tree is never mounted.
+
+Cargo's `target/debug/deps` and `target/debug` loader search paths still require
+fresh bounded checks excluding loadable files, symlinks and hardware-capability
+subdirectories. Unsupported loader paths or changing source, artifact,
+toolchain or runtime observations refuse remote admission or installation.
+The launcher requires a daemon advertising `dependency-exec-v3`; old execution
+contexts cannot admit new work. Already sealed results from older contexts can
+still resume against their exact saved request fingerprint.
 
 A successful remote primary producer does not run a duplicate local compile.
 Publication and installation still check the exact request, outputs, current

@@ -363,8 +363,10 @@ fn main() {
 }
 
 /// A real rustc invocation, retained source owner, pinned toolchain lease,
-/// private output capture and bubblewrap alias namespace. This exercises the
-/// worker executor; the authenticated transport is covered by its session tests.
+/// private output capture and the dependency-exec-v3 alias namespace. The sealed
+/// source bundle uses package/ while rustc retains its original source paths.
+/// This exercises the worker executor; authenticated transport is covered by
+/// its session tests.
 #[test]
 fn real_dependency_rustc_preserves_paths_env_and_stock_metadata() {
     use rabs_sandbox::dependency_context::DependencyExecContext;
@@ -437,11 +439,13 @@ pub const INCLUDED: &str = include_str!("message.txt");
     for (name, bytes) in files {
         std::fs::write(source.path().join(name), bytes).unwrap();
     }
+    // Only the transfer layout changes. Both compilers still observe the
+    // original source directory and unchanged relative compiler arguments.
     let manifest = SourceManifest::new(
         files
             .iter()
             .map(|(path, bytes)| SourceFile {
-                path: (*path).to_owned(),
+                path: format!("package/{path}"),
                 len: bytes.len() as u64,
                 sha256: Sha256::digest(bytes).into(),
                 executable: false,
@@ -452,7 +456,8 @@ pub const INCLUDED: &str = include_str!("message.txt");
     let manifest_json = json!({
         "manifest_sha256":hex(&manifest.digest()),
         "files":files.iter().map(|(path, bytes)| json!({
-            "path":path,"bytes":bytes.len(),"sha256":hex(&Sha256::digest(bytes)),"executable":false,
+            "path":format!("package/{path}"),"bytes":bytes.len(),
+            "sha256":hex(&Sha256::digest(bytes)),"executable":false,
         })).collect::<Vec<_>>(),
     });
     let visible_toolchain = toolchain.path().to_str().unwrap().to_owned();
@@ -541,7 +546,8 @@ pub const INCLUDED: &str = include_str!("message.txt");
             .unwrap();
         for (name, bytes) in files {
             transfer.handle(&json!({"kind":"source-chunk","request_id":request_id,
-                "manifest_sha256":hex(&manifest.digest()),"path":name,"offset":0,"data_hex":hex(bytes),
+                "manifest_sha256":hex(&manifest.digest()),"path":format!("package/{name}"),
+                "offset":0,"data_hex":hex(bytes),
                 "chunk_sha256":hex(&Sha256::digest(bytes))}), true, false).unwrap();
         }
         transfer
@@ -568,6 +574,10 @@ pub const INCLUDED: &str = include_str!("message.txt");
             cohort.bytes,
         )
         .unwrap();
+        assert!(
+            context.artifact_roots().is_empty(),
+            "the leaf constructor must select an explicit empty v3 artifact closure"
+        );
         let request = CanonicalExecRequest {
             request_id,
             program: compiler.clone(),

@@ -12,6 +12,7 @@ fn context() -> Value {
         "compiler":"/home/user/toolchains/pinned/bin/rustc",
         "out_dir":"/work/target/debug/deps",
         "dependency_dirs":["/work/target/debug/deps"],
+        "artifact_roots":[],
         "env":[["DEPENDENCY_FLAVOR","spaces \"quotes\" $HOME\n雪"],["EXPLICIT_EMPTY",""]],
         "runtime_cohort_sha256":"ab".repeat(32),
     })
@@ -20,7 +21,7 @@ fn context() -> Value {
 fn dependency_request() -> Value {
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
     let manifest = SourceManifest::new(vec![SourceFile {
-        path: "src/lib.rs".to_owned(),
+        path: "package/src/lib.rs".to_owned(),
         len: 1,
         sha256: [1; 32],
         executable: false,
@@ -30,7 +31,7 @@ fn dependency_request() -> Value {
         "kind":"canonical-exec", "request_id":712,
         "program":"/home/user/toolchains/pinned/bin/rustc",
         "args":["--crate-name","leaf","--crate-type","lib","--emit=dep-info,metadata","src/lib.rs"],
-        "source_manifest":{"files":[{"path":"src/lib.rs","bytes":1,"sha256":"01".repeat(32),"executable":false}],
+        "source_manifest":{"files":[{"path":"package/src/lib.rs","bytes":1,"sha256":"01".repeat(32),"executable":false}],
             "manifest_sha256":rabs_wkr::source_transfer::hex(&manifest.digest())},
         "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
         "toolchain_identity":{"version":rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION,
@@ -92,11 +93,13 @@ fn cargo_loader_parent_is_explicit_and_old_context_versions_cannot_ignore_it() {
             .env()
             .contains(&("LD_LIBRARY_PATH".to_owned(), value.to_owned()))
     );
-    request["dependency_context"]["version"] = json!("dependency-exec-v1");
-    assert!(
-        parse_exec_request(&request).is_err(),
-        "an old worker contract cannot represent loader parents"
-    );
+    for version in ["dependency-exec-v1", "dependency-exec-v2"] {
+        request["dependency_context"]["version"] = json!(version);
+        assert!(
+            parse_exec_request(&request).is_err(),
+            "an old worker contract cannot select v3 execution: {version}"
+        );
+    }
     request["dependency_context"]["version"] = json!(DEPENDENCY_CONTEXT_VERSION);
     for invalid in [
         Value::Null,
@@ -107,6 +110,130 @@ fn cargo_loader_parent_is_explicit_and_old_context_versions_cannot_ignore_it() {
         request["dependency_context"]["loader_dirs"] = invalid;
         assert!(parse_exec_request(&request).is_err());
     }
+}
+
+fn dependency_dag_request() -> Value {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    let mut request = dependency_request();
+    request["dependency_context"]["dependency_dirs"] = json!([
+        "/work/inputs/z-first",
+        "/work/target/debug/deps",
+        "/work/inputs/a-second",
+    ]);
+    request["dependency_context"]["artifact_roots"] = json!([
+        {"path":"/work/inputs/z-first", "prefix":"dependencies/0000"},
+        {"path":"/work/inputs/a-second", "prefix":"dependencies/0002"},
+    ]);
+    let manifest = SourceManifest::new(vec![
+        SourceFile {
+            path: "package/src/lib.rs".to_owned(),
+            len: 1,
+            sha256: [1; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "dependencies/0000/libfirst.rmeta".to_owned(),
+            len: 2,
+            sha256: [2; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "dependencies/0002/libsecond.rlib".to_owned(),
+            len: 3,
+            sha256: [3; 32],
+            executable: false,
+        },
+    ])
+    .unwrap();
+    let files: Vec<_> = manifest
+        .files()
+        .iter()
+        .map(|file| {
+            json!({
+                "path":file.path, "bytes":file.len,
+                "sha256":rabs_wkr::source_transfer::hex(&file.sha256),
+                "executable":file.executable,
+            })
+        })
+        .collect();
+    request["source_manifest"] = json!({
+        "files":files,
+        "manifest_sha256":rabs_wkr::source_transfer::hex(&manifest.digest()),
+    });
+    request
+}
+
+#[test]
+fn dependency_artifact_roots_preserve_first_use_mapping_when_paths_sort_differently() {
+    let request = dependency_dag_request();
+    let parsed = parse_exec_request(&request).unwrap();
+    let context = parsed.dependency_context.unwrap();
+    assert_eq!(
+        context.dependency_dirs(),
+        &[
+            "/work/inputs/z-first".to_owned(),
+            "/work/target/debug/deps".to_owned(),
+            "/work/inputs/a-second".to_owned(),
+        ]
+    );
+    // Sorting paired roots must preserve their original directory index.
+    // The empty writable output root contributes no artifact mount.
+    let roots = context.artifact_roots();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0].path, "/work/inputs/a-second");
+    assert_eq!(roots[0].prefix, "dependencies/0002");
+    assert_eq!(roots[1].path, "/work/inputs/z-first");
+    assert_eq!(roots[1].prefix, "dependencies/0000");
+    assert_eq!(request, dependency_dag_request(), "decoder changed wire identity");
+}
+
+#[test]
+fn dependency_artifact_root_parser_requires_exact_bounded_mapping_records() {
+    for removed in ["artifact_roots", "dependency_dirs"] {
+        let mut request = dependency_dag_request();
+        request["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove(removed);
+        assert!(parse_exec_request(&request).is_err(), "{removed}");
+    }
+    for invalid in [
+        Value::Null,
+        json!(true),
+        json!({}),
+        json!(["/work/inputs/z-first"]),
+        json!([Value::Null]),
+        json!([{"path":"/work/inputs/z-first"}]),
+        json!([{"prefix":"dependencies/0000"}]),
+        json!([{"path":17, "prefix":"dependencies/0000"}]),
+        json!([{"path":"/work/inputs/z-first", "prefix":17}]),
+        json!([{"path":"/work/inputs/z-first", "prefix":"dependencies/0000", "backing":"/private"}]),
+        json!([
+            {"path":"/work/inputs/z-first", "prefix":"dependencies/0000"},
+            {"path":"/work/inputs/z-first", "prefix":"dependencies/0000"},
+        ]),
+        json!([
+            {"path":"/work/inputs/z-first", "prefix":"dependencies/0000"},
+            {"path":"/work/inputs/a-second", "prefix":"dependencies/0000"},
+        ]),
+        json!([{"path":"/work/inputs/z-first", "prefix":"dependencies/0002"}]),
+        json!([{"path":"/work/inputs/z-first", "prefix":"dependencies/0"}]),
+        json!([{"path":"/work/inputs/z-first", "prefix":"dependencies/0000/nested"}]),
+        json!([{"path":"/work/inputs/z-first", "prefix":"package"}]),
+        json!([{"path":"/work/inputs/unmentioned", "prefix":"dependencies/0003"}]),
+        json!([{"path":"/work/target/debug/deps", "prefix":"dependencies/0001"}]),
+    ] {
+        let mut request = dependency_dag_request();
+        request["dependency_context"]["artifact_roots"] = invalid.clone();
+        assert!(parse_exec_request(&request).is_err(), "{invalid}");
+    }
+    let mut oversized = dependency_dag_request();
+    oversized["dependency_context"]["artifact_roots"] = Value::Array(
+        (0..=rabs_sandbox::dependency_context::MAX_DEPENDENCY_DIRS)
+            .map(|_| json!({"path":"/work/inputs/z-first", "prefix":"dependencies/0000"}))
+            .collect(),
+    );
+    assert!(parse_exec_request(&oversized).is_err());
 }
 
 #[test]
@@ -127,7 +254,13 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
                 .is_err()
         );
     }
-    for bad in [Value::Null, json!(true), json!("dependency-exec-v999")] {
+    for bad in [
+        Value::Null,
+        json!(true),
+        json!("dependency-exec-v1"),
+        json!("dependency-exec-v2"),
+        json!("dependency-exec-v999"),
+    ] {
         assert!(
             dependency_context_selection(
                 &json!({"dependency_context":bad}).to_string(),
@@ -236,6 +369,12 @@ fn retained_v1_dependency_result_remains_recoverable_after_context_upgrade() {
 }
 
 #[cfg(unix)]
+#[test]
+fn retained_v2_dependency_result_remains_recoverable_after_context_upgrade() {
+    assert_retained_dependency_resume("dependency-exec-v2");
+}
+
+#[cfg(unix)]
 fn assert_retained_dependency_resume(version: &str) {
     let root = private_root();
     let mut original = dependency_request();
@@ -248,6 +387,10 @@ fn assert_retained_dependency_resume(version: &str) {
     // exact saved fingerprint still authorizes retrieval-only recovery.
     original["dependency_context"]["version"] = json!(version);
     if version != DEPENDENCY_CONTEXT_VERSION {
+        original["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_roots");
         assert!(parse_exec_request(&original).is_err());
     }
     let id = original["request_id"].as_u64().unwrap();

@@ -12,8 +12,8 @@ use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
-    DEPENDENCY_CONTEXT_VERSION, DependencyExecContext, MAX_DEPENDENCY_DIRS,
-    MAX_DEPENDENCY_ENV_ENTRIES,
+    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
+    MAX_DEPENDENCY_DIRS, MAX_DEPENDENCY_ENV_ENTRIES,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -166,7 +166,8 @@ pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandConte
 
 /// Decode the separately negotiated full dependency context. Unknown fields,
 /// duplicate environment names and absent versus malformed values never fall
-/// back to the canonical execution defaults.
+/// back to the canonical execution defaults. The v3 artifact closure is always
+/// explicit, including an empty array for a dependency leaf.
 pub fn parse_dependency_context(
     request: &serde_json::Value,
 ) -> Result<Option<DependencyExecContext>, String> {
@@ -186,6 +187,7 @@ pub fn parse_dependency_context(
         "toolchain_root",
         "compiler",
         "out_dir",
+        "artifact_roots",
         "env",
         "runtime_cohort_sha256",
     ];
@@ -248,6 +250,35 @@ pub fn parse_dependency_context(
     };
     let dirs = directories("dependency_dirs")?;
     let loader_dirs = directories("loader_dirs")?;
+    let artifact_roots = object
+        .get("artifact_roots")
+        .and_then(serde_json::Value::as_array)
+        .filter(|roots| roots.len() <= MAX_DEPENDENCY_DIRS)
+        .ok_or("dependency artifact_roots must be a bounded array")?
+        .iter()
+        .map(|value| {
+            let fields = value
+                .as_object()
+                .filter(|fields| {
+                    fields.len() == 2
+                        && fields.contains_key("path")
+                        && fields.contains_key("prefix")
+                })
+                .ok_or("dependency artifact roots require exactly path and prefix")?;
+            Ok(DependencyArtifactRoot {
+                path: fields
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("dependency artifact root path must be a string")?
+                    .to_owned(),
+                prefix: fields
+                    .get("prefix")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("dependency artifact root prefix must be a string")?
+                    .to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let digest = text("runtime_cohort_sha256")?;
     if digest.len() != 64
         || !digest
@@ -261,7 +292,7 @@ pub fn parse_dependency_context(
         *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
-    DependencyExecContext::new_with_loader_dirs(
+    DependencyExecContext::new_with_artifacts(
         text("source_root")?,
         text("cwd")?,
         text("toolchain_root")?,
@@ -269,6 +300,7 @@ pub fn parse_dependency_context(
         text("out_dir")?,
         dirs,
         loader_dirs,
+        artifact_roots,
         env,
         runtime_cohort,
     )
@@ -654,7 +686,7 @@ fn execute_canonical_inner(
                 .as_ref()
                 .ok_or("dependency execution lacks its empty search owner")?;
             let source_root = source
-                .dependency_root(request.request_id)
+                .dependency_root(request.request_id, context)
                 .map_err(|error| error.to_string())?;
             // The runtime cohort probes the output materialization filesystem.
             // Both fresh trees normally share the temp parent; explicitly refuse
@@ -662,7 +694,7 @@ fn execute_canonical_inner(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                let source_device = std::fs::metadata(source_root)
+                let source_device = std::fs::metadata(&source_root)
                     .map_err(|error| error.to_string())?
                     .dev();
                 let output_device = std::fs::metadata(artifacts.backing())
@@ -680,7 +712,7 @@ fn execute_canonical_inner(
                 .map_err(|error| format!("dependency loader mountpoints: {error}"))?;
             let spec = context
                 .namespace(
-                    source_root,
+                    &source_root,
                     toolchain.root(),
                     artifacts.backing(),
                     empty.path(),

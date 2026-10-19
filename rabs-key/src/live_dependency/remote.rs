@@ -2,8 +2,9 @@
 //!
 //! This class has distinct isolation and platform identity from unsandboxed
 //! local dependency execution. The worker retains subscriber source, cwd,
-//! toolchain and output spellings, mounts the complete captured package and
-//! toolchain read-only, and supplies private empty dependency directories.
+//! toolchain and output spellings, mounts the complete captured package,
+//! toolchain and exact dependency candidate directories read-only, and supplies
+//! private empty backings only for directories with an empty inventory.
 //! A remote result cannot be offered as an edge-local execution.
 //!
 //! The runtime digest is observed by rabs_sandbox::runtime_cohort on both hosts
@@ -16,11 +17,12 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::TypedDigest;
 
 use super::{
-    DependencyActionPlan, DependencyDirectoryFact, LiveDependencyKey, LiveRefusal, ToolchainFacts,
-    live_dependency_key, plain_path, within,
+    DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveDependencyKey, LiveRefusal,
+    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
+use crate::extern_resolution::DependencyArtifactKind;
 use crate::hit_verification::{descriptor_canonical_bytes, descriptor_digest};
 use crate::output_derivation::derive_dependency_output_declarations;
 use crate::output_platform::{CpuBaseline, OutputPlatformContract};
@@ -28,23 +30,25 @@ use crate::typed_digest::compute;
 
 /// Required observer domain; kept in sync with the sandbox runtime observer.
 pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v1";
-/// Isolation policy domain for the remote leaf class.
+/// Isolation policy domain for the remote metadata dependency class.
 pub const REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str = "rabs.remote-leaf.isolation.v1";
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
-pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-leaf-metadata-v2: \
+pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v3: \
     Linux worker namespace; subscriber paths preserved; complete regular-file \
-    dependency source and exact toolchain mounted read-only; no extern, \
-    proc-macro, generated or native inputs; metadata and dep-info only; \
-    dependency search directories privately empty at spawn; outputs private \
-    until complete authenticated delivery; network denied; compiler environment \
-    preserved by dependency-env-v2 except process-local jobserver descriptors; \
-    all loader paths within the exact toolchain or independently observed \
-    private-empty dependency-exec-v2 directories, including Cargo output parents; \
-    host ELF runtime, CPU and filesystem cohort observed and independently \
-    matched before execution; dep-info closure and tracked-environment checks \
-    required before coordinator-only publication; full-result readiness";
+    dependency source, exact toolchain and complete crate-candidate inventories \
+    mounted read-only; explicit rmeta and complete rlib extern bytes retained; \
+    no bare extern, proc-macro, generated or native inputs; metadata and dep-info \
+    only; nonempty dependency roots disjoint from outputs; empty inventories \
+    receive private empty backings; outputs private until complete authenticated \
+    delivery; network denied; compiler environment preserved by dependency-env-v2 \
+    except process-local jobserver descriptors; all loader paths within the exact \
+    toolchain or independently observed dependency-exec-v3 directories without \
+    dynamic libraries, including Cargo output parents; host ELF runtime, CPU and \
+    filesystem cohort observed and independently matched before execution; \
+    dep-info closure and tracked-environment checks required before coordinator-only \
+    publication; full-result readiness";
 
 /// Why an otherwise admitted dependency cannot use this remote class.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,13 +57,13 @@ pub enum RemoteDependencyRefusal {
     Local(LiveRefusal),
     /// Only --emit=dep-info,metadata is currently executed remotely.
     MetadataOnly,
-    /// Generated/build-script inputs are outside the leaf closure.
+    /// Generated/build-script inputs are outside the admitted dependency closure.
     GeneratedInputs,
-    /// Any explicit extern, including a bare name, leaves the leaf class.
+    /// An extern is unbound, executable, or lacks a complete candidate identity.
     ExternInputs,
     /// Native input or host-dependent CPU selection.
     NativeInputs,
-    /// A directory contains compiler-loadable candidates.
+    /// A writable output directory also contains dependency input candidates.
     NonemptyDependencyDirectory(String),
     /// The exact observed compiler/sysroot paths are not the requested ones.
     ToolchainPath(String),
@@ -214,11 +218,11 @@ fn loader_paths(
     Ok((search_paths, empty.into_iter().collect()))
 }
 
-/// Check the remote leaf shape before expensive capture or runtime observation.
+/// Check the remote metadata shape before expensive capture or runtime observation.
 ///
 /// This has no filesystem access and needs neither a retained toolchain nor a
 /// runtime digest. It checks the same invocation, output, loader and complete
-/// empty-directory restrictions that remote_dependency_key enforces again.
+/// dependency-inventory restrictions that remote_dependency_key enforces again.
 /// A success admits preparation only; it is not dispatch or cache authority.
 pub fn remote_dependency_shape(
     plan: &DependencyActionPlan,
@@ -241,9 +245,7 @@ pub fn remote_dependency_shape(
     {
         return Err(RemoteDependencyRefusal::GeneratedInputs);
     }
-    if !plan.externs.is_empty() || !plan.invocation.externs.is_empty() {
-        return Err(RemoteDependencyRefusal::ExternInputs);
-    }
+    remote_extern_facts(plan, directories)?;
     if !plan.invocation.native_libs.is_empty()
         || plan
             .invocation
@@ -267,7 +269,7 @@ pub fn remote_dependency_shape(
         );
     }
     for directory in directories {
-        if !directory.artifacts.is_empty() {
+        if directory.path == plan.out_dir && !directory.artifacts.is_empty() {
             return Err(RemoteDependencyRefusal::NonemptyDependencyDirectory(
                 directory.path.clone(),
             ));
@@ -277,7 +279,48 @@ pub fn remote_dependency_shape(
     Ok(())
 }
 
-/// Key an admitted, fully observed metadata-only leaf for remote execution.
+/// Resolve every explicit extern to its exact keyed candidate. The ordinary
+/// local planner labels a bare extern as toolchain-provided but does not prove
+/// that resolution cannot execute a proc macro, so this remote class refuses it.
+fn remote_extern_facts(
+    plan: &DependencyActionPlan,
+    directories: &[DependencyDirectoryFact],
+) -> Result<Vec<ExternFact>, RemoteDependencyRefusal> {
+    if plan.externs.len() != plan.invocation.externs.len() {
+        return Err(RemoteDependencyRefusal::ExternInputs);
+    }
+    plan.externs
+        .iter()
+        .zip(&plan.invocation.externs)
+        .map(|(planned, (argument_name, argument_path))| {
+            let PlannedExtern::File { name, path, kind } = planned else {
+                return Err(RemoteDependencyRefusal::ExternInputs);
+            };
+            if name != argument_name
+                || argument_path.as_deref() != Some(path.as_str())
+                || !matches!(
+                    kind,
+                    DependencyArtifactKind::Rmeta | DependencyArtifactKind::Rlib
+                )
+            {
+                return Err(RemoteDependencyRefusal::ExternInputs);
+            }
+            directories
+                .iter()
+                .flat_map(|directory| &directory.artifacts)
+                .find(|fact| &fact.path == path)
+                .cloned()
+                .ok_or_else(|| {
+                    LiveRefusal::Facts(
+                        "remote extern is missing from the complete candidate inventory".into(),
+                    )
+                    .into()
+                })
+        })
+        .collect()
+}
+
+/// Key an admitted, fully observed metadata-only dependency for remote execution.
 ///
 /// Ordinary semantic input components are retained, while worker isolation and
 /// the measured platform replace the unsandboxed local components. The existing
@@ -290,9 +333,10 @@ pub fn remote_dependency_shape(
 /// upload and require the worker's independently verified identical identity.
 ///
 /// Directory facts must cover every planned directory in order, even when it
-/// is the output directory, and every inventory must be empty. Retain and
-/// revalidate these observations through dispatch and install fresh private
-/// empty worker directories, never the worker's host target tree.
+/// is the output directory. Every nonempty inventory is retained byte-for-byte
+/// and mounted read-only on the worker, and must be disjoint from the writable
+/// output root. Empty inventories receive fresh private worker directories.
+/// Revalidate all original observations through dispatch and installation.
 ///
 /// # Errors
 /// A typed refusal for unsupported invocation shape, incomplete closure facts
@@ -310,7 +354,8 @@ pub fn remote_dependency_key(
         return Err(RemoteDependencyRefusal::RuntimeIdentity);
     }
     remote_dependency_shape(plan, directories, toolchain_root)?;
-    let mut key = live_dependency_key(plan, toolchain, &[], directories, None, inputs)?;
+    let externs = remote_extern_facts(plan, directories)?;
+    let mut key = live_dependency_key(plan, toolchain, &externs, directories, None, inputs)?;
     let mut retained_toolchain = CanonicalEncoder::new();
     retained_toolchain
         .str(key.descriptor.toolchain.domain)
@@ -363,9 +408,7 @@ pub fn remote_dependency_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live_dependency::{
-        ExternFact, LiveRustcRequest, PlannedExtern, plan_dependency_action,
-    };
+    use crate::live_dependency::{LiveRustcRequest, plan_dependency_action};
     use rabs_protocol::input_evidence::{
         INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
     };
@@ -601,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn every_search_inventory_is_required_and_must_be_empty() {
+    fn every_search_inventory_is_required_and_writable_output_inventory_stays_empty() {
         let plan = plan(OUTPUT);
         let runtime = compute(RUNTIME_COHORT_DOMAIN, b"runtime");
         let call = |directories: &[DependencyDirectoryFact]| {
@@ -629,6 +672,143 @@ mod tests {
             Err(RemoteDependencyRefusal::NonemptyDependencyDirectory(_))
         ));
         assert!(call(&directories(&plan)).is_ok());
+    }
+
+    fn dag_fixture(out_dir: &str) -> (DependencyActionPlan, Vec<DependencyDirectoryFact>) {
+        let mut plan = plan(out_dir);
+        for (name, root, file, kind) in [
+            (
+                "middle",
+                "/work/inputs/z-first",
+                "libmiddle.rmeta",
+                DependencyArtifactKind::Rmeta,
+            ),
+            (
+                "archive",
+                "/work/inputs/a-second",
+                "libarchive.rlib",
+                DependencyArtifactKind::Rlib,
+            ),
+        ] {
+            let path = format!("{root}/{file}");
+            plan.dependency_dirs.push(root.into());
+            plan.invocation
+                .lib_search
+                .push(format!("dependency={root}"));
+            plan.invocation
+                .externs
+                .push((name.into(), Some(path.clone())));
+            plan.externs.push(PlannedExtern::File {
+                name: name.into(),
+                path,
+                kind,
+            });
+        }
+        let mut directories = directories(&plan);
+        directories[1].artifacts = vec![
+            ExternFact {
+                path: "/work/inputs/z-first/libmiddle.rmeta".into(),
+                content_digest: compute("rabs.test.v1", b"direct metadata"),
+            },
+            ExternFact {
+                path: "/work/inputs/z-first/libtransitive.rmeta".into(),
+                content_digest: compute("rabs.test.v1", b"transitive metadata"),
+            },
+        ];
+        directories[2].artifacts.push(ExternFact {
+            path: "/work/inputs/a-second/libarchive.rlib".into(),
+            content_digest: compute("rabs.test.v1", b"complete archive including object members"),
+        });
+        (plan, directories)
+    }
+
+    fn dag_key(
+        plan: &DependencyActionPlan,
+        directories: &[DependencyDirectoryFact],
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_dependency_key(
+            plan,
+            &toolchain(),
+            directories,
+            &inputs(plan),
+            TOOLCHAIN,
+            &[41; 32],
+            &compute(RUNTIME_COHORT_DOMAIN, b"same-runtime"),
+        )
+    }
+
+    #[test]
+    fn remote_metadata_dag_binds_direct_artifacts_and_every_transitive_candidate() {
+        let (plan, directories) = dag_fixture(OUTPUT);
+        let remote = dag_key(&plan, &directories).unwrap();
+        let local = live_dependency_key(
+            &plan,
+            &toolchain(),
+            &remote_extern_facts(&plan, &directories).unwrap(),
+            &directories,
+            None,
+            &inputs(&plan),
+        )
+        .unwrap();
+        assert_eq!(
+            remote.descriptor.dependency_inputs,
+            local.descriptor.dependency_inputs
+        );
+        // Neither a direct metadata edit, a transitive search candidate edit,
+        // nor an implementation member in an explicitly supplied full archive
+        // may reuse this result. No reduced archive projection is introduced.
+        for (directory, artifact) in [(1, 0), (1, 1), (2, 0)] {
+            let mut changed = directories.clone();
+            changed[directory].artifacts[artifact].content_digest =
+                compute("rabs.test.v1", b"changed consumed bytes");
+            let changed = dag_key(&plan, &changed).unwrap();
+            assert_ne!(remote.action_key, changed.action_key);
+            assert_ne!(
+                remote.descriptor.dependency_inputs,
+                changed.descriptor.dependency_inputs
+            );
+        }
+        let (relocated, relocated_directories) = dag_fixture("/other/target/check/out");
+        assert_eq!(
+            remote.action_key,
+            dag_key(&relocated, &relocated_directories)
+                .unwrap()
+                .action_key
+        );
+    }
+
+    #[test]
+    fn remote_dag_refuses_missing_reordered_executable_or_unbound_extern_inputs() {
+        let (plan, directories) = dag_fixture(OUTPUT);
+        let mut missing = directories.clone();
+        missing[1].artifacts.remove(0);
+        assert!(dag_key(&plan, &missing).is_err());
+        let mut reordered = directories.clone();
+        reordered.swap(1, 2);
+        assert!(dag_key(&plan, &reordered).is_err());
+        let mut executable = plan.clone();
+        if let PlannedExtern::File { kind, .. } = &mut executable.externs[0] {
+            *kind = DependencyArtifactKind::ProcMacroDylib;
+        }
+        assert_eq!(
+            dag_key(&executable, &directories),
+            Err(RemoteDependencyRefusal::ExternInputs)
+        );
+        let mut bare = plan.clone();
+        bare.invocation.externs[0].1 = None;
+        bare.externs[0] = PlannedExtern::Toolchain {
+            name: "middle".into(),
+        };
+        assert_eq!(
+            dag_key(&bare, &directories),
+            Err(RemoteDependencyRefusal::ExternInputs)
+        );
+        let mut divergent = plan.clone();
+        divergent.invocation.externs[0].1 = Some("/unobserved/libother.rmeta".into());
+        assert_eq!(
+            dag_key(&divergent, &directories),
+            Err(RemoteDependencyRefusal::ExternInputs)
+        );
     }
 
     #[test]
