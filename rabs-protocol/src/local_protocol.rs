@@ -217,6 +217,181 @@ pub fn decide_fallback(
     }
 }
 
+/// Telemetry label emitted when edge/coordinator are unavailable and wrappers
+/// fail open without fleet singleflight or root-permit accounting (bead C018; R87).
+pub const UNCOORDINATED_LOCAL_FALLBACK_LABEL: &str = "UncoordinatedLocalFallback";
+
+/// Execution coordination posture for a wrapper/harness invocation (bead C018; R87).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackExecutionMode {
+    /// Edge/coordinator available: fleet singleflight and root-permit accounting active.
+    Coordinated,
+    /// Edge/coordinator unavailable: wrapper failed open locally without distributed
+    /// singleflight or root-permit accounting (`R87`).
+    UncoordinatedLocalFallback,
+}
+
+impl FallbackExecutionMode {
+    /// Canonical telemetry label (`"Coordinated"` or `"UncoordinatedLocalFallback"`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Coordinated => "Coordinated",
+            Self::UncoordinatedLocalFallback => UNCOORDINATED_LOCAL_FALLBACK_LABEL,
+        }
+    }
+}
+
+/// Optional pre-existing host-local emergency limiter consulted during
+/// `UncoordinatedLocalFallback` (bead C018; plan §75 / R87).
+///
+/// May cap local compile stampedes when available, but MUST NEVER delay the
+/// fail-open safety path beyond `safety_latency_budget_us` or wait on stale
+/// distributed authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostLocalEmergencyLimiter {
+    /// Maximum concurrent local fallback roots permitted by the host-local limiter.
+    pub max_concurrent_local_roots: u32,
+    /// Strict latency budget (microseconds) beyond which the safety path bypasses waiting.
+    pub safety_latency_budget_us: u64,
+}
+
+/// Decision of the optional [`HostLocalEmergencyLimiter`] during fail-open (bead C018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmergencyLimiterDecision {
+    /// No host-local limiter was configured; wrapper proceeds immediately.
+    NotConfigured,
+    /// Host-local permit acquired immediately without waiting.
+    PermitGranted {
+        /// Resulting active local fallback roots on the host (`1..=max_concurrent_local_roots`).
+        active_local_roots: u32,
+    },
+    /// Host-local slot acquired within the strict safety-path latency budget.
+    QueuedWithinSafetyBudget {
+        /// Microseconds waited (`<= safety_latency_budget_us`).
+        waited_us: u64,
+        /// Configured host-local concurrency cap.
+        max_concurrent_local_roots: u32,
+    },
+    /// Waiting for a host-local permit would violate `safety_latency_budget_us`;
+    /// bypassed immediately so the fail-open safety path is never delayed.
+    BypassedForSafetyBound {
+        /// Estimated wait that would have exceeded the safety bound (us).
+        estimated_wait_us: u64,
+        /// Configured safety-path latency budget (us).
+        safety_budget_us: u64,
+    },
+}
+
+impl EmergencyLimiterDecision {
+    /// Actual delay (microseconds) added to the fail-open safety path (`<= safety_latency_budget_us`).
+    #[must_use]
+    pub const fn safety_path_delay_us(self) -> u64 {
+        match self {
+            Self::NotConfigured
+            | Self::PermitGranted { .. }
+            | Self::BypassedForSafetyBound { .. } => 0,
+            Self::QueuedWithinSafetyBudget { waited_us, .. } => waited_us,
+        }
+    }
+
+    /// Stable machine code for telemetry records.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::PermitGranted { .. } => "permit_granted",
+            Self::QueuedWithinSafetyBudget { .. } => "queued_within_safety_budget",
+            Self::BypassedForSafetyBound { .. } => "bypassed_for_safety_bound",
+        }
+    }
+}
+
+impl HostLocalEmergencyLimiter {
+    /// Evaluate the host-local emergency limiter without ever exceeding `safety_latency_budget_us`.
+    #[must_use]
+    pub const fn evaluate(
+        &self,
+        current_active_local_roots: u32,
+        estimated_wait_us: u64,
+    ) -> EmergencyLimiterDecision {
+        let cap = if self.max_concurrent_local_roots == 0 {
+            1
+        } else {
+            self.max_concurrent_local_roots
+        };
+        if current_active_local_roots < cap {
+            EmergencyLimiterDecision::PermitGranted {
+                active_local_roots: current_active_local_roots.saturating_add(1),
+            }
+        } else if estimated_wait_us <= self.safety_latency_budget_us {
+            EmergencyLimiterDecision::QueuedWithinSafetyBudget {
+                waited_us: estimated_wait_us,
+                max_concurrent_local_roots: cap,
+            }
+        } else {
+            EmergencyLimiterDecision::BypassedForSafetyBound {
+                estimated_wait_us,
+                safety_budget_us: self.safety_latency_budget_us,
+            }
+        }
+    }
+}
+
+/// Explicit telemetry record emitted when a wrapper enters `UncoordinatedLocalFallback` (bead C018).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncoordinatedFallbackTelemetry {
+    /// Canonical mode label (`"UncoordinatedLocalFallback"`).
+    pub mode_label: &'static str,
+    /// Execution posture (`FallbackExecutionMode::UncoordinatedLocalFallback`).
+    pub mode: FallbackExecutionMode,
+    /// Request/build identifier.
+    pub request_id: u128,
+    /// Chosen fallback action from [`decide_fallback`].
+    pub fallback_action: FallbackAction,
+    /// Outcome of the optional host-local emergency limiter.
+    pub limiter_decision: EmergencyLimiterDecision,
+    /// Delay added to the fail-open safety path (microseconds; bounded by safety budget).
+    pub safety_path_delay_us: u64,
+}
+
+impl UncoordinatedFallbackTelemetry {
+    /// Construct an `UncoordinatedLocalFallback` telemetry record.
+    #[must_use]
+    pub const fn new(
+        request_id: u128,
+        fallback_action: FallbackAction,
+        limiter_decision: EmergencyLimiterDecision,
+    ) -> Self {
+        Self {
+            mode_label: UNCOORDINATED_LOCAL_FALLBACK_LABEL,
+            mode: FallbackExecutionMode::UncoordinatedLocalFallback,
+            request_id,
+            fallback_action,
+            limiter_decision,
+            safety_path_delay_us: limiter_decision.safety_path_delay_us(),
+        }
+    }
+
+    /// Render a deterministic NDJSON line carrying `"mode":"UncoordinatedLocalFallback"`.
+    #[must_use]
+    pub fn to_ndjson_line(&self) -> String {
+        let action_code = match &self.fallback_action {
+            FallbackAction::RunOriginalSeamless => "run_original_seamless",
+            FallbackAction::DetachAndRunLabeled { .. } => "detach_and_run_labeled",
+            FallbackAction::ReconnectOrFailCoherently { .. } => "reconnect_or_fail_coherently",
+        };
+        format!(
+            "{{\"schema\":\"rabs.uncoordinated_local_fallback.v1\",\"mode\":\"{}\",\"request_id\":\"{:032x}\",\"fallback_action\":\"{}\",\"limiter_decision\":\"{}\",\"safety_path_delay_us\":{}}}",
+            self.mode_label,
+            self.request_id,
+            action_code,
+            self.limiter_decision.code(),
+            self.safety_path_delay_us,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +541,55 @@ mod tests {
         let entry = lookup(SchemaDomain::Protocol, "rabs.local-wrapper")
             .expect("local wrapper protocol must be registered (A005)");
         assert_eq!(entry.version, CURRENT_LOCAL_PROTOCOL.0);
+    }
+
+    #[test]
+    fn c018_uncoordinated_local_fallback_telemetry_and_emergency_limiter_bound() {
+        assert_eq!(
+            FallbackExecutionMode::UncoordinatedLocalFallback.label(),
+            "UncoordinatedLocalFallback"
+        );
+        let limiter = HostLocalEmergencyLimiter {
+            max_concurrent_local_roots: 4,
+            safety_latency_budget_us: 2_000,
+        };
+        let d1 = limiter.evaluate(2, 0);
+        assert_eq!(
+            d1,
+            EmergencyLimiterDecision::PermitGranted {
+                active_local_roots: 3
+            }
+        );
+        assert_eq!(d1.safety_path_delay_us(), 0);
+
+        let d2 = limiter.evaluate(4, 1_500);
+        assert_eq!(
+            d2,
+            EmergencyLimiterDecision::QueuedWithinSafetyBudget {
+                waited_us: 1_500,
+                max_concurrent_local_roots: 4,
+            }
+        );
+        assert_eq!(d2.safety_path_delay_us(), 1_500);
+
+        // Exceeding safety_latency_budget_us bypasses immediately with 0 delay on the safety path.
+        let d3 = limiter.evaluate(4, 8_000);
+        assert_eq!(
+            d3,
+            EmergencyLimiterDecision::BypassedForSafetyBound {
+                estimated_wait_us: 8_000,
+                safety_budget_us: 2_000,
+            }
+        );
+        assert_eq!(d3.safety_path_delay_us(), 0);
+
+        let telemetry =
+            UncoordinatedFallbackTelemetry::new(42, FallbackAction::RunOriginalSeamless, d3);
+        assert_eq!(telemetry.mode_label, "UncoordinatedLocalFallback");
+        assert!(
+            telemetry
+                .to_ndjson_line()
+                .contains("\"mode\":\"UncoordinatedLocalFallback\"")
+        );
     }
 }
