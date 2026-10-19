@@ -456,6 +456,267 @@ pub fn build_speculation_roi(runs: &[SpeculationRunRecord]) -> SpeculationRoiPan
     }
 }
 
+/// Rollout posture for default-on speculation (bead Q010; plan §143, §164, Epic Q).
+///
+/// Speculation ships `DefaultOff` until the ROI dashboard proves positive net
+/// saved foreground latency and strictly improved foreground p95 latency
+/// without pressure regressions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpeculationDefaultOnPosture {
+    /// Speculation ships default-off; automatic default-on speculation is refused.
+    #[default]
+    DefaultOff,
+    /// Positive net ROI, positive p95 value, improved foreground p95, and zero
+    /// pressure regressions have been proven; default-on speculation is permitted.
+    DefaultOn,
+}
+
+impl SpeculationDefaultOnPosture {
+    /// Whether default-on speculation admission is permitted.
+    #[must_use]
+    pub const fn permits_default_on(self) -> bool {
+        matches!(self, Self::DefaultOn)
+    }
+
+    /// Stable machine token for decision receipts and operator dashboards.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::DefaultOff => "default-off-gated",
+            Self::DefaultOn => "default-on-authorized",
+        }
+    }
+}
+
+/// Specific reason why default-on speculation remains gated off (bead Q010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeculationGateBlockReason {
+    /// No speculative runs have executed yet (`saved + wasted == 0`).
+    NoExecutedSpeculationRuns,
+    /// Net saved foreground latency minus wasted execution cost is non-positive.
+    NonPositiveNetSavedLatency {
+        /// Net saved latency minus wasted execution cost (ms).
+        net_saved_minus_wasted_exec_ms: i64,
+    },
+    /// Speculation ROI panel does not show positive p95 value (`saved_p95_ms == 0`
+    /// or `useful_work_permille < 500`).
+    NonPositiveSpeculationP95Value {
+        /// Nearest-rank p95 of saved foreground latency (ms).
+        saved_p95_ms: u64,
+        /// Useful speculative work rate in permille.
+        useful_work_permille: u32,
+    },
+    /// Missing baseline or speculative foreground latency samples to prove p95 improvement.
+    MissingForegroundLatencyEvidence {
+        /// Number of baseline foreground latency samples.
+        baseline_samples: usize,
+        /// Number of foreground latency samples with speculation active.
+        candidate_samples: usize,
+    },
+    /// Foreground p95 latency with speculation is not strictly better than baseline p95.
+    ForegroundP95NotImproved {
+        /// Baseline foreground p95 latency without speculation (ms).
+        baseline_p95_ms: u64,
+        /// Foreground p95 latency with speculation (ms).
+        with_speculation_p95_ms: u64,
+    },
+    /// One or more pressure regressions occurred while speculation was active.
+    PressureRegressionDetected {
+        /// Number of pressure regressions recorded.
+        pressure_regressions: u64,
+    },
+}
+
+impl SpeculationGateBlockReason {
+    /// Stable machine code for decision receipts and audit logs.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NoExecutedSpeculationRuns => "no_executed_speculation_runs",
+            Self::NonPositiveNetSavedLatency { .. } => "non_positive_net_saved_latency",
+            Self::NonPositiveSpeculationP95Value { .. } => "non_positive_speculation_p95_value",
+            Self::MissingForegroundLatencyEvidence { .. } => "missing_foreground_latency_evidence",
+            Self::ForegroundP95NotImproved { .. } => "foreground_p95_not_improved",
+            Self::PressureRegressionDetected { .. } => "pressure_regression_detected",
+        }
+    }
+}
+
+/// Inputs to the default-on speculation rollout gate (bead Q010).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeculationDefaultOnGateInput {
+    /// Speculation ROI dashboard panel computed from provenance runs (Q009).
+    pub roi: SpeculationRoiPanel,
+    /// Baseline foreground wall-clock latencies without speculation (ms).
+    pub baseline_foreground_latencies_ms: Vec<u64>,
+    /// Foreground wall-clock latencies with speculation active (ms).
+    pub with_speculation_foreground_latencies_ms: Vec<u64>,
+    /// Pressure regressions observed while speculation was active (must be 0).
+    pub pressure_regressions: u64,
+}
+
+/// Auditable decision record produced by the default-on speculation gate (bead Q010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculationDefaultOnDecisionRecord {
+    /// Resulting default-on speculation posture (`DefaultOff` or `DefaultOn`).
+    pub posture: SpeculationDefaultOnPosture,
+    /// Whether default-on speculation is permitted (`posture == DefaultOn`).
+    pub default_on_permitted: bool,
+    /// Snapshot of the [`SpeculationRoiPanel`] evaluated by the gate.
+    pub roi: SpeculationRoiPanel,
+    /// Baseline foreground p95 latency without speculation (ms).
+    pub baseline_foreground_p95_ms: u64,
+    /// Foreground p95 latency with speculation (ms).
+    pub with_speculation_foreground_p95_ms: u64,
+    /// Foreground p95 latency improvement (`baseline_p95 - with_speculation_p95`, ms).
+    pub foreground_p95_improvement_ms: i64,
+    /// Pressure regressions observed in the evaluation window.
+    pub pressure_regressions: u64,
+    /// Ordered list of blocking reasons when `posture == DefaultOff` (empty when `DefaultOn`).
+    pub block_reasons: Vec<SpeculationGateBlockReason>,
+}
+
+impl SpeculationDefaultOnDecisionRecord {
+    /// Whether default-on speculation is permitted by this decision record.
+    #[must_use]
+    pub const fn permits_default_on(&self) -> bool {
+        self.default_on_permitted
+    }
+
+    /// Stable decision token for durable `decision_receipts` rows.
+    #[must_use]
+    pub const fn decision_token(&self) -> &'static str {
+        self.posture.token()
+    }
+
+    /// Deterministic reason string suitable for durable `decision_receipts` storage.
+    #[must_use]
+    pub fn reason_summary(&self) -> String {
+        if self.block_reasons.is_empty() {
+            format!(
+                "authorized:net_saved_ms={},saved_p95_ms={},fg_p95_baseline_ms={},fg_p95_spec_ms={},fg_p95_gain_ms={},pressure_regressions=0",
+                self.roi.net_saved_minus_wasted_exec_ms,
+                self.roi.saved_p95_ms,
+                self.baseline_foreground_p95_ms,
+                self.with_speculation_foreground_p95_ms,
+                self.foreground_p95_improvement_ms,
+            )
+        } else {
+            let codes: Vec<&str> = self
+                .block_reasons
+                .iter()
+                .map(SpeculationGateBlockReason::code)
+                .collect();
+            format!(
+                "gated_off:{}:net_saved_ms={},saved_p95_ms={},fg_p95_baseline_ms={},fg_p95_spec_ms={},pressure_regressions={}",
+                codes.join("+"),
+                self.roi.net_saved_minus_wasted_exec_ms,
+                self.roi.saved_p95_ms,
+                self.baseline_foreground_p95_ms,
+                self.with_speculation_foreground_p95_ms,
+                self.pressure_regressions,
+            )
+        }
+    }
+
+    /// Machine-readable NDJSON decision record line for audit logs and CI artefacts.
+    #[must_use]
+    pub fn to_ndjson_line(&self) -> String {
+        let codes: Vec<String> = self
+            .block_reasons
+            .iter()
+            .map(|r| format!("\"{}\"", r.code()))
+            .collect();
+        format!(
+            "{{\"schema\":\"rabs.speculation_default_on_decision.v1\",\"posture\":\"{}\",\"default_on_permitted\":{},\"net_saved_minus_wasted_exec_ms\":{},\"saved_p95_ms\":{},\"useful_work_permille\":{},\"positive_p95_value\":{},\"baseline_foreground_p95_ms\":{},\"with_speculation_foreground_p95_ms\":{},\"foreground_p95_improvement_ms\":{},\"pressure_regressions\":{},\"block_reasons\":[{}]}}",
+            self.decision_token(),
+            self.default_on_permitted,
+            self.roi.net_saved_minus_wasted_exec_ms,
+            self.roi.saved_p95_ms,
+            self.roi.useful_work_permille,
+            self.roi.positive_p95_value,
+            self.baseline_foreground_p95_ms,
+            self.with_speculation_foreground_p95_ms,
+            self.foreground_p95_improvement_ms,
+            self.pressure_regressions,
+            codes.join(","),
+        )
+    }
+}
+
+/// Evaluate whether default-on speculation may be enabled from the ROI dashboard,
+/// foreground p95 latency comparison, and pressure-regression counter (bead Q010).
+#[must_use]
+pub fn evaluate_speculation_default_on_gate(
+    input: &SpeculationDefaultOnGateInput,
+) -> SpeculationDefaultOnDecisionRecord {
+    let mut block_reasons = Vec::new();
+    let executed_runs = input.roi.saved.saturating_add(input.roi.wasted);
+    if executed_runs == 0 {
+        block_reasons.push(SpeculationGateBlockReason::NoExecutedSpeculationRuns);
+    }
+    if input.roi.net_saved_minus_wasted_exec_ms <= 0 {
+        block_reasons.push(SpeculationGateBlockReason::NonPositiveNetSavedLatency {
+            net_saved_minus_wasted_exec_ms: input.roi.net_saved_minus_wasted_exec_ms,
+        });
+    }
+    if !input.roi.positive_p95_value {
+        block_reasons.push(SpeculationGateBlockReason::NonPositiveSpeculationP95Value {
+            saved_p95_ms: input.roi.saved_p95_ms,
+            useful_work_permille: input.roi.useful_work_permille,
+        });
+    }
+
+    let mut baseline_sorted = input.baseline_foreground_latencies_ms.clone();
+    baseline_sorted.sort_unstable();
+    let mut candidate_sorted = input.with_speculation_foreground_latencies_ms.clone();
+    candidate_sorted.sort_unstable();
+
+    let baseline_foreground_p95_ms = percentile(&baseline_sorted, 95);
+    let with_speculation_foreground_p95_ms = percentile(&candidate_sorted, 95);
+    let foreground_p95_improvement_ms = i64::try_from(baseline_foreground_p95_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::try_from(with_speculation_foreground_p95_ms).unwrap_or(i64::MAX));
+
+    if baseline_sorted.is_empty() || candidate_sorted.is_empty() {
+        block_reasons.push(
+            SpeculationGateBlockReason::MissingForegroundLatencyEvidence {
+                baseline_samples: baseline_sorted.len(),
+                candidate_samples: candidate_sorted.len(),
+            },
+        );
+    } else if with_speculation_foreground_p95_ms >= baseline_foreground_p95_ms {
+        block_reasons.push(SpeculationGateBlockReason::ForegroundP95NotImproved {
+            baseline_p95_ms: baseline_foreground_p95_ms,
+            with_speculation_p95_ms: with_speculation_foreground_p95_ms,
+        });
+    }
+
+    if input.pressure_regressions > 0 {
+        block_reasons.push(SpeculationGateBlockReason::PressureRegressionDetected {
+            pressure_regressions: input.pressure_regressions,
+        });
+    }
+
+    let default_on_permitted = block_reasons.is_empty();
+    let posture = if default_on_permitted {
+        SpeculationDefaultOnPosture::DefaultOn
+    } else {
+        SpeculationDefaultOnPosture::DefaultOff
+    };
+
+    SpeculationDefaultOnDecisionRecord {
+        posture,
+        default_on_permitted,
+        roi: input.roi.clone(),
+        baseline_foreground_p95_ms,
+        with_speculation_foreground_p95_ms,
+        foreground_p95_improvement_ms,
+        pressure_regressions: input.pressure_regressions,
+        block_reasons,
+    }
+}
+
 /// The dashboard: every panel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Dashboard {
@@ -1043,5 +1304,122 @@ mod tests {
         assert_eq!(roi.useful_work_permille, 500);
         assert_eq!(roi.saved_p95_ms, 420);
         assert!(roi.positive_p95_value);
+    }
+
+    #[test]
+    fn q010_default_on_speculation_gated_on_positive_p95_and_no_pressure_regressions() {
+        assert_eq!(
+            SpeculationDefaultOnPosture::default(),
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+
+        let empty_decision =
+            evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput::default());
+        assert_eq!(
+            empty_decision.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!empty_decision.permits_default_on());
+        assert_eq!(empty_decision.decision_token(), "default-off-gated");
+        assert!(
+            empty_decision
+                .block_reasons
+                .contains(&SpeculationGateBlockReason::NoExecutedSpeculationRuns)
+        );
+
+        let positive_roi = build_speculation_roi(&[
+            SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::SavedCompleted,
+                saved_foreground_latency_ms: 450,
+                execution_cost_ms: 450,
+                transfer_cost_bytes: 8_192,
+                storage_cost_bytes: 16_384,
+            },
+            SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::PromotedToForeground,
+                saved_foreground_latency_ms: 300,
+                execution_cost_ms: 400,
+                transfer_cost_bytes: 8_192,
+                storage_cost_bytes: 16_384,
+            },
+            SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::WastedUnused,
+                saved_foreground_latency_ms: 0,
+                execution_cost_ms: 100,
+                transfer_cost_bytes: 2_048,
+                storage_cost_bytes: 2_048,
+            },
+        ]);
+        assert!(positive_roi.positive_p95_value);
+
+        // Authorized when ROI is positive, foreground p95 strictly improves, and pressure_regressions == 0.
+        let authorized = evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput {
+            roi: positive_roi.clone(),
+            baseline_foreground_latencies_ms: vec![600, 720, 880, 950],
+            with_speculation_foreground_latencies_ms: vec![210, 290, 410, 500],
+            pressure_regressions: 0,
+        });
+        assert_eq!(authorized.posture, SpeculationDefaultOnPosture::DefaultOn);
+        assert!(authorized.permits_default_on());
+        assert_eq!(authorized.decision_token(), "default-on-authorized");
+        assert_eq!(authorized.baseline_foreground_p95_ms, 950);
+        assert_eq!(authorized.with_speculation_foreground_p95_ms, 500);
+        assert_eq!(authorized.foreground_p95_improvement_ms, 450);
+        assert!(authorized.block_reasons.is_empty());
+        assert!(
+            authorized
+                .reason_summary()
+                .starts_with("authorized:net_saved_ms=650")
+        );
+        assert!(
+            authorized
+                .to_ndjson_line()
+                .contains("\"default_on_permitted\":true")
+        );
+
+        // Blocked when foreground p95 does not improve.
+        let unimproved_fg = evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput {
+            roi: positive_roi.clone(),
+            baseline_foreground_latencies_ms: vec![400, 480, 500],
+            with_speculation_foreground_latencies_ms: vec![410, 490, 500],
+            pressure_regressions: 0,
+        });
+        assert_eq!(
+            unimproved_fg.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!unimproved_fg.permits_default_on());
+        assert_eq!(
+            unimproved_fg.block_reasons,
+            vec![SpeculationGateBlockReason::ForegroundP95NotImproved {
+                baseline_p95_ms: 500,
+                with_speculation_p95_ms: 500,
+            }]
+        );
+
+        // Blocked when pressure regressions > 0 even if ROI and foreground p95 are positive.
+        let pressure_regressed =
+            evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput {
+                roi: positive_roi,
+                baseline_foreground_latencies_ms: vec![600, 900],
+                with_speculation_foreground_latencies_ms: vec![250, 450],
+                pressure_regressions: 1,
+            });
+        assert_eq!(
+            pressure_regressed.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!pressure_regressed.permits_default_on());
+        assert_eq!(
+            pressure_regressed.block_reasons,
+            vec![SpeculationGateBlockReason::PressureRegressionDetected {
+                pressure_regressions: 1,
+            }]
+        );
+        assert!(
+            pressure_regressed
+                .reason_summary()
+                .contains("pressure_regression_detected")
+        );
     }
 }

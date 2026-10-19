@@ -56,7 +56,9 @@ use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
 use rabs_protocol::dashboards::{
+    SpeculationDefaultOnDecisionRecord, SpeculationDefaultOnGateInput, SpeculationDefaultOnPosture,
     SpeculationRoiPanel, SpeculationRunOutcome, SpeculationRunRecord, build_speculation_roi,
+    evaluate_speculation_default_on_gate,
 };
 use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
 use rabs_protocol::generation::{
@@ -1098,6 +1100,19 @@ impl EdgeSubscriber {
     }
 }
 
+/// Durable `decision_receipts` kind written whenever the Q010 default-on
+/// speculation gate is evaluated (`rabsd::coord::live`).
+pub const SPECULATION_DEFAULT_ON_RECEIPT_KIND: &str = "speculation_default_on_gate";
+
+#[derive(Default)]
+struct SpeculationGateState {
+    posture: SpeculationDefaultOnPosture,
+    baseline_foreground_latencies_ms: Vec<u64>,
+    with_speculation_foreground_latencies_ms: Vec<u64>,
+    pressure_regressions: u64,
+    last_decision: Option<SpeculationDefaultOnDecisionRecord>,
+}
+
 /// The live coordinator state shared edge↔coord in-process.
 #[derive(Default)]
 pub struct CoordLive {
@@ -1110,6 +1125,7 @@ pub struct CoordLive {
     speculation_pressure: Mutex<Option<PressureBand>>,
     speculation_provenance: Mutex<SpeculationProvenance>,
     speculation_runs: Mutex<Vec<SpeculationRunRecord>>,
+    speculation_gate: Mutex<SpeculationGateState>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -1457,6 +1473,136 @@ impl CoordLive {
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)?;
         Ok(build_speculation_roi(&runs))
+    }
+
+    /// Current default-on speculation posture (bead Q010; defaults to [`SpeculationDefaultOnPosture::DefaultOff`]).
+    pub fn speculation_default_on_posture(
+        &self,
+    ) -> Result<SpeculationDefaultOnPosture, SubmissionRefusal> {
+        Ok(self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .posture)
+    }
+
+    /// Record a foreground command latency sample with or without speculation active (bead Q010).
+    pub fn record_foreground_latency_sample(
+        &self,
+        with_speculation: bool,
+        latency_ms: u64,
+    ) -> Result<(), SubmissionRefusal> {
+        let mut gate = self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if with_speculation {
+            gate.with_speculation_foreground_latencies_ms
+                .push(latency_ms);
+        } else {
+            gate.baseline_foreground_latencies_ms.push(latency_ms);
+        }
+        Ok(())
+    }
+
+    /// Record a pressure regression attributed to speculation and immediately demote
+    /// default-on posture back to [`SpeculationDefaultOnPosture::DefaultOff`] (bead Q010).
+    pub fn record_speculation_pressure_regression(&self) -> Result<(), SubmissionRefusal> {
+        let mut gate = self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        gate.pressure_regressions = gate.pressure_regressions.saturating_add(1);
+        gate.posture = SpeculationDefaultOnPosture::DefaultOff;
+        Ok(())
+    }
+
+    /// Evaluate the Q010 default-on speculation gate against the live ROI dashboard,
+    /// foreground p95 latency samples, and pressure regressions, updating the coordinator's
+    /// default-on posture and writing a durable decision receipt when a CAS store is mounted.
+    pub fn evaluate_speculation_default_on_gate(
+        &self,
+    ) -> Result<SpeculationDefaultOnDecisionRecord, SubmissionRefusal> {
+        let roi = self.speculation_roi_panel()?;
+        let decision = {
+            let mut gate = self
+                .speculation_gate
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            let input = SpeculationDefaultOnGateInput {
+                roi,
+                baseline_foreground_latencies_ms: gate.baseline_foreground_latencies_ms.clone(),
+                with_speculation_foreground_latencies_ms: gate
+                    .with_speculation_foreground_latencies_ms
+                    .clone(),
+                pressure_regressions: gate.pressure_regressions,
+            };
+            let record = evaluate_speculation_default_on_gate(&input);
+            gate.posture = record.posture;
+            gate.last_decision = Some(record.clone());
+            record
+        };
+        if let Some(cas) = self.cas.as_ref() {
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    SPECULATION_DEFAULT_ON_RECEIPT_KIND,
+                    &self.build_identity,
+                    seq,
+                    decision.decision_token(),
+                    &decision.reason_summary(),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!(
+                        "speculation gate decision receipt failed: {error:?}"
+                    ))
+                })?;
+        }
+        Ok(decision)
+    }
+
+    /// Latest evaluated [`SpeculationDefaultOnDecisionRecord`], if any (bead Q010).
+    pub fn latest_speculation_default_on_decision(
+        &self,
+    ) -> Result<Option<SpeculationDefaultOnDecisionRecord>, SubmissionRefusal> {
+        Ok(self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .last_decision
+            .clone())
+    }
+
+    /// Submit a default-on speculative action gated on [`SpeculationDefaultOnPosture::DefaultOn`] (bead Q010).
+    ///
+    /// Ships default-off: until [`Self::evaluate_speculation_default_on_gate`] proves positive
+    /// net saved foreground latency and improved foreground p95 without pressure regressions,
+    /// automatic default-on speculation is refused with [`SubmissionRefusal::Admission`].
+    pub fn submit_default_on_speculation(
+        &self,
+        input: ActionSubmission,
+        request: JoinRequest,
+        now_unix_micros: i64,
+        clock_epoch: u64,
+    ) -> Result<SubmissionReceipt, SubmissionRefusal> {
+        if !matches!(
+            request.kind,
+            SubscriberKind::Speculative | SubscriberKind::GitPrewarm
+        ) {
+            return Err(SubmissionRefusal::Admission(
+                "submit_default_on_speculation requires optional SubscriberKind".to_owned(),
+            ));
+        }
+        if !self.speculation_default_on_posture()?.permits_default_on() {
+            return Err(SubmissionRefusal::Admission(
+                "default-on speculation gated off: requires positive p95 ROI and improved foreground p95 without pressure regressions".to_owned(),
+            ));
+        }
+        self.submit_action(input, request, now_unix_micros, clock_epoch)
     }
 
     fn optional_admitted(&self) -> Result<bool, SubmissionRefusal> {
@@ -4089,5 +4235,73 @@ mod tests {
         assert!(roi.wasted_execution_cost_ms >= 1);
         assert!(roi.wasted_transfer_cost_bytes > 0);
         assert!(roi.wasted_storage_cost_bytes > 0);
+
+        // Q010: Default-on speculation ships DefaultOff and refuses automatic submission until
+        // the gate evaluates positive ROI + improved foreground p95 + zero pressure regressions.
+        coord
+            .set_speculation_pressure(PressureBand::Normal)
+            .unwrap();
+        assert_eq!(
+            coord.speculation_default_on_posture().unwrap(),
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        let s6_desc = desc_with_tag(6);
+        assert!(matches!(
+            coord.submit_default_on_speculation(
+                submission(&source, &manifest, &s6_desc),
+                request(40, SubscriberKind::Speculative, 10),
+                1_900_000,
+                0,
+            ),
+            Err(SubmissionRefusal::Admission(reason)) if reason.contains("default-on speculation gated off")
+        ));
+
+        // Evaluate before foreground latency samples are recorded -> remains DefaultOff.
+        let initial_gate = coord.evaluate_speculation_default_on_gate().unwrap();
+        assert_eq!(
+            initial_gate.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!initial_gate.permits_default_on());
+
+        // Record baseline and speculative foreground latency samples showing strict p95 improvement.
+        for ms in [420_u64, 510, 640] {
+            coord.record_foreground_latency_sample(false, ms).unwrap();
+        }
+        for ms in [120_u64, 180, 240] {
+            coord.record_foreground_latency_sample(true, ms).unwrap();
+        }
+        let passing_gate = coord.evaluate_speculation_default_on_gate().unwrap();
+        assert_eq!(passing_gate.posture, SpeculationDefaultOnPosture::DefaultOn);
+        assert!(passing_gate.permits_default_on());
+        assert_eq!(passing_gate.decision_token(), "default-on-authorized");
+        assert_eq!(
+            coord.latest_speculation_default_on_decision().unwrap(),
+            Some(passing_gate.clone())
+        );
+
+        // Default-on speculation submission is now permitted.
+        let admitted_default_on = coord
+            .submit_default_on_speculation(
+                submission(&source, &manifest, &s6_desc),
+                request(40, SubscriberKind::Speculative, 10),
+                1_900_000,
+                0,
+            )
+            .unwrap();
+        assert!(admitted_default_on.actor_created);
+
+        // Recording a pressure regression immediately demotes posture back to DefaultOff.
+        coord.record_speculation_pressure_regression().unwrap();
+        assert_eq!(
+            coord.speculation_default_on_posture().unwrap(),
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        let regressed_gate = coord.evaluate_speculation_default_on_gate().unwrap();
+        assert_eq!(
+            regressed_gate.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!regressed_gate.permits_default_on());
     }
 }

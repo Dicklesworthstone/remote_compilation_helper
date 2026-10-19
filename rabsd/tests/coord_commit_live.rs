@@ -552,6 +552,7 @@ fn speculation_browns_out_before_foreground_and_feeds_roi_dashboard() {
     s1_dispatch.advance(AttemptState::Running).unwrap();
     let s1_pid = s1_child.0.id().to_string();
     s1_child.wait_until(|| std::fs::read_to_string(&s1_starts).is_ok_and(|v| v.trim() == s1_pid));
+    std::thread::sleep(Duration::from_millis(25));
     s1_child.release_and_wait();
     for state in [
         AttemptState::ProcessExited,
@@ -712,6 +713,72 @@ fn speculation_browns_out_before_foreground_and_feeds_roi_dashboard() {
     assert_eq!(
         roi.wasted_storage_cost_bytes,
         b"speculative cancelled\n".len() as u64
+    );
+
+    // Q010: Default-on speculation ships DefaultOff and writes durable decision receipts.
+    use rabs_cas::metadata_store::SqlValue;
+    use rabs_protocol::dashboards::SpeculationDefaultOnPosture;
+    use rabsd::coord::live::SPECULATION_DEFAULT_ON_RECEIPT_KIND;
+
+    coord
+        .set_speculation_pressure(PressureBand::Normal)
+        .unwrap();
+    assert_eq!(
+        coord.speculation_default_on_posture().unwrap(),
+        SpeculationDefaultOnPosture::DefaultOff
+    );
+    let s4_source = make_source("s4-src", b"default-on gated candidate\n");
+    assert!(
+        coord
+            .submit_default_on_speculation(
+                submission_from_source(Arc::clone(&s4_source)),
+                submission_join(40, SubscriberKind::Speculative),
+                now_micros(),
+                0,
+            )
+            .is_err()
+    );
+
+    let gated_off = coord.evaluate_speculation_default_on_gate().unwrap();
+    assert_eq!(gated_off.posture, SpeculationDefaultOnPosture::DefaultOff);
+    assert!(!gated_off.permits_default_on());
+
+    for ms in [350_u64, 480, 620] {
+        coord.record_foreground_latency_sample(false, ms).unwrap();
+    }
+    for ms in [110_u64, 150, 210] {
+        coord.record_foreground_latency_sample(true, ms).unwrap();
+    }
+    let authorized = coord.evaluate_speculation_default_on_gate().unwrap();
+    assert_eq!(authorized.posture, SpeculationDefaultOnPosture::DefaultOn);
+    assert!(authorized.permits_default_on());
+
+    let admitted_default_on = coord
+        .submit_default_on_speculation(
+            submission_from_source(s4_source),
+            submission_join(40, SubscriberKind::Speculative),
+            now_micros(),
+            0,
+        )
+        .unwrap();
+    assert!(admitted_default_on.actor_created);
+
+    let receipt_rows = open_store(dir.path())
+        .query(
+            "SELECT decision, reason FROM decision_receipts WHERE kind = ?1 ORDER BY seq ASC",
+            &[SqlValue::Text(
+                SPECULATION_DEFAULT_ON_RECEIPT_KIND.to_owned(),
+            )],
+        )
+        .unwrap();
+    assert_eq!(receipt_rows.len(), 2);
+    assert_eq!(
+        receipt_rows[0][0],
+        SqlValue::Text("default-off-gated".to_owned())
+    );
+    assert_eq!(
+        receipt_rows[1][0],
+        SqlValue::Text("default-on-authorized".to_owned())
     );
 }
 
