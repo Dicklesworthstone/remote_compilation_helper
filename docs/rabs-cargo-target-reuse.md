@@ -5,9 +5,22 @@ Cargo also passes layout settings through its environment. The exact environment
 policy keys these values, so separate agent/CI directories can still split
 otherwise identical dependency actions.
 
-## Opt in on the daemon
+## Enable reuse through the launcher or daemon
 
-Set `RABS_REUSE_CARGO_LAYOUT=1` (also `true` or `on`) **before starting rabsd**,
+`cargo rabs build` enables the complete layout profile when it starts a new
+daemon. Separate agent target/build directories can then reuse eligible
+dependency results without an additional setting. The launcher's default is
+passed only to the new daemon; it does not introduce a new variable into Cargo's
+or rustc's environment. Explicit operator values are preserved, including
+`RABS_REUSE_CARGO_LAYOUT=0` to retain exact layout keying.
+
+An already-running shared daemon keeps its existing policy. Attaching a new
+`cargo rabs` invocation never restarts or reconfigures it, and readiness alone
+does not promise a cache hit. Use an explicitly configured daemon or separate
+state/socket paths when a different policy is required.
+
+When starting `rabsd` directly, set `RABS_REUSE_CARGO_LAYOUT=1` (also `true` or
+`on`) **before starting the daemon**,
 in addition to `RABS_LIVE_DEPENDENCY=1`. This projects eligible values of:
 
 - `CARGO_TARGET_DIR`: final artifact directory override.
@@ -22,14 +35,17 @@ Cargo still chooses the real directories; RABS does not reinterpret its config,
 precedence, templates or output paths.
 
 The existing `RABS_REUSE_CARGO_TARGET_DIR=1` remains a narrower opt-in: it projects
-only `CARGO_TARGET_DIR`. Both settings are off by default and read once per daemon
-process. Selecting both is equivalent to selecting the complete layout profile.
-The `scripts/cargo-rabs` launcher passes these settings to a new daemon; it does
-not reconfigure an already-running shared daemon. For example, with installed
-binaries and no existing daemon:
+only `CARGO_TARGET_DIR`. Both settings are off by default in a directly started
+daemon and read once per daemon process. Selecting both is equivalent to
+selecting the complete layout profile. To select the narrower profile through
+the launcher, explicitly disable its complete-layout default. For example, with
+installed binaries and no existing daemon:
 
 ```sh
-RABS_REUSE_CARGO_LAYOUT=1 cargo rabs build
+cargo rabs build
+
+# Or select only CARGO_TARGET_DIR reuse for a new daemon:
+RABS_REUSE_CARGO_LAYOUT=0 RABS_REUSE_CARGO_TARGET_DIR=1 cargo rabs build
 ```
 
 The profile removes only eligible values from the compiler key. It does not

@@ -33,7 +33,8 @@ CARGO = r'''
 import json, os, signal, sys
 keys = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC", "RUSTUP_TOOLCHAIN",
         "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_MAKEFLAGS", "RABS_SOCKET_PATH",
-        "RABS_STATE_DIR", "RABS_CONFIG", "RABS_BREAKER_FILE", "CARGO_TARGET_DIR"]
+        "RABS_STATE_DIR", "RABS_CONFIG", "RABS_BREAKER_FILE", "CARGO_TARGET_DIR",
+        "RABS_REUSE_CARGO_LAYOUT"]
 value = {"argv": [os.fsencode(x).hex() for x in sys.argv[1:]],
          "env": {k: os.environ[k] for k in keys if k in os.environ},
          "pid": os.getpid(), "cwd": os.getcwd()}
@@ -274,6 +275,8 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(value["cwd"], str(self.root))
         self.assertEqual(len(self.starts()), 1)
         self.assertEqual(self.starts()[0]["live"], "1")
+        self.assertEqual(self.starts()[0]["layout"], "1")
+        self.assertNotIn("RABS_REUSE_CARGO_LAYOUT", value["env"])
         self.assertEqual(self.starts()[0]["pid"], self.starts()[0]["pgid"])
         folder = self.root / "state/cargo-launcher"
         self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
@@ -287,6 +290,23 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(first["env"]["RUSTC_WRAPPER"], second["env"]["RUSTC_WRAPPER"])
         self.assertEqual(self.endpoint.stat().st_ino, identity)
         self.assertEqual(len(self.starts()), 1)
+
+    def test_explicit_layout_policy_is_preserved_for_daemon_and_cargo(self):
+        value = self.cargo_result(self.launch(changes={"RABS_REUSE_CARGO_LAYOUT": "0"}))
+        self.assertEqual(value["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(value["env"]["RABS_REUSE_CARGO_LAYOUT"], "0")
+        self.assertEqual(self.starts()[0]["layout"], "0")
+
+    def test_layout_default_does_not_reconfigure_an_attached_daemon(self):
+        self.cargo_result(self.launch(changes={"RABS_REUSE_CARGO_LAYOUT": "0"}))
+        identity = rabs.socket_identity(self.endpoint)
+        for options in (["check"], ["--rabs-no-start", "check"]):
+            value = self.cargo_result(self.launch(options))
+            self.assertEqual(value["env"]["RUSTC_WRAPPER"], str(self.wrap))
+            self.assertNotIn("RABS_REUSE_CARGO_LAYOUT", value["env"])
+            self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(self.starts()[0]["layout"], "0")
 
     def test_parallel_cargo_callers_start_exactly_one_service(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:

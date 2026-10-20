@@ -83,8 +83,13 @@ RUSTUP_TOOLCHAIN, Cargo +toolchain arguments and RCH routing settings are passed
 to RCH without reinterpretation. Custom local Cargo binaries are not transported.
 
 The first invocation can start one shared rabsd with RABS_LIVE_DEPENDENCY=1.
-Later invocations reuse it. An existing daemon is never stopped, replaced, or
-reconfigured: its live/shadow setting remains its own. A connected daemon is
+New daemons also default RABS_REUSE_CARGO_LAYOUT=1 so separate Cargo target/build
+directories can reuse eligible dependency results. An explicit value is kept;
+set RABS_REUSE_CARGO_LAYOUT=0 to retain exact layout keying. The default is set
+only for daemon startup, never added to Cargo's or rustc's environment. Tracked
+reads of projected layout variables still veto cache publication.
+Later invocations reuse the daemon. An existing daemon is never stopped, replaced,
+or reconfigured: its serving and layout policies remain its own. A connected daemon is
 accepted only when it reports the live dependency lane; a shadow or older
 daemon gives a setup error with the ordinary stock-Cargo fallback. Readiness
 is not a promise of a cache hit. Unsupported units, warming facts and required
@@ -907,6 +912,12 @@ def prepare(env, no_start):
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     daemon_env = dict(env)
     daemon_env["RABS_LIVE_DEPENDENCY"] = "1"
+    # The launcher explicitly opts this build into dependency reuse. Match the
+    # worker-cache profile so independent target/build layouts can share eligible
+    # results. Keep an operator's value (including 0 or empty) and do not inject
+    # this default into Cargo/build scripts, whose environment remains exact.
+    # ensure_daemon never reconfigures an already-running shared daemon.
+    daemon_env.setdefault("RABS_REUSE_CARGO_LAYOUT", "1")
     socket_path = checked_config(daemon, daemon_env, deadline)
     home = env.get("HOME")
     state = env.get("RABS_STATE_DIR")
