@@ -330,6 +330,58 @@ class RecoveryDriverTests(unittest.TestCase):
         with self.assertRaises(RECOVER.Refused):
             intent.verify_unchanged()
 
+    def test_later_interrupted_recovery_reuses_selected_prefix_without_new_execution_identity(self):
+        original = self.partial()
+        later = self.base / "second-interrupted"
+        later.mkdir(mode=0o700)
+        (later / "diagnostics").mkdir(mode=0o700)
+        self.put(later / "diagnostics/stdout", b"larger untrusted retained prefix\0\xff")
+        result = self.launch("--resume-to", self.base / "third-attempt", "--prefix-from", later)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        event, = self.events()
+        self.assertEqual(event["args"][:3], ["--worker-exec-tls", "--resume-from", str(later)])
+        self.assertEqual(event["request_sha256"], self.record["request_sha256"])
+        self.assertEqual(event["state"], str(self.state))
+        self.assertNotIn("canonical-exec", event["args"])
+        self.assertEqual((original / "diagnostics/stdout").read_bytes(), b"partial\0\xff")
+        self.assertEqual((later / "diagnostics/stdout").read_bytes(), b"larger untrusted retained prefix\0\xff")
+
+    def test_selected_prefix_cannot_overlap_the_new_destination(self):
+        previous = self.base / "second-interrupted"
+        previous.mkdir(mode=0o700)
+        for destination in (previous, previous / "new", self.base):
+            self.refused(self.launch("--resume-to", destination, "--prefix-from", previous))
+
+    def test_missing_linked_and_nonprivate_selected_prefixes_refuse(self):
+        self.refused(self.launch("--resume-to", self.base / "new", "--prefix-from", self.base / "missing"))
+        previous = self.base / "previous"
+        previous.mkdir(mode=0o750)
+        self.refused(self.launch("--resume-to", self.base / "new", "--prefix-from", previous))
+        previous.chmod(0o700)
+        alias = self.base / "prefix-link"
+        alias.symlink_to(previous, target_is_directory=True)
+        self.refused(self.launch("--resume-to", self.base / "new", "--prefix-from", alias))
+
+    def test_prefix_selection_is_never_an_implicit_operation(self):
+        previous = self.partial()
+        for args in (("--prefix-from", previous),
+                     ("--prefix-from", previous, "--acknowledge", previous),
+                     ("--prefix-from", previous, "--no-prefix", "--resume-to", self.base / "new")):
+            self.refused(self.launch(*args))
+
+    def test_worker_unicode_and_byte_bounds_refuse_without_a_native_handoff(self):
+        for worker in ("bad\u0085control", "bad\udcffsurrogate", "雪" * 400):
+            self.record["remote_configuration"]["worker_id"] = worker
+            self.save_record()
+            self.refused(self.launch("--resume-to", self.base / "new"))
+
+    def test_private_record_can_use_existing_group_accessible_admission_parent_without_chmod(self):
+        self.state.chmod(0o775)
+        result = self.launch("--resume-to", self.base / "new")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o775)
+        self.assertEqual(self.events()[0]["state"], str(self.state))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

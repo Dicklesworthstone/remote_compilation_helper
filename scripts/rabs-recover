@@ -245,7 +245,7 @@ def private_directory(path):
         os.close(fd)
 
 
-def operation(intent, resume_to, acknowledge, no_prefix):
+def operation(intent, resume_to, acknowledge, no_prefix, prefix_from=None):
     if resume_to:
         destination = absolute(resume_to)
         fd = open_directory(destination.parent)
@@ -253,14 +253,20 @@ def operation(intent, resume_to, acknowledge, no_prefix):
         require(not os.path.lexists(destination), "resume destination must not already exist")
         require(intent.root not in destination.parents and destination not in intent.root.parents
                 and destination != intent.root, "recovery and resume directories must not overlap")
-        previous = intent.root / "delivery"
+        previous = absolute(prefix_from) if prefix_from is not None else intent.root / "delivery"
+        require(not (no_prefix and prefix_from is not None), "conflicting prefix selection")
+        if prefix_from is not None:
+            private_directory(previous)
+        require(previous != destination and previous not in destination.parents
+                and destination not in previous.parents, "resume prefix and destination must not overlap")
         if not no_prefix and os.path.lexists(previous):
             private_directory(previous)
             flags = ["--resume-from", str(previous)]
         else:
             flags = ["--resume"]
     else:
-        require(acknowledge is not None and not no_prefix, "--no-prefix requires --resume-to")
+        require(acknowledge is not None and not no_prefix and prefix_from is None,
+                "prefix selection requires --resume-to")
         destination = absolute(acknowledge)
         private_directory(destination)
         fd = open_directory(destination)
@@ -314,12 +320,16 @@ def main(argv=None):
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--resume-to", metavar="NEW_DIRECTORY", help="retrieve results into a new directory")
     choice.add_argument("--acknowledge", metavar="DELIVERY_DIRECTORY", help="verify and acknowledge an existing delivery")
-    parser.add_argument("--no-prefix", action="store_true", help="explicitly download afresh; preserve old partial files")
+    prefix = parser.add_mutually_exclusive_group()
+    prefix.add_argument("--no-prefix", action="store_true", help="explicitly download afresh; preserve old partial files")
+    prefix.add_argument("--prefix-from", metavar="OLD_DIRECTORY",
+                        help="reuse a later interrupted recovery as untrusted byte hints")
     parser.add_argument("--rabsd", help="native daemon executable, never taken from the recovery record")
     args = parser.parse_args(argv)
     try:
         require(sys.platform == "linux", "live RABS recovery currently requires Linux")
-        require(not args.no_prefix or args.resume_to is not None, "--no-prefix requires --resume-to")
+        require(not (args.no_prefix or args.prefix_from is not None) or args.resume_to is not None,
+                "prefix selection requires --resume-to")
         intent = load_intent(args.directory)
         if args.resume_to is None and args.acknowledge is None:
             print(json.dumps({"kind": "rabs-remote-recovery-intent", "directory": str(intent.root),
@@ -328,7 +338,8 @@ def main(argv=None):
                               "transport_state_dir": str(intent.state), "outputs_verified": False,
                               "publication_authorized": False, "reexecute": False}, ensure_ascii=True))
             return 0
-        flags, destination = operation(intent, args.resume_to, args.acknowledge, args.no_prefix)
+        flags, destination = operation(intent, args.resume_to, args.acknowledge,
+                                       args.no_prefix, args.prefix_from)
         env = dict(os.environ)
         daemon = daemon_path(args.rabsd, env)
         for name in ("RABS_COORD_TLS_CA", "RABS_COORD_TLS_CERT", "RABS_COORD_TLS_KEY"):
