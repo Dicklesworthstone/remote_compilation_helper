@@ -197,6 +197,78 @@ pub fn decide_exec_policy(command: &str, ctx: &ExecContext) -> ExecDecision {
     }
 }
 
+/// Decide whether an explicit command may run locally on a client without a
+/// supported remote transport. This is not the fail-open PreToolUse policy.
+///
+/// The caller supplies the already-loaded configuration and the two original
+/// environment values. Presence matters: an explicit `RCH_REQUIRE_REMOTE=0`
+/// or `RCH_FORCE_REMOTE=0` overrides the dispatcher default, but never a
+/// configured prohibition on compilation fallback. Force-remote preference
+/// alone is not strict-remote policy.
+///
+/// Selected-source, job, worker-pin and verified-tool requests must be refused
+/// by the transport before calling this function. Explicit local configuration
+/// cannot satisfy those guarantees. This function performs no I/O and never
+/// grants remote execution authority.
+///
+/// # Errors
+/// Returns a stable policy reason when no local command may be started.
+pub fn unavailable_remote_fallback(
+    command: &str,
+    config: &crate::RchConfig,
+    require_remote_env: Option<&str>,
+    force_remote_env: Option<&str>,
+) -> Result<&'static str, &'static str> {
+    let require_remote = require_remote_env.is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    let classification = classify_command(command);
+    // Like explicit Unix exec, ordinary non-compilation commands stay local,
+    // but an explicit strict-remote request never silently runs them there.
+    if !classification.is_compilation {
+        return if require_remote {
+            Err("RCH_REQUIRE_REMOTE")
+        } else {
+            Ok("non-compilation command")
+        };
+    }
+    if config.general.force_local && config.general.force_remote {
+        return Err("invalid config: force_local+force_remote");
+    }
+    // A deliberate local placement is not silent fallback. These settings
+    // outrank ambient strict-remote intent, as in the Unix config policy.
+    if !config.general.enabled {
+        return Ok("rch disabled (general.enabled=false)");
+    }
+    if config.general.force_local {
+        return Ok("force_local");
+    }
+    if require_remote {
+        return Err("RCH_REQUIRE_REMOTE");
+    }
+    if config.general.role == crate::BoxRole::Dispatcher
+        && require_remote_env.is_none()
+        && force_remote_env.is_none()
+    {
+        return Err("role=dispatcher");
+    }
+    if !config.compilation.allow_local_fallback {
+        return Err("compilation.allow_local_fallback=false");
+    }
+    // An allowlist exclusion is not an explicit local override of any of the
+    // refusals above. Do not mislabel it as a transport connectivity problem.
+    if classification
+        .kind
+        .is_some_and(|kind| !config.execution.is_allowed(kind.command_base()))
+    {
+        return Ok("command not in execution.allowlist");
+    }
+    Ok("remote transport unavailable")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +391,161 @@ mod tests {
         assert_eq!(v["mutates_local_state"], true);
         let back: ExecDecision = serde_json::from_value(v).unwrap();
         assert_eq!(back, d);
+    }
+
+    fn fallback_config() -> crate::RchConfig {
+        let mut config = crate::RchConfig::default();
+        config.general.enabled = true;
+        config.general.force_local = false;
+        config.general.force_remote = false;
+        config.general.role = crate::BoxRole::Hybrid;
+        config.compilation.allow_local_fallback = true;
+        config
+    }
+
+    #[test]
+    fn unavailable_transport_strict_exec_refuses_builds_and_non_compilations() {
+        let config = fallback_config();
+        for command in [
+            "cargo build",
+            "cargo test",
+            "go build ./...",
+            "echo hello",
+            "cargo fmt",
+        ] {
+            for flag in ["1", "true", "TRUE", "yes", "on"] {
+                assert_eq!(
+                    unavailable_remote_fallback(command, &config, Some(flag), None),
+                    Err("RCH_REQUIRE_REMOTE"),
+                    "{command}: {flag}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_transport_dispatcher_defaults_apply_only_to_compilations() {
+        let mut config = fallback_config();
+        config.general.role = crate::BoxRole::Dispatcher;
+        assert_eq!(
+            unavailable_remote_fallback("cargo build", &config, None, None),
+            Err("role=dispatcher"),
+        );
+        assert_eq!(
+            unavailable_remote_fallback("echo hello", &config, None, None),
+            Ok("non-compilation command"),
+        );
+        for flag in ["0", "false", "FALSE", "no", "off"] {
+            assert!(
+                unavailable_remote_fallback("cargo build", &config, Some(flag), None).is_ok()
+            );
+            assert!(
+                unavailable_remote_fallback("cargo build", &config, None, Some(flag)).is_ok()
+            );
+        }
+        assert_eq!(
+            unavailable_remote_fallback("cargo build", &config, Some("1"), Some("0")),
+            Err("RCH_REQUIRE_REMOTE"),
+        );
+    }
+
+    #[test]
+    fn unavailable_transport_no_fallback_cannot_be_overridden_by_force_preference() {
+        let mut config = fallback_config();
+        config.compilation.allow_local_fallback = false;
+        for role in [
+            crate::BoxRole::Hybrid,
+            crate::BoxRole::Worker,
+            crate::BoxRole::Dispatcher,
+        ] {
+            config.general.role = role;
+            for force_remote in [false, true] {
+                config.general.force_remote = force_remote;
+                for flag in ["0", "1"] {
+                    assert_eq!(
+                        unavailable_remote_fallback(
+                            "cargo build",
+                            &config,
+                            Some("0"),
+                            Some(flag)
+                        ),
+                        Err("compilation.allow_local_fallback=false"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_transport_explicit_local_config_is_not_fallback() {
+        for enabled in [false, true] {
+            let mut config = fallback_config();
+            config.general.enabled = enabled;
+            config.general.force_local = enabled;
+            config.general.role = crate::BoxRole::Dispatcher;
+            config.compilation.allow_local_fallback = false;
+            assert_eq!(
+                unavailable_remote_fallback("cargo build", &config, Some("1"), None),
+                Ok(if enabled {
+                    "force_local"
+                } else {
+                    "rch disabled (general.enabled=false)"
+                }),
+            );
+            // Explicit exec classifies non-compilations before config-local
+            // overrides; strict non-compilation requests remain refusals.
+            assert_eq!(
+                unavailable_remote_fallback("echo hello", &config, Some("1"), None),
+                Err("RCH_REQUIRE_REMOTE"),
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_transport_force_remote_is_not_require_remote() {
+        let mut config = fallback_config();
+        config.general.force_remote = true;
+        for flag in [None, Some("0"), Some("1")] {
+            assert!(unavailable_remote_fallback("cargo build", &config, None, flag).is_ok());
+        }
+        config.general.force_local = true;
+        assert_eq!(
+            unavailable_remote_fallback("cargo build", &config, None, None),
+            Err("invalid config: force_local+force_remote"),
+        );
+    }
+
+    #[test]
+    fn unavailable_transport_allowlist_is_not_a_strict_policy_override() {
+        let mut config = fallback_config();
+        config.execution.allowlist = vec!["make".into()];
+        assert_eq!(
+            unavailable_remote_fallback("cargo build", &config, None, None),
+            Ok("command not in execution.allowlist"),
+        );
+        assert_eq!(
+            unavailable_remote_fallback("cargo build", &config, Some("1"), None),
+            Err("RCH_REQUIRE_REMOTE"),
+        );
+        config.compilation.allow_local_fallback = false;
+        assert_eq!(
+            unavailable_remote_fallback("cargo build", &config, Some("0"), None),
+            Err("compilation.allow_local_fallback=false"),
+        );
+    }
+
+    #[test]
+    fn unavailable_transport_local_non_compilation_does_not_consume_fallback_permission() {
+        let mut config = fallback_config();
+        config.compilation.allow_local_fallback = false;
+        assert_eq!(
+            unavailable_remote_fallback("echo hello", &config, None, None),
+            Ok("non-compilation command"),
+        );
+        assert_eq!(
+            decide_exec_policy("echo hello", &ExecContext::hook()).disposition,
+            ExecDisposition::RunLocalFallback,
+            "explicit-exec refusal must not change the passive hook policy",
+        );
     }
 }
