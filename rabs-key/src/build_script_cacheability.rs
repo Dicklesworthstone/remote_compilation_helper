@@ -347,6 +347,112 @@ pub fn build_cacheability_report(
     }
 }
 
+/// Digest domain for the offline input closure of a split captured-fetch generator (`N009`).
+pub const DOMAIN_CAPTURED_FETCH_INPUT: &str = "rabs.captured-fetch-input.v1";
+
+/// One captured output of an explicit bounded-network fetch action (`N009`).
+///
+/// The downstream build/generator runs offline against `payload_object` and
+/// `response_metadata_digest`. Transport provenance (`source_url_hint`,
+/// `capability_token_id`, `fetch_timestamp_ns`) is retained for audit receipts
+/// only and NEVER enters the offline generator's action key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedNetworkFetchObject {
+    ///Canonical virtual path where the fetched artifact is mounted in the offline generator view.
+    pub mounted_virtual_path: String,
+    /// Immutable CAS object holding the fetched response bytes.
+    pub payload_object: rabs_protocol::result_identity::ObjectId,
+    /// Digest of canonicalized response metadata (e.g. content-type/schema version,
+    /// with wall-clock `Date`/`Age` headers stripped).
+    pub response_metadata_digest: TypedDigest,
+    /// Audit-only URL hint from the fetch phase (excluded from offline action key).
+    pub source_url_hint: String,
+    /// Audit-only capability token ID that authorized the fetch phase (excluded from offline action key).
+    pub capability_token_id: u64,
+    /// Audit-only wall-clock timestamp when the fetch completed (excluded from offline action key).
+    pub fetch_timestamp_ns: u64,
+}
+
+/// Routing and key-binding outcome for a networked build script or code generator (`N009`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkGeneratorSplitPlan {
+    /// Generator is split into (1) explicit bounded-network fetch producing immutable
+    /// objects and (2) offline canonical execution keyed strictly on captured content
+    /// and normalized metadata — never on URL spelling or wall-clock fetch time.
+    CanonicalSplitOffline {
+        /// Key component digest binding all `(mounted_virtual_path, payload_object, response_metadata_digest)`
+        /// entries in canonical path order.
+        offline_inputs_digest: TypedDigest,
+        /// Immutable CAS objects mounted into the offline generator namespace.
+        captured_objects: Vec<rabs_protocol::result_identity::ObjectId>,
+    },
+    /// Generator cannot be separated into a pure fetch phase + offline transform
+    /// (or lacks offline namespace enforcement / captured objects); it stays
+    /// volatile/capability-specific and is refused from the ordinary shared cache.
+    NonSeparableVolatile {
+        /// Actionable explanation for why the generator stays local/volatile.
+        reason: String,
+    },
+}
+
+/// Plan the `N009` captured-fetch split for a network-consuming generator or build script.
+#[must_use]
+pub fn plan_captured_fetch_generator_split(
+    separable_fetch_phase: bool,
+    offline_execution_enforced: bool,
+    captured_fetches: &[CapturedNetworkFetchObject],
+) -> NetworkGeneratorSplitPlan {
+    use crate::canonical::CanonicalEncoder;
+    use crate::typed_digest::compute;
+
+    if !separable_fetch_phase {
+        return NetworkGeneratorSplitPlan::NonSeparableVolatile {
+            reason: "generator interleaves live network I/O with build execution and cannot be separated into a captured-fetch phase (N009)".into(),
+        };
+    }
+    if !offline_execution_enforced {
+        return NetworkGeneratorSplitPlan::NonSeparableVolatile {
+            reason: "generator execution phase does not enforce default-deny offline network isolation (N009)".into(),
+        };
+    }
+    if captured_fetches.is_empty() {
+        return NetworkGeneratorSplitPlan::NonSeparableVolatile {
+            reason:
+                "captured-fetch split requires at least one immutable captured fetch object (N009)"
+                    .into(),
+        };
+    }
+
+    let mut sorted: Vec<&CapturedNetworkFetchObject> = captured_fetches.iter().collect();
+    sorted.sort_by(|a, b| a.mounted_virtual_path.cmp(&b.mounted_virtual_path));
+    if sorted
+        .windows(2)
+        .any(|w| w[0].mounted_virtual_path == w[1].mounted_virtual_path)
+    {
+        return NetworkGeneratorSplitPlan::NonSeparableVolatile {
+            reason: "duplicate mounted_virtual_path in captured-fetch set (N009)".into(),
+        };
+    }
+
+    let mut enc = CanonicalEncoder::new();
+    let mut captured_objects = Vec::with_capacity(sorted.len());
+    enc.seq(&sorted, |enc, item| {
+        enc.str(&item.mounted_virtual_path)
+            .str(item.payload_object.0.domain)
+            .bytes(&item.payload_object.0.bytes)
+            .str(item.response_metadata_digest.domain)
+            .bytes(&item.response_metadata_digest.bytes);
+    });
+    for item in &sorted {
+        captured_objects.push(item.payload_object.clone());
+    }
+
+    NetworkGeneratorSplitPlan::CanonicalSplitOffline {
+        offline_inputs_digest: compute(DOMAIN_CAPTURED_FETCH_INPUT, &enc.finish()),
+        captured_objects,
+    }
+}
+
 // ---------------------------------------------------------------------
 // Tests — N008 acceptance: zero-divergence gate + automated
 // cacheability report with the >80% target.
@@ -618,6 +724,68 @@ mod tests {
         assert!(matches!(o.volatility,
             Volatility::Volatile { reasons }
                 if reasons.contains(&"volatile-generator-vergen")
+        ));
+    }
+
+    #[test]
+    fn n009_networked_generator_fixture_converts_to_captured_fetch_split_pattern() {
+        use rabs_protocol::result_identity::ObjectId;
+
+        let fetch_a = CapturedNetworkFetchObject {
+            mounted_virtual_path: "/__rabs/inputs/fetched/openapi.json".into(),
+            payload_object: ObjectId(id(0x41)),
+            response_metadata_digest: id(0x42),
+            source_url_hint: "https://mirror-a.example.com/openapi.json".into(),
+            capability_token_id: 1001,
+            fetch_timestamp_ns: 1_700_000_000_000_000_000,
+        };
+        // Same captured content + normalized metadata fetched from a different mirror URL,
+        // under a different capability token, at a later wall-clock time.
+        let fetch_b = CapturedNetworkFetchObject {
+            mounted_virtual_path: "/__rabs/inputs/fetched/openapi.json".into(),
+            payload_object: ObjectId(id(0x41)),
+            response_metadata_digest: id(0x42),
+            source_url_hint: "https://mirror-b.example.org/v1/openapi.json".into(),
+            capability_token_id: 2002,
+            fetch_timestamp_ns: 1_800_000_000_000_000_000,
+        };
+
+        let plan_a = plan_captured_fetch_generator_split(true, true, &[fetch_a.clone()]);
+        let plan_b = plan_captured_fetch_generator_split(true, true, &[fetch_b]);
+        assert_eq!(
+            plan_a, plan_b,
+            "N009: offline generator key must bind captured content + metadata, never URL or wall-clock fetch time"
+        );
+        let NetworkGeneratorSplitPlan::CanonicalSplitOffline {
+            offline_inputs_digest: digest_a,
+            captured_objects,
+        } = plan_a
+        else {
+            panic!("expected CanonicalSplitOffline");
+        };
+        assert_eq!(digest_a.domain, DOMAIN_CAPTURED_FETCH_INPUT);
+        assert_eq!(captured_objects, vec![ObjectId(id(0x41))]);
+
+        // Changing the captured payload bytes changes the offline generator input digest.
+        let mut fetch_mutated = fetch_a.clone();
+        fetch_mutated.payload_object = ObjectId(id(0x99));
+        let NetworkGeneratorSplitPlan::CanonicalSplitOffline {
+            offline_inputs_digest: digest_mutated,
+            ..
+        } = plan_captured_fetch_generator_split(true, true, &[fetch_mutated])
+        else {
+            panic!("expected CanonicalSplitOffline");
+        };
+        assert_ne!(digest_a, digest_mutated);
+
+        // Non-separable or non-offline generators stay volatile/capability-specific.
+        assert!(matches!(
+            plan_captured_fetch_generator_split(false, true, std::slice::from_ref(&fetch_a)),
+            NetworkGeneratorSplitPlan::NonSeparableVolatile { .. }
+        ));
+        assert!(matches!(
+            plan_captured_fetch_generator_split(true, false, std::slice::from_ref(&fetch_a)),
+            NetworkGeneratorSplitPlan::NonSeparableVolatile { .. }
         ));
     }
 }
