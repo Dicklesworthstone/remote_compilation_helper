@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Recover retained live RABS results without dispatching another compiler.
+
+Linux, Python 3.9+. With no operation flag this only inspects private intent
+metadata; it does not verify output bytes or contact a worker. --resume-to and
+--acknowledge hand off once to the existing pinned TLS rabsd operator. That
+operator owns authentication, result verification, timeouts and acknowledgment.
+Recovered bytes do not repair an abandoned coordinator action or authorize a
+Cargo compiler skip. No credentials, request arguments or environment values
+are printed. Keep the recovery and admission directories exclusively owned
+while operating; this is not a hostile same-user shared-directory interface.
+"""
+
+import argparse
+from dataclasses import dataclass
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+
+
+# rabs_asupersync::worker_transport::MAX_JSON_RECORD. The native operator also
+# enforces its current envelope bound before contacting a worker.
+MAX_RECORD = 1024 * 1024 - 64
+SCHEMA = "rabs-live-remote-recovery-v1"
+
+
+class Refused(Exception):
+    """No recovery operation has been handed to the native operator."""
+
+
+def require(condition, message):
+    if not condition:
+        raise Refused(message)
+
+
+def absolute(value):
+    require(isinstance(value, str) and value.startswith("/") and "\0" not in value,
+            "paths must be absolute")
+    require(not any(part in (".", "..") for part in value.split("/")),
+            "paths must not contain traversal")
+    value.encode("utf-8")
+    path = Path(value)
+    require(path != Path("/"), "paths must name a directory below the root")
+    return path
+
+
+def open_directory(path):
+    """Walk using directory descriptors, refusing symlinks in every component."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def identity(metadata):
+    return metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_mode
+
+
+def fingerprint(metadata):
+    return identity(metadata) + (metadata.st_size, metadata.st_nlink,
+                                 metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def private_file(metadata):
+    require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1,
+            "recovery records must be ordinary files with one link")
+    require(metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077 == 0,
+            "recovery records must be private to the current user")
+    require(metadata.st_size <= MAX_RECORD, "recovery record exceeds its byte bound")
+
+
+def read_record(directory, name):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                 dir_fd=directory)
+    try:
+        before = os.fstat(fd)
+        private_file(before)
+        data = bytearray()
+        while len(data) <= MAX_RECORD:
+            chunk = os.read(fd, min(65536, MAX_RECORD + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        require(len(data) == before.st_size and len(data) <= MAX_RECORD,
+                "recovery record changed length while reading")
+        require(fingerprint(before) == fingerprint(os.fstat(fd)) == fingerprint(
+            os.stat(name, dir_fd=directory, follow_symlinks=False)),
+            "recovery record changed while reading")
+        return bytes(data), fingerprint(before)
+    finally:
+        os.close(fd)
+
+
+def decode(data):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "duplicate recovery JSON field")
+            result[key] = value
+        return result
+
+    def nonfinite(_value):
+        raise Refused("non-finite recovery JSON number")
+
+    try:
+        result = json.loads(data.decode("utf-8"), object_pairs_hook=unique,
+                            parse_constant=nonfinite)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise Refused("malformed recovery JSON") from error
+    require(isinstance(result, dict), "recovery JSON must be an object")
+    return result
+
+
+def hex_digest(value):
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
+
+
+def listener(value):
+    require(isinstance(value, str), "missing recorded worker listener")
+    try:
+        host, port = value.rsplit(":", 1)
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+            require(ipaddress.ip_address(host).version == 6, "invalid IPv6 listener")
+        else:
+            require(ipaddress.ip_address(host).version == 4, "IPv6 listener needs brackets")
+        require("%" not in host and port.isascii() and port.isdecimal()
+                and 0 < int(port) <= 65535, "invalid recorded listener port")
+    except ValueError as error:
+        raise Refused("worker listener must be a literal IP and nonzero port") from error
+    return value
+
+
+@dataclass(frozen=True)
+class Intent:
+    root: Path
+    state: Path
+    request: bytes
+    request_id: int
+    action_key: str
+    worker: str
+    pin: str
+    listen: str
+    root_identity: tuple
+    state_identity: tuple
+    record_fingerprint: tuple
+    request_fingerprint: tuple
+
+    def verify_unchanged(self):
+        state_fd = open_directory(self.state)
+        try:
+            require(identity(os.fstat(state_fd)) == self.state_identity,
+                    "transport state directory changed")
+        finally:
+            os.close(state_fd)
+        root_fd = open_directory(self.root)
+        try:
+            require(identity(os.fstat(root_fd)) == self.root_identity,
+                    "recovery directory changed")
+            for name, expected in (("recovery.json", self.record_fingerprint),
+                                   ("request.json", self.request_fingerprint)):
+                require(fingerprint(os.stat(name, dir_fd=root_fd, follow_symlinks=False)) == expected,
+                        "recovery identity changed before handoff")
+        finally:
+            os.close(root_fd)
+
+
+def load_intent(value):
+    root = absolute(value)
+    state = root.parent
+    state_fd = open_directory(state)
+    try:
+        state_identity = identity(os.fstat(state_fd))
+        require(state_identity[2] == os.geteuid(), "transport state belongs to another user")
+        fd = os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=state_fd)
+    finally:
+        os.close(state_fd)
+    try:
+        metadata = os.fstat(fd)
+        require(metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077 == 0,
+                "recovery directory must be private to the current user")
+        record_bytes, record_fingerprint = read_record(fd, "recovery.json")
+        request_bytes, request_fingerprint = read_record(fd, "request.json")
+    finally:
+        os.close(fd)
+    record, request = decode(record_bytes), decode(request_bytes)
+    require(record.get("schema") == SCHEMA
+            and record.get("recovery_mode") == "resume-or-acknowledge-only"
+            and record.get("execution_state") == "unknown"
+            and record.get("reexecute") is False
+            and record.get("publication_authorized") is False,
+            "unsupported recovery schema or authority policy")
+    require(record.get("request_file") == "request.json"
+            and record.get("partial_delivery") == "delivery",
+            "recovery record changed its fixed file names")
+    require(absolute(record.get("transport_state_dir")) == state,
+            "recovery directory must remain in its original transport state directory")
+    request_id = record.get("request_id")
+    require(type(request_id) is int and 0 < request_id < 2**64
+            and type(request.get("request_id")) is int and request["request_id"] == request_id
+            and request.get("kind") == "canonical-exec", "request identity mismatch")
+    require(hex_digest(record.get("request_sha256"))
+            and hashlib.sha256(request_bytes).hexdigest() == record["request_sha256"],
+            "saved request digest mismatch")
+    action_key = record.get("action_key")
+    require(isinstance(action_key, str) and 0 < len(action_key) <= 512,
+            "missing or oversized action identity")
+    config = record.get("remote_configuration")
+    require(isinstance(config, dict) and type(config.get("remote_protocol")) is int
+            and config["remote_protocol"] == 1, "unsupported remote configuration")
+    worker, pin = config.get("worker_id"), config.get("worker_spki_sha256")
+    require(isinstance(worker, str) and 0 < len(worker.encode("utf-8")) <= 1024
+            and all(ord(char) >= 32 and not 127 <= ord(char) <= 159 for char in worker),
+            "invalid recorded worker identity")
+    require(hex_digest(pin) and pin != "0" * 64, "invalid recorded worker SPKI pin")
+    intent = Intent(root, state, request_bytes, request_id, action_key, worker, pin,
+                    listener(config.get("listen")), identity(metadata), state_identity,
+                    record_fingerprint, request_fingerprint)
+    intent.verify_unchanged()
+    return intent
+
+
+def private_directory(path):
+    fd = open_directory(path)
+    try:
+        metadata = os.fstat(fd)
+        require(metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077 == 0,
+                "delivery directory must be private to the current user")
+    finally:
+        os.close(fd)
+
+
+def operation(intent, resume_to, acknowledge, no_prefix):
+    if resume_to:
+        destination = absolute(resume_to)
+        fd = open_directory(destination.parent)
+        os.close(fd)
+        require(not os.path.lexists(destination), "resume destination must not already exist")
+        require(intent.root not in destination.parents and destination not in intent.root.parents
+                and destination != intent.root, "recovery and resume directories must not overlap")
+        previous = intent.root / "delivery"
+        if not no_prefix and os.path.lexists(previous):
+            private_directory(previous)
+            flags = ["--resume-from", str(previous)]
+        else:
+            flags = ["--resume"]
+    else:
+        require(acknowledge is not None and not no_prefix, "--no-prefix requires --resume-to")
+        destination = absolute(acknowledge)
+        private_directory(destination)
+        fd = open_directory(destination)
+        try:
+            # This is only a structural preflight. The native operator must
+            # reverify the exact request, pinned provenance and EVERY result byte.
+            read_record(fd, "delivery.json")
+        finally:
+            os.close(fd)
+        flags = ["--acknowledge"]
+    return flags, str(destination)
+
+
+def daemon_path(selected, env):
+    candidates = ([selected] if selected else
+                  [env.get("CARGO_RABS_DAEMON"), str(Path(__file__).resolve().with_name("rabsd")),
+                   shutil.which("rabsd", path=env.get("PATH"))])
+    # An explicit override must never silently select a different installed binary.
+    if not selected and env.get("CARGO_RABS_DAEMON") is not None:
+        candidates = [env["CARGO_RABS_DAEMON"]]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            require(not os.path.samefile(candidate, __file__), "rabsd resolves to this recovery driver")
+            return os.path.abspath(candidate)
+    raise Refused("rabsd is not executable; select it with --rabsd or CARGO_RABS_DAEMON")
+
+
+def sealed_request(data):
+    """Pass the exact checked bytes across exec, not a mutable pathname."""
+    fd = os.memfd_create("rabs-recovery-request", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            require(written > 0, "request snapshot made no progress")
+            view = view[written:]
+        os.lseek(fd, 0, os.SEEK_SET)
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+        require(fcntl.fcntl(fd, fcntl.F_GET_SEALS) & seals == seals, "request snapshot is not sealed")
+        require(os.path.isfile("/proc/self/fd/{}".format(fd)), "procfs request handoff is unavailable")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("directory", help="retained result-* directory containing recovery.json")
+    choice = parser.add_mutually_exclusive_group()
+    choice.add_argument("--resume-to", metavar="NEW_DIRECTORY", help="retrieve results into a new directory")
+    choice.add_argument("--acknowledge", metavar="DELIVERY_DIRECTORY", help="verify and acknowledge an existing delivery")
+    parser.add_argument("--no-prefix", action="store_true", help="explicitly download afresh; preserve old partial files")
+    parser.add_argument("--rabsd", help="native daemon executable, never taken from the recovery record")
+    args = parser.parse_args(argv)
+    try:
+        require(sys.platform == "linux", "live RABS recovery currently requires Linux")
+        require(not args.no_prefix or args.resume_to is not None, "--no-prefix requires --resume-to")
+        intent = load_intent(args.directory)
+        if args.resume_to is None and args.acknowledge is None:
+            print(json.dumps({"kind": "rabs-remote-recovery-intent", "directory": str(intent.root),
+                              "request_id": intent.request_id, "action_key": intent.action_key,
+                              "worker_id": intent.worker, "listen": intent.listen,
+                              "transport_state_dir": str(intent.state), "outputs_verified": False,
+                              "publication_authorized": False, "reexecute": False}, ensure_ascii=True))
+            return 0
+        flags, destination = operation(intent, args.resume_to, args.acknowledge, args.no_prefix)
+        env = dict(os.environ)
+        daemon = daemon_path(args.rabsd, env)
+        for name in ("RABS_COORD_TLS_CA", "RABS_COORD_TLS_CERT", "RABS_COORD_TLS_KEY"):
+            require(bool(env.get(name)), "recovery requires explicit coordinator TLS credentials")
+            absolute(env[name])
+        # The worker admission ledger lives BELOW the ordinary daemon state root.
+        # Reusing the default root would lose its enrolled pin/boot fencing history.
+        env["RABS_STATE_DIR"] = str(intent.state)
+        intent.verify_unchanged()
+        fd = sealed_request(intent.request)
+        try:
+            os.set_inheritable(fd, True)
+            command = [daemon, "--worker-exec-tls"] + flags + [
+                intent.listen, intent.worker, intent.pin, "/proc/self/fd/{}".format(fd), destination]
+            os.execvpe(daemon, command, env)
+        finally:
+            os.close(fd)
+    except (Refused, OSError, UnicodeError, ValueError, RecursionError, AttributeError) as error:
+        detail = str(error) if isinstance(error, Refused) else type(error).__name__
+        print("rabs-recover: refused: {}; no execution retry".format(detail), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
