@@ -4,20 +4,20 @@
 
 use super::super::rustc_request::{Decided, LiveEdge, complete_on_lane, decide};
 use super::super::{
-    EdgeLimits, EdgeServices, EdgeStream, FRAME_READ_BUFFER_BYTES,
-    LIVE_DECISION_WORKERS, MATERIALIZATION_WORKERS, handle_connection,
+    EdgeLimits, EdgeServices, EdgeStream, FRAME_READ_BUFFER_BYTES, LIVE_DECISION_WORKERS,
+    MATERIALIZATION_WORKERS, handle_connection,
 };
 use super::{Limit, OwnedWork};
-use asupersync::net::unix::UnixListener;
-use asupersync::runtime::RuntimeBuilder;
-use rabs_asupersync::daemon_runtime::block_on_top_level;
-use rabs_cas::metadata_store::RabsMetadataStore;
-use rabs_protocol::socket_admission::{AdmissionPolicy, SocketMetadata};
 use crate::coord::live::CoordLive;
 use crate::coord::live_dependency::{
     CompletionOutcome, CompletionReport, LiveDependencyLane, LocalAttempt,
 };
 use crate::janitor::store::{LiveCas, mount_and_reconcile};
+use asupersync::net::unix::UnixListener;
+use asupersync::runtime::RuntimeBuilder;
+use rabs_asupersync::daemon_runtime::block_on_top_level;
+use rabs_cas::metadata_store::RabsMetadataStore;
+use rabs_protocol::socket_admission::{AdmissionPolicy, SocketMetadata};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -63,7 +63,8 @@ impl Fixture {
         std::fs::write(
             toolchain.join("lib/rustlib/x86_64-unknown-linux-gnu/lib/libcore.rlib"),
             b"sysroot fixture",
-        ).unwrap();
+        )
+        .unwrap();
         let compiler = toolchain.join("bin/rustc");
         std::fs::write(&compiler, concat!(
             "#!/bin/sh\ncase \"$*\" in\n",
@@ -84,10 +85,21 @@ impl Fixture {
         });
         let cas = Arc::new(mount_and_reconcile(&root.join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
-        coord.acquire_boot_authority("completion-reservation-fixture").unwrap();
+        coord
+            .acquire_boot_authority("completion-reservation-fixture")
+            .unwrap();
         coord.mark_up();
         let live = Arc::new(LiveEdge::new(LiveDependencyLane::new(Arc::clone(&coord))));
-        Self { _dir: dir, root, package, out, request, live, coord, cas }
+        Self {
+            _dir: dir,
+            root,
+            package,
+            out,
+            request,
+            live,
+            coord,
+            cas,
+        }
     }
 
     fn begin(&self) -> (Box<LocalAttempt>, String) {
@@ -112,17 +124,25 @@ impl Fixture {
 
     fn outputs(&self) {
         std::fs::write(self.out.join("libfoo-123.rmeta"), ARTIFACT).unwrap();
-        std::fs::write(self.out.join("foo-123.d"), format!(
-            "{}/libfoo-123.rmeta: {}/lib.rs\n\n{}/lib.rs:\n",
-            self.out.display(), self.package.display(), self.package.display(),
-        )).unwrap();
+        std::fs::write(
+            self.out.join("foo-123.d"),
+            format!(
+                "{}/libfoo-123.rmeta: {}/lib.rs\n\n{}/lib.rs:\n",
+                self.out.display(),
+                self.package.display(),
+                self.package.display(),
+            ),
+        )
+        .unwrap();
     }
 
     fn report(attempt: &LocalAttempt) -> Vec<u8> {
         json!({
             "kind":"rustc-complete", "capture_protocol":1, "attempt":attempt.attempt_hex(),
             "exit_code":0, "signal":null, "stdout_hex":"", "stderr_hex":"",
-        }).to_string().into_bytes()
+        })
+        .to_string()
+        .into_bytes()
     }
 
     fn warm_replay(&self) -> String {
@@ -151,9 +171,16 @@ impl Fixture {
     }
 
     fn locations(&self) -> Vec<(String, String)> {
-        let mut locations: Vec<_> = self.cas.store().lock().unwrap()
-            .reconciliation_scan().unwrap().into_iter()
-            .map(|row| (row.object_key, row.store_path)).collect();
+        let mut locations: Vec<_> = self
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .reconciliation_scan()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.object_key, row.store_path))
+            .collect();
         locations.sort();
         locations
     }
@@ -184,8 +211,12 @@ fn handoff(ack: Ack) {
         let listener = UnixListener::bind(&path).await.unwrap();
         let peer = std::thread::spawn(move || {
             let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut socket = BufReader::new(socket);
             let mut line = String::new();
             socket.read_line(&mut line).unwrap();
@@ -194,12 +225,23 @@ fn handoff(ack: Ack) {
             assert_eq!(receipt["publication_authorized"], false);
             // Captured bytes are durable, but there is no publication before
             // consent and no metadata mutex held by the acknowledgment waiter.
-            assert!(cas.store().try_lock().unwrap().list_publications().unwrap().is_empty());
+            assert!(
+                cas.store()
+                    .try_lock()
+                    .unwrap()
+                    .list_publications()
+                    .unwrap()
+                    .is_empty()
+            );
             let mut occupied = Vec::new();
             while let Some(permit) = peer_capacity.acquire() {
                 occupied.push(permit);
             }
-            assert_eq!(occupied.len(), 7, "the capture reservation must survive its joined stage");
+            assert_eq!(
+                occupied.len(),
+                7,
+                "the capture reservation must survive its joined stage"
+            );
             match ack {
                 Ack::Matching | Ack::WrongCapture => {
                     let capture = match ack {
@@ -220,13 +262,24 @@ fn handoff(ack: Ack) {
         let (socket, _) = listener.accept().await.unwrap();
         let mut socket = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, socket);
         let result = complete_on_lane(
-            &capacity, Arc::clone(&fixture.live), attempt, report, &mut socket,
-        ).await;
+            &capacity,
+            Arc::clone(&fixture.live),
+            attempt,
+            report,
+            &mut socket,
+        )
+        .await;
         let _ = finished.send(());
         peer.join().unwrap();
         serde_json::from_str::<Value>(&result).unwrap()
     });
-    let publications = fixture.cas.store().lock().unwrap().list_publications().unwrap();
+    let publications = fixture
+        .cas
+        .store()
+        .lock()
+        .unwrap()
+        .list_publications()
+        .unwrap();
     match ack {
         Ack::Matching => {
             assert_eq!(result["outcome"], "committed", "{result}");
@@ -244,7 +297,10 @@ fn handoff(ack: Ack) {
     let recovered: Vec<_> = (0..8).map(|_| capacity.acquire().unwrap()).collect();
     assert!(capacity.acquire().is_none());
     drop(recovered);
-    assert_eq!(std::fs::read(fixture.out.join("libfoo-123.rmeta")).unwrap(), ARTIFACT);
+    assert_eq!(
+        std::fs::read(fixture.out.join("libfoo-123.rmeta")).unwrap(),
+        ARTIFACT
+    );
 }
 
 #[test]
@@ -275,32 +331,61 @@ fn initial_saturation_never_acknowledges_or_copies_outputs() {
         let listener = UnixListener::bind(&path).await.unwrap();
         let peer = std::thread::spawn(move || {
             let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut socket = BufReader::new(socket);
             let mut line = String::new();
-            assert_eq!(socket.read_line(&mut line).unwrap(), 0, "no custody receipt on refusal");
+            assert_eq!(
+                socket.read_line(&mut line).unwrap(),
+                0,
+                "no custody receipt on refusal"
+            );
         });
         let (socket, _) = listener.accept().await.unwrap();
         let mut socket = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, socket);
         let result = complete_on_lane(
-            &Limit::new(0), Arc::clone(&fixture.live), attempt, report, &mut socket,
-        ).await;
+            &Limit::new(0),
+            Arc::clone(&fixture.live),
+            attempt,
+            report,
+            &mut socket,
+        )
+        .await;
         drop(socket);
         peer.join().unwrap();
         serde_json::from_str::<Value>(&result).unwrap()
     });
     assert_eq!(result["outcome"], "not-published");
     assert_eq!(result["publication_authorized"], false);
-    assert!(fixture.cas.store().lock().unwrap().list_publications().unwrap().is_empty());
-    assert_eq!(fixture.locations(), locations_before, "no additional captured blob locations");
+    assert!(
+        fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .list_publications()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.locations(),
+        locations_before,
+        "no additional captured blob locations"
+    );
     drop(fixture.begin());
-    assert_eq!(std::fs::read(fixture.out.join("libfoo-123.rmeta")).unwrap(), ARTIFACT);
+    assert_eq!(
+        std::fs::read(fixture.out.join("libfoo-123.rmeta")).unwrap(),
+        ARTIFACT
+    );
 }
-
 
 fn read_reply(socket: &mut BufReader<std::os::unix::net::UnixStream>) -> Value {
     let mut line = String::new();
-    assert!(socket.read_line(&mut line).unwrap() > 0, "missing daemon reply");
+    assert!(
+        socket.read_line(&mut line).unwrap() > 0,
+        "missing daemon reply"
+    );
     serde_json::from_str(&line).unwrap()
 }
 
@@ -325,8 +410,12 @@ fn run_connection(
         let listener = UnixListener::bind(&path).await.unwrap();
         let client = std::thread::spawn(move || {
             let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut socket = BufReader::new(socket);
             let hello = json!({
                 "kind":"hello",
@@ -347,10 +436,14 @@ fn run_connection(
                 require_token_on_unix: false,
                 tcp_enabled: false,
             },
-            SocketMetadata { owner_uid, mode: 0o600 },
+            SocketMetadata {
+                owner_uid,
+                mode: 0o600,
+            },
             services,
             limits,
-        ).await;
+        )
+        .await;
         client.join().unwrap();
     });
 }
@@ -364,10 +457,12 @@ fn occupy_decisions(lane: &Limit) -> Vec<(mpsc::Sender<()>, OwnedWork<()>)> {
     for _ in 0..LIVE_DECISION_WORKERS {
         let started = started.clone();
         let (release, released) = mpsc::channel();
-        let work = lane.spawn(move || {
-            started.send(()).unwrap();
-            let _ = released.recv_timeout(Duration::from_secs(10));
-        }).unwrap();
+        let work = lane
+            .spawn(move || {
+                started.send(()).unwrap();
+                let _ = released.recv_timeout(Duration::from_secs(10));
+            })
+            .unwrap();
         occupied.push((release, work));
     }
     for _ in 0..LIVE_DECISION_WORKERS {
@@ -401,7 +496,7 @@ fn hit_handoff(ack: InstallAck) {
     std::fs::write(&metadata, prior_metadata).unwrap();
     std::fs::write(&dep_info, prior_dep_info).unwrap();
     let request = fixture.request.clone();
-    let limits = EdgeLimits::new();
+    let limits = EdgeLimits::new(0);
     let peer_limits = limits.clone();
     let peer_metadata = metadata.clone();
     let peer_dep_info = dep_info.clone();
@@ -428,7 +523,10 @@ fn hit_handoff(ack: InstallAck) {
                 assert_eq!(served["action_key"], action);
                 assert_eq!(served["compiler_skip_authorized"], true);
                 assert_eq!(std::fs::read(&peer_metadata).unwrap(), ARTIFACT);
-                assert_eq!(std::fs::read(&peer_dep_info).unwrap(), peer_expected_dep_info);
+                assert_eq!(
+                    std::fs::read(&peer_dep_info).unwrap(),
+                    peer_expected_dep_info
+                );
                 // No decision worker was released to make the hit succeed.
                 assert!(peer_limits.live.acquire().is_none());
                 let returned = peer_limits.materialization.acquire().unwrap();
@@ -487,7 +585,7 @@ fn saturated_installation_retries_before_consent_then_serves_the_same_request() 
     let prior = b"subscriber outputs before acceptance";
     std::fs::write(&metadata, prior).unwrap();
     std::fs::write(&dep_info, prior).unwrap();
-    let limits = EdgeLimits::new();
+    let limits = EdgeLimits::new(0);
     let occupied: Vec<_> = (0..MATERIALIZATION_WORKERS)
         .map(|_| limits.materialization.acquire().unwrap())
         .collect();

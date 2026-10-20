@@ -34,7 +34,7 @@ import json, os, signal, sys
 keys = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC", "RUSTUP_TOOLCHAIN",
         "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_MAKEFLAGS", "RABS_SOCKET_PATH",
         "RABS_STATE_DIR", "RABS_CONFIG", "RABS_BREAKER_FILE", "CARGO_TARGET_DIR",
-        "RABS_REUSE_CARGO_LAYOUT"]
+        "RABS_REUSE_CARGO_LAYOUT", "RABS_DEPENDENCY_WORKERS_JSON"]
 value = {"argv": [os.fsencode(x).hex() for x in sys.argv[1:]],
          "env": {k: os.environ[k] for k in keys if k in os.environ},
          "pid": os.getpid(), "cwd": os.getcwd()}
@@ -101,7 +101,8 @@ if sys.argv[1:] == ["--check-config"]:
 with open(root / "starts", "a") as f:
     f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgrp(),
                         "live": os.environ.get("RABS_LIVE_DEPENDENCY"),
-                        "layout": os.environ.get("RABS_REUSE_CARGO_LAYOUT")}) + "\n")
+                        "layout": os.environ.get("RABS_REUSE_CARGO_LAYOUT"),
+                        "pool": os.environ.get("RABS_DEPENDENCY_WORKERS_JSON")}) + "\n")
 if os.environ.get("TEST_START_GATE"):
     gate = pathlib.Path(os.environ["TEST_START_GATE"])
     deadline = time.monotonic() + 10
@@ -156,9 +157,14 @@ while running and time.monotonic() < end and root.exists():
                 status["remote_dependency"] = None
                 worker_keys = ("RABS_DEPENDENCY_WORKER_LISTEN", "RABS_DEPENDENCY_WORKER_ID",
                                "RABS_DEPENDENCY_WORKER_SPKI_SHA256")
-                if all(name in os.environ for name in worker_keys):
+                if "RABS_DEPENDENCY_WORKERS_JSON" in os.environ:
                     status["remote_dependency"] = {
-        "remote_protocol": 1, "dependency_context": "dependency-exec-v5",
+                        "remote_protocol": 1, "dependency_context": "dependency-exec-v5",
+                        "workers": json.loads(os.environ["RABS_DEPENDENCY_WORKERS_JSON"]),
+                    }
+                elif all(name in os.environ for name in worker_keys):
+                    status["remote_dependency"] = {
+                        "remote_protocol": 1, "dependency_context": "dependency-exec-v5",
                         "listen": os.environ[worker_keys[0]],
                         "worker_id": os.environ[worker_keys[1]],
                         "worker_spki_sha256": os.environ[worker_keys[2]],
@@ -826,6 +832,197 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(result.stdout, b"")
                 self.assertIn(b"all dependency worker settings are required", result.stderr)
         self.assertEqual(self.starts(), [])
+
+    def dependency_workers(self):
+        return [
+            {"listen": "127.0.0.1:9443", "worker_id": "compile-a", "worker_spki_sha256": "ab" * 32},
+            {"listen": "127.0.0.1:9444", "worker_id": "compile-b", "worker_spki_sha256": "cd" * 32},
+        ]
+
+    def dependency_pool_settings(self, workers=None):
+        return {"RABS_DEPENDENCY_WORKERS_JSON": json.dumps(
+            self.dependency_workers() if workers is None else workers)}
+
+    def test_requested_pool_is_verified_on_start_and_reuse_with_literal_environment(self):
+        settings = self.dependency_pool_settings()
+        first = self.cargo_result(self.launch(["--rabs-require-daemon", "check"], settings))
+        self.assertEqual(first["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(first["env"]["RABS_DEPENDENCY_WORKERS_JSON"],
+                         settings["RABS_DEPENDENCY_WORKERS_JSON"])
+        self.assertEqual(self.starts()[0]["pool"], settings["RABS_DEPENDENCY_WORKERS_JSON"])
+        identity = rabs.socket_identity(str(self.endpoint))
+        # Object key order and JSON whitespace do not change the requested pool.
+        reordered = {"RABS_DEPENDENCY_WORKERS_JSON": json.dumps(
+            self.dependency_workers(), sort_keys=True, indent=2)}
+        for changes in (settings, reordered, {}):
+            value = self.cargo_result(self.launch(
+                ["--rabs-no-start", "--rabs-require-daemon", "check"], changes))
+            self.assertEqual(value["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_pool_readiness_accepts_native_normalized_addresses(self):
+        workers = self.dependency_workers()
+        workers[0]["listen"] = "[0:0:0:0:0:FFFF:7f00:1]:09443"
+        workers[1]["listen"] = "[2001:0DB8:0:0:0:0:0:2]:9444"
+        expected = [dict(workers[0], listen="[::ffff:127.0.0.1]:9443"),
+                    dict(workers[1], listen="[2001:db8::2]:9444")]
+        status = {"remote_protocol": 1, "dependency_context": "dependency-exec-v5",
+                  "workers": expected}
+        settings = self.dependency_pool_settings(workers)
+        self.assertEqual(rabs.requested_dependency_worker(settings), status)
+        settings["TEST_STATUS_REMOTE_JSON"] = json.dumps(status)
+        value = self.cargo_result(self.launch(["--rabs-require-daemon", "check"], settings))
+        self.assertEqual(value["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(self.starts()[0]["pool"], settings["RABS_DEPENDENCY_WORKERS_JSON"])
+
+    def test_attached_pool_must_match_all_workers_and_order_without_restart(self):
+        workers = self.dependency_workers()
+        self.cargo_result(self.launch(changes=self.dependency_pool_settings(workers)))
+        identity = rabs.socket_identity(str(self.endpoint))
+        variants = [("count", workers[:1]), ("order", list(reversed(workers)))]
+        for name, replacement in (("listen", "127.0.0.1:9445"),
+                                  ("worker_id", "different-worker"),
+                                  ("worker_spki_sha256", "ef" * 32)):
+            variants.append((name, [workers[0], dict(workers[1], **{name: replacement})]))
+        for name, requested in variants:
+            with self.subTest(name=name):
+                result = self.launch(["--rabs-no-start", "--rabs-require-daemon", "check"],
+                                     self.dependency_pool_settings(requested))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"dependency worker configuration (workers)", result.stderr)
+        singleton = self.dependency_worker_settings(RABS_DEPENDENCY_WORKER_ID="compile-a")
+        result = self.launch(["--rabs-no-start", "--rabs-require-daemon", "check"], singleton)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_local_daemon_cannot_silently_satisfy_explicit_pool(self):
+        self.cargo_result(self.launch())
+        identity = rabs.socket_identity(str(self.endpoint))
+        settings = self.dependency_pool_settings()
+        fallback = self.launch(["check"], settings)
+        value = self.cargo_result(fallback)
+        self.assertNotIn("RUSTC_WRAPPER", value["env"])
+        self.assertEqual(value["env"]["RABS_DEPENDENCY_WORKERS_JSON"],
+                         settings["RABS_DEPENDENCY_WORKERS_JSON"])
+        self.assertIn(b"running stock Cargo", fallback.stderr)
+        required = self.launch(["--rabs-require-daemon", "check"], settings)
+        self.assertEqual(required.returncode, 2, required.stderr)
+        self.assertEqual(required.stdout, b"")
+        self.assertIn(b"dependency worker configuration", required.stderr)
+        self.assertEqual(rabs.socket_identity(str(self.endpoint)), identity)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_singleton_daemon_does_not_satisfy_one_worker_pool(self):
+        singleton = self.dependency_worker_settings(RABS_DEPENDENCY_WORKER_ID="compile-a")
+        self.cargo_result(self.launch(changes=singleton))
+        result = self.launch(["--rabs-require-daemon", "check"],
+                             self.dependency_pool_settings(self.dependency_workers()[:1]))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"dependency worker configuration (workers)", result.stderr)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_new_pool_daemon_must_advertise_current_dependency_context(self):
+        old = {"remote_protocol": 1, "dependency_context": "dependency-exec-v4",
+               "workers": self.dependency_workers()}
+        settings = dict(self.dependency_pool_settings(), TEST_STATUS_REMOTE_JSON=json.dumps(old))
+        result = self.launch(["--rabs-require-daemon", "check"], settings)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"dependency_context", result.stderr)
+        self.assertNotIn(b"startup was not confirmed", result.stderr)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertFalse(rabs.process_exited(self.starts()[0]["pid"]))
+
+    def test_pool_schema_and_identity_validation_matches_native_contract(self):
+        valid = self.dependency_workers()[0]
+        invalid = [None, {}, [], [valid] * 33, [None], [list(valid)],
+                   [dict(valid, unexpected=True)], [{"listen": valid["listen"]}]]
+        for field in valid:
+            for value in (None, True, 123, [], {}, ""):
+                invalid.append([dict(valid, **{field: value})])
+        for value in ("worker\nname", "worker\x7fname", "worker\x85name", "é" * 513, "\ud800"):
+            invalid.append([dict(valid, worker_id=value)])
+        for value in ("worker.example:9443", "127.0.0.1:0", "127.0.0.1:65536",
+                      "127.0.0.1:+9443", "[127.0.0.1]:9443", "::1:9443", "[::1%lo]:9443"):
+            invalid.append([dict(valid, listen=value)])
+        for value in ("AB" * 32, "0" * 64, "a" * 63, "a" * 65, "z" * 64):
+            invalid.append([dict(valid, worker_spki_sha256=value)])
+        for index, workers in enumerate(invalid):
+            with self.subTest(index=index):
+                with self.assertRaises(rabs.SetupError):
+                    rabs.requested_dependency_worker({"RABS_DEPENDENCY_WORKERS_JSON": json.dumps(workers)})
+        accepted = dict(valid, worker_id="é" * 512)
+        result = rabs.requested_dependency_worker(self.dependency_pool_settings([accepted]))
+        self.assertEqual(result["workers"], [accepted])
+
+    def test_pool_rejects_duplicate_identity_listener_pin_and_json_fields(self):
+        for field in ("listen", "worker_id", "worker_spki_sha256"):
+            workers = self.dependency_workers()
+            workers[1][field] = workers[0][field]
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(rabs.SetupError, "duplicate dependency worker " + field):
+                    rabs.requested_dependency_worker(self.dependency_pool_settings(workers))
+        workers = self.dependency_workers()
+        workers[0]["listen"] = "[::1]:9443"
+        workers[1]["listen"] = "[0:0:0:0:0:0:0:1]:09443"
+        with self.assertRaisesRegex(rabs.SetupError, "duplicate dependency worker listen"):
+            rabs.requested_dependency_worker(self.dependency_pool_settings(workers))
+        duplicate = ('[{"listen":"127.0.0.1:9443","listen":"127.0.0.1:9444",'
+                     '"worker_id":"compile-a","worker_spki_sha256":"' + "ab" * 32 + '"}]')
+        with self.assertRaisesRegex(rabs.SetupError, "duplicate JSON field"):
+            rabs.requested_dependency_worker({"RABS_DEPENDENCY_WORKERS_JSON": duplicate})
+
+    def test_pool_worker_count_and_utf8_byte_bounds(self):
+        workers = [{"listen": "127.0.0.1:{}".format(9400 + index),
+                    "worker_id": "worker-{}".format(index),
+                    "worker_spki_sha256": "{:064x}".format(index + 1)} for index in range(32)]
+        result = rabs.requested_dependency_worker(self.dependency_pool_settings(workers))
+        self.assertEqual(result["workers"], workers)
+        workers[0]["worker_id"] = "é"
+        value = json.dumps(workers, ensure_ascii=False)
+        value += " " * (128 * 1024 - len(value.encode("utf-8")))
+        result = rabs.requested_dependency_worker({"RABS_DEPENDENCY_WORKERS_JSON": value})
+        self.assertEqual(result["workers"], workers)
+        with self.assertRaisesRegex(rabs.SetupError, "configuration byte limit"):
+            rabs.requested_dependency_worker({"RABS_DEPENDENCY_WORKERS_JSON": value + " "})
+        with self.assertRaisesRegex(rabs.SetupError, "UTF-8"):
+            rabs.requested_dependency_worker({"RABS_DEPENDENCY_WORKERS_JSON": "\ud800"})
+
+    def test_full_pool_status_with_escaped_worker_ids_fits_readiness_bound(self):
+        workers = [{"listen": "127.0.0.1:{}".format(9400 + index),
+                    "worker_id": "{:02d}/".format(index) + '"' * 1021,
+                    "worker_spki_sha256": "{:064x}".format(index + 1)} for index in range(32)]
+        settings = self.dependency_pool_settings(workers)
+        # All IDs are within the native 1024-byte limit, but JSON escaping
+        # makes their status exceed the original single-worker frame bound.
+        self.assertGreater(len(settings["RABS_DEPENDENCY_WORKERS_JSON"]), rabs.MAX_FRAME)
+        result = self.launch(["--rabs-require-daemon", "check"], settings)
+        self.assertEqual(self.cargo_result(result)["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_invalid_or_mixed_pool_never_starts_daemon_or_wraps_cargo(self):
+        settings = self.dependency_pool_settings()
+        invalid = [{"RABS_DEPENDENCY_WORKERS_JSON": "[broken"},
+                   {"RABS_DEPENDENCY_WORKERS_JSON": "[]"}]
+        invalid.extend(dict(settings, **{name: ""}) for name in rabs.DEPENDENCY_WORKER_KEYS)
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                required = self.launch(["--rabs-require-daemon", "check"], changes)
+                self.assertEqual(required.returncode, 2, required.stderr)
+                self.assertEqual(required.stdout, b"")
+                self.assertEqual(self.starts(), [])
+        fallback = self.launch(["check"], invalid[0])
+        value = self.cargo_result(fallback)
+        self.assertNotIn("RUSTC_WRAPPER", value["env"])
+        self.assertEqual(value["env"]["RABS_DEPENDENCY_WORKERS_JSON"], "[broken")
+        self.assertIn(b"running stock Cargo", fallback.stderr)
+        self.assertEqual(self.starts(), [])
+        self.assertFalse(self.endpoint.exists())
 
     def test_cargo_self_recursion_is_refused(self):
         result = self.launch(changes={"CARGO": str(LAUNCHER)})

@@ -140,6 +140,8 @@ jobs:
           cargo test --release -p rabsd --lib output_capture --locked
           cargo test --release -p rabsd --lib capture_pins --locked
           cargo test --release -p rabsd --lib coord::live_dependency::remote::recovery --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::worker_pool_tests --locked
+          cargo test --release -p rabsd --lib coord::remote_dependency_transport::tests --locked
           cargo test --release -p rabsd --lib edge::live_facts::package_capture --locked
       - name: Toolchain ownership and complete live input observations
         run: cargo test --release -p rabsd --lib edge::live_facts --locked

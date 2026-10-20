@@ -17,7 +17,7 @@ use super::{
 use crate::coord::remote_dependency_transport::{
     RemoteDependencyReservation, RemoteDependencyTransport,
 };
-use crate::coord::secure_worker_delivery::OperationCancellation;
+use crate::coord::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
 use crate::coord::source_delivery::SourceUpload;
 use crate::coord::worker_delivery::{Delivery, toolchain_identity_value};
 use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT};
@@ -37,8 +37,10 @@ use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits, captur
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod recovery;
@@ -48,6 +50,10 @@ const CONFIG_KEYS: [&str; 3] = [
     "RABS_DEPENDENCY_WORKER_ID",
     "RABS_DEPENDENCY_WORKER_SPKI_SHA256",
 ];
+const POOL_CONFIG_KEY: &str = "RABS_DEPENDENCY_WORKERS_JSON";
+const MAX_WORKER_CONFIG_BYTES: usize = 128 * 1024;
+/// One explicitly pinned worker per slot; the edge execution lane uses this bound.
+pub const MAX_DEPENDENCY_WORKERS: usize = 32;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -57,10 +63,193 @@ fn invalid(reason: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, reason.to_string())
 }
 
-/// Explicit single-worker deployment for the first live leaf class.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerEndpoint {
+    listen: SocketAddr,
+    worker_id: String,
+    worker_spki_sha256: String,
+}
+
+impl WorkerEndpoint {
+    fn value(&self) -> Value {
+        json!({
+            "listen":self.listen.to_string(), "worker_id":self.worker_id,
+            "worker_spki_sha256":self.worker_spki_sha256,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WorkerConfiguration {
+    endpoints: Vec<WorkerEndpoint>,
+    pool: bool,
+}
+
+impl WorkerConfiguration {
+    /// Parse without reading process state so all configuration refusal paths
+    /// can be exercised without mutating the concurrent daemon's environment.
+    fn parse(pool: Option<&str>, legacy: [Option<&str>; 3]) -> io::Result<Option<Self>> {
+        let (endpoints, pool) = if let Some(value) = pool {
+            if legacy.iter().any(Option::is_some) {
+                return Err(invalid(
+                    "dependency worker pool cannot be mixed with singleton settings",
+                ));
+            }
+            if value.len() > MAX_WORKER_CONFIG_BYTES {
+                return Err(invalid(
+                    "dependency worker pool exceeds the configuration byte limit",
+                ));
+            }
+            let endpoints: Vec<WorkerEndpoint> = serde_json::from_str(value)
+                .map_err(|error| invalid(format!("invalid dependency worker pool: {error}")))?;
+            (endpoints, true)
+        } else {
+            if legacy.iter().all(Option::is_none) {
+                return Ok(None);
+            }
+            let required = |index: usize| {
+                legacy[index]
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid(format!("missing {}", CONFIG_KEYS[index])))
+            };
+            (
+                vec![WorkerEndpoint {
+                    listen: required(0)?.parse().map_err(|error| {
+                        invalid(format!("invalid dependency worker listener: {error}"))
+                    })?,
+                    worker_id: required(1)?.to_owned(),
+                    worker_spki_sha256: required(2)?.to_owned(),
+                }],
+                false,
+            )
+        };
+        if endpoints.is_empty() || endpoints.len() > MAX_DEPENDENCY_WORKERS {
+            return Err(invalid(format!(
+                "dependency worker pool requires 1..={MAX_DEPENDENCY_WORKERS} workers"
+            )));
+        }
+        let mut addresses = HashSet::new();
+        let mut names = HashSet::new();
+        let mut pins = HashSet::new();
+        for endpoint in &endpoints {
+            if endpoint.listen.port() == 0 {
+                return Err(invalid(
+                    "remote dependency listener requires a fixed nonzero port",
+                ));
+            }
+            if endpoint.worker_id.is_empty()
+                || endpoint.worker_id.len() > 1024
+                || endpoint.worker_id.chars().any(char::is_control)
+            {
+                return Err(invalid("remote dependency worker name is empty or invalid"));
+            }
+            let pin = parse_worker_pin(&endpoint.worker_spki_sha256)?;
+            if !addresses.insert(endpoint.listen) {
+                return Err(invalid("duplicate dependency worker listener"));
+            }
+            if !names.insert(endpoint.worker_id.as_str()) {
+                return Err(invalid("duplicate dependency worker identity"));
+            }
+            if !pins.insert(pin) {
+                return Err(invalid("duplicate dependency worker SPKI pin"));
+            }
+        }
+        Ok(Some(Self { endpoints, pool }))
+    }
+
+    fn value(&self) -> Value {
+        let mut configuration = if self.pool {
+            json!({"workers":self.endpoints.iter().map(WorkerEndpoint::value).collect::<Vec<_>>()})
+        } else {
+            self.endpoints[0].value()
+        };
+        configuration["remote_protocol"] = json!(1);
+        configuration["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
+        configuration
+    }
+}
+
+/// A reservation prevents duplicate dispatch while the worker is connecting,
+/// before the authoritative coordinator can admit the authenticated attempt.
+/// Its lifetime covers the offer, execution and publication. It grants no
+/// execution authority and never replaces CoordLive's action ownership.
+#[derive(Debug)]
+struct PendingActionClaim {
+    actions: Arc<Mutex<HashSet<TypedDigest>>>,
+    key: TypedDigest,
+}
+
+impl Drop for PendingActionClaim {
+    fn drop(&mut self) {
+        // A poisoned decision lock must not strand claims owned by already
+        // admitted requests. Further reservations still report its failure.
+        let mut actions = self
+            .actions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        actions.remove(&self.key);
+    }
+}
+
+#[derive(Debug)]
+struct DependencyWorkerPool {
+    workers: Vec<Arc<RemoteDependencyTransport>>,
+    next: AtomicUsize,
+    pending: Arc<Mutex<HashSet<TypedDigest>>>,
+}
+
+impl DependencyWorkerPool {
+    fn new(workers: Vec<Arc<RemoteDependencyTransport>>) -> Self {
+        Self {
+            workers,
+            next: AtomicUsize::new(0),
+            pending: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    fn try_reserve(
+        &self,
+        key: &TypedDigest,
+    ) -> io::Result<(RemoteDependencyReservation, PendingActionClaim)> {
+        let mut actions = self
+            .pending
+            .lock()
+            .map_err(|_| io::Error::other("remote pending-action lock poisoned"))?;
+        if !actions.insert(key.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another subscriber is preparing this remote action",
+            ));
+        }
+        let claim = PendingActionClaim {
+            actions: Arc::clone(&self.pending),
+            key: key.clone(),
+        };
+        drop(actions);
+        if self.workers.is_empty() {
+            return Err(invalid("remote dependency worker pool is empty"));
+        }
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        for offset in 0..self.workers.len() {
+            let worker = &self.workers[(start + offset) % self.workers.len()];
+            match worker.try_reserve() {
+                Ok(reservation) => return Ok((reservation, claim)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "all remote dependency workers are busy",
+        ))
+    }
+}
+
+/// An explicitly configured, bounded pool for the first live dependency class.
 #[derive(Debug)]
 pub struct RemoteDependencies {
-    transport: Arc<RemoteDependencyTransport>,
+    workers: DependencyWorkerPool,
     state: PathBuf,
     configuration: Value,
     toolchain: Mutex<Option<ToolchainMemo>>,
@@ -147,41 +336,58 @@ impl RemoteDependencies {
     /// No variables selects the ordinary local lane. Partial or invalid explicit
     /// configuration refuses daemon startup instead of silently disabling it.
     pub fn from_environment(state: &Path) -> io::Result<Option<Arc<Self>>> {
-        if CONFIG_KEYS
-            .iter()
-            .all(|name| std::env::var_os(name).is_none())
-        {
-            return Ok(None);
-        }
-        let required = |name: &str| -> io::Result<String> {
-            std::env::var(name)
-                .ok()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| invalid(format!("missing or non-UTF-8 {name}")))
+        let optional = |name: &str| -> io::Result<Option<String>> {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => Err(invalid(format!("non-UTF-8 {name}"))),
+            }
         };
-        let listen: SocketAddr = required(CONFIG_KEYS[0])?
-            .parse()
-            .map_err(|error| invalid(format!("invalid dependency worker listener: {error}")))?;
-        let worker = required(CONFIG_KEYS[1])?;
-        let pin = required(CONFIG_KEYS[2])?;
+        let legacy = CONFIG_KEYS.map(optional);
+        let [listen, worker, pin] = legacy;
+        let (listen, worker, pin) = (listen?, worker?, pin?);
+        let pool = optional(POOL_CONFIG_KEY)?;
+        let Some(configured) = WorkerConfiguration::parse(
+            pool.as_deref(),
+            [listen.as_deref(), worker.as_deref(), pin.as_deref()],
+        )?
+        else {
+            return Ok(None);
+        };
         let state = state.join("dependency-workers");
         std::fs::create_dir_all(&state)?;
         let state = std::fs::canonicalize(state)?;
-        let transport = Arc::new(RemoteDependencyTransport::from_environment(
-            listen, &worker, &pin, &state,
-        )?);
+        // PinnedWorkerAdmission namespaces this same root by the exact worker
+        // name. Keep that layout when moving a singleton into a pool: its key,
+        // boot-generation fences and request high-water history must survive.
+        let workers = configured
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                RemoteDependencyTransport::from_environment(
+                    endpoint.listen,
+                    &endpoint.worker_id,
+                    &endpoint.worker_spki_sha256,
+                    &state,
+                )
+                .map(Arc::new)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         Ok(Some(Arc::new(Self {
-            transport,
+            workers: DependencyWorkerPool::new(workers),
             state,
-            configuration: json!({
-                "remote_protocol":1, "dependency_context":DEPENDENCY_CONTEXT_VERSION,
-                "listen":listen.to_string(), "worker_id":worker, "worker_spki_sha256":pin,
-            }),
+            configuration: configured.value(),
             toolchain: Mutex::new(None),
         })))
     }
 
-    /// The connected daemon's selected worker, for launcher compatibility checks.
+    /// The configured pool size, used to bound the edge's remote execution lane.
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.workers.workers.len()
+    }
+
+    /// The connected daemon's pinned workers, for launcher compatibility checks.
     #[must_use]
     pub fn configuration(&self) -> &Value {
         &self.configuration
@@ -397,13 +603,14 @@ impl LiveDependencyLane {
             Ok(None) => {}
             Err(error) => return LiveDecision::PassThrough(format!("remote dispatch: {error:?}")),
         }
-        match remote.transport.try_reserve() {
-            Ok(reservation) => LiveDecision::Remote(PendingRemote {
+        match remote.workers.try_reserve(&request.key.action_key) {
+            Ok((reservation, action_claim)) => LiveDecision::Remote(PendingRemote {
                 lane: self.clone(),
                 request,
                 remote,
                 invocation,
                 reservation,
+                action_claim,
             }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => LiveDecision::InFlight,
             Err(error) => LiveDecision::PassThrough(format!("remote worker: {error}")),
@@ -411,7 +618,7 @@ impl LiveDependencyLane {
     }
 }
 
-/// Private worker capacity held until the wrapper accepts execution or leaves.
+/// Private worker capacity and action ownership retained through publication.
 #[derive(Debug)]
 pub struct PendingRemote {
     lane: LiveDependencyLane,
@@ -419,6 +626,7 @@ pub struct PendingRemote {
     remote: Arc<RemoteDependencies>,
     invocation: RemoteInvocation,
     reservation: RemoteDependencyReservation,
+    action_claim: PendingActionClaim,
 }
 
 impl PendingRemote {
@@ -450,6 +658,7 @@ impl PendingRemote {
             remote,
             invocation,
             mut reservation,
+            action_claim: _action_claim,
         } = self;
         let settled = |reason: String| (reason, true);
         if cancellation.is_cancelled() {
@@ -520,14 +729,19 @@ impl PendingRemote {
         let owner: Arc<Mutex<Option<AdmittedRemote>>> = Arc::new(Mutex::new(None));
         let admitted_owner = Arc::clone(&owner);
         // Persist exact recovery intent BEFORE execution can leave this process.
-        // A lost result must not also lose its request and private partial bytes.
+        // Recovery must target this reserved worker, even when the pool changes
+        // order or membership. The whole pool is not a worker identity.
         directory
             .record_request(
                 &wire,
                 &rabs_cas::metadata_store::digest_key(&request.key.action_key),
-                remote.configuration(),
+                &reservation.worker_configuration(),
             )
             .map_err(|error| settled(format!("persist remote recovery request: {error}")))?;
+        let selected_worker = reservation.worker().to_owned();
+        // Borrow the reservation: transport completion alone does not release
+        // worker capacity. Its later drop follows the admitted session's drop
+        // after capture/publication, including every error return below.
         let delivery = reservation.execute(
             &wire,
             &upload,
@@ -560,11 +774,21 @@ impl PendingRemote {
                 let mut slot = admitted_owner
                     .lock()
                     .map_err(|_| io::Error::other("remote attempt owner poisoned"))?;
+                let key = rabs_cas::metadata_store::digest_key(&attempt.request.key.action_key);
                 *slot = Some(AdmittedRemote {
                     attempt: Some(attempt),
                     _session: session,
                     execution_finished: false,
                 });
+                drop(slot);
+                crate::edge::server::log_line(
+                    "rabsd-remote-dependency-admitted",
+                    &[
+                        ("key", &key),
+                        ("worker_id", &selected_worker),
+                        ("worker_spki_sha256", &worker.worker_peer_id.0),
+                    ],
+                );
                 Ok(())
             },
         );
@@ -911,6 +1135,318 @@ impl PendingRemoteInstall {
             Ok(other) => InstallResult::Declined(format!("remote install: {other:?}")),
             Err(error) => InstallResult::Fault(format!("remote install: {error}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_pool_tests {
+    use super::*;
+    use rabs_asupersync::worker_transport::TlsFiles;
+    use rabs_key::typed_digest::compute;
+
+    fn endpoint(index: u16) -> Value {
+        json!({
+            "listen":format!("127.0.0.1:{}", 9000 + index),
+            "worker_id":format!("worker-{index}"),
+            "worker_spki_sha256":format!("{index:064x}"),
+        })
+    }
+
+    fn configured(entries: &[Value]) -> io::Result<WorkerConfiguration> {
+        WorkerConfiguration::parse(Some(&json!(entries).to_string()), [None; 3])
+            .map(|configuration| configuration.expect("explicit pool"))
+    }
+
+    fn pool(state: &Path, count: u16) -> DependencyWorkerPool {
+        let configured = configured(&(1..=count).map(endpoint).collect::<Vec<_>>()).unwrap();
+        DependencyWorkerPool::new(
+            configured
+                .endpoints
+                .into_iter()
+                .map(|endpoint| {
+                    Arc::new(
+                        RemoteDependencyTransport::new(
+                            endpoint.listen,
+                            endpoint.worker_id,
+                            parse_worker_pin(&endpoint.worker_spki_sha256).unwrap(),
+                            state.to_path_buf(),
+                            TlsFiles {
+                                ca: PathBuf::from("/private/ca.pem"),
+                                certificate: PathBuf::from("/private/coord.pem"),
+                                private_key: PathBuf::from("/private/coord.key"),
+                            },
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn key(index: u8) -> TypedDigest {
+        compute("rabs.test.worker-pool.v1", &[index])
+    }
+
+    #[test]
+    fn singleton_configuration_is_unchanged_and_pool_preserves_order() {
+        assert!(
+            WorkerConfiguration::parse(None, [None; 3])
+                .unwrap()
+                .is_none()
+        );
+        let pin = format!("{:064x}", 1);
+        let singleton = WorkerConfiguration::parse(
+            None,
+            [Some("127.0.0.1:9001"), Some("worker-1"), Some(&pin)],
+        )
+        .unwrap()
+        .unwrap();
+        let expected = json!({
+            "remote_protocol":1, "dependency_context":DEPENDENCY_CONTEXT_VERSION,
+            "listen":"127.0.0.1:9001", "worker_id":"worker-1", "worker_spki_sha256":pin,
+        });
+        assert_eq!(singleton.value(), expected);
+
+        let entries = [endpoint(2), endpoint(1)];
+        let configuration = configured(&entries).unwrap();
+        assert_eq!(
+            configuration.value(),
+            json!({
+                "remote_protocol":1, "dependency_context":DEPENDENCY_CONTEXT_VERSION,
+                "workers":entries,
+            })
+        );
+        let mut ipv6 = endpoint(3);
+        ipv6["listen"] = json!("[0:0:0:0:0:0:0:1]:9003");
+        assert_eq!(
+            configured(&[ipv6]).unwrap().value()["workers"][0]["listen"],
+            "[::1]:9003"
+        );
+    }
+
+    #[test]
+    fn explicit_pool_refuses_incomplete_ambiguous_and_unbounded_configuration() {
+        for count in [0, MAX_DEPENDENCY_WORKERS + 1] {
+            let entries = (1..=count)
+                .map(|index| endpoint(u16::try_from(index).unwrap()))
+                .collect::<Vec<_>>();
+            assert!(configured(&entries).is_err());
+        }
+        assert!(
+            configured(
+                &(1..=u16::try_from(MAX_DEPENDENCY_WORKERS).unwrap())
+                    .map(endpoint)
+                    .collect::<Vec<_>>()
+            )
+            .is_ok()
+        );
+        for text in ["", "null", "{}", "[null]", "[{}]", "[true]"] {
+            assert!(
+                WorkerConfiguration::parse(Some(text), [None; 3]).is_err(),
+                "{text}"
+            );
+        }
+        assert!(
+            WorkerConfiguration::parse(Some(&" ".repeat(MAX_WORKER_CONFIG_BYTES + 1)), [None; 3])
+                .is_err()
+        );
+        let valid = json!([endpoint(1)]).to_string();
+        for index in 0..3 {
+            let mut legacy = [None; 3];
+            legacy[index] = Some("");
+            assert!(WorkerConfiguration::parse(Some(&valid), legacy).is_err());
+            assert!(WorkerConfiguration::parse(None, legacy).is_err());
+        }
+        for (field, value) in [
+            ("extra", json!(true)),
+            ("listen", json!("127.0.0.1:0")),
+            ("listen", json!("worker.example:9001")),
+            ("listen", json!(9001)),
+            ("worker_id", json!("")),
+            ("worker_id", json!("worker\nname")),
+            ("worker_id", json!("w".repeat(1025))),
+            ("worker_id", json!("é".repeat(513))),
+            ("worker_spki_sha256", json!("00".repeat(32))),
+            ("worker_spki_sha256", json!("AB".repeat(32))),
+            ("worker_spki_sha256", json!("1")),
+        ] {
+            let mut entry = endpoint(1);
+            entry[field] = value;
+            assert!(configured(&[entry]).is_err(), "{field}");
+        }
+        let repeated = format!(
+            "[{{\"listen\":\"127.0.0.1:9001\",\"listen\":\"127.0.0.1:9002\",\"worker_id\":\"worker\",\"worker_spki_sha256\":\"{}\"}}]",
+            "01".repeat(32)
+        );
+        assert!(WorkerConfiguration::parse(Some(&repeated), [None; 3]).is_err());
+    }
+
+    #[test]
+    fn pool_rejects_duplicate_endpoints_and_worker_key_aliases() {
+        for field in ["listen", "worker_id", "worker_spki_sha256"] {
+            let first = endpoint(1);
+            let mut second = endpoint(2);
+            second[field] = first[field].clone();
+            assert!(configured(&[first, second]).is_err(), "{field}");
+        }
+        let mut first = endpoint(1);
+        let mut second = endpoint(2);
+        first["listen"] = json!("[0:0:0:0:0:0:0:1]:9001");
+        second["listen"] = json!("[::1]:9001");
+        assert!(configured(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn independent_actions_fill_the_pool_and_busy_workers_are_skipped() {
+        let pool = pool(Path::new("/private/worker-pool"), 3);
+        let first = pool.try_reserve(&key(1)).unwrap();
+        let second = pool.try_reserve(&key(2)).unwrap();
+        let third = pool.try_reserve(&key(3)).unwrap();
+        assert_eq!(
+            [first.0.worker(), second.0.worker(), third.0.worker()],
+            ["worker-1", "worker-2", "worker-3"]
+        );
+        assert_eq!(
+            pool.try_reserve(&key(4)).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            !pool.pending.lock().unwrap().contains(&key(4)),
+            "a full pool must release the unoffered action claim"
+        );
+        drop(second);
+        let fourth = pool.try_reserve(&key(4)).unwrap();
+        assert_eq!(fourth.0.worker(), "worker-2");
+        drop((first, third, fourth));
+        assert!(pool.pending.lock().unwrap().is_empty());
+        // Every dropped pre-execution offer restores real worker capacity.
+        let all = (5..=7)
+            .map(|index| pool.try_reserve(&key(index)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_records_the_selected_worker_without_ambiguous_pool_membership() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let first = pool.try_reserve(&key(1)).unwrap();
+        let selected = pool.try_reserve(&key(2)).unwrap();
+        let mut expected = endpoint(2);
+        expected["remote_protocol"] = json!(1);
+        expected["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
+        assert_eq!(selected.0.worker_configuration(), expected);
+
+        let request = json!({"kind":"canonical-exec", "request_id":17,
+            "program":"/toolchain/bin/rustc", "args":["src/lib.rs"]});
+        let action_key = rabs_cas::metadata_store::digest_key(&key(2));
+        let mut directory = recovery::ResultDirectory::new(state.path()).unwrap();
+        directory
+            .record_request(&request, &action_key, &selected.0.worker_configuration())
+            .unwrap();
+        let retained = directory.path().to_path_buf();
+        drop(directory);
+        drop((first, selected, pool));
+
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(retained.join("recovery.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["remote_configuration"], expected);
+        assert!(record["remote_configuration"].get("workers").is_none());
+        assert_eq!(record["action_key"], action_key);
+        assert_eq!(record["publication_authorized"], false);
+        assert_eq!(record["reexecute"], false);
+        assert_eq!(
+            std::fs::read(retained.join("request.json")).unwrap(),
+            serde_json::to_vec(&request).unwrap()
+        );
+    }
+
+    #[test]
+    fn same_action_cannot_dispatch_twice_even_before_worker_authentication() {
+        let pool = pool(Path::new("/private/worker-pool"), 2);
+        let (first_worker, first_claim) = pool.try_reserve(&key(1)).unwrap();
+        assert_eq!(
+            pool.try_reserve(&key(1)).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            pool.try_reserve(&key(2)).is_ok(),
+            "duplicate did not occupy the other worker"
+        );
+        drop(first_worker);
+        assert_eq!(
+            pool.try_reserve(&key(1)).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "releasing worker capacity does not release the action's publication claim"
+        );
+        drop(first_claim);
+        assert!(pool.try_reserve(&key(1)).is_ok());
+
+        let first = pool.try_reserve(&key(7)).unwrap();
+        let mut other_domain = key(7);
+        other_domain.domain = "rabs.test.other-domain.v1";
+        assert!(
+            pool.try_reserve(&other_domain).is_ok(),
+            "claims use the entire typed identity"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn concurrent_duplicate_subscribers_consume_exactly_one_worker() {
+        let pool = pool(Path::new("/private/worker-pool"), 3);
+        let start = std::sync::Barrier::new(12);
+        let reserved = std::sync::Barrier::new(12);
+        let successes = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..12 {
+                scope.spawn(|| {
+                    start.wait();
+                    let result = pool.try_reserve(&key(1));
+                    if result.is_ok() {
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    reserved.wait();
+                    if let Err(error) = &result {
+                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    }
+                    drop(result);
+                });
+            }
+        });
+        assert_eq!(successes.load(Ordering::Relaxed), 1);
+        assert!(pool.pending.lock().unwrap().is_empty());
+        let capacity = (1..=3)
+            .map(|index| pool.try_reserve(&key(index)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(capacity.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workers_have_independent_durable_admission_but_preserve_singleton_history() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let (mut first, first_claim) = pool.try_reserve(&key(1)).unwrap();
+        let (mut second, second_claim) = pool.try_reserve(&key(2)).unwrap();
+        let first_id = first.allocate_request_id().unwrap();
+        let second_id = second.allocate_request_id().unwrap();
+        assert!(
+            first_id > 0 && second_id > 0,
+            "different stores can be held concurrently"
+        );
+        let singleton = Arc::clone(&pool.workers[0]);
+        drop((first, first_claim, second, second_claim));
+        let mut returned_singleton = singleton.try_reserve().unwrap();
+        assert!(
+            returned_singleton.allocate_request_id().unwrap() > first_id,
+            "changing pool membership must not reset the worker request high-water mark"
+        );
+        drop(returned_singleton);
+        let mut independent = pool.workers[1].try_reserve().unwrap();
+        assert!(independent.allocate_request_id().unwrap() > second_id);
     }
 }
 

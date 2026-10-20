@@ -98,19 +98,97 @@ impl Run {
 
 // Drop children before their storage owner even if an assertion fails.
 struct LiveFixture {
-    worker: Process,
+    workers: Vec<LiveWorker>,
     daemon: Process,
     fixture: Fixture,
     wrapper: PathBuf,
     compiler: PathBuf,
     package: PathBuf,
     output: PathBuf,
-    worker_state: PathBuf,
     sequence: Cell<u64>,
+}
+
+struct LiveWorker {
+    process: Process,
+    state: PathBuf,
+}
+
+fn additional_worker_credentials(fixture: &Fixture, index: usize) -> TlsFiles {
+    let root = fixture
+        .owner
+        .path()
+        .join(format!("worker-credentials-{index}"));
+    fs::create_dir(&root).unwrap();
+    let run = |name: &str, args: &[&str]| {
+        let mut command = command("openssl");
+        command.current_dir(&root).args(args);
+        let mut process = Process::spawn(&root, name, &mut command);
+        assert!(
+            process.wait(Duration::from_secs(20)).success(),
+            "{}",
+            String::from_utf8_lossy(&read_log(&process.stderr))
+        );
+    };
+    run(
+        "request",
+        &[
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-sha256",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            "worker.key",
+            "-out",
+            "worker.csr",
+        ],
+    );
+    fs::write(
+        root.join("worker.ext"),
+        "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\nsubjectAltName=DNS:localhost\n",
+    )
+    .unwrap();
+    let ca = &fixture.certificates.worker.ca;
+    let key = ca.with_file_name("ca.key");
+    run(
+        "sign",
+        &[
+            "x509",
+            "-req",
+            "-in",
+            "worker.csr",
+            "-CA",
+            ca.to_str().unwrap(),
+            "-CAkey",
+            key.to_str().unwrap(),
+            "-set_serial",
+            &(index + 10).to_string(),
+            "-days",
+            "1",
+            "-sha256",
+            "-extfile",
+            "worker.ext",
+            "-out",
+            "worker.pem",
+        ],
+    );
+    TlsFiles {
+        ca: ca.clone(),
+        certificate: root.join("worker.pem"),
+        private_key: root.join("worker.key"),
+    }
 }
 
 impl LiveFixture {
     fn new() -> Self {
+        Self::with_worker_count(1)
+    }
+
+    fn with_worker_count(worker_count: usize) -> Self {
+        assert!((1..=2).contains(&worker_count));
         let missing = rabs_sandbox::canonical_namespace::HostIsolationSupport::probe()
             .missing_for_canonical();
         assert!(
@@ -170,58 +248,100 @@ pub const INCLUDED: &str = include_str!("message.txt");
         // The real transport binds for each accepted action. Reserve a loopback
         // address long enough to select it, then let the daemon own each listen;
         // a bind conflict is a test failure, never a connection to another peer.
-        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reserved.local_addr().unwrap();
-        let remote_env = vec![
-            ("RABS_LIVE_DEPENDENCY".to_owned(), "1".to_owned()),
-            (
-                "RABS_DEPENDENCY_WORKER_LISTEN".to_owned(),
-                address.to_string(),
-            ),
-            ("RABS_DEPENDENCY_WORKER_ID".to_owned(), WORKER_ID.to_owned()),
-            (
-                "RABS_DEPENDENCY_WORKER_SPKI_SHA256".to_owned(),
-                fixture.certificates.pin(),
-            ),
-        ];
+        let reserved: Vec<_> = (0..worker_count)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addresses: Vec<_> = reserved
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect();
+        let credentials: Vec<_> = (0..worker_count)
+            .map(|index| {
+                if index == 0 {
+                    fixture.certificates.worker.clone()
+                } else {
+                    additional_worker_credentials(&fixture, index)
+                }
+            })
+            .collect();
+        let mut remote_env = vec![("RABS_LIVE_DEPENDENCY".to_owned(), "1".to_owned())];
+        if worker_count == 1 {
+            remote_env.extend([
+                ("RABS_DEPENDENCY_WORKER_LISTEN".into(), addresses[0].clone()),
+                ("RABS_DEPENDENCY_WORKER_ID".into(), WORKER_ID.into()),
+                (
+                    "RABS_DEPENDENCY_WORKER_SPKI_SHA256".into(),
+                    fixture.certificates.pin(),
+                ),
+            ]);
+        } else {
+            let pool: Vec<_> = addresses
+                .iter()
+                .zip(&credentials)
+                .enumerate()
+                .map(|(index, (address, tls))| {
+                    let pin: String = tls
+                        .local_identity()
+                        .unwrap()
+                        .fingerprint
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    json!({
+                        "listen":address, "worker_id":format!("{WORKER_ID}-{index}"),
+                        "worker_spki_sha256":pin,
+                    })
+                })
+                .collect();
+            remote_env.push((
+                "RABS_DEPENDENCY_WORKERS_JSON".into(),
+                json!(pool).to_string(),
+            ));
+        }
         drop(reserved);
         let daemon = fixture.daemon_with_environment(&remote_env);
-        let worker_state = fixture.owner.path().join("live-worker-state");
-        let mut worker_command = command(worker_binary);
-        worker_command
-            .args([
-                "--coordinator",
-                &address.to_string(),
-                "--worker-id",
-                WORKER_ID,
-            ])
-            .env("RABS_WORKER_STATE_DIR", &worker_state)
-            .env("RABS_WORKER_TLS_CA", &fixture.certificates.worker.ca)
-            .env(
-                "RABS_WORKER_TLS_CERT",
-                &fixture.certificates.worker.certificate,
-            )
-            .env(
-                "RABS_WORKER_TLS_KEY",
-                &fixture.certificates.worker.private_key,
-            )
-            .env("RABS_WORKER_TLS_SERVER_NAME", "localhost");
-        // A persistent production worker reconnects outward across verification
-        // attempts, retaining the complete compiler dataset between sessions.
-        let worker = Process::spawn(
-            fixture.owner.path(),
-            "live-dependency-worker",
-            &mut worker_command,
-        );
+        let workers = addresses
+            .iter()
+            .zip(&credentials)
+            .enumerate()
+            .map(|(index, (address, tls))| {
+                let id = if worker_count == 1 {
+                    WORKER_ID.to_owned()
+                } else {
+                    format!("{WORKER_ID}-{index}")
+                };
+                let state = fixture
+                    .owner
+                    .path()
+                    .join(format!("live-worker-state-{index}"));
+                let mut worker_command = command(&worker_binary);
+                worker_command
+                    .args(["--coordinator", address, "--worker-id", &id])
+                    .env("RABS_WORKER_STATE_DIR", &state)
+                    .env(
+                        "RABS_WORKER_TOOLCHAIN_CACHE_BYTES",
+                        rabs_sandbox::toolchain_dataset::ToolchainLimits::default()
+                            .max_bytes
+                            .to_string(),
+                    )
+                    .env("RABS_WORKER_TLS_CA", &tls.ca)
+                    .env("RABS_WORKER_TLS_CERT", &tls.certificate)
+                    .env("RABS_WORKER_TLS_KEY", &tls.private_key)
+                    .env("RABS_WORKER_TLS_SERVER_NAME", "localhost");
+                // Production workers reconnect with their own persistent
+                // identity and retain the compiler dataset between sessions.
+                let process = Process::spawn(fixture.owner.path(), &id, &mut worker_command);
+                LiveWorker { process, state }
+            })
+            .collect();
         Self {
-            worker,
+            workers,
             daemon,
             fixture,
             wrapper,
             compiler,
             package,
             output,
-            worker_state,
             sequence: Cell::new(0),
         }
     }
@@ -352,7 +472,7 @@ pub const INCLUDED: &str = include_str!("message.txt");
             "wrapper={}; daemon={}; worker={}",
             String::from_utf8_lossy(&read_log(&wrapper.stderr)),
             String::from_utf8_lossy(&read_log(&self.daemon.stderr)),
-            String::from_utf8_lossy(&read_log(&self.worker.stderr))
+            String::from_utf8_lossy(&read_log(&self.workers[0].process.stderr))
         );
         assert_eq!(
             read_log(&wrapper.stdout),
@@ -424,9 +544,13 @@ pub const INCLUDED: &str = include_str!("message.txt");
     }
 
     fn worker_receipt(&self) -> Value {
+        self.worker_receipt_at(0)
+    }
+
+    fn worker_receipt_at(&self, index: usize) -> Value {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let bytes = fs::read(self.worker_state.join("requests.json")).unwrap();
+            let bytes = fs::read(self.workers[index].state.join("requests.json")).unwrap();
             let value: Value = serde_json::from_slice(&bytes).unwrap();
             let last = &value["last"];
             if last["resolved"] == true && last["receipt"]["retained_result_released"] == true {
@@ -772,7 +896,7 @@ impl LiveFixture {
             "cargo={}; daemon={}; worker={}",
             String::from_utf8_lossy(&read_log(&process.stderr)),
             String::from_utf8_lossy(&read_log(&self.daemon.stderr)),
-            String::from_utf8_lossy(&read_log(&self.worker.stderr))
+            String::from_utf8_lossy(&read_log(&self.workers[0].process.stderr))
         );
         let messages: Vec<Value> = String::from_utf8(read_log(&process.stdout))
             .unwrap()
@@ -991,6 +1115,357 @@ fn actual_offline_cargo_check_uses_remote_dependency_dag_then_replays() {
             "actual Cargo DAG never reached qualified replay: {observations:?}"
         );
         std::thread::sleep(Duration::from_millis(250));
+    }
+    live.daemon.terminate();
+}
+
+struct FleetClient {
+    dependency: &'static str,
+    root: PathBuf,
+}
+
+struct FleetCargo {
+    process: Process,
+    events_start: usize,
+}
+
+struct FleetResult {
+    action: Run,
+    outputs: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    diagnostics: Vec<Value>,
+}
+
+impl FleetResult {
+    fn matches_stock(&self, stock: &Self) {
+        assert_eq!(
+            self.outputs, stock.outputs,
+            "fleet outputs differ from stock Cargo"
+        );
+        assert_eq!(
+            self.diagnostics, stock.diagnostics,
+            "fleet diagnostics differ from stock Cargo"
+        );
+    }
+}
+
+impl FleetClient {
+    fn prepare(live: &LiveFixture) -> [Self; 2] {
+        let root = live.fixture.owner.path();
+        let vendor = root.join("fleet-vendor");
+        fs::create_dir(&vendor).unwrap();
+        let cargo_home = root.join("fleet-cargo-home");
+        fs::create_dir(&cargo_home).unwrap();
+        fs::create_dir_all(root.join("home")).unwrap();
+        fs::write(
+            cargo_home.join("config.toml"),
+            format!(
+                "[source.crates-io]\nreplace-with='fixture'\n\
+                 [source.fixture]\ndirectory={}\n[net]\noffline=true\n",
+                serde_json::to_string(vendor.to_str().unwrap()).unwrap(),
+            ),
+        )
+        .unwrap();
+        ["fleet_left", "fleet_right"].map(|dependency| {
+            let package = vendor.join(format!("{dependency}-1.0.0"));
+            fs::create_dir_all(package.join("src")).unwrap();
+            fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname='{dependency}'\nversion='1.0.0'\nedition='2024'\n"),
+            )
+            .unwrap();
+            fs::write(package.join(".cargo-checksum.json"), "{\"files\":{}}\n").unwrap();
+            fs::write(
+                package.join("src/lib.rs"),
+                b"pub const NAME: &str = env!(\"CARGO_PKG_NAME\");\n\
+                  pub const FLAVOR: &str = env!(\"DEPENDENCY_FLAVOR\");\n\
+                  pub const MESSAGE: &str = include_str!(\"message.txt\");\n\
+                  pub struct Token(pub [u8; MESSAGE.len()]);\n",
+            )
+            .unwrap();
+            fs::write(package.join("src/message.txt"), dependency).unwrap();
+            let project = root.join(format!("{dependency}-consumer"));
+            fs::create_dir_all(project.join("src")).unwrap();
+            fs::create_dir(project.join("target")).unwrap();
+            fs::write(
+                project.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='{dependency}_consumer'\nversion='0.1.0'\nedition='2024'\n\
+                     [dependencies]\n{dependency}='=1.0.0'\n",
+                ),
+            )
+            .unwrap();
+            fs::write(
+                project.join("src/lib.rs"),
+                format!(
+                    "pub use {dependency}::Token;\n\
+                     pub const NAME: &str = {dependency}::NAME;\n\
+                     pub const FLAVOR: &str = {dependency}::FLAVOR;\n\
+                     pub const MESSAGE: &str = {dependency}::MESSAGE;\n",
+                ),
+            )
+            .unwrap();
+            Self {
+                dependency,
+                root: project,
+            }
+        })
+    }
+
+    fn start(&self, live: &LiveFixture, wrapped: bool) -> FleetCargo {
+        let number = live.sequence.get();
+        live.sequence.set(number + 1);
+        let root = live.fixture.owner.path();
+        let target = self.root.join("target");
+        fs::rename(&target, root.join(format!("fleet-target-{number}"))).unwrap();
+        fs::create_dir(&target).unwrap();
+        let toolchain = live.compiler.parent().and_then(Path::parent).unwrap();
+        let mut cargo = Command::new(toolchain.join("bin/cargo"));
+        cargo
+            .current_dir(&self.root)
+            .args(["check", "--offline", "--jobs=1", "--message-format=json"])
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", root.join("home"))
+            .env("CARGO_HOME", root.join("fleet-cargo-home"))
+            .env("CARGO_TARGET_DIR", target)
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TERM_COLOR", "never")
+            .env("LANG", "C.UTF-8")
+            .env("DEPENDENCY_FLAVOR", FLAVOR)
+            .env("LD_LIBRARY_PATH", toolchain.join("lib"))
+            .env("RUSTC", &live.compiler);
+        for (name, value) in live.environment(FLAVOR) {
+            if name.starts_with("RABS_") {
+                cargo.env(name, value);
+            }
+        }
+        if wrapped {
+            cargo.env("RUSTC_WRAPPER", &live.wrapper);
+        }
+        let events_start = live.events().len();
+        FleetCargo {
+            process: Process::spawn(root, &format!("fleet-cargo-{number}"), &mut cargo),
+            events_start,
+        }
+    }
+
+    fn finish(&self, live: &LiveFixture, mut cargo: FleetCargo) -> FleetResult {
+        assert!(
+            cargo.process.wait(Duration::from_secs(660)).success(),
+            "cargo={}; daemon={}; workers={:?}",
+            String::from_utf8_lossy(&read_log(&cargo.process.stderr)),
+            String::from_utf8_lossy(&read_log(&live.daemon.stderr)),
+            live.workers
+                .iter()
+                .map(|worker| {
+                    String::from_utf8_lossy(&read_log(&worker.process.stderr)).into_owned()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let messages: Vec<Value> = String::from_utf8(read_log(&cargo.process.stdout))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("actual fleet Cargo message"))
+            .collect();
+        let finished: Vec<_> = messages
+            .iter()
+            .filter(|message| message["reason"] == "build-finished")
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0]["success"], true);
+        let mut outputs = std::collections::BTreeMap::new();
+        let mut metadata = None;
+        for name in [
+            self.dependency.to_owned(),
+            format!("{}_consumer", self.dependency),
+        ] {
+            let artifacts: Vec<_> = messages
+                .iter()
+                .filter(|message| {
+                    message["reason"] == "compiler-artifact" && message["target"]["name"] == name
+                })
+                .collect();
+            assert_eq!(artifacts.len(), 1, "missing {name} artifact");
+            assert_eq!(artifacts[0]["fresh"], false);
+            let files = artifacts[0]["filenames"].as_array().unwrap();
+            let rmeta: Vec<_> = files
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "rmeta")
+                })
+                .collect();
+            assert_eq!(rmeta.len(), 1);
+            let rmeta = &rmeta[0];
+            let stem = rmeta
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .strip_prefix("lib")
+                .unwrap()
+                .strip_suffix(".rmeta")
+                .unwrap();
+            let dep_info = rmeta.with_file_name(format!("{stem}.d"));
+            for path in [rmeta, &dep_info] {
+                let bytes = fs::read(path).unwrap();
+                assert!(!bytes.is_empty());
+                if name == self.dependency && path == rmeta {
+                    metadata = Some(bytes.clone());
+                }
+                assert!(
+                    outputs
+                        .insert(path.strip_prefix(&self.root).unwrap().to_path_buf(), bytes)
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(outputs.len(), 4);
+        let all_events = live.events();
+        FleetResult {
+            action: Run {
+                events: cargo_dependency_events(&all_events[cargo.events_start..], self.dependency),
+                metadata: metadata.unwrap(),
+            },
+            outputs,
+            diagnostics: messages
+                .into_iter()
+                .filter(|message| message["reason"] == "compiler-message")
+                .collect(),
+        }
+    }
+}
+
+/// A stopped real worker is a deliberate pressure condition, not a replacement
+/// executor. Always resume it during unwinding so fixture teardown can drain.
+struct PausedWorker(u32);
+
+impl PausedWorker {
+    fn pause(worker: &LiveWorker) -> Self {
+        let paused = Self(worker.process.child.id());
+        assert!(
+            command("/bin/kill")
+                .args(["-STOP", &paused.0.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        paused
+    }
+}
+
+impl Drop for PausedWorker {
+    fn drop(&mut self) {
+        let _ = command("/bin/kill")
+            .args(["-CONT", &self.0.to_string()])
+            .status();
+    }
+}
+
+#[test]
+#[ignore = "requires Linux isolation and matching RABS_TEST_WORKER_BIN/RABS_TEST_WRAP_BIN; real Cargo, two independently pinned workers and cache replay"]
+fn actual_cargo_pool_bypasses_occupied_worker_and_reuses_both_slots() {
+    let mut live = LiveFixture::with_worker_count(2);
+    let clients = FleetClient::prepare(&live);
+    let stock = clients
+        .each_ref()
+        .map(|client| client.finish(&live, client.start(&live, false)));
+    assert!(stock.iter().all(|result| result.action.events.is_empty()));
+
+    let mut first = clients[0].start(&live, true);
+    let until = Instant::now() + Duration::from_secs(240);
+    let admitted_key = loop {
+        let events = live.events();
+        if let Some(event) = events[first.events_start..]
+            .iter()
+            .find(|event| event["kind"] == "rabsd-remote-dependency-admitted")
+        {
+            assert_eq!(event["worker_id"], format!("{WORKER_ID}-0"));
+            break event["key"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            first.process.child.try_wait().unwrap().is_none(),
+            "first Cargo completed without authenticated worker admission"
+        );
+        assert!(
+            Instant::now() < until,
+            "first action never reached a real authenticated worker: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let paused = PausedWorker::pause(&live.workers[0]);
+    assert!(
+        !live.events().iter().any(|event| {
+            event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == admitted_key
+        }),
+        "the suspended action must still own the first slot"
+    );
+
+    let right = clients[1].finish(&live, clients[1].start(&live, true));
+    right.matches_stock(&stock[1]);
+    let right_key = right.action.assert_remote(None).to_owned();
+    assert_ne!(right_key, admitted_key);
+    assert!(
+        first.process.child.try_wait().unwrap().is_none(),
+        "a busy worker must not force the first action to run locally"
+    );
+    let right_receipt = live.worker_receipt_at(1);
+    assert!(
+        live.events().iter().any(|event| {
+            event["kind"] == "rabsd-remote-dependency-admitted"
+                && event["worker_id"] == format!("{WORKER_ID}-1")
+                && event["key"] == right_key
+        }),
+        "the second authenticated worker must own the independent action"
+    );
+
+    drop(paused);
+    let left = clients[0].finish(&live, first);
+    left.matches_stock(&stock[0]);
+    left.action.assert_remote(Some(&admitted_key));
+    let mut receipts = [live.worker_receipt_at(0), right_receipt];
+    let keys = [admitted_key, right_key];
+    // Repeat real productions through the same sockets/state directories. Both
+    // occupied flags and coordinator sessions must be released for these to run.
+    for _ in 0..2 {
+        let running = clients.each_ref().map(|client| client.start(&live, true));
+        for (index, (client, cargo)) in clients.iter().zip(running).enumerate() {
+            let result = client.finish(&live, cargo);
+            result.matches_stock(&stock[index]);
+            result.action.assert_remote(Some(&keys[index]));
+        }
+        let next = [live.worker_receipt_at(0), live.worker_receipt_at(1)];
+        for (old, new) in receipts.iter().zip(&next) {
+            assert!(new["request_id"].as_u64().unwrap() > old["request_id"].as_u64().unwrap());
+        }
+        receipts = next;
+    }
+    let running = clients.each_ref().map(|client| client.start(&live, true));
+    for (index, (client, cargo)) in clients.iter().zip(running).enumerate() {
+        let result = client.finish(&live, cargo);
+        result.matches_stock(&stock[index]);
+        result.action.assert_hit(&keys[index]);
+    }
+    assert_eq!(
+        [live.worker_receipt_at(0), live.worker_receipt_at(1)],
+        receipts,
+        "qualified cache hits must not dispatch either worker"
+    );
+    for worker in &live.workers {
+        let acquisitions: Vec<_> = String::from_utf8(read_log(&worker.process.stderr))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["kind"] == "worker-toolchain-acquired")
+            .map(|event| event["disposition"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            acquisitions,
+            ["captured", "reused", "reused"],
+            "each worker must retain and revalidate its complete compiler across sessions"
+        );
     }
     live.daemon.terminate();
 }

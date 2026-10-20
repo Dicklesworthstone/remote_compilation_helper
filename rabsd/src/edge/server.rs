@@ -67,8 +67,6 @@ const LIVE_DECISION_WORKERS: usize = 8;
 /// wait for publication. Keep this lane separate from decisions; no worker
 /// permit is held while awaiting the subscriber's acknowledgment.
 const LIVE_COMPLETION_WORKERS: usize = 8;
-/// Long compiler and input-transfer waits never occupy decision or hit lanes.
-const REMOTE_EXECUTION_WORKERS: usize = 1;
 /// How long an admitted local execution may run before its completion
 /// frame must arrive (the attempt lease is longer still).
 const LOCAL_EXECUTION_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
@@ -85,7 +83,7 @@ struct EdgeLimits {
     remote_execution: Limit,
 }
 impl EdgeLimits {
-    fn new() -> Self {
+    fn new(remote_workers: usize) -> Self {
         Self {
             sessions: Limit::new(MAX_CONNECTIONS),
             control: Limit::new(CONTROL_WORKERS),
@@ -94,7 +92,11 @@ impl EdgeLimits {
             prepared_admission: Limit::new(PREPARED_ADMISSION_WORKERS),
             live: Limit::new(LIVE_DECISION_WORKERS),
             live_completion: Limit::new(LIVE_COMPLETION_WORKERS),
-            remote_execution: Limit::new(REMOTE_EXECUTION_WORKERS),
+            // One owned execution lane per configured worker. Long compiler
+            // and transfer waits never occupy decisions or cache-hit installs.
+            remote_execution: Limit::new(
+                remote_workers.min(crate::coord::live_dependency::remote::MAX_DEPENDENCY_WORKERS),
+            ),
         }
     }
 }
@@ -143,7 +145,7 @@ pub struct EdgeServerConfig {
 /// One NDJSON event on stderr. Values are JSON-encoded, so a reason that
 /// quotes a path or an OS error with backslashes or newlines stays one
 /// parseable line instead of silently dropping out of the decision trail.
-fn log_line(kind: &str, fields: &[(&str, &str)]) {
+pub(crate) fn log_line(kind: &str, fields: &[(&str, &str)]) {
     eprintln!("{}", render_log_line(kind, fields));
 }
 
@@ -213,7 +215,12 @@ async fn serve(
             })
             .transpose()?,
     };
-    let limits = EdgeLimits::new();
+    let limits = EdgeLimits::new(
+        services
+            .live
+            .as_ref()
+            .map_or(0, |live| live.remote_worker_count()),
+    );
     let acceptor = cx
         .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, services, limits))
         .map_err(|e| format!("acceptor spawn: {e:?}"))?;

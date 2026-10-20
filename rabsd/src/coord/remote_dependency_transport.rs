@@ -8,8 +8,8 @@
 //! Publication, Cargo output installation and fallback remain with the caller.
 
 use super::secure_worker_delivery::{
-    DEPENDENCY_CONTEXT_VERSION, OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook, parse_worker_pin,
-    receive_authenticated_with_admission,
+    DEPENDENCY_CONTEXT_VERSION, OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook,
+    parse_worker_pin, receive_authenticated_with_admission,
 };
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
@@ -84,16 +84,22 @@ impl RemoteDependencyTransport {
             return Err(invalid("remote dependency worker name is empty or invalid"));
         }
         if pin == [0; 32] {
-            return Err(invalid("remote dependency requires an explicit worker SPKI pin"));
+            return Err(invalid(
+                "remote dependency requires an explicit worker SPKI pin",
+            ));
         }
         if !absolute_without_traversal(&state) {
-            return Err(invalid("remote dependency state must be absolute without traversal"));
+            return Err(invalid(
+                "remote dependency state must be absolute without traversal",
+            ));
         }
         if [&tls.ca, &tls.certificate, &tls.private_key]
             .iter()
             .any(|path| !absolute_without_traversal(path))
         {
-            return Err(invalid("coordinator TLS files must be absolute without traversal"));
+            return Err(invalid(
+                "coordinator TLS files must be absolute without traversal",
+            ));
         }
         Ok(Self {
             address,
@@ -117,7 +123,9 @@ impl RemoteDependencyTransport {
             std::env::var_os(name)
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}"))
+                })
         };
         Self::new(
             address,
@@ -147,12 +155,16 @@ impl RemoteDependencyTransport {
         self.occupied
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
-                io::Error::new(io::ErrorKind::WouldBlock, "remote dependency worker is busy")
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote dependency worker is busy",
+                )
             })?;
         Ok(RemoteDependencyReservation {
             transport: Arc::clone(self),
             admission: None,
             request_id: None,
+            dispatch_attempted: false,
         })
     }
 
@@ -191,7 +203,11 @@ impl RemoteDependencyTransport {
             return Err(before_dispatch(cancelled()));
         }
         preflight(request, upload, destination).map_err(&before_dispatch)?;
-        let acceptor = self.tls.acceptor().map_err(io::Error::other).map_err(&before_dispatch)?;
+        let acceptor = self
+            .tls
+            .acceptor()
+            .map_err(io::Error::other)
+            .map_err(&before_dispatch)?;
         // This exclusive store is transport identity fencing. The callback
         // below must separately admit the actual offer into the LIVE authority.
         let admission = match admission {
@@ -199,36 +215,41 @@ impl RemoteDependencyTransport {
             None => PinnedWorkerAdmission::open(&self.state, &self.worker, self.pin)
                 .map_err(&before_dispatch)?,
         };
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| before_dispatch(io::Error::other(format!(
+        let runtime = RuntimeBuilder::current_thread().build().map_err(|error| {
+            before_dispatch(io::Error::other(format!(
                 "remote dependency runtime: {error:?}"
-            ))))?;
+            )))
+        })?;
         let peer = rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
             let exchange = async {
                 let listener = asupersync::net::TcpListener::bind(self.address)
                     .await
-                    .map_err(|error| io::Error::new(error.kind(), format!(
-                        "remote dependency TLS listen: {error}"
-                    )))?;
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("remote dependency TLS listen: {error}"),
+                        )
+                    })?;
                 let (stream, _) = listener.accept().await.map_err(worker_transport_error)?;
                 // The TLS boundary exposes authentication failures as text.
                 // Do not infer transport retry eligibility from that text.
-                accept_peer(&acceptor, stream).await.map_err(io::Error::other)
+                accept_peer(&acceptor, stream)
+                    .await
+                    .map_err(io::Error::other)
             };
             until_cancelled(&cancellation, async {
-                asupersync::time::timeout(
-                    asupersync::time::wall_now(),
-                    CONNECT_BUDGET,
-                    exchange,
-                )
-                .await
-                .map_err(|_| worker_transport_error(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "remote dependency worker connection deadline exceeded",
-                )))?
-            }).await
-        }).map_err(&before_dispatch)?;
+                asupersync::time::timeout(asupersync::time::wall_now(), CONNECT_BUDGET, exchange)
+                    .await
+                    .map_err(|_| {
+                        worker_transport_error(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "remote dependency worker connection deadline exceeded",
+                        ))
+                    })?
+            })
+            .await
+        })
+        .map_err(&before_dispatch)?;
 
         receive_authenticated_with_admission(
             &runtime,
@@ -246,36 +267,72 @@ impl RemoteDependencyTransport {
     }
 }
 
-/// Exactly one caller owns this worker slot until execution/delivery finishes
-/// or the caller abandons its pre-execution offer. It cannot be cloned.
+/// Exactly one caller owns this worker slot until it drops the reservation,
+/// including any capture/publication after delivery. It cannot be cloned.
 pub struct RemoteDependencyReservation {
     transport: Arc<RemoteDependencyTransport>,
     admission: Option<PinnedWorkerAdmission>,
     request_id: Option<u64>,
+    dispatch_attempted: bool,
 }
 
 impl std::fmt::Debug for RemoteDependencyReservation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("RemoteDependencyReservation")
+        formatter
+            .debug_struct("RemoteDependencyReservation")
             .field("transport", &self.transport)
             .field("request_id", &self.request_id)
             .field("admission_held", &self.admission.is_some())
+            .field("dispatch_attempted", &self.dispatch_attempted)
             .finish()
     }
 }
 
 impl RemoteDependencyReservation {
+    /// The configured identity held by this slot; transport admission still
+    /// independently authenticates the worker's key and process incarnation.
+    pub fn worker(&self) -> &str {
+        self.transport.worker()
+    }
+
+    /// Persist only this selected worker's exact recovery context. A pool can
+    /// change membership or order while an uncertain result remains retained;
+    /// its aggregate status cannot identify the owner of this request.
+    pub fn worker_configuration(&self) -> Value {
+        let pin: String = self
+            .transport
+            .pin
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        serde_json::json!({
+            "remote_protocol":1, "dependency_context":DEPENDENCY_CONTEXT_VERSION,
+            "listen":self.transport.address.to_string(), "worker_id":self.transport.worker,
+            "worker_spki_sha256":pin,
+        })
+    }
+
     /// Allocate after the wrapper accepts remote execution, before preparing
     /// the immutable request and uploads. This is blocking metadata work, never
     /// part of the decision lane. The persistent worker lock stays owned until
     /// execute finishes or this reservation is dropped.
     pub fn allocate_request_id(&mut self) -> io::Result<u64> {
+        if self.dispatch_attempted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "this remote dependency reservation already attempted execution",
+            ));
+        }
         if asupersync::cx::Cx::current().is_some() {
-            return Err(invalid("worker request allocation requires a dedicated blocking thread"));
+            return Err(invalid(
+                "worker request allocation requires a dedicated blocking thread",
+            ));
         }
         if self.request_id.is_some() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
-                "this remote dependency reservation already owns a request ID"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "this remote dependency reservation already owns a request ID",
+            ));
         }
         if self.admission.is_none() {
             self.admission = Some(PinnedWorkerAdmission::open(
@@ -284,29 +341,47 @@ impl RemoteDependencyReservation {
                 self.transport.pin,
             )?);
         }
-        let admission = self.admission.as_ref()
+        let admission = self
+            .admission
+            .as_ref()
             .ok_or_else(|| invalid("missing reserved worker admission"))?;
         let request_id = admission.allocate_request_id()?;
         self.request_id = Some(request_id);
         Ok(request_id)
     }
 
-
-    /// Run on a dedicated blocking thread. A transport error after the execution
-    /// write may have run the compiler; preserve the receiver's uncertainty bit.
-    /// All files stay in the caller's private destination until it publishes and
-    /// installs them through the ordinary coordinator and wrapper paths.
+    /// Run once on a dedicated blocking thread. A transport error after the
+    /// execution write may have run the compiler; preserve its uncertainty bit.
+    /// The caller retains this capacity through result capture/publication so a
+    /// new request cannot race a still-live coordinator worker session. Drop the
+    /// reservation only after releasing that session. All delivered files stay
+    /// private until the ordinary coordinator and wrapper paths install them.
     pub fn execute(
-        mut self,
+        &mut self,
         request: &Value,
         upload: &SourceUpload,
         destination: &Path,
         cancellation: OperationCancellation,
         on_admitted: impl FnOnce(&WorkerSessionOffer) -> io::Result<()> + Send + 'static,
     ) -> Result<Delivery, DeliveryFailure> {
-        if self.request_id.is_some_and(|allocated| request["request_id"].as_u64() != Some(allocated)) {
-            return Err(failure(destination,
-                invalid("execution request differs from its durable reserved worker ID")));
+        if std::mem::replace(&mut self.dispatch_attempted, true) {
+            // A second call cannot prove the first compiler stopped. Even API
+            // misuse must never turn an uncertain dispatch into safe fallback.
+            return Err(DeliveryFailure {
+                directory: destination.to_path_buf(),
+                execution_may_have_run: true,
+                transport_interrupted: false,
+                detail: "remote dependency reservation cannot dispatch twice".into(),
+            });
+        }
+        if self
+            .request_id
+            .is_some_and(|allocated| request["request_id"].as_u64() != Some(allocated))
+        {
+            return Err(failure(
+                destination,
+                invalid("execution request differs from its durable reserved worker ID"),
+            ));
         }
         self.transport.execute_reserved(
             self.admission.take(),
@@ -332,7 +407,9 @@ fn preflight(request: &Value, upload: &SourceUpload, destination: &Path) -> io::
     validate_request(request)?;
     upload.validate_request(request)?;
     if !absolute_without_traversal(destination) {
-        return Err(invalid("remote dependency destination must be absolute without traversal"));
+        return Err(invalid(
+            "remote dependency destination must be absolute without traversal",
+        ));
     }
     if request["dependency_context"]["version"] != DEPENDENCY_CONTEXT_VERSION
         || request.get("command_context").is_some()
@@ -349,7 +426,10 @@ fn preflight(request: &Value, upload: &SourceUpload, destination: &Path) -> io::
 }
 
 fn cancelled() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "remote dependency cancelled before dispatch")
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "remote dependency cancelled before dispatch",
+    )
 }
 
 async fn until_cancelled<T>(
@@ -376,30 +456,39 @@ mod tests {
     }
 
     fn transport_at(state: &Path) -> Arc<RemoteDependencyTransport> {
-        Arc::new(RemoteDependencyTransport::new(
-            "127.0.0.1:9123".parse().unwrap(),
-            "worker".into(),
-            [1; 32],
-            state.to_path_buf(),
-            TlsFiles {
-                ca: PathBuf::from("/private/ca.pem"),
-                certificate: PathBuf::from("/private/server.pem"),
-                private_key: PathBuf::from("/private/server.key"),
-            },
-        ).unwrap())
+        Arc::new(
+            RemoteDependencyTransport::new(
+                "127.0.0.1:9123".parse().unwrap(),
+                "worker".into(),
+                [1; 32],
+                state.to_path_buf(),
+                TlsFiles {
+                    ca: PathBuf::from("/private/ca.pem"),
+                    certificate: PathBuf::from("/private/server.pem"),
+                    private_key: PathBuf::from("/private/server.key"),
+                },
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
     fn a_reserved_worker_cannot_accept_another_offer_and_can_move_to_its_lane() {
         let transport = transport();
         let reservation = transport.try_reserve().unwrap();
-        assert_eq!(transport.try_reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            transport.try_reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         let (release, wait) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(reservation);
         });
-        assert_eq!(transport.try_reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            transport.try_reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         release.send(()).unwrap();
         thread.join().unwrap();
         drop(transport.try_reserve().unwrap());
@@ -414,7 +503,10 @@ mod tests {
         let mut reservation = transport.try_reserve().unwrap();
         let first = reservation.allocate_request_id().unwrap();
         assert!(first > 0);
-        assert_eq!(reservation.allocate_request_id().unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            reservation.allocate_request_id().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         let mut competing = independent.try_reserve().unwrap();
         assert!(competing.allocate_request_id().is_err());
         drop(competing);
@@ -430,7 +522,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn execution_rejects_a_request_that_does_not_own_its_reserved_id_and_releases_the_lock() {
+    fn execution_keeps_capacity_until_drop_and_cannot_repeat_a_reserved_dispatch() {
         use rabs_sandbox::snapshot_capture::capture_sealed_source;
         use serde_json::json;
 
@@ -439,25 +531,58 @@ mod tests {
         let mut reservation = transport.try_reserve().unwrap();
         let allocated = reservation.allocate_request_id().unwrap();
         let source = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("lib.rs"), b"pub fn answer() -> u8 { 42 }").unwrap();
+        std::fs::write(
+            source.path().join("lib.rs"),
+            b"pub fn answer() -> u8 { 42 }",
+        )
+        .unwrap();
         let snapshot = capture_sealed_source(
-            &[("workspace".into(), source.path().to_path_buf())], false, 1, 1024,
-        ).unwrap();
-        let upload = SourceUpload::from_snapshot(
-            Arc::new(snapshot), "workspace", &["lib.rs".into()],
-        ).unwrap();
+            &[("workspace".into(), source.path().to_path_buf())],
+            false,
+            1,
+            1024,
+        )
+        .unwrap();
+        let upload =
+            SourceUpload::from_snapshot(Arc::new(snapshot), "workspace", &["lib.rs".into()])
+                .unwrap();
         let destination = state.path().join("must-not-be-created");
-        let error = reservation.execute(
-            &json!({"request_id":allocated.checked_add(1).unwrap()}),
-            &upload,
-            &destination,
-            OperationCancellation::new(),
-            |_| panic!("mismatched request must not admit a live worker"),
-        ).unwrap_err();
+        let error = reservation
+            .execute(
+                &json!({"request_id":allocated.checked_add(1).unwrap()}),
+                &upload,
+                &destination,
+                OperationCancellation::new(),
+                |_| panic!("mismatched request must not admit a live worker"),
+            )
+            .unwrap_err();
         assert!(!error.execution_may_have_run);
         assert!(!error.transport_interrupted);
         assert!(error.detail.contains("durable reserved worker ID"));
         assert!(!destination.exists());
+        assert_eq!(
+            transport.try_reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "delivery must retain capacity until the caller releases its session"
+        );
+        let repeated = reservation
+            .execute(
+                &json!({"request_id":allocated}),
+                &upload,
+                &destination,
+                OperationCancellation::new(),
+                |_| panic!("a repeated reservation must never admit another worker"),
+            )
+            .unwrap_err();
+        assert!(repeated.execution_may_have_run);
+        assert!(!repeated.transport_interrupted);
+        assert!(repeated.detail.contains("cannot dispatch twice"));
+        assert!(!destination.exists());
+        assert_eq!(
+            reservation.allocate_request_id().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        drop(reservation);
         let mut next = transport.try_reserve().unwrap();
         assert!(next.allocate_request_id().unwrap() > allocated);
     }
@@ -478,7 +603,10 @@ mod tests {
                 3 => state = PathBuf::from("/private/../state"),
                 _ => tls.private_key = PathBuf::from("relative.key"),
             }
-            assert!(RemoteDependencyTransport::new(address, worker, pin, state, tls).is_err(), "case {case}");
+            assert!(
+                RemoteDependencyTransport::new(address, worker, pin, state, tls).is_err(),
+                "case {case}"
+            );
         }
     }
 
@@ -489,7 +617,8 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let error = rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
             until_cancelled(&cancellation, std::future::pending::<io::Result<()>>()).await
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(!transport_interrupted(&error));
     }

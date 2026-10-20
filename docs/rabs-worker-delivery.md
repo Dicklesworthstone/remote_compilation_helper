@@ -18,7 +18,7 @@ or downgraded to make a fleet connection use this operator lane.
 ## Run the live Cargo dependency worker
 
 The normal Cargo wrapper can send an eligible dependency compilation directly
-to one authenticated worker, publish its verified result, and install that
+to an authenticated worker, publish its verified result, and install that
 current result after the wrapper acknowledges the exact output manifest. Build
 matching binaries from this checkout:
 
@@ -71,7 +71,7 @@ RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-worker" \
 
 The daemon binds this listener when an eligible wrapper request has accepted
 remote execution. Keep the worker's reconnect loop running without `--once`;
-there is no idle worker queue in this first single-peer lane. Preserve its
+there is no idle connection queue on the listener. Preserve its
 durable state across reconnects and restarts.
 
 For a systemd worker, the fleet deployment script can install those same
@@ -205,6 +205,110 @@ Publication and installation still check the exact request, outputs, current
 authority, release policy and negative verification/class holds. Subsequent
 cache replays retain the existing qualification and periodic sampling rules.
 Transport uncertainty cannot authorize a concurrent local retry.
+
+### Run independent dependency compilations on a worker pool
+
+Set `RABS_DEPENDENCY_WORKERS_JSON` to configure 1–32 individually pinned workers.
+Each entry has exactly `listen`, `worker_id` and `worker_spki_sha256` fields.
+Every listener, worker ID and certificate pin must be unique. The launcher
+accepts literal coordinator-side IPv4 or unscoped bracketed IPv6 addresses with
+fixed nonzero ports; each worker connects to its assigned coordinator port. The
+JSON is limited to 128 KiB. Worker IDs are nonempty UTF-8 strings of at most 1024 bytes
+without control characters; the fleet installer has the narrower ID rules
+documented above. Pins retain the 64 lowercase hexadecimal, nonzero format.
+Unknown or duplicate JSON fields, duplicate identities, and mixtures of pool
+and singleton settings are refused, including empty singleton variables.
+
+On the coordinator, prepare a separate state directory and export the pool
+selection. The two pins below are **examples**: replace them with the SPKI
+SHA-256 values obtained from each worker's trusted certificate using the
+OpenSSL command above. Replace the example listen address with the coordinator's
+actual private address.
+
+```sh
+unset RABS_DEPENDENCY_WORKER_LISTEN RABS_DEPENDENCY_WORKER_ID RABS_DEPENDENCY_WORKER_SPKI_SHA256
+install -d -m 700 "$HOME/.cache/rabs-pool"
+export RABS_STATE_DIR="$HOME/.cache/rabs-pool"
+export RABS_SOCKET_PATH="$HOME/.cache/rabs-pool/rabs.sock"
+export RABS_DEPENDENCY_WORKERS_JSON='[
+  {"listen":"192.0.2.10:7092","worker_id":"leaf-a","worker_spki_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  {"listen":"192.0.2.10:7093","worker_id":"leaf-b","worker_spki_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+]'
+```
+
+Run the matching worker on each worker host with its own certificate and durable
+journal directory. For `leaf-a`, use:
+
+```sh
+RABS_WORKER_TLS_CA=/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/credentials/leaf-a.pem \
+RABS_WORKER_TLS_KEY=/credentials/leaf-a.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-a" \
+RABS_WORKER_TOOLCHAIN_CACHE_BYTES=8589934592 \
+  ./target/debug/rabs-wkr \
+    --coordinator coordinator.example.internal:7092 --worker-id leaf-a
+```
+
+For `leaf-b`, use its certificate, key and journal directory and connect to the
+second port:
+
+```sh
+RABS_WORKER_TLS_CA=/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/credentials/leaf-b.pem \
+RABS_WORKER_TLS_KEY=/credentials/leaf-b.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-b" \
+RABS_WORKER_TOOLCHAIN_CACHE_BYTES=8589934592 \
+  ./target/debug/rabs-wkr \
+    --coordinator coordinator.example.internal:7093 --worker-id leaf-b
+```
+
+Each example allows up to 8 GiB of verified toolchain retention per worker,
+separate from source staging and private execution copies. Select a byte budget
+that fits the host's disk capacity. The first execution captures the toolchain;
+later jobs in the same worker process can reuse its verified bytes and avoid
+retransmission. Absence or zero disables this retention. See the
+[toolchain transfer and cache guide](#send-the-selected-toolchain-with-a-prepared-build)
+for size limits, cache validation and worker-restart behavior.
+
+Keep both worker reconnect loops running. In the coordinator shell with the
+exported pool configuration, start an ordinary Cargo check:
+
+```sh
+RABS_COORD_TLS_CA=/credentials/ca.pem \
+RABS_COORD_TLS_CERT=/credentials/coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/coordinator.key \
+CARGO_RABS_DAEMON="$PWD/target/debug/rabsd" \
+CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
+  ./scripts/cargo-rabs --rabs-require-daemon \
+    check --locked --manifest-path /absolute/project/Cargo.toml
+```
+
+This starts a live daemon if needed. Subsequent invocations retain the exported
+pool selection so the launcher checks the attached daemon's exact normalized
+configuration, including worker order, remote protocol 1 and
+`dependency-exec-v5`. The advertised `remote_dependency` object contains these
+protocol fields and a `workers` array in configured order. A singleton daemon
+does not satisfy a pool request, even when the pool contains that one worker.
+An existing daemon is never reconfigured or restarted to fit a new request;
+use a separate socket and state directory when changing the selection.
+
+Independent eligible metadata actions can execute concurrently, with at most
+one admitted action per worker. Selection rotates across available slots, and
+each reservation remains held through execution, result capture and publication.
+Two requests for the same action cannot consume separate workers while the
+first dispatch is pending. When every slot is busy, the existing bounded
+wrapper wait and local path before remote acceptance still apply. A transport
+failure or uncertain result after dispatch never causes an automatic retry on
+another worker. Durable recovery remains bound to the selected worker's identity.
+
+The pool retains all source, toolchain, isolation and output checks described
+above. It expands concurrency for the supported metadata dependency class;
+ordinary archive/codegen actions, native linking, proc macros and build-script
+execution retain their existing local path. `--rabs-require-daemon` guarantees
+matching daemon setup, not remote execution of every Cargo action. The original
+three-variable singleton configuration and its status fields remain supported.
 
 ### Run the native wrapper-to-worker oracle
 

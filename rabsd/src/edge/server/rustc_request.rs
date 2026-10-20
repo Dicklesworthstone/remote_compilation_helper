@@ -100,6 +100,14 @@ impl LiveEdge {
         self.remote.as_ref().map(|remote| remote.configuration())
     }
 
+    /// The edge must allow every configured worker to execute independently.
+    /// A local-only daemon owns no remote execution capacity.
+    pub(super) fn remote_worker_count(&self) -> usize {
+        self.remote
+            .as_ref()
+            .map_or(0, |remote| remote.worker_count())
+    }
+
     pub(super) fn configured(lane: LiveDependencyLane, state: &Path) -> Result<Self, String> {
         let mut live = Self::new(lane);
         live.remote =

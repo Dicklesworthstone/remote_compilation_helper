@@ -7,7 +7,9 @@
 //! Normal waiting yields to the native reactor. Drop may wait for a filesystem
 //! operation that the operating system cannot interrupt, rather than detach it.
 
-use std::future::poll_fn;
+use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -17,6 +19,12 @@ use std::thread::JoinHandle;
 pub(super) struct Limit {
     active: Arc<AtomicUsize>,
     maximum: usize,
+    waiters: Arc<Mutex<VecDeque<CapacityWaiter>>>,
+}
+
+struct CapacityWaiter {
+    identity: Arc<()>,
+    waker: Waker,
 }
 
 impl Limit {
@@ -24,16 +32,42 @@ impl Limit {
         Self {
             active: Arc::new(AtomicUsize::new(0)),
             maximum,
+            waiters: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
     pub(super) fn acquire(&self) -> Option<Permit> {
+        let waiters = self
+            .waiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !waiters.is_empty() {
+            return None;
+        }
+        self.acquire_unqueued()
+    }
+
+    // The caller owns the waiter lock and has checked queue order.
+    fn acquire_unqueued(&self) -> Option<Permit> {
         self.active
             .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.maximum).then(|| active + 1)
             })
             .ok()?;
-        Some(Permit(Arc::clone(&self.active)))
+        Some(Permit(Arc::clone(&self.active), Arc::clone(&self.waiters)))
+    }
+
+    /// Wait cooperatively for a completed remote result's installation slot.
+    /// No thread or permit is retained while queued. The edge's connection cap
+    /// bounds waiters; caller liveness and a deadline bound their lifetime.
+    /// Fresh cache hits cannot overtake results that already finished compiling.
+    pub(super) fn wait(&self) -> WaitingPermit {
+        WaitingPermit {
+            limit: self.clone(),
+            identity: Arc::new(()),
+            registered: false,
+            completed: false,
+        }
     }
 
     /// Admission has no queue and never waits behind another caller. Spawn
@@ -47,9 +81,84 @@ impl Limit {
     }
 }
 
+pub(super) struct WaitingPermit {
+    limit: Limit,
+    identity: Arc<()>,
+    registered: bool,
+    completed: bool,
+}
+
+impl Future for WaitingPermit {
+    type Output = Permit;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        assert!(!this.completed, "capacity future polled after completion");
+        let shared = Arc::clone(&this.limit.waiters);
+        let mut waiters = shared.lock().unwrap_or_else(|error| error.into_inner());
+        let is_next = waiters
+            .front()
+            .is_none_or(|waiter| Arc::ptr_eq(&waiter.identity, &this.identity));
+        if is_next && let Some(permit) = this.limit.acquire_unqueued() {
+            if this.registered {
+                waiters.pop_front();
+                this.registered = false;
+            }
+            this.completed = true;
+            let next = (this.limit.active.load(Ordering::Acquire) < this.limit.maximum)
+                .then(|| waiters.front().map(|waiter| waiter.waker.clone()))
+                .flatten();
+            drop(waiters);
+            if let Some(waker) = next {
+                waker.wake();
+            }
+            return Poll::Ready(permit);
+        }
+        if let Some(waiter) = waiters
+            .iter_mut()
+            .find(|waiter| Arc::ptr_eq(&waiter.identity, &this.identity))
+        {
+            waiter.waker.clone_from(cx.waker());
+        } else {
+            waiters.push_back(CapacityWaiter {
+                identity: Arc::clone(&this.identity),
+                waker: cx.waker().clone(),
+            });
+            this.registered = true;
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for WaitingPermit {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut waiters = self
+            .limit
+            .waiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(&waiter.identity, &self.identity))
+        {
+            waiters.remove(index);
+        }
+        let next = (self.limit.active.load(Ordering::Acquire) < self.limit.maximum)
+            .then(|| waiters.front().map(|waiter| waiter.waker.clone()))
+            .flatten();
+        drop(waiters);
+        if let Some(waker) = next {
+            waker.wake();
+        }
+    }
+}
+
 /// Non-clone capacity permit, never execution or publication authority.
 /// Moving it into a stage prevents concurrent use of that reservation.
-pub(super) struct Permit(Arc<AtomicUsize>);
+pub(super) struct Permit(Arc<AtomicUsize>, Arc<Mutex<VecDeque<CapacityWaiter>>>);
 
 impl Permit {
     /// Keep this reservation with the result of a joined stage. The receiver
@@ -84,6 +193,15 @@ impl Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+        let next = self
+            .1
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .front()
+            .map(|waiter| waiter.waker.clone());
+        if let Some(waker) = next {
+            waker.wake();
+        }
     }
 }
 
@@ -256,6 +374,85 @@ mod tests {
     }
 
     #[test]
+    fn completed_results_wait_in_order_without_fresh_hits_stealing_capacity() {
+        let limit = Limit::new(1);
+        let occupied = limit.acquire().unwrap();
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut first = Box::pin(limit.wait());
+        let mut second = Box::pin(limit.wait());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(occupied);
+        assert!(
+            limit.acquire().is_none(),
+            "new hits must respect completed results"
+        );
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        let Poll::Ready(first_permit) = first.as_mut().poll(&mut cx) else {
+            panic!("first completed result did not receive the free slot");
+        };
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(first_permit);
+        let Poll::Ready(second_permit) = second.as_mut().poll(&mut cx) else {
+            panic!("second completed result did not receive the free slot");
+        };
+        drop(second_permit);
+        assert!(limit.acquire().is_some());
+    }
+
+    #[test]
+    fn abandoned_installation_waiters_release_queue_ownership_and_wake_successors() {
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let limit = Limit::new(1);
+        let occupied = limit.acquire().unwrap();
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut abandoned = Box::pin(limit.wait());
+        let mut survivor = Box::pin(limit.wait());
+        assert!(abandoned.as_mut().poll(&mut cx).is_pending());
+        assert!(survivor.as_mut().poll(&mut cx).is_pending());
+        drop(occupied);
+        let before = wake.0.load(Ordering::SeqCst);
+        assert!(before > 0, "permit release must wake a registered waiter");
+        drop(abandoned);
+        assert!(wake.0.load(Ordering::SeqCst) > before);
+        let Poll::Ready(permit) = survivor.as_mut().poll(&mut cx) else {
+            panic!("cancelled predecessor stranded free capacity");
+        };
+        drop(permit);
+        assert_eq!(limit.active.load(Ordering::Acquire), 0);
+        assert!(limit.waiters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelling_all_waiters_restores_ordinary_nonblocking_admission() {
+        let limit = Limit::new(1);
+        let occupied = limit.acquire().unwrap();
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(limit.wait());
+        for _ in 0..8 {
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(limit.waiters.lock().unwrap().len(), 1);
+        drop(waiter);
+        assert!(limit.waiters.lock().unwrap().is_empty());
+        assert!(
+            limit.acquire().is_none(),
+            "cancellation cannot release another owner"
+        );
+        drop(occupied);
+        assert!(limit.acquire().is_some());
+    }
+
+    #[test]
     fn pending_work_yields_and_completion_wakes_the_waiter() {
         let limit = Limit::new(1);
         let (release, blocked) = mpsc::channel();
@@ -403,11 +600,15 @@ mod tests {
         let payload = Payload(Arc::clone(&dropped));
         let (started, entered) = mpsc::channel();
         let (release, continue_work) = mpsc::channel();
-        let work = limit.acquire().unwrap().stage(move || {
-            started.send(()).unwrap();
-            continue_work.recv_timeout(Duration::from_secs(5)).unwrap();
-            payload
-        }).unwrap();
+        let work = limit
+            .acquire()
+            .unwrap()
+            .stage(move || {
+                started.send(()).unwrap();
+                continue_work.recv_timeout(Duration::from_secs(5)).unwrap();
+                payload
+            })
+            .unwrap();
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         let (dropping, drop_started) = mpsc::channel();
         let dropper = std::thread::spawn(move || {
