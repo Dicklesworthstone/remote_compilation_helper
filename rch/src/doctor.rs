@@ -7443,11 +7443,23 @@ mod tests {
         let diagnostics = reliability_schema_compatibility_diagnostics();
 
         assert_eq!(diagnostics.len(), 4);
-        for check_name in [
-            "doctor_reliability",
-            "status",
-            "repo_updater_contract",
-            "process_triage_contract",
+        // Each component has its own pin (#118 moved the reliability doctor
+        // and status schemas to 1.1.0); compare against that pin, not a
+        // shared literal.
+        for (check_name, expected) in [
+            (
+                "doctor_reliability",
+                EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION,
+            ),
+            ("status", EXPECTED_STATUS_SCHEMA_VERSION),
+            (
+                "repo_updater_contract",
+                EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION,
+            ),
+            (
+                "process_triage_contract",
+                EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION,
+            ),
         ] {
             let diagnostic = diagnostics
                 .iter()
@@ -7462,12 +7474,14 @@ mod tests {
 
             assert_eq!(diagnostic.severity, ReliabilitySeverity::Pass);
             assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaCompatible);
+            let suffix = format!(" expected={expected}");
             assert!(
                 diagnostic
                     .details
                     .as_deref()
-                    .is_some_and(|details| details.ends_with(" expected=1.0.0")),
-                "{check_name} should compare against this doctor's pinned expected schema version"
+                    .is_some_and(|details| details.ends_with(&suffix)),
+                "{check_name} should compare against this doctor's pinned expected schema version {expected}: {:?}",
+                diagnostic.details
             );
         }
     }
