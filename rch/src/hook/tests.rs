@@ -4993,6 +4993,98 @@ fn test_exit_code_constants() {
 }
 
 #[test]
+fn cargo_profile_forwarding_binds_settings_and_preserves_shell_precedence() {
+    let environment = rch_common::types::EnvironmentConfig::default();
+    let layer0 = vec![("CARGO_PROFILE_TEST_DEBUG".to_owned(), "1".to_owned())];
+    let settings = vec![
+        ("CARGO_PROFILE_TEST_DEBUG".to_owned(), "0".to_owned()),
+        ("CARGO_INCREMENTAL".to_owned(), "0".to_owned()),
+    ];
+    for command in [
+        "cargo test --workspace",
+        "make check",
+        "./project-test-wrapper",
+    ] {
+        let bound = bind_cargo_profile_command(command, &environment, &layer0, settings.clone());
+        assert_eq!(
+            bound,
+            bind_cargo_profile_command(
+                command,
+                &environment,
+                &layer0,
+                settings.clone().into_iter().rev()
+            )
+        );
+        assert_ne!(
+            bound,
+            bind_cargo_profile_command(
+                command,
+                &environment,
+                &layer0,
+                [("CARGO_PROFILE_TEST_DEBUG".to_owned(), "2".to_owned())]
+            )
+        );
+        assert_ne!(bound, command);
+    }
+    for (command, expected) in [
+        (r#"sh -c 'printf "%s" "$CARGO_PROFILE_TEST_DEBUG"'"#, "0"),
+        (
+            r#"CARGO_PROFILE_TEST_DEBUG=2 sh -c 'printf "%s" "$CARGO_PROFILE_TEST_DEBUG"'"#,
+            "2",
+        ),
+        (
+            r#"env -u CARGO_PROFILE_TEST_DEBUG sh -c 'printf "%s" "${CARGO_PROFILE_TEST_DEBUG-unset}"'"#,
+            "unset",
+        ),
+        (
+            r#"env -i sh -c 'printf "%s" "${CARGO_PROFILE_TEST_DEBUG-unset}"'"#,
+            "unset",
+        ),
+    ] {
+        let bound = bind_cargo_profile_command(command, &environment, &layer0, settings.clone());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &bound])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{bound}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{bound}"
+        );
+    }
+    let disabled = rch_common::types::EnvironmentConfig {
+        allowlist: Vec::new(),
+        forward_cargo_profile_settings: false,
+    };
+    assert_eq!(
+        bind_cargo_profile_command("cargo test", &disabled, &[], settings.clone()),
+        "cargo test"
+    );
+    let explicit = rch_common::types::EnvironmentConfig {
+        allowlist: vec!["CARGO_PROFILE_TEST_DEBUG".to_owned()],
+        ..disabled
+    };
+    assert_eq!(
+        bind_cargo_profile_command("cargo test", &explicit, &[], settings),
+        "CARGO_PROFILE_TEST_DEBUG=0 cargo test"
+    );
+    assert_eq!(
+        bind_cargo_profile_command(
+            "cargo test",
+            &environment,
+            &[],
+            [(
+                "CARGO_PROFILE_TEST_DEBUG".to_owned(),
+                "$(touch unsafe)".to_owned()
+            )]
+        ),
+        "cargo test"
+    );
+}
+
+#[test]
 fn test_remote_pipeline_failure_policy_ssh_timeout_fails_closed() {
     let _guard = test_guard!();
     let error = anyhow::anyhow!("SSH command timed out after 1800s");
@@ -8078,6 +8170,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         "cargo check",
         TransferConfig::default(),
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -8204,6 +8297,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         "cargo build",
         TransferConfig::default(),
         Vec::new(),
+        true,
         Some(PathBuf::from(&custom_target_dir)),
         &rch_common::CompilationConfig::default(),
         None,
@@ -8323,6 +8417,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         "cargo check",
         transfer_config,
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -8491,6 +8586,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         "cargo test",
         TransferConfig::default(),
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -8590,6 +8686,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         "cargo build",
         TransferConfig::default(),
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -8618,6 +8715,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         "cargo test",
         TransferConfig::default(),
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,

@@ -1676,11 +1676,25 @@ pub struct GeneralConfig {
 }
 
 /// Environment variable passthrough configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentConfig {
     /// Allowlist of environment variables to forward to remote workers.
     #[serde(default)]
     pub allowlist: Vec<String>,
+    /// Automatically forward validated Cargo artifact-size settings, including
+    /// custom profiles and build overrides. Exact allowlist entries still work
+    /// when this is disabled; arbitrary Cargo variables are never added.
+    #[serde(default = "default_true")]
+    pub forward_cargo_profile_settings: bool,
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            allowlist: Vec::new(),
+            forward_cargo_profile_settings: true,
+        }
+    }
 }
 
 impl Default for GeneralConfig {

@@ -1143,6 +1143,47 @@ fn layer0_env_for_lane(
         .collect()
 }
 
+/// Snapshot the effective artifact settings into the command sent to admission
+/// and execution. A small debug-free build must not fund a larger debug build.
+/// Command-local assignments and `env -u`/`env -i` retain shell precedence.
+fn bind_cargo_profile_command(
+    command: &str,
+    environment: &rch_common::types::EnvironmentConfig,
+    layer0_env: &[(String, String)],
+    inherited: impl IntoIterator<Item = (String, String)>,
+) -> String {
+    use rch_common::config::env::cargo_profile_env_is_safe;
+
+    // Job/Make/Ninja wrappers can run Cargo too: match the forwarding policy
+    // for every command, rather than only directly classified Cargo commands.
+    let mut settings = std::collections::BTreeMap::new();
+    for (key, value) in layer0_env {
+        if cargo_profile_env_is_safe(key, value) {
+            settings.insert(key.clone(), value.clone());
+        }
+    }
+    for (key, value) in inherited {
+        if (environment.forward_cargo_profile_settings
+            || environment
+                .allowlist
+                .iter()
+                .any(|allowed| allowed.trim() == key))
+            && cargo_profile_env_is_safe(&key, &value)
+        {
+            settings.insert(key, value);
+        }
+    }
+    if settings.is_empty() {
+        return command.to_owned();
+    }
+    let prefix = settings
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", shell_escape::escape(value.into())))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{prefix} {command}")
+}
+
 /// `CARGO_PROFILE_RELEASE_CODEGEN_UNITS` -> ("release", "codegen-units").
 fn cargo_profile_env_setting(key: &str) -> Option<(String, String)> {
     let rest = key.strip_prefix("CARGO_PROFILE_")?;
@@ -3960,6 +4001,13 @@ pub async fn run_exec(
         forwarded_cargo_target_dir.as_ref(),
         &reporter,
     );
+    let remote_command = bind_cargo_profile_command(
+        &remote_command,
+        &config.environment,
+        &layer0_env,
+        std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
+    );
 
     // Determine required runtime
     let required_runtime = if clean_overlay_fmt_check {
@@ -4377,6 +4425,7 @@ pub async fn run_exec(
             &remote_command,
             config.transfer.clone(),
             config.environment.allowlist.clone(),
+            config.environment.forward_cargo_profile_settings,
             forwarded_cargo_target_dir.clone(),
             &config.compilation,
             toolchain.as_ref(),
@@ -5731,6 +5780,7 @@ async fn handle_selection_response(
         &remote_command,
         config.transfer.clone(),
         config.environment.allowlist.clone(),
+        config.environment.forward_cargo_profile_settings,
         forwarded_cargo_target_dir,
         &config.compilation,
         toolchain,

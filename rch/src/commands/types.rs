@@ -334,6 +334,7 @@ pub fn is_default_verify_size(val: &u64) -> bool {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigEnvironmentSection {
     pub allowlist: Vec<String>,
+    pub forward_cargo_profile_settings: bool,
 }
 
 /// Circuit breaker configuration section.

@@ -2606,6 +2606,8 @@ pub struct TransferPipeline {
     color_mode: ColorMode,
     /// Environment variables to forward to workers.
     env_allowlist: Vec<String>,
+    /// Automatically forward validated Cargo artifact-size controls.
+    forward_cargo_profile_settings: bool,
     /// Layer 0 configuration-pack env pairs (bd-bqu38): config-resolved
     /// `CARGO_PROFILE_*` assignments forced onto the remote build, bypassing
     /// the ambient-environment allowlist lookup entirely.
@@ -2774,6 +2776,7 @@ impl TransferPipeline {
             ssh_options,
             color_mode: ColorMode::default(),
             env_allowlist: Vec::new(),
+            forward_cargo_profile_settings: true,
             layer0_env: Vec::new(),
             env_overrides: None,
             compilation_kind: None,
@@ -3455,6 +3458,16 @@ impl TransferPipeline {
         self
     }
 
+    /// Enable automatic forwarding of validated Cargo profile settings.
+    ///
+    /// An exact allowlist entry remains effective when automatic forwarding
+    /// is disabled. Both paths enforce the same Cargo scalar-value validation.
+    #[must_use]
+    pub fn with_cargo_profile_forwarding(mut self, enabled: bool) -> Self {
+        self.forward_cargo_profile_settings = enabled;
+        self
+    }
+
     /// Force Layer 0 configuration-pack env pairs (bd-bqu38).
     ///
     /// These are resolved from the `[layer0]` config knobs by the caller and
@@ -3882,15 +3895,6 @@ impl TransferPipeline {
         Some(escape(Cow::from(parent.to_string())).to_string())
     }
 
-    fn env_value(&self, key: &str) -> Option<String> {
-        if let Some(ref overrides) = self.env_overrides
-            && let Some(value) = overrides.get(key)
-        {
-            return Some(value.clone());
-        }
-        std::env::var(key).ok()
-    }
-
     /// Compute the managed, worker-scoped value (and the directory that must
     /// exist for it) for an env var that we pin into the remote build zone.
     ///
@@ -3971,15 +3975,56 @@ impl TransferPipeline {
     }
 
     fn build_remote_env_plan(&self, remote_path: &str) -> RemoteEnvPlan {
+        self.build_remote_env_plan_with_environment(
+            remote_path,
+            std::env::vars_os().filter_map(|(key, value)| {
+                Some((key.into_string().ok()?, value.into_string().ok()?))
+            }),
+        )
+    }
+
+    fn build_remote_env_plan_with_environment(
+        &self,
+        remote_path: &str,
+        inherited: impl IntoIterator<Item = (String, String)>,
+    ) -> RemoteEnvPlan {
+        use rch_common::config::env::{
+            cargo_profile_env_is_safe, cargo_profile_env_key_is_supported,
+        };
+
+        // Snapshot once per invocation. Explicit overrides replace inherited
+        // values before validation, so a rejected override cannot resurrect a
+        // different value from the dispatcher's environment.
+        let mut environment = inherited
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if let Some(overrides) = &self.env_overrides {
+            environment.extend(
+                overrides
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        let mut allowlist = self.env_allowlist.clone();
+        if self.forward_cargo_profile_settings {
+            for key in environment
+                .keys()
+                .filter(|key| cargo_profile_env_key_is_supported(key))
+            {
+                if !allowlist.iter().any(|existing| existing.trim() == key) {
+                    allowlist.push(key.clone());
+                }
+            }
+        }
         let mut parts = Vec::new();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
         let mut ensure_dirs = Vec::new();
         let mut restricted_dirs = Vec::new();
 
-        for raw_key in &self.env_allowlist {
+        for raw_key in &allowlist {
             let key = raw_key.trim();
-            if key.is_empty() {
+            if key.is_empty() || applied.iter().any(|existing| existing == key) {
                 continue;
             }
             if !is_valid_env_key(key) {
@@ -3991,12 +4036,23 @@ impl TransferPipeline {
                 continue;
             }
 
-            let Some(original_value) = self.env_value(key) else {
+            let Some(original_value) = environment.get(key) else {
                 continue;
             };
 
+            if cargo_profile_env_key_is_supported(key)
+                && !cargo_profile_env_is_safe(key, original_value)
+            {
+                info!(
+                    "Rejecting env var '{}': invalid Cargo artifact-size setting",
+                    key
+                );
+                rejected.push(key.to_string());
+                continue;
+            }
+
             let (effective_value, ensure_dir, rewritten) =
-                self.rewrite_remote_env_value(key, &original_value, remote_path);
+                self.rewrite_remote_env_value(key, original_value, remote_path);
             if rewritten {
                 info!(
                     "Rewriting {} for remote execution (worker-scoped path): {} -> {}",
@@ -14102,6 +14158,243 @@ Number of files transferred: 42
     }
 
     #[test]
+    fn cargo_profile_forwarding_works_with_existing_minimal_allowlist() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec![
+            "TMPDIR".into(),
+            "CARGO_TARGET_DIR".into(),
+            "RUSTUP_TOOLCHAIN".into(),
+        ]);
+        let forwarded = [
+            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+            ("CARGO_PROFILE_TEST_STRIP", "debuginfo"),
+            ("CARGO_PROFILE_CI_SMALL_INCREMENTAL", "false"),
+            ("CARGO_PROFILE_CI_SMALL_BUILD_OVERRIDE_CODEGEN_UNITS", "16"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("CARGO_BUILD_INCREMENTAL", "false"),
+        ];
+        let inherited = forwarded
+            .into_iter()
+            .chain([
+                ("RUSTC_WRAPPER", "/tmp/worker-escape"),
+                ("CARGO_PROFILE_DEV_RUSTFLAGS", "--out-dir /tmp/elsewhere"),
+                ("CARGO_REGISTRY_TOKEN", "secret-must-not-forward"),
+                ("CARGO_TARGET_DIR", "/caller/target"),
+            ])
+            .map(|(key, value)| (key.to_owned(), value.to_owned()));
+        let plan =
+            pipeline.build_remote_env_plan_with_environment(&pipeline.remote_path(), inherited);
+        for (key, _) in forwarded {
+            assert!(
+                plan.env_prefix.applied.iter().any(|applied| applied == key),
+                "{key}"
+            );
+        }
+        for rejected in [
+            "RUSTC_WRAPPER",
+            "CARGO_PROFILE_DEV_RUSTFLAGS",
+            "CARGO_REGISTRY_TOKEN",
+        ] {
+            assert!(
+                !plan
+                    .env_prefix
+                    .applied
+                    .iter()
+                    .any(|applied| applied == rejected),
+                "{rejected}"
+            );
+        }
+        assert!(!plan.env_prefix.prefix.contains("/caller/target"));
+        assert!(!plan.env_prefix.prefix.contains("secret-must-not-forward"));
+        assert!(
+            plan.env_prefix
+                .applied
+                .iter()
+                .any(|key| key == "RCH_CARGO_WRAPPER_BYPASS")
+        );
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_inherited_and_override_sources_match() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        );
+        let environment = [
+            (
+                "CARGO_PROFILE_TEST_DEBUG".to_owned(),
+                "line-tables-only".to_owned(),
+            ),
+            (
+                "CARGO_PROFILE_DEV_INCREMENTAL".to_owned(),
+                "false".to_owned(),
+            ),
+        ];
+        let root = pipeline.remote_path();
+        let inherited = pipeline.build_remote_env_plan_with_environment(&root, environment.clone());
+        let overrides = pipeline
+            .with_env_overrides(environment.into_iter().collect())
+            .build_remote_env_plan_with_environment(&root, []);
+        assert_eq!(inherited.env_prefix.prefix, overrides.env_prefix.prefix);
+        assert_eq!(inherited.env_prefix.applied, overrides.env_prefix.applied);
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_opt_out_retains_exact_allowlist_policy() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        )
+        .with_cargo_profile_forwarding(false)
+        .with_env_allowlist(vec!["CARGO_PROFILE_TEST_DEBUG".into()]);
+        let plan = pipeline.build_remote_env_plan_with_environment(
+            &pipeline.remote_path(),
+            [
+                ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
+                ("CARGO_PROFILE_DEV_DEBUG".into(), "0".into()),
+                ("CARGO_INCREMENTAL".into(), "0".into()),
+            ],
+        );
+        assert!(
+            plan.env_prefix
+                .applied
+                .iter()
+                .any(|key| key == "CARGO_PROFILE_TEST_DEBUG")
+        );
+        assert!(
+            !plan
+                .env_prefix
+                .applied
+                .iter()
+                .any(|key| key == "CARGO_PROFILE_DEV_DEBUG" || key == "CARGO_INCREMENTAL")
+        );
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_rejected_override_never_uses_ambient_fallback() {
+        let _guard = test_guard!();
+        for enabled in [false, true] {
+            let pipeline = TransferPipeline::new(
+                PathBuf::from("/tmp/project"),
+                "project".into(),
+                "hash".into(),
+                TransferConfig::default(),
+            )
+            .with_cargo_profile_forwarding(enabled)
+            .with_env_allowlist(vec!["CARGO_PROFILE_TEST_DEBUG".into()])
+            .with_env_overrides(HashMap::from([(
+                "CARGO_PROFILE_TEST_DEBUG".into(),
+                "0; touch /tmp/escape".into(),
+            )]));
+            let plan = pipeline.build_remote_env_plan_with_environment(
+                &pipeline.remote_path(),
+                [("CARGO_PROFILE_TEST_DEBUG".into(), "2".into())],
+            );
+            assert!(
+                plan.env_prefix
+                    .rejected
+                    .iter()
+                    .any(|key| key == "CARGO_PROFILE_TEST_DEBUG")
+            );
+            assert!(
+                !plan
+                    .env_prefix
+                    .applied
+                    .iter()
+                    .any(|key| key == "CARGO_PROFILE_TEST_DEBUG")
+            );
+            assert!(!plan.env_prefix.prefix.contains("touch /tmp/escape"));
+        }
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_caller_values_override_layer0_defaults() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        )
+        .with_layer0_env(vec![(
+            "CARGO_PROFILE_TEST_DEBUG".into(),
+            "line-tables-only".into(),
+        )]);
+        let plan = pipeline.build_remote_env_plan_with_environment(
+            &pipeline.remote_path(),
+            [("CARGO_PROFILE_TEST_DEBUG".into(), "0".into())],
+        );
+        assert!(!plan.env_prefix.prefix.contains("line-tables-only"));
+        assert_eq!(
+            plan.env_prefix
+                .applied
+                .iter()
+                .filter(|key| *key == "CARGO_PROFILE_TEST_DEBUG")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_profile_forwarding_preserves_shell_assignments_unset_and_clean_env() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        );
+        let plan = pipeline.build_remote_env_plan_with_environment(
+            &pipeline.remote_path(),
+            [
+                ("CARGO_PROFILE_TEST_DEBUG".into(), "2".into()),
+                ("CARGO_INCREMENTAL".into(), "0".into()),
+            ],
+        );
+        let probe = "sh -c 'printf \"%s|%s\" \"${CARGO_PROFILE_TEST_DEBUG-unset}\" \"${CARGO_INCREMENTAL-unset}\"'";
+        for (command, expected) in [
+            (probe.to_owned(), "2|0"),
+            (format!("CARGO_PROFILE_TEST_DEBUG=0 {probe}"), "0|0"),
+            (
+                format!("env -u CARGO_PROFILE_TEST_DEBUG {probe}"),
+                "unset|0",
+            ),
+            (format!("env -i {probe}"), "unset|unset"),
+        ] {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{}{command}", plan.env_prefix.prefix))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .expect("execute real shell");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn test_build_remote_command_rewrites_cargo_target_dir_and_tmpdir() {
         let _guard = test_guard!();
         let mut overrides = HashMap::new();
@@ -20577,7 +20870,9 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             TransferConfig::default(),
         );
 
-        let env_prefix = pipeline.build_env_prefix();
+        let env_prefix = pipeline
+            .build_remote_env_plan_with_environment(&pipeline.remote_path(), [])
+            .env_prefix;
         assert!(!env_prefix.prefix.contains("CARGO_PROFILE_"));
         assert!(
             !env_prefix

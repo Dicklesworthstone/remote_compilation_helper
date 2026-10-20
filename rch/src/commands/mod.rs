@@ -687,6 +687,7 @@ mod tests {
             },
             environment: ConfigEnvironmentSection {
                 allowlist: vec!["RUSTFLAGS".to_string()],
+                forward_cargo_profile_settings: true,
             },
             circuit: ConfigCircuitSection {
                 failure_threshold: 3,

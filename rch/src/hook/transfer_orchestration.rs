@@ -563,6 +563,7 @@ pub(super) async fn execute_remote_compilation(
     command: &str,
     transfer_config: TransferConfig,
     env_allowlist: Vec<String>,
+    forward_cargo_profile_settings: bool,
     forwarded_cargo_target_dir: Option<PathBuf>,
     compilation_config: &rch_common::CompilationConfig,
     toolchain: Option<&ToolchainInfo>,
@@ -600,6 +601,7 @@ pub(super) async fn execute_remote_compilation(
         command,
         transfer_config,
         env_allowlist,
+        forward_cargo_profile_settings,
         forwarded_cargo_target_dir,
         compilation_config,
         toolchain,
@@ -653,6 +655,7 @@ async fn execute_remote_compilation_inner(
     command: &str,
     transfer_config: TransferConfig,
     env_allowlist: Vec<String>,
+    forward_cargo_profile_settings: bool,
     forwarded_cargo_target_dir: Option<PathBuf>,
     compilation_config: &rch_common::CompilationConfig,
     toolchain: Option<&ToolchainInfo>,
@@ -1596,7 +1599,9 @@ async fn execute_remote_compilation_inner(
             root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
         }
         if entry.is_primary {
-            root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
+            root_pipeline = root_pipeline
+                .with_env_allowlist(effective_env_allowlist.clone())
+                .with_cargo_profile_forwarding(forward_cargo_profile_settings);
             // The primary root's pipeline runs the command, so the Layer 0
             // pack belongs here. Until bd-hoxgn it rode only on
             // workspace-metadata roots, which never execute anything.

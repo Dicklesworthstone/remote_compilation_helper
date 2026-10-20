@@ -136,6 +136,17 @@ impl<'a> ConfigDisplay<'a> {
             "{} [environment]",
             Icons::tree_branch(self.context)
         ));
+        self.push_config_line(
+            &mut lines,
+            "  ",
+            "forward_cargo_profile_settings",
+            &self
+                .config
+                .environment
+                .forward_cargo_profile_settings
+                .to_string(),
+            "environment.forward_cargo_profile_settings",
+        );
         let allowlist = format!("{:?}", self.config.environment.allowlist);
         self.push_config_line(
             &mut lines,
@@ -341,6 +352,16 @@ impl<'a> ConfigDisplay<'a> {
         // Environment section
         console.print_plain("");
         console.print_plain("[environment]");
+        self.print_plain_value(
+            console,
+            "forward_cargo_profile_settings",
+            &self
+                .config
+                .environment
+                .forward_cargo_profile_settings
+                .to_string(),
+            "environment.forward_cargo_profile_settings",
+        );
         let allowlist = format!("{:?}", self.config.environment.allowlist);
         self.print_plain_value(console, "allowlist", &allowlist, "environment.allowlist");
 
@@ -480,6 +501,7 @@ mod tests {
             },
             environment: ConfigEnvironmentSection {
                 allowlist: vec!["RUSTFLAGS".to_string()],
+                forward_cargo_profile_settings: true,
             },
             circuit: ConfigCircuitSection {
                 failure_threshold: 3,

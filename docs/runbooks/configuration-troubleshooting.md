@@ -225,8 +225,69 @@ exclude_patterns = [
 ]
 
 [environment]
-RUSTFLAGS = "-C target-cpu=native"
+allowlist = ["RUSTFLAGS"]
 ```
+
+### Forward Cargo artifact-size settings
+
+RCH forwards supported Cargo profile settings from the caller's environment by
+default, including when an existing `environment.allowlist` only contains
+`TMPDIR`, `CARGO_TARGET_DIR`, and `RUSTUP_TOOLCHAIN`. For example:
+
+```bash
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_INCREMENTAL=false \
+  rch exec -- cargo test --workspace
+```
+
+Automatic forwarding validates both the setting name and its scalar value. The
+supported `CARGO_PROFILE_<PROFILE>_<SETTING>` controls are:
+
+| Setting | Accepted values |
+|---------|-----------------|
+| `DEBUG` | `0`, `1`, `2`, `false`, `true`, `none`, `limited`, `full`, `line-directives-only`, `line-tables-only` |
+| `STRIP` | `none`, `debuginfo`, `symbols`, `false`, `true` |
+| `INCREMENTAL` | `false`, `true` |
+| `SPLIT_DEBUGINFO` | `off`, `packed`, `unpacked` |
+| `OPT_LEVEL` | `0`, `1`, `2`, `3`, `s`, `z` |
+| `CODEGEN_UNITS` | Positive decimal integers fitting in `u32` |
+| `LTO` | `false`, `true`, `off`, `thin`, `fat` |
+
+Custom profile names use Cargo's uppercase spelling with dashes replaced by
+underscores: `ci-small` becomes `CARGO_PROFILE_CI_SMALL_DEBUG`. Build-dependency
+overrides use `CARGO_PROFILE_<PROFILE>_BUILD_OVERRIDE_<SETTING>` with the same
+validation, except that Cargo does not support `LTO` in build overrides. RCH
+also forwards `CARGO_INCREMENTAL=0|1` and
+`CARGO_BUILD_INCREMENTAL=false|true`, which can override profile incremental
+settings. Executable paths, output paths, compiler flags, credentials, and
+arbitrary `CARGO_*` variables are not added by this policy.
+
+Caller values take precedence over RCH's Layer 0 defaults. Assignments inside
+the delegated command retain shell precedence, and explicit `env -u` or `env -i`
+still remove inherited values. Managed artifact directories and the remote
+loop-prevention setting retain their existing isolation policy.
+
+To disable automatic forwarding while preserving the exact allowlist:
+
+```toml
+[environment]
+forward_cargo_profile_settings = false
+allowlist = ["TMPDIR", "CARGO_TARGET_DIR", "RUSTUP_TOOLCHAIN"]
+```
+
+The equivalent CLI command is
+`rch config set environment.forward_cargo_profile_settings false`.
+`RCH_FORWARD_CARGO_PROFILE_SETTINGS=false` overrides file configuration. Resetting
+the key returns to `true`. An explicitly allowlisted supported profile key still
+forwards when automatic forwarding is disabled, with the same value validation.
+
+Reducing `DEBUG` can reduce intermediate compilation artifacts; `STRIP` controls
+stripping of final binaries and is not a substitute for reducing generated debug
+information. Disabling incremental compilation saves its additional target data
+but may slow subsequent builds. These settings complement worker disk admission
+and monitoring; they do not constitute a disk quota. See Cargo's
+[environment-variable reference](https://doc.rust-lang.org/cargo/reference/environment-variables.html)
+and [profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html)
+for toolchain and target-specific behavior.
 
 ## Validation Steps
 

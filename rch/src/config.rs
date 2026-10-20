@@ -842,6 +842,7 @@ struct PartialTransferConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialEnvironmentConfig {
     allowlist: Option<Vec<String>>,
+    forward_cargo_profile_settings: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1461,6 +1462,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "transfer.source_sync_silence_timeout_secs",
         "transfer.rsync_bin",
         "environment.allowlist",
+        "environment.forward_cargo_profile_settings",
         "circuit.failure_threshold",
         "circuit.success_threshold",
         "circuit.error_rate_threshold",
@@ -1708,6 +1710,14 @@ fn apply_layer(
     if let Some(allowlist) = layer.environment.allowlist.as_ref() {
         config.environment.allowlist = allowlist.clone();
         set_source(sources, "environment.allowlist", source.clone());
+    }
+    if let Some(enabled) = layer.environment.forward_cargo_profile_settings {
+        config.environment.forward_cargo_profile_settings = enabled;
+        set_source(
+            sources,
+            "environment.forward_cargo_profile_settings",
+            source.clone(),
+        );
     }
 
     if let Some(failure_threshold) = layer.circuit.failure_threshold {
@@ -2595,6 +2605,19 @@ fn apply_env_overrides_inner(
                 sources,
                 "environment.allowlist",
                 ConfigValueSource::EnvVar("RCH_ENV_ALLOWLIST".to_string()),
+            );
+        }
+    }
+
+    if let Some(val) = get_env("RCH_FORWARD_CARGO_PROFILE_SETTINGS")
+        && let Some(enabled) = parse_bool(&val)
+    {
+        config.environment.forward_cargo_profile_settings = enabled;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "environment.forward_cargo_profile_settings",
+                ConfigValueSource::EnvVar("RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_string()),
             );
         }
     }
@@ -4895,6 +4918,75 @@ check_interval_secs = 70
             &ConfigValueSource::EnvVar("RCH_ENV_ALLOWLIST".to_string())
         );
         info!("PASS: RCH_ENV_ALLOWLIST override applied with source tracking");
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_config_defaults_layers_and_environment_precedence() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let user = dir.join("user.toml");
+        let project = dir.join("project.toml");
+        let key = "environment.forward_cargo_profile_settings";
+        let mut environment = HashMap::new();
+        std::fs::write(
+            &user,
+            "[environment]\nallowlist = ['TMPDIR', 'CARGO_TARGET_DIR', 'RUSTUP_TOOLCHAIN']\n",
+        )
+        .unwrap();
+        let original =
+            load_config_with_sources_from_paths(Some(&user), None, Some(&environment)).unwrap();
+        assert!(original.config.environment.forward_cargo_profile_settings);
+        assert_eq!(original.sources.get(key), Some(&ConfigValueSource::Default));
+        std::fs::write(
+            &user,
+            "[environment]\nforward_cargo_profile_settings = false\n",
+        )
+        .unwrap();
+        std::fs::write(&project, "[environment]\nallowlist = ['TMPDIR']\n").unwrap();
+        let layered =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(!layered.config.environment.forward_cargo_profile_settings);
+        assert_eq!(layered.config.environment.allowlist, vec!["TMPDIR"]);
+        std::fs::write(
+            &project,
+            "[environment]\nforward_cargo_profile_settings = true\nallowlist = ['TMPDIR']\n",
+        )
+        .unwrap();
+        let project_enabled =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(
+            project_enabled
+                .config
+                .environment
+                .forward_cargo_profile_settings
+        );
+        environment.insert(
+            "RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_owned(),
+            "false".to_owned(),
+        );
+        let disabled =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(!disabled.config.environment.forward_cargo_profile_settings);
+        assert_eq!(
+            disabled.sources.get(key),
+            Some(&ConfigValueSource::EnvVar(
+                "RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_owned()
+            ))
+        );
+        environment.insert(
+            "RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_owned(),
+            "maybe".to_owned(),
+        );
+        let invalid =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(invalid.config.environment.forward_cargo_profile_settings);
+        let roundtrip: RchConfig =
+            toml::from_str(&toml::to_string(&disabled.config).unwrap()).unwrap();
+        assert!(!roundtrip.environment.forward_cargo_profile_settings);
     }
 
     #[test]

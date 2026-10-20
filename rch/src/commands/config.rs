@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -157,6 +157,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             },
             environment: ConfigEnvironmentSection {
                 allowlist: config.environment.allowlist.clone(),
+                forward_cargo_profile_settings: config.environment.forward_cargo_profile_settings,
             },
             circuit: ConfigCircuitSection {
                 failure_threshold: config.circuit.failure_threshold,
@@ -407,6 +408,20 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
     );
 
     println!("\n{}", style.highlight("[environment]"));
+    println!(
+        "  {} = {}",
+        style.key("forward_cargo_profile_settings"),
+        format_with_source(
+            "environment.forward_cargo_profile_settings",
+            &style.value(
+                &config
+                    .environment
+                    .forward_cargo_profile_settings
+                    .to_string()
+            ),
+            &value_sources,
+        )
+    );
     let allowlist_source = source_label("environment.allowlist", &value_sources);
     if let Some(source) = allowlist_source {
         println!(
@@ -913,6 +928,15 @@ pub(super) fn collect_value_sources(
         &mut values,
         "environment.allowlist",
         format!("{:?}", config.environment.allowlist),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "environment.forward_cargo_profile_settings",
+        config
+            .environment
+            .forward_cargo_profile_settings
+            .to_string(),
         sources,
     );
     push_value_source(
@@ -1440,6 +1464,9 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "environment.allowlist" => {
             config.environment.allowlist = parse_string_list(value, key)?;
         }
+        "environment.forward_cargo_profile_settings" => {
+            config.environment.forward_cargo_profile_settings = parse_bool(value, key)?;
+        }
         "output.visibility" => {
             let trimmed = value.trim().trim_matches(|c| c == '"');
             let visibility = trimmed
@@ -1659,6 +1686,14 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             config.environment.allowlist = defaults.environment.allowlist;
             format!("{:?}", config.environment.allowlist)
         }
+        "environment.forward_cargo_profile_settings" => {
+            config.environment.forward_cargo_profile_settings =
+                defaults.environment.forward_cargo_profile_settings;
+            config
+                .environment
+                .forward_cargo_profile_settings
+                .to_string()
+        }
         "output.visibility" => {
             config.output.visibility = defaults.output.visibility;
             config.output.visibility.to_string()
@@ -1808,6 +1843,10 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 "export RCH_ENV_ALLOWLIST=\"{}\"",
                 config.environment.allowlist.join(",")
             );
+            println!(
+                "export RCH_FORWARD_CARGO_PROFILE_SETTINGS={}",
+                config.environment.forward_cargo_profile_settings
+            );
         }
         "env" => {
             // .env file format
@@ -1854,6 +1893,10 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 "RCH_ENV_ALLOWLIST={}",
                 config.environment.allowlist.join(",")
             );
+            println!(
+                "RCH_FORWARD_CARGO_PROFILE_SETTINGS={}",
+                config.environment.forward_cargo_profile_settings
+            );
         }
         "json" => {
             // JSON format (ignore ctx.is_json() since user explicitly requested JSON)
@@ -1888,6 +1931,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     },
                     "environment": {
                         "allowlist": config.environment.allowlist,
+                        "forward_cargo_profile_settings": config.environment.forward_cargo_profile_settings,
                     },
                     // Redacted so any operator paths (proof store, incident
                     // ledger, disk roots, remote base) never leak into an export
@@ -2543,6 +2587,13 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         "self_healing.auto_start_timeout_secs"
     );
 
+    diff_field!(
+        "environment.forward_cargo_profile_settings",
+        config.environment.forward_cargo_profile_settings,
+        defaults.environment.forward_cargo_profile_settings,
+        "environment.forward_cargo_profile_settings"
+    );
+
     // Environment allowlist (compare as sets)
     if !config.environment.allowlist.is_empty()
         && config.environment.allowlist != defaults.environment.allowlist
@@ -3044,6 +3095,36 @@ mod tests {
         config_reset_at(&path, "general.role", &plain_context()).unwrap();
         let config: RchConfig = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(config.general.role, rch_common::BoxRole::Hybrid);
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_config_set_get_reset_and_invalid_value() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let path = dir.join("config.toml");
+        let key = "environment.forward_cargo_profile_settings";
+        apply_config_set(
+            &path,
+            "environment.allowlist",
+            "TMPDIR,CARGO_TARGET_DIR,RUSTUP_TOOLCHAIN",
+        )
+        .unwrap();
+        apply_config_set(&path, key, "false").unwrap();
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        let config: RchConfig = toml::from_str(&bytes).unwrap();
+        assert!(!config.environment.forward_cargo_profile_settings);
+        assert_eq!(config.environment.allowlist.len(), 3);
+        let values = collect_value_sources(&config, &Default::default());
+        assert_eq!(
+            values.iter().find(|value| value.key == key).unwrap().value,
+            "false"
+        );
+        assert!(apply_config_set(&path, key, "maybe").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        config_reset_at(&path, key, &plain_context()).unwrap();
+        let reset: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(reset.environment.forward_cargo_profile_settings);
+        assert_eq!(reset.environment.allowlist, config.environment.allowlist);
     }
 
     /// `[layer0]` keys are settable, resettable and readable from the CLI, so
