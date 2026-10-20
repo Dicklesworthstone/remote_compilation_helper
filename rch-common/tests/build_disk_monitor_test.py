@@ -172,6 +172,74 @@ class DiskMonitorTests(unittest.TestCase):
         self.assertTrue(usage["complete"])
         self.assertEqual(usage["exit_code"], 101)
 
+    def check_terminal_sample(self, condition, reason):
+        # Real execution and final output scanning, with a telemetry transition
+        # AFTER the old completion path's last free-space observation. This is
+        # synchronized by the observer/scan calls, not by a scheduling sleep.
+        for mode in ("standalone", "tracked"):
+            with self.subTest(mode=mode, condition=condition):
+                witness = self.root / ("terminal-sample-" + mode)
+                artifact = self.target / ("retained-" + mode)
+                inject = f"""original_finish=m.finish_descendants
+original_observe=m.Monitor.observe_free
+original_scan=m.Monitor.scan
+original_sample=m.Monitor.sample
+def finish(value, heartbeat):
+    original_finish(value, heartbeat)
+    value.finalizing=True
+def observe(value, samples, now):
+    original_observe(value, samples, now)
+    if getattr(value, 'finalizing', False):
+        value.final_free_observed=True
+def scan(value):
+    total=original_scan(value)
+    if getattr(value, 'final_free_observed', False):
+        value.terminal_scan_done=True
+    return total
+def sample(value):
+    samples=original_sample(value)
+    if getattr(value, 'terminal_scan_done', False):
+        pathlib.Path({str(witness)!r}).write_text('sampled after final scan')
+        condition={condition!r}
+        if condition == 'floor':
+            return {{device: value.floor for device in samples}}
+        if condition == 'error':
+            raise OSError('terminal filesystem probe failed')
+        if condition == 'identity':
+            return {{max(samples) + 1: min(samples.values())}}
+        if condition == 'timeout':
+            time.sleep(5)
+    return samples
+m.finish_descendants=finish
+m.Monitor.observe_free=observe
+m.Monitor.scan=scan
+m.Monitor.sample=sample"""
+                payload = f"from pathlib import Path; Path({str(artifact)!r}).write_text('keep'); print('foreground-finished')"
+                process, receipt = self.spawn(payload, inject=inject, mode=mode)
+                status, stdout, stderr = self.complete(process)
+                self.assertNotEqual(status, 0, stderr)
+                self.assertIn("foreground-finished", stdout)
+                failure = self.failure(receipt)
+                self.assertEqual(failure["reason"], reason)
+                self.assertTrue(failure["started"])
+                usage = json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])
+                self.assertFalse(usage["complete"])
+                self.assertIsNone(usage["exit_code"])
+                self.assertTrue(witness.exists())
+                self.assertEqual(artifact.read_text(), "keep")
+
+    def test_completion_rechecks_floor_after_final_scan(self):
+        self.check_terminal_sample("floor", "free_floor")
+
+    def test_completion_refuses_failed_terminal_probe(self):
+        self.check_terminal_sample("error", "monitor_unavailable")
+
+    def test_completion_refuses_changed_terminal_filesystem(self):
+        self.check_terminal_sample("identity", "monitor_unavailable")
+
+    def test_completion_bounds_terminal_probe(self):
+        self.check_terminal_sample("timeout", "monitor_unavailable")
+
     def test_complete_receipt_binds_original_status_before_guardian_ack(self):
         inject = """original_supervise=m.supervise
 def killed_after_receipt(*args):
@@ -273,10 +341,14 @@ m.supervise=killed_after_receipt"""
 
     def test_spawn_interruption_is_started_and_kills_unreturned_child(self):
         ready = self.target / "writer"
-        inject = """original_popen=m.subprocess.Popen
+        inject = f"""original_popen=m.subprocess.Popen
 def interrupted_spawn(*args, **kwargs):
     child=original_popen(*args, **kwargs)
-    time.sleep(0.15)
+    deadline=time.monotonic()+5
+    while not pathlib.Path({str(ready)!r}).exists():
+        if child.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError('spawn fixture did not publish its writer identity')
+        time.sleep(0.01)
     raise m.BudgetFailure('interrupted', detail='signal after OS spawn')
 m.subprocess.Popen=interrupted_spawn"""
         process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(20)", inject=inject)

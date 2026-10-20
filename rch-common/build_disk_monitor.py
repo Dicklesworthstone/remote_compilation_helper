@@ -542,8 +542,15 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
         if scan_future is not None:
             monitor.observe_output(bounded_result(scan_future, scan_started + SCAN_DEADLINE, heartbeat))
         monitor.observe_output(bounded_result(executor.submit(monitor.scan), time.monotonic() + SCAN_DEADLINE, heartbeat))
+        # The in-flight free-space sample can predate the command's last writes
+        # (or the entire command). A final output scan can also take seconds
+        # while unrelated jobs consume this filesystem. Only a NEW probe after
+        # writers stop and scanning finishes can attest the completion floor.
+        monitor.observe_free(bounded_result(
+            executor.submit(monitor.sample), time.monotonic() + FREE_SAMPLE_DEADLINE, heartbeat,
+        ), time.monotonic())
         # Completion means the foreground command ended, remaining writers
-        # stopped, and the final output scan passed. Its ordinary nonzero exit
+        # stopped, and final output and free-space checks passed. A nonzero exit
         # remains a complete measurement; callers gate successful learning on
         # that independent command status.
         exit_code = child.returncode if child.returncode >= 0 else 128 - child.returncode
