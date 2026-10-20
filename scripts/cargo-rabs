@@ -62,7 +62,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-no-start        Only use an already-running daemon.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
-  --rabs-canonical FILE  Build named binaries through a canonical worker profile.
+  --rabs-canonical FILE  Compile selected Cargo targets through a canonical worker.
   --help                Show this help without starting a daemon or Cargo.
 
 Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
@@ -71,7 +71,8 @@ build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
 explicit upload boundary, profile and worker connection setup. This Linux-only
 profile uses a captured toolchain, fixed worker environment and new output tree;
 it is not transparent local-path replay, per-action scheduling or cache serving.
-Only named binary builds and the documented argument subset are accepted.
+Builds, checks and test --no-run accept ordinary workspace/target selection.
+Cargo's artifact reports identify the required real outputs in the captured tree.
 Profiles may select an existing vendor tree or an explicit cargo_home_source
 for checksum-verified, locked crates.io dependencies from the offline cache.
 Cargo metadata may run locally; builds never do. No local/RCH fallback or
@@ -1184,14 +1185,14 @@ def canonical_profile(path):
 
 
 def canonical_build_arguments(args):
-    """Preserve supported argv and derive REAL mandatory binary outputs.
+    """Preserve compile-only Cargo intent and select the native artifact contract.
 
-    Do not use Cargo's incidental metadata files as an invented success marker.
-    Broader target classes need their own explicit output contract first.
+    Cargo's JSON reports supply actual library, metadata, binary and test names,
+    including toolchain-specific intermediate and target-triple layouts.
     """
     import re
-    if not args or args[0] != "build" or len(args) > 256:
-        raise SetupError("canonical mode requires build with explicit --bin NAME")
+    if not args or args[0] not in ("build", "check", "test") or len(args) > 256:
+        raise SetupError("canonical mode requires build, check or test --no-run")
     if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
         raise SetupError("canonical Cargo arguments exceed their bounds")
     try:
@@ -1199,13 +1200,16 @@ def canonical_build_arguments(args):
             arg.encode("utf-8")
     except UnicodeError as error:
         raise SetupError("canonical Cargo arguments must be UTF-8") from error
-    binaries = set()
-    release = False
     target = None
+    no_run = False
+    workspace = False
+    excluded = False
+    selections = set()
     at = 1
     while at < len(args):
         option, separator, value = args[at].partition("=")
-        if option in ("--bin", "--package", "-p", "--features", "-F", "--target", "--color"):
+        if option in ("--bin", "--example", "--test", "--bench", "--package", "-p",
+                      "--features", "-F", "--target", "--color", "--exclude"):
             if not separator:
                 at += 1
                 if at == len(args):
@@ -1213,11 +1217,11 @@ def canonical_build_arguments(args):
                 value = args[at]
             if not value or value.startswith("-"):
                 raise SetupError("invalid canonical Cargo option value")
-            if option == "--bin":
+            if option in ("--bin", "--example", "--test", "--bench"):
                 if (re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,127}", value) is None
-                        or value in binaries or len(binaries) >= 128):
-                    raise SetupError("canonical binary names must be unique literal names")
-                binaries.add(value)
+                        or (option, value) in selections or len(selections) >= 128):
+                    raise SetupError("canonical target names must be unique literal names")
+                selections.add((option, value))
             elif option == "--target":
                 if target is not None or value not in (
                     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
@@ -1227,18 +1231,26 @@ def canonical_build_arguments(args):
                 target = value
             elif option == "--color" and value not in ("auto", "always", "never"):
                 raise SetupError("invalid Cargo color choice")
+            elif option == "--exclude":
+                excluded = True
         elif not separator and option in ("--release", "-r"):
-            release = True
+            pass
+        elif not separator and option == "--no-run" and args[0] == "test" and not no_run:
+            no_run = True
+        elif not separator and option == "--workspace":
+            workspace = True
         elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
-                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q"):
+                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q",
+                                          "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets"):
             pass
         else:
             raise SetupError("unsupported canonical Cargo argument: " + args[at])
         at += 1
-    if not binaries:
-        raise SetupError("canonical mode requires at least one explicit --bin NAME")
-    prefix = ((target + "/") if target else "") + ("release/" if release else "debug/")
-    return list(args), [prefix + name for name in sorted(binaries)]
+    if args[0] == "test" and not no_run:
+        raise SetupError("canonical test mode requires --no-run; test execution is a separate operation")
+    if excluded and not workspace:
+        raise SetupError("canonical --exclude requires --workspace")
+    return list(args), []
 
 
 def canonical_invocation(profile_path, args, env):
@@ -1263,7 +1275,7 @@ def canonical_invocation(profile_path, args, env):
         for flag in ("--locked", "--offline"):
             if flag not in cargo_args:
                 cargo_args.append(flag)
-    cargo_args += ["--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
+    cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
     import secrets
     specification = {
         "kind": "canonical-exec", "request_id": secrets.randbits(64) or 1,
@@ -1272,7 +1284,7 @@ def canonical_invocation(profile_path, args, env):
                             "env": {"CARGO_INCREMENTAL": "0"}},
         "toolchain_source": profile["toolchain_root"],
         "cargo_source": {"manifest": profile["manifest"]},
-        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs},
+        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs, "cargo": "cargo-json-v1"},
     }
     if "vendor" in profile:
         specification["cargo_source"]["vendor"] = profile["vendor"]

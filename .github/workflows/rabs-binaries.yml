@@ -129,6 +129,13 @@ jobs:
           cargo test --release -p rabsd --test cargo_vendor_prepare registry:: --locked
           cargo test --release -p rabs-sandbox --lib cargo_home --locked
           cargo test --release -p rabs-wkr --lib cargo_home --locked
+      - name: Cargo workspace outputs and independent delivery verification
+        run: |
+          cargo test --release -p rabs-sandbox --lib cargo_artifacts --locked
+          cargo test --release -p rabs-sandbox --test cargo_artifacts --locked -- --nocapture
+          cargo test --release -p rabs-wkr --lib cargo_capture --locked
+          cargo test --release -p rabs-wkr --lib cargo_dynamic_outputs --locked
+          cargo test --release -p rabsd --lib coord::worker_delivery::tests --locked
       - name: Binary size budget (rabs-wrap < 2 MiB, A021)
         run: |
           size=$(stat -c%s target/release/rabs-wrap)

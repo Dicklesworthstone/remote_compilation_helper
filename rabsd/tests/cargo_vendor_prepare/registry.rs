@@ -371,3 +371,26 @@ fn corrupt_missing_or_unapproved_registry_inputs_refuse_before_bundle_publicatio
 fn cached_crates_io_builds_over_native_tls_without_user_cache_and_replays_outputs_offline() {
     run_native_tls_build(fixture(), false);
 }
+
+#[test]
+#[ignore = "requires canonical-capable Linux, OpenSSL and matching RABS_TEST_WORKER_BIN; run explicitly"]
+fn cargo_selected_workspace_outputs_survive_native_tls_and_offline_recovery() {
+    let mut fixture = fixture();
+    fixture.specification["args"] = json!([
+        "build",
+        "--workspace",
+        "--frozen",
+        "--jobs=1",
+        "--message-format=json",
+        "--target-dir",
+        "/__rabs/out/cargo"
+    ]);
+    fixture.specification["command_context"]["env"]["CARGO_TARGET_DIR"] =
+        json!("/__rabs/out/cargo");
+    fixture.specification["artifacts"] = json!({
+        "unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-json-v1"
+    });
+    // The shared fixture retires the original checkout/cache, executes the
+    // installed binary, and replays the same verified delivery without a worker.
+    run_native_tls_build(fixture, false);
+}

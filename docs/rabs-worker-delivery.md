@@ -827,6 +827,19 @@ request must contain a source manifest and an artifact declaration; an explicit
 intermediate files. The compiler command still supplies its exact arguments,
 canonical working directory, environment, and explicit toolchain selection.
 
+Canonical Cargo requests can additionally declare `"cargo":"cargo-json-v1"`
+inside `artifacts`, with `"unit":"cargo"`, `"tree":"tree-files-v1"` and an
+empty `files` minimum. This explicit contract requires the native Cargo program,
+`--message-format=json`, `/__rabs/out/cargo` as the target directory, and a
+compilation command (`build`, `check`, or `test --no-run`). Cargo's completed
+artifact report supplies the actual required filenames and executable modes.
+The worker validates them while capturing the complete tree; the coordinator
+checks them independently before acknowledgement and again during offline
+recovery. A success-looking marker without compiler artifacts is insufficient.
+The contract does not run tests, publish cache entries or change request identity.
+See [canonical Cargo](rabs-canonical-cargo.md) for supported frontend selections
+and report bounds. Endpoints without this contract reject the new field.
+
 With the TLS environment described below, run:
 
 ```sh

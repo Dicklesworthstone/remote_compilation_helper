@@ -1052,9 +1052,15 @@ fn execute_canonical_inner(
                 && output.residual_group_members == 0
                 && control.reason().is_none()
             {
-                let capture = artifacts
-                    .capture_with_dependency_inputs(dependency_inputs.as_ref(), || {
-                        control.reason().is_some()
+                let capture = output
+                    .stdout
+                    .reader()
+                    .and_then(|stdout| {
+                        artifacts.capture_with_cargo_output(
+                            dependency_inputs.as_ref(),
+                            stdout,
+                            || control.reason().is_some(),
+                        )
                     })
                     .and_then(|captured| {
                         if let Some(inputs) = &generated_inputs {

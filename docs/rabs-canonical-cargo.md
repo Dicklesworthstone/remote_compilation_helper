@@ -1,7 +1,9 @@
 # Canonical Cargo-driver builds through the installed toolset
 
-`cargo rabs --rabs-canonical PROFILE.json -- build --bin app --release` connects
-ordinary named-binary Cargo builds to RABS's existing canonical worker path:
+`cargo rabs --rabs-canonical PROFILE.json -- build --workspace` connects ordinary
+Cargo workspace builds to RABS's existing canonical worker path. The same path
+supports `check` and `test --no-run`, with Cargo selecting the requested libraries,
+binaries, examples and test executables:
 
 1. The launcher validates explicit source, toolchain, worker and destination
    intent and creates a new private operation directory.
@@ -9,9 +11,10 @@ ordinary named-binary Cargo builds to RABS's existing canonical worker path:
 3. The native driver captures the source graph, approved vendor tree or locked
    registry cache, and complete toolchain. `request.json` is made durable only
    after the captured input bundle is ready.
-4. The existing mutual-TLS worker exchange transfers the captured inputs, runs
-   Cargo itself inside the worker's canonical namespace and receives the complete
-   verified output tree. Successful results install into a new private directory.
+4. The existing mutual-TLS worker exchange transfers the captured inputs and runs
+   Cargo itself inside the worker's canonical namespace. Cargo's JSON reports
+   identify its actual outputs; both peers verify those files against the complete
+   captured output tree. Successful results install into a new private directory.
 
 This is the canonical **Cargo driver**, not a wrapper-only path rewrite. The
 source remains `/__rabs/workspace`, the captured toolchain lives under
@@ -118,12 +121,23 @@ cache publication or a compiler skip.
 
 ## Supported command contract
 
-The first command must be `build`, with at least one explicit `--bin NAME` or
-`--bin=NAME`. The required outputs are those **actual binaries**, never incidental
-Cargo metadata used as an invented success marker. `tree-files-v1` also returns
-the complete bounded regular-file output tree, including intermediate artifacts.
+The first command must be `build`, `check`, or `test` with `--no-run`. For example:
 
-Supported options are `--package`/`-p`, `--features`/`-F`, `--all-features`,
+```sh
+cargo rabs --rabs-canonical PROFILE.json -- build --workspace
+cargo rabs --rabs-canonical PROFILE.json -- check --workspace --all-targets
+cargo rabs --rabs-canonical PROFILE.json -- test --workspace --no-run
+cargo rabs --rabs-canonical PROFILE.json -- build -p app --bin app --release
+```
+
+Cargo owns package and target selection, including its normal defaults when no
+selection option is supplied. Supported selectors are `--workspace`,
+`--package`/`-p`, `--exclude` (with `--workspace`), `--lib`, `--bins`, `--examples`,
+`--tests`, `--benches`, `--all-targets`, and literal `--bin NAME`, `--example NAME`,
+`--test NAME` or `--bench NAME`. Test executables are compiled and returned;
+this operation does not run them or claim that their tests passed.
+
+Supported build options are `--features`/`-F`, `--all-features`,
 `--no-default-features`, `--release`/`-r`, `--locked`, `--offline`, `--frozen`,
 `--color`, `--verbose`/`-v`/`-vv`, `--quiet`/`-q`, and one optional `--target` from:
 `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
@@ -134,10 +148,10 @@ in the captured toolchain or admitted worker environment; selecting a triple doe
 not install a cross-compiler. Cargo remains responsible for package/feature
 resolution and may reject an otherwise syntactically supported request.
 
-The profile owns `--manifest-path` and `--target-dir`. Custom profiles, target JSON,
-`--config`, unstable flags, `+toolchain`, execution commands (`run`, tests), broad
-implicit target selection and unknown options refuse rather than silently change
-meaning. The selected toolchain also supplies local Cargo metadata probes; a
+The profile owns `--manifest-path`, `--target-dir` and `--message-format=json`.
+Custom profiles, target JSON, `--config`, unstable flags, `+toolchain`, execution
+commands (`run`, `test` without `--no-run`), arguments after `--`, and unknown
+options refuse before preparation. The selected toolchain also supplies local Cargo metadata probes; a
 `cargo +nightly rabs` launcher selection does not override that explicit dataset.
 Cargo is always locked/offline, without duplicating supplied flags.
 
@@ -158,6 +172,25 @@ each. Each root owns its implicit slot and receives at most one transferable
 jobserver token. The worker keeps that grant through process-group cleanup.
 
 ## Outputs, failure and recovery
+
+The explicit `artifacts.cargo = "cargo-json-v1"` contract augments
+`tree-files-v1`. The launcher's `files` minimum is empty because it does not guess
+hashed library, metadata, executable or target-triple paths. After Cargo exits
+successfully and its writers have drained, the worker requires a complete
+`compiler-artifact` / `build-finished` report with at least one ordinary target.
+Every reported output must exist beneath `/__rabs/out/cargo`, and each reported
+executable must retain executable mode. The worker captures the entire bounded
+regular-file tree, including Cargo intermediates that are absent from the report.
+Incidental files such as `.rustc_info.json`, or a success marker alone, cannot
+satisfy the contract.
+
+The coordinator independently checks the hash-verified report against the artifact
+manifest before acknowledging delivery, then verifies every delivered file using
+the existing protocol. Offline recovery repeats the report check after verifying
+the retained bytes and modes. Missing outputs, truncated reports, failed builds
+and malformed output paths refuse success. Old worker/driver versions reject the
+new declaration; install matching binaries. Cargo's report supplies output names,
+never cache authority or permission to skip a compiler.
 
 Before handing off, the launcher prints the retained operation directory to
 stderr. `spec.json` is preparation intent, not an input or result digest.
@@ -181,7 +214,10 @@ failures must be corrected before requesting another build; partial bundles are
 never overwritten.
 
 Existing transfer bounds still apply: a maximum 4096 regular tree files and the
-worker delivery byte limit, currently 1 GiB including diagnostics. Filesystem and
+worker delivery byte limit, currently 1 GiB including diagnostics. Cargo report
+parsing also limits stdout to 64 MiB and each line to 1 MiB, before allocating an
+unbounded record. Non-JSON procedural-macro stdout remains in diagnostics.
+Filesystem and
 source/toolchain preparation costs are included; kernel I/O is not claimed
 interruptible. Nothing here demonstrates a speedup or establishes production
 readiness.
@@ -201,6 +237,32 @@ rch exec -- cargo test -p rabsd --bin rabsd worker_exec::prepared_build --locked
 rch exec -- cargo test -p rabsd --test cargo_vendor_prepare registry:: --locked
 rch exec -- cargo test -p rabs-sandbox --lib cargo_home --locked
 rch exec -- cargo test -p rabs-wkr --lib cargo_home --locked
+rch exec -- cargo test -p rabs-sandbox --lib cargo_artifacts --locked
+rch exec -- cargo test -p rabs-sandbox --test cargo_artifacts --locked
+rch exec -- cargo test -p rabs-wkr --lib cargo_capture --locked
+rch exec -- cargo test -p rabs-wkr --lib cargo_dynamic_outputs --locked
+rch exec -- cargo test -p rabsd --lib coord::worker_delivery::tests --locked
+```
+
+The Cargo artifact integration fixture runs the real installed Cargo and rustc
+against a two-package workspace with generated Rust. It builds, checks and
+compiles tests, validates every report against the descriptor-anchored output
+inventory, executes the produced application and integration-test binary, and
+checks that a real compiler error cannot become a successful report. Worker
+capture/completion tests preserve the original admitted declaration while
+discovering dynamic outputs. Coordinator scripted-peer tests cover refusal before
+acknowledgement and revalidation during offline recovery; they do not substitute
+for authenticated worker execution.
+
+The separate canonical namespace fixture uses the production mount and launch
+builders, poisons the live checkout after source capture, and checks read-only
+source enforcement plus all three compilation modes. It is explicitly opt-in;
+an incapable host fails the requested test instead of recording a successful skip:
+
+```sh
+cargo test -p rabs-sandbox --test cargo_artifacts \
+  canonical_namespace_build_check_and_test_compilation_capture_actual_outputs \
+  -- --ignored --exact
 ```
 
 The cached-registry integration fixture calls the production preparer and runs
@@ -217,6 +279,11 @@ Linux host with OpenSSL and matching built binaries:
 RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
   cargo test -p rabsd --test cargo_vendor_prepare \
     registry::cached_crates_io_builds_over_native_tls_without_user_cache_and_replays_outputs_offline \
+    -- --ignored --nocapture
+
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test cargo_vendor_prepare \
+    registry::cargo_selected_workspace_outputs_survive_native_tls_and_offline_recovery \
     -- --ignored --nocapture
 ```
 
