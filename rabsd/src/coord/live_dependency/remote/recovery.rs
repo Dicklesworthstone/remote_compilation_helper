@@ -358,3 +358,264 @@ mod tests {
         assert!(path.join("recovery.json").is_file());
     }
 }
+
+#[cfg(test)]
+mod receiver_tests {
+    use super::*;
+    use crate::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+    use crate::coord::worker_delivery::{
+        CHUNK_BYTES, DeliveryMode, ResumePeer, ResumeSource, WorkerPeer, receive_operation,
+        worker_transport_error,
+    };
+    use std::collections::VecDeque;
+
+    // Real receiver, persisted bytes and resume-prefix checks; the worker frames
+    // are explicit fixtures. These tests do not establish TLS or rustc execution.
+    struct Peer {
+        replies: VecDeque<Value>,
+        sent: Vec<Value>,
+        lose_ack: bool,
+    }
+
+    impl WorkerPeer for Peer {
+        fn send(&mut self, frame: &Value) -> io::Result<()> {
+            self.sent.push(frame.clone());
+            if self.lose_ack && frame["kind"] == "output-ack" {
+                return Err(worker_transport_error(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture lost acknowledgment write",
+                )));
+            }
+            Ok(())
+        }
+
+        fn receive(&mut self) -> io::Result<Value> {
+            self.replies.pop_front().ok_or_else(|| {
+                worker_transport_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "fixture lost output range",
+                ))
+            })
+        }
+    }
+
+    fn hash(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn request() -> Value {
+        json!({
+            "kind": "canonical-exec", "request_id": 17,
+            "program": "rustc", "args": ["lib.rs"],
+            "toolchain_backing": "/tc", "workspace_backing": "/ws",
+        })
+    }
+
+    fn output_chunk(stream: &str, bytes: &[u8], start: usize, end: usize) -> Value {
+        let chunk = &bytes[start..end];
+        json!({
+            "kind": "output-chunk", "request_id": 17, "stream": stream,
+            "offset": start, "next_offset": end, "total_bytes": bytes.len(),
+            "sha256": hash(bytes), "chunk_sha256": hash(chunk),
+            "eof": end == bytes.len(),
+            "data_hex": chunk.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        })
+    }
+
+    fn peer(resumed: bool, partial: bool) -> (Peer, Vec<u8>) {
+        let output: Vec<u8> = (0..CHUNK_BYTES + 17).map(|n| (n % 251) as u8).collect();
+        let mut replies = VecDeque::from([
+            json!({
+                "kind": "worker-hello", "worker_id": "worker-a", "canonical": true,
+                "slots": 1, "boot_generation": if resumed { 2 } else { 1 },
+                "incarnation": if resumed { "02".repeat(16) } else { "01".repeat(16) },
+                "request_high_water": if resumed { json!(17) } else { Value::Null },
+                "recovery_protocols": ["request-journal-v1"],
+                "output_transfers": ["ranges-v1"],
+                "result_retentions": ["durable-result-v1"],
+            }),
+            json!({
+                "kind": "exec-result", "request_id": 17, "executed": true,
+                "resumed": resumed, "exit_code": 0, "residual_group_members": 0,
+                "stop_reason": null, "output_transfer": "ranges-v1",
+                "output_ack_required": true, "stdout_bytes": output.len(),
+                "stdout_sha256": hash(&output), "stderr_bytes": 0,
+                "stderr_sha256": hash(b""), "artifact_ack_required": false,
+                "artifact_manifest": null, "result_retention": "durable-result-v1",
+                "retained_result_sha256": hash(b"explicit retained-result fixture"),
+            }),
+        ]);
+        if !resumed {
+            replies.push_back(output_chunk("stdout", &output, 0, CHUNK_BYTES));
+        }
+        if !partial {
+            replies.push_back(output_chunk("stdout", &output, CHUNK_BYTES, output.len()));
+            replies.push_back(output_chunk("stderr", b"", 0, 0));
+            replies.push_back(json!({
+                "kind": "output-acknowledged", "request_id": 17, "already_released": false,
+            }));
+        }
+        (Peer { replies, sent: Vec::new(), lose_ack: false }, output)
+    }
+
+    fn recorded(parent: &Path) -> ResultDirectory {
+        let mut directory = ResultDirectory::new(parent).unwrap();
+        directory.record_request(
+            &request(), "action-key",
+            &json!({"worker_id": "worker-a", "listen": "127.0.0.1:9123",
+                    "worker_spki_sha256": "ab".repeat(32)}),
+        ).unwrap();
+        directory
+    }
+
+    fn retained_partial(parent: &Path) -> (PathBuf, Vec<u8>) {
+        let directory = recorded(parent);
+        let root = directory.path().to_path_buf();
+        let (mut peer, output) = peer(false, true);
+        let failure = receive_operation(
+            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
+        ).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(failure.transport_interrupted);
+        assert_eq!(peer.sent.iter().filter(|v| v["kind"] == "canonical-exec").count(), 1);
+        assert!(!peer.sent.iter().any(|v| v["kind"] == "output-ack"));
+        // This is the original failure frontier: the outer owner is dropped.
+        drop(directory);
+        assert_eq!(
+            std::fs::read(root.join("delivery/diagnostics/stdout")).unwrap(),
+            output[..CHUNK_BYTES],
+        );
+        assert!(!root.join("delivery/delivery.json").exists());
+        (root, output)
+    }
+
+    #[test]
+    fn interrupted_receiver_resumes_from_retained_prefix_without_reexecution() {
+        let parent = crate::test_util::private_tempdir();
+        let (root, output) = retained_partial(parent.path());
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(root.join("request.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(saved, request());
+        let old = root.join("delivery");
+        assert!(recover_existing_delivery(&saved, "worker-a", &old, DeliveryTrust::Loopback).is_err());
+        let source = ResumeSource::open(&old).unwrap();
+        let destination = parent.path().join("resumed");
+        source.validate_destination(&destination).unwrap();
+        let (mut peer, _) = peer(true, false);
+        let delivery = receive_operation(
+            &mut ResumePeer::new(&mut peer, &source), &saved, "worker-a",
+            &destination, DeliveryMode::Resume,
+        ).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(std::fs::read(destination.join("diagnostics/stdout")).unwrap(), output);
+        assert_eq!(std::fs::read(old.join("diagnostics/stdout")).unwrap(), output[..CHUNK_BYTES]);
+        assert!(root.join("request.json").is_file());
+        assert_eq!(delivery.receipt["resumed"], true);
+        assert_eq!(delivery.receipt["worker_identity_scope"], "delivery-session");
+        assert_eq!(delivery.receipt["execution_boot_generation"], Value::Null);
+        assert_eq!(delivery.receipt["publication_authorized"], false);
+        assert_eq!(peer.sent.iter().filter(|v| v["kind"] == "result-resume").count(), 1);
+        assert!(!peer.sent.iter().any(|v| v["kind"] == "canonical-exec"));
+        let reads: Vec<_> = peer.sent.iter().filter(|v| {
+            v["kind"] == "output-read" && v["stream"] == "stdout"
+        }).collect();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0]["offset"], CHUNK_BYTES);
+        assert!(peer.replies.is_empty());
+    }
+
+    #[test]
+    fn lost_ack_preserves_a_delivery_the_existing_recovery_verifier_can_read() {
+        let parent = crate::test_util::private_tempdir();
+        let mut directory = recorded(parent.path());
+        let root = directory.path().to_path_buf();
+        let (mut peer, output) = peer(false, false);
+        peer.lose_ack = true;
+        let delivery = receive_operation(
+            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
+        ).unwrap();
+        assert!(!delivery.acknowledgments_confirmed);
+        assert!(delivery.acknowledgment_interrupted);
+        directory.delivery_finished(delivery.acknowledgments_confirmed);
+        drop(directory);
+        let recovered = recover_existing_delivery(
+            &request(), "worker-a", &root.join("delivery"), DeliveryTrust::Loopback,
+        ).unwrap().unwrap();
+        assert_eq!(recovered.receipt, delivery.receipt);
+        assert_eq!(std::fs::read(root.join("delivery/diagnostics/stdout")).unwrap(), output);
+        assert!(root.join("request.json").is_file());
+        // Retention is not authority to upgrade this fixture's transport proof.
+        assert!(recover_existing_delivery(
+            &request(), "worker-a", &root.join("delivery"), DeliveryTrust::PinnedWorker([0xab; 32]),
+        ).is_err());
+        let mut wrong_request = request();
+        wrong_request["args"] = json!(["other.rs"]);
+        assert!(recover_existing_delivery(
+            &wrong_request, "worker-a", &root.join("delivery"), DeliveryTrust::Loopback,
+        ).is_err());
+    }
+
+    #[test]
+    fn corrupt_retained_prefix_refuses_before_ack_without_repairing_or_reexecuting() {
+        let parent = crate::test_util::private_tempdir();
+        let (root, _) = retained_partial(parent.path());
+        let old = root.join("delivery");
+        let path = old.join("diagnostics/stdout");
+        let mut corrupt = std::fs::read(&path).unwrap();
+        corrupt[0] ^= 1;
+        std::fs::write(&path, &corrupt).unwrap();
+        let source = ResumeSource::open(&old).unwrap();
+        let destination = parent.path().join("refused-resume");
+        let (mut peer, _) = peer(true, false);
+        let failure = receive_operation(
+            &mut ResumePeer::new(&mut peer, &source), &request(), "worker-a",
+            &destination, DeliveryMode::Resume,
+        ).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(!failure.transport_interrupted);
+        assert!(!destination.join("delivery.json").exists());
+        assert!(!peer.sent.iter().any(|v| {
+            v["kind"] == "canonical-exec" || v["kind"] == "output-ack"
+        }));
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+        assert!(root.join("request.json").is_file());
+    }
+
+    #[test]
+    fn receiver_refusal_before_dispatch_restores_scratch_cleanup() {
+        let parent = crate::test_util::private_tempdir();
+        let mut directory = recorded(parent.path());
+        let root = directory.path().to_path_buf();
+        let (mut peer, _) = peer(false, false);
+        peer.replies.front_mut().unwrap()["worker_id"] = json!("wrong-worker");
+        let failure = receive_operation(
+            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
+        ).unwrap_err();
+        assert!(!failure.execution_may_have_run);
+        assert!(peer.sent.is_empty());
+        directory.execution_finished();
+        drop(directory);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn fully_verified_receiver_with_confirmed_ack_restores_scratch_cleanup() {
+        let parent = crate::test_util::private_tempdir();
+        let mut directory = recorded(parent.path());
+        let root = directory.path().to_path_buf();
+        let (mut peer, output) = peer(false, false);
+        let delivery = receive_operation(
+            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
+        ).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(std::fs::read(root.join("delivery/diagnostics/stdout")).unwrap(), output);
+        assert!(peer.replies.is_empty());
+        directory.delivery_finished(delivery.acknowledgments_confirmed);
+        drop(directory);
+        assert!(!root.exists());
+    }
+}
