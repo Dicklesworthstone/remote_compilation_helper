@@ -97,11 +97,12 @@ fn cargo_loader_parent_is_explicit_and_old_context_versions_cannot_ignore_it() {
         "dependency-exec-v1",
         "dependency-exec-v2",
         "dependency-exec-v3",
+        "dependency-exec-v4",
     ] {
         request["dependency_context"]["version"] = json!(version);
         assert!(
             parse_exec_request(&request).is_err(),
-            "an old worker contract cannot select v4 execution: {version}"
+            "an old worker contract cannot select v5 execution: {version}"
         );
     }
     request["dependency_context"]["version"] = json!(DEPENDENCY_CONTEXT_VERSION);
@@ -114,6 +115,91 @@ fn cargo_loader_parent_is_explicit_and_old_context_versions_cannot_ignore_it() {
         request["dependency_context"]["loader_dirs"] = invalid;
         assert!(parse_exec_request(&request).is_err());
     }
+}
+
+#[test]
+fn generated_out_dir_requires_an_exact_optional_root_and_environment() {
+    let mut request = dependency_request();
+    assert!(
+        parse_exec_request(&request)
+            .unwrap()
+            .dependency_context
+            .unwrap()
+            .generated_root()
+            .is_none()
+    );
+    request["dependency_context"]["generated_root"] = Value::Null;
+    assert!(
+        parse_exec_request(&request)
+            .unwrap()
+            .dependency_context
+            .unwrap()
+            .generated_root()
+            .is_none()
+    );
+
+    let generated = "/work/target/debug/build/generated-unit/out";
+    request["dependency_context"]["generated_root"] = json!(generated);
+    request["dependency_context"]["env"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(["OUT_DIR", generated]));
+    // No generated files is meaningful: the worker owns a private empty
+    // read-only directory even when the build script produced no files.
+    let original = request.clone();
+    let decoded = parse_exec_request(&request).unwrap();
+    let context = decoded.dependency_context.unwrap();
+    assert_eq!(context.generated_root(), Some(generated));
+    assert!(
+        context
+            .env()
+            .contains(&("OUT_DIR".to_owned(), generated.to_owned()))
+    );
+    assert_eq!(
+        request, original,
+        "decoder changed the generated-root wire identity"
+    );
+
+    for invalid in [
+        Value::Null,
+        json!(true),
+        json!(17),
+        json!([]),
+        json!({}),
+        json!("/home/user/registry/package/generated"),
+        json!("/home/user/toolchains/pinned/generated"),
+        json!("/work/target/debug/deps/generated"),
+        json!("/work/target/debug"),
+        json!("/usr/generated"),
+        json!("relative/generated"),
+        json!("/work/generated/../out"),
+    ] {
+        let mut invalid_request = request.clone();
+        invalid_request["dependency_context"]["generated_root"] = invalid.clone();
+        // Keep coherent strings so path rejections exercise the root guard,
+        // independently of the OUT_DIR agreement check.
+        if invalid.is_string() {
+            invalid_request["dependency_context"]["env"] = json!([["OUT_DIR", invalid]]);
+        }
+        assert!(parse_exec_request(&invalid_request).is_err());
+    }
+    for env in [
+        json!([]),
+        json!([["OUT_DIR", ""]]),
+        json!([["OUT_DIR", "/work/other"]]),
+    ] {
+        let mut invalid_request = request.clone();
+        invalid_request["dependency_context"]["env"] = env;
+        assert!(parse_exec_request(&invalid_request).is_err());
+    }
+    request["dependency_context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("generated_root");
+    assert!(
+        parse_exec_request(&request).is_err(),
+        "OUT_DIR needs an owned generated-root mapping"
+    );
 }
 
 fn dependency_dag_request() -> Value {
@@ -196,7 +282,7 @@ fn dependency_artifact_roots_preserve_first_use_mapping_when_paths_sort_differen
 }
 
 #[test]
-fn dependency_artifact_root_parser_admits_shared_output_only_under_v4() {
+fn dependency_artifact_root_parser_admits_shared_output_only_under_current_contract() {
     let mut request = dependency_dag_request();
     // Keep the exact sealed manifest and first-use prefixes. This populated
     // root now also receives the worker-owned writable output directory.
@@ -209,8 +295,10 @@ fn dependency_artifact_root_parser_admits_shared_output_only_under_v4() {
         .find(|root| root.path == context.out_dir())
         .unwrap();
     assert_eq!(shared.prefix, "dependencies/0000");
-    request["dependency_context"]["version"] = json!("dependency-exec-v3");
-    assert!(parse_exec_request(&request).is_err());
+    for version in ["dependency-exec-v3", "dependency-exec-v4"] {
+        request["dependency_context"]["version"] = json!(version);
+        assert!(parse_exec_request(&request).is_err());
+    }
 }
 
 #[test]
@@ -285,6 +373,7 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
         json!("dependency-exec-v1"),
         json!("dependency-exec-v2"),
         json!("dependency-exec-v3"),
+        json!("dependency-exec-v4"),
         json!("dependency-exec-v999"),
     ] {
         assert!(
@@ -404,6 +493,12 @@ fn retained_v2_dependency_result_remains_recoverable_after_context_upgrade() {
 #[test]
 fn retained_v3_dependency_result_remains_recoverable_after_context_upgrade() {
     assert_retained_dependency_resume("dependency-exec-v3");
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_v4_dependency_result_remains_recoverable_after_context_upgrade() {
+    assert_retained_dependency_resume("dependency-exec-v4");
 }
 
 #[cfg(unix)]

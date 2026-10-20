@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
-pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v4";
+pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v5";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -36,6 +36,7 @@ pub struct DependencyArtifactRoot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyExecContext {
     source_root: String,
+    generated_root: Option<String>,
     cwd: String,
     toolchain_root: String,
     compiler: String,
@@ -158,12 +159,48 @@ impl DependencyExecContext {
         compiler: String,
         out_dir: String,
         dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_with_generated_artifacts(
+            source_root,
+            cwd,
+            toolchain_root,
+            compiler,
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            None,
+            env,
+            runtime_cohort_sha256,
+        )
+    }
+
+    /// Add one complete captured build-script output tree at its original
+    /// OUT_DIR spelling. This imports generated compiler inputs only; the
+    /// worker never runs or replays the build script. An empty tree still
+    /// requires a separate private read-only backing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_generated_artifacts(
+        source_root: String,
+        cwd: String,
+        toolchain_root: String,
+        compiler: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
         mut loader_dirs: Vec<String>,
         mut artifact_roots: Vec<DependencyArtifactRoot>,
+        generated_root: Option<String>,
         mut env: Vec<(String, String)>,
         runtime_cohort_sha256: [u8; 32],
     ) -> Result<Self, DependencyContextError> {
-        let roots = [&source_root, &toolchain_root, &out_dir];
+        let roots: Vec<_> = [&source_root, &toolchain_root, &out_dir]
+            .into_iter()
+            .chain(generated_root.iter())
+            .collect();
         if roots.iter().any(|root| !valid_alias(root))
             || !normalized_absolute(&cwd)
             || !Path::new(&cwd).starts_with(&source_root)
@@ -177,7 +214,7 @@ impl DependencyExecContext {
                 .any(|other| overlaps(Path::new(root), Path::new(other)))
             {
                 return Err(invalid(
-                    "dependency source, toolchain and output roots overlap",
+                    "dependency source, generated, toolchain and output roots overlap",
                 ));
             }
         }
@@ -234,6 +271,9 @@ impl DependencyExecContext {
             if !valid_alias(directory)
                 || overlaps(Path::new(directory), Path::new(&source_root))
                 || overlaps(Path::new(directory), Path::new(&toolchain_root))
+                || generated_root
+                    .as_ref()
+                    .is_some_and(|root| Path::new(directory).starts_with(root))
                 || (directory != &out_dir && Path::new(directory).starts_with(&out_dir))
                 || dependency_dirs.iter().any(|dependency| {
                     directory != dependency && Path::new(directory).starts_with(dependency)
@@ -271,9 +311,20 @@ impl DependencyExecContext {
                 ));
             }
         }
+        if env
+            .iter()
+            .find(|(name, _)| name == "OUT_DIR")
+            .map(|(_, value)| value.as_str())
+            != generated_root.as_deref()
+        {
+            return Err(invalid(
+                "dependency OUT_DIR differs from its captured generated root",
+            ));
+        }
         env.sort_by(|left, right| left.0.cmp(&right.0));
         let context = Self {
             source_root,
+            generated_root,
             cwd,
             toolchain_root,
             compiler,
@@ -292,6 +343,10 @@ impl DependencyExecContext {
     /// Original immutable package/snapshot root.
     pub fn source_root(&self) -> &str {
         &self.source_root
+    }
+    /// Original captured build-script output tree, when present.
+    pub fn generated_root(&self) -> Option<&str> {
+        self.generated_root.as_deref()
     }
     /// Original compiler working directory.
     pub fn cwd(&self) -> &str {
@@ -407,6 +462,7 @@ impl DependencyExecContext {
                 .copied()
                 .chain(std::iter::once(self.out_dir.as_str()))
                 .chain(self.artifact_roots.iter().map(|root| root.path.as_str()))
+                .chain(self.generated_root())
             {
                 if let Ok(relative) = Path::new(child).strip_prefix(*alias)
                     && !relative.as_os_str().is_empty()
@@ -452,13 +508,19 @@ impl DependencyExecContext {
             Bind::new(source_backing, &self.source_root),
             Bind::new(toolchain_backing, &self.toolchain_root),
         ];
-        if !self.artifact_roots.is_empty() {
+        if !self.artifact_roots.is_empty() || self.generated_root.is_some() {
             if source_backing.file_name() != Some(std::ffi::OsStr::new("package")) {
                 return Err(invalid("dependency source is not a sealed package bundle"));
             }
             let bundle = source_backing
                 .parent()
                 .ok_or_else(|| invalid("dependency bundle parent is missing"))?;
+            if let Some(generated) = self.generated_root() {
+                // SourceOwner replaces this with its exclusive empty backing
+                // when the sealed manifest contains an empty generated tree.
+                spec.ro_binds
+                    .push(Bind::new(bundle.join("generated"), generated));
+            }
             spec.ro_binds.extend(
                 self.artifact_roots
                     .iter()
@@ -498,6 +560,7 @@ pub fn build_dependency_argv(
         context.toolchain_root.as_str(),
     ]
     .into_iter()
+    .chain(context.generated_root())
     .chain(context.empty_aliases())
     .chain(
         context
@@ -650,6 +713,164 @@ mod tests {
             [7; 32],
         )
         .unwrap()
+    }
+
+    fn generated_context(
+        generated: Option<&str>,
+        env: Vec<(String, String)>,
+        loaders: Vec<String>,
+    ) -> Result<DependencyExecContext, DependencyContextError> {
+        let base = context(Vec::new());
+        DependencyExecContext::new_with_generated_artifacts(
+            base.source_root,
+            base.cwd,
+            base.toolchain_root,
+            base.compiler,
+            base.out_dir,
+            base.dependency_dirs,
+            loaders,
+            Vec::new(),
+            generated.map(str::to_owned),
+            env,
+            [7; 32],
+        )
+    }
+
+    #[test]
+    fn generated_root_and_out_dir_environment_form_one_exact_contract() {
+        let root = "/work/build/generated/unit/out";
+        let env = vec![("OUT_DIR".to_owned(), root.to_owned())];
+        let good = generated_context(Some(root), env.clone(), Vec::new()).unwrap();
+        assert_eq!(good.generated_root(), Some(root));
+        assert_eq!(good.env(), env);
+        assert!(
+            generated_context(None, Vec::new(), Vec::new())
+                .unwrap()
+                .generated_root()
+                .is_none()
+        );
+        for (generated, env) in [
+            (Some(root), Vec::new()),
+            (None, env.clone()),
+            (Some(root), vec![("OUT_DIR".to_owned(), String::new())]),
+            (
+                Some(root),
+                vec![("OUT_DIR".to_owned(), "/elsewhere/out".to_owned())],
+            ),
+        ] {
+            assert!(generated_context(generated, env, Vec::new()).is_err());
+        }
+        for generated in [
+            "/home/user/registry/package",
+            "/home/user/registry/package/generated",
+            "/home/user/toolchains/pinned/lib",
+            "/work/build/deps",
+            "/work/build/deps/generated",
+            "/work/build/empty",
+            "/work/build",
+            "/usr/generated",
+            "/proc/generated",
+            "/__rabs/generated",
+            "/work/../generated",
+            "relative/generated",
+        ] {
+            assert!(
+                generated_context(
+                    Some(generated),
+                    vec![("OUT_DIR".to_owned(), generated.to_owned())],
+                    Vec::new()
+                )
+                .is_err(),
+                "{generated}"
+            );
+        }
+        for loader in [root, "/work/build/generated/unit/out/lib"] {
+            assert!(generated_context(Some(root), env.clone(), vec![loader.to_owned()]).is_err());
+        }
+    }
+
+    #[test]
+    fn generated_tree_is_read_only_below_its_prepared_loader_parent() {
+        let root = "/work/build/generated/unit/out";
+        let context = generated_context(
+            Some(root),
+            vec![
+                ("OUT_DIR".to_owned(), root.to_owned()),
+                ("LD_LIBRARY_PATH".to_owned(), "/work/build".to_owned()),
+            ],
+            vec!["/work/build".to_owned()],
+        )
+        .unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        context.prepare_empty_backings(empty.path()).unwrap();
+        let spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                empty.path(),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let parent = spec
+            .ro_binds
+            .iter()
+            .find(|bind| bind.visible == Path::new("/work/build"))
+            .unwrap();
+        let generated = spec
+            .ro_binds
+            .iter()
+            .find(|bind| bind.visible == Path::new(root))
+            .unwrap();
+        assert_eq!(generated.backing, Path::new("/private/bundle/generated"));
+        assert_eq!(
+            std::fs::read_dir(parent.backing.join("generated/unit/out"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(
+            spec.rw_binds
+                .iter()
+                .all(|bind| !overlaps(&bind.visible, Path::new(root)))
+        );
+        let support = HostIsolationSupport {
+            bubblewrap: Some("test".into()),
+            unprivileged_userns: true,
+            overlayfs: false,
+            cgroup_v2: false,
+            landlock: false,
+        };
+        let launch =
+            build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).unwrap();
+        let argv: Vec<_> = launch
+            .argv
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        let parent_at = argv
+            .windows(3)
+            .position(|row| row == ["--ro-bind", parent.backing.to_str().unwrap(), "/work/build"])
+            .unwrap();
+        let generated_at = argv
+            .windows(3)
+            .position(|row| row == ["--ro-bind", "/private/bundle/generated", root])
+            .unwrap();
+        assert!(parent_at < generated_at);
+        let mut missing = spec.clone();
+        missing
+            .ro_binds
+            .retain(|bind| bind.visible != Path::new(root));
+        assert!(
+            build_dependency_argv(&context, &missing, &support, context.compiler(), &[]).is_err()
+        );
+        let mut extra = spec;
+        extra
+            .ro_binds
+            .push(Bind::new("/private/foreign", format!("{root}/injected")));
+        assert!(
+            build_dependency_argv(&context, &extra, &support, context.compiler(), &[]).is_err()
+        );
     }
 
     #[test]

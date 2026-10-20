@@ -157,7 +157,7 @@ while running and time.monotonic() < end and root.exists():
                                "RABS_DEPENDENCY_WORKER_SPKI_SHA256")
                 if all(name in os.environ for name in worker_keys):
                     status["remote_dependency"] = {
-                        "remote_protocol": 1, "dependency_context": "dependency-exec-v4",
+        "remote_protocol": 1, "dependency_context": "dependency-exec-v5",
                         "listen": os.environ[worker_keys[0]],
                         "worker_id": os.environ[worker_keys[1]],
                         "worker_spki_sha256": os.environ[worker_keys[2]],
@@ -1293,7 +1293,7 @@ class ProtocolTests(unittest.TestCase):
             "RABS_DEPENDENCY_WORKER_SPKI_SHA256": "ab" * 32,
         }
         self.assertEqual(rabs.requested_dependency_worker(settings), {
-            "remote_protocol": 1, "dependency_context": "dependency-exec-v4",
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v5",
             "listen": "[::1]:9443", "worker_id": "compiler 雪",
             "worker_spki_sha256": "ab" * 32,
         })
@@ -1319,7 +1319,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_dependency_worker_status_requires_typed_supported_capability(self):
         expected = {
-            "remote_protocol": 1, "dependency_context": "dependency-exec-v4",
+            "remote_protocol": 1, "dependency_context": "dependency-exec-v5",
             "listen": "127.0.0.1:9443", "worker_id": "compiler",
             "worker_spki_sha256": "ab" * 32,
         }
@@ -1330,7 +1330,8 @@ class ProtocolTests(unittest.TestCase):
                        dict(expected, dependency_context="dependency-exec-v1"),
                        dict(expected, dependency_context="dependency-exec-v2"),
                        dict(expected, dependency_context="dependency-exec-v3"),
-                       dict(expected, dependency_context="dependency-exec-v5")]:
+                       dict(expected, dependency_context="dependency-exec-v4"),
+                       dict(expected, dependency_context="dependency-exec-v6")]:
             with self.subTest(actual=actual), self.assertRaises(rabs.RemoteConfigurationMismatch):
                 rabs.require_dependency_worker({"remote_dependency": actual}, expected)
 

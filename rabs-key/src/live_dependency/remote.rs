@@ -3,8 +3,9 @@
 //! This class has distinct isolation and platform identity from unsandboxed
 //! local dependency execution. The worker retains subscriber source, cwd,
 //! toolchain and output spellings, mounts the complete captured package,
-//! toolchain and exact dependency candidate directories read-only, and supplies
-//! private empty backings only for directories with an empty inventory.
+//! toolchain, completed build-script OUT_DIR and exact dependency candidate
+//! directories read-only, and supplies private empty backings only for
+//! directories with an empty inventory.
 //! A remote result cannot be offered as an edge-local execution.
 //!
 //! The runtime digest is observed by rabs_sandbox::runtime_cohort on both hosts
@@ -35,18 +36,21 @@ pub const REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str = "rabs.remote-leaf.isolation
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
-pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v4: \
+pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v5: \
     Linux worker namespace; subscriber paths preserved; complete regular-file \
     dependency source, exact toolchain and complete crate-candidate inventories \
     mounted read-only; explicit rmeta and complete rlib extern bytes retained; \
-    no bare extern, proc-macro, generated or native inputs; metadata and dep-info \
+    complete generated OUT_DIR tree retained read-only at its original path, \
+    including an empty tree, with exact captured Cargo stdout and rustc-env \
+    directives bound; build-script execution is not cached; no bare extern, \
+    proc-macro or native inputs; metadata and dep-info \
     only; shared input/output roots use exact read-only file mounts above private \
     writable output backing, with owned input placeholders verified and excluded \
     from exact output capture; declared outputs cannot alias inputs; empty inventories \
     receive private empty backings; outputs private until complete authenticated \
     delivery; network denied; compiler environment preserved by dependency-env-v2 \
     except process-local jobserver descriptors; all loader paths within the exact \
-    toolchain or independently observed dependency-exec-v4 directories without \
+    toolchain or independently observed dependency-exec-v5 directories without \
     dynamic libraries, including Cargo output parents; host ELF runtime, CPU and \
     filesystem cohort observed and independently matched before execution; \
     dep-info closure and tracked-environment checks required before coordinator-only \
@@ -59,7 +63,7 @@ pub enum RemoteDependencyRefusal {
     Local(LiveRefusal),
     /// Only --emit=dep-info,metadata is currently executed remotely.
     MetadataOnly,
-    /// Generated/build-script inputs are outside the admitted dependency closure.
+    /// Generated inputs do not have a coherent, disjoint original OUT_DIR binding.
     GeneratedInputs,
     /// An extern is unbound, executable, or lacks a complete candidate identity.
     ExternInputs,
@@ -127,7 +131,7 @@ pub fn remote_loader_search_paths(
 
 /// Exact private-empty loader aliases required by the original environment.
 ///
-/// Sorted and deduplicated for the dependency-exec-v4 worker context. This
+/// Sorted and deduplicated for the dependency-exec-v5 worker context. This
 /// includes output/dependency entries and Cargo's output parent. No directory
 /// is silently assumed empty: rabs_sandbox::loader_directories must observe
 /// every returned root, even if its Rust .rlib/.rmeta inventory was empty.
@@ -199,6 +203,10 @@ fn loader_paths(
                     .any(|reserved| overlaps(entry, reserved))
                     || within(entry, &plan.out_dir)
                     || plan.dependency_dirs.iter().any(|root| within(entry, root))
+                    || plan
+                        .generated_root
+                        .as_deref()
+                        .is_some_and(|root| entry == root || within(entry, root))
                 {
                     return Err(RemoteDependencyRefusal::LoaderEnvironment(
                         "private loader directory overlaps inputs, runtime or an output descendant"
@@ -240,10 +248,7 @@ pub fn remote_dependency_shape(
         )
         .into());
     }
-    if plan.generated_root.is_some() || plan.execution_env.iter().any(|(name, _)| name == "OUT_DIR")
-    {
-        return Err(RemoteDependencyRefusal::GeneratedInputs);
-    }
+    validate_generated_root(plan, toolchain_root)?;
     remote_extern_facts(plan, directories)?;
     if !plan.invocation.native_libs.is_empty()
         || plan
@@ -268,6 +273,46 @@ pub fn remote_dependency_shape(
         );
     }
     remote_loader_search_paths(plan, toolchain_root)?;
+    Ok(())
+}
+
+/// The generated tree is an input, never an output-placement alias. Check the
+/// original environment even when an independent local key projection removed
+/// OUT_DIR from keyed_env: the worker must still receive its exact real path.
+fn validate_generated_root(
+    plan: &DependencyActionPlan,
+    toolchain_root: &str,
+) -> Result<(), RemoteDependencyRefusal> {
+    let mut presented = plan
+        .execution_env
+        .iter()
+        .filter(|(name, _)| name == "OUT_DIR")
+        .map(|(_, value)| value.as_str());
+    let observed = presented.next();
+    if presented.next().is_some() || observed != plan.generated_root.as_deref() {
+        return Err(RemoteDependencyRefusal::GeneratedInputs);
+    }
+    let Some(root) = plan.generated_root.as_deref() else {
+        return Ok(());
+    };
+    let overlaps = |other: &str| root == other || within(root, other) || within(other, root);
+    if !plain_path(root)
+        || root.contains(&plan.out_dir)
+        || [
+            plan.source_root.as_str(),
+            plan.out_dir.as_str(),
+            toolchain_root,
+        ]
+        .into_iter()
+        .chain(plan.dependency_dirs.iter().map(String::as_str))
+        .chain([
+            "/__rabs", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys",
+            "/run",
+        ])
+        .any(overlaps)
+    {
+        return Err(RemoteDependencyRefusal::GeneratedInputs);
+    }
     Ok(())
 }
 
@@ -330,16 +375,22 @@ fn remote_extern_facts(
 /// receive individual read-only file mounts over owned placeholders; only
 /// declared new outputs are captured. Empty inventories receive fresh private
 /// worker directories.
+/// Generated source members use the existing generated input manifest root.
+/// Their complete tree and exact Cargo build-script stdout are keyed by the
+/// ordinary dependency validator, including rustc-env agreement. The worker
+/// sees the captured tree at the original OUT_DIR, never the mutable caller tree.
 /// Revalidate all original observations through dispatch and installation.
 ///
 /// # Errors
 /// A typed refusal for unsupported invocation shape, incomplete closure facts
 /// or a runtime identity with another domain.
+#[allow(clippy::too_many_arguments)]
 pub fn remote_dependency_key(
     plan: &DependencyActionPlan,
     toolchain: &ToolchainFacts,
     directories: &[DependencyDirectoryFact],
     inputs: &ActionInputManifest,
+    build_script_output: Option<&[u8]>,
     toolchain_root: &str,
     retained_toolchain_sha256: &[u8; 32],
     runtime: &TypedDigest,
@@ -349,7 +400,14 @@ pub fn remote_dependency_key(
     }
     remote_dependency_shape(plan, directories, toolchain_root)?;
     let externs = remote_extern_facts(plan, directories)?;
-    let mut key = live_dependency_key(plan, toolchain, &externs, directories, None, inputs)?;
+    let mut key = live_dependency_key(
+        plan,
+        toolchain,
+        &externs,
+        directories,
+        build_script_output,
+        inputs,
+    )?;
     let mut retained_toolchain = CanonicalEncoder::new();
     retained_toolchain
         .str(key.descriptor.toolchain.domain)
@@ -491,6 +549,7 @@ mod tests {
             &toolchain(),
             &directories(plan),
             &inputs(plan),
+            None,
             TOOLCHAIN,
             &[41; 32],
             &compute(RUNTIME_COHORT_DOMAIN, runtime_bytes),
@@ -563,6 +622,7 @@ mod tests {
                 facts,
                 &directories(&plan),
                 &inputs(&plan),
+                None,
                 TOOLCHAIN,
                 retained,
                 &runtime,
@@ -647,6 +707,7 @@ mod tests {
                 &toolchain(),
                 directories,
                 &inputs(&plan),
+                None,
                 TOOLCHAIN,
                 &[41; 32],
                 &runtime,
@@ -732,6 +793,7 @@ mod tests {
             &toolchain(),
             directories,
             &inputs(plan),
+            None,
             TOOLCHAIN,
             &[41; 32],
             &compute(RUNTIME_COHORT_DOMAIN, b"same-runtime"),
@@ -873,8 +935,289 @@ mod tests {
         );
     }
 
+    fn generated_plan(root: &str) -> DependencyActionPlan {
+        let mut plan = plan(OUTPUT);
+        plan.generated_root = Some(root.to_owned());
+        for env in [&mut plan.execution_env, &mut plan.keyed_env] {
+            env.push(("OUT_DIR".into(), root.to_owned()));
+            env.push(("BUILD_LABEL".into(), "pinned".into()));
+            env.sort();
+        }
+        plan
+    }
+
+    fn generated_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let mut inputs = inputs(plan);
+        inputs.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(
+                plan.generated_input_virtual_path("nested/generated.rs")
+                    .into_bytes(),
+            ),
+            object: ObjectId(compute("rabs.test.v1", b"pub const VALUE: u32 = 17;")),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        inputs
+    }
+
+    fn generated_key(
+        plan: &DependencyActionPlan,
+        inputs: &ActionInputManifest,
+        record: Option<&[u8]>,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_dependency_key(
+            plan,
+            &toolchain(),
+            &directories(plan),
+            inputs,
+            record,
+            TOOLCHAIN,
+            &[41; 32],
+            &compute(RUNTIME_COHORT_DOMAIN, b"same-runtime"),
+        )
+    }
+
     #[test]
-    fn link_extern_generated_and_invented_runtime_inputs_are_refused() {
+    fn generated_metadata_binds_complete_files_cargo_record_and_original_path() {
+        let plan = generated_plan("/work/target/debug/build/leaf/out");
+        let inputs = generated_inputs(&plan);
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        let remote = generated_key(&plan, &inputs, Some(record)).unwrap();
+        let local = live_dependency_key(
+            &plan,
+            &toolchain(),
+            &[],
+            &directories(&plan),
+            Some(record),
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(
+            remote.descriptor.action_inputs,
+            local.descriptor.action_inputs
+        );
+        assert_eq!(remote.descriptor.environment, local.descriptor.environment);
+        assert_eq!(
+            remote.descriptor.dependency_inputs,
+            local.descriptor.dependency_inputs
+        );
+        assert_eq!(
+            remote.descriptor.negative_dependencies,
+            local.descriptor.negative_dependencies
+        );
+        assert_ne!(remote.action_key, local.action_key);
+
+        let mut changed = inputs.clone();
+        changed.inputs.last_mut().unwrap().object =
+            ObjectId(compute("rabs.test.v1", b"pub const VALUE: u32 = 23;"));
+        assert_ne!(
+            remote.action_key,
+            generated_key(&plan, &changed, Some(record))
+                .unwrap()
+                .action_key
+        );
+
+        let mut added = inputs.clone();
+        let mut member = added.inputs.last().unwrap().clone();
+        member.virtual_path =
+            RawBytes::new(plan.generated_input_virtual_path("new.rs").into_bytes());
+        added.inputs.push(member);
+        assert_ne!(
+            remote.action_key,
+            generated_key(&plan, &added, Some(record))
+                .unwrap()
+                .action_key
+        );
+
+        let other_record =
+            b"cargo::rustc-env=BUILD_LABEL=pinned\ncargo::rerun-if-env-changed=CONFIG\n";
+        assert_ne!(
+            remote.action_key,
+            generated_key(&plan, &inputs, Some(other_record))
+                .unwrap()
+                .action_key
+        );
+        let relocated = generated_plan("/other/target/debug/build/leaf/out");
+        let relocated = generated_key(&relocated, &inputs, Some(record)).unwrap();
+        assert_eq!(
+            remote.descriptor.action_inputs,
+            relocated.descriptor.action_inputs
+        );
+        assert_ne!(
+            remote.descriptor.environment,
+            relocated.descriptor.environment
+        );
+        assert_ne!(
+            remote.descriptor.negative_dependencies,
+            relocated.descriptor.negative_dependencies
+        );
+        assert_ne!(remote.action_key, relocated.action_key);
+    }
+
+    #[test]
+    fn empty_generated_tree_is_distinct_and_still_requires_the_cargo_record() {
+        let generated = generated_plan("/work/build/leaf/out");
+        let inputs = inputs(&generated);
+        let empty = generated_key(&generated, &inputs, Some(b"")).unwrap();
+        assert_ne!(
+            empty.action_key,
+            key(&plan(OUTPUT), b"same-runtime").action_key
+        );
+        assert!(matches!(
+            generated_key(&generated, &inputs, None),
+            Err(RemoteDependencyRefusal::Local(LiveRefusal::Facts(reason)))
+                if reason.contains("missing build-script output record")
+        ));
+        assert!(matches!(
+            generated_key(&plan(OUTPUT), &inputs, Some(b"")),
+            Err(RemoteDependencyRefusal::Local(LiveRefusal::Facts(reason)))
+                if reason.contains("unexpected build-script output record")
+        ));
+        let populated =
+            generated_key(&generated, &generated_inputs(&generated), Some(b"")).unwrap();
+        assert_ne!(empty.action_key, populated.action_key);
+    }
+
+    #[test]
+    fn generated_rustc_env_and_read_closure_are_not_bypassed_remotely() {
+        let mut plan = generated_plan("/work/build/leaf/out");
+        let inputs = generated_inputs(&plan);
+        assert_eq!(
+            generated_key(
+                &plan,
+                &inputs,
+                Some(b"cargo::rustc-env=BUILD_LABEL=stale\n")
+            ),
+            Err(RemoteDependencyRefusal::Local(LiveRefusal::RefusedEnv(
+                "BUILD_LABEL".into()
+            )))
+        );
+        let dep_info = format!(
+            "{OUTPUT}/leaf.d: {PACKAGE}/src/lib.rs /work/build/leaf/out/nested/generated.rs\n# env-dep:OUT_DIR=/work/build/leaf/out\n"
+        );
+        let captured = |path: &str| {
+            inputs
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        assert!(
+            super::super::dep_info_closure_violation(&plan, dep_info.as_bytes(), captured)
+                .is_none()
+        );
+        let unobserved = dep_info.replace("nested/generated.rs", "nested/unobserved.rs");
+        assert!(
+            super::super::dep_info_closure_violation(&plan, unobserved.as_bytes(), captured)
+                .is_some()
+        );
+        // The existing empty-OUT_DIR optimization leaves a tracked-read veto
+        // in the plan. Remote key composition must not restore that variable
+        // silently or discard the veto when the environment is replayed.
+        plan.keyed_env.retain(|(name, _)| name != "OUT_DIR");
+        generated_key(&plan, &inputs, Some(b"")).unwrap();
+        assert_eq!(
+            super::super::dep_info_closure_violation(&plan, dep_info.as_bytes(), captured),
+            Some("tracked read of unkeyed variable OUT_DIR".into())
+        );
+    }
+
+    #[test]
+    fn generated_binding_refuses_missing_duplicate_mismatched_or_overlapping_roots() {
+        let generated = generated_plan("/work/build/leaf/out");
+        remote_dependency_shape(&generated, &directories(&generated), TOOLCHAIN).unwrap();
+        let mut missing = generated.clone();
+        missing.execution_env.retain(|(name, _)| name != "OUT_DIR");
+        let mut duplicate = generated.clone();
+        duplicate
+            .execution_env
+            .push(("OUT_DIR".into(), "/work/build/leaf/out".into()));
+        let mut mismatched = generated.clone();
+        mismatched.generated_root = Some("/other/generated".into());
+        let mut undeclared = generated.clone();
+        undeclared.generated_root = None;
+        for plan in [missing, duplicate, mismatched, undeclared] {
+            assert_eq!(
+                remote_dependency_shape(&plan, &directories(&plan), TOOLCHAIN),
+                Err(RemoteDependencyRefusal::GeneratedInputs)
+            );
+        }
+        for root in [
+            PACKAGE,
+            OUTPUT,
+            "/work/target/debug",
+            "/toolchain/generated",
+            "/usr/generated",
+            "/proc",
+            "/work/../generated",
+            "relative",
+        ] {
+            let plan = generated_plan(root);
+            assert_eq!(
+                remote_dependency_shape(&plan, &directories(&plan), TOOLCHAIN),
+                Err(RemoteDependencyRefusal::GeneratedInputs),
+                "{root}"
+            );
+        }
+        let (mut plan, facts) = dag_fixture(OUTPUT);
+        plan.generated_root = Some("/work/inputs/z-first/nested".into());
+        plan.execution_env
+            .push(("OUT_DIR".into(), "/work/inputs/z-first/nested".into()));
+        assert_eq!(
+            remote_dependency_shape(&plan, &facts, TOOLCHAIN),
+            Err(RemoteDependencyRefusal::GeneratedInputs)
+        );
+    }
+
+    #[test]
+    fn generated_tree_cannot_silently_become_a_loader_directory() {
+        let mut plan = generated_plan("/work/target/debug/build/leaf/out");
+        for loader in [
+            "/work/target/debug/build/leaf/out",
+            "/work/target/debug/build/leaf/out/lib",
+        ] {
+            plan.execution_env
+                .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            plan.execution_env
+                .push(("LD_LIBRARY_PATH".into(), loader.into()));
+            assert!(matches!(
+                remote_dependency_shape(&plan, &directories(&plan), TOOLCHAIN),
+                Err(RemoteDependencyRefusal::LoaderEnvironment(_))
+            ));
+        }
+        plan.execution_env
+            .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+        plan.execution_env.push((
+            "LD_LIBRARY_PATH".into(),
+            "/work/target/debug:/toolchain/lib".into(),
+        ));
+        assert_eq!(
+            remote_empty_loader_directories(&plan, TOOLCHAIN).unwrap(),
+            ["/work/target/debug"]
+        );
+        remote_dependency_shape(&plan, &directories(&plan), TOOLCHAIN).unwrap();
+    }
+
+    #[test]
+    fn generated_inputs_do_not_admit_archive_codegen_or_undeclared_reads() {
+        let mut plan = generated_plan("/work/build/leaf/out");
+        let mut inputs = generated_inputs(&plan);
+        plan.invocation.emit.push("link".into());
+        assert_eq!(
+            generated_key(&plan, &inputs, Some(b"")),
+            Err(RemoteDependencyRefusal::MetadataOnly)
+        );
+        plan.invocation.emit.pop();
+        inputs.inputs.last_mut().unwrap().virtual_path =
+            RawBytes::new(b"/usr/lib/unobserved".to_vec());
+        assert!(matches!(
+            generated_key(&plan, &inputs, Some(b"")),
+            Err(RemoteDependencyRefusal::Local(LiveRefusal::Facts(_)))
+        ));
+    }
+
+    #[test]
+    fn link_extern_incoherent_generated_and_invented_runtime_inputs_are_refused() {
         let runtime = compute(RUNTIME_COHORT_DOMAIN, b"runtime");
         let call = |plan: &DependencyActionPlan, runtime: &TypedDigest| {
             remote_dependency_key(
@@ -882,6 +1225,7 @@ mod tests {
                 &toolchain(),
                 &directories(plan),
                 &inputs(plan),
+                None,
                 TOOLCHAIN,
                 &[41; 32],
                 runtime,

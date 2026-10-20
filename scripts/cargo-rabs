@@ -32,7 +32,7 @@ DEFAULT_STARTUP_MS = 5000
 MAX_STARTUP_MS = 30000
 OWNER_RECEIPT = "daemon-owner.json"
 MAX_OWNER_RECEIPT = 2048
-DEPENDENCY_CONTEXT = "dependency-exec-v4"
+DEPENDENCY_CONTEXT = "dependency-exec-v5"
 DEPENDENCY_WORKER_KEYS = (
     "RABS_DEPENDENCY_WORKER_LISTEN",
     "RABS_DEPENDENCY_WORKER_ID",
@@ -94,7 +94,7 @@ Set all of RABS_DEPENDENCY_WORKER_LISTEN, RABS_DEPENDENCY_WORKER_ID and
 RABS_DEPENDENCY_WORKER_SPKI_SHA256 to select the authenticated per-dependency
 worker lane, together with the existing RABS_COORD_TLS_* credentials for a
 new daemon. The connected daemon must advertise that exact worker, listener,
-pin and dependency-exec-v4 capability. A different, local-only or older daemon
+pin and dependency-exec-v5 capability. A different, local-only or older daemon
 produces a setup error and an explicit stock-Cargo fallback; use
 --rabs-require-daemon to refuse setup instead. Settings never reconfigure an
 attached daemon. A matching configuration does not promise a connected worker

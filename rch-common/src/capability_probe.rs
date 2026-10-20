@@ -1568,9 +1568,24 @@ mod tests {
         let home = root.path().join("it's a home");
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
-        // A symlink to an existing binary, not a freshly written executable, so
-        // no exec can race the write. `echo --version` prints a version line.
-        std::os::unix::fs::symlink("/bin/echo", bin.join("rch-wkr")).unwrap();
+        // A fake rch-wkr written by a child process, so this multithreaded
+        // test binary never holds a write descriptor that a sibling test's
+        // fork could inherit (exec would then fail with ETXTBSY). A symlink to
+        // a system binary is no substitute: a multicall coreutils (uutils,
+        // busybox) dispatches on the link's name and does not act as `echo`.
+        let fake = bin.join("rch-wkr");
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&fake)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            &mut writer.stdin.take().unwrap(),
+            b"#!/bin/sh\ncase \"$1\" in\n  --version) echo 'rch-wkr 9.9.9-probe' ;;\n  --protocol-version) echo 7 ;;\n  *) exit 2 ;;\nesac\n",
+        )
+        .unwrap();
+        assert!(writer.wait().unwrap().success(), "{}", fake.display());
         let not_a_binary = root.path().join("dir/rch-wkr");
         std::fs::create_dir_all(&not_a_binary).unwrap();
         let mut spec = ProbeSpec::new("probe", not_a_binary.to_str().unwrap());
@@ -1595,7 +1610,8 @@ mod tests {
         assert_eq!(found.rch_wkr_path.as_deref(), expected.to_str());
         let worker = found.worker.expect("the binary under $HOME ran");
         assert_eq!(worker.rch_wkr_path, expected.to_str().unwrap());
-        assert!(!worker.version.is_empty());
+        assert_eq!(worker.version, "rch-wkr 9.9.9-probe");
+        assert_eq!(worker.protocol_version, 7);
 
         let empty_home = root.path().join("empty home");
         std::fs::create_dir(&empty_home).unwrap();

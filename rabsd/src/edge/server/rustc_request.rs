@@ -39,7 +39,7 @@ use crate::coord::live_dependency::{
     CompletionReport, InstallResult, LiveDecision, LiveDependencyLane, LiveDependencyRequest,
     LocalAttempt, MAX_TRANSCRIPT_BYTES, PendingServe,
 };
-use crate::edge::live_facts::{FactsMiss, LiveFacts};
+use crate::edge::live_facts::{FactsMiss, GENERATED_ROOT, LiveFacts};
 use rabs_cas::metadata_store::digest_key;
 use rabs_key::build_script_directives::bind_rustc_environment;
 use rabs_key::live_dependency::{
@@ -50,6 +50,7 @@ use rabs_protocol::input_evidence::{
 };
 use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::ObjectId;
+use rabs_sandbox::generated_source::GeneratedSource;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
@@ -468,16 +469,36 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     };
     // Older wrappers keep the existing local protocol. A remote descriptor
     // can only be selected alongside this distinct accepted-execution path.
-    let remote = if request.get("remote_protocol").and_then(Value::as_u64) == Some(1)
-        && package.build_script_output.is_none()
-    {
+    let remote = if request.get("remote_protocol").and_then(Value::as_u64) == Some(1) {
         live.remote.as_ref().and_then(|remote| {
+            if plan.generated_root.is_some() {
+                let generated_paths = package
+                    .generated_files
+                    .iter()
+                    .map(|(path, _, _)| path.clone())
+                    .collect::<Vec<_>>();
+                // Use the transfer's exact projection before offering remote
+                // execution. Unsupported generated layouts retain the local
+                // key and protocol; no remote acceptance has happened yet.
+                if let Err(reason) = GeneratedSource::from_snapshot(
+                    Arc::clone(&package.snapshot),
+                    GENERATED_ROOT,
+                    &generated_paths,
+                ) {
+                    log(
+                        "remote-ineligible",
+                        &[("crate", unit), ("reason", &reason.to_string())],
+                    );
+                    return None;
+                }
+            }
             match remote.key(
                 &plan,
                 &toolchain,
                 &toolchain_guard,
                 &dependencies.directories,
                 &inputs,
+                package.build_script_output.as_deref(),
                 &parsed.argv,
             ) {
                 Ok((remote_key, invocation)) => {

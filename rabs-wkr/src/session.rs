@@ -166,8 +166,9 @@ pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandConte
 
 /// Decode the separately negotiated full dependency context. Unknown fields,
 /// duplicate environment names and absent versus malformed values never fall
-/// back to the canonical execution defaults. The v3 artifact closure is always
-/// explicit, including an empty array for a dependency leaf.
+/// back to the canonical execution defaults. The artifact closure is always
+/// explicit, including an empty array for a dependency leaf. V5 optionally binds
+/// one captured generated tree to the exact OUT_DIR environment value.
 pub fn parse_dependency_context(
     request: &serde_json::Value,
 ) -> Result<Option<DependencyExecContext>, String> {
@@ -196,6 +197,7 @@ pub fn parse_dependency_context(
             !REQUIRED.contains(&field.as_str())
                 && field != "dependency_dirs"
                 && field != "loader_dirs"
+                && field != "generated_root"
         })
         || object.get("version").and_then(serde_json::Value::as_str)
             != Some(DEPENDENCY_CONTEXT_VERSION)
@@ -250,6 +252,15 @@ pub fn parse_dependency_context(
     };
     let dirs = directories("dependency_dirs")?;
     let loader_dirs = directories("loader_dirs")?;
+    let generated_root = match object.get("generated_root") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or("dependency generated_root must be a string or null")?
+                .to_owned(),
+        ),
+    };
     let artifact_roots = object
         .get("artifact_roots")
         .and_then(serde_json::Value::as_array)
@@ -292,7 +303,7 @@ pub fn parse_dependency_context(
         *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
-    DependencyExecContext::new_with_artifacts(
+    DependencyExecContext::new_with_generated_artifacts(
         text("source_root")?,
         text("cwd")?,
         text("toolchain_root")?,
@@ -301,6 +312,7 @@ pub fn parse_dependency_context(
         dirs,
         loader_dirs,
         artifact_roots,
+        generated_root,
         env,
         runtime_cohort,
     )
@@ -680,6 +692,7 @@ fn execute_canonical_inner(
     // drains and output capture are complete. A name alone cannot authorize
     // excluding a file from a shared Cargo input/output directory.
     let mut dependency_inputs = None;
+    let mut generated_inputs = None;
     let prepared_spec = (|| -> Result<_, String> {
         if let Some(context) = &request.dependency_context {
             let source = source.ok_or("dependency execution lacks its source owner")?;
@@ -723,6 +736,9 @@ fn execute_canonical_inner(
                     execution_home,
                 )
                 .map_err(|error| error.to_string())?;
+            generated_inputs = source
+                .prepare_dependency_generated(request.request_id, context, &mut spec)
+                .map_err(|error| format!("generated input preparation: {error}"))?;
             let inputs = source
                 .prepare_dependency_output(request.request_id, context, &mut spec)
                 .map_err(|error| format!("dependency input mountpoints: {error}"))?;
@@ -844,6 +860,14 @@ fn execute_canonical_inner(
         )));
         return exec_error(request.request_id);
     }
+    if let Some(inputs) = &generated_inputs
+        && let Err(error) = inputs.verify()
+    {
+        let _ = control.retain_outputs(Err(format!(
+            "generated inputs changed before execution: {error}"
+        )));
+        return exec_error(request.request_id);
+    }
     // Verification may have spent the remaining lease or execution budget.
     // Do not start a compiler after that final input-preparation boundary.
     if control.reason().is_some() {
@@ -936,6 +960,12 @@ fn execute_canonical_inner(
                 let capture = artifacts
                     .capture_with_dependency_inputs(dependency_inputs.as_ref(), || {
                         control.reason().is_some()
+                    })
+                    .and_then(|captured| {
+                        if let Some(inputs) = &generated_inputs {
+                            inputs.verify()?;
+                        }
+                        Ok(captured)
                     });
                 // Retain failure as evidence. A zero compiler exit is NOT a
                 // successful completion if its requested artifact set is missing.

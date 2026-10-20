@@ -456,6 +456,37 @@ an older daemon refuses the request instead of silently ignoring requirements.
 A successful named probe establishes cached tool presence. It does not bind the
 executable bytes, compiler version or SDK inventory used by a particular build.
 
+**Exact Node and Bun versions.** `--require-tool` (alias `--require-toolchain`)
+also accepts `node@VERSION` and `bun@VERSION`, matched against the version each
+worker reports in its capabilities (`rch workers capabilities --refresh`):
+
+```bash
+rch exec --require-toolchain bun@1.3.2 -- bun test
+rch exec --job --require-toolchain node@22.11.0 -- npm test
+```
+
+```toml
+[jobs]
+required_tools = ["node@22.11.0"]   # job mode only, like named tools
+```
+
+The version must be a complete `MAJOR.MINOR.PATCH`; an optional prerelease or
+build suffix must match exactly, and the `v` that `node --version` prints is
+ignored. Ranges, partial versions (`22`, `22.11`) and aliases (`lts`) are
+refused, and a worker that reports no version, or another one, is not
+admitted. Like named tools, the check happens before reservation, makes the
+run strict remote, and only filters: it never reorders workers. It compares
+the version the worker's capability probe found. It does not install runtimes,
+and it does not override a version manager (nvm, fnm, a login profile) that
+picks a different binary when the job runs.
+
+There is no `rust@VERSION`: a worker's default `rustc` says nothing about the
+compiler a job selects. Pin Rust exactly with the toolchain instead, for
+example `channel = "1.90.0"` in `rust-toolchain.toml` (or `RUSTUP_TOOLCHAIN`,
+or `cargo +1.90.0`). RCH sends that toolchain to the worker, only selects a
+worker on which `rustup run <toolchain> rustc --version` and
+`cargo --version` succeed, and runs the build under that toolchain.
+
 `rch admit [--job] [--require-tool NAME]... -- <command>` preflights the same
 decision read-only — it syncs nothing and reserves nothing. Without `--job` the
 preflight consults the compilation classifier, so a fuzz script answers

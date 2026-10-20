@@ -297,6 +297,53 @@ async fn recover_default_with_paths(
         .unwrap_or(Err(AutoStartError::Timeout(config.auto_start_timeout_secs)))
 }
 
+/// The default-socket candidates of this process's environment, `requested`
+/// first.
+fn environment_candidates(requested: &Path, uid: u32) -> Vec<PathBuf> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    candidates_for_context(
+        requested,
+        runtime_dir.as_deref(),
+        dirs::cache_dir().as_deref(),
+        uid,
+        cfg!(target_os = "linux"),
+    )
+}
+
+fn discovery_state_dir(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/rch-autostart-{uid}"))
+}
+
+/// Default-derived sockets other than `requested` where a daemon started in
+/// another environment may listen: the endpoint recorded by an earlier
+/// recovery, then the candidates [`recover_daemon`] probes. Diagnostics only
+/// (`rch doctor`, #69): nothing is created, and an unsafe endpoint record is
+/// skipped rather than trusted.
+pub(crate) fn alternate_default_sockets(requested: &Path, uid: u32) -> Vec<PathBuf> {
+    alternate_sockets(
+        requested,
+        environment_candidates(requested, uid),
+        &discovery_state_dir(uid),
+        uid,
+    )
+}
+
+fn alternate_sockets(
+    requested: &Path,
+    candidates: Vec<PathBuf>,
+    state_dir: &Path,
+    uid: u32,
+) -> Vec<PathBuf> {
+    let candidates = candidates_with_record(&candidates, state_dir, uid).unwrap_or(candidates);
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate != requested)
+        .collect()
+}
+
 pub(super) async fn recover_daemon(
     config: &SelfHealingConfig,
     requested: &Path,
@@ -331,19 +378,8 @@ pub(super) async fn recover_daemon(
         return Ok(requested.to_path_buf());
     }
     let uid = effective_uid().map_err(AutoStartError::Io)?;
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
-    let cache_dir = dirs::cache_dir();
-    let candidates = candidates_for_context(
-        requested,
-        runtime_dir.as_deref(),
-        cache_dir.as_deref(),
-        uid,
-        cfg!(target_os = "linux"),
-    );
-    let state_dir = PathBuf::from(format!("/tmp/rch-autostart-{uid}"));
+    let candidates = environment_candidates(requested, uid);
+    let state_dir = discovery_state_dir(uid);
     let resolved =
         recover_default_with_paths(config, requested, &candidates, &state_dir, uid, launch).await?;
     if resolved != requested {
@@ -834,5 +870,64 @@ mod tests {
         )
         .unwrap();
         assert!(candidates_with_record(&[], &other_state, uid).is_err());
+    }
+
+    /// #69: `rch doctor` looks for the daemon on every other default-derived
+    /// socket: the recorded endpoint first, never the socket it already
+    /// tried, and an unsafe record is skipped instead of failing the check.
+    #[tokio::test]
+    async fn alternate_sockets_lead_with_the_record_and_skip_the_requested_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let uid = effective_uid().unwrap();
+        let requested = PathBuf::from("/tmp/rch-doctor-requested.sock");
+        let candidates = vec![
+            requested.clone(),
+            PathBuf::from("/run/user/4242/rch.sock"),
+            PathBuf::from("/tmp/rch.sock"),
+        ];
+
+        let absent = temp.path().join("absent-state");
+        assert_eq!(
+            alternate_sockets(&requested, candidates.clone(), &absent, uid),
+            [
+                PathBuf::from("/run/user/4242/rch.sock"),
+                PathBuf::from("/tmp/rch.sock")
+            ]
+        );
+
+        let state = temp.path().join("state");
+        prepare_state_dir(&state, uid).unwrap();
+        remember_endpoint(&state, Path::new("/home/someone/.cache/rch/rch.sock")).unwrap();
+        assert_eq!(
+            alternate_sockets(&requested, candidates.clone(), &state, uid),
+            [
+                PathBuf::from("/home/someone/.cache/rch/rch.sock"),
+                PathBuf::from("/run/user/4242/rch.sock"),
+                PathBuf::from("/tmp/rch.sock")
+            ]
+        );
+
+        // The record names the socket already tried: still not repeated.
+        remember_endpoint(&state, &requested).unwrap();
+        assert_eq!(
+            alternate_sockets(&requested, candidates.clone(), &state, uid),
+            [
+                PathBuf::from("/run/user/4242/rch.sock"),
+                PathBuf::from("/tmp/rch.sock")
+            ]
+        );
+
+        std::fs::set_permissions(
+            state.join("endpoint"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(
+            alternate_sockets(&requested, candidates, &state, uid),
+            [
+                PathBuf::from("/run/user/4242/rch.sock"),
+                PathBuf::from("/tmp/rch.sock")
+            ]
+        );
     }
 }

@@ -20,7 +20,7 @@ use crate::coord::remote_dependency_transport::{
 use crate::coord::secure_worker_delivery::OperationCancellation;
 use crate::coord::source_delivery::SourceUpload;
 use crate::coord::worker_delivery::{Delivery, toolchain_identity_value};
-use crate::edge::live_facts::PACKAGE_ROOT;
+use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT};
 use rabs_key::live_dependency::remote::{
     remote_dependency_key, remote_dependency_shape, remote_empty_loader_directories,
 };
@@ -109,7 +109,12 @@ impl RemoteValidation {
             .image
             .verify_source_unchanged(request.toolchain.sysroot(), || false)
             .map_err(|error| format!("complete original toolchain changed: {error}"))?;
-        request.verify_toolchain()
+        request.verify_toolchain()?;
+        // Both newly produced remote results and remote cache hits call this
+        // after synchronous materialization. Checking only runtime/toolchain
+        // state would allow changed source, OUT_DIR or Cargo run records to
+        // authorize a compiler skip under the earlier input generation.
+        verify_package_generation(&request.package, &request.plan)
     }
 }
 
@@ -190,6 +195,7 @@ impl RemoteDependencies {
         guard: &ToolchainGuard,
         directories: &[DependencyDirectoryFact],
         inputs: &ActionInputManifest,
+        build_script_output: Option<&[u8]>,
         argv: &[String],
     ) -> Result<(LiveDependencyKey, RemoteInvocation), String> {
         if argv.first().map(String::as_str) != Some(plan.compiler.as_str()) {
@@ -221,6 +227,7 @@ impl RemoteDependencies {
             toolchain,
             directories,
             inputs,
+            build_script_output,
             visible_root,
             &retained.image.identity().sha256,
             &runtime,
@@ -240,7 +247,7 @@ impl RemoteDependencies {
                 prefix: format!("dependencies/{index:04}"),
             })
             .collect();
-        let context = DependencyExecContext::new_with_artifacts(
+        let context = DependencyExecContext::new_with_generated_artifacts(
             plan.source_root.clone(),
             plan.cwd.clone(),
             visible_root.to_owned(),
@@ -249,6 +256,7 @@ impl RemoteDependencies {
             plan.dependency_dirs.clone(),
             loader_witness.directories().to_vec(),
             artifact_roots,
+            plan.generated_root.clone(),
             plan.execution_env.clone(),
             runtime_bytes,
         )
@@ -461,13 +469,30 @@ impl PendingRemote {
         // checks every byte digest and both inventory fences; the upload then
         // owns these bytes without reopening the caller's mutable target tree.
         let dependency_artifacts = request.dependencies.retained_artifacts().map_err(settled)?;
-        let upload = SourceUpload::from_snapshot(
+        let mut upload = SourceUpload::from_snapshot(
             Arc::clone(&request.package.snapshot),
             PACKAGE_ROOT,
             &paths,
         )
-        .and_then(|upload| upload.with_dependency_artifacts(dependency_artifacts))
         .map_err(|error| settled(error.to_string()))?;
+        if request.plan.generated_root.is_some() {
+            let generated_paths = request
+                .package
+                .generated_files
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect::<Vec<_>>();
+            upload = upload
+                .with_generated_snapshot(
+                    Arc::clone(&request.package.snapshot),
+                    GENERATED_ROOT,
+                    &generated_paths,
+                )
+                .map_err(|error| settled(format!("prepare generated inputs: {error}")))?;
+        }
+        let upload = upload
+            .with_dependency_artifacts(dependency_artifacts)
+            .map_err(|error| settled(error.to_string()))?;
         verify_request(&request).map_err(settled)?;
         // The worker persists a request-id high-water mark. The admission owner
         // durably allocates before sending; random ids fail on ordinary reuse.
@@ -639,6 +664,7 @@ fn context_value(context: &DependencyExecContext) -> Value {
     json!({
         "version":DEPENDENCY_CONTEXT_VERSION,
         "source_root":context.source_root(), "cwd":context.cwd(),
+        "generated_root":context.generated_root(),
         "toolchain_root":context.toolchain_root(), "compiler":context.compiler(),
         "out_dir":context.out_dir(), "dependency_dirs":context.dependency_dirs(),
         "loader_dirs":context.loader_dirs(),
@@ -689,11 +715,18 @@ impl Drop for AdmittedRemote {
 
 fn verify_request(request: &LiveDependencyRequest) -> Result<(), String> {
     request.verify_toolchain()?;
-    request
-        .package
-        .verify_unchanged(Path::new(&request.plan.source_root))?;
-    request.package.verify_generated_disjoint(&request.plan)?;
+    verify_package_generation(&request.package, &request.plan)?;
     request.dependencies.verify_unchanged()
+}
+
+fn verify_package_generation(
+    package: &super::PackageFacts,
+    plan: &DependencyActionPlan,
+) -> Result<(), String> {
+    package
+        .verify_unchanged(Path::new(&plan.source_root))
+        .and_then(|()| package.verify_generated_disjoint(plan))
+        .map_err(|reason| format!("captured dependency inputs changed: {reason}"))
 }
 
 /// The plan has already rejected ambiguous loader entries. Keep their exact
@@ -844,5 +877,223 @@ impl PendingRemoteInstall {
             Ok(other) => InstallResult::Declined(format!("remote install: {other:?}")),
             Err(error) => InstallResult::Fault(format!("remote install: {error}")),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod installed_input_generation_tests {
+    use super::super::{object_id, output_role};
+    use super::*;
+    use crate::edge::live_facts::{LiveFacts, PackageFacts};
+    use crate::janitor::store::{LiveCas, mount_and_reconcile};
+    use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+    use rabs_cas::materialization::{
+        MaterializationMode, PlannedActionOutput, materialize_action_outputs_prepared,
+    };
+    use rabs_key::live_dependency::{LiveRustcRequest, plan_dependency_action};
+    use rabs_key::output_declarations::OutputClass;
+    use rabs_protocol::raw_bytes::RawBytes;
+
+    // Real capture and CAS materialization exercise the completion boundary.
+    // Fixture artifact bytes do not claim compiler, daemon or TLS execution.
+    struct MaterializedInputs {
+        _directory: tempfile::TempDir,
+        plan: DependencyActionPlan,
+        package: Arc<PackageFacts>,
+        cas: LiveCas,
+        outputs: Vec<PlannedActionOutput>,
+    }
+
+    impl MaterializedInputs {
+        fn new(populated: bool) -> Self {
+            let directory = crate::test_util::private_tempdir();
+            let cargo = directory.path().join("cargo");
+            let source = cargo.join("registry/src/install-index/consumer-1.0.0");
+            let output = directory.path().join("target/debug/deps");
+            let generated = directory
+                .path()
+                .join("target/debug/build/consumer-unit/out");
+            for root in [&source, &output, &generated] {
+                std::fs::create_dir_all(root).unwrap();
+            }
+            std::fs::write(source.join("lib.rs"), b"pub const VALUE: u32 = 17;").unwrap();
+            if populated {
+                std::fs::write(
+                    generated.join("value.rs"),
+                    b"pub const GENERATED: u32 = 17;",
+                )
+                .unwrap();
+            }
+            let unit = generated.parent().unwrap();
+            std::fs::write(unit.join("output"), b"cargo::rustc-cfg=generated\n").unwrap();
+            std::fs::write(unit.join("root-output"), generated.to_str().unwrap()).unwrap();
+            let argv = vec![
+                "/toolchain/bin/rustc".into(),
+                source.join("lib.rs").to_str().unwrap().into(),
+                "--crate-name=consumer".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--error-format=json".into(),
+                format!("--out-dir={}", output.display()),
+            ];
+            let env = vec![
+                ("CARGO_HOME".into(), cargo.to_str().unwrap().into()),
+                ("CARGO_MANIFEST_DIR".into(), source.to_str().unwrap().into()),
+                ("CARGO_PKG_NAME".into(), "consumer".into()),
+                ("OUT_DIR".into(), generated.to_str().unwrap().into()),
+            ];
+            let plan = plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: source.to_str().unwrap(),
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let package = LiveFacts::new()
+                .package(&source, plan.source_kind, Some(&generated))
+                .unwrap();
+            let cas = mount_and_reconcile(&directory.path().join("cas")).unwrap();
+            let outputs = plan
+                .outputs
+                .declarations
+                .iter()
+                .map(|declaration| {
+                    let bytes = if declaration.class == OutputClass::DepInfo {
+                        b"libconsumer.rmeta: lib.rs\n".as_slice()
+                    } else {
+                        b"verified replacement metadata".as_slice()
+                    };
+                    let object = object_id(bytes).unwrap();
+                    let mut store = cas.store().lock().unwrap();
+                    put_if_absent(
+                        cas.layout(),
+                        &mut *store,
+                        &object,
+                        &mut &bytes[..],
+                        PutLimits::default(),
+                        DurabilityPolicy::FULL,
+                    )
+                    .unwrap();
+                    PlannedActionOutput {
+                        role: output_role(declaration.class),
+                        virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
+                        object,
+                        destination: output.join(&declaration.virtual_path),
+                    }
+                })
+                .collect();
+            Self {
+                _directory: directory,
+                plan,
+                package,
+                cas,
+                outputs,
+            }
+        }
+
+        fn materialize(&self, during_tail: impl Fn()) -> Result<(), String> {
+            verify_package_generation(&self.package, &self.plan)?;
+            let mut store = self.cas.store().lock().unwrap();
+            let receipt = materialize_action_outputs_prepared(
+                &mut *store,
+                &self.outputs,
+                MaterializationMode::PrivateCopy,
+                std::time::SystemTime::now(),
+                &|output, _| {
+                    if output.role == OutputRole::DepInfo {
+                        assert_eq!(
+                            std::fs::read(Path::new(&self.plan.out_dir).join("libconsumer.rmeta"))
+                                .unwrap(),
+                            b"verified replacement metadata"
+                        );
+                        during_tail();
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| format!("materialization failed: {error:?}"))?;
+            assert_eq!(receipt.installed.len(), 2);
+            drop(store);
+            // The production RemoteValidation uses this same final check for
+            // both produced-result and cache-hit installation completion.
+            verify_package_generation(&self.package, &self.plan)
+        }
+    }
+
+    #[test]
+    fn declared_materialization_preserves_populated_and_empty_generated_inputs() {
+        for populated in [false, true] {
+            let fixture = MaterializedInputs::new(populated);
+            assert!(fixture.materialize(|| {}).is_ok());
+            assert_eq!(
+                fixture.package.generated_files.len(),
+                usize::from(populated)
+            );
+        }
+    }
+
+    #[test]
+    fn changes_during_materialization_refuse_the_original_source_generation() {
+        for mutation in [
+            "source",
+            "generated",
+            "new-generated",
+            "stdout",
+            "root-output",
+        ] {
+            let fixture = MaterializedInputs::new(mutation != "new-generated");
+            let generated = Path::new(fixture.plan.generated_root.as_ref().unwrap());
+            let result = fixture.materialize(|| {
+                let (path, bytes): (PathBuf, &[u8]) = match mutation {
+                    "source" => (
+                        Path::new(&fixture.plan.source_root).join("lib.rs"),
+                        b"changed source",
+                    ),
+                    "generated" => (generated.join("value.rs"), b"changed generated input"),
+                    "new-generated" => (
+                        generated.join("introduced.rs"),
+                        b"new formerly absent input",
+                    ),
+                    "stdout" => (
+                        generated.parent().unwrap().join("output"),
+                        b"cargo::rustc-cfg=changed\n",
+                    ),
+                    "root-output" => (
+                        generated.parent().unwrap().join("root-output"),
+                        b"/another/generated/root",
+                    ),
+                    _ => unreachable!(),
+                };
+                std::fs::write(path, bytes).unwrap();
+            });
+            assert!(
+                result
+                    .unwrap_err()
+                    .starts_with("captured dependency inputs changed:"),
+                "changed input generation was accepted: {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_materialization_output_alias_cannot_reuse_unchanged_generated_bytes() {
+        use std::os::unix::fs::symlink;
+        let fixture = MaterializedInputs::new(true);
+        fixture.materialize(|| {}).unwrap();
+        let generated = Path::new(fixture.plan.generated_root.as_ref().unwrap());
+        std::fs::rename(
+            &fixture.plan.out_dir,
+            fixture._directory.path().join("retained-output"),
+        )
+        .unwrap();
+        symlink(generated, &fixture.plan.out_dir).unwrap();
+        fixture
+            .package
+            .verify_unchanged(Path::new(&fixture.plan.source_root))
+            .unwrap();
+        assert!(verify_package_generation(&fixture.package, &fixture.plan).is_err());
     }
 }
