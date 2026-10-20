@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use rabs_sandbox::process_context::CommandContext;
 use rabs_wkr::jobserver::{replace_with_worker_local, worker_makeflags};
-use rabs_wkr::session::{CanonicalExecRequest, execute_canonical};
+use rabs_wkr::session::{CanonicalExecRequest, ExecutionResources, execute_canonical};
 
 /// The RABS fleet shape: unprivileged userns + bubblewrap. On any other
 /// host SKIP loudly rather than fake a pass.
@@ -149,6 +149,9 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let cargo_home = tempfile::tempdir().expect("cargo-home tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
+    let host_budget_root = tempfile::tempdir().expect("host budget tempdir");
+    let host_budget = rabs_wkr::host_budget::HostBudget::open(host_budget_root.path(), 6)
+        .expect("fixed shared host capacity");
 
     // The action writes EVERY coordination var it can see into its own
     // writable workspace — the only honest way to assert what the
@@ -177,7 +180,10 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             &request,
             cargo_home.path(),
             home.path(),
-            6,
+            ExecutionResources {
+                slots: 6,
+                host_budget: Some(&host_budget),
+            },
             &workspace.path().join("spills"),
         );
 
@@ -233,6 +239,79 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             "jobserver setup does not edit source"
         );
     }
+
+    // Exercise the actual executor's cancellation/drain release boundary. The
+    // child ignores TERM and owns a descendant; the follow-up needs the ENTIRE
+    // host grant, so neither a leaked lease nor an unfinished two-credit owner
+    // can be hidden by spare host capacity.
+    use rabs_wkr::execution::{ExecutionControl, StopReason};
+    use rabs_wkr::session::execute_canonical_controlled;
+    use std::time::{Duration, Instant};
+    let control = ExecutionControl::new(Duration::from_secs(15)).unwrap();
+    let mut request = CanonicalExecRequest {
+        request_id: 424_243,
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "trap '' TERM; printf ready > /__rabs/workspace/host-budget-started; sleep 30 & wait"
+                .into(),
+        ],
+        toolchain_backing: toolchain.path().display().to_string(),
+        toolchain_identity: None,
+        workspace_backing: workspace.path().display().to_string(),
+        dependency_context: None,
+        jobserver_grant: Some(2),
+        command_context: CommandContext::default(),
+    };
+    let resources = ExecutionResources {
+        slots: 6,
+        host_budget: Some(&host_budget),
+    };
+    let result = std::thread::scope(|scope| {
+        let execution = scope.spawn(|| {
+            execute_canonical_controlled(
+                &request,
+                cargo_home.path(),
+                home.path(),
+                resources,
+                &workspace.path().join("spills"),
+                &control,
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while !workspace.path().join("host-budget-started").is_file() {
+            assert!(
+                !execution.is_finished(),
+                "worker refused before real child admission"
+            );
+            assert!(Instant::now() < until, "real worker child did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(control.cancel(StopReason::Cancelled));
+        execution.join().unwrap()
+    });
+    assert!(
+        result.executed,
+        "cancellation must finish the managed process wait: {result:?}"
+    );
+    assert_eq!(result.exit_code, StopReason::Cancelled.exit_code());
+    assert_eq!(result.residual_group_members, 0);
+    request.request_id += 1;
+    request.args = vec!["-c".into(), "test \"$NUM_JOBS\" = 6".into()];
+    request.jobserver_grant = Some(6);
+    let after = execute_canonical(
+        &request,
+        cargo_home.path(),
+        home.path(),
+        resources,
+        &workspace.path().join("spills"),
+    );
+    assert!(
+        after.executed,
+        "clean cancellation must return the whole host grant: {after:?}"
+    );
+    assert_eq!(after.exit_code, 0);
+    assert_eq!(after.residual_group_members, 0);
 }
 
 #[test]
@@ -267,7 +346,7 @@ fn jobserver_setup_failure_refuses_execution() {
         &request,
         cargo_home.path(),
         &obstruction,
-        6,
+        ExecutionResources::new(6),
         &workspace.path().join("spills"),
     );
     assert_eq!(result.request_id, request.request_id);
@@ -347,7 +426,7 @@ fn main() {
         &request,
         cargo_home.path(),
         home.path(),
-        4,
+        ExecutionResources::new(4),
         spills.path(),
         &control,
     );
@@ -616,7 +695,7 @@ pub const INCLUDED: &str = include_str!("message.txt");
                     &request,
                     cargo_home.path(),
                     home.path(),
-                    4,
+                    ExecutionResources::new(4),
                     spills.path(),
                     &control,
                     &source_owner,
@@ -972,7 +1051,7 @@ pub const SOURCE: &str = file!();
                     &request,
                     cargo_home.path(),
                     home.path(),
-                    4,
+                    ExecutionResources::new(4),
                     spills.path(),
                     &control,
                     &source_owner,

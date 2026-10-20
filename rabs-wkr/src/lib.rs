@@ -18,6 +18,7 @@
 
 pub mod artifacts;
 pub mod execution;
+pub mod host_budget;
 pub mod jobserver;
 pub mod output;
 pub mod request_journal;

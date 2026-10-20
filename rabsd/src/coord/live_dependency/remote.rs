@@ -716,6 +716,9 @@ impl PendingRemote {
         let wire = json!({
             "kind":"canonical-exec", "request_id":request_id,
             "program":request.plan.compiler, "args":invocation.argv[1..],
+            // One standalone metadata compiler consumes one action grant. Its
+            // original keyed NUM_JOBS remains exact in dependency_context.
+            "jobserver_grant":1,
             "source_manifest":upload.wire_manifest(),
             "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
             "toolchain_identity":toolchain_identity_value(retained.image.identity()),

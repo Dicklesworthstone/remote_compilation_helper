@@ -29,12 +29,14 @@ use rabs_wkr::execution::{
     DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, OUTPUT_PREVIEW_VERSION,
     StopReason, output_preview_reply,
 };
+use rabs_wkr::host_budget::HostBudget;
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{
-    CanonicalExecRequest, execute_canonical_controlled, execute_uploaded_canonical_controlled,
-    parse_command_context, parse_dependency_context, probe_capability, sample_pressure,
+    CanonicalExecRequest, ExecutionResources, execute_canonical_controlled,
+    execute_uploaded_canonical_controlled, parse_command_context, parse_dependency_context,
+    probe_capability, sample_pressure,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceOwner};
@@ -497,6 +499,8 @@ fn main() {
                  Fleet transport requires RABS_WORKER_TLS_CA, RABS_WORKER_TLS_CERT,\n\
                  RABS_WORKER_TLS_KEY and RABS_WORKER_TLS_SERVER_NAME.\n\
                  Request IDs must increase across restarts; request-status reconciles outcomes.\n\
+                 Optional shared-host admission: set RABS_WORKER_HOST_BUDGET_DIR and\n\
+                 RABS_WORKER_HOST_SLOTS together on every worker in one local capacity domain.\n\
                  RABS_WORKER_STATE_DIR selects a private durable directory (never reset it to retry work)."
             );
             return;
@@ -534,6 +538,13 @@ fn main() {
         eprintln!("rabs-wkr: --coordinator <host:port> is required");
         std::process::exit(2);
     };
+    let host_budget = match HostBudget::from_environment() {
+        Ok(budget) => budget,
+        Err(error) => {
+            eprintln!("rabs-wkr: shared host budget configuration: {error}");
+            std::process::exit(1);
+        }
+    };
     // Persist ownership before any runtime task or network advertisement. An IO
     // error never falls back to a fresh temporary journal that forgets history.
     let journal = match worker_state_path(&worker_id, &coordinator)
@@ -552,7 +563,13 @@ fn main() {
         report.canonical_namespace,
         report.slots
     );
-    std::process::exit(reconnect::run(coordinator, report, once, journal));
+    std::process::exit(reconnect::run(
+        coordinator,
+        report,
+        once,
+        journal,
+        host_budget,
+    ));
 }
 
 /// Partial input belongs to the session, not to a disposable read future.
@@ -1542,6 +1559,7 @@ async fn session_loop(
     once: bool,
     journal: &mut WorkerJournal,
     admitted_at: &mut Option<std::time::Instant>,
+    host_budget: Option<std::sync::Arc<HostBudget>>,
 ) -> Result<(), String> {
     let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
     cx.trace("rabs-wkr connected to coordinator");
@@ -1724,6 +1742,7 @@ async fn session_loop(
             let home = home.clone();
             let spills = spills.clone();
             let slots = report.slots;
+            let host_budget = host_budget.clone();
             let id = request.request_id;
             let retention = retain_result
                 .then(|| RetentionTarget::from_admitted(&journal_root, id, recipient.clone()))
@@ -1735,12 +1754,16 @@ async fn session_loop(
                     control.request_output_capture();
                 }
                 let _toolchain_owner = toolchain;
+                let resources = ExecutionResources {
+                    slots,
+                    host_budget: host_budget.as_deref(),
+                };
                 match source.as_ref() {
                     Some(source) => execute_uploaded_canonical_controlled(
                         &request,
                         &cargo_home,
                         &home,
-                        slots,
+                        resources,
                         &spills,
                         &control,
                         source,
@@ -1749,7 +1772,7 @@ async fn session_loop(
                         &request,
                         &cargo_home,
                         &home,
-                        slots,
+                        resources,
                         &spills,
                         &control,
                     ),
