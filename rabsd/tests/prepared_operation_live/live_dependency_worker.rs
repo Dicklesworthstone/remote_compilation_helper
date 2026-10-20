@@ -448,31 +448,34 @@ pub const INCLUDED: &str = include_str!("message.txt");
 #[ignore = "requires Linux isolation, matching RABS_TEST_WORKER_BIN and RABS_TEST_WRAP_BIN; runs actual wrapper/daemon/worker/rustc"]
 fn live_wrapper_remote_leaf_matches_stock_and_samples_replay() {
     let mut live = LiveFixture::new();
-    let warmup_deadline = Instant::now() + Duration::from_secs(1200);
-    let first = loop {
-        let run = live.compile(FLAVOR);
-        if run.remote_key().is_some() {
-            break run;
-        }
-        for event in &run.events {
-            if event["kind"] == "rabsd-live-dependency" && event["decision"] == "remote-ineligible"
-            {
-                assert!(
-                    event["reason"]
-                        .as_str()
-                        .is_some_and(|reason| reason.contains("warming")),
-                    "the real Cargo-shaped leaf is outside remote execution: {event}"
-                );
-            }
-        }
-        assert!(
-            Instant::now() < warmup_deadline,
-            "retained remote toolchain never warmed: {:?}",
-            run.events
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    };
+    // The fresh daemon must retain the complete compiler dataset and finish
+    // this first wrapper invocation on the actual authenticated worker.
+    let first = live.compile(FLAVOR);
     let key = first.assert_remote(None).to_owned();
+    let pending = first
+        .events
+        .iter()
+        .position(|event| {
+            event["kind"] == "rabsd-live-dependency"
+                && event["decision"] == "preparing"
+                && event["reason"] == "remote-toolchain-pending"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "cold compiler preparation was not awaited: {:?}",
+                first.events
+            )
+        });
+    let executed = first
+        .events
+        .iter()
+        .position(|event| event["kind"] == "rabsd-remote-dependency-executed")
+        .expect("assert_remote required a real remote result");
+    assert!(
+        pending < executed,
+        "the first wrapper must await preparation before remote execution: {:?}",
+        first.events
+    );
     let first_receipt = live.worker_receipt();
     let mut last_request_id = first_receipt["request_id"].as_u64().unwrap();
     // Enrollment requires the normal same-worker verification observations.
@@ -604,6 +607,7 @@ fn cargo_dependency_warming(events: &[Value]) -> bool {
                         "toolchain-facts-pending"
                             | "package-facts-pending"
                             | "dependency-facts-pending"
+                            | "remote-toolchain-pending"
                     )
                 ))
     })
@@ -626,12 +630,14 @@ fn cargo_dependency_events_bind_terminal_records_to_each_crate() {
     let middle = cargo_dependency_events(&events, CARGO_MIDDLE);
     assert_eq!(middle, [events[1].clone(), events[3].clone()]);
     assert!(cargo_dependency_events(&events, CARGO_TOP).is_empty());
-    let preparing = json!({"decision":"preparing", "reason":"dependency-facts-pending"});
-    assert!(cargo_dependency_warming(std::slice::from_ref(&preparing)));
-    assert!(!cargo_dependency_warming(&[
-        preparing,
-        json!({"decision":"remote-ineligible", "reason":"REMOTE_DEP_NATIVE_INPUTS"}),
-    ]));
+    for reason in ["dependency-facts-pending", "remote-toolchain-pending"] {
+        let preparing = json!({"decision":"preparing", "reason":reason});
+        assert!(cargo_dependency_warming(std::slice::from_ref(&preparing)));
+        assert!(!cargo_dependency_warming(&[
+            preparing,
+            json!({"decision":"remote-ineligible", "reason":"REMOTE_DEP_NATIVE_INPUTS"}),
+        ]));
+    }
     assert!(!cargo_dependency_warming(&[
         json!({"decision":"preparing", "reason":"unknown-facts"}),
     ]));
@@ -906,7 +912,7 @@ impl LiveFixture {
 /// Actual Cargo chooses argv, cwd, jobserver and loader environment. The graph
 /// is leaf -> middle -> top -> consumer; top has no direct leaf dependency but
 /// must resolve leaf's RemoteToken through middle's metadata. This fixture
-/// supports shared or disjoint input/output directories under dependency-exec-v4,
+/// supports shared or disjoint input/output directories under dependency-exec-v5,
 /// never treats local fallback as evidence of a working remote DAG, and performs
 /// no argv rewriting.
 #[test]

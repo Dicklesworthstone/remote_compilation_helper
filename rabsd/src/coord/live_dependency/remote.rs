@@ -187,6 +187,8 @@ impl RemoteDependencies {
 
     /// Measure the edge host and bind the separate remote isolation contract.
     /// A refusal leaves the caller's original local key untouched.
+    /// `None` means the owned complete-toolchain capture is still preparing;
+    /// a waiting caller can retry without acquiring execution authority.
     #[allow(clippy::too_many_arguments)]
     pub fn key(
         &self,
@@ -197,7 +199,7 @@ impl RemoteDependencies {
         inputs: &ActionInputManifest,
         build_script_output: Option<&[u8]>,
         argv: &[String],
-    ) -> Result<(LiveDependencyKey, RemoteInvocation), String> {
+    ) -> Result<Option<(LiveDependencyKey, RemoteInvocation)>, String> {
         if argv.first().map(String::as_str) != Some(plan.compiler.as_str()) {
             return Err("remote argv does not name the observed compiler".into());
         }
@@ -210,7 +212,9 @@ impl RemoteDependencies {
             .map_err(|error| error.to_string())?;
         let loader_witness = observe_loader_directories(&empty_loader, || false)
             .map_err(|error| format!("original loader directories: {error}"))?;
-        let retained = self.retained_toolchain(guard, Path::new(&plan.compiler))?;
+        let Some(retained) = self.retained_toolchain(guard, Path::new(&plan.compiler))? else {
+            return Ok(None);
+        };
         // Probe the compiler's complete original lookup order. The worker may
         // omit independently witnessed private aliases from its physical probe,
         // but the source observation must preserve loader selection and errors.
@@ -269,7 +273,7 @@ impl RemoteDependencies {
             .image
             .verify_source_unchanged(root, || false)
             .map_err(|error| format!("original toolchain changed during keying: {error}"))?;
-        Ok((
+        Ok(Some((
             key,
             RemoteInvocation {
                 argv: argv.to_vec(),
@@ -280,14 +284,14 @@ impl RemoteDependencies {
                     loader: loader_witness,
                 },
             },
-        ))
+        )))
     }
 
     fn retained_toolchain(
         &self,
         guard: &ToolchainGuard,
         compiler: &Path,
-    ) -> Result<Arc<RetainedToolchain>, String> {
+    ) -> Result<Option<Arc<RetainedToolchain>>, String> {
         guard.verify_unchanged(compiler)?;
         let mut memo = self
             .toolchain
@@ -299,7 +303,7 @@ impl RemoteDependencies {
                 .as_ref()
                 .is_some_and(std::thread::JoinHandle::is_finished)
             {
-                return Err("complete remote toolchain capture is warming".into());
+                return Ok(None);
             }
             let handle = warmup
                 .handle
@@ -319,11 +323,12 @@ impl RemoteDependencies {
                 .verify_source_unchanged(guard.sysroot(), || false)
                 .is_ok()
         {
-            return Ok(Arc::clone(retained));
+            return Ok(Some(Arc::clone(retained)));
         }
         // A warmup never blocks the hot decision lane on a multi-GB copy.
-        // This request uses the ordinary local lane; the next request can use
-        // the fully retained image after the owned copy and checks finish.
+        // A waiting wrapper retries this same invocation after preparation;
+        // nonwaiting callers retain the ordinary local lane. Neither acquires
+        // a remote action key or execution authority from the pending copy.
         let state = self.state.clone();
         let guard = guard.clone();
         let compiler = compiler.to_path_buf();
@@ -360,7 +365,7 @@ impl RemoteDependencies {
             cancellation,
             handle: Some(handle),
         }));
-        Err("complete remote toolchain capture is warming".into())
+        Ok(None)
     }
 }
 

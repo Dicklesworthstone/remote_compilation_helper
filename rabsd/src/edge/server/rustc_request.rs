@@ -24,8 +24,9 @@
 //!   identical request on this connection under its own bounded backoff.
 //!   Each retry reobserves inputs and rechecks every serving/sampling gate;
 //! - `{"kind":"rustc-decision","decision":"preparing",…}` — also only
-//!   with `wait_for_inflight: true`: shared input facts are warming. There
-//!   is no action identity or execution/install ownership yet. Retrying
+//!   with `wait_for_inflight: true`: shared input facts or the complete
+//!   remote toolchain image are warming. There is no action identity or
+//!   execution/install ownership yet. Retrying
 //!   allows the FIRST cold build to populate the cache instead of requiring
 //!   throwaway builds. Preparation and keyed waits share the wrapper's one
 //!   deadline and retry quota. Older wrappers can decline before any writes;
@@ -146,6 +147,7 @@ enum PendingFacts {
     Toolchain,
     Package,
     Dependencies,
+    RemoteToolchain,
 }
 
 impl PendingFacts {
@@ -154,6 +156,7 @@ impl PendingFacts {
             Self::Toolchain => "toolchain-facts-pending",
             Self::Package => "package-facts-pending",
             Self::Dependencies => "dependency-facts-pending",
+            Self::RemoteToolchain => "remote-toolchain-pending",
         }
     }
 }
@@ -469,6 +472,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     };
     // Older wrappers keep the existing local protocol. A remote descriptor
     // can only be selected alongside this distinct accepted-execution path.
+    let mut remote_toolchain_pending = false;
     let remote = if request.get("remote_protocol").and_then(Value::as_u64) == Some(1) {
         live.remote.as_ref().and_then(|remote| {
             if plan.generated_root.is_some() {
@@ -501,9 +505,22 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 package.build_script_output.as_deref(),
                 &parsed.argv,
             ) {
-                Ok((remote_key, invocation)) => {
+                Ok(Some((remote_key, invocation))) => {
                     key = remote_key;
                     Some((Arc::clone(remote), invocation))
+                }
+                Ok(None) => {
+                    remote_toolchain_pending = true;
+                    if !may_wait {
+                        log(
+                            "remote-ineligible",
+                            &[
+                                ("crate", unit),
+                                ("reason", "complete remote toolchain capture is warming"),
+                            ],
+                        );
+                    }
+                    None
                 }
                 Err(reason) => {
                     log("remote-ineligible", &[("crate", unit), ("reason", &reason)]);
@@ -514,6 +531,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     } else {
         None
     };
+    if remote_toolchain_pending && may_wait {
+        // No lane has been consulted and the original local key was not
+        // replaced. Retrying reobserves all inputs before remote admission.
+        return preparing(unit, PendingFacts::RemoteToolchain);
+    }
     let key_text = digest_key(&key.action_key);
     let admitted = LiveDependencyRequest {
         key,
@@ -940,6 +962,7 @@ mod tests {
             (PendingFacts::Toolchain, "toolchain-facts-pending"),
             (PendingFacts::Package, "package-facts-pending"),
             (PendingFacts::Dependencies, "dependency-facts-pending"),
+            (PendingFacts::RemoteToolchain, "remote-toolchain-pending"),
         ] {
             let Decided::Reply(reply) = preparing("leaf", facts) else {
                 panic!("preparation must release the request lane without ownership");

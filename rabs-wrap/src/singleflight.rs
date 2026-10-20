@@ -227,6 +227,7 @@ fn wait_for(reply: &Value) -> Option<WaitFor<'_>> {
                         "toolchain-facts-pending"
                             | "package-facts-pending"
                             | "dependency-facts-pending"
+                            | "remote-toolchain-pending"
                     )
                 ) =>
         {

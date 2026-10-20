@@ -125,9 +125,14 @@ CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
 ```
 
 The first eligible request starts a complete toolchain capture in the
-background and may compile locally while that copy warms. Later requests use
-the retained compiler and sysroot only while their complete source witness
-still matches. Worker execution also requires the measured kernel, CPU,
+background. A waiting wrapper receives `remote-toolchain-pending` and retries
+the same invocation within its existing preparation deadline; it can then
+execute remotely on that first build. Preparation grants no execution or
+installation authority. Callers that disable waiting, exhaust their wait
+budget or encounter a capture failure retain the existing local path before
+remote acceptance. Later requests use the retained compiler and sysroot only
+while their complete source witness still matches. Worker execution also
+requires the measured kernel, CPU,
 external loader libraries and filesystem profile to match the coordinator.
 Both hosts need the supported Linux isolation environment; the worker needs
 working bubblewrap and user namespaces.
@@ -218,7 +223,9 @@ The fixture starts the real wrapper, daemon, TLS worker and rustc. It compares
 every result's metadata, dep-info and diagnostics with stock rustc under the
 same Cargo-shaped invocation, uses durable worker receipts to distinguish
 remote production from cache replay, and checks later sampling and an
-environment-driven key change.
+environment-driven key change. Its first wrapper invocation must wait for the
+cold toolchain capture and finish on the worker; repeated local warmup builds
+do not satisfy the fixture.
 
 A second fixture lets actual Cargo choose the compiler arguments, working
 directory, jobserver and loader environment. It builds an entirely offline

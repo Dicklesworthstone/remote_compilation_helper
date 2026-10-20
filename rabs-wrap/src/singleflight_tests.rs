@@ -65,6 +65,7 @@ fn cold_facts_join_a_keyed_flight_then_one_admitted_execution() {
             PREPARING.to_owned(),
             PREPARING.replace("toolchain-facts-pending", "package-facts-pending"),
             PREPARING.replace("toolchain-facts-pending", "dependency-facts-pending"),
+            PREPARING.replace("toolchain-facts-pending", "remote-toolchain-pending"),
             WAIT.to_owned(),
             EXECUTE.to_owned(),
         ],
@@ -77,7 +78,64 @@ fn cold_facts_join_a_keyed_flight_then_one_admitted_execution() {
         }
         _ => panic!("only the final keyed decision may admit execution"),
     }
-    assert_eq!(requests, vec!["original bytes\n"; 4]);
+    assert_eq!(requests, vec!["original bytes\n"; 5]);
+}
+
+#[test]
+fn cold_remote_toolchain_retries_before_accepting_private_execution_and_installation() {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let mut peer = BufReader::new(peer);
+        peer.get_mut()
+            .write_all(
+                PREPARING
+                    .replace("toolchain-facts-pending", "remote-toolchain-pending")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let mut line = String::new();
+        peer.read_line(&mut line).unwrap();
+        assert_eq!(line, "original bytes\n", "preparation grants no execution");
+        peer.get_mut()
+            .write_all(
+                b"{\"kind\":\"rustc-decision\",\"decision\":\"remote\",\"action_key\":\"key\",\"remote_protocol\":1,\"capture_protocol\":1,\"compiler_skip_authorized\":false}\n",
+            )
+            .unwrap();
+        line.clear();
+        peer.read_line(&mut line).unwrap();
+        assert_eq!(
+            line,
+            "{\"kind\":\"rustc-remote-accept\",\"remote_protocol\":1,\"action_key\":\"key\"}\n"
+        );
+        peer.get_mut()
+            .write_all(
+                b"{\"kind\":\"rustc-decision\",\"decision\":\"remote-ready\",\"action_key\":\"key\",\"remote_protocol\":1,\"capture_protocol\":1,\"capture\":\"current-output\",\"compiler_skip_authorized\":false}\n",
+            )
+            .unwrap();
+        line.clear();
+        peer.read_line(&mut line).unwrap();
+        assert_eq!(
+            line, "{\"kind\":\"rustc-accept\",\"capture\":\"current-output\"}\n",
+            "private execution must not authorize installation"
+        );
+        peer.get_mut()
+            .write_all(
+                b"{\"kind\":\"rustc-decision\",\"decision\":\"remote-complete\",\"action_key\":\"key\",\"remote_protocol\":1,\"compiler_skip_authorized\":true,\"writer_returned\":true,\"stderr_hex\":\"6f6b0a\"}\n",
+            )
+            .unwrap();
+    });
+    let outcome = read_with_policy(
+        reader(stream),
+        "original bytes",
+        Duration::from_secs(1),
+        true,
+        policy(3),
+        None,
+        &|| true,
+    );
+    daemon.join().unwrap();
+    assert!(matches!(outcome, Ok(Live::Served(ref transcript)) if transcript == b"ok\n"));
 }
 
 #[test]
