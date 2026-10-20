@@ -673,15 +673,53 @@ impl WorkerSelector {
         self.build_history = Some(history);
     }
 
+    /// Use the same guarded job allowance in placement and authoritative
+    /// admission. A declaration is a minimum, not permission to underfund a
+    /// known large build. Generic worker-list previews have no build budget.
+    pub(crate) fn build_disk_budget(
+        &self,
+        request: &SelectionRequest,
+    ) -> Option<rch_common::BuildDiskBudget> {
+        let cold = request
+            .command
+            .as_deref()
+            .and_then(crate::headroom::cold_build_footprint_gib);
+        if cold.is_none() && request.disk_headroom_gib == 0 && !request.job_mode {
+            return None;
+        }
+        let estimate = request
+            .command
+            .as_deref()
+            .and_then(|command| {
+                self.build_history
+                    .as_ref()?
+                    .learned_footprint_gib(&request.project, command)
+            })
+            .or(cold)
+            .or_else(|| request.job_mode.then_some(16.0));
+        let growth_gib = estimate
+            .map(rch_common::BuildDiskBudget::growth_budget_gib)
+            .unwrap_or(0)
+            .max(request.disk_headroom_gib);
+        let floor_gib = match self.config.min_free_gb {
+            None => 0,
+            Some(floor) if floor.is_finite() && floor >= 0.0 => floor.ceil() as u64,
+            // Invalid configuration cannot silently remove the reserve floor.
+            Some(_) => u64::MAX,
+        };
+        Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: u64::from(growth_gib) * rch_common::BuildDiskBudget::GIB,
+            min_free_bytes: floor_gib.saturating_mul(rch_common::BuildDiskBudget::GIB),
+        })
+    }
+
     async fn disk_headroom_failure(
         &self,
         worker: &WorkerState,
         worker_id: &str,
-        request: &SelectionRequest,
+        budget: Option<rch_common::BuildDiskBudget>,
     ) -> Option<DiskHeadroomRejection> {
-        if request.disk_headroom_gib == 0 {
-            return None;
-        }
+        let budget = budget?;
         let Some(history) = &self.build_history else {
             return Some(DiskHeadroomRejection::Unknown);
         };
@@ -689,68 +727,19 @@ impl WorkerSelector {
             .check_disk_headroom(
                 worker_id,
                 &DiskHeadroomAdmission {
-                    requested_gib: request.disk_headroom_gib,
+                    requested_gib: u32::try_from(
+                        budget
+                            .max_growth_bytes
+                            .div_ceil(rch_common::BuildDiskBudget::GIB),
+                    )
+                    .unwrap_or(u32::MAX),
+                    floor_gib: budget
+                        .min_free_bytes
+                        .div_ceil(rch_common::BuildDiskBudget::GIB),
                     capacity: worker.disk_capacity_observation().await,
                 },
             )
             .err()
-    }
-
-    /// Prefer workers whose free build disk can hold this project's learned
-    /// footprint (bd-wv746). One `cargo test --all-features` grew a pool to
-    /// 64 GiB on a worker admitted with 51 GiB free and filled it. Learned
-    /// growth is evidence, not a declared budget, so this only narrows the
-    /// candidate list when some candidate fits; it never refuses a build.
-    /// A declared `disk_headroom_gib` at least as large wins outright.
-    async fn steer_by_learned_footprint(
-        &self,
-        candidates: Vec<(Arc<WorkerState>, CircuitState)>,
-        request: &SelectionRequest,
-    ) -> Vec<(Arc<WorkerState>, CircuitState)> {
-        let (Some(history), Some(command)) = (&self.build_history, request.command.as_deref())
-        else {
-            return candidates;
-        };
-        let Some(footprint) = history.learned_footprint_gib(&request.project, command) else {
-            return candidates;
-        };
-        if footprint <= f64::from(request.disk_headroom_gib) {
-            return candidates;
-        }
-        let required = crate::headroom::footprint_requirement_gib(footprint);
-        let mut fits = Vec::with_capacity(candidates.len());
-        let mut short = Vec::new();
-        for candidate in &candidates {
-            let worker_id = candidate.0.config.read().await.id.to_string();
-            let available = candidate
-                .0
-                .disk_capacity_observation()
-                .await
-                .and_then(|sample| sample.current_free_gib(&worker_id))
-                .map(|free| {
-                    free as f64
-                        - history.reserved_disk_headroom_gib(&worker_id) as f64
-                        - history.pending_footprint_gib(&worker_id)
-                });
-            // No current probe is unknown space, not a full disk.
-            if available.is_none_or(|available| available >= required) {
-                fits.push(candidate.clone());
-            } else {
-                short.push(worker_id);
-            }
-        }
-        if fits.is_empty() || short.is_empty() {
-            return candidates;
-        }
-        info!(
-            project = %request.project,
-            footprint_gib = footprint,
-            required_gib = required,
-            avoided = ?short,
-            "Steering build away from workers without room for its learned disk footprint"
-        );
-        metrics::inc_reliability_error("selection", "footprint_steered");
-        fits
     }
 
     /// Set the repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
@@ -1278,7 +1267,7 @@ impl WorkerSelector {
         }
 
         if self
-            .disk_headroom_failure(&worker, &fallback_id, request)
+            .disk_headroom_failure(&worker, &fallback_id, self.build_disk_budget(request))
             .await
             .is_some()
         {
@@ -1579,6 +1568,7 @@ impl WorkerSelector {
         let mut active_project_exclusion_count = 0usize;
 
         let required_os = required_os_for_request(request);
+        let disk_budget = self.build_disk_budget(request);
 
         for worker in all_workers {
             let config = worker.config.read().await;
@@ -1594,7 +1584,7 @@ impl WorkerSelector {
             let capabilities = worker.capabilities().await;
             let pressure = worker.pressure_assessment().await;
             let disk_headroom_failure = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), request)
+                .disk_headroom_failure(&worker, worker_id.as_str(), disk_budget)
                 .await;
             let success_rate = self.health_score(&worker).await;
             let active_project_excluded = excluded_worker_ids.contains(worker_id.as_str());
@@ -2173,6 +2163,7 @@ impl WorkerSelector {
         let mut any_has_runtime = false;
 
         let required_os = required_os_for_request(request);
+        let disk_budget = self.build_disk_budget(request);
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
@@ -2242,10 +2233,10 @@ impl WorkerSelector {
 
             any_has_runtime = true;
 
-            // An explicit disk budget is a hard resource constraint, including
+            // A build disk budget is a hard resource constraint, including
             // for undersized CPU candidates and every health fail-open list.
             if let Some(failure) = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), request)
+                .disk_headroom_failure(&worker, worker_id.as_str(), disk_budget)
                 .await
             {
                 debug!("Worker {} excluded: {}", worker_id, failure);
@@ -2785,7 +2776,7 @@ impl WorkerSelector {
         // (the `!matched_preferred_worker` return above) or refused for a
         // cause no specific branch names (e.g. an open circuit).
         if !eligible.is_empty() {
-            return Ok(self.steer_by_learned_footprint(eligible, request).await);
+            return Ok(eligible);
         }
 
         // Degrade rather than fall local when the ONLY thing standing between
@@ -4465,6 +4456,8 @@ mod tests {
                 num_cpus: Some(8),
                 disk_free_gb: Some(100.0),
                 disk_total_gb: Some(200.0),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(200.0),
                 projects_root_ok: Some(true),
                 ..Default::default()
             })
@@ -4487,6 +4480,27 @@ mod tests {
                 evaluated_at_unix_ms: 0,
             })
             .await;
+    }
+
+    /// Scheduling fixtures model a healthy, separately measured build volume.
+    /// Preserve their explicit pressure assessment (which may model another
+    /// mount); tests for missing build telemetry construct their own samples.
+    async fn budgeted_fixture_selector(
+        pool: &WorkerPool,
+        mut selector: WorkerSelector,
+    ) -> WorkerSelector {
+        selector.set_build_history(Arc::new(crate::history::BuildHistory::new(100)));
+        for worker in pool.all_workers().await {
+            let mut caps = worker.capabilities().await;
+            if caps.build_disk_free_gb.is_none() || caps.build_disk_total_gb.is_none() {
+                let pressure = worker.pressure_assessment().await;
+                caps.build_disk_free_gb.get_or_insert(100.0);
+                caps.build_disk_total_gb.get_or_insert(200.0);
+                worker.set_capabilities(caps).await;
+                worker.set_pressure_assessment(pressure).await;
+            }
+        }
+        selector
     }
 
     fn process_only_weights() -> SignalWeights {
@@ -5504,6 +5518,7 @@ mod tests {
             SelectionConfig::default(),
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
 
         let request = SelectionRequest {
             job_mode: false,
@@ -5559,6 +5574,7 @@ mod tests {
             );
             pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
                 .await;
+            let selector = budgeted_fixture_selector(&pool, selector).await;
             let result = selector.select(&pool, &request).await;
             let selected = result
                 .worker
@@ -5598,6 +5614,7 @@ mod tests {
             request.job_mode = true;
             pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
                 .await;
+            let selector = budgeted_fixture_selector(&pool, selector).await;
             let selected = selector
                 .select(&pool, &request)
                 .await
@@ -5623,6 +5640,7 @@ mod tests {
             SelectionConfig::default(),
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
 
         let request = SelectionRequest {
             job_mode: false,
@@ -5736,6 +5754,7 @@ mod tests {
             },
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
         selector.record_success("warm-worker", "test-project").await;
 
         let request = SelectionRequest {
@@ -6219,7 +6238,8 @@ mod tests {
         pool.add_worker_state(worker).await;
 
         let request = pinned_component_request("asupersync", "cargo clippy --workspace");
-        let result = WorkerSelector::default().select(&pool, &request).await;
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
+        let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(
             result.reason,
@@ -6385,7 +6405,7 @@ mod tests {
 
         pool.add_worker_state(worker).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6439,7 +6459,7 @@ mod tests {
         .await;
         pool.add_worker_state(v3).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6506,7 +6526,7 @@ mod tests {
         .await;
         pool.add_worker_state(free).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6560,7 +6580,7 @@ mod tests {
             .await;
         pool.add_worker_state(rust_only).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let nix_request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6593,6 +6613,8 @@ mod tests {
             .set_capabilities(rch_common::WorkerCapabilities {
                 rustc_version: Some("1.87.0".to_string()),
                 nix_version: Some("nix (Nix) 2.24.9".to_string()),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(200.0),
                 ..Default::default()
             })
             .await;
@@ -6620,7 +6642,7 @@ mod tests {
             .await;
         pool.add_worker_state(pinned).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -6673,7 +6695,7 @@ mod tests {
         let non_rust = make_worker("non-rust", 4, 70.0);
         pool.add_worker_state(non_rust).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -6758,7 +6780,7 @@ mod tests {
             .await;
         pool.add_worker_state(busy_b).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let mut excluded_worker_ids = HashSet::new();
         excluded_worker_ids.insert("busy-a".to_string());
         excluded_worker_ids.insert("busy-b".to_string());
@@ -6886,7 +6908,7 @@ mod tests {
         .await;
         pool.add_worker_state(toolchain_mismatch).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -6949,7 +6971,7 @@ mod tests {
             .await;
         pool.add_worker_state(healthy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "topology-project".to_string(),
@@ -6987,7 +7009,7 @@ mod tests {
             .await;
         pool.add_worker_state(wrong_target).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "topology-project".to_string(),
@@ -7058,7 +7080,7 @@ mod tests {
         assert!(busy.reserve_slots(8).await);
         pool.add_worker_state(busy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-plus-busy".to_string(),
@@ -7107,7 +7129,7 @@ mod tests {
             pool.add_worker_state(worker).await;
         }
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "derated-fleet".to_string(),
@@ -7219,19 +7241,18 @@ mod tests {
         request.disk_headroom_gib = 0;
         assert!(
             selector.select(&pool, &request).await.worker.is_some(),
-            "undeclared jobs preserve existing admission"
+            "an ordinary build's cold budget still fits with the worker floor"
         );
     }
 
-    /// bd-wv746: a project whose last unshared build grew a worker's build
-    /// disk by 64 GiB is steered to a worker with room, even against
-    /// affinity, but a fleet where nobody has room still gets a worker.
+    /// Learned output is a hard condition across affinity and CPU degradation.
     #[tokio::test]
-    async fn learned_footprint_steers_without_ever_refusing() {
+    async fn learned_footprint_is_a_hard_constraint_across_affinity_and_fallback() {
         let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
         let history = Arc::new(crate::history::BuildHistory::new(10));
         selector.set_build_history(Arc::clone(&history));
         request.estimated_cores = 1;
+        request.command = Some("cargo build --workspace".into());
         let seed = history
             .try_start_active_build_with_waiter(
                 request.project.clone(),
@@ -7244,6 +7265,7 @@ mod tests {
                 None,
                 crate::disk_pressure::DiskHeadroomAdmission {
                     requested_gib: 0,
+                    floor_gib: 0,
                     capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                         "seed-worker",
                         120.0,
@@ -7264,6 +7286,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: Some(64 * rch_common::BuildDiskBudget::GIB),
                     timing: None,
                     cancellation: None,
                 },
@@ -7301,15 +7324,196 @@ mod tests {
             );
         }
 
-        // Nobody has room: steering steps aside rather than refusing.
+        // A fleet with no room must not resurrect a worker through a different
+        // route, even when the requested CPU count could otherwise degrade.
         set_free("free-small", 40.0).await;
-        assert!(selector.select(&pool, &request).await.worker.is_some());
+        for cores in [1, 4] {
+            request.estimated_cores = cores;
+            assert!(selector.select(&pool, &request).await.worker.is_none());
+            assert!(
+                selector
+                    .preview_with_exclusions(&pool, &request, &HashSet::new(),)
+                    .await
+                    .worker
+                    .is_none()
+            );
+            assert!(
+                selector
+                    .try_fallback(&pool, &request, &HashSet::new())
+                    .await
+                    .is_none()
+            );
+        }
 
         // A different command class has no footprint and is not steered.
         assert_eq!(
             history.learned_footprint_gib(&request.project, "cargo test"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn reported_21_gib_test_moves_to_safe_worker_and_small_control_still_runs() {
+        let pool = WorkerPool::new();
+        for (id, free) in [("hz3", 33.0), ("spare", 80.0)] {
+            let worker = make_worker(id, 8, 80.0);
+            prepare_fixture_worker(
+                &worker,
+                Some("1.97.0-nightly"),
+                PressureState::Healthy,
+                "healthy",
+            )
+            .await;
+            let mut caps = worker.capabilities().await;
+            caps.build_disk_free_gb = Some(free);
+            worker.set_capabilities(caps).await;
+            pool.add_worker_state(worker).await;
+        }
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        for (project, gib) in [("frankennumpy", 21), ("small", 2)] {
+            let seed = history.start_active_build_with_wrapper(
+                project.into(),
+                "seed".into(),
+                "cargo test --workspace".into(),
+                0,
+                Some(format!("owner-{project}")),
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            history
+                .complete_durable(
+                    seed.id,
+                    "seed",
+                    seed.local_wrapper_id.as_deref(),
+                    crate::history::BuildCompletion {
+                        exit_code: 0,
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let mut selector = WorkerSelector::with_config(
+            SelectionConfig {
+                min_free_gb: Some(13.0),
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+        selector.set_build_history(history);
+        selector.record_success("hz3", "frankennumpy").await;
+        let mut request = tool_gate_request();
+        request.job_mode = false;
+        request.project = "frankennumpy".into();
+        request.command = Some("cargo test --workspace".into());
+        request.required_runtime = RequiredRuntime::Rust;
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            27 * rch_common::BuildDiskBudget::GIB
+        );
+        assert_eq!(
+            selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str(),
+            "spare"
+        );
+        request.preferred_workers = vec![WorkerId::new("hz3")];
+        assert!(selector.select(&pool, &request).await.worker.is_none());
+
+        // 33 free minus the 13 GiB floor cannot fund the 21 GiB workload,
+        // but the measured 2 GiB workload has a guarded 4 GiB budget and fits.
+        request.project = "small".into();
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            4 * rch_common::BuildDiskBudget::GIB
+        );
+        assert_eq!(
+            selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str(),
+            "hz3"
+        );
+        request.command = Some("cargo test --workspace --profile release".into());
+        assert!(
+            selector.select(&pool, &request).await.worker.is_none(),
+            "new profiles retain the cold prior"
+        );
+        request.command = Some("cargo test --workspace".into());
+        request.project = "unmeasured".into();
+        assert!(
+            selector.select(&pool, &request).await.worker.is_none(),
+            "a new workspace test is conservatively sized"
+        );
+    }
+
+    #[test]
+    fn automatic_disk_budget_respects_valid_floors_and_explicit_minima() {
+        let mut selector = WorkerSelector::new();
+        let mut request = tool_gate_request();
+        request.job_mode = false;
+        assert_eq!(selector.build_disk_budget(&request), None);
+        request.disk_headroom_gib = 3;
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            3 * rch_common::BuildDiskBudget::GIB
+        );
+        request.command = Some("cargo check".into());
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            4 * rch_common::BuildDiskBudget::GIB
+        );
+        request.disk_headroom_gib = 12;
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            12 * rch_common::BuildDiskBudget::GIB
+        );
+        for (floor, expected) in [(None, 0), (Some(0.0), 0), (Some(0.25), 1), (Some(13.0), 13)] {
+            selector.config.min_free_gb = floor;
+            assert_eq!(
+                selector.build_disk_budget(&request).unwrap().min_free_bytes,
+                expected * rch_common::BuildDiskBudget::GIB
+            );
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            selector.config.min_free_gb = Some(invalid);
+            assert_eq!(
+                selector.build_disk_budget(&request).unwrap().min_free_bytes,
+                u64::MAX
+            );
+        }
     }
 
     #[tokio::test]
@@ -7330,6 +7534,7 @@ mod tests {
                 None,
                 DiskHeadroomAdmission {
                     requested_gib: 64,
+                    floor_gib: 0,
                     capacity: worker.disk_capacity_observation().await,
                 },
                 Some(worker.endpoint_snapshot().await),
@@ -7337,7 +7542,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let excluded = HashSet::from(["active-project".into()]);
-        request.disk_headroom_gib = 37;
+        request.disk_headroom_gib = 27;
         assert!(
             selector
                 .select_with_exclusions(&pool, &request, &excluded)
@@ -7345,7 +7550,7 @@ mod tests {
                 .worker
                 .is_none()
         );
-        request.disk_headroom_gib = 36;
+        request.disk_headroom_gib = 26;
         assert_eq!(
             selector
                 .select_with_exclusions(&pool, &request, &excluded)
@@ -7365,7 +7570,7 @@ mod tests {
             .await;
         let mut fallback_request = request.clone();
         fallback_request.estimated_cores = 1;
-        fallback_request.disk_headroom_gib = 36;
+        fallback_request.disk_headroom_gib = 26;
         assert_eq!(
             selector
                 .try_fallback(&pool, &fallback_request, &excluded)
@@ -7387,6 +7592,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -7665,7 +7871,7 @@ mod tests {
             .await;
         pool.add_worker_state(small_critical).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "degraded-must-respect-pressure".to_string(),
@@ -7725,7 +7931,7 @@ mod tests {
         assert!(busy.reserve_slots(8).await);
         pool.add_worker_state(busy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "os-gate-hijack".to_string(),
@@ -7805,7 +8011,7 @@ mod tests {
             .await;
         pool.add_worker_state(critical).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "os-gate-plus-pressure".to_string(),
@@ -7846,7 +8052,7 @@ mod tests {
             .await;
         pool.add_worker_state(flapping).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "topology-flap".to_string(),
@@ -7873,6 +8079,8 @@ mod tests {
                 rustc_version: Some("1.87.0".to_string()),
                 projects_root_ok: Some(true),
                 projects_root_checked_at_unix_ms: Some(1_700_000_100_000),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(200.0),
                 ..Default::default()
             })
             .await;
@@ -8000,7 +8208,7 @@ mod tests {
             .await;
         pool.add_worker_state(broken).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "toolchain-project".to_string(),
@@ -8063,7 +8271,7 @@ mod tests {
             .await;
         pool.add_worker_state(usable_slow).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "toolchain-project".to_string(),
@@ -8123,7 +8331,7 @@ mod tests {
             .await;
         pool.add_worker_state(critical).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-critical".to_string(),
@@ -8172,7 +8380,7 @@ mod tests {
         unhealthy.record_failure(None).await;
         pool.add_worker_state(unhealthy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-and-health".to_string(),
@@ -8222,7 +8430,7 @@ mod tests {
         .await;
         pool.add_worker_state(telemetry_gap).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-mixed".to_string(),
@@ -8283,7 +8491,7 @@ mod tests {
             .await;
         pool.add_worker_state(telemetry_gap).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-gap".to_string(),
@@ -8427,6 +8635,7 @@ mod tests {
             CircuitBreakerConfig::default(),
         );
 
+        let selector = budgeted_fixture_selector(&pool, selector).await;
         // Record only build cache first (no test binaries yet).
         selector.record_build("test-warm", "proj", false).await;
 
@@ -9058,6 +9267,7 @@ mod tests {
             tools: Vec::new(),
         };
         pool.add_worker(worker_config).await;
+        let selector = budgeted_fixture_selector(&pool, selector).await;
 
         // Make a selection request
         let request = SelectionRequest {
@@ -9114,6 +9324,7 @@ mod tests {
             },
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "poolrepro".to_string(),
@@ -10277,7 +10488,7 @@ mod tests {
             let mut reliability = ReliabilityAggregator::new(reliability_cfg);
             reliability.set_remediation(remediation);
 
-            let mut selector = WorkerSelector::with_config(
+            let selector = WorkerSelector::with_config(
                 SelectionConfig {
                     strategy: SelectionStrategy::Balanced,
                     weights: SelectionWeightConfig {
@@ -10293,6 +10504,7 @@ mod tests {
                 },
                 CircuitBreakerConfig::default(),
             );
+            let mut selector = budgeted_fixture_selector(&pool, selector).await;
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
@@ -10357,7 +10569,7 @@ mod tests {
             let mut reliability = ReliabilityAggregator::new(reliability_cfg);
             reliability.set_remediation(remediation);
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
@@ -10432,7 +10644,7 @@ mod tests {
 
             pool.add_worker_state(worker).await;
 
-            let mut selector = WorkerSelector::with_config(
+            let selector = WorkerSelector::with_config(
                 SelectionConfig {
                     strategy: SelectionStrategy::Balanced,
                     weights: SelectionWeightConfig {
@@ -10448,6 +10660,7 @@ mod tests {
                 },
                 CircuitBreakerConfig::default(),
             );
+            let mut selector = budgeted_fixture_selector(&pool, selector).await;
             selector.set_reliability(reliability.clone());
 
             let request = SelectionRequest {
@@ -10530,7 +10743,7 @@ mod tests {
                 .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10557,7 +10770,7 @@ mod tests {
                 )
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10602,7 +10815,7 @@ mod tests {
                 crate::repo_convergence::ConvergenceDriftState::Failed
             );
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10631,7 +10844,7 @@ mod tests {
                 crate::repo_convergence::ConvergenceDriftState::Converging
             );
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10663,7 +10876,7 @@ mod tests {
             let wid = WorkerId::new("converging");
             convergence.mark_converging(&wid).await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10687,7 +10900,7 @@ mod tests {
             let drift = convergence.get_drift_state(&wid).await;
             assert_eq!(drift, crate::repo_convergence::ConvergenceDriftState::Stale);
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10740,7 +10953,7 @@ mod tests {
                     .await;
             }
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10770,7 +10983,7 @@ mod tests {
             pool.add_worker(make_worker("w2", 8, 80.0).config.read().await.clone())
                 .await;
 
-            let selector = WorkerSelector::new();
+            let selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             // No convergence service set.
 
             let request = make_selection_request("test-project");
@@ -10795,7 +11008,7 @@ mod tests {
                 .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10836,7 +11049,7 @@ mod tests {
             );
 
             // Step 2: Drifting workers are allowed (warn only).
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence.clone());
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -10847,7 +11060,7 @@ mod tests {
 
             // Step 3: Worker enters Converging → excluded.
             convergence.mark_converging(&wid).await;
-            let mut selector2 = WorkerSelector::new();
+            let mut selector2 = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector2.set_repo_convergence(convergence.clone());
             let result2 = selector2.select(&pool, &request).await;
             assert!(
@@ -10865,7 +11078,7 @@ mod tests {
                 crate::repo_convergence::ConvergenceDriftState::Ready
             );
 
-            let mut selector3 = WorkerSelector::new();
+            let mut selector3 = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector3.set_repo_convergence(convergence);
             let result3 = selector3.select(&pool, &request).await;
             assert!(
@@ -10910,7 +11123,7 @@ mod tests {
                 );
             }
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -10944,7 +11157,7 @@ mod tests {
                 .update_required_repos(&wid_ready, vec!["repo-a".into()], vec!["repo-a".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -10994,7 +11207,7 @@ mod tests {
                 .update_required_repos(&wid_fresh, vec!["repo-x".into()], vec!["repo-x".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -11029,7 +11242,7 @@ mod tests {
             let convergence = make_convergence_svc();
             // Neither worker registered → both Stale (fail-open).
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;

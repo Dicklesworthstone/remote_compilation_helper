@@ -769,6 +769,8 @@ pub(crate) struct ReleaseFaults<'a> {
     pub(crate) live_checkout_refused: bool,
     /// Another owner held this worker's source past the admission wait.
     pub(crate) source_busy: bool,
+    /// Attributable output high water, even when the job exceeded its budget.
+    pub(crate) disk_peak_output_bytes: Option<u64>,
 }
 
 /// [`release_worker`] for a completed remote run, also telling the daemon
@@ -823,6 +825,9 @@ pub(crate) async fn release_worker_with_fault(
     }
     if let Some(bytes_transferred) = bytes_transferred {
         request.push_str(&format!("&bytes_transferred={}", bytes_transferred));
+    }
+    if let Some(peak) = faults.disk_peak_output_bytes {
+        request.push_str(&format!("&disk_peak_output_bytes={peak}"));
     }
     if faults.worker_fault {
         request.push_str("&worker_fault=1");
@@ -1414,6 +1419,7 @@ mod bounded_ipc_tests {
                     worker_disk_roots: &[],
                     live_checkout_refused,
                     source_busy,
+                    disk_peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
                 },
             );
             let (result, request) = timeout(Duration::from_secs(2), async {
@@ -1422,6 +1428,10 @@ mod bounded_ipc_tests {
             .await
             .expect("release fixture must terminate");
             result.unwrap();
+            assert!(
+                request.contains("&disk_peak_output_bytes=22548578304"),
+                "{request}"
+            );
             assert!(
                 request.starts_with("POST /release-worker?worker=ipc-test&slots=1&build_id=42"),
                 "{request}"

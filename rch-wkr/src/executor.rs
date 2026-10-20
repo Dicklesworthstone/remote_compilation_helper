@@ -2,7 +2,7 @@
 
 mod relay;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rch_common::types::RequiredRuntime;
 use std::io::Write as _;
 use std::path::Path;
@@ -25,6 +25,18 @@ fn eprintln_best_effort(msg: &str) {
 #[error("Command failed with exit code: {exit_code}")]
 pub struct CommandFailed {
     pub exit_code: i32,
+}
+
+/// Structured worker budget failure; a possibly started job cannot be replayed.
+#[derive(Debug, Error)]
+#[error("remote_build_disk_budget_exceeded: {reason} (started: {started})")]
+pub struct BuildDiskBudgetExceeded {
+    pub reason: String,
+    pub started: bool,
+}
+
+pub(crate) fn quote_shell_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Sentinel exit code returned when worker-side dependency prepare
@@ -393,6 +405,14 @@ mod runtime_detection_tests {
 /// `node_modules/` is in place (cache-aware via the dependency
 /// fingerprint stored in `<workdir>/.rch_dep_fingerprint.json`).
 pub async fn execute(workdir: &str, command: &str) -> Result<()> {
+    execute_with_disk_budget(workdir, command, None).await
+}
+
+pub async fn execute_with_disk_budget(
+    workdir: &str,
+    command: &str,
+    disk_budget: Option<rch_common::BuildDiskBudget>,
+) -> Result<()> {
     info!(
         "Executing in {}: {}",
         workdir,
@@ -405,7 +425,7 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
 
     // br-4998x: pre-execution hook for Bun/Node projects.
     let runtime = detect_runtime_from_command(command);
-    if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+    if disk_budget.is_none() && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
         let project_root = Path::new(workdir);
         let log_dir = project_root.join(".rch_prepare_logs");
         match crate::prepare::prepare(project_root, runtime, &log_dir).await {
@@ -464,10 +484,105 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
 
     // Use shell execution to properly handle quoted arguments and shell features
     // This matches how the SSH client executes commands (sh -c "...")
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workdir)
+    let mut disk_receipt = None;
+    let mut cmd = if let Some(budget) = disk_budget {
+        anyhow::ensure!(budget.max_growth_bytes > 0, "positive disk budget required");
+        let root = std::fs::canonicalize(workdir)?;
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
+        let target = if target.is_absolute() {
+            target
+        } else {
+            root.join(target)
+        };
+        let temporary = root.join(".rch-tmp");
+        let run = root.join(".rch-run");
+        for directory in [&target, &temporary, &run] {
+            std::fs::create_dir_all(directory)?;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let marker = format!("RCH_WORKER_{}_{nonce}_DISK_BUDGET:", std::process::id());
+        let receipt = run.join(format!("disk-{}-{nonce}.receipt", std::process::id()));
+        let outputs = vec![root.clone(), target.clone(), temporary.clone()];
+        let mut probes = outputs.clone();
+        // Shared Cargo/toolchain downloads may land on a separate filesystem.
+        // Probe that free space without charging another project's existing
+        // cache or toolchains to this job's allocated-output highwater.
+        if command.contains("cargo") || command.contains("prepare-toolchain") {
+            for (key, leaf) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+                let directory = std::env::var_os(key)
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|home| home.join(leaf)))
+                    .context("toolchain cache directory is unavailable")?;
+                let directory = if directory.is_absolute() {
+                    directory
+                } else {
+                    root.join(directory)
+                };
+                std::fs::create_dir_all(&directory)?;
+                probes.push(directory);
+            }
+        }
+        let output_paths = outputs
+            .iter()
+            .map(|path| path.to_str().context("disk output path is not UTF-8"))
+            .collect::<Result<Vec<_>>>()?;
+        let probe_paths = probes
+            .iter()
+            .map(|path| path.to_str().context("disk probe path is not UTF-8"))
+            .collect::<Result<Vec<_>>>()?;
+        let plan =
+            serde_json::json!({"probe": probe_paths, "output": output_paths, "receipt": receipt});
+        let guarded_command = if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+            let worker = std::env::current_exe()?;
+            let worker = quote_shell_argument(
+                worker
+                    .to_str()
+                    .context("worker executable path is not UTF-8")?,
+            );
+            let project = quote_shell_argument(root.to_str().context("project path is not UTF-8")?);
+            let runtime = if runtime == RequiredRuntime::Bun {
+                "bun"
+            } else {
+                "node"
+            };
+            format!(
+                "{worker} prepare --project {project} --runtime {runtime} >/dev/null || exit {EXIT_PREPARE_FAILED}; sh -c {}",
+                quote_shell_argument(command)
+            )
+        } else {
+            command.to_owned()
+        };
+        let mut guarded = Command::new("python3");
+        guarded
+            .args([
+                "-I",
+                "-S",
+                "-c",
+                rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT,
+            ])
+            .arg(budget.max_growth_bytes.to_string())
+            .arg(budget.min_free_bytes.to_string())
+            .arg(&marker)
+            .arg(&target)
+            .arg(plan.to_string())
+            .arg("standalone")
+            .args(["sh", "-c", &guarded_command])
+            .env("CARGO_TARGET_DIR", &target)
+            .env("TMPDIR", &temporary)
+            .env("TMP", &temporary)
+            .env("TEMP", &temporary);
+        disk_receipt = Some((receipt, marker, budget));
+        guarded
+    } else {
+        let mut shell = Command::new("sh");
+        shell.args(["-c", command]);
+        shell
+    };
+    cmd.current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -481,13 +596,23 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
     // `prepare()` (above) has already installed node_modules by this point.
     if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
         let local_bin = Path::new(workdir).join("node_modules").join(".bin");
-        if local_bin.is_dir() {
+        if local_bin.is_dir() || disk_budget.is_some() {
             let existing = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{existing}", local_bin.display()));
         }
     }
 
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) if disk_budget.is_some() => {
+            return Err(BuildDiskBudgetExceeded {
+                reason: format!("monitor_unavailable: {error}"),
+                started: false,
+            }
+            .into());
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
@@ -502,6 +627,86 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
         relay::POST_EXIT_DRAIN,
     )
     .await?;
+
+    if let Some((path, marker, budget)) = disk_receipt {
+        #[cfg(unix)]
+        let observed_exit_code = {
+            use std::os::unix::process::ExitStatusExt;
+            status
+                .code()
+                .or_else(|| status.signal().map(|value| 128 + value))
+        };
+        #[cfg(not(unix))]
+        let observed_exit_code = status.code();
+        let text = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(|info| info.is_file() && info.len() <= 8192)
+            .and_then(|_| std::fs::read_to_string(&path).ok());
+        let mut valid_usage = false;
+        if let Some(text) = text {
+            // Replay after stopping the workload: monitor stderr may have
+            // been full when it needed to kill writers immediately.
+            eprintln_best_effort(&text);
+            let usage_marker = format!("{}_DISK_USAGE:", marker.trim_end_matches("_DISK_BUDGET:"));
+            for line in text
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+            {
+                let line = line.trim_end_matches(['\r', '\n']);
+                let failure = line.strip_prefix(&marker);
+                let usage = line.strip_prefix(&usage_marker);
+                let Some(body) = failure.or(usage) else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+                    continue;
+                };
+                if value["max_growth_bytes"].as_u64() != Some(budget.max_growth_bytes)
+                    || value["min_free_bytes"].as_u64() != Some(budget.min_free_bytes)
+                {
+                    continue;
+                }
+                if failure.is_some() {
+                    let Some(started) = value["started"].as_bool() else {
+                        continue;
+                    };
+                    let Some(reason) = value["reason"].as_str() else {
+                        continue;
+                    };
+                    if matches!(
+                        reason,
+                        "admission"
+                            | "growth"
+                            | "free_floor"
+                            | "monitor_unavailable"
+                            | "interrupted"
+                    ) {
+                        return Err(BuildDiskBudgetExceeded {
+                            reason: reason.to_owned(),
+                            started,
+                        }
+                        .into());
+                    }
+                } else if let (Some(peak), Some(growth), Some(complete)) = (
+                    value["peak_output_bytes"].as_u64(),
+                    value["peak_growth_bytes"].as_u64(),
+                    value["complete"].as_bool(),
+                ) {
+                    valid_usage |= complete
+                        && peak >= growth
+                        && growth <= budget.max_growth_bytes
+                        && value["exit_code"].as_i64() == observed_exit_code.map(i64::from);
+                }
+            }
+        }
+        if !valid_usage {
+            return Err(BuildDiskBudgetExceeded {
+                reason: "monitor_unavailable: execution receipt is unconfirmed".into(),
+                started: true,
+            }
+            .into());
+        }
+    }
 
     if status.success() {
         if !stdout_relayed || !stderr_relayed {
@@ -544,6 +749,84 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_small_workload_preserves_success_and_compiler_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: 8 << 20,
+            min_free_bytes: 0,
+        });
+        execute_with_disk_budget(
+            directory.path().to_str().unwrap(),
+            "printf small > output",
+            budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join("output")).unwrap(),
+            b"small"
+        );
+        let error =
+            execute_with_disk_budget(directory.path().to_str().unwrap(), "exit 101", budget)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CommandFailed>().unwrap().exit_code,
+            101
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_preflight_refuses_before_any_build_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = execute_with_disk_budget(
+            directory.path().to_str().unwrap(),
+            "printf started > output",
+            Some(rch_common::BuildDiskBudget {
+                max_growth_bytes: 1 << 20,
+                min_free_bytes: 1 << 62,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let failure = error.downcast_ref::<BuildDiskBudgetExceeded>().unwrap();
+        assert_eq!(failure.reason, "admission");
+        assert!(!failure.started);
+        assert!(!directory.path().join("output").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_workspace_output_growth_stops_and_preserves_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute_with_disk_budget(
+                directory.path().to_str().unwrap(),
+                "head -c 2097152 /dev/zero > outside-target; sleep 20",
+                Some(rch_common::BuildDiskBudget {
+                    max_growth_bytes: 1 << 20,
+                    min_free_bytes: 1 << 20,
+                }),
+            ),
+        )
+        .await
+        .expect("guard must stop the writer promptly")
+        .unwrap_err();
+        let failure = error.downcast_ref::<BuildDiskBudgetExceeded>().unwrap();
+        assert_eq!(failure.reason, "growth");
+        assert!(failure.started);
+        assert_eq!(
+            std::fs::metadata(directory.path().join("outside-target"))
+                .unwrap()
+                .len(),
+            2 << 20
+        );
+    }
 
     // === Command Parsing and Execution Tests ===
 

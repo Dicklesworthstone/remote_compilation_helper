@@ -1601,7 +1601,12 @@ async fn execute_remote_compilation_inner(
         if entry.is_primary {
             root_pipeline = root_pipeline
                 .with_env_allowlist(effective_env_allowlist.clone())
-                .with_cargo_profile_forwarding(forward_cargo_profile_settings);
+                .with_cargo_profile_forwarding(forward_cargo_profile_settings)
+                .with_disk_budget(
+                    worker
+                        .disk_budget
+                        .or_else(|| rch_common::BuildDiskBudget::cold_for_command(command)),
+                );
             // The primary root's pipeline runs the command, so the Layer 0
             // pack belongs here. Until bd-hoxgn it rode only on
             // workspace-metadata roots, which never execute anything.
@@ -2151,6 +2156,10 @@ async fn execute_remote_compilation_inner(
 
     let stderr_capture_cell = Rc::new(RefCell::new(String::new()));
     let deadline_triggered = Rc::new(Cell::new(false));
+    let disk_failure = Rc::new(RefCell::new(None));
+    let disk_peak_output_bytes = Rc::new(Cell::new(None::<u64>));
+    let disk_usage_exit_code = Rc::new(Cell::new(None::<i32>));
+    let disk_usage_conflict = Rc::new(Cell::new(false));
 
     struct CompileUiState {
         progress: Option<CompilationProgress>,
@@ -2212,6 +2221,10 @@ async fn execute_remote_compilation_inner(
     let ui_state_stderr = Rc::clone(&ui_state);
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
     let deadline_triggered_stderr = Rc::clone(&deadline_triggered);
+    let disk_failure_stderr = Rc::clone(&disk_failure);
+    let disk_peak_output_stderr = Rc::clone(&disk_peak_output_bytes);
+    let disk_usage_exit_stderr = Rc::clone(&disk_usage_exit_code);
+    let disk_usage_conflict_stderr = Rc::clone(&disk_usage_conflict);
     let deadline_pipeline = pipeline.clone();
     let process_setup_marker = pipeline.remote_process_setup_marker();
     let heartbeat_state_stdout = heartbeat_loop
@@ -2272,6 +2285,23 @@ async fn execute_remote_compilation_inner(
             }
         },
         move |line| {
+            // Capture the attempt-bound control receipts before any bounded
+            // output/UI buffer can discard a late disk failure.
+            if let Some(failure) = deadline_pipeline.parse_disk_budget_marker(line) {
+                *disk_failure_stderr.borrow_mut() = Some(failure);
+                return;
+            }
+            if let Some(peak) = deadline_pipeline.parse_disk_usage_marker(line) {
+                let status = deadline_pipeline.parse_disk_usage_exit_code(line);
+                if disk_usage_exit_stderr.get().is_some() && disk_usage_exit_stderr.get() != status
+                {
+                    disk_usage_conflict_stderr.set(true);
+                }
+                disk_usage_exit_stderr.set(status);
+                disk_peak_output_stderr
+                    .set(Some(disk_peak_output_stderr.get().unwrap_or(0).max(peak)));
+                return;
+            }
             if deadline_pipeline.is_deadline_marker(line) {
                 deadline_triggered_stderr.set(true);
                 return;
@@ -2327,6 +2357,72 @@ async fn execute_remote_compilation_inner(
         .context(crate::transfer::RemoteExecutionUnconfirmed)?;
     }
 
+    let mut captured_disk_failure = disk_failure.borrow_mut().take();
+    if captured_disk_failure.is_none() && disk_peak_output_bytes.get().is_none() {
+        // A full stderr pipe may drop control output. The immutable receipt
+        // remains available after confirmed completion and is attempt-bound.
+        if let Some(receipt) = pipeline
+            .read_remote_disk_receipt(&worker_config)
+            .await
+            .context(crate::transfer::RemoteExecutionUnconfirmed)?
+        {
+            for line in receipt.split_inclusive('\n') {
+                if pipeline.is_deadline_marker(line) {
+                    deadline_triggered.set(true);
+                }
+                if let Some(failure) = pipeline.parse_disk_budget_marker(line) {
+                    captured_disk_failure = Some(failure);
+                }
+                if let Some(peak) = pipeline.parse_disk_usage_marker(line) {
+                    let status = pipeline.parse_disk_usage_exit_code(line);
+                    if disk_usage_exit_code.get().is_some() && disk_usage_exit_code.get() != status
+                    {
+                        disk_usage_conflict.set(true);
+                    }
+                    disk_usage_exit_code.set(status);
+                    disk_peak_output_bytes
+                        .set(Some(disk_peak_output_bytes.get().unwrap_or(0).max(peak)));
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        !disk_usage_conflict.get()
+            && (disk_peak_output_bytes.get().is_none()
+                || disk_usage_exit_code.get() == Some(result.exit_code)),
+        crate::transfer::RemoteExecutionUnconfirmed
+    );
+    if let Some(mut failure) = captured_disk_failure {
+        // The holder may have disappeared while its durable receipts were
+        // read. Recheck before turning pre-start evidence into a retry grant.
+        confirm_source_pair_execution(source_pair_lock.as_mut(), result.exit_code)?;
+        anyhow::ensure!(
+            matches!(
+                (failure.started, result.exit_code),
+                (false, 120 | 125) | (true, 120 | 137)
+            ),
+            crate::transfer::RemoteExecutionUnconfirmed
+        );
+        failure.worker_id = worker.id.as_str().to_string();
+        if let Some(session) = recovery_session.as_mut() {
+            session
+                .returned(result.exit_code)
+                .context(crate::transfer::RemoteExecutionUnconfirmed)?;
+            drop(source_authority_lock.take());
+            drop(source_pair_lock.take());
+            session
+                .retire_returned()
+                .await
+                .context(crate::transfer::RemoteExecutionUnconfirmed)?;
+        }
+        return Err(failure.into());
+    }
+    if disk_peak_output_bytes.get().is_none()
+        && !(result.exit_code == 137 && deadline_triggered.get())
+    {
+        pipeline.ensure_remote_disk_budget(&result)?;
+    }
+
     // A setup refusal authorizes failover only after the execution and source
     // ownership checks above have established that this attempt has finished.
     if let Err(error) =
@@ -2338,10 +2434,15 @@ async fn execute_remote_compilation_inner(
             // This typed refusal follows an exact completion and proves the
             // workload never started. Finish source ownership before allowing
             // the caller's existing worker-failover path to select another job.
-            session.returned(result.exit_code)?;
+            session
+                .returned(result.exit_code)
+                .context(crate::transfer::RemoteExecutionUnconfirmed)?;
             drop(source_authority_lock.take());
             drop(source_pair_lock.take());
-            session.retire_returned().await?;
+            session
+                .retire_returned()
+                .await
+                .context(crate::transfer::RemoteExecutionUnconfirmed)?;
         }
         return Err(error);
     }
@@ -3341,6 +3442,7 @@ async fn execute_remote_compilation_inner(
         timing,
         result_dirs: exec_dir_stats,
         disk_roots,
+        disk_peak_output_bytes: disk_peak_output_bytes.get(),
         cargo_stdout,
     })
 }

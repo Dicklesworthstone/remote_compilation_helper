@@ -258,7 +258,12 @@ enum RemotePipelineFailurePolicy {
 }
 
 fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFailurePolicy {
-    if is_remote_execution_unconfirmed(error) || is_ssh_command_timeout_error(error) {
+    if is_remote_execution_unconfirmed(error)
+        || is_ssh_command_timeout_error(error)
+        || error
+            .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            .is_some_and(|failure| failure.started)
+    {
         RemotePipelineFailurePolicy::FailClosedNoLocalFallback
     } else {
         RemotePipelineFailurePolicy::AllowLocalFallback
@@ -280,6 +285,18 @@ fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
         .is_some()
 }
 
+fn remote_failure_exit_code(error: &anyhow::Error) -> i32 {
+    if is_remote_execution_unconfirmed(error) {
+        return EXIT_BUILD_ERROR;
+    }
+    error
+        .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+        .map_or(
+            EXIT_BUILD_ERROR,
+            |failure| if failure.started { 137 } else { 120 },
+        )
+}
+
 /// Keep failure evidence tied to the selected worker and the transfer's
 /// direction. An unresolved source/execution owner still takes precedence:
 /// its reservation cannot be completed merely because disk exhaustion was
@@ -295,10 +312,23 @@ fn remote_release_faults<'a>(
             worker_disk_roots: &result.disk_roots,
             live_checkout_refused: false,
             source_busy: false,
+            disk_peak_output_bytes: result.disk_peak_output_bytes,
         },
         Err(error) if !is_remote_execution_unconfirmed(error) => {
             let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
             let source_busy = crate::transfer::source_authority_busy(error);
+            if let Some(failure) = error
+                .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+                .filter(|failure| failure.worker_id == worker_id.as_str())
+            {
+                return daemon_ipc::ReleaseFaults {
+                    worker_fault: true,
+                    worker_disk_full: failure.reason == "free_floor",
+                    worker_disk_roots: &failure.roots,
+                    disk_peak_output_bytes: failure.peak_output_bytes,
+                    ..Default::default()
+                };
+            }
             match crate::transfer::find_remote_upload_disk_full(error)
                 .filter(|fault| fault.worker_id == worker_id.as_str())
             {
@@ -308,6 +338,7 @@ fn remote_release_faults<'a>(
                     worker_disk_roots: &fault.roots,
                     live_checkout_refused,
                     source_busy,
+                    disk_peak_output_bytes: None,
                 },
                 None => daemon_ipc::ReleaseFaults {
                     live_checkout_refused,
@@ -333,6 +364,12 @@ fn remote_pipeline_failure_summary(worker_id: &WorkerId, error: &anyhow::Error) 
         return format!(
             "[RCH] remote {} completion unconfirmed; ownership retained for recovery (no local fallback)",
             worker_id
+        );
+    }
+    if let Some(failure) = error.downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>() {
+        return format!(
+            "[RCH] remote {worker_id} stopped [{}]: {failure}",
+            ErrorCode::BuildDiskBudgetExceeded.code_string()
         );
     }
     format!(
@@ -1527,7 +1564,11 @@ enum RemoteFaultExhaustAction {
     /// Surface the remote failure by exiting with this code. Used for OOM /
     /// signal kills: a crate that OOMs every worker must NOT then be run on (and
     /// likely OOM) the orchestrator, so this never falls back to local.
-    ExitWithCode { code: i32, summary: String },
+    ExitWithCode {
+        code: i32,
+        summary: String,
+        error_code: Option<&'static str>,
+    },
     /// Exit with a code after emitting worker-system-dependency remediation.
     ExitWithEnvRemediation {
         code: i32,
@@ -4466,7 +4507,7 @@ pub async fn run_exec(
         let release_exit_code = result
             .as_ref()
             .map(|ok| ok.exit_code)
-            .unwrap_or(EXIT_BUILD_ERROR);
+            .unwrap_or_else(|error| remote_failure_exit_code(error));
         let release_timing = result.as_ref().ok().map(|ok| {
             let mut timing = ok.timing.clone();
             timing.total = Some(remote_elapsed);
@@ -4508,6 +4549,11 @@ pub async fn run_exec(
             // acknowledgement is lost. Recovery then knows the command outcome
             // without pretending its reservation/ownership was retired.
             durable_lease.record_exit(result.exit_code)?;
+        } else if let Err(error) = result.as_ref()
+            && !retain_unconfirmed_ownership
+            && error.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+        {
+            durable_lease.record_exit(release_exit_code)?;
         }
         if !retain_unconfirmed_ownership && !release_acknowledged {
             if let Err(persist_error) = durable_lease.heartbeat("release_unconfirmed") {
@@ -4746,6 +4792,7 @@ pub async fn run_exec(
                         failed_worker: worker.id.clone(),
                         on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
                             code: result.exit_code,
+                            error_code: None,
                             summary: format!(
                                 "[RCH] remote {} killed (SIGILL — CPU capability)",
                                 worker.id
@@ -4784,6 +4831,7 @@ pub async fn run_exec(
                         failed_worker: worker.id.clone(),
                         on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
                             code: result.exit_code,
+                            error_code: None,
                             summary: format!(
                                 "[RCH] remote {} build script killed ({} — CPU capability)",
                                 worker.id,
@@ -4809,6 +4857,7 @@ pub async fn run_exec(
                         failed_worker: worker.id.clone(),
                         on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
                             code: result.exit_code,
+                            error_code: None,
                             summary: format!(
                                 "[RCH] remote {} killed ({}) — cause unconfirmed; inspect worker OOM and SSH/session logs",
                                 worker.id,
@@ -4940,6 +4989,8 @@ pub async fn run_exec(
                     // Fail-closed refusal: the line explaining the non-zero exit must
                     // reach the agent even at stock visibility (rch#31).
                     reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id, &e));
+                    let disk_failure = !is_remote_execution_unconfirmed(&e)
+                        && e.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>();
                     if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
                     {
                         warn!(
@@ -4950,22 +5001,26 @@ pub async fn run_exec(
                     emit_exec_envelope(&ExecResultEnvelope {
                         api_version: "1.0",
                         command: &remote_command,
-                        outcome: "transport_error",
+                        outcome: if disk_failure {
+                            "disk_budget_exceeded"
+                        } else {
+                            "transport_error"
+                        },
                         location: "remote",
                         fallback_reason: Some("fail_closed_no_local_fallback"),
                         worker_id: Some(worker.id.as_str()),
                         timing: exec_timing.as_ref(),
                         result_dirs: exec_dir_stats.as_deref(),
-                        remote_exit_code: None,
+                        remote_exit_code: disk_failure.then_some(release_exit_code),
                         duration_ms: Some(exec_start.elapsed().as_millis() as u64),
-                        error_code: None,
+                        error_code: disk_failure.then_some("RCH-E330"),
                         admission: durable_lease.machine_admission_reference(
                             &wrapper_id,
                             remote_build_id,
                             &worker.id,
                         )?,
                     });
-                    std::process::exit(EXIT_BUILD_ERROR);
+                    std::process::exit(remote_failure_exit_code(&e));
                 }
 
                 // Issue #59: a silence-detected source-sync stall is a typed
@@ -4976,7 +5031,21 @@ pub async fn run_exec(
                 // (tried_workers), mirroring the E104 failover semantics
                 // instead of dying inside the sync leg or falling straight to
                 // local.
-                if let Some(stall) = crate::transfer::find_source_sync_stall(&e) {
+                if let Some(failure) =
+                    e.downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+                {
+                    // Only a confirmed pre-start refusal reaches this branch.
+                    // It may relocate; exhausting workers surfaces E330.
+                    RetryableRemoteFault {
+                        log_reason: format!("disk admission refused: {}", failure.reason),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
+                            code: release_exit_code,
+                            summary: remote_pipeline_failure_summary(&worker.id, &e),
+                            error_code: Some("RCH-E330"),
+                        },
+                    }
+                } else if let Some(stall) = crate::transfer::find_source_sync_stall(&e) {
                     warn!(
                         "Source sync stalled on {} (phase {}, no output for {}s); failing over to another worker",
                         worker.id,
@@ -5067,7 +5136,11 @@ pub async fn run_exec(
 
         // Retries exhausted (or no bigger worker available): terminal action.
         match fault.on_exhaust {
-            RemoteFaultExhaustAction::ExitWithCode { code, summary } => {
+            RemoteFaultExhaustAction::ExitWithCode {
+                code,
+                summary,
+                error_code,
+            } => {
                 warn!(
                     "Remote build failed and no higher-capacity worker was available after {} attempt(s); surfacing exit {}",
                     tried_workers.len(),
@@ -5093,7 +5166,7 @@ pub async fn run_exec(
                     duration_ms: Some(exec_start.elapsed().as_millis() as u64),
                     timing: exec_timing.as_ref(),
                     result_dirs: exec_dir_stats.as_deref(),
-                    error_code: None,
+                    error_code,
                     admission: durable_lease.machine_admission_reference(
                         &wrapper_id,
                         remote_build_id,
@@ -5810,7 +5883,7 @@ async fn handle_selection_response(
     let release_exit_code = result
         .as_ref()
         .map(|ok| ok.exit_code)
-        .unwrap_or(EXIT_BUILD_ERROR);
+        .unwrap_or_else(|error| remote_failure_exit_code(error));
     // Add total elapsed time to the timing breakdown
     let release_timing = result.as_ref().ok().map(|ok| {
         let mut timing = ok.timing.clone();
@@ -6052,6 +6125,15 @@ async fn handle_selection_response(
             }
         }
         Err(e) => {
+            if !is_remote_execution_unconfirmed(&e)
+                && e.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            {
+                reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id, &e));
+                return HookOutput::allow_with_modified_command(format!(
+                    "exit {}",
+                    remote_failure_exit_code(&e)
+                ));
+            }
             if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
                 let evidence_summary = preflight_err.evidence_summary();
                 info!(

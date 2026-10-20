@@ -986,6 +986,38 @@ pub(crate) struct RemoteUploadDiskFull {
     pub(crate) roots: Vec<String>,
 }
 
+/// Attempt-bound runtime disk refusal. A started job is never safe to replay.
+#[derive(Debug, Clone, thiserror::Error, serde::Deserialize)]
+#[error(
+    "remote_build_disk_budget_exceeded: {reason} (growth {growth_bytes} bytes, budget {max_growth_bytes} bytes, free {free_bytes} bytes, protected {min_free_bytes} bytes); {detail}"
+)]
+pub(crate) struct RemoteBuildDiskBudgetExceeded {
+    pub reason: String,
+    pub free_bytes: u64,
+    pub growth_bytes: u64,
+    pub max_growth_bytes: u64,
+    pub min_free_bytes: u64,
+    pub started: bool,
+    #[serde(default)]
+    pub peak_output_bytes: Option<u64>,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(skip)]
+    pub worker_id: String,
+    #[serde(skip)]
+    pub roots: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteBuildDiskUsage {
+    max_growth_bytes: u64,
+    min_free_bytes: u64,
+    peak_output_bytes: u64,
+    peak_growth_bytes: u64,
+    complete: bool,
+    exit_code: Option<i32>,
+}
+
 pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&RemoteUploadDiskFull> {
     error.downcast_ref::<RemoteUploadDiskFull>().or_else(|| {
         // Archive uploads classify each completed attempt before the retry
@@ -1536,11 +1568,16 @@ async fn collect_cargo_artifact_evidence(
 /// The same identity publisher and verifier used by daemon crash recovery.
 /// Arguments: record path, timeout seconds, deadline marker, build ID, command.
 fn remote_build_watchdog_script() -> String {
+    remote_build_watchdog_script_with_refusal(
+        r#"printf "\n%s_IDENTITY_UNAVAILABLE\n" "$3" >&2; exit 125"#,
+    )
+}
+
+fn remote_build_watchdog_script_with_refusal(refusal: &str) -> String {
     format!(
-        "{}\n{}",
+        "{}\nrch_remote_record \"$1\" \"$4\" || {{ {refusal}; }}\n{}",
         rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
-        r#"rch_remote_record "$1" "$4" || { printf "\n%s_IDENTITY_UNAVAILABLE\n" "$3" >&2; exit 125; }
-__p=$$; __t="$2"; __m="$3"; shift 4
+        r#"__p=$$; __t="$2"; __m="$3"; shift 4
 __cancelled=0; __w=; __watch_start=
 trap '__cancelled=1' TERM
 "$@" 3>&- & __c=$!
@@ -2601,6 +2638,8 @@ pub(crate) fn configure_clean_git_command(command: &mut Command) {
 pub struct TransferPipeline {
     /// Correlates deadline enforcement with this execution, independently of exit 137.
     deadline_marker: String,
+    /// Absolute worker headroom and allocated-output growth reservation.
+    disk_budget: Option<rch_common::BuildDiskBudget>,
     /// Local project root.
     project_root: PathBuf,
     /// Caller-owned tree used to distinguish source from artifact roots. A
@@ -2780,6 +2819,7 @@ impl TransferPipeline {
 
         Self {
             deadline_marker: format!("RCH_EXTERNAL_DEADLINE:{}", uuid::Uuid::new_v4()),
+            disk_budget: None,
             retrieval_reference_root: project_root.clone(),
             project_root,
             project_id: safe_project_id,
@@ -3478,6 +3518,11 @@ impl TransferPipeline {
     #[must_use]
     pub fn with_cargo_profile_forwarding(mut self, enabled: bool) -> Self {
         self.forward_cargo_profile_settings = enabled;
+        self
+    }
+
+    pub fn with_disk_budget(mut self, budget: Option<rch_common::BuildDiskBudget>) -> Self {
+        self.disk_budget = budget;
         self
     }
 
@@ -4686,6 +4731,281 @@ impl TransferPipeline {
         )
     }
 
+    pub(crate) fn remote_disk_receipt_path(&self) -> Option<String> {
+        self.disk_budget.map(|_| {
+            let nonce = self
+                .deadline_marker
+                .strip_prefix("RCH_EXTERNAL_DEADLINE:")
+                .unwrap_or(&self.deadline_marker);
+            format!(
+                "{}/disk-{nonce}.receipt",
+                Self::remote_run_dir_for_root(&self.remote_path())
+            )
+        })
+    }
+
+    fn disk_failure_line(&self, detail: &str, started: bool) -> String {
+        let budget = self.disk_budget.expect("disk guard budget");
+        let receipt = serde_json::json!({
+            "reason": "monitor_unavailable", "free_bytes": 0, "growth_bytes": 0,
+            "max_growth_bytes": budget.max_growth_bytes, "min_free_bytes": budget.min_free_bytes,
+            "started": started, "detail": detail,
+        });
+        format!("{}_DISK_BUDGET:{receipt}", self.deadline_marker)
+    }
+
+    /// Only an actual prelaunch refusal may publish started:false. Preserve the
+    /// setup status and its old marker too, so completion recovery stays exact.
+    fn disk_prestart_refusal(&self, detail: &str, exit_code: i32) -> String {
+        let line = escape(Cow::Owned(self.disk_failure_line(detail, false)));
+        let receipt = escape(Cow::Owned(
+            self.remote_disk_receipt_path().expect("disk receipt path"),
+        ));
+        let setup = if exit_code == 125 {
+            format!(
+                "printf '\\n%s\\n' {} >&2; ",
+                escape(Cow::Owned(self.remote_process_setup_marker()))
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "(umask 077; printf '%s\\n' {line} > {receipt}) || exit 120; {setup}printf '\\n%s\\n' {line} >&2; exit {exit_code}"
+        )
+    }
+
+    fn wrap_with_disk_budget(
+        &self,
+        command: &str,
+        managed_dirs: &[String],
+        timeout_seconds: u64,
+    ) -> String {
+        let Some(budget) = self.disk_budget else {
+            return command.to_owned();
+        };
+        if self.worker_platform.is_windows() {
+            let line = escape(Cow::Owned(self.disk_failure_line(
+                "worker platform has no safe build disk supervisor",
+                false,
+            )));
+            return format!(
+                "sh -c {}",
+                escape(Cow::Owned(format!(
+                    "printf '\\n%s\\n' {line} >&2; exit 120"
+                )))
+            );
+        }
+        let mut outputs = managed_dirs.to_vec();
+        if !outputs.contains(&self.remote_cargo_target_dir()) {
+            outputs.push(self.remote_cargo_target_dir());
+        }
+        // Native compilers, custom jobs, and package managers also write in
+        // the owned workspace. Inode deduplication avoids charging nested
+        // target/temporary directories twice; the initial checkout is baseline.
+        if !outputs.contains(&self.remote_path()) {
+            outputs.push(self.remote_path());
+        }
+        let probes = outputs.clone();
+        let plan = serde_json::json!({
+            "probe": probes, "output": outputs,
+            "receipt": self.remote_disk_receipt_path(), "receipt_initialized": true,
+            "timeout_seconds": timeout_seconds,
+        });
+        let script = escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT));
+        let target = escape(Cow::Owned(self.remote_cargo_target_dir()));
+        let marker = escape(Cow::Owned(format!("{}_DISK_BUDGET:", self.deadline_marker)));
+        let plan = escape(Cow::Owned(plan.to_string()));
+        let command = escape(Cow::Borrowed(command));
+        let mode = if self.build_id.is_some() {
+            "tracked"
+        } else {
+            "standalone"
+        };
+        let refusal =
+            self.disk_prestart_refusal("worker Python disk supervisor is unavailable", 120);
+        let program = format!(
+            "if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
+            budget.max_growth_bytes, budget.min_free_bytes,
+        );
+        // Keep all control flow inside a single argv-safe shell invocation.
+        format!("sh -c {}", escape(Cow::Owned(program)))
+    }
+
+    fn with_disk_receipt_replay(&self, execution: String) -> String {
+        if self.disk_budget.is_none() || self.worker_platform.is_windows() {
+            return execution;
+        }
+        let directory = escape(Cow::Owned(Self::remote_run_dir_for_root(
+            &self.remote_path(),
+        )));
+        let receipt = escape(Cow::Owned(
+            self.remote_disk_receipt_path().expect("disk receipt path"),
+        ));
+        let marker = escape(Cow::Owned(format!("{}_DISK_BUDGET:", self.deadline_marker)));
+        let failure_prefix = escape(Cow::Owned(format!(
+            "{}_DISK_BUDGET:{{",
+            self.deadline_marker
+        )));
+        let usage_prefix = escape(Cow::Owned(format!(
+            "{}_DISK_USAGE:{{",
+            self.deadline_marker
+        )));
+        let fallback = escape(Cow::Owned(self.disk_failure_line(
+            "disk supervisor did not publish a complete receipt; execution cannot be replayed",
+            true,
+        )));
+        // Claim this exact attempt before creating any process. Noclobber also
+        // prevents a reused pipeline/nonce from replaying an older receipt.
+        // The outer shell survives group termination and forwards diagnostics
+        // after noisy workload stderr can no longer delay stopping writers.
+        format!(
+            "mkdir -p {directory} && {{ \
+if ! (umask 077; set -C; printf '%s\\n' {marker} > {receipt}); then printf '\\n%s\\n' {fallback} >&2; exit 120; fi; \
+if ( {execution} ); then __rch_disk_status=0; else __rch_disk_status=$?; fi; \
+if [ -f {receipt} ] && [ ! -L {receipt} ] && [ \"$(wc -c < {receipt})\" -le 8192 ] && \
+{{ grep -F -q -- {failure_prefix} {receipt} || grep -F -q -- {usage_prefix} {receipt}; }}; then \
+cat {receipt} >&2 || exit 120; else printf '\\n%s\\n' {fallback} >&2; exit 120; fi; \
+exit \"$__rch_disk_status\"; }}"
+        )
+    }
+
+    /// Parse before stderr truncation. A partial line cannot establish a
+    /// prestart refusal or authorize a retry on another worker.
+    pub(crate) fn parse_disk_budget_marker(
+        &self,
+        line: &str,
+    ) -> Option<RemoteBuildDiskBudgetExceeded> {
+        let budget = self.disk_budget?;
+        if line.len() > 8192 {
+            return None;
+        }
+        let body = line.strip_suffix('\n')?.trim_end_matches('\r');
+        let prefix = format!("{}_DISK_BUDGET:", self.deadline_marker);
+        let mut failure: RemoteBuildDiskBudgetExceeded =
+            serde_json::from_str(body.strip_prefix(&prefix)?).ok()?;
+        if failure.max_growth_bytes != budget.max_growth_bytes
+            || failure.min_free_bytes != budget.min_free_bytes
+            || (!failure.started && failure.growth_bytes != 0)
+            || failure
+                .peak_output_bytes
+                .is_some_and(|peak| peak < failure.growth_bytes)
+            || !matches!(
+                failure.reason.as_str(),
+                "admission" | "growth" | "free_floor" | "monitor_unavailable" | "interrupted"
+            )
+        {
+            return None;
+        }
+        failure.roots = vec![self.remote_path(), self.remote_cargo_target_dir()];
+        Some(failure)
+    }
+
+    fn parse_complete_disk_usage(&self, line: &str) -> Option<RemoteBuildDiskUsage> {
+        let budget = self.disk_budget?;
+        if line.len() > 8192 {
+            return None;
+        }
+        let body = line.strip_suffix('\n')?.trim_end_matches('\r');
+        let prefix = format!("{}_DISK_USAGE:", self.deadline_marker);
+        let usage: RemoteBuildDiskUsage = serde_json::from_str(body.strip_prefix(&prefix)?).ok()?;
+        (usage.max_growth_bytes == budget.max_growth_bytes
+            && usage.min_free_bytes == budget.min_free_bytes
+            && usage.complete
+            && usage
+                .exit_code
+                .is_some_and(|code| (0..=255).contains(&code))
+            && usage.peak_growth_bytes <= usage.peak_output_bytes
+            && usage.peak_growth_bytes <= usage.max_growth_bytes)
+            .then_some(usage)
+    }
+
+    pub(crate) fn parse_disk_usage_marker(&self, line: &str) -> Option<u64> {
+        self.parse_complete_disk_usage(line)
+            .map(|usage| usage.peak_output_bytes)
+    }
+
+    pub(crate) fn parse_disk_usage_exit_code(&self, line: &str) -> Option<i32> {
+        self.parse_complete_disk_usage(line)
+            .and_then(|usage| usage.exit_code)
+    }
+
+    pub(crate) fn ensure_remote_disk_budget(&self, result: &CommandResult) -> Result<()> {
+        if self.disk_budget.is_none() {
+            return Ok(());
+        }
+        for line in result.stderr.split_inclusive('\n').rev() {
+            if let Some(failure) = self.parse_disk_budget_marker(line) {
+                if (!failure.started && matches!(result.exit_code, 120 | 125))
+                    || (failure.started && matches!(result.exit_code, 120 | 137))
+                {
+                    return Err(failure.into());
+                }
+                return Err(RemoteExecutionUnconfirmed.into());
+            }
+        }
+        let mut complete_usage = false;
+        for line in result.stderr.split_inclusive('\n') {
+            if let Some(exit_code) = self.parse_disk_usage_exit_code(line) {
+                if exit_code != result.exit_code {
+                    return Err(RemoteExecutionUnconfirmed.into());
+                }
+                complete_usage = true;
+            }
+        }
+        if complete_usage
+            || (result.exit_code == 137
+                && result
+                    .stderr
+                    .split_inclusive('\n')
+                    .any(|line| line.ends_with('\n') && self.is_deadline_marker(line)))
+        {
+            Ok(())
+        } else {
+            Err(RemoteExecutionUnconfirmed.into())
+        }
+    }
+
+    /// Read only after exact execution completion, while the caller retains
+    /// source ownership. The receipt is attempt-scoped, bounded and immutable.
+    pub(crate) async fn read_remote_disk_receipt(
+        &self,
+        worker: &WorkerConfig,
+    ) -> Result<Option<String>> {
+        let Some(path) = self.remote_disk_receipt_path() else {
+            return Ok(None);
+        };
+        let path = escape(Cow::Owned(path));
+        let script =
+            format!("if [ -f {path} ] && [ ! -L {path} ]; then head -c 8193 -- {path}; fi");
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.worker_ssh_command_with_activity(
+                worker,
+                &["sh", "-c", &escape(Cow::Owned(script))],
+                false,
+            )
+            .output(),
+        )
+        .await??;
+        anyhow::ensure!(output.status.success(), "disk receipt probe failed");
+        anyhow::ensure!(
+            output.stdout.len() <= 8192,
+            "disk receipt exceeded size bound"
+        );
+        let text = String::from_utf8(output.stdout)?;
+        if text.is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            text.split_inclusive('\n')
+                .any(|line| self.parse_disk_budget_marker(line).is_some()
+                    || self.parse_disk_usage_marker(line).is_some()
+                    || (line.ends_with('\n') && self.is_deadline_marker(line))),
+            "disk receipt is incomplete or belongs to another attempt"
+        );
+        Ok(Some(text))
+    }
+
     /// Build the full remote command string with all wrappers.
     fn build_remote_command(&self, command: &str, toolchain: Option<&ToolchainInfo>) -> String {
         let remote_path = self.remote_path();
@@ -4714,7 +5034,6 @@ impl TransferPipeline {
         // - https://github.com/oven-sh/bun/issues/21277 (sync loops block timeout)
         // - https://github.com/oven-sh/bun/issues/6751 (multiple test files cause hangs)
         // The `timeout` command provides a hard kill that works even for CPU-bound loops.
-        let timeout_wrapped_command = self.wrap_with_external_timeout(&colored_command);
         // Wall-clock cap in seconds for the pgid-tracked path's watchdog (0 = disabled).
         // Same source of truth as `wrap_with_external_timeout`, applied via an
         // in-session group-kill watchdog instead of `timeout(1)` (see build_id branch).
@@ -4724,6 +5043,24 @@ impl TransferPipeline {
                 .as_secs()
         } else {
             0
+        };
+        let colored_command = self.wrap_with_disk_budget(
+            &colored_command,
+            &env_plan.ensure_dirs,
+            external_timeout_secs,
+        );
+        // The disk supervisor owns the deadline too. A second timer in the
+        // same group would look like a surviving build child during cleanup;
+        // killing its sleep can also make the old timer fire spuriously.
+        let timeout_wrapped_command = if self.disk_budget.is_some() {
+            colored_command.clone()
+        } else {
+            self.wrap_with_external_timeout(&colored_command)
+        };
+        let watchdog_timeout_secs = if self.disk_budget.is_some() {
+            0
+        } else {
+            external_timeout_secs
         };
 
         // Ensure remote-scoped env directories exist before build execution.
@@ -4798,7 +5135,20 @@ impl TransferPipeline {
             // that sleep, leaving neither an open SSH pipe nor an orphan
             // group member that would obstruct later recovery. Only the
             // timer retains fd 3 for its deadline marker before group kill.
-            let watchdog = escape(Cow::Owned(remote_build_watchdog_script()));
+            let (watchdog, setup_refusal) = if self.disk_budget.is_some() {
+                let refusal =
+                    self.disk_prestart_refusal("worker process identity setup is unavailable", 125);
+                (remote_build_watchdog_script_with_refusal(&refusal), refusal)
+            } else {
+                (
+                    remote_build_watchdog_script(),
+                    format!(
+                        "printf '\\n%s\\n' {} >&2; exit 125",
+                        self.remote_process_setup_marker()
+                    ),
+                )
+            };
+            let watchdog = escape(Cow::Owned(watchdog));
 
             // Darwin provides setsid(2), but not setsid(1). Use the same
             // isolated Python syscall/exec path as the owned-group child;
@@ -4808,15 +5158,15 @@ impl TransferPipeline {
 Darwin) set -- python3 -I -S -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])';; \
 *) set -- setsid;; esac; \
 if ! command -v \"$1\" >/dev/null 2>&1; then \
-printf '\\n%s\\n' {} >&2; exit 125; fi; \
+{}; fi; \
 mkdir -p {} && rm -f {} && \
 \"$@\" sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
-                self.remote_process_setup_marker(),
+                setup_refusal,
                 escaped_run_dir,
                 escaped_pgid_file,
                 watchdog,
                 escaped_pgid_file,
-                external_timeout_secs,
+                watchdog_timeout_secs,
                 self.deadline_marker,
                 build_id,
                 escaped_command,
@@ -4824,6 +5174,7 @@ mkdir -p {} && rm -f {} && \
         } else {
             timeout_wrapped_command
         };
+        let execution_command = self.with_disk_receipt_replay(execution_command);
 
         // Per-job rustc cap (issue #49). Exported in the outer session so
         // explicit worker/command/project settings all still win; see
@@ -6244,6 +6595,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let result = self
                 .execute_over_ssh_streaming(worker, &wrapped_command, |_| {}, |_| {})
                 .await?;
+            self.ensure_remote_disk_budget(&result)?;
             self.ensure_remote_process_setup(&result)?;
 
             if result.success() {
@@ -11569,6 +11921,342 @@ Number of files transferred: 42
             "timeout: sending signal KILL to command 'sh'".into(),
         ] {
             assert!(!first.is_deadline_marker(&unrelated), "{unrelated}");
+        }
+    }
+
+    fn disk_budget_test_pipeline(
+        directory: &Path,
+        build_id: Option<u64>,
+        seconds: u64,
+    ) -> TransferPipeline {
+        TransferPipeline::new(
+            directory.to_path_buf(),
+            "disk-test".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(directory.to_str().unwrap())
+        .with_env_allowlist(Vec::new())
+        .with_build_id(build_id)
+        .with_disk_budget(Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: 8 << 20,
+            min_free_bytes: 1 << 20,
+        }))
+        .with_compilation_config(rch_common::CompilationConfig {
+            build_timeout_sec: seconds,
+            external_timeout_enabled: true,
+            remote_build_jobs: RemoteBuildJobs::Off,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn disk_budget_receipts_require_exact_nonce_budget_completion_and_status() {
+        let pipeline = disk_budget_test_pipeline(Path::new("/tmp/disk-marker-test"), Some(1), 20);
+        let other = disk_budget_test_pipeline(Path::new("/tmp/disk-marker-test"), Some(1), 20);
+        let marker = format!("{}\n", pipeline.disk_failure_line("prestart", false));
+        assert!(!pipeline.parse_disk_budget_marker(&marker).unwrap().started);
+        assert!(
+            pipeline
+                .parse_disk_budget_marker(marker.trim_end())
+                .is_none()
+        );
+        assert!(other.parse_disk_budget_marker(&marker).is_none());
+        let mut usage = serde_json::json!({
+            "max_growth_bytes": 8 << 20, "min_free_bytes": 1 << 20,
+            "peak_output_bytes": 30 << 20, "peak_growth_bytes": 1 << 20,
+            "complete": true, "exit_code": 0,
+        });
+        let usage_line = |value: &serde_json::Value| {
+            format!("{}_DISK_USAGE:{value}\n", pipeline.deadline_marker)
+        };
+        assert_eq!(
+            pipeline.parse_disk_usage_marker(&usage_line(&usage)),
+            Some(30 << 20)
+        );
+        assert_eq!(
+            pipeline.parse_disk_usage_exit_code(&usage_line(&usage)),
+            Some(0)
+        );
+        let wrong_completion = CommandResult {
+            exit_code: 137,
+            stderr: usage_line(&usage),
+            stdout: String::new(),
+            duration_ms: 0,
+        };
+        assert!(
+            pipeline
+                .ensure_remote_disk_budget(&wrong_completion)
+                .unwrap_err()
+                .is::<RemoteExecutionUnconfirmed>()
+        );
+        usage["complete"] = false.into();
+        assert!(
+            pipeline
+                .parse_disk_usage_marker(&usage_line(&usage))
+                .is_none()
+        );
+        usage["complete"] = true.into();
+        usage["max_growth_bytes"] = 9.into();
+        assert!(
+            pipeline
+                .parse_disk_usage_marker(&usage_line(&usage))
+                .is_none()
+        );
+
+        for status in [120, 125] {
+            let result = CommandResult {
+                exit_code: status,
+                stderr: marker.clone(),
+                stdout: String::new(),
+                duration_ms: 0,
+            };
+            let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
+            assert!(
+                !error
+                    .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+                    .unwrap()
+                    .started
+            );
+        }
+        let mismatch = CommandResult {
+            exit_code: 0,
+            stderr: marker,
+            stdout: String::new(),
+            duration_ms: 0,
+        };
+        assert!(
+            pipeline
+                .ensure_remote_disk_budget(&mismatch)
+                .unwrap_err()
+                .is::<RemoteExecutionUnconfirmed>()
+        );
+        usage["max_growth_bytes"] = (8 << 20).into();
+        usage["complete"] = false.into();
+        usage["exit_code"] = 137.into();
+        let incomplete = CommandResult {
+            exit_code: 137,
+            stderr: usage_line(&usage),
+            stdout: String::new(),
+            duration_ms: 0,
+        };
+        assert!(
+            pipeline
+                .ensure_remote_disk_budget(&incomplete)
+                .unwrap_err()
+                .is::<RemoteExecutionUnconfirmed>()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_real_shell_preserves_small_build_status_and_deadlines() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (index, (build_id, script, status, deadline, seconds)) in [
+            (
+                None,
+                "printf small > workspace-output; printf 'small-ok'",
+                0,
+                false,
+                15,
+            ),
+            (
+                Some(1),
+                "printf small > workspace-output; printf 'small-ok'",
+                0,
+                false,
+                15,
+            ),
+            (Some(2), "exit 101", 101, false, 15),
+            (None, "exit 137", 137, false, 15),
+            (Some(3), "exec sleep 20", 137, true, 1),
+            (None, "exec sleep 20", 137, true, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = retained.join(index.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let pipeline = disk_budget_test_pipeline(&directory, build_id, seconds);
+            let output = run_external_timeout_fixture(
+                &directory,
+                &pipeline.build_remote_command(script, None),
+            )
+            .await;
+            let result = CommandResult {
+                exit_code: output.status.code().unwrap(),
+                stdout: String::from_utf8(output.stdout).unwrap(),
+                stderr: String::from_utf8(output.stderr).unwrap(),
+                duration_ms: 0,
+            };
+            assert_eq!(result.exit_code, status, "case {index}: {result:?}");
+            pipeline.ensure_remote_disk_budget(&result).unwrap();
+            assert_eq!(
+                result
+                    .stderr
+                    .lines()
+                    .any(|line| pipeline.is_deadline_marker(line)),
+                deadline,
+                "{result:?}"
+            );
+            assert!(
+                !result
+                    .stderr
+                    .split_inclusive('\n')
+                    .any(|line| pipeline.parse_disk_budget_marker(line).is_some()),
+                "{result:?}"
+            );
+            if status == 0 {
+                assert_eq!(result.stdout, "small-ok");
+                assert_eq!(
+                    std::fs::read(directory.join("workspace-output")).unwrap(),
+                    b"small"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_real_shell_workspace_growth_is_typed_and_artifacts_remain() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap().keep();
+        let pipeline = disk_budget_test_pipeline(&directory, Some(7), 15).with_disk_budget(Some(
+            rch_common::BuildDiskBudget {
+                max_growth_bytes: 1 << 20,
+                min_free_bytes: 1 << 20,
+            },
+        ));
+        let output = run_external_timeout_fixture(
+            &directory,
+            &pipeline.build_remote_command(
+                "head -c 2097152 /dev/zero > workspace-output; exec sleep 20",
+                None,
+            ),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
+        let failure = error
+            .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+            .unwrap();
+        assert!(failure.started, "{result:?}");
+        assert_eq!(failure.reason, "growth");
+        assert!(failure.peak_output_bytes.unwrap() >= 2 << 20);
+        assert_eq!(
+            std::fs::metadata(directory.join("workspace-output"))
+                .unwrap()
+                .len(),
+            2 << 20
+        );
+        assert!(
+            !result
+                .stderr
+                .split_inclusive('\n')
+                .any(|line| pipeline.parse_disk_usage_marker(line).is_some())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_real_shell_refuses_prestart_and_reused_receipts() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for build_id in [None, Some(9)] {
+            let directory = retained.join(if build_id.is_some() {
+                "tracked"
+            } else {
+                "standalone"
+            });
+            std::fs::create_dir(&directory).unwrap();
+            let pipeline = disk_budget_test_pipeline(&directory, build_id, 15).with_disk_budget(
+                Some(rch_common::BuildDiskBudget {
+                    max_growth_bytes: 1 << 20,
+                    min_free_bytes: 1 << 62,
+                }),
+            );
+            let command = pipeline.build_remote_command("printf started > workload-started", None);
+            let output = run_external_timeout_fixture(&directory, &command).await;
+            let result = CommandResult {
+                exit_code: output.status.code().unwrap(),
+                stdout: String::from_utf8(output.stdout).unwrap(),
+                stderr: String::from_utf8(output.stderr).unwrap(),
+                duration_ms: 0,
+            };
+            let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
+            let failure = error
+                .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+                .unwrap();
+            assert!(!failure.started, "{result:?}");
+            assert_eq!(failure.reason, "admission");
+            assert!(!directory.join("workload-started").exists());
+            let repeated = run_external_timeout_fixture(&directory, &command).await;
+            let stderr = String::from_utf8(repeated.stderr).unwrap();
+            let failure = stderr
+                .split_inclusive('\n')
+                .find_map(|line| pipeline.parse_disk_budget_marker(line))
+                .unwrap();
+            assert!(
+                failure.started,
+                "reusing an attempt must never authorize replay: {stderr}"
+            );
+            assert!(!directory.join("workload-started").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_budget_missing_capability_has_durable_exact_prestart_receipt() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (name, build_id, expected) in [("python", None, 120), ("setsid", Some(11), 125)] {
+            let directory = retained.join(name);
+            let bin = directory.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            // Let every setup/receipt operation succeed. Only the intended
+            // supervisor/session capability is absent from this real PATH.
+            for tool in [
+                "sh", "touch", "mkdir", "rm", "chmod", "uname", "wc", "grep", "cat",
+            ] {
+                std::os::unix::fs::symlink(format!("/bin/{tool}"), bin.join(tool)).unwrap();
+            }
+            let pipeline = disk_budget_test_pipeline(&directory, build_id, 15);
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &pipeline.build_remote_command("printf started > workload-started", None),
+                ])
+                .env_clear()
+                .env("HOME", &directory)
+                .env("PATH", &bin)
+                .output()
+                .unwrap();
+            let result = CommandResult {
+                exit_code: output.status.code().unwrap(),
+                stdout: String::from_utf8(output.stdout).unwrap(),
+                stderr: String::from_utf8(output.stderr).unwrap(),
+                duration_ms: 0,
+            };
+            assert_eq!(result.exit_code, expected, "{name}: {result:?}");
+            let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
+            let failure = error
+                .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+                .unwrap();
+            assert!(!failure.started, "{name}: {result:?}");
+            assert_eq!(failure.reason, "monitor_unavailable");
+            let receipt =
+                std::fs::read_to_string(pipeline.remote_disk_receipt_path().unwrap()).unwrap();
+            let durable = receipt
+                .split_inclusive('\n')
+                .find_map(|line| pipeline.parse_disk_budget_marker(line))
+                .unwrap();
+            assert!(!durable.started);
+            assert!(!directory.join("workload-started").exists());
         }
     }
 

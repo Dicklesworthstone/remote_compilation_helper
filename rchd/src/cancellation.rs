@@ -917,6 +917,7 @@ impl CancellationOrchestrator {
                     exit_code: 130,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: Some(cancellation),
                 },

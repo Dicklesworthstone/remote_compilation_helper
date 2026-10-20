@@ -3853,6 +3853,7 @@ mod tests {
                 speed_score: 90.0,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: None,
             }),
             reason: rch_common::SelectionReason::Success,
             diagnostics: Some(diagnostics),

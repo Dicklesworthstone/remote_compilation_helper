@@ -98,6 +98,9 @@ pub mod tool_requirement;
 pub mod toolchain;
 pub mod transfer_hardening;
 pub mod types;
+
+/// Standard-library-only worker guard shared by SSH and direct execution.
+pub const REMOTE_BUILD_DISK_MONITOR_SCRIPT: &str = include_str!("../build_disk_monitor.py");
 pub mod ui;
 pub mod util;
 pub mod worker_config_validation;
@@ -282,8 +285,8 @@ pub use transfer_hardening::{
 };
 pub use types::{
     AffinityConfig, ApiConfig, BoxRole, BuildCancellationMetadata, BuildCancellationWorkerHealth,
-    BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats,
-    CircuitBreakerConfig, CircuitState, CircuitStats, ColorMode, CommandPriority,
+    BuildDiskBudget, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord,
+    BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats, ColorMode, CommandPriority,
     CommandTimingBreakdown, CompilationConfig, CompilationMetrics, CompilationTimer,
     CompilationTimingBreakdown, DashboardConfig, DoctorConfig, DoctorWebhookEndpoint,
     DoctorWebhookFormat, DoctorWebhooksConfig, EnvironmentConfig, ExecutionConfig, FairnessConfig,

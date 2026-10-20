@@ -1671,6 +1671,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut exit_code = None;
         let mut duration_ms = None;
         let mut bytes_transferred = None;
+        let mut disk_peak_output_bytes = None;
         let mut local_wrapper_id = None;
         let mut worker_fault = false;
         let mut worker_disk_full = false;
@@ -1690,9 +1691,23 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "worker" => worker_id = Some(percent_unescape_query_value(value)),
                 "slots" => slots = value.parse().ok(),
                 "build_id" => build_id = value.parse().ok(),
-                "exit_code" => exit_code = value.parse().ok(),
+                "exit_code" => {
+                    anyhow::ensure!(exit_code.is_none(), "Duplicate release exit code");
+                    exit_code = Some(value.parse::<i32>().context("Invalid release exit code")?);
+                }
                 "duration_ms" => duration_ms = value.parse().ok(),
                 "bytes_transferred" => bytes_transferred = value.parse().ok(),
+                "disk_peak_output_bytes" => {
+                    anyhow::ensure!(
+                        disk_peak_output_bytes.is_none(),
+                        "Duplicate disk peak output measurement"
+                    );
+                    disk_peak_output_bytes = Some(
+                        value
+                            .parse::<u64>()
+                            .context("Invalid disk peak output measurement")?,
+                    );
+                }
                 "local_wrapper_id" => local_wrapper_id = Some(percent_unescape_query_value(value)),
                 "worker_fault" => worker_fault = matches!(value, "1" | "true"),
                 "worker_disk_full" => worker_disk_full = matches!(value, "1" | "true"),
@@ -1712,6 +1727,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let worker_id = worker_id.ok_or_else(|| anyhow!("Missing 'worker' parameter"))?;
         let slots = slots.unwrap_or(0);
 
+        anyhow::ensure!(
+            disk_peak_output_bytes.is_none() || exit_code.is_some(),
+            "Disk output measurement requires an explicit release exit code"
+        );
         return Ok(ApiRequest::ReleaseWorker(ReleaseRequest {
             worker_id: rch_common::WorkerId::new(worker_id),
             slots,
@@ -1719,6 +1738,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             exit_code,
             duration_ms,
             bytes_transferred,
+            disk_peak_output_bytes,
             local_wrapper_id,
             timing: None,
             worker_fault,
@@ -2562,6 +2582,7 @@ async fn handle_select_worker_dry_run(
                 speed_score,
                 declared_os: rch_common::declared_os(&config.tags),
                 project_lane: 0,
+                disk_budget: ctx.worker_selector.build_disk_budget(request),
             })
         }
         None => None,
@@ -2852,6 +2873,24 @@ async fn handle_select_worker_mode(
                         .clone()
                         .unwrap_or_else(|| "<unknown>".to_string());
 
+                    let disk_budget = ctx.worker_selector.build_disk_budget(request);
+                    let disk = crate::disk_pressure::DiskHeadroomAdmission {
+                        requested_gib: disk_budget.map_or(0, |budget| {
+                            u32::try_from(
+                                budget
+                                    .max_growth_bytes
+                                    .div_ceil(rch_common::BuildDiskBudget::GIB),
+                            )
+                            .unwrap_or(u32::MAX)
+                        }),
+                        floor_gib: disk_budget.map_or(0, |budget| {
+                            budget
+                                .min_free_bytes
+                                .div_ceil(rch_common::BuildDiskBudget::GIB)
+                        }),
+                        capacity: worker.disk_capacity_observation().await,
+                    };
+
                     let admission = ctx.history.try_start_active_build_in_lanes(
                         request.project.clone(),
                         id.as_str().to_string(),
@@ -2861,10 +2900,7 @@ async fn handle_select_worker_mode(
                         reserve_slots,
                         rch_common::BuildLocation::Remote,
                         waiter,
-                        crate::disk_pressure::DiskHeadroomAdmission {
-                            requested_gib: request.disk_headroom_gib,
-                            capacity: worker.disk_capacity_observation().await,
-                        },
+                        disk,
                         Some(selected_endpoint.clone()),
                         ctx.pool.project_lanes(id.as_str()),
                     );
@@ -2941,6 +2977,32 @@ async fn handle_select_worker_mode(
                             speed_score,
                             declared_os,
                             project_lane: state.project_lane,
+                            disk_budget: if state.disk_headroom_gib != 0 {
+                                Some(rch_common::BuildDiskBudget {
+                                    max_growth_bytes: u64::from(state.disk_headroom_gib)
+                                        * rch_common::BuildDiskBudget::GIB,
+                                    min_free_bytes: state
+                                        .disk_floor_gib
+                                        .saturating_mul(rch_common::BuildDiskBudget::GIB),
+                                })
+                            } else if state.recovered {
+                                // Legacy live rows are charged a cold allowance by
+                                // history, and replay must enforce the same charge.
+                                Some(rch_common::BuildDiskBudget {
+                                    max_growth_bytes: u64::from(
+                                        rch_common::BuildDiskBudget::growth_budget_gib(f64::from(
+                                            rch_common::BuildDiskBudget::cold_growth_gib(
+                                                &state.command,
+                                            )
+                                            .unwrap_or(16),
+                                        )),
+                                    ) * rch_common::BuildDiskBudget::GIB,
+                                    min_free_bytes: disk_budget
+                                        .map_or(0, |budget| budget.min_free_bytes),
+                                })
+                            } else {
+                                None
+                            },
                         }),
                         reason: selection_reason,
                         build_id,
@@ -3794,6 +3856,10 @@ fn lease_waits_for_restart_admission(lease: &DurableJobLease) -> bool {
 
 /// Handle a release-worker request.
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
+    anyhow::ensure!(
+        request.disk_peak_output_bytes.is_none() || request.exit_code.is_some(),
+        "Disk output measurement requires an explicit release exit code"
+    );
     let _release_guard = ctx.history.lock_releases().await;
     let started = std::time::Instant::now();
     let exit_code = request.exit_code.unwrap_or(0);
@@ -3808,6 +3874,7 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
                     exit_code,
                     duration_ms: request.duration_ms,
                     bytes_transferred: request.bytes_transferred,
+                    disk_peak_output_bytes: request.disk_peak_output_bytes,
                     timing: request.timing,
                     cancellation: None,
                 },
@@ -5148,10 +5215,13 @@ mod tests {
             crate::alerts::AlertConfig::default(),
         ));
         let events = EventBus::new(16);
+        let history = Arc::new(BuildHistory::new(100));
+        let mut selector = WorkerSelector::new();
+        selector.set_build_history(history.clone());
         DaemonContext {
             pool,
-            worker_selector: Arc::new(WorkerSelector::new()),
-            history: Arc::new(BuildHistory::new(100)),
+            worker_selector: Arc::new(selector),
+            history,
             telemetry: Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             benchmark_trigger: make_test_benchmark_trigger(),
@@ -5193,6 +5263,20 @@ mod tests {
         handle
     }
 
+    fn replace_test_history(ctx: &mut DaemonContext, history: BuildHistory) {
+        let history = Arc::new(history);
+        Arc::make_mut(&mut ctx.worker_selector).set_build_history(Arc::clone(&history));
+        ctx.history = history;
+    }
+
+    async fn set_test_build_disk(pool: &WorkerPool, worker_id: &str, free_gib: f64) {
+        let worker = pool.get(&WorkerId::new(worker_id)).await.unwrap();
+        let mut capabilities = worker.capabilities().await;
+        capabilities.build_disk_free_gb = Some(free_gib);
+        capabilities.build_disk_total_gb = Some(200.0);
+        worker.set_capabilities(capabilities).await;
+    }
+
     /// Interrupt the actual waiting handler only after its queue row is durable,
     /// then construct a fresh history manager exactly as daemon startup does.
     async fn queue_resume_fixture(
@@ -5215,6 +5299,7 @@ mod tests {
         let path = tmp.path().join("history.jsonl");
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("requested", 4)).await;
+        set_test_build_disk(&pool, "requested", 100.0).await;
         assert!(
             pool.get(&WorkerId::new("requested"))
                 .await
@@ -5224,7 +5309,10 @@ mod tests {
         );
         let mut ctx = make_test_context(pool);
         ctx.queue_timeout_secs = queue_timeout_secs;
-        ctx.history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(10).with_persistence(path.clone()),
+        );
         let request = SelectionRequest {
             project: "resume-project".into(),
             command: Some("cargo build".into()),
@@ -5263,7 +5351,7 @@ mod tests {
         let queue_id = ctx.history.queued_builds()[0].id;
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
-        ctx.history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap());
+        replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 10).unwrap());
         assert!(ctx.history.queued_build(queue_id).unwrap().recovered);
         (tmp, ctx, request, wrapper, queue_id)
     }
@@ -5406,8 +5494,10 @@ mod tests {
         snapshot["queued"][0]["queued_at"] =
             serde_json::json!((Utc::now() - ChronoDuration::seconds(2)).to_rfc3339());
         std::fs::write(&ownership, serde_json::to_vec(&snapshot).unwrap()).unwrap();
-        ctx.history =
-            Arc::new(BuildHistory::load_from_file(&tmp.path().join("history.jsonl"), 10).unwrap());
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::load_from_file(&tmp.path().join("history.jsonl"), 10).unwrap(),
+        );
         // Increasing daemon configuration cannot extend the persisted deadline.
         ctx.queue_timeout_secs = 600;
         let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
@@ -5652,7 +5742,10 @@ mod tests {
                 .await;
         }
         let mut ctx = make_test_context(pool);
-        ctx.history = Arc::new(BuildHistory::new(100).with_persistence(history_path.clone()));
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(100).with_persistence(history_path.clone()),
+        );
         ctx.worker_selector = Arc::new(crate::daemon_worker_selector(
             &rch_common::RchConfig::default(),
             Arc::clone(&ctx.history),
@@ -5707,6 +5800,7 @@ mod tests {
         assert_eq!(worker.used_slots(), 1);
 
         let release = |owner: &str| ReleaseRequest {
+            disk_peak_output_bytes: None,
             local_wrapper_id: Some(owner.into()),
             worker_id: WorkerId::new("large"),
             slots: 99,
@@ -5785,6 +5879,185 @@ mod tests {
         assert_eq!(worker.used_slots(), 1);
     }
 
+    #[tokio::test]
+    async fn automatic_disk_budget_api_relocates_reported_21_gib_test_and_admits_small_control() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap().keep();
+        let history_path = directory.join("history.jsonl");
+        let pool = WorkerPool::new();
+        for (id, free_gib) in [("hz3", 33.0), ("spare", 100.0)] {
+            pool.add_worker(make_test_worker(id, 8)).await;
+            set_test_build_disk(&pool, id, free_gib).await;
+        }
+        let mut ctx = make_test_context(pool);
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(100).with_persistence(history_path.clone()),
+        );
+        let gib = rch_common::BuildDiskBudget::GIB;
+
+        // Feed attributed measurements through admitted, owner-checked API
+        // completions. The reported failed 21 GiB build stays a lower bound;
+        // it must never be treated as evidence of a successful small build.
+        for (project, peak_gib, exit_code) in [("frankennumpy", 21, 101), ("small-control", 2, 0)] {
+            set_test_build_disk(&ctx.pool, "spare", 100.0).await;
+            let ApiRequest::SelectWorker { request, .. } = parse_request(&format!(
+                "GET /select-worker?project={project}&command=cargo%20test%20--workspace&cores=1&worker=spare&runtime=none",
+            ))
+            .unwrap() else {
+                panic!("expected ordinary selection request")
+            };
+            assert_eq!(request.disk_headroom_gib, 0);
+            let owner = format!("rchw-measured-{project}");
+            let response =
+                handle_select_worker_with_wrapper(&ctx, request, false, None, Some(owner.clone()))
+                    .await
+                    .unwrap();
+            let selected = response.worker.expect("cold build fits the spare worker");
+            assert_eq!(selected.id.as_str(), "spare");
+            let budget = selected.disk_budget.expect("automatic command budget");
+            assert_eq!(budget.max_growth_bytes, 40 * gib);
+            let build_id = response.build_id.unwrap();
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("spare"), 40);
+            let heartbeat = handle_build_heartbeat(
+                &ctx,
+                BuildHeartbeatRequest {
+                    build_id,
+                    worker_id: WorkerId::new("spare"),
+                    hook_pid: None,
+                    local_wrapper_id: Some(owner.clone()),
+                    remote_pgid_file: None,
+                    phase: rch_common::BuildHeartbeatPhase::Execute,
+                    detail: None,
+                    progress_counter: Some(1),
+                    progress_percent: None,
+                },
+            )
+            .await;
+            assert_eq!(heartbeat.status, "ok");
+
+            let ApiRequest::ReleaseWorker(receipt) = parse_request(&format!(
+                "POST /release-worker?worker=spare&build_id={build_id}&local_wrapper_id={owner}&exit_code={exit_code}&disk_peak_output_bytes={}",
+                peak_gib * gib,
+            ))
+            .unwrap() else {
+                panic!("expected measured release receipt")
+            };
+            let mut wrong_owner = receipt.clone();
+            wrong_owner.local_wrapper_id = Some("rchw-other-owner".into());
+            assert!(handle_release_worker(&ctx, wrong_owner).await.is_err());
+            assert_eq!(
+                ctx.history
+                    .learned_footprint_gib(project, "cargo test --workspace"),
+                None,
+            );
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("spare"), 40);
+            handle_release_worker(&ctx, receipt).await.unwrap();
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("spare"), 0);
+            assert_eq!(
+                ctx.history
+                    .terminal_build(build_id, &owner)
+                    .unwrap()
+                    .exit_code,
+                exit_code,
+            );
+        }
+
+        // Startup must bind placement and admission to the same persisted
+        // measurements, including the failed build's conservative cold floor.
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::load_from_file(&history_path, 100).unwrap(),
+        );
+        assert_eq!(
+            ctx.history
+                .learned_footprint_gib("frankennumpy", "cargo test --workspace"),
+            Some(32.0),
+        );
+        assert_eq!(
+            ctx.history
+                .learned_footprint_gib("small-control", "cargo test --workspace"),
+            Some(2.0),
+        );
+        for (id, free_gib) in [("hz3", 33.0), ("spare", 100.0)] {
+            set_test_build_disk(&ctx.pool, id, free_gib).await;
+        }
+        let ApiRequest::SelectWorker { request, .. } = parse_request(
+            "GET /select-worker?project=frankennumpy&command=cargo%20test%20--workspace&cores=1&runtime=none",
+        )
+        .unwrap() else {
+            panic!("expected automatic admission request")
+        };
+        let preview = handle_select_worker_dry_run(&ctx, &request).await;
+        let preview_worker = preview.worker.expect("preview finds the safe spare");
+        assert_eq!(preview_worker.id.as_str(), "spare");
+        let expected_budget = preview_worker.disk_budget.unwrap();
+        assert_eq!(expected_budget.max_growth_bytes, 40 * gib);
+        assert_eq!(expected_budget.min_free_bytes, 10 * gib);
+        assert!(preview.build_id.is_none());
+        assert!(ctx.history.active_builds().is_empty());
+
+        let mut forced = request.clone();
+        forced.preferred_workers = vec![WorkerId::new("hz3")];
+        let refused = handle_select_worker_with_wrapper(
+            &ctx,
+            forced,
+            false,
+            None,
+            Some("rchw-forced-incident-retry".into()),
+        )
+        .await
+        .unwrap();
+        assert!(refused.worker.is_none());
+        assert!(refused.build_id.is_none());
+        assert!(refused.diagnostics.unwrap().workers.iter().any(|worker| {
+            worker.worker_id.as_str() == "hz3"
+                && worker
+                    .reason_codes
+                    .iter()
+                    .any(|code| code.starts_with("disk_headroom"))
+        }),);
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("hz3"), 0);
+
+        let relocated = handle_select_worker_with_wrapper(
+            &ctx,
+            request.clone(),
+            false,
+            None,
+            Some("rchw-safe-incident-retry".into()),
+        )
+        .await
+        .unwrap();
+        let selected = relocated.worker.unwrap();
+        assert_eq!(selected.id.as_str(), "spare");
+        assert_eq!(selected.disk_budget, Some(expected_budget));
+        let active = ctx
+            .history
+            .active_build(relocated.build_id.unwrap())
+            .unwrap();
+        assert_eq!(active.disk_headroom_gib, 40);
+        assert_eq!(active.disk_floor_gib, 10);
+
+        let mut small = request;
+        small.project = "small-control".into();
+        small.preferred_workers = vec![WorkerId::new("hz3")];
+        let admitted = handle_select_worker_with_wrapper(
+            &ctx,
+            small,
+            false,
+            None,
+            Some("rchw-small-control".into()),
+        )
+        .await
+        .unwrap();
+        let selected = admitted.worker.expect("measured small build fits hz3");
+        assert_eq!(selected.id.as_str(), "hz3");
+        assert_eq!(selected.disk_budget.unwrap().max_growth_bytes, 4 * gib);
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("hz3"), 4);
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("spare"), 40);
+        assert_eq!(ctx.history.active_builds().len(), 2);
+    }
+
     #[test]
     fn test_parse_request_basic() {
         let _guard = test_guard!();
@@ -5832,6 +6105,7 @@ mod tests {
         let _guard = test_guard!();
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("dry-worker", 8)).await;
+        set_test_build_disk(&pool, "dry-worker", 100.0).await;
         let worker = pool.get(&WorkerId::new("dry-worker")).await.unwrap();
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
@@ -6610,12 +6884,16 @@ mod tests {
         for by_queue_id in [false, true] {
             let pool = WorkerPool::new();
             pool.add_worker(make_test_worker("requested", 4)).await;
+            set_test_build_disk(&pool, "requested", 100.0).await;
             let worker = pool.get(&WorkerId::new("requested")).await.unwrap();
             assert!(worker.reserve_slots(4).await);
             let tmp = tempfile::TempDir::new().unwrap();
             let path = tmp.path().join("history.jsonl");
             let mut ctx = make_test_context(pool);
-            ctx.history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+            replace_test_history(
+                &mut ctx,
+                BuildHistory::new(10).with_persistence(path.clone()),
+            );
             let wrapper = format!("rchw-{}", Uuid::new_v4());
             let request = SelectionRequest {
                 job_mode: false,
@@ -6692,7 +6970,7 @@ mod tests {
             assert_eq!(ctx.history.queue_depth(), 0);
             assert_eq!(worker.available_slots().await, 4);
 
-            ctx.history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap());
+            replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 10).unwrap());
             let retry = handle_select_worker_with_wrapper(
                 &ctx,
                 request,
@@ -7601,8 +7879,10 @@ mod tests {
         let non_directory = directory.path().join("not-a-directory");
         std::fs::write(&non_directory, "a regular file").unwrap();
         let mut ctx = make_test_context(WorkerPool::new());
-        ctx.history =
-            Arc::new(BuildHistory::new(10).with_persistence(non_directory.join("history.jsonl")));
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(10).with_persistence(non_directory.join("history.jsonl")),
+        );
         let failure = ctx
             .history
             .try_start_active_build_with_wrapper(
@@ -7674,6 +7954,7 @@ mod tests {
     async fn test_handle_select_worker_tracks_active_build_when_hook_pid_present() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
+        set_test_build_disk(&pool, "worker1", 100.0).await;
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
@@ -7719,6 +8000,7 @@ mod tests {
             &ctx,
             ReleaseRequest {
                 local_wrapper_id: Some("rchw-daemon-correlation".to_string()),
+                disk_peak_output_bytes: None,
                 worker_id: WorkerId::new("worker1"),
                 slots: 2,
                 build_id: Some(build_id),
@@ -7827,6 +8109,7 @@ mod tests {
     async fn queue_hold_steers_younger_requests_off_the_held_worker() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("held", 3)).await;
+        set_test_build_disk(&pool, "held", 100.0).await;
         let ctx = make_test_context(pool);
         let request = |hook_pid| SelectionRequest {
             job_mode: false,
@@ -7886,6 +8169,7 @@ mod tests {
     async fn test_handle_select_worker_blocks_same_project_on_same_worker() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
+        set_test_build_disk(&pool, "worker1", 100.0).await;
 
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
@@ -7953,6 +8237,8 @@ mod tests {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
         pool.add_worker(make_test_worker("worker2", 8)).await;
+        set_test_build_disk(&pool, "worker1", 100.0).await;
+        set_test_build_disk(&pool, "worker2", 100.0).await;
 
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
@@ -8013,6 +8299,8 @@ mod tests {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
         pool.add_worker(make_test_worker("worker2", 8)).await;
+        set_test_build_disk(&pool, "worker1", 100.0).await;
+        set_test_build_disk(&pool, "worker2", 100.0).await;
 
         let ctx = make_test_context(pool);
         let shard = |pid: u32, job_mode: bool| SelectionRequest {
@@ -8063,6 +8351,7 @@ mod tests {
     async fn test_handle_select_worker_allows_different_projects_on_same_worker() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
+        set_test_build_disk(&pool, "worker1", 100.0).await;
 
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
@@ -8791,6 +9080,45 @@ mod tests {
                 unreachable!("expected release worker request for {query}");
             };
             assert_eq!(req.worker_fault, expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn test_parse_release_disk_peak_requires_one_unsigned_measurement() {
+        let ApiRequest::ReleaseWorker(request) = parse_request(
+            "POST /release-worker?worker=hz3&exit_code=0&disk_peak_output_bytes=22548578304",
+        )
+        .unwrap() else {
+            panic!("expected release")
+        };
+        assert_eq!(
+            request.disk_peak_output_bytes,
+            Some(21 * rch_common::BuildDiskBudget::GIB),
+        );
+        for suffix in [
+            "-1",
+            "NaN",
+            "18446744073709551616",
+            "1&disk_peak_output_bytes=2",
+        ] {
+            assert!(
+                parse_request(&format!(
+                    "POST /release-worker?worker=hz3&exit_code=0&disk_peak_output_bytes={suffix}",
+                ))
+                .is_err(),
+            );
+        }
+    }
+
+    #[test]
+    fn disk_peak_requires_an_explicit_unambiguous_terminal_status() {
+        for status in ["", "&exit_code=bad", "&exit_code=1&exit_code=0"] {
+            assert!(
+                parse_request(&format!(
+                    "POST /release-worker?worker=hz3{status}&disk_peak_output_bytes=2147483648",
+                ))
+                .is_err()
+            );
         }
     }
 
@@ -9843,6 +10171,7 @@ mod tests {
 
     fn disk_fault_release_request(build_id: u64) -> ReleaseRequest {
         ReleaseRequest {
+            disk_peak_output_bytes: None,
             local_wrapper_id: Some("disk-owner".into()),
             worker_id: WorkerId::new("worker1"),
             slots: 2,
@@ -9869,7 +10198,10 @@ mod tests {
             let pool = WorkerPool::new();
             pool.add_worker(make_test_worker("worker1", 8)).await;
             let mut ctx = make_test_context(pool);
-            ctx.history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+            replace_test_history(
+                &mut ctx,
+                BuildHistory::new(10).with_persistence(history_path.clone()),
+            );
             ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
                 BypassRecordStore::with_path(&store_path),
             )));
@@ -9900,6 +10232,7 @@ mod tests {
                     crate::history::BuildCompletion {
                         exit_code: 101,
                         duration_ms: Some(50),
+                        disk_peak_output_bytes: None,
                         bytes_transferred: None,
                         timing: None,
                         cancellation: None,
@@ -9945,7 +10278,10 @@ mod tests {
             // replay must never release it on behalf of the terminal build.
             assert!(worker.reserve_slots(3).await);
             let mut restored = make_test_context(pool);
-            restored.history = Arc::new(BuildHistory::load_from_file(&history_path, 10).unwrap());
+            replace_test_history(
+                &mut restored,
+                BuildHistory::load_from_file(&history_path, 10).unwrap(),
+            );
             let store = Arc::new(tokio::sync::Mutex::new(BypassRecordStore::load(
                 &store_path,
             )));
@@ -9981,7 +10317,10 @@ mod tests {
             store.lock().await.remove("worker1").unwrap();
             worker.recover_to_canary().await.unwrap();
             worker.promote_from_canary().await.unwrap();
-            restored.history = Arc::new(BuildHistory::load_from_file(&history_path, 10).unwrap());
+            replace_test_history(
+                &mut restored,
+                BuildHistory::load_from_file(&history_path, 10).unwrap(),
+            );
             replay_pending_disk_faults(&restored).await.unwrap();
             handle_release_worker(&restored, duplicate).await.unwrap();
             assert!(!store.lock().await.contains("worker1"));
@@ -10003,7 +10342,10 @@ mod tests {
         let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
         assert!(worker.reserve_slots(5).await);
         let mut ctx = make_test_context(pool);
-        ctx.history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(10).with_persistence(history_path.clone()),
+        );
         let store = Arc::new(tokio::sync::Mutex::new(BypassRecordStore::with_path(
             &store_path,
         )));
@@ -10074,8 +10416,10 @@ mod tests {
                 pool.add_worker(original.clone()).await;
                 let mut worker = pool.get(&original.id).await.unwrap();
                 let mut ctx = make_test_context(pool);
-                ctx.history =
-                    Arc::new(BuildHistory::new(100).with_persistence(history_path.clone()));
+                replace_test_history(
+                    &mut ctx,
+                    BuildHistory::new(100).with_persistence(history_path.clone()),
+                );
                 if durable_store {
                     ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
                         BypassRecordStore::with_path(&store_path),
@@ -10121,6 +10465,7 @@ mod tests {
                             crate::history::BuildCompletion {
                                 exit_code: 101,
                                 duration_ms: None,
+                                disk_peak_output_bytes: None,
                                 bytes_transferred: None,
                                 timing: None,
                                 cancellation: None,
@@ -10129,8 +10474,10 @@ mod tests {
                         )
                         .unwrap()
                         .unwrap();
-                    ctx.history =
-                        Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                    replace_test_history(
+                        &mut ctx,
+                        BuildHistory::load_from_file(&history_path, 100).unwrap(),
+                    );
                     ctx.pool = WorkerPool::new();
                     ctx.pool.add_worker(replacement).await;
                     worker = ctx.pool.get(&original.id).await.unwrap();
@@ -10181,7 +10528,10 @@ mod tests {
 
                 // An archived stale fault remains evidence when the old
                 // coordinates return in a later daemon; it never replays.
-                ctx.history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                replace_test_history(
+                    &mut ctx,
+                    BuildHistory::load_from_file(&history_path, 100).unwrap(),
+                );
                 ctx.pool = WorkerPool::new();
                 ctx.pool.add_worker(original.clone()).await;
                 worker = ctx.pool.get(&original.id).await.unwrap();
@@ -10221,6 +10571,7 @@ mod tests {
             worker_id: WorkerId::new("worker1"),
             slots: 4,
             build_id: None,
+            disk_peak_output_bytes: None,
             exit_code: None,
             duration_ms: None,
             bytes_transferred: None,
@@ -10275,6 +10626,7 @@ mod tests {
             slots: 4,
             build_id: Some(build_id),
             exit_code: Some(0),
+            disk_peak_output_bytes: None,
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
             timing: None,
@@ -10313,9 +10665,13 @@ mod tests {
             let original = make_test_worker("bound-completion", 8);
             let pool = WorkerPool::new();
             pool.add_worker(original.clone()).await;
+            set_test_build_disk(&pool, original.id.as_str(), 100.0).await;
             let mut worker = pool.get(&original.id).await.unwrap();
             let mut ctx = make_test_context(pool.clone());
-            ctx.history = Arc::new(BuildHistory::new(100).with_persistence(history_path.clone()));
+            replace_test_history(
+                &mut ctx,
+                BuildHistory::new(100).with_persistence(history_path.clone()),
+            );
             let other = ctx.history.start_active_build(
                 "other-build".into(),
                 original.id.to_string(),
@@ -10383,7 +10739,10 @@ mod tests {
                     pool.add_worker(original.clone()).await;
                 }
             } else if change == "restart" {
-                ctx.history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                replace_test_history(
+                    &mut ctx,
+                    BuildHistory::load_from_file(&history_path, 100).unwrap(),
+                );
                 ctx.pool = WorkerPool::new();
                 ctx.pool.add_worker(original.clone()).await;
                 worker = ctx.pool.get(&original.id).await.unwrap();
@@ -10397,6 +10756,7 @@ mod tests {
             let release = ReleaseRequest {
                 local_wrapper_id: None,
                 worker_id: original.id.clone(),
+                disk_peak_output_bytes: None,
                 slots: 999,
                 build_id: Some(build_id),
                 exit_code: Some(0),
@@ -10464,6 +10824,7 @@ mod tests {
             local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 0,
+            disk_peak_output_bytes: None,
             build_id: Some(build_id),
             exit_code: Some(0),
             duration_ms: Some(5000),
@@ -10502,6 +10863,7 @@ mod tests {
         assert!(worker.reserve_slots(4).await);
 
         let release = || ReleaseRequest {
+            disk_peak_output_bytes: None,
             local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 4,
@@ -10552,6 +10914,7 @@ mod tests {
                     &ctx,
                     ReleaseRequest {
                         local_wrapper_id: None,
+                        disk_peak_output_bytes: None,
                         worker_id: WorkerId::new("worker1"),
                         slots: 4,
                         build_id: Some(build_id),
@@ -10594,6 +10957,7 @@ mod tests {
                 local_wrapper_id: None,
                 worker_id: WorkerId::new("worker1"),
                 slots: 4,
+                disk_peak_output_bytes: None,
                 build_id: Some(build_id),
                 exit_code: Some(1),
                 duration_ms: None,
@@ -10640,6 +11004,7 @@ mod tests {
             build.id
         };
         let release = |build_id| ReleaseRequest {
+            disk_peak_output_bytes: None,
             local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 2,
@@ -10762,6 +11127,7 @@ mod tests {
             slots: 4,
             build_id: Some(build_id),
             exit_code: Some(101),
+            disk_peak_output_bytes: None,
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
             timing: None,
@@ -11145,6 +11511,7 @@ mod tests {
             ReleaseRequest {
                 local_wrapper_id: None,
                 worker_id: WorkerId::new("disk-worker"),
+                disk_peak_output_bytes: None,
                 slots: 4,
                 build_id: Some(build_id),
                 exit_code: Some(0),

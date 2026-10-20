@@ -2227,6 +2227,7 @@ mod tests {
             .await;
         let first = DiskHeadroomAdmission {
             requested_gib: 64,
+            floor_gib: 0,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(first.check("disk-worker", 0).is_ok());
@@ -2253,6 +2254,7 @@ mod tests {
         );
         let second = DiskHeadroomAdmission {
             requested_gib: 64,
+            floor_gib: 0,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(matches!(
@@ -2281,6 +2283,7 @@ mod tests {
             .await;
         let before_reload = DiskHeadroomAdmission {
             requested_gib: 64,
+            floor_gib: 0,
             capacity: worker.disk_capacity_observation().await,
         };
         let mut config = recovered_worker_config("disk-worker", 8);
@@ -2325,6 +2328,7 @@ mod tests {
         assert_eq!(
             DiskHeadroomAdmission {
                 requested_gib: 64,
+                floor_gib: 0,
                 capacity: worker.disk_capacity_observation().await,
             }
             .check("disk-worker", 0),
@@ -2555,6 +2559,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },

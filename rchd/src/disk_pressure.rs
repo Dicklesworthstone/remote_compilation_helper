@@ -172,7 +172,7 @@ impl DiskCapacityObservation {
     ) -> Option<Self> {
         // Pressure may describe /tmp instead of build storage. Older workers
         // without an explicit complete build-root sample cannot prove this
-        // opt-in contract, even if their generic disk report looks healthy.
+        // build budget, even if their generic disk report looks healthy.
         let (Some(free), Some(total)) = (
             capabilities.build_disk_free_gb,
             capabilities.build_disk_total_gb,
@@ -226,12 +226,14 @@ impl DiskCapacityObservation {
     }
 }
 
-/// Explicit additional build space, including the operator's margin. Active
+/// Guarded additional build space and the worker's reserve floor. Active
 /// reservations remain whole even when observed free space has already fallen;
 /// that conservative double counting avoids treating consumed bytes as a release.
 #[derive(Debug, Clone, Default)]
 pub struct DiskHeadroomAdmission {
     pub requested_gib: u32,
+    /// Charge the largest active floor once for the worker, not once per job.
+    pub floor_gib: u64,
     pub capacity: Option<DiskCapacityObservation>,
 }
 
@@ -255,9 +257,9 @@ impl DiskHeadroomRejection {
 impl std::fmt::Display for DiskHeadroomRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unknown => f.write_str("declared disk headroom requires a valid live capacity sample and durable budget accounting"),
-            Self::Stale => f.write_str("declared disk headroom capacity sample expired, was superseded, or requires a probe after budget release"),
-            Self::Insufficient { free_gib, required_gib } => write!(f, "declared disk headroom requires {required_gib} GiB including active reservations; worker reported {free_gib} GiB free"),
+            Self::Unknown => f.write_str("build disk headroom requires a valid live capacity sample and durable budget accounting"),
+            Self::Stale => f.write_str("build disk headroom capacity sample expired, was superseded, or requires a probe after budget release"),
+            Self::Insufficient { free_gib, required_gib } => write!(f, "build disk headroom requires {required_gib} GiB including active reservations and the reserve floor; worker reported {free_gib} GiB free"),
         }
     }
 }
@@ -274,14 +276,14 @@ impl DiskHeadroomAdmission {
 
     /// Releasing a budget does not imply its bytes became free. A new probe
     /// must start strictly after completion before its capacity can fund
-    /// another declared build, including probes still in flight at completion.
+    /// another build, including probes still in flight at completion.
     pub(crate) fn check_after_completion(
         &self,
         worker_id: &str,
         reserved_gib: u64,
         capacity_after: Option<Instant>,
     ) -> Result<(), DiskHeadroomRejection> {
-        if self.requested_gib == 0 {
+        if self.requested_gib == 0 && self.floor_gib == 0 {
             return Ok(());
         }
         let capacity = self
@@ -296,7 +298,9 @@ impl DiskHeadroomAdmission {
         {
             return Err(DiskHeadroomRejection::Stale);
         }
-        let required_gib = reserved_gib.checked_add(u64::from(self.requested_gib));
+        let required_gib = reserved_gib
+            .checked_add(u64::from(self.requested_gib))
+            .and_then(|required| required.checked_add(self.floor_gib));
         if required_gib.is_none_or(|required| required > capacity.free_gib) {
             return Err(DiskHeadroomRejection::Insufficient {
                 free_gib: capacity.free_gib,
@@ -891,6 +895,7 @@ mod tests {
         let observed_at = sample.observed_at;
         let disk = DiskHeadroomAdmission {
             requested_gib: 80,
+            floor_gib: 0,
             capacity: Some(sample),
         };
         for cutoff in [observed_at, observed_at + Duration::from_nanos(1)] {
@@ -914,6 +919,7 @@ mod tests {
     fn declared_disk_budget_requires_valid_recent_same_worker_capacity() {
         let admission = |free, age| DiskHeadroomAdmission {
             requested_gib: 64,
+            floor_gib: 0,
             capacity: Some(DiskCapacityObservation::fixture("worker", free, age)),
         };
         assert!(matches!(
@@ -945,6 +951,7 @@ mod tests {
         assert_eq!(
             DiskHeadroomAdmission {
                 requested_gib: 1,
+                floor_gib: 0,
                 capacity: None
             }
             .check("worker", 0),
@@ -994,6 +1001,35 @@ mod tests {
                 "{caps:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_disk_budget_preserves_floor_and_rejects_21_gib_incident() {
+        let mut admission = DiskHeadroomAdmission {
+            requested_gib: rch_common::BuildDiskBudget::growth_budget_gib(21.0),
+            floor_gib: 13,
+            capacity: Some(DiskCapacityObservation::fixture(
+                "hz3",
+                33.0,
+                Duration::ZERO,
+            )),
+        };
+        assert_eq!(admission.requested_gib, 27);
+        assert_eq!(
+            admission.check("hz3", 0),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 33,
+                required_gib: 40,
+            })
+        );
+        // The same worker can safely run a measured small build and concurrent
+        // reservations; the floor is kept even when the pool otherwise fits.
+        admission.requested_gib = rch_common::BuildDiskBudget::growth_budget_gib(2.0);
+        assert_eq!(admission.requested_gib, 4);
+        assert!(admission.check("hz3", 16).is_ok());
+        assert!(admission.check("hz3", 20).is_err());
+        admission.floor_gib = u64::MAX;
+        assert!(admission.check("hz3", 0).is_err());
     }
 
     #[test]

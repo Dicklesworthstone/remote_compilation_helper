@@ -2168,6 +2168,7 @@ fn test_selected_worker_to_config() {
         speed_score: 75.5,
         declared_os: None,
         project_lane: 0,
+        disk_budget: None,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -2969,6 +2970,7 @@ async fn retry_selection_selected_response_stays_pending_until_new_admission() {
                 speed_score: 90.0,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: None,
             }),
             build_id: Some(42),
             reason: SelectionReason::Success,
@@ -3540,6 +3542,7 @@ async fn test_daemon_query_protocol() {
                 speed_score: 95.0,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -3629,6 +3632,7 @@ async fn test_daemon_query_sends_preferred_workers() {
                 speed_score: 95.0,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -3716,6 +3720,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
                     speed_score: 90.0,
                     declared_os: None,
                     project_lane: 0,
+                    disk_budget: None,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(42),
@@ -3820,6 +3825,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
                     speed_score: 90.0,
                     declared_os: None,
                     project_lane: 0,
+                    disk_budget: None,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(43),
@@ -3936,6 +3942,7 @@ async fn test_daemon_query_wait_parameters() {
                 speed_score: 95.0,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4018,6 +4025,7 @@ async fn test_daemon_query_url_encoding() {
                 speed_score: 1.0,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4144,6 +4152,7 @@ async fn test_process_hook_remote_success_mocked() {
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4225,6 +4234,7 @@ async fn test_force_local_allows_even_when_remote_available() {
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4294,6 +4304,7 @@ async fn test_force_remote_bypasses_confidence_threshold() {
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4482,6 +4493,7 @@ async fn test_process_hook_remote_nonzero_exit_uses_transparent_interception() {
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -4534,6 +4546,7 @@ fn test_worker_config_from_selected_worker() {
         speed_score: 88.8,
         declared_os: None,
         project_lane: 0,
+        disk_budget: None,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -5376,6 +5389,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
             timing: Default::default(),
             result_dirs: Vec::new(),
             disk_roots: vec!["/build-volume/target".into()],
+            disk_peak_output_bytes: None,
             cargo_stdout: None,
         });
         let faults = remote_release_faults(&result, &worker);
@@ -5425,6 +5439,7 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         timing: Default::default(),
         result_dirs: Vec::new(),
         disk_roots: Vec::new(),
+        disk_peak_output_bytes: None,
         cargo_stdout: None,
     });
     assert!(!remote_release_faults(&build, &worker).live_checkout_refused);
@@ -5449,6 +5464,65 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         .live_checkout_refused
     );
     assert!(!remote_release_faults(&checked("Permission denied"), &worker).live_checkout_refused);
+}
+
+#[test]
+fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
+    let worker = WorkerId::new("hz3");
+    for started in [false, true] {
+        for reason in ["admission", "growth", "free_floor", "monitor_unavailable"] {
+            let failure = crate::transfer::RemoteBuildDiskBudgetExceeded {
+                worker_id: worker.as_str().into(),
+                roots: vec!["/build-volume/target".into()],
+                reason: reason.into(),
+                started,
+                free_bytes: 12 * rch_common::BuildDiskBudget::GIB,
+                growth_bytes: 21 * rch_common::BuildDiskBudget::GIB,
+                max_growth_bytes: 20 * rch_common::BuildDiskBudget::GIB,
+                min_free_bytes: 13 * rch_common::BuildDiskBudget::GIB,
+                peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                detail: "guard stopped before ENOSPC".into(),
+            };
+            let error = anyhow::Error::new(failure.clone());
+            assert_eq!(
+                classify_remote_pipeline_failure(&error),
+                if started {
+                    RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+                } else {
+                    RemotePipelineFailurePolicy::AllowLocalFallback
+                }
+            );
+            assert_eq!(
+                remote_failure_exit_code(&error),
+                if started { 137 } else { 120 }
+            );
+            assert!(remote_pipeline_failure_summary(&worker, &error).contains("RCH-E330"));
+            let result = Err(error);
+            let faults = remote_release_faults(&result, &worker);
+            assert!(faults.worker_fault);
+            assert_eq!(faults.worker_disk_full, reason == "free_floor");
+            assert_eq!(faults.disk_peak_output_bytes, failure.peak_output_bytes);
+            assert_eq!(
+                remote_release_faults(&result, &WorkerId::new("other-worker")),
+                daemon_ipc::ReleaseFaults::default()
+            );
+
+            let error =
+                anyhow::Error::new(failure).context(crate::transfer::RemoteExecutionUnconfirmed);
+            assert_eq!(remote_failure_exit_code(&error), EXIT_BUILD_ERROR);
+            assert_eq!(
+                classify_remote_pipeline_failure(&error),
+                RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+            );
+            assert!(
+                remote_pipeline_failure_summary(&worker, &error).contains("completion unconfirmed")
+            );
+            assert_eq!(
+                remote_release_faults(&Err(error), &worker),
+                daemon_ipc::ReleaseFaults::default()
+            );
+        }
+    }
 }
 
 #[test]
@@ -8163,6 +8237,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         speed_score: 1.0,
         declared_os: Some("windows".to_string()),
         project_lane: 0,
+        disk_budget: None,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
     let result = Box::pin(execute_remote_compilation(
@@ -8289,6 +8364,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
+        disk_budget: None,
     };
 
     let reporter = HookReporter::new(OutputVisibility::None);
@@ -8398,6 +8474,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
+        disk_budget: None,
     };
     let transfer_config = TransferConfig {
         sync_timeout_ms: Some(1_000),
@@ -8572,6 +8649,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
+        disk_budget: None,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
     let layer0 = rch_common::types::Layer0Config {
@@ -8675,6 +8753,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
+        disk_budget: None,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
 
@@ -9005,6 +9084,7 @@ async fn test_cargo_test_remote_build_failure() {
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9068,6 +9148,7 @@ async fn test_cargo_test_with_filter() {
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9131,6 +9212,7 @@ async fn test_cargo_test_with_test_threads() {
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9199,6 +9281,7 @@ async fn test_cargo_test_signal_killed() {
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9267,6 +9350,7 @@ async fn test_cargo_test_signal_killed_with_toolchain_path_does_not_fallback_loc
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9329,6 +9413,7 @@ async fn test_cargo_test_toolchain_fallback() {
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,

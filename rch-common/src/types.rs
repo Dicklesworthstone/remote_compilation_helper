@@ -581,6 +581,92 @@ fn default_fallback_min_success_rate() -> f64 {
     0.5 // More lenient than normal min_success_rate (0.8)
 }
 
+/// A job's additional allocation allowance and the worker's protected reserve.
+///
+/// The daemon reserves growth atomically; the worker enforces these byte limits
+/// against fresh filesystem observations for the lifetime of the execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BuildDiskBudget {
+    pub max_growth_bytes: u64,
+    pub min_free_bytes: u64,
+}
+
+impl BuildDiskBudget {
+    pub const GIB: u64 = 1 << 30;
+
+    /// Conservative cold output estimates until this project and command have
+    /// successful, attributable worker measurements. Test workspaces have much
+    /// larger linker and incremental outputs than metadata-only checks.
+    pub fn cold_growth_gib(command: &str) -> Option<u32> {
+        let wide = command.split_whitespace().any(|arg| {
+            matches!(
+                arg,
+                "--workspace" | "--all" | "--all-targets" | "--all-features"
+            )
+        });
+        Some(match crate::classify_command(command).kind? {
+            CompilationKind::CargoTest
+            | CompilationKind::CargoNextest
+            | CompilationKind::CargoBench => {
+                if wide {
+                    32
+                } else {
+                    24
+                }
+            }
+            CompilationKind::CargoBuild | CompilationKind::CargoZigbuild => {
+                if wide {
+                    16
+                } else {
+                    8
+                }
+            }
+            CompilationKind::CargoCheck | CompilationKind::CargoClippy => {
+                if wide {
+                    8
+                } else {
+                    2
+                }
+            }
+            CompilationKind::CargoDoc => 8,
+            CompilationKind::Rustc
+            | CompilationKind::Gcc
+            | CompilationKind::Gpp
+            | CompilationKind::Clang
+            | CompilationKind::Clangpp
+            | CompilationKind::BunTypecheck
+            | CompilationKind::GoVet
+            | CompilationKind::Tsc => 2,
+            CompilationKind::BunTest | CompilationKind::GoBuild | CompilationKind::GoTest => 4,
+            CompilationKind::Make
+            | CompilationKind::CmakeBuild
+            | CompilationKind::Ninja
+            | CompilationKind::Meson
+            | CompilationKind::NixBuild
+            | CompilationKind::Job => 16,
+        })
+    }
+
+    /// Allow at least 2 GiB or 25% above the observed high water, rounded up.
+    /// Invalid history must never turn into a zero-size admission allowance.
+    pub fn growth_budget_gib(footprint_gib: f64) -> u32 {
+        if !footprint_gib.is_finite() || footprint_gib < 0.0 {
+            return u32::MAX;
+        }
+        (footprint_gib + (footprint_gib * 0.25).max(2.0)).ceil() as u32
+    }
+
+    /// Compatibility fallback for a new client talking to a pre-budget daemon.
+    /// Worker-side admission remains authoritative even without a wire budget.
+    pub fn cold_for_command(command: &str) -> Option<Self> {
+        let footprint = Self::cold_growth_gib(command)?;
+        Some(Self {
+            max_growth_bytes: u64::from(Self::growth_budget_gib(f64::from(footprint))) * Self::GIB,
+            min_free_bytes: 10 * Self::GIB,
+        })
+    }
+}
+
 /// Details about a selected worker for remote compilation.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SelectedWorker {
@@ -608,6 +694,9 @@ pub struct SelectedWorker {
     /// Old daemons never send it, so old and new hooks both read 0.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub project_lane: u32,
+    /// The allowance committed with this build's durable admission record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_budget: Option<BuildDiskBudget>,
 }
 
 fn is_zero_u32(value: &u32) -> bool {
@@ -722,6 +811,10 @@ pub struct ReleaseRequest {
     /// Optional bytes transferred during the pipeline (upload + artifact download).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_transferred: Option<u64>,
+    /// Peak allocated output bytes, including the preexisting output pool.
+    /// Only a confirmed worker receipt may supply this measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_peak_output_bytes: Option<u64>,
     /// Optional per-phase timing breakdown for the build pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<CommandTimingBreakdown>,
@@ -4850,6 +4943,7 @@ retry_max = 2
                 speed_score: 75.0,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4945,6 +5039,7 @@ retry_max = 2
                 speed_score: 90.5,
                 declared_os: None,
                 project_lane: 0,
+                disk_budget: BuildDiskBudget::cold_for_command("cargo test --workspace"),
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4959,7 +5054,26 @@ retry_max = 2
         assert_eq!(worker.id.as_str(), "worker-1");
         assert_eq!(worker.host, "192.168.1.100");
         assert_eq!(worker.slots_available, 16);
+        assert_eq!(
+            worker.disk_budget,
+            BuildDiskBudget::cold_for_command("cargo test --workspace")
+        );
         assert_eq!(parsed.reason, SelectionReason::Success);
+    }
+
+    #[test]
+    fn build_disk_budget_incident_and_small_build_controls() {
+        assert_eq!(BuildDiskBudget::growth_budget_gib(21.0), 27);
+        assert_eq!(BuildDiskBudget::growth_budget_gib(2.0), 4);
+        assert_eq!(
+            BuildDiskBudget::cold_growth_gib("cargo test --workspace"),
+            Some(32)
+        );
+        assert_eq!(BuildDiskBudget::cold_growth_gib("cargo check"), Some(2));
+        assert_eq!(BuildDiskBudget::cold_growth_gib("echo hello"), None);
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(BuildDiskBudget::growth_budget_gib(invalid), u32::MAX);
+        }
     }
 
     #[test]

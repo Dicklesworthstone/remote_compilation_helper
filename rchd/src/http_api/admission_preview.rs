@@ -255,6 +255,7 @@ async fn observe(
                     speed_score,
                     declared_os: rch_common::declared_os(&config.tags),
                     project_lane,
+                    disk_budget: ctx.worker_selector.build_disk_budget(&request),
                 })
             }
             None => None,
@@ -323,6 +324,15 @@ mod tests {
                 tools: Vec::new(),
             })
             .await;
+            pool.get(&WorkerId::new(id))
+                .await
+                .unwrap()
+                .set_capabilities(rch_common::WorkerCapabilities {
+                    build_disk_free_gb: Some(100.0),
+                    build_disk_total_gb: Some(200.0),
+                    ..Default::default()
+                })
+                .await;
         }
         let ctx = crate::test_daemon_context(pool.clone());
         let router = create_api_router(
@@ -415,6 +425,7 @@ mod tests {
                 None,
                 crate::disk_pressure::DiskHeadroomAdmission {
                     requested_gib: 0,
+                    floor_gib: 0,
                     capacity: None,
                 },
                 None,
@@ -435,6 +446,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -701,7 +713,15 @@ mod tests {
                     .fence_live_checkout(&request.project, "requested"),
                 "busy" => ctx.history.fence_source_busy(&request.project, "requested"),
                 "tools" => request.required_tools.push("never-probed-tool".into()),
-                "disk" => request.disk_headroom_gib = 23,
+                "disk" => {
+                    request.disk_headroom_gib = 23;
+                    ctx.pool
+                        .get(&WorkerId::new("requested"))
+                        .await
+                        .unwrap()
+                        .set_capabilities(rch_common::WorkerCapabilities::default())
+                        .await;
+                }
                 _ => unreachable!(),
             }
             let response = router
@@ -712,6 +732,79 @@ mod tests {
             assert!(response.selection.worker.is_none(), "{fence}");
             assert!(response.selection.diagnostics.is_some(), "{fence}");
             assert_unowned(&ctx, 4).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_disk_preview_rejects_large_output_but_admits_measured_small_builds() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        for (project, gib) in [("large-test", 21), ("small-test", 2)] {
+            let seed = ctx.history.start_active_build_with_wrapper(
+                project.into(),
+                "seed".into(),
+                "cargo test --workspace".into(),
+                0,
+                Some(format!("owner-{project}")),
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            ctx.history
+                .complete_durable(
+                    seed.id,
+                    "seed",
+                    seed.local_wrapper_id.as_deref(),
+                    crate::history::BuildCompletion {
+                        exit_code: 0,
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        let mut caps = worker.capabilities().await;
+        caps.build_disk_free_gb = Some(33.0);
+        worker.set_capabilities(caps).await;
+        for post in [false, true] {
+            let mut request = input();
+            request.command = "cargo test --workspace".into();
+            request.project = "large-test".into();
+            let rejected = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(rejected.selection.worker.is_none());
+            request.project = "small-test".into();
+            let accepted = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let selected = accepted.selection.worker.unwrap();
+            assert_eq!(selected.id.as_str(), "requested");
+            assert_eq!(
+                selected.disk_budget,
+                Some(rch_common::BuildDiskBudget {
+                    max_growth_bytes: 4 * rch_common::BuildDiskBudget::GIB,
+                    min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+                })
+            );
+            // The independent flat-slot policy derates this 33 GiB worker
+            // to two slots; a read-only preview must preserve that capacity.
+            assert_unowned(&ctx, 2).await;
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("requested"), 0);
         }
     }
 

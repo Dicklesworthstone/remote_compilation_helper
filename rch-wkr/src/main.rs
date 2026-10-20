@@ -39,6 +39,11 @@ enum Commands {
         /// Process to inspect; no signals are sent.
         pid: u32,
     },
+    /// Ensure the requested Rust toolchain inside a guarded execution.
+    PrepareToolchain {
+        #[arg(long)]
+        toolchain: String,
+    },
     /// Run a compilation command
     Execute {
         /// Working directory
@@ -56,6 +61,14 @@ enum Commands {
         /// `rustup run <toolchain>`.
         #[arg(short, long)]
         toolchain: Option<String>,
+
+        /// Maximum additional allocated output bytes for this job.
+        #[arg(long, requires = "disk_min_free_bytes", value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        disk_budget_bytes: Option<u64>,
+
+        /// Free bytes that this job must preserve on each output filesystem.
+        #[arg(long, requires = "disk_budget_bytes", value_parser = clap::value_parser!(u64).range(0..=i64::MAX as u64))]
+        disk_min_free_bytes: Option<u64>,
     },
 
     /// Respond to health check
@@ -226,11 +239,29 @@ async fn run_worker(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::ProcessIdentity { pid } => print_process_identity(pid),
+        Commands::PrepareToolchain { toolchain: name } => {
+            let info = toolchain::parse_toolchain_string(&name);
+            toolchain::ensure_toolchain(&info).with_context(|| {
+                format!("Required toolchain {name} is unavailable; command was not run")
+            })?;
+            Ok(())
+        }
         Commands::Execute {
             workdir,
             command,
             toolchain,
+            disk_budget_bytes,
+            disk_min_free_bytes,
         } => {
+            let disk_budget = match (disk_budget_bytes, disk_min_free_bytes) {
+                (Some(max_growth_bytes), Some(min_free_bytes)) => {
+                    Some(rch_common::BuildDiskBudget {
+                        max_growth_bytes,
+                        min_free_bytes,
+                    })
+                }
+                _ => rch_common::BuildDiskBudget::cold_for_command(&command),
+            };
             // Prepare the command, optionally wrapping with toolchain
             let final_command = if let Some(tc_str) = toolchain {
                 // Parse toolchain string and ensure it's available
@@ -240,13 +271,24 @@ async fn run_worker(cli: Cli) -> Result<()> {
                 // best-effort optimization. A worker must never substitute its
                 // default compiler when preparation fails. No user command or
                 // project-cache touch has happened yet; report the error upstream.
-                toolchain::ensure_toolchain(&tc_info).with_context(|| {
-                    format!("Required toolchain {tc_str} is unavailable; command was not run")
-                })?;
-                info!("Toolchain {} ready", tc_str);
-
-                // Wrap command with rustup run
-                rch_common::wrap_command_with_toolchain(&command, Some(&tc_info))
+                let wrapped = rch_common::wrap_command_with_toolchain(&command, Some(&tc_info));
+                if disk_budget.is_some() {
+                    let executable = std::env::current_exe()?;
+                    let executable = executor::quote_shell_argument(
+                        executable.to_str().context("worker path is not UTF-8")?,
+                    );
+                    format!(
+                        "{executable} prepare-toolchain --toolchain {} || exit {}; {wrapped}",
+                        executor::quote_shell_argument(&tc_str),
+                        executor::EXIT_PREPARE_FAILED
+                    )
+                } else {
+                    toolchain::ensure_toolchain(&tc_info).with_context(|| {
+                        format!("Required toolchain {tc_str} is unavailable; command was not run")
+                    })?;
+                    info!("Toolchain {} ready", tc_str);
+                    wrapped
+                }
             } else {
                 command
             };
@@ -254,9 +296,18 @@ async fn run_worker(cli: Cli) -> Result<()> {
             // Touch the project cache to prevent cleanup
             cache::touch_project(std::path::Path::new(&workdir));
 
-            match executor::execute(&workdir, &final_command).await {
+            let result = if disk_budget.is_some() {
+                executor::execute_with_disk_budget(&workdir, &final_command, disk_budget).await
+            } else {
+                executor::execute(&workdir, &final_command).await
+            };
+            match result {
                 Ok(()) => Ok(()),
                 Err(err) => {
+                    if let Some(failure) = err.downcast_ref::<executor::BuildDiskBudgetExceeded>() {
+                        eprintln!("{failure}");
+                        std::process::exit(120);
+                    }
                     if let Some(failure) = err.downcast_ref::<executor::CommandFailed>() {
                         std::process::exit(failure.exit_code);
                     }
@@ -2559,6 +2610,7 @@ mod tests {
             workdir,
             command,
             toolchain,
+            ..
         } = cli.command
         else {
             anyhow::bail!("expected execute command");
@@ -2568,6 +2620,46 @@ mod tests {
         assert_eq!(toolchain.as_deref(), Some("nightly"));
         println!("TEST PASS: test_cli_parses_execute_with_toolchain");
         Ok(())
+    }
+
+    #[test]
+    fn test_cli_disk_budget_flags_are_paired_and_allow_zero_floor() {
+        let base = [
+            "rch-wkr",
+            "execute",
+            "--workdir",
+            "/tmp",
+            "--command",
+            "cargo check",
+        ];
+        for invalid in [
+            vec!["--disk-budget-bytes", "8388608"],
+            vec!["--disk-min-free-bytes", "1048576"],
+            vec!["--disk-budget-bytes", "0", "--disk-min-free-bytes", "0"],
+            vec![
+                "--disk-budget-bytes",
+                "8388608",
+                "--disk-min-free-bytes",
+                "-1",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(invalid)).is_err());
+        }
+        let parsed = Cli::try_parse_from(base.into_iter().chain([
+            "--disk-budget-bytes",
+            "8388608",
+            "--disk-min-free-bytes",
+            "0",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Execute {
+                disk_budget_bytes: Some(8388608),
+                disk_min_free_bytes: Some(0),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -1229,6 +1229,7 @@ mod tests {
             speed_score: 1.5,
             declared_os: None,
             project_lane: 0,
+            disk_budget: None,
         };
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,

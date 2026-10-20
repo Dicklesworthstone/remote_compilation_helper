@@ -29,6 +29,8 @@ async fn versioned_pool() -> WorkerPool {
                 num_cpus: Some(8),
                 disk_free_gb: Some(100.0),
                 disk_total_gb: Some(200.0),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(200.0),
                 projects_root_ok: Some(true),
                 tools_present: vec!["clang".to_owned()],
                 ..Default::default()
@@ -36,6 +38,14 @@ async fn versioned_pool() -> WorkerPool {
             .await;
     }
     pool
+}
+
+fn versioned_selector(config: SelectionConfig) -> WorkerSelector {
+    let mut selector = WorkerSelector::with_config(config, CircuitBreakerConfig::default());
+    // Runtime constraints are the variable under test; disk admission has a
+    // real empty reservation book and fresh capacity from versioned_pool.
+    selector.set_build_history(Arc::new(crate::history::BuildHistory::new(100)));
+    selector
 }
 
 fn request(runtime: RequiredRuntime, requirement: &str) -> SelectionRequest {
@@ -72,13 +82,10 @@ async fn exact_version_eligibility_precedes_all_five_ranking_strategies() {
             SelectionStrategy::FairFastest,
         ] {
             let pool = versioned_pool().await;
-            let selector = WorkerSelector::with_config(
-                SelectionConfig {
-                    strategy,
-                    ..Default::default()
-                },
-                CircuitBreakerConfig::default(),
-            );
+            let selector = versioned_selector(SelectionConfig {
+                strategy,
+                ..Default::default()
+            });
             let outcome = selector.select(&pool, &request(runtime, requirement)).await;
             let worker = outcome
                 .worker
@@ -91,8 +98,7 @@ async fn exact_version_eligibility_precedes_all_five_ranking_strategies() {
 #[tokio::test]
 async fn explicit_worker_preferences_do_not_override_exact_runtime_constraints() {
     let pool = versioned_pool().await;
-    let selector =
-        WorkerSelector::with_config(SelectionConfig::default(), CircuitBreakerConfig::default());
+    let selector = versioned_selector(SelectionConfig::default());
     let mut request = request(RequiredRuntime::Node, "node@26.7.0");
     request.preferred_workers = vec![WorkerId::new("incompatible")];
     assert!(selector.select(&pool, &request).await.worker.is_none());
@@ -106,10 +112,7 @@ async fn conflicting_or_unsupported_constraints_cannot_fall_back_to_another_work
         vec!["node@26.7.0", "bun@1.2.9"],
     ] {
         let pool = versioned_pool().await;
-        let selector = WorkerSelector::with_config(
-            SelectionConfig::default(),
-            CircuitBreakerConfig::default(),
-        );
+        let selector = versioned_selector(SelectionConfig::default());
         let mut request = request(RequiredRuntime::Node, "node@26.7.0");
         request.required_tools = constraints.into_iter().map(str::to_owned).collect();
         assert!(selector.select(&pool, &request).await.worker.is_none());
@@ -144,7 +147,7 @@ async fn last_success_affinity_cannot_bypass_required_runtime_or_named_tools() {
     let pool = versioned_pool().await;
     let mut config = SelectionConfig::default();
     config.affinity.enable_last_success_fallback = true;
-    let selector = WorkerSelector::with_config(config, CircuitBreakerConfig::default());
+    let selector = versioned_selector(config);
     let mut request = request(RequiredRuntime::Node, "node@26.7.0");
     request.job_mode = false;
     selector

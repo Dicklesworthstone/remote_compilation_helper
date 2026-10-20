@@ -45,6 +45,8 @@ pub(super) struct RemoteExecutionResult {
     pub(super) result_dirs: Vec<ExecResultDirStat>,
     /// Actual source/output filesystems that must recover after a disk fault.
     pub(super) disk_roots: Vec<String>,
+    /// Total allocated output high water from a confirmed worker receipt.
+    pub(super) disk_peak_output_bytes: Option<u64>,
     /// Opt-in Cargo stdout, released only after daemon acknowledgment. A
     /// delivery failure supplies no caller-local success records.
     pub(super) cargo_stdout: Option<Vec<u8>>,

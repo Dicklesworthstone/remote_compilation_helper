@@ -85,6 +85,9 @@ class PrepareTransactions(unittest.TestCase):
             executable = shutil.which(name)
             self.assertIsNotNone(executable, name)
             (self.bin / name).symlink_to(executable)
+        # Execute runs the real stdlib disk supervisor before preparation.
+        # Keep the manager PATH isolated while providing only this interpreter.
+        (self.bin / "python3").symlink_to(Path(sys.executable).resolve())
         for name in ("npm", "bun", "pnpm", "yarn"):
             manager = self.bin / name
             manager.write_text(NPM)
@@ -119,6 +122,11 @@ class PrepareTransactions(unittest.TestCase):
         user_command = "bun test" if runtime == "bun" else "tsc --noEmit"
         args = (["execute", "--workdir", str(project), "--command", user_command]
                 if execute else ["prepare", "--project", str(project), "--runtime", runtime])
+        if execute:
+            # Fixture installers produce KiB, so test their actual transaction
+            # outcomes with an explicit small budget independent of host GiB.
+            args.extend(["--disk-budget-bytes", str(8 << 20),
+                         "--disk-min-free-bytes", str(1 << 20)])
         env = {
             "PATH": str(self.bin), "HOME": str(self.home), "LC_ALL": "C",
             "XDG_CACHE_HOME": str(self.home / ".cache"),

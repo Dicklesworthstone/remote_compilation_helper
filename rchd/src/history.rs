@@ -3,7 +3,10 @@
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
 use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
-use crate::headroom::{FootprintBook, footprint_key};
+use crate::headroom::{
+    FootprintBook, cold_build_footprint_gib, family_footprint_key, footprint_key,
+    legacy_footprint_key,
+};
 use crate::workers::{WorkerEndpointIdentity, WorkerEndpointSnapshot};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::{
@@ -149,6 +152,8 @@ pub struct BuildCompletion {
     pub exit_code: i32,
     pub duration_ms: Option<u64>,
     pub bytes_transferred: Option<u64>,
+    /// Attributed peak allocated output, including the starting artifact pool.
+    pub disk_peak_output_bytes: Option<u64>,
     pub timing: Option<CommandTimingBreakdown>,
     pub cancellation: Option<BuildCancellationMetadata>,
 }
@@ -227,9 +232,12 @@ pub struct ActiveBuildState {
     /// 0 is the canonical mirror; lane k > 0 is `<root>.rch-lane-<k>`.
     #[serde(default, skip_serializing_if = "is_lane_zero")]
     pub project_lane: u32,
-    /// Declared additional build space retained until this owner completes.
+    /// Guarded additional build space retained until this owner completes.
     #[serde(default)]
     pub disk_headroom_gib: u32,
+    /// Worker free-space floor admitted for this owner, retained across restart.
+    #[serde(default)]
+    pub disk_floor_gib: u64,
     /// Free build-disk GiB on the worker at admission (bd-wv746 footprint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_start_gib: Option<u64>,
@@ -580,6 +588,7 @@ impl BuildHistory {
             slots,
             project_lane: 0,
             disk_headroom_gib: 0,
+            disk_floor_gib: 0,
             disk_free_start_gib: None,
             disk_free_min_gib: None,
             disk_shared: false,
@@ -738,6 +747,7 @@ impl BuildHistory {
             slots,
             project_lane: 0,
             disk_headroom_gib: disk.requested_gib,
+            disk_floor_gib: disk.floor_gib,
             disk_free_start_gib,
             disk_free_min_gib: None,
             disk_shared: false,
@@ -891,16 +901,32 @@ impl BuildHistory {
         }
     }
 
-    /// Learned build-disk growth for this project and command class.
+    /// Exact complete output can establish a small requirement. Broader command
+    /// families and legacy df deltas may raise the cold prior, never lower it.
     pub(crate) fn learned_footprint_gib(&self, project_id: &str, command: &str) -> Option<f64> {
-        self.footprints
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .estimate_gib(&footprint_key(project_id, command), Utc::now().timestamp())
+        let now = Utc::now().timestamp();
+        let cold = cold_build_footprint_gib(command).unwrap_or(16.0);
+        let exact_key = footprint_key(project_id, command);
+        let family_key = family_footprint_key(project_id, command);
+        let legacy_key = legacy_footprint_key(project_id, command);
+        let book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
+        let estimate = book
+            .admission_estimate_gib(&exact_key, now, cold)
+            .or_else(|| {
+                book.estimate_gib(&family_key, now)
+                    .map(|growth| growth.max(cold))
+            });
+        let legacy = book
+            .estimate_gib(&legacy_key, now)
+            .map(|growth| growth.max(cold));
+        match (estimate, legacy) {
+            (Some(current), Some(legacy)) => Some(current.max(legacy)),
+            (current, legacy) => current.or(legacy),
+        }
     }
 
-    /// Learned growth still expected from builds running on this worker: each
-    /// one's footprint minus the growth already visible in its probes.
+    /// Diagnostic estimate only: this never releases an active reservation.
+    /// Learned growth minus a worker's observed drop is not admission credit.
     pub(crate) fn pending_footprint_gib(&self, worker_id: &str) -> f64 {
         let builds: Vec<(String, String, f64)> = self
             .active
@@ -925,31 +951,49 @@ impl BuildHistory {
             .sum()
     }
 
-    /// Learn from a finished remote build that had the worker to itself.
-    fn learn_footprint(&self, state: &ActiveBuildState, exit_code: i32) {
+    /// Only attributed total output can prove a small successful build.
+    /// Filesystem deltas can be deflated by concurrent cleanup even when this
+    /// daemon owns the worker's only job, so they are incomplete lower bounds.
+    fn learn_footprint(
+        &self,
+        state: &ActiveBuildState,
+        exit_code: i32,
+        disk_peak_output_bytes: Option<u64>,
+    ) {
         // A cancelled build stopped early; its growth says little.
-        if state.location != BuildLocation::Remote || state.disk_shared || exit_code == 130 {
+        if state.location != BuildLocation::Remote || exit_code == 130 {
             return;
         }
-        let (Some(start), Some(min)) = (state.disk_free_start_gib, state.disk_free_min_gib) else {
-            return;
+        let measured_output = disk_peak_output_bytes
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| (bytes as f64 / rch_common::BuildDiskBudget::GIB as f64).max(1.0));
+        let growth = match measured_output {
+            Some(output) => output,
+            None if !state.disk_shared => {
+                let (Some(start), Some(min)) = (state.disk_free_start_gib, state.disk_free_min_gib)
+                else {
+                    return;
+                };
+                start.saturating_sub(min) as f64
+            }
+            None => return,
         };
-        let growth = start.saturating_sub(min) as f64;
+        let complete = exit_code == 0 && measured_output.is_some();
         let now = Utc::now().timestamp();
+        let exact_key = footprint_key(&state.project_id, &state.command);
+        let family_key = family_footprint_key(&state.project_id, &state.command);
         let mut book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
-        if !book.record(
-            &footprint_key(&state.project_id, &state.command),
-            growth,
-            now,
-        ) {
+        if !book.record(&exact_key, growth, now, complete) {
             return;
         }
+        book.record(&family_key, growth, now, false);
         book.prune(now);
         debug!(
             build_id = state.id,
             project = %state.project_id,
             worker = %state.worker_id,
             growth_gib = growth,
+            complete,
             "learned remote build disk footprint"
         );
         if let Some(path) = self.persistence_path.as_deref().map(footprint_path)
@@ -976,13 +1020,22 @@ impl BuildHistory {
         worker_id: &str,
         disk: &DiskHeadroomAdmission,
     ) -> Result<(), DiskHeadroomRejection> {
-        if disk.requested_gib > 0 && self.ownership_failed() {
+        if (disk.requested_gib > 0 || disk.floor_gib > 0) && self.ownership_failed() {
             return Err(DiskHeadroomRejection::Unknown);
         }
         let completed = self
             .disk_budget_completed_at
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let floor_gib = active
+            .values()
+            .filter(|state| state.location == BuildLocation::Remote && state.worker_id == worker_id)
+            .map(|state| state.disk_floor_gib)
+            .fold(disk.floor_gib, u64::max);
+        let disk = DiskHeadroomAdmission {
+            floor_gib,
+            ..disk.clone()
+        };
         disk.check_after_completion(
             worker_id,
             reserved_disk_headroom(active, worker_id),
@@ -1167,6 +1220,7 @@ impl BuildHistory {
                 exit_code,
                 duration_ms,
                 bytes_transferred,
+                disk_peak_output_bytes: None,
                 timing,
                 cancellation: None,
             },
@@ -1191,6 +1245,7 @@ impl BuildHistory {
                 exit_code: 130,
                 duration_ms: None,
                 bytes_transferred,
+                disk_peak_output_bytes: None,
                 timing: None,
                 cancellation,
             },
@@ -2534,6 +2589,7 @@ impl BuildHistory {
             exit_code,
             duration_ms,
             bytes_transferred,
+            disk_peak_output_bytes,
             timing,
             cancellation,
         } = completion;
@@ -2630,7 +2686,7 @@ impl BuildHistory {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(build_id, receipt);
-        if state.location == BuildLocation::Remote && state.disk_headroom_gib > 0 {
+        if state.location == BuildLocation::Remote && active_disk_reservation_gib(state) > 0 {
             // Keep the old sample fenced before releasing `active`: completed
             // output still occupies disk even though its reservation is gone.
             self.disk_budget_completed_at
@@ -2658,7 +2714,11 @@ impl BuildHistory {
             });
         }
         let state = active.remove(&build_id).expect("locked ownership exists");
-        self.learn_footprint(&state, exit_code);
+        self.learn_footprint(
+            &state,
+            exit_code,
+            disk_peak_output_bytes.filter(|_| record.cancellation.is_none()),
+        );
         self.record(record.clone());
         Ok(Some((state, record)))
     }
@@ -2840,8 +2900,20 @@ fn reserved_disk_headroom(active: &HashMap<u64, ActiveBuildState>, worker_id: &s
         .values()
         .filter(|state| state.worker_id == worker_id && state.location == BuildLocation::Remote)
         .fold(0u64, |sum, state| {
-            sum.saturating_add(u64::from(state.disk_headroom_gib))
+            sum.saturating_add(active_disk_reservation_gib(state))
         })
+}
+
+fn active_disk_reservation_gib(state: &ActiveBuildState) -> u64 {
+    if state.disk_headroom_gib > 0 || !state.recovered {
+        return u64::from(state.disk_headroom_gib);
+    }
+    // A job restored from an older daemon still consumes capacity. Missing
+    // historical budgets must not make live output free to the new scheduler.
+    let cold = rch_common::BuildDiskBudget::cold_growth_gib(&state.command).unwrap_or(16);
+    u64::from(rch_common::BuildDiskBudget::growth_budget_gib(f64::from(
+        cold,
+    )))
 }
 
 impl Default for BuildHistory {
@@ -2954,6 +3026,7 @@ mod tests {
                         exit_code,
                         duration_ms: Some(1),
                         bytes_transferred: None,
+                        disk_peak_output_bytes: None,
                         timing: None,
                         cancellation: None,
                     },
@@ -2984,6 +3057,7 @@ mod tests {
                     exit_code: 130,
                     duration_ms: Some(1),
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -3008,6 +3082,7 @@ mod tests {
             worker,
             DiskHeadroomAdmission {
                 requested_gib: budget,
+                floor_gib: 0,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     worker,
                     free,
@@ -3089,6 +3164,7 @@ mod tests {
             exit_code,
             duration_ms: None,
             bytes_transferred: None,
+            disk_peak_output_bytes: None,
             timing: None,
             cancellation: None,
         }
@@ -3202,6 +3278,7 @@ mod tests {
             "w",
             DiskHeadroomAdmission {
                 requested_gib: 0,
+                floor_gib: 0,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     "w",
                     200.0,
@@ -3216,6 +3293,232 @@ mod tests {
         assert_eq!(history.learned_footprint_gib("e", "cargo test"), None);
     }
 
+    #[test]
+    fn attributed_total_output_is_required_to_lower_cold_build_estimates() {
+        let history = BuildHistory::new(20);
+        let measured = |state: &ActiveBuildState, gib: u64, exit_code| {
+            history
+                .complete_durable(
+                    state.id,
+                    &state.worker_id,
+                    state.local_wrapper_id.as_deref(),
+                    BuildCompletion {
+                        disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        ..disk_budget_completion(exit_code)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        };
+        let df_only = disk_budget_admit(&history, "df-only", "w", 0, 100.0).unwrap();
+        history.observe_build_disk("w", 98, Instant::now());
+        finish_owned(&history, &df_only, 0);
+        assert_eq!(
+            history.learned_footprint_gib("df-only", "cargo test"),
+            Some(24.0)
+        );
+
+        let first = disk_budget_admit(
+            &history,
+            "numpy::clean-overlay::0123456789abcdef",
+            "w",
+            0,
+            100.0,
+        )
+        .unwrap();
+        // External cleanup hid most of the 21 GiB pool from the df delta.
+        history.observe_build_disk("w", 98, Instant::now());
+        measured(&first, 21, 0);
+        let warm = disk_budget_admit(
+            &history,
+            "numpy::clean-overlay::fedcba9876543210",
+            "w",
+            0,
+            100.0,
+        )
+        .unwrap();
+        measured(&warm, 2, 0);
+        assert_eq!(
+            history.learned_footprint_gib("numpy", "cargo test"),
+            Some(21.0)
+        );
+        assert_eq!(
+            history.learned_footprint_gib("numpy", "cargo test --workspace"),
+            Some(32.0)
+        );
+        assert_eq!(history.learned_footprint_gib("other", "cargo test"), None);
+
+        let small = disk_budget_admit(&history, "small", "shared", 0, 100.0).unwrap();
+        let neighbour = disk_budget_admit(&history, "neighbour", "shared", 0, 100.0).unwrap();
+        history.observe_build_disk("shared", 70, Instant::now());
+        measured(&small, 2, 0);
+        finish_owned(&history, &neighbour, 0);
+        assert_eq!(
+            history.learned_footprint_gib("small", "cargo test"),
+            Some(2.0)
+        );
+        assert_eq!(
+            history.learned_footprint_gib("neighbour", "cargo test"),
+            None
+        );
+        let failed = disk_budget_admit(&history, "failed", "w", 0, 100.0).unwrap();
+        measured(&failed, 2, 101);
+        assert_eq!(
+            history.learned_footprint_gib("failed", "cargo test"),
+            Some(24.0)
+        );
+        let zero = disk_budget_admit(&history, "zero", "w", 0, 100.0).unwrap();
+        measured(&zero, 0, 0);
+        assert_eq!(history.learned_footprint_gib("zero", "cargo test"), None);
+
+        history.footprints.lock().unwrap().record(
+            &legacy_footprint_key("legacy", "cargo test"),
+            2.0,
+            Utc::now().timestamp(),
+            false,
+        );
+        assert_eq!(
+            history.learned_footprint_gib("legacy", "cargo test"),
+            Some(24.0)
+        );
+    }
+
+    #[test]
+    fn output_measurement_requires_the_owner_and_first_terminal_completion() {
+        let history = BuildHistory::new(10);
+        let state = disk_budget_admit(&history, "numpy", "w", 0, 100.0).unwrap();
+        let completion = |gib| BuildCompletion {
+            disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+            ..disk_budget_completion(0)
+        };
+        assert!(
+            history
+                .complete_durable(state.id, "w", Some("forged"), completion(1))
+                .is_err()
+        );
+        assert_eq!(history.learned_footprint_gib("numpy", "cargo test"), None);
+        assert!(
+            history
+                .complete_durable(
+                    state.id,
+                    "w",
+                    state.local_wrapper_id.as_deref(),
+                    completion(21),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            history
+                .complete_durable(
+                    state.id,
+                    "w",
+                    state.local_wrapper_id.as_deref(),
+                    completion(1),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            history.learned_footprint_gib("numpy", "cargo test"),
+            Some(21.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_disk_reservation_charges_floor_once_and_survives_restart() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let sample = || DiskHeadroomAdmission {
+            requested_gib: 4,
+            floor_gib: 13,
+            capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                "hz3",
+                33.0,
+                Duration::ZERO,
+            )),
+        };
+        let first = disk_budget_admit_snapshot(&history, "p0", "hz3", sample()).unwrap();
+        // A lost reply cannot create a second reservation for the same owner,
+        // even though four more independent small builds still fit.
+        assert!(disk_budget_admit_snapshot(&history, "p0", "hz3", sample()).is_none());
+        for index in 1..5 {
+            assert!(
+                disk_budget_admit_snapshot(&history, &format!("p{index}"), "hz3", sample(),)
+                    .is_some()
+            );
+        }
+        assert_eq!(history.reserved_disk_headroom_gib("hz3"), 20);
+        assert!(disk_budget_admit_snapshot(&history, "overflow", "hz3", sample()).is_none());
+        history.observe_build_disk("hz3", 25, Instant::now());
+        assert_eq!(
+            history.reserved_disk_headroom_gib("hz3"),
+            20,
+            "observed growth does not release reservations"
+        );
+        drop(history);
+
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("hz3"), 20);
+        assert!(
+            restored
+                .active_builds()
+                .iter()
+                .all(|state| state.disk_floor_gib == 13)
+        );
+        let mut lowered_floor = sample();
+        lowered_floor.floor_gib = 0;
+        assert!(
+            disk_budget_admit_snapshot(&restored, "lower-floor", "hz3", lowered_floor,).is_none(),
+            "new configuration cannot erase active jobs' reserve floor"
+        );
+        let old = sample();
+        assert!(
+            restored
+                .complete_durable(first.id, "hz3", Some("forged"), disk_budget_completion(130),)
+                .is_err()
+        );
+        assert!(restored.disk_budget_completed_at.lock().unwrap().is_empty());
+        finish_owned(&restored, &first, 130);
+        assert_eq!(restored.reserved_disk_headroom_gib("hz3"), 16);
+        assert_eq!(
+            restored.check_disk_headroom("hz3", &old),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert!(disk_budget_admit_snapshot(&restored, "replacement", "hz3", sample()).is_some());
+    }
+
+    #[tokio::test]
+    async fn recovered_legacy_job_reserves_cold_growth_until_owned_completion_and_new_probe() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let legacy = disk_budget_admit(&history, "old", "w", 0, 100.0).unwrap();
+        drop(history);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restored.active_build(legacy.id).unwrap().recovered);
+        assert_eq!(restored.reserved_disk_headroom_gib("w"), 30);
+        let sample = || DiskHeadroomAdmission {
+            requested_gib: 4,
+            floor_gib: 10,
+            capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                "w",
+                40.0,
+                Duration::ZERO,
+            )),
+        };
+        let old = sample();
+        assert!(disk_budget_admit_snapshot(&restored, "new", "w", old.clone()).is_none());
+        finish_owned(&restored, &legacy, 0);
+        assert_eq!(restored.reserved_disk_headroom_gib("w"), 0);
+        assert_eq!(
+            restored.check_disk_headroom("w", &old),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert!(disk_budget_admit_snapshot(&restored, "new", "w", sample()).is_some());
+    }
+
     #[tokio::test]
     async fn disk_budget_completion_cannot_spend_the_same_capacity_sample_twice() {
         let root = TempDir::new().unwrap();
@@ -3223,6 +3526,7 @@ mod tests {
         let history = BuildHistory::new(10).with_persistence(path);
         let request = |worker, free| DiskHeadroomAdmission {
             requested_gib: 80,
+            floor_gib: 0,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 worker,
                 free,
@@ -3322,6 +3626,7 @@ mod tests {
                 Arc::new(BuildHistory::new(10).with_persistence(root.path().join("history.jsonl")));
             let sample = DiskHeadroomAdmission {
                 requested_gib: 80,
+                floor_gib: 0,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     "worker",
                     100.0,
@@ -3379,6 +3684,7 @@ mod tests {
         assert!(history.disk_budget_completed_at.lock().unwrap().is_empty());
         let sample = DiskHeadroomAdmission {
             requested_gib: 1,
+            floor_gib: 0,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "worker",
                 100.0,
@@ -3400,6 +3706,7 @@ mod tests {
                 "worker",
                 &DiskHeadroomAdmission {
                     requested_gib: 20,
+                    floor_gib: 0,
                     capacity: None
                 }
             ),
@@ -3413,6 +3720,7 @@ mod tests {
         let history = BuildHistory::new(10);
         let sample = DiskHeadroomAdmission {
             requested_gib: 80,
+            floor_gib: 0,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "worker",
                 100.0,
@@ -3497,6 +3805,7 @@ mod tests {
             exit_code: 0,
             duration_ms: None,
             bytes_transferred: None,
+            disk_peak_output_bytes: None,
             timing: None,
             cancellation: None,
         };
@@ -3540,6 +3849,7 @@ mod tests {
                 None,
                 DiskHeadroomAdmission {
                     requested_gib: 64,
+                    floor_gib: 0,
                     capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                         "worker",
                         100.0,
@@ -5038,6 +5348,7 @@ mod tests {
             exit_code: 101,
             duration_ms: Some(10),
             bytes_transferred: None,
+            disk_peak_output_bytes: None,
             timing: None,
             cancellation: None,
         };
@@ -5127,6 +5438,7 @@ mod tests {
                     exit_code: 1,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -5190,6 +5502,7 @@ mod tests {
                     exit_code: 101,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -5740,6 +6053,7 @@ mod tests {
                     exit_code: 137,
                     duration_ms: Some(17),
                     bytes_transferred: Some(23),
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -5799,6 +6113,7 @@ mod tests {
                         exit_code: 0,
                         duration_ms: None,
                         bytes_transferred: None,
+                        disk_peak_output_bytes: None,
                         timing: None,
                         cancellation: None,
                     }
@@ -6715,6 +7030,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },

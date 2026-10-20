@@ -89,6 +89,15 @@ impl Fixture {
         // PATH contains only fixtures, so even an installed host rustup cannot
         // repair a deliberately missing executable or contact the network.
         symlink("/bin/sh", root.path().join("bin/sh")).expect("provide worker's shell");
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .map(|path| path.join("python3"))
+            .find(|path| path.is_file())
+            .and_then(|path| fs::canonicalize(path).ok())
+            .expect("guarded worker integration tests require Python 3.8+");
+        symlink(python, root.path().join("bin/python3"))
+            .expect("provide the stdlib-only disk supervisor");
         executable(&root.path().join("bin/cargo"), CARGO);
         if mode != "missing" {
             executable(&root.path().join("bin/rustup"), RUSTUP);
@@ -106,6 +115,14 @@ impl Fixture {
             .args(["execute", "--workdir"])
             .arg(self.path("work"))
             .args(["--command", USER_COMMAND])
+            // These fixtures write only a few KiB. Exercise the real guard
+            // with an explicit small budget without depending on host GiB.
+            .args([
+                "--disk-budget-bytes",
+                "8388608",
+                "--disk-min-free-bytes",
+                "1048576",
+            ])
             .env_clear()
             .env("PATH", self.path("bin"))
             .env("HOME", self.path("home"))
