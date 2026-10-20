@@ -80,8 +80,9 @@ pub struct PressureAssessment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_free_ratio: Option<f64>,
     /// Free GB on the filesystem holding build trees, when the worker reports
-    /// it separately from the tightest mount (GH #78). Sizes capacity only;
-    /// `state` is still classified from `disk_free_gb`.
+    /// it separately from the tightest mount (GH #78). It sizes capacity, and
+    /// when `/tmp` is the tightest mount it is also the disk the full pressure
+    /// rules judge, while `/tmp` gets a free-space floor (GH #117).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_disk_free_gb: Option<f64>,
     /// Total GB of the filesystem reported in `build_disk_free_gb`.
@@ -386,6 +387,10 @@ pub struct DiskPressurePolicyConfig {
     /// When set, the critical ratio rule applies only at or below this many
     /// free GB (`[selection] disk_critical_ratio_cap_gb`, bd-xxck3).
     pub critical_free_ratio_cap_gb: Option<f64>,
+    /// A `/tmp` that is the tightest mount but holds no build trees is
+    /// Critical only below this many free GB; its ratio rules give at most
+    /// Warning (GH #117).
+    pub tmp_critical_free_gb: f64,
     /// Warning disk I/O saturation threshold.
     pub warning_disk_io_util_pct: f64,
     /// Critical disk I/O saturation threshold.
@@ -406,6 +411,7 @@ impl Default for DiskPressurePolicyConfig {
             warning_free_ratio: 0.12,
             critical_free_ratio: 0.05,
             critical_free_ratio_cap_gb: None,
+            tmp_critical_free_gb: 2.0,
             warning_disk_io_util_pct: 85.0,
             critical_disk_io_util_pct: 95.0,
             warning_memory_pressure: 80.0,
@@ -670,10 +676,31 @@ pub fn evaluate_pressure_policy(
             .map(|disk| disk.max_io_utilization_pct)
     });
 
+    // GH #117: the worker's tightest sample is the fullest of the project
+    // roots and `/tmp`, and its build sample the fullest of the roots alone,
+    // both copied from the same readings. So they differ exactly when `/tmp`
+    // is the tightest mount. Then the build disk gets the full rule set and
+    // `/tmp`, which holds no build trees, is judged by how close it is to
+    // full; the worse verdict wins. Without a build sample (older rch-wkr)
+    // the tightest mount is judged as before.
+    let tmp_is_tightest = matches!(
+        (disk_free_gb, disk_total_gb, build_disk_free_gb, build_disk_total_gb),
+        (Some(free), Some(total), Some(build_free), Some(build_total))
+            if (free, total) != (build_free, build_total)
+    );
+    let (judged_free_gb, judged_total_gb, judged_free_ratio) = if tmp_is_tightest {
+        let ratio = build_disk_free_gb
+            .zip(build_disk_total_gb)
+            .map(|(free, total)| (free / total).clamp(0.0, 1.0));
+        (build_disk_free_gb, build_disk_total_gb, ratio)
+    } else {
+        (disk_free_gb, disk_total_gb, disk_free_ratio)
+    };
+
     // A zero or non-finite reading is a failed probe, not a full disk: it
     // must not classify as critical via a defaulted 0.0 ratio.
-    let (state, confidence, reason_code, policy_rule) =
-        if disk_free_ratio.is_none() || disk_total_gb.is_some_and(|total| !total.is_finite()) {
+    let verdict =
+        if judged_free_ratio.is_none() || judged_total_gb.is_some_and(|total| !total.is_finite()) {
             (
                 PressureState::TelemetryGap,
                 PressureConfidence::Low,
@@ -682,20 +709,28 @@ pub fn evaluate_pressure_policy(
             )
         } else if telemetry_fresh {
             classify_with_fresh_telemetry(
-                disk_free_gb.unwrap_or_default(),
-                disk_total_gb.unwrap_or_default(),
-                disk_free_ratio.unwrap_or_default(),
+                judged_free_gb.unwrap_or_default(),
+                judged_total_gb.unwrap_or_default(),
+                judged_free_ratio.unwrap_or_default(),
                 disk_io_util_pct,
                 memory_pressure,
                 config,
             )
         } else {
             classify_without_fresh_telemetry(
-                disk_free_gb.unwrap_or_default(),
-                disk_total_gb.unwrap_or_default(),
-                disk_free_ratio.unwrap_or_default(),
+                judged_free_gb.unwrap_or_default(),
+                judged_total_gb.unwrap_or_default(),
+                judged_free_ratio.unwrap_or_default(),
                 config,
             )
+        };
+    let (state, confidence, reason_code, policy_rule) =
+        match (tmp_is_tightest, disk_free_gb, disk_free_ratio) {
+            (true, Some(tmp_free_gb), Some(tmp_free_ratio)) => worse_verdict(
+                verdict,
+                classify_tmp_mount(tmp_free_gb, tmp_free_ratio, telemetry_fresh, config),
+            ),
+            _ => verdict,
         };
 
     PressureAssessment {
@@ -725,6 +760,62 @@ pub fn evaluate_pressure_policy(
 /// twice the warning threshold gets the full rule set.
 fn absolute_gb_thresholds_apply(disk_total_gb: f64, config: &DiskPressurePolicyConfig) -> bool {
     disk_total_gb >= 2.0 * config.warning_free_gb
+}
+
+type Verdict = (PressureState, PressureConfidence, String, String);
+
+/// `/tmp` when it is the tightest mount but not the build disk (GH #117): it
+/// breaks scp and mktemp only when actually full, so it is Critical below an
+/// absolute floor, and its ratio rules give at most Warning. The reason codes
+/// name `/tmp` so every surface shows which mount drove the verdict.
+fn classify_tmp_mount(
+    tmp_free_gb: f64,
+    tmp_free_ratio: f64,
+    telemetry_fresh: bool,
+    config: &DiskPressurePolicyConfig,
+) -> Verdict {
+    let confidence = if telemetry_fresh {
+        PressureConfidence::High
+    } else {
+        PressureConfidence::Medium
+    };
+    if tmp_free_gb < config.tmp_critical_free_gb {
+        return (
+            PressureState::Critical,
+            confidence,
+            "tmp_free_below_floor".to_string(),
+            "tmp_free_gb<tmp_critical_free_gb".to_string(),
+        );
+    }
+    if tmp_free_ratio <= config.warning_free_ratio {
+        return (
+            PressureState::Warning,
+            confidence,
+            "tmp_ratio_below_warning".to_string(),
+            "tmp_free_ratio<=warning_free_ratio".to_string(),
+        );
+    }
+    (
+        PressureState::Healthy,
+        PressureConfidence::High,
+        "pressure_healthy".to_string(),
+        "all_pressure_rules_within_threshold".to_string(),
+    )
+}
+
+/// The more severe of two verdicts; on a tie the first (build disk) is kept.
+fn worse_verdict(first: Verdict, second: Verdict) -> Verdict {
+    let rank = |state: &PressureState| match state {
+        PressureState::Healthy => 0,
+        PressureState::TelemetryGap => 1,
+        PressureState::Warning => 2,
+        PressureState::Critical => 3,
+    };
+    if rank(&second.0) > rank(&first.0) {
+        second
+    } else {
+        first
+    }
 }
 
 /// The critical ratio rule, bounded by the optional absolute cap.
@@ -1140,7 +1231,64 @@ mod tests {
         let caps = caps_with_build_disk((0.2, 15.5), Some((1700.0, 1900.0)));
         let pressure = evaluate_pressure_policy(&caps, None, &config);
         assert_eq!(pressure.state, PressureState::Critical);
+        assert_eq!(pressure.reason_code, "tmp_free_below_floor");
         assert_eq!(pressure.capacity_free_gb(), Some(1700.0));
+    }
+
+    /// GH #117 reproduction: a 46 GiB tmpfs /tmp at 4.5% free (2.05 GiB) no
+    /// longer excludes a worker whose 387 GiB build disk has 136 GiB free; it
+    /// is a Warning that names /tmp, with or without the ratio cap.
+    #[test]
+    fn tmpfs_tmp_with_gigabytes_free_does_not_exclude_a_worker_with_a_roomy_build_disk() {
+        let caps = caps_with_build_disk((2.05, 46.04), Some((136.0, 387.0)));
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+
+        let default = DiskPressurePolicyConfig::default();
+        let fresh = evaluate_pressure_policy(&caps, Some(&telemetry), &default);
+        assert_eq!(fresh.capacity_free_gb(), Some(136.0));
+        assert_eq!(fresh.state, PressureState::Warning, "{}", fresh.reason_code);
+        assert_eq!(fresh.reason_code, "tmp_ratio_below_warning");
+        assert_eq!(
+            fresh.disk_free_gb,
+            Some(2.05),
+            "the /tmp sample is still reported"
+        );
+
+        let capped = DiskPressurePolicyConfig {
+            critical_free_ratio_cap_gb: Some(10.0),
+            ..DiskPressurePolicyConfig::default()
+        };
+        let fresh = evaluate_pressure_policy(&caps, Some(&telemetry), &capped);
+        assert_ne!(
+            fresh.state,
+            PressureState::Critical,
+            "{}",
+            fresh.reason_code
+        );
+
+        let stale = evaluate_pressure_policy(&caps, None, &default);
+        assert_eq!(stale.state, PressureState::Warning, "{}", stale.reason_code);
+    }
+
+    /// When /tmp is the tightest mount, the build disk still gets every rule:
+    /// 9 GB free on a 387 GB build disk is Critical by the absolute floor even
+    /// though /tmp (3 GB of 200 GB) alone would only be a Warning.
+    #[test]
+    fn build_disk_rules_still_apply_when_tmp_is_the_tightest_mount() {
+        let caps = caps_with_build_disk((3.0, 200.0), Some((9.0, 387.0)));
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+        let config = DiskPressurePolicyConfig::default();
+        let fresh = evaluate_pressure_policy(&caps, Some(&telemetry), &config);
+        assert_eq!(fresh.state, PressureState::Critical);
+        assert_eq!(fresh.reason_code, "disk_free_below_critical_gb");
+
+        // When the tightest sample IS the build disk, nothing changes.
+        let caps = caps_with_build_disk((9.0, 387.0), Some((9.0, 387.0)));
+        let fresh = evaluate_pressure_policy(&caps, Some(&telemetry), &config);
+        assert_eq!(fresh.reason_code, "disk_free_below_critical_gb");
+        let small = caps_with_build_disk((0.15, 3.8), Some((0.15, 3.8)));
+        let fresh = evaluate_pressure_policy(&small, Some(&telemetry), &config);
+        assert_eq!(fresh.reason_code, "disk_ratio_below_critical");
     }
 
     fn test_capabilities(free_gb: f64, total_gb: f64) -> WorkerCapabilities {
