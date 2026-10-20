@@ -147,7 +147,11 @@ class PreviewTests(unittest.TestCase):
         cls.token.chmod(0o600)
 
     def run_cli(self, endpoint, value=None, raw=None, extra=None, env=None):
-        args = [sys.executable, str(SCRIPT), '--endpoint', endpoint, '--token-file', str(self.token)]
+        # The fixture itself needs only stdlib. Keep host site-packages out
+        # of its startup; deadlines and every protocol assertion are unchanged.
+        # The separate real-venv test below verifies the helper's own flags.
+        args = [sys.executable, '-I', '-S', str(SCRIPT), '--endpoint', endpoint,
+                '--token-file', str(self.token)]
         args += extra or []
         result = subprocess.run(args, input=raw if raw is not None else client.encode(value or request()),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -184,6 +188,112 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(result['observation'], 'unknown' if is_error else 'unavailable')
             self.assertEqual(result['selection']['reason'], reason)
             self.assertEqual(len(peer.requests), 1)
+
+    def test_budgeted_daemon_approvals_preserve_exact_byte_allowances(self):
+        # SelectedWorker.disk_budget is emitted by the production HTTP
+        # observer, not an execution grant or a client-selected constraint.
+        # These values intentionally exceed the slot field's u32 range.
+        for reason, growth, floor in [('success', 40 << 30, 10 << 30),
+                                      ('affinity_pinned', (1 << 53) + 1, 0),
+                                      ('affinity_fallback', (1 << 64) - 1, (1 << 64) - 1)]:
+            with self.subTest(reason=reason):
+                response = reply(reason=reason)
+                budget = {'max_growth_bytes': growth, 'min_free_bytes': floor}
+                response['selection']['worker']['disk_budget'] = budget
+                response['selection']['worker']['slots_available'] = 1
+                with Peer(response) as peer:
+                    code, result = self.run_cli(peer.endpoint)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result['observation'], 'available')
+                self.assertEqual(result['selection'], response['selection'])
+                self.assertEqual(len(peer.requests), 1)
+                self.assertEqual(json.loads(peer.requests[0][3]), request())
+                self.assertNotIn('disk_budget', json.loads(peer.requests[0][3]))
+
+    def test_absent_and_null_budgets_are_not_synthesized_or_reserved(self):
+        for present in [False, True]:
+            with self.subTest(present=present):
+                response = reply()
+                if present:
+                    response['selection']['worker']['disk_budget'] = None
+                with Peer(response) as peer:
+                    code, result = self.run_cli(peer.endpoint)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result['selection'], response['selection'])
+                self.assertEqual(len(peer.requests), 1)
+
+    def test_malformed_budget_never_turns_into_a_partial_approval(self):
+        valid = {'max_growth_bytes': 32 << 30, 'min_free_bytes': 0}
+        malformed = [False, 1, 'unlimited', [], {},
+                     {'max_growth_bytes': 1}, {'min_free_bytes': 0},
+                     dict(valid, reserved=True), dict(valid, extra=0)]
+        for key in valid:
+            for bad in [True, False, -1, 1.5, '1024', None, 1 << 64]:
+                malformed.append(dict(valid, **{key: bad}))
+        malformed.append(dict(valid, max_growth_bytes=0))
+        for budget in malformed:
+            with self.subTest(budget=budget):
+                response = reply()
+                response['selection']['worker']['disk_budget'] = budget
+                with self.assertRaisesRegex(client.PreviewError, '^invalid_disk_budget$'):
+                    client.validate_response(response, request())
+        # Run representative malformed evidence through the complete native
+        # HTTP/helper boundary too, without 24 copies of process startup.
+        for budget in [dict(valid, min_free_bytes=True), dict(valid, reserved=True)]:
+            response = reply()
+            response['selection']['worker']['disk_budget'] = budget
+            with Peer(response) as peer:
+                code, result = self.run_cli(peer.endpoint)
+            self.assertEqual(code, 2)
+            self.assertEqual(result['observation'], 'unknown')
+            self.assertEqual(result['error'], 'invalid_disk_budget')
+            self.assertNotIn('selection', result)
+            self.assertEqual(len(peer.requests), 1, 'no retry or release')
+
+    def test_budget_support_does_not_weaken_worker_or_ownership_checks(self):
+        valid = reply()
+        valid['selection']['worker']['disk_budget'] = {
+            'max_growth_bytes': 32 << 30, 'min_free_bytes': 10 << 30}
+        cases = []
+        for key, value in [('id', 'not-requested'), ('slots_available', 0),
+                           ('slots_available', 1 << 32), ('project_lane', -1),
+                           ('new_execution_grant', True)]:
+            changed = copy.deepcopy(valid)
+            changed['selection']['worker'][key] = value
+            cases.append(changed)
+        for key, value in [('build_id', 1), ('reason', 'all_workers_busy')]:
+            changed = copy.deepcopy(valid)
+            changed['selection'][key] = value
+            cases.append(changed)
+        for response in cases:
+            with self.subTest(response=response), Peer(response) as peer:
+                code, result = self.run_cli(peer.endpoint)
+                self.assertEqual(code, 2)
+                self.assertEqual(result['observation'], 'unknown')
+                self.assertNotIn('selection', result)
+                self.assertEqual(len(peer.requests), 1)
+
+    def test_budget_cannot_be_supplied_as_a_new_client_authority_field(self):
+        value = request()
+        value['disk_budget'] = {'max_growth_bytes': 1, 'min_free_bytes': 0}
+        with Peer() as peer:
+            code, result = self.run_cli(peer.endpoint, value=value)
+            self.assertEqual(code, 2)
+            self.assertEqual(result['error'], 'invalid_request_fields')
+            self.assertEqual(peer.requests, [])
+
+    def test_duplicate_budget_fields_are_rejected_before_selection_validation(self):
+        response = reply()
+        response['selection']['worker']['disk_budget'] = {
+            'max_growth_bytes': 32 << 30, 'min_free_bytes': 0}
+        body = client.encode(response).replace(
+            b'"max_growth_bytes":', b'"max_growth_bytes":1,"max_growth_bytes":', 1)
+        with Peer(raw=body) as peer:
+            code, result = self.run_cli(peer.endpoint)
+        self.assertEqual(code, 2)
+        self.assertEqual(result['error'], 'duplicate_json_field')
+        self.assertNotIn('selection', result)
+        self.assertEqual(len(peer.requests), 1)
 
     def test_worker_pin_and_capacity_contradictions_never_authorize_or_release(self):
         values = [reply('not-requested'), reply(None), reply('wanted', 'all_workers_busy')]
@@ -257,7 +367,7 @@ class PreviewTests(unittest.TestCase):
                     }
                 with self.subTest(secret=secret, location=location), Peer(reflected) as peer:
                     completed = subprocess.run(
-                        [sys.executable, str(SCRIPT), '--endpoint', peer.endpoint,
+                        [sys.executable, '-I', '-S', str(SCRIPT), '--endpoint', peer.endpoint,
                          '--token-file', str(token_path)], input=client.encode(request()),
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=7, check=False,
                     )
@@ -277,7 +387,7 @@ class PreviewTests(unittest.TestCase):
         token_path.chmod(0o600)
         with Peer() as peer:
             completed = subprocess.run(
-                [sys.executable, str(SCRIPT), '--endpoint', peer.endpoint,
+                [sys.executable, '-I', '-S', str(SCRIPT), '--endpoint', peer.endpoint,
                  '--token-file', str(token_path)], input=client.encode(request()),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=7, check=False,
             )
@@ -473,7 +583,7 @@ class PreviewTests(unittest.TestCase):
         path = self.root / 'request.json'
         path.write_bytes(client.encode(request()))
         with Peer() as peer:
-            result = subprocess.run([sys.executable, str(SCRIPT), '--endpoint', peer.endpoint,
+            result = subprocess.run([sys.executable, '-I', '-S', str(SCRIPT), '--endpoint', peer.endpoint,
                                      '--no-token', '--request', str(path)],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6,
                                     env=dict(os.environ, RCH_API_TOKEN='ambient-token'))
@@ -512,7 +622,7 @@ class PreviewTests(unittest.TestCase):
 
     def test_abrupt_cli_owner_death_closes_the_live_helper_connection(self):
         with Peer(delay=True) as peer:
-            parent = subprocess.Popen([sys.executable, str(SCRIPT), '--endpoint', peer.endpoint,
+            parent = subprocess.Popen([sys.executable, '-I', '-S', str(SCRIPT), '--endpoint', peer.endpoint,
                                        '--no-token', '--timeout', '30'],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE)
@@ -547,6 +657,36 @@ class PreviewTests(unittest.TestCase):
         self.assertNotEqual(children[0].returncode, 0)
         with self.assertRaises(ChildProcessError):
             os.waitpid(children[0].pid, os.WNOHANG)
+
+    def test_network_helper_never_loads_environment_site_hooks(self):
+        import venv
+
+        # A real private interpreter environment, not a mocked Popen/transport.
+        # -I alone excludes user site but STILL runs environment .pth and
+        # sitecustomize code. Start the parent without site so only its
+        # directly owned helper could create the unwanted side effect.
+        for hook in ['sitecustomize.py', 'admission_startup.pth']:
+            with self.subTest(hook=hook):
+                root = Path(tempfile.mkdtemp(prefix='rch-preview-site-'))
+                venv.EnvBuilder(with_pip=False).create(root / 'env')
+                python = root / 'env' / 'bin' / 'python'
+                sites = list((root / 'env' / 'lib').glob('python*/site-packages'))
+                self.assertEqual(len(sites), 1)
+                witness = root / 'site-hook-ran'
+                (sites[0] / hook).write_text(
+                    'import pathlib; pathlib.Path({!r}).write_text("site loaded")\n'.format(str(witness)))
+                with Peer() as peer:
+                    result = subprocess.run(
+                        [str(python), '-I', '-S', str(SCRIPT), '--endpoint', peer.endpoint,
+                         '--no-token', '--timeout', '2'], input=client.encode(request()),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                output = json.loads(result.stdout)
+                self.assertEqual(output['observation'], 'available')
+                self.assertIs(output['execution_authorized'], False)
+                self.assertEqual(len(peer.requests), 1)
+                self.assertEqual(json.loads(peer.requests[0][3]), request())
+                self.assertFalse(witness.exists(), 'the network helper loaded unrelated startup code')
 
     def test_unknown_reason_variants_refuse_instead_of_becoming_denials(self):
         for reason in ['success_v2', 'future_denial', {'future_reason': 'details'},

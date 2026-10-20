@@ -83,6 +83,19 @@ including its diagnostics and optional observed project lane, is retained:
 | `1` | `unavailable` | The daemon returned a recognized selection denial; inspect its reason and diagnostics. |
 | `2` | `unknown` | Input, protocol, authentication, transport, timeout, internal selection error, or inconsistent evidence prevented a reliable observation. |
 
+Budget-aware daemons also return `selection.worker.disk_budget`, containing
+`max_growth_bytes` and `min_free_bytes`. These are exact unsigned 64-bit byte
+counts, not CPU-slot counts; zero protected-floor bytes is valid, while a
+present budget must have positive growth allowance. The client preserves both
+values unchanged, including allowances larger than 4 GiB. An absent or null
+budget remains absent or null: no cold estimate is invented by the client.
+Malformed budgets produce `unknown`, not an approval with the budget discarded.
+
+This is the daemon's **observed** budget, not a committed reservation. It does
+not authorize a build, reserve disk space, or promise that the next execution
+will receive the same allowance. `disk_headroom_gib` remains the request's
+supported disk input; a caller-supplied `disk_budget` field is rejected.
+
 `selection_error` is unknown even when the HTTP response is valid. A `429`
 means the preview service is saturated, not that worker slots are exhausted.
 Missing daemons, malformed responses, unknown protocol variants, a selected
@@ -114,6 +127,10 @@ separate, inherited ownership pipe also makes the helper exit and close its
 connection if the parent dies abruptly. It does
 not signal a daemon, a worker, a process group or an arbitrary recorded PID.
 Kernel scheduling and local input-file reads are not claimed to be hard-real-time.
+The helper runs with both Python isolated mode and site initialization disabled
+(`-I -S`): environment `.pth` files and site hooks are unnecessary for this
+standard-library-only transport and must not run or consume its deadline.
+This does not change how the caller starts the top-level client process.
 
 Responses are limited to one MiB of uncompressed body bytes. Content decoding,
 ambiguous framing, duplicate JSON fields, non-finite JSON numbers and truncated

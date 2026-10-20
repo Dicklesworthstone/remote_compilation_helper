@@ -168,6 +168,21 @@ def load_token(path):
     return token
 
 
+def validate_disk_budget(budget):
+    # SelectedWorker carries an optional BuildDiskBudget (two u64 byte
+    # counters), NOT two u32 slot counts or a reservation receipt. Retain
+    # exact integers: real GiB budgets already exceed the slot field's range.
+    # Do not infer a budget when absent or translate it into execution rights.
+    if budget is None:
+        return
+    if (type(budget) is not dict or budget.keys() != {'max_growth_bytes', 'min_free_bytes'}
+            or type(budget['max_growth_bytes']) is not int
+            or not 1 <= budget['max_growth_bytes'] <= (1 << 64) - 1
+            or type(budget['min_free_bytes']) is not int
+            or not 0 <= budget['min_free_bytes'] <= (1 << 64) - 1):
+        fail('invalid_disk_budget')
+
+
 def validate_response(response, request):
     if type(response) is not dict or response.keys() != {"protocol_version", "selection"}:
         fail("invalid_preview_envelope")
@@ -193,7 +208,7 @@ def validate_response(response, request):
     if worker is not None:
         required = {"id", "host", "user", "identity_file", "slots_available", "speed_score"}
         if (type(worker) is not dict or not required <= worker.keys()
-                or worker.keys() - required - {"declared_os", "project_lane"}
+                or worker.keys() - required - {"declared_os", "project_lane", "disk_budget"}
                 or not all(text(worker[key]) for key in ("id", "host", "user", "identity_file"))
                 or not uint(worker["slots_available"])
                 or not uint(worker.get("project_lane", 0))
@@ -201,6 +216,7 @@ def validate_response(response, request):
                 or not math.isfinite(worker["speed_score"])
                 or (worker.get("declared_os") is not None and not text(worker["declared_os"]))):
             fail("invalid_selected_worker")
+        validate_disk_budget(worker.get('disk_budget'))
         allowed = request.get("preferred_workers", [])
         if allowed and worker["id"] not in allowed:
             fail("worker_outside_requested_set")
@@ -346,8 +362,11 @@ def observe(endpoint, request, token, timeout_seconds):
     owner_read, owner_write = os.pipe()
     try:
         try:
+            # Isolated mode alone still processes environment site-packages
+            # and their executable .pth hooks. The helper needs only stdlib;
+            # unrelated startup code must not spend its deadline or run here.
             child = subprocess.Popen(
-                [sys.executable, "-I", str(Path(__file__).resolve()), "--_transport", str(owner_read)],
+                [sys.executable, "-I", "-S", str(Path(__file__).resolve()), "--_transport", str(owner_read)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 close_fds=True, pass_fds=(owner_read,))
         finally:
