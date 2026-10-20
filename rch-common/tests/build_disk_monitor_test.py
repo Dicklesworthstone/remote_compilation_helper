@@ -45,12 +45,13 @@ class DiskMonitorTests(unittest.TestCase):
                     process.kill()
             process.communicate(timeout=3)
 
-    def spawn(self, payload, *, budget=8 * MIB, floor=MIB, inject="", mode="standalone", outputs=None, target=None, timeout_seconds=0, receipt_initial=None):
+    def spawn(self, payload, *, budget=8 * MIB, floor=MIB, inject="", mode="standalone", outputs=None, target=None, timeout_seconds=0, receipt_initial=None, probe_paths=None):
         number = len(self.processes)
         receipt = self.root / ("receipt-" + str(number))
         target = target or self.target
         outputs = outputs or [target]
-        plan = {"probe": [str(target)] + [str(path) for path in outputs],
+        probes = probe_paths if probe_paths is not None else [target] + outputs
+        plan = {"probe": [str(path) for path in probes],
                 "output": [str(path) for path in outputs], "receipt": str(receipt),
                 "timeout_seconds": timeout_seconds, "receipt_initialized": receipt_initial is not None}
         if receipt_initial is not None:
@@ -131,11 +132,11 @@ class DiskMonitorTests(unittest.TestCase):
         # living group members keep the entire reservation.
 
     def test_free_bytes_use_unprivileged_available_blocks(self):
-        with patch.object(monitor.os, "statvfs", return_value=SimpleNamespace(f_bavail=7, f_bfree=99, f_frsize=4096)):
+        with patch.object(monitor.os, "fstatvfs", return_value=SimpleNamespace(f_bavail=7, f_bfree=99, f_frsize=4096)):
             self.assertEqual(list(monitor.filesystem_sample([str(self.target)]).values()), [7 * 4096])
 
     def test_telemetry_errors_and_filesystem_changes_fail_closed(self):
-        with patch.object(monitor.os, "statvfs", side_effect=PermissionError("probe unavailable")):
+        with patch.object(monitor.os, "fstatvfs", side_effect=PermissionError("probe unavailable")):
             with self.assertRaises(PermissionError):
                 monitor.filesystem_sample([str(self.target)])
         value = self.synthetic_monitor()
@@ -300,6 +301,130 @@ m.supervise=killed_after_receipt"""
         self.complete(process)
         self.assertEqual(self.failure(receipt)["reason"], "growth")
         self.assertTrue(output.exists())
+
+    def secondary_volume(self):
+        shared = Path("/dev/shm")
+        if not shared.is_dir() or not os.access(shared, os.W_OK):
+            self.skipTest("a writable second filesystem is required")
+        if shared.stat().st_dev == self.target.stat().st_dev:
+            self.skipTest("fixture directories must be on distinct filesystems")
+        return Path(tempfile.mkdtemp(prefix="rch-disk-test-", dir=str(shared)))
+
+    def secondary_capacity(self, secondary, free):
+        return f"""original_sample=m.filesystem_sample
+def sample(paths):
+    result=original_sample(paths)
+    device=os.stat({str(secondary)!r}).st_dev
+    if device in result:
+        result[device]={free}
+    return result
+m.filesystem_sample=sample"""
+
+    def test_unlisted_output_volume_refuses_before_workload_when_full(self):
+        secondary = self.secondary_volume()
+        process, receipt = self.spawn(
+            "print('must-not-start')", outputs=[self.target, secondary],
+            probe_paths=[self.target], inject=self.secondary_capacity(secondary, MIB),
+        )
+        status, stdout, _ = self.complete(process)
+        self.assertEqual(status, monitor.EXIT_BUDGET)
+        self.assertNotIn("must-not-start", stdout)
+        failure = self.failure(receipt)
+        self.assertEqual(failure["reason"], "admission")
+        self.assertFalse(failure["started"])
+
+    def test_unlisted_healthy_output_volume_is_reserved_and_allowed(self):
+        secondary = self.secondary_volume()
+        output = secondary / "output"
+        process, receipt = self.spawn(
+            f"from pathlib import Path; Path({str(output)!r}).write_bytes(b'x'*4096)",
+            outputs=[self.target, secondary, secondary], probe_paths=[self.target],
+            inject=self.secondary_capacity(secondary, 24 * MIB),
+        )
+        status, _, stderr = self.complete(process)
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(output.stat().st_size, 4096)
+        entries = monitor.Registry(str(self.registry)).read()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["devices"],
+                         sorted([self.target.stat().st_dev, secondary.stat().st_dev]))
+        self.assertTrue(json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])["complete"])
+
+    def test_unlisted_output_volume_floor_stops_running_workload(self):
+        secondary = self.secondary_volume()
+        ready = secondary / "writer"
+        free = f"({MIB} if pathlib.Path({str(ready)!r}).exists() else {24*MIB})"
+        payload = f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(2)"
+        process, receipt = self.spawn(
+            payload, outputs=[self.target, secondary], probe_paths=[self.target],
+            inject=self.secondary_capacity(secondary, free),
+        )
+        status, _, _ = self.complete(process)
+        self.assertNotEqual(status, 0)
+        failure = self.failure(receipt)
+        self.assertEqual(failure["reason"], "free_floor")
+        self.assertTrue(failure["started"])
+        record = monitor.process_snapshot().get(int(ready.read_text()))
+        self.assertTrue(record is None or record["state"] in ("Z", "X"))
+
+    def test_capacity_and_device_are_bound_to_the_same_open_directory(self):
+        secondary = self.secondary_volume()
+        link = self.root / "probe-link"
+        link.symlink_to(self.target, target_is_directory=True)
+        original_stat, original_open = os.stat, os.open
+        device = self.target.stat().st_dev
+        switched = False
+
+        def switch():
+            nonlocal switched
+            if not switched:
+                link.rename(self.root / "original-probe-link")
+                link.symlink_to(secondary, target_is_directory=True)
+                switched = True
+
+        def changing_stat(path, *args, **kwargs):
+            value = original_stat(path, *args, **kwargs)
+            if path == str(link):
+                switch()
+            return value
+
+        def changing_open(path, *args, **kwargs):
+            descriptor = original_open(path, *args, **kwargs)
+            if path == str(link):
+                switch()
+            return descriptor
+
+        def capacity(dev):
+            return SimpleNamespace(f_bavail=7 if dev == device else 99, f_frsize=4096)
+
+        with patch.object(monitor.os, "stat", side_effect=changing_stat), \
+             patch.object(monitor.os, "open", side_effect=changing_open), \
+             patch.object(monitor.os, "statvfs", side_effect=lambda path: capacity(original_stat(path).st_dev)), \
+             patch.object(monitor.os, "fstatvfs", side_effect=lambda fd: capacity(os.fstat(fd).st_dev)):
+            samples = monitor.filesystem_sample([str(link)])
+        self.assertTrue(switched, "the fixture must actually replace the path")
+        self.assertEqual(samples, {device: 7 * 4096})
+
+    def test_output_replacement_during_admission_probe_never_starts_workload(self):
+        inject = f"""original_sample=m.filesystem_sample
+samples=0
+def sample(paths):
+    global samples
+    result=original_sample(paths)
+    samples+=1
+    if samples == 2:
+        os.rename({str(self.target)!r}, {str(self.root / 'original-target')!r})
+        os.mkdir({str(self.target)!r})
+    return result
+m.filesystem_sample=sample"""
+        process, receipt = self.spawn("print('must-not-start')", inject=inject)
+        status, stdout, _ = self.complete(process)
+        self.assertEqual(status, monitor.EXIT_BUDGET)
+        self.assertNotIn("must-not-start", stdout)
+        failure = self.failure(receipt)
+        self.assertEqual(failure["reason"], "monitor_unavailable")
+        self.assertFalse(failure["started"])
+        self.assertEqual(monitor.Registry(str(self.registry)).read(), [])
 
     def test_corrupt_ledger_refuses_before_workload(self):
         registry = monitor.Registry(str(self.registry))

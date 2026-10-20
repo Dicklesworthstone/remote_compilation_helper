@@ -148,8 +148,15 @@ def reservation_alive(record, boot, groups):
 def filesystem_sample(paths):
     samples = {}
     for path in paths:
-        device = os.stat(path).st_dev
-        info = os.statvfs(path)
+        # Bind capacity to the same directory as its device identity. Separate
+        # path-based stat/statvfs calls can combine different filesystems when
+        # a symlink or mount path changes between the two operations.
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            device = os.fstat(descriptor).st_dev
+            info = os.fstatvfs(descriptor)
+        finally:
+            os.close(descriptor)
         available = info.f_bavail * info.f_frsize
         samples[device] = min(samples.get(device, available), available)
     return samples
@@ -310,8 +317,10 @@ class Registry:
 class Monitor:
     def __init__(self, budget, floor, target, paths, outputs=None):
         self.budget, self.floor = budget, floor
-        self.paths = list(dict.fromkeys(paths + [target]))
         self.outputs = list(dict.fromkeys(outputs if outputs is not None else [target]))
+        # Every managed output volume needs both a reservation and ongoing
+        # floor protection, even when a caller omitted it from its probe list.
+        self.paths = list(dict.fromkeys(paths + [target] + self.outputs))
         self.bindings = output_bindings(self.outputs)
         self.boot, self.group = boot_identity(), os.getpgrp()
         if self.group <= 1:
@@ -334,7 +343,9 @@ class Monitor:
 
     def sample(self):
         verify_output_bindings(self.bindings)
-        return filesystem_sample(self.paths)
+        samples = filesystem_sample(self.paths)
+        verify_output_bindings(self.bindings)
+        return samples
 
     def scan(self):
         verify_output_bindings(self.bindings)
