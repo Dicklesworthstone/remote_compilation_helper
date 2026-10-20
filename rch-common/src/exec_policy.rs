@@ -436,12 +436,8 @@ mod tests {
             Ok("non-compilation command"),
         );
         for flag in ["0", "false", "FALSE", "no", "off"] {
-            assert!(
-                unavailable_remote_fallback("cargo build", &config, Some(flag), None).is_ok()
-            );
-            assert!(
-                unavailable_remote_fallback("cargo build", &config, None, Some(flag)).is_ok()
-            );
+            assert!(unavailable_remote_fallback("cargo build", &config, Some(flag), None).is_ok());
+            assert!(unavailable_remote_fallback("cargo build", &config, None, Some(flag)).is_ok());
         }
         assert_eq!(
             unavailable_remote_fallback("cargo build", &config, Some("1"), Some("0")),
@@ -463,12 +459,7 @@ mod tests {
                 config.general.force_remote = force_remote;
                 for flag in ["0", "1"] {
                     assert_eq!(
-                        unavailable_remote_fallback(
-                            "cargo build",
-                            &config,
-                            Some("0"),
-                            Some(flag)
-                        ),
+                        unavailable_remote_fallback("cargo build", &config, Some("0"), Some(flag)),
                         Err("compilation.allow_local_fallback=false"),
                     );
                 }

@@ -66,7 +66,10 @@ impl PreviewRequest {
                 "estimated_cores must be positive",
             ));
         }
-        if self.required_tools.iter().any(|tool| tool.trim().is_empty())
+        if self
+            .required_tools
+            .iter()
+            .any(|tool| tool.trim().is_empty())
             || self
                 .preferred_workers
                 .iter()
@@ -132,7 +135,9 @@ impl PreviewRequest {
                 "expected exactly one request parameter",
             ))?;
         if raw.contains('&') || query.len() > MAX_REQUEST_BYTES {
-            return Err(PreviewError::InvalidRequest("unexpected or oversized query"));
+            return Err(PreviewError::InvalidRequest(
+                "unexpected or oversized query",
+            ));
         }
         let mut bytes = Vec::with_capacity(raw.len());
         let mut input = raw.bytes();
@@ -247,7 +252,10 @@ mod tests {
         );
         let selection = decoded.into_selection().unwrap();
         assert_eq!(selection.project, original.project);
-        assert_eq!(selection.command.as_deref(), Some(original.command.as_str()));
+        assert_eq!(
+            selection.command.as_deref(),
+            Some(original.command.as_str())
+        );
         assert_eq!(selection.estimated_cores, 7);
         assert_eq!(selection.disk_headroom_gib, 31);
         assert_eq!(selection.preferred_workers, original.preferred_workers);
@@ -262,10 +270,8 @@ mod tests {
     #[test]
     fn preview_rejects_execution_controls_unknown_constraints_and_duplicate_fields() {
         assert!(
-            PreviewRequest::from_query(&encoded_query(
-                &serde_json::to_string(&request()).unwrap()
-            ))
-            .is_ok()
+            PreviewRequest::from_query(&encoded_query(&serde_json::to_string(&request()).unwrap()))
+                .is_ok()
         );
         for name in [
             "wait",
@@ -278,7 +284,10 @@ mod tests {
             let mut value = serde_json::to_value(request()).unwrap();
             value[name] = serde_json::json!(1);
             let error = PreviewRequest::from_query(&encoded_query(&value.to_string())).unwrap_err();
-            assert!(error.to_string().contains("unknown field"), "{name}: {error}");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{name}: {error}"
+            );
         }
         let json = serde_json::to_string(&request()).unwrap();
         let duplicate = format!("{{\"estimated_cores\":1,{}", &json[1..]);
