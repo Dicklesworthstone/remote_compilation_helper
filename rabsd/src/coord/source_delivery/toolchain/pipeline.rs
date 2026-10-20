@@ -1,9 +1,12 @@
 //! One bounded acknowledgment window across the entire cold toolchain tree.
 //! Entries and chunks keep their original wire order and exact response checks.
 //! No payload is retained in this window, and any failure permanently stops it.
+//! A valid oldest ACK releases only its own credit: later controls remain in
+//! flight while the sender refills that space, instead of draining each burst.
 
 use super::{CHUNK_WINDOW, WorkerPeer, digest, invalid, require};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::io;
 
 // The worker permits eight deferred frames / 2 MiB. Stay strictly below both
@@ -65,7 +68,9 @@ pub(super) struct UploadWindow<'peer, 'paths, P: WorkerPeer + ?Sized> {
     peer: &'peer mut P,
     request_id: u64,
     identity: [u8; 32],
-    pending: Vec<ExpectedAck<'paths>>,
+    // The byte charge includes the encoded frame and its newline. Retaining
+    // it per control is necessary when metadata and chunks have different sizes.
+    pending: VecDeque<(ExpectedAck<'paths>, usize)>,
     pending_bytes: usize,
     failed: bool,
 }
@@ -76,7 +81,7 @@ impl<'peer, 'paths, P: WorkerPeer + ?Sized> UploadWindow<'peer, 'paths, P> {
             peer,
             request_id,
             identity,
-            pending: Vec::with_capacity(CHUNK_WINDOW),
+            pending: VecDeque::with_capacity(CHUNK_WINDOW),
             pending_bytes: 0,
             failed: false,
         }
@@ -93,25 +98,36 @@ impl<'peer, 'paths, P: WorkerPeer + ?Sized> UploadWindow<'peer, 'paths, P> {
             .checked_add(1)
             .filter(|bytes| *bytes <= MAX_IN_FLIGHT_BYTES)
             .ok_or_else(|| invalid("toolchain control exceeds its byte window"))?;
-        if self.pending_bytes > MAX_IN_FLIGHT_BYTES - bytes {
-            self.drain()?;
+        while self.pending_bytes > MAX_IN_FLIGHT_BYTES - bytes {
+            self.acknowledge_one()?;
         }
         self.peer.send(frame)?;
-        self.pending.push(expected);
+        self.pending.push_back((expected, bytes));
         self.pending_bytes += bytes;
         if self.pending.len() == CHUNK_WINDOW {
-            self.drain()?;
+            // One validated reply makes room for one more control. Do not
+            // wait for the rest of the window: those bytes are already owned
+            // by the same admitted transfer and retain their exact ACK debt.
+            self.acknowledge_one()?;
         }
         self.failed = false;
         Ok(())
     }
 
-    fn drain(&mut self) -> io::Result<()> {
-        for expected in self.pending.drain(..) {
-            let reply = self.peer.receive()?;
-            expected.check_reply(&reply, self.request_id, &self.identity)?;
-        }
-        self.pending_bytes = 0;
+    fn acknowledge_one(&mut self) -> io::Result<()> {
+        let (expected, bytes) = self
+            .pending
+            .front()
+            .ok_or_else(|| invalid("toolchain byte credit has no pending acknowledgment"))?;
+        let reply = self.peer.receive()?;
+        expected.check_reply(&reply, self.request_id, &self.identity)?;
+        // A malformed, lost or out-of-order ACK earns no credit. Keep the
+        // debt until every identity/range check above has succeeded.
+        self.pending_bytes = self
+            .pending_bytes
+            .checked_sub(*bytes)
+            .ok_or_else(|| invalid("toolchain upload byte credit underflow"))?;
+        let _ = self.pending.pop_front();
         Ok(())
     }
 
@@ -120,6 +136,12 @@ impl<'peer, 'paths, P: WorkerPeer + ?Sized> UploadWindow<'peer, 'paths, P> {
     pub(super) fn finish(mut self) -> io::Result<()> {
         require(!self.failed, "toolchain upload window already failed")?;
         self.failed = true;
-        self.drain()
+        while !self.pending.is_empty() {
+            self.acknowledge_one()?;
+        }
+        require(
+            self.pending_bytes == 0,
+            "toolchain upload has unacknowledged bytes",
+        )
     }
 }
