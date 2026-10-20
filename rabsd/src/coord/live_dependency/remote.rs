@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod recovery;
+mod toolchains;
 
 const CONFIG_KEYS: [&str; 3] = [
     "RABS_DEPENDENCY_WORKER_LISTEN",
@@ -309,28 +310,9 @@ impl RemoteValidation {
     }
 }
 
-#[derive(Debug)]
-enum ToolchainMemo {
-    Warming(ToolchainCapture),
-    Ready(Arc<RetainedToolchain>),
-}
-
-/// One owned background warmup, never one copy per compiler invocation.
-/// Drop cancels the bounded filesystem walker and joins its owner.
-#[derive(Debug)]
-struct ToolchainCapture {
-    cancellation: OperationCancellation,
-    handle: Option<std::thread::JoinHandle<Result<Arc<RetainedToolchain>, String>>>,
-}
-
-impl Drop for ToolchainCapture {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
+// The original compiler AND sysroot spellings select preparation ownership.
+// Path equality is never content authority: every returned image is revalidated.
+type ToolchainMemo = toolchains::Cache<(PathBuf, PathBuf), RetainedToolchain>;
 
 impl RemoteDependencies {
     /// No variables selects the ordinary local lane. Partial or invalid explicit
@@ -501,79 +483,75 @@ impl RemoteDependencies {
         compiler: &Path,
     ) -> Result<Option<Arc<RetainedToolchain>>, String> {
         guard.verify_unchanged(compiler)?;
-        let mut memo = self
-            .toolchain
-            .lock()
-            .map_err(|_| "toolchain retention lock poisoned")?;
-        if let Some(ToolchainMemo::Warming(warmup)) = memo.as_mut() {
-            if !warmup
-                .handle
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-            {
-                return Ok(None);
-            }
-            let handle = warmup
-                .handle
-                .take()
-                .ok_or("toolchain warmup owner missing")?;
-            let outcome = handle
-                .join()
-                .map_err(|_| "toolchain warmup panicked".to_owned());
-            *memo = None;
-            let retained = outcome??;
-            *memo = Some(ToolchainMemo::Ready(retained));
-        }
-        if let Some(ToolchainMemo::Ready(retained)) = memo.as_ref()
-            && retained.guard.verify_unchanged(compiler).is_ok()
-            && retained
+        let key = (compiler.to_path_buf(), guard.sysroot().to_path_buf());
+        let retained = {
+            // A contended cache is preparation, never authority or an excuse
+            // to block the decision lane behind another compiler's scan.
+            let mut memo = match self.toolchain.try_lock() {
+                Ok(memo) => memo,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("toolchain retention lock poisoned".into());
+                }
+            };
+            let state = self.state.clone();
+            let capture_guard = guard.clone();
+            let capture_compiler = compiler.to_path_buf();
+            memo.get_or_insert_with(|| ToolchainMemo::new(toolchains::CAPACITY))
+                .poll(key.clone(), move |stopped| {
+                    if stopped.load(Ordering::Acquire) {
+                        return Err("toolchain capture cancelled".into());
+                    }
+                    capture_guard.verify_unchanged(&capture_compiler)?;
+                    let directory = tempfile::Builder::new()
+                        .prefix("compiler-")
+                        .tempdir_in(state)
+                        .map_err(|error| error.to_string())?;
+                    let image = capture_toolchain(
+                        capture_guard.sysroot(),
+                        &directory.path().join("tree"),
+                        None,
+                        &ToolchainLimits::default(),
+                        || stopped.load(Ordering::Acquire),
+                    )
+                    .map_err(|error| format!("capture complete original toolchain: {error}"))?;
+                    capture_guard.verify_unchanged(&capture_compiler)?;
+                    image
+                        .verify_source_unchanged(capture_guard.sysroot(), || {
+                            stopped.load(Ordering::Acquire)
+                        })
+                        .map_err(|error| error.to_string())?;
+                    Ok(RetainedToolchain {
+                        guard: capture_guard,
+                        image: Arc::new(image),
+                        _directory: directory,
+                    })
+                })?
+        };
+        let Some(retained) = retained else {
+            return Ok(None);
+        };
+        // Retain the generation before releasing the cache lock; eviction can
+        // never remove its backing while these filesystem checks or a later
+        // upload use it. Validate outside the lock so other ready toolchains
+        // make progress. Keep all original checks, not just a cached path hit.
+        if retained.guard.verify_unchanged(compiler).is_err()
+            || retained
                 .image
                 .verify_source_unchanged(guard.sysroot(), || false)
-                .is_ok()
+                .is_err()
         {
-            return Ok(Some(Arc::clone(retained)));
+            let mut memo = self
+                .toolchain
+                .lock()
+                .map_err(|_| "toolchain retention lock poisoned")?;
+            if let Some(cache) = memo.as_mut() {
+                cache.invalidate(&key, &retained);
+            }
+            return Ok(None);
         }
-        // A warmup never blocks the hot decision lane on a multi-GB copy.
-        // A waiting wrapper retries this same invocation after preparation;
-        // nonwaiting callers retain the ordinary local lane. Neither acquires
-        // a remote action key or execution authority from the pending copy.
-        let state = self.state.clone();
-        let guard = guard.clone();
-        let compiler = compiler.to_path_buf();
-        let cancellation = OperationCancellation::new();
-        let stopped = cancellation.clone();
-        let handle = std::thread::Builder::new()
-            .name("rabs-remote-toolchain".into())
-            .spawn(move || {
-                guard.verify_unchanged(&compiler)?;
-                let directory = tempfile::Builder::new()
-                    .prefix("compiler-")
-                    .tempdir_in(state)
-                    .map_err(|error| error.to_string())?;
-                let image = capture_toolchain(
-                    guard.sysroot(),
-                    &directory.path().join("tree"),
-                    None,
-                    &ToolchainLimits::default(),
-                    || stopped.is_cancelled(),
-                )
-                .map_err(|error| format!("capture complete original toolchain: {error}"))?;
-                guard.verify_unchanged(&compiler)?;
-                image
-                    .verify_source_unchanged(guard.sysroot(), || stopped.is_cancelled())
-                    .map_err(|error| error.to_string())?;
-                Ok(Arc::new(RetainedToolchain {
-                    guard,
-                    image: Arc::new(image),
-                    _directory: directory,
-                }))
-            })
-            .map_err(|error| error.to_string())?;
-        *memo = Some(ToolchainMemo::Warming(ToolchainCapture {
-            cancellation,
-            handle: Some(handle),
-        }));
-        Ok(None)
+        guard.verify_unchanged(compiler)?;
+        Ok(Some(retained))
     }
 }
 
