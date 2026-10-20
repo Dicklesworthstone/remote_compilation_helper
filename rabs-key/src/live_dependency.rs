@@ -14,8 +14,11 @@
 //!
 //! ## The class (`live-dependency-v1`)
 //!
-//! Plan §204's first served target, restricted to what can be keyed
-//! exactly without a sandbox on the edge host:
+//! Plan §204's first dependency target. Planning models library invocations;
+//! authoritative serving additionally requires
+//! [`check_dependency_cache_read_closure`]. The unsandboxed edge currently
+//! serves only metadata plus dep-info, because rustc does not report every
+//! assembler/codegen input in dep-info:
 //!
 //! - rustc invoked by Cargo for a registry package at
 //!   `<cargo-home>/registry/src/<index>/<package>` or a Git dependency at
@@ -49,9 +52,12 @@
 //!   publication. Captured bytes, including dirty and untracked files,
 //!   define identity; a revision directory name never proves cleanliness.
 //!   A file added anywhere in the source tree changes the key, so the
-//!   negative-dependency component binds complete enumeration. Reads
-//!   outside that tree are caught after execution by
-//!   [`dep_info_closure_violation`] and the result is not published.
+//!   negative-dependency component binds complete enumeration. Source reads
+//!   reported outside that tree are caught after execution by
+//!   [`dep_info_closure_violation`] and the result is not published. Dep-info
+//!   is not a complete codegen read observer: for example, `global_asm!` can
+//!   use `.incbin` without reporting that file. Such invocations may be
+//!   planned for discovery, but may not publish or serve in this lane.
 //! - **Placement virtualization:** `--out-dir` is rewritten to
 //!   [`CANONICAL_OUT_DIR`]; ordered dependency search directories and
 //!   `--extern` paths use distinct canonical roots before keying. rustc does not embed the out-dir
@@ -230,6 +236,8 @@ pub enum LiveRefusal {
     DiagnosticFormat,
     /// `target-cpu=native` has no resolved cohort here.
     NativeCpu,
+    /// Codegen can read inputs that rustc's dep-info does not report.
+    UnclosedCodegenInputs,
     /// Supplied facts do not cover the plan (caller bug or a race).
     Facts(String),
 }
@@ -255,6 +263,7 @@ impl LiveRefusal {
             Self::NativeLibrary(_) => "LIVE_DEP_NATIVE_LIB",
             Self::DiagnosticFormat => "LIVE_DEP_DIAGNOSTIC_FORMAT",
             Self::NativeCpu => "LIVE_DEP_NATIVE_CPU",
+            Self::UnclosedCodegenInputs => "LIVE_DEP_CODEGEN_READ_CLOSURE",
             Self::Facts(_) => "LIVE_DEP_FACTS",
         }
     }
@@ -279,7 +288,43 @@ impl std::fmt::Display for LiveRefusal {
             Self::MissingEnv(name) => write!(f, "{}: {name}", self.code()),
             Self::NotDependencyCompile(why) => write!(f, "{}: {why}", self.code()),
             Self::DiagnosticFormat | Self::NativeCpu => f.write_str(self.code()),
+            Self::UnclosedCodegenInputs => write!(
+                f,
+                "{}: only metadata and dep-info have serving authority; codegen requires enforced input closure",
+                self.code()
+            ),
         }
+    }
+}
+
+/// Restrict live cache authority to the output mode whose reads the current
+/// dependency lane can validate. This is a serving gate, not an invocation
+/// parser or a source scanner. Keep it separate from planning so discovery
+/// and output-conformance probes can still describe ordinary rlib compiles.
+///
+/// A complete package inventory and repeated matching outputs do not close
+/// codegen inputs: assembler `.incbin`, including assembly introduced through
+/// macro expansion, can read outside every keyed root without appearing in
+/// rustc's dep-info. A codegen result therefore cannot qualify merely by
+/// accumulating verification samples. Callers must apply this check before
+/// persisted-result lookup and again at execution/publication boundaries.
+/// Re-enabling codegen requires a distinct enforced-view policy and key.
+///
+/// # Errors
+/// Returns [`LiveRefusal::UnclosedCodegenInputs`] for implicit link output,
+/// explicit link/object/assembly/LLVM outputs, and every emit set other than
+/// exactly metadata plus dep-info. Success still requires all normal planning,
+/// input observation, dep-info and serving checks.
+pub fn check_dependency_cache_read_closure(
+    invocation: &NormalizedRustcInvocation,
+) -> Result<(), LiveRefusal> {
+    if invocation.emit.len() == 2
+        && invocation.emit.iter().any(|kind| kind == "metadata")
+        && invocation.emit.iter().any(|kind| kind == "dep-info")
+    {
+        Ok(())
+    } else {
+        Err(LiveRefusal::UnclosedCodegenInputs)
     }
 }
 
@@ -1675,6 +1720,43 @@ mod tests {
         .collect();
         argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
         argv
+    }
+
+    #[test]
+    fn cache_read_closure_requires_exact_metadata_and_dep_info_without_codegen() {
+        for emit in ["dep-info,metadata", "metadata,dep-info"] {
+            let mut args = argv(OUT_A, &[]);
+            *args
+                .iter_mut()
+                .find(|argument| argument.starts_with("--emit="))
+                .unwrap() = format!("--emit={emit}");
+            let invocation = parse(&args, None).unwrap();
+            assert_eq!(check_dependency_cache_read_closure(&invocation), Ok(()));
+        }
+        for emit in [
+            "dep-info,metadata,link",
+            "dep-info,link",
+            "dep-info,obj",
+            "dep-info,asm",
+            "dep-info,llvm-ir",
+            "dep-info,llvm-bc",
+            "dep-info,mir",
+            "metadata",
+            "dep-info",
+            "",
+        ] {
+            let mut args = argv(OUT_A, &[]);
+            args.retain(|argument| !argument.starts_with("--emit="));
+            if !emit.is_empty() {
+                args.push(format!("--emit={emit}"));
+            }
+            let invocation = parse(&args, None).unwrap();
+            assert_eq!(
+                check_dependency_cache_read_closure(&invocation),
+                Err(LiveRefusal::UnclosedCodegenInputs),
+                "the emit set {emit:?} cannot gain authority through dep-info"
+            );
+        }
     }
 
     fn env(extra: &[(&str, &str)]) -> Vec<(String, String)> {

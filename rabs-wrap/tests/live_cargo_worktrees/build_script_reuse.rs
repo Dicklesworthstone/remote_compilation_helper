@@ -48,12 +48,12 @@ fn script_dependency(world: &World, source: &str, script: &str) {
 
 /// Cargo's own JSON reports the actual build-script directory. It is not a
 /// guessed target-layout path or a value we inject into the wrapper request.
-fn json_build(world: &World, worktree: &Path, wrapped: bool) -> (Output, PathBuf) {
+fn json_check(world: &World, worktree: &Path, wrapped: bool) -> (Output, PathBuf) {
     let output = world
         .cargo_command(worktree, wrapped)
-        .args(["build", "-v", "--message-format=json"])
+        .args(["check", "-v", "--message-format=json"])
         .output()
-        .expect("real cargo build");
+        .expect("real cargo check");
     assert!(output.status.success(), "{}", stderr(&output));
     let records: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
         .unwrap()
@@ -81,7 +81,7 @@ fn request_key(decisions: &[serde_json::Value], decision: &str) -> String {
 }
 
 #[test]
-fn config_only_build_script_compiles_are_served_across_real_cargo_worktrees() {
+fn config_only_build_script_dependency_metadata_is_served_across_real_cargo_worktrees() {
     let dir = tempfile::Builder::new()
         .prefix("rc-cfg")
         .tempdir_in("/tmp")
@@ -91,16 +91,16 @@ fn config_only_build_script_compiles_are_served_across_real_cargo_worktrees() {
     script_dependency(
         &world,
         concat!(
-            "#[cfg(configured)] pub fn quad(x: u32) -> u32 { x * 4 }\n",
+            "#[cfg(configured)] pub const fn quad(x: u32) -> u32 { x * 4 }\n",
             "#[cfg(not(configured))] compile_error!(\"missing build-script cfg\");\n",
-            "pub fn leaf_origin() -> &'static str { env!(\"BUILD_LABEL\") }\n",
+            "pub const fn leaf_origin() -> &'static str { env!(\"BUILD_LABEL\") }\n",
         ),
         CONFIG_SCRIPT,
     );
     let stock = world.worktree("stock");
-    let (_, stock_generated) = json_build(&world, &stock, false);
+    World::expect_origin(&stock, "ready");
+    let (_, stock_generated) = json_check(&world, &stock, false);
     assert_eq!(std::fs::read_dir(&stock_generated).unwrap().count(), 0);
-    assert_eq!(World::run_app(&stock), "12 ready\n");
     let expected = library_outputs(&stock, "middle");
     let daemon = daemon_with_reuse(&world);
     let mut original_key = None;
@@ -112,8 +112,9 @@ fn config_only_build_script_compiles_are_served_across_real_cargo_worktrees() {
         ("served", "served"),
     ] {
         let worktree = world.worktree(name);
+        World::expect_origin(&worktree, "ready");
         let mark = daemon.decisions().len();
-        let (build, generated) = json_build(&world, &worktree, true);
+        let (build, generated) = json_check(&world, &worktree, true);
         assert!(generated_roots.insert(generated.clone()));
         assert_eq!(std::fs::read_dir(&generated).unwrap().count(), 0);
         // Every worktree runs its build script normally, even the served one.
@@ -148,12 +149,11 @@ fn config_only_build_script_compiles_are_served_across_real_cargo_worktrees() {
         } else {
             original_key = Some(key);
         }
-        assert_eq!(World::run_app(&worktree), "12 ready\n");
         assert_eq!(library_outputs(&worktree, "middle"), expected);
     }
     let served = world.root.join("served");
     let mark = daemon.decisions().len();
-    let fresh = world.cargo_build(&served, true);
+    let fresh = world.cargo_check(&served, true);
     for unit in ["middle", "app"] {
         assert!(
             stderr(&fresh).contains(&format!("Fresh {unit}")),
@@ -176,8 +176,8 @@ fn tracked_out_dir_reads_never_become_cross_worktree_cache_hits() {
         script_dependency(
             &world,
             &format!(
-                "pub fn quad(x: u32) -> u32 {{ x * 4 }}\n\
-                 pub fn leaf_origin() -> &'static str {{ {expression} }}\n"
+                "pub const fn quad(x: u32) -> u32 {{ x * 4 }}\n\
+                 pub const fn leaf_origin() -> &'static str {{ {expression} }}\n"
             ),
             CONFIG_SCRIPT,
         );
@@ -188,11 +188,16 @@ fn tracked_out_dir_reads_never_become_cross_worktree_cache_hits() {
         for index in 0..4 {
             let worktree = world.worktree(&format!("read-{index}"));
             let mark = daemon.decisions().len();
-            let (_, generated) = json_build(&world, &worktree, true);
+            let (_, generated) = json_check(&world, &worktree, true);
             assert_eq!(std::fs::read_dir(&generated).unwrap().count(), 0);
-            assert_eq!(
-                World::run_app(&worktree),
-                format!("12 {}\n", generated.display())
+            // A real downstream typecheck reads the value from the produced
+            // metadata. It must match this worktree's own build-script path.
+            World::expect_origin(&worktree, generated.to_str().unwrap());
+            let fresh = world.cargo_check(&worktree, true);
+            assert!(
+                stderr(&fresh).contains("Fresh middle"),
+                "{}",
+                stderr(&fresh)
             );
             // Capture rejection has no publication task to settle. Request
             // decisions precede compiler execution and are already recorded.
@@ -226,8 +231,8 @@ fn generated_file_consumers_keep_the_exact_path_lane_with_reuse_enabled() {
         &world,
         concat!(
             "include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
-            "pub fn quad(x: u32) -> u32 { x * 4 }\n",
-            "pub fn leaf_origin() -> &'static str { LABEL }\n",
+            "pub const fn quad(x: u32) -> u32 { x * 4 }\n",
+            "pub const fn leaf_origin() -> &'static str { LABEL }\n",
         ),
         r#"
 fn main() {
@@ -241,15 +246,15 @@ fn main() {
     let mut keys = Vec::new();
     for name in ["generated-one", "generated-two"] {
         let worktree = world.worktree(name);
+        World::expect_origin(&worktree, "generated");
         let mark = daemon.decisions().len();
-        let (_, generated) = json_build(&world, &worktree, true);
+        let (_, generated) = json_check(&world, &worktree, true);
         assert!(generated.join("value.rs").is_file());
         let decisions = daemon.settled_since(mark);
         assert_eq!(count(&decisions, "execute"), 1, "{:?}", tally(&decisions));
         assert_eq!(count(&decisions, "committed"), 1, "{:?}", tally(&decisions));
         assert_eq!(count(&decisions, "hit"), 0);
         keys.push(request_key(&decisions, "execute"));
-        assert_eq!(World::run_app(&worktree), "12 generated\n");
     }
     assert_ne!(
         keys[0], keys[1],

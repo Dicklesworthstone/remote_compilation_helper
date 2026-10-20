@@ -1,8 +1,8 @@
 //! M4 acceptance in miniature (bridge plan Phase 1; bd-k52xe / bd-14t4j):
-//! REAL `cargo build` in several worktrees of one project, every rustc
+//! REAL `cargo check` in several worktrees of one project, every rustc
 //! routed through the REAL `rabs-wrap` to a REAL `rabsd` with the live
 //! dependency lane on. Nothing here hand-builds a rustc argv: Cargo plans
-//! the units, chooses the flags, pipelines dependents on `.rmeta`
+//! the units, chooses the flags, consumes dependency `.rmeta`
 //! notifications and fingerprints the results, exactly as for an agent.
 //!
 //! Sources use both Cargo's registry layout
@@ -12,15 +12,15 @@
 //!
 //! What it proves:
 //!
-//! 1. the FIRST cold build commits every dependency without throwaway builds;
+//! 1. the FIRST cold check commits every dependency without throwaway checks;
 //!    later worktrees climb the same keys' verification/serving ladder;
-//! 2. a later worktree's `cargo build` is served every dependency compile:
-//!    the daemon answers hit -> served and admits no execution, the build
-//!    succeeds, and the served `.rlib`/`.rmeta` bytes equal stock Cargo's;
+//! 2. a later worktree's `cargo check` is served every dependency compile:
+//!    the daemon answers hit -> served and admits no execution, the check
+//!    succeeds, and the served `.rmeta` bytes equal stock Cargo's;
 //! 3. served outputs are FRESH to Cargo: an immediate rebuild reports every
 //!    unit Fresh and never reaches the wrapper; editing the workspace member
 //!    rebuilds only that member;
-//! 4. the wall-clock of a served build versus a stock build is recorded
+//! 4. the wall-clock of a served check versus a stock check is recorded
 //!    (printed, not asserted: tiny fixtures say nothing about real crates).
 //! 5. already-built large dependency metadata and a large source package
 //!    both warm during a single real Cargo invocation, then reach serving.
@@ -263,28 +263,50 @@ impl World {
         cargo
     }
 
-    /// `cargo build -v` as an agent would run it, with or without RABS.
-    fn cargo_build(&self, worktree: &Path, wrapped: bool) -> Output {
+    /// `cargo check -v` as an agent would run it, with or without RABS.
+    fn cargo_check(&self, worktree: &Path, wrapped: bool) -> Output {
         let output = self
             .cargo_command(worktree, wrapped)
-            .args(["build", "-v"])
+            .args(["check", "-v"])
             .output()
             .expect("run cargo");
         assert!(
             output.status.success(),
-            "cargo build failed in {}:\n{}",
+            "cargo check failed in {}:\n{}",
             worktree.display(),
             String::from_utf8_lossy(&output.stderr)
         );
         output
     }
 
-    fn run_app(worktree: &Path) -> String {
-        let output = Command::new(worktree.join("target/debug/app"))
-            .output()
-            .expect("run app");
-        assert!(output.status.success());
-        String::from_utf8(output.stdout).unwrap()
+    /// Make Cargo's real downstream compiler evaluate the dependency's public
+    /// constant expression. A successful metadata replay must preserve values,
+    /// not merely install a file with the expected extension.
+    fn expect_value(worktree: &Path, expected: u32) {
+        std::fs::write(
+            worktree.join("src/main.rs"),
+            format!("const _: () = assert!(middle::quad(3) == {expected});\nfn main() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    fn expect_origin(worktree: &Path, expected: &str) {
+        std::fs::write(
+            worktree.join("src/main.rs"),
+            format!(
+                "const _: () = {{\n\
+                 let actual = middle::leaf_origin().as_bytes();\n\
+                 let expected = {expected:?}.as_bytes();\n\
+                 assert!(actual.len() == expected.len());\n\
+                 let mut index = 0;\n\
+                 while index < expected.len() {{\n\
+                     assert!(actual[index] == expected[index]);\n\
+                     index += 1;\n\
+                 }}\n\
+                 }};\nfn main() {{}}\n"
+            ),
+        )
+        .unwrap();
     }
 }
 
@@ -301,7 +323,7 @@ fn files_below(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The `.rlib`/`.rmeta` Cargo produced for `name` in a worktree, wherever
+/// The `.rmeta` Cargo produced for `name` in a worktree, wherever
 /// the build-dir layout placed them (`deps/` or per-unit `build/.../out`).
 fn library_outputs(worktree: &Path, name: &str) -> Vec<(String, Vec<u8>)> {
     let mut found = Vec::new();
@@ -310,16 +332,15 @@ fn library_outputs(worktree: &Path, name: &str) -> Vec<(String, Vec<u8>)> {
         .into_iter()
         .filter_map(|path| {
             let file = path.file_name()?.to_str()?.to_owned();
-            (file.starts_with(&format!("lib{name}-"))
-                && (file.ends_with(".rlib") || file.ends_with(".rmeta")))
-            .then(|| (file, std::fs::read(&path).unwrap()))
+            (file.starts_with(&format!("lib{name}-")) && file.ends_with(".rmeta"))
+                .then(|| (file, std::fs::read(&path).unwrap()))
         })
         .collect();
     outputs.sort();
     assert_eq!(
         outputs.len(),
-        2,
-        "expected one rlib and one rmeta for {name} in {}",
+        1,
+        "expected one metadata output for {name} in {}",
         worktree.display()
     );
     outputs
@@ -357,21 +378,21 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
     world.write_dependency(
         "leaf",
         "",
-        "#[inline]\npub fn twice(x: u32) -> u32 { x * 2 }\n\
-         pub fn origin() -> &'static str { file!() }\n",
+        "pub const fn twice(x: u32) -> u32 { x * 2 }\n\
+         pub const fn origin() -> &'static str { file!() }\n",
     );
     // An independent sibling: Cargo compiles it CONCURRENTLY with `leaf`,
     // both writing into the same `target/debug/deps` search directory.
     world.write_dependency(
         "side",
         "",
-        "pub const OFFSET: u32 = 0;\npub fn shift(x: u32) -> u32 { x + OFFSET }\n",
+        "pub const OFFSET: u32 = 0;\npub const fn shift(x: u32) -> u32 { x + OFFSET }\n",
     );
     world.write_dependency(
         "middle",
         "leaf = \"1.0\"\nside = \"1.0\"\n",
-        "pub fn quad(x: u32) -> u32 { side::shift(leaf::twice(leaf::twice(x))) }\n\
-         pub fn leaf_origin() -> &'static str { leaf::origin() }\n",
+        "pub const fn quad(x: u32) -> u32 { side::shift(leaf::twice(leaf::twice(x))) }\n\
+         pub const fn leaf_origin() -> &'static str { leaf::origin() }\n",
     );
     let daemon = Daemon::start(&world.root, &world.socket);
 
@@ -379,17 +400,17 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
     // today and what every served artifact must equal byte for byte.
     let stock = world.worktree("stock");
     let started = Instant::now();
-    world.cargo_build(&stock, false);
+    World::expect_value(&stock, 12);
+    world.cargo_check(&stock, false);
     let stock_elapsed = started.elapsed();
-    let expected_output = World::run_app(&stock);
-    assert!(expected_output.starts_with("12 "), "{expected_output}");
 
     // 1. One FIRST cold build, not a retry-until-green warmup loop. Every
     //    dependency must wait for live facts and populate the cache in this
     //    invocation. Stock Cargo above never contacted this daemon.
     let cold = world.worktree("cold");
+    World::expect_value(&cold, 12);
     let mark = daemon.decisions().len();
-    let cold_build = world.cargo_build(&cold, true);
+    let cold_build = world.cargo_check(&cold, true);
     let decisions = daemon.settled_since(mark);
     assert_preparing(&decisions, "toolchain-facts-pending");
     assert_eq!(
@@ -399,13 +420,16 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
         tally(&decisions),
         stderr(&cold_build)
     );
-    assert_eq!(World::run_app(&cold), expected_output);
+    for name in DEPENDENCIES {
+        assert_eq!(library_outputs(&cold, name), library_outputs(&stock, name));
+    }
 
     // Two more worktrees: the SAME keys, each a verifying execution.
     for name in ["verify-1", "verify-2"] {
         let worktree = world.worktree(name);
+        World::expect_value(&worktree, 12);
         let mark = daemon.decisions().len();
-        world.cargo_build(&worktree, true);
+        world.cargo_check(&worktree, true);
         let decisions = daemon.settled_since(mark);
         assert_eq!(
             count(&decisions, "verified"),
@@ -413,15 +437,21 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
             "{name}: every dependency verifies its committed key: {:?}",
             tally(&decisions)
         );
-        assert_eq!(World::run_app(&worktree), expected_output);
+        for dependency in DEPENDENCIES {
+            assert_eq!(
+                library_outputs(&worktree, dependency),
+                library_outputs(&stock, dependency)
+            );
+        }
     }
 
     // 2. The served worktree: every dependency compile is answered from
     //    the cache and no compiler attempt is admitted for them.
     let served = world.worktree("served");
+    World::expect_value(&served, 12);
     let mark = daemon.decisions().len();
     let started = Instant::now();
-    let build = world.cargo_build(&served, true);
+    let build = world.cargo_check(&served, true);
     let served_elapsed = started.elapsed();
     let decisions = daemon.settled_since(mark);
     assert_eq!(
@@ -435,7 +465,6 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
         tally(&decisions),
         stderr(&build)
     );
-    assert_eq!(World::run_app(&served), expected_output);
     for name in DEPENDENCIES {
         assert_eq!(
             library_outputs(&served, name),
@@ -444,13 +473,13 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
         );
     }
     eprintln!(
-        "M4 wall-clock (tiny fixture, informational): stock cargo build {stock_elapsed:?}, \
-         served cargo build {served_elapsed:?}"
+        "M4 wall-clock (tiny fixture, informational): stock cargo check {stock_elapsed:?}, \
+         served cargo check {served_elapsed:?}"
     );
 
     // 3a. Freshness: Cargo must not rebuild anything it was just served.
     let mark = daemon.decisions().len();
-    let rebuild = world.cargo_build(&served, true);
+    let rebuild = world.cargo_check(&served, true);
     let log = stderr(&rebuild);
     for unit in DEPENDENCIES.iter().chain(&["app"]) {
         assert!(
@@ -459,7 +488,7 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
         );
     }
     assert!(
-        !log.contains("Compiling") && !log.contains("Running"),
+        !log.contains("Checking") && !log.contains("Running"),
         "a served dependency was rebuilt:\n{log}"
     );
     assert_eq!(
@@ -471,16 +500,15 @@ fn exercise_cargo_worktrees(world: &World) -> Daemon {
     // 3b. Editing the workspace member rebuilds only the member.
     std::fs::write(
         served.join("src/main.rs"),
-        "fn main() { println!(\"edited {}\", middle::quad(1)); }\n",
+        "const _: () = assert!(middle::quad(1) == 4);\nfn main() {}\n",
     )
     .unwrap();
-    let edited = world.cargo_build(&served, true);
+    let edited = world.cargo_check(&served, true);
     let log = stderr(&edited);
     for name in DEPENDENCIES {
         assert!(log.contains(&format!("Fresh {name}")), "{log}");
     }
-    assert!(log.contains("Compiling app"), "{log}");
-    assert_eq!(World::run_app(&served), "edited 4\n");
+    assert!(log.contains("Checking app"), "{log}");
     daemon
 }
 
@@ -528,23 +556,25 @@ fn real_cargo_vendored_dependencies_serve_and_invalidate_actual_source_changes()
     assert_eq!(checksum, b"{\"files\":{}}");
     std::fs::write(
         package.join("src/lib.rs"),
-        "pub fn quad(x: u32) -> u32 { side::shift(leaf::twice(leaf::twice(x))) + 1 }\n\
-         pub fn leaf_origin() -> &'static str { leaf::origin() }\n",
+        "pub const fn quad(x: u32) -> u32 { side::shift(leaf::twice(leaf::twice(x))) + 1 }\n\
+         pub const fn leaf_origin() -> &'static str { leaf::origin() }\n",
     )
     .unwrap();
     let stock = world.worktree("stock-changed");
-    world.cargo_build(&stock, false);
-    let expected = World::run_app(&stock);
-    assert!(expected.starts_with("13 "), "{expected}");
-    assert_ne!(expected, World::run_app(&world.root.join("stock")));
+    World::expect_value(&stock, 13);
+    world.cargo_check(&stock, false);
+    assert_ne!(
+        library_outputs(&stock, "middle"),
+        library_outputs(&world.root.join("stock"), "middle")
+    );
 
     let changed = world.worktree("changed");
+    World::expect_value(&changed, 13);
     let mark = daemon.decisions().len();
-    world.cargo_build(&changed, true);
+    world.cargo_check(&changed, true);
     let decisions = daemon.settled_since(mark);
     let changed_key = admitted_key(&decisions, "middle");
     assert_ne!(changed_key, original_key);
-    assert_eq!(World::run_app(&changed), expected);
     assert_eq!(
         library_outputs(&changed, "middle"),
         library_outputs(&stock, "middle")
@@ -555,11 +585,11 @@ fn real_cargo_vendored_dependencies_serve_and_invalidate_actual_source_changes()
     // even if it is not listed by the checksum document or read by this rustc.
     std::fs::write(package.join("unlisted.txt"), b"new package member\n").unwrap();
     let added = world.worktree("added-input");
+    World::expect_value(&added, 13);
     let mark = daemon.decisions().len();
-    world.cargo_build(&added, true);
+    world.cargo_check(&added, true);
     let decisions = daemon.settled_since(mark);
     assert_ne!(admitted_key(&decisions, "middle"), changed_key);
-    assert_eq!(World::run_app(&added), expected);
     assert_eq!(
         library_outputs(&added, "middle"),
         library_outputs(&stock, "middle")
@@ -591,17 +621,17 @@ fn real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution() 
         "leaf",
         "",
         "pub const DATA: &[u8; 5 * 1024 * 1024] = include_bytes!(\"payload.bin\");\n\
-         #[inline] pub fn twice(x: u32) -> u32 { x * 2 }\n\
-         pub fn origin() -> &'static str { file!() }\n",
+         pub const fn twice(x: u32) -> u32 { x * 2 }\n\
+         pub const fn origin() -> &'static str { file!() }\n",
     );
     world.write_dependency(
         "middle",
         "leaf = \"1.0\"\n",
         "const LOCAL: &[u8] = include_bytes!(\"payload.bin\");\n\
-         pub fn quad(x: u32) -> u32 {\n\
-             leaf::twice(leaf::twice(x)) + u32::from(leaf::DATA[0] ^ LOCAL[0])\n\
+         pub const fn quad(x: u32) -> u32 {\n\
+             leaf::twice(leaf::twice(x)) + (leaf::DATA[0] ^ LOCAL[0]) as u32\n\
          }\n\
-         pub fn leaf_origin() -> &'static str { leaf::origin() }\n",
+         pub const fn leaf_origin() -> &'static str { leaf::origin() }\n",
     );
     for name in ["leaf", "middle"] {
         std::fs::write(
@@ -613,9 +643,8 @@ fn real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution() 
         .unwrap();
     }
     let worktree = world.worktree("prebuilt");
-    world.cargo_build(&worktree, false);
-    let expected_output = World::run_app(&worktree);
-    assert!(expected_output.starts_with("12 "), "{expected_output}");
+    World::expect_value(&worktree, 12);
+    world.cargo_check(&worktree, false);
     let expected_artifacts = library_outputs(&worktree, "middle");
     assert!(
         library_outputs(&worktree, "leaf")
@@ -635,7 +664,7 @@ fn real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution() 
             .expect("cargo clean middle");
         assert!(clean.status.success(), "{}", stderr(&clean));
         let mark = daemon.decisions().len();
-        let build = world.cargo_build(&worktree, true);
+        let build = world.cargo_check(&worktree, true);
         let decisions = daemon.settled_since(mark);
         assert!(stderr(&build).contains("Fresh leaf"), "{}", stderr(&build));
         if outcome == "committed" {
@@ -657,11 +686,10 @@ fn real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution() 
         if outcome == "served" {
             assert_eq!(count(&decisions, "hit"), 1, "{:?}", tally(&decisions));
         }
-        assert_eq!(World::run_app(&worktree), expected_output);
         assert_eq!(library_outputs(&worktree, "middle"), expected_artifacts);
     }
     let mark = daemon.decisions().len();
-    let fresh = world.cargo_build(&worktree, true);
+    let fresh = world.cargo_check(&worktree, true);
     for name in ["leaf", "middle", "app"] {
         assert!(
             stderr(&fresh).contains(&format!("Fresh {name}")),

@@ -16,6 +16,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use rabs_key::live_dependency::{
+    LiveRefusal, LiveRustcRequest, check_dependency_cache_read_closure, plan_dependency_action,
+};
 use rabs_key::live_dependency::{canonicalize_out_dir, render_out_dir};
 
 struct Compiled {
@@ -147,5 +154,122 @@ fn library_bytes_ignore_the_out_dir_and_the_rest_canonicalizes_exactly() {
         String::from_utf8(canonical)
             .unwrap()
             .contains("\"artifact\":\"/__rabs/out/libb-b0123.rmeta\"")
+    );
+}
+
+/// A real compiler counterexample to using dep-info as complete codegen read
+/// evidence. The assembler input lives outside every keyed source root, and a
+/// macro introduces the assembly so a textual source scan is not an answer.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn assembler_input_changes_rlib_without_changing_dep_info_and_cannot_serve() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cargo_home = temporary.path().join("cargo");
+    let package = cargo_home.join("registry/src/closure-index/hidden_asm-1.0.0");
+    let output = temporary.path().join("outputs");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir(&output).unwrap();
+    let payload = temporary.path().join("untracked-payload.bin");
+    std::fs::write(&payload, b"first___").unwrap();
+    let source = package.join("lib.rs");
+    let assembly = format!(
+        ".section .rodata\n.global rabs_hidden_payload\nrabs_hidden_payload:\n.incbin \"{}\"\n",
+        payload.display()
+    );
+    std::fs::write(
+        &source,
+        format!(
+            "macro_rules! import_payload {{ () => {{ core::arch::global_asm!({assembly:?}); }}; }}\n\
+             import_payload!();\npub fn answer() -> u32 {{ 42 }}\n"
+        ),
+    )
+    .unwrap();
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(sysroot.status.success());
+    let compiler =
+        Path::new(std::str::from_utf8(&sysroot.stdout).unwrap().trim()).join("bin/rustc");
+    let identity = Command::new(&compiler).arg("-vV").output().unwrap();
+    assert!(identity.status.success());
+    let identity = String::from_utf8(identity.stdout).unwrap();
+    let host = identity
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let argv = vec![
+        compiler.to_str().unwrap().to_owned(),
+        source.to_str().unwrap().to_owned(),
+        "--crate-name=hidden_asm".into(),
+        "--crate-type=rlib".into(),
+        "--edition=2021".into(),
+        "--emit=metadata,dep-info,link".into(),
+        "--cap-lints=allow".into(),
+        "--error-format=json".into(),
+        format!("--out-dir={}", output.display()),
+    ];
+    let environment = vec![
+        ("CARGO_HOME".into(), cargo_home.to_str().unwrap().to_owned()),
+        (
+            "CARGO_MANIFEST_DIR".into(),
+            package.to_str().unwrap().to_owned(),
+        ),
+        ("CARGO_PKG_NAME".into(), "hidden_asm".into()),
+    ];
+    let plan = plan_dependency_action(
+        LiveRustcRequest {
+            argv: &argv,
+            cwd: package.to_str().unwrap(),
+            env: &environment,
+        },
+        host,
+    )
+    .unwrap();
+    assert_eq!(
+        check_dependency_cache_read_closure(&plan.invocation),
+        Err(LiveRefusal::UnclosedCodegenInputs)
+    );
+    let compile = || {
+        let compiled = Command::new(&compiler)
+            .args(&argv[1..])
+            .current_dir(&package)
+            .envs(environment.iter().map(|(name, value)| (name, value)))
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        (
+            std::fs::read(output.join("hidden_asm.d")).unwrap(),
+            std::fs::read(output.join("libhidden_asm.rmeta")).unwrap(),
+            std::fs::read(output.join("libhidden_asm.rlib")).unwrap(),
+        )
+    };
+    let before = compile();
+    std::fs::write(&payload, b"second__").unwrap();
+    let after = compile();
+    assert_eq!(
+        before.0, after.0,
+        "rustc did not report this assembler input"
+    );
+    assert!(
+        !String::from_utf8(before.0)
+            .unwrap()
+            .contains(payload.to_str().unwrap()),
+        "this fixture must exercise a real dep-info observation gap"
+    );
+    assert_eq!(
+        before.1, after.1,
+        "metadata-only execution does not assemble the input"
+    );
+    assert_ne!(
+        before.2, after.2,
+        "codegen actually consumed the changed external bytes"
     );
 }

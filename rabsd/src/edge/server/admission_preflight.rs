@@ -8,7 +8,9 @@
 //! or classify a directory source without its captured checksum witness.
 
 use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
-use rabs_key::live_dependency::{LiveRefusal, LiveRustcRequest};
+use rabs_key::live_dependency::{
+    LiveRefusal, LiveRustcRequest, check_dependency_cache_read_closure,
+};
 use rabs_key::output_derivation::check_dependency_output_options;
 
 #[path = "sysroot_preflight.rs"]
@@ -104,6 +106,12 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
         return Some(LiveRefusal::NotDependencyCompile(
             "live dependency serving requires dep-info read evidence",
         ));
+    }
+    // A .d file does not report assembler reads such as global_asm! .incbin.
+    // Refuse codegen before any expensive facts, persisted hit or sampling
+    // decision. The wrapper still executes the exact original command.
+    if let Err(refusal) = check_dependency_cache_read_closure(&invocation) {
+        return Some(refusal);
     }
     if !invocation
         .passthrough
@@ -403,6 +411,65 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn codegen_with_dep_info_bypasses_before_warming_or_persisted_lookup() {
+        use super::super::{Decided, LiveEdge, decide};
+        use crate::coord::live::CoordLive;
+        use crate::coord::live_dependency::LiveDependencyLane;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let temporary = crate::test_util::private_tempdir();
+        let cas = Arc::new(
+            crate::janitor::store::mount_and_reconcile(&temporary.path().join("cas")).unwrap(),
+        );
+        let coord = Arc::new(CoordLive::with_cas(cas));
+        coord
+            .acquire_boot_authority("codegen-read-closure")
+            .unwrap();
+        coord.mark_up();
+        let live = LiveEdge::new(LiveDependencyLane::new(coord));
+        for package in [
+            PACKAGE,
+            "/cargo/git/checkouts/leaf-123/abcdef123/member",
+            "/workspace/vendor/leaf",
+        ] {
+            for emit in [
+                "dep-info,metadata,link",
+                "dep-info,link",
+                "dep-info,obj",
+                "dep-info,asm",
+                "dep-info,llvm-ir",
+                "dep-info,llvm-bc",
+            ] {
+                let (mut argv, mut env) = fixture(package);
+                *argv
+                    .iter_mut()
+                    .find(|argument| argument.starts_with("--emit="))
+                    .unwrap() = format!("--emit={emit}");
+                env.push(("OUT_DIR".into(), "/target/build/leaf/out".into()));
+                env.push(("CARGO_TARGET_DIR".into(), "/target".into()));
+                let request = LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package,
+                    env: &env,
+                };
+                assert_eq!(rejection(request), Some(LiveRefusal::UnclosedCodegenInputs));
+                for may_wait in [false, true] {
+                    let request = json!({
+                        "kind": "rustc-request", "argv": argv, "cwd": package,
+                        "env": env, "wait_for_inflight": may_wait,
+                    });
+                    let Decided::Shadow(observed) = decide(&live, &request) else {
+                        panic!("codegen cannot warm, execute privately or serve: {emit}");
+                    };
+                    assert_eq!(observed.argv, argv, "fallback retains original outputs");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn real_decide_shadows_cold_probes_and_primary_packages_without_starting_rustc() {
         use super::super::{Decided, LiveEdge, decide};
         use crate::coord::live::CoordLive;
@@ -506,7 +573,14 @@ mod tests {
                         cwd: PACKAGE,
                         env: &env,
                     };
-                    assert_eq!(rejection(request), None, "{kind} {emit} on {host}");
+                    assert_eq!(
+                        rejection(request),
+                        emit.contains("link")
+                            .then_some(LiveRefusal::UnclosedCodegenInputs),
+                        "{kind} {emit} on {host}"
+                    );
+                    // Structural planning remains useful for discovery. It
+                    // is not authority to serve a codegen result.
                     assert!(plan_dependency_action(request, host).is_ok());
                 }
             }

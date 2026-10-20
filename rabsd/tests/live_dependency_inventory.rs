@@ -1,7 +1,7 @@
 //! Real rustc artifacts through live observation, keying, publication and replay.
 //!
 //! The upstream compiler really creates a lib-prefixed .d file plus an rlib
-//! and its metadata sibling. The consumer explicitly names that rlib. No
+//! and its metadata sibling. The metadata-only consumer explicitly names that rlib. No
 //! descriptor, object digest, publication or verification sample is injected.
 //! This is the in-process host-local lane, not Cargo/wrapper/remote-fleet proof.
 #![cfg(target_os = "linux")]
@@ -163,7 +163,7 @@ impl NativeInventory {
             "--crate-name=consumer".into(),
             "--crate-type=rlib".into(),
             "--edition=2021".into(),
-            "--emit=link,metadata,dep-info".into(),
+            "--emit=metadata,dep-info".into(),
             "--error-format=json".into(),
             "--json=artifacts".into(),
             "--cap-lints=allow".into(),
@@ -375,7 +375,11 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
         panic!("qualified result did not install through the real materializer");
     };
     assert_eq!(consumer_compiles, 3, "replay must not invoke the compiler");
-    assert_eq!(installed.len(), 2, "both native artifacts must be returned");
+    assert_eq!(
+        installed.len(),
+        1,
+        "the native metadata artifact must be returned"
+    );
     assert_eq!(Some(output_bytes(&plan)), expected_outputs);
     assert_eq!(
         Some(canonicalize_placements(&transcript, &plan).unwrap()),

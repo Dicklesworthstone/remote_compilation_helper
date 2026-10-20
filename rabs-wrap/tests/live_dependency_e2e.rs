@@ -3,7 +3,8 @@
 //! `rustc`, registry packages laid out as Cargo extracts them, and a real
 //! local Git workspace fetched by Cargo at a pinned revision. They compile
 //! into separate out-dirs the way Cargo compiles dependencies in separate
-//! worktrees.
+//! worktrees. The served class is metadata plus dep-info. Codegen remains an
+//! ordinary local execution until its complete read view can be enforced.
 //!
 //! What it proves, in order:
 //!
@@ -151,7 +152,7 @@ impl World {
             "--json=diagnostic-rendered-ansi,artifacts,future-incompat".to_owned(),
             "--crate-type".to_owned(),
             "lib".to_owned(),
-            "--emit=dep-info,metadata,link".to_owned(),
+            "--emit=dep-info,metadata".to_owned(),
             "-C".to_owned(),
             "embed-bitcode=no".to_owned(),
             "-C".to_owned(),
@@ -343,9 +344,8 @@ impl World {
     }
 }
 
-fn outputs(name: &str) -> [String; 3] {
+fn outputs(name: &str) -> [String; 2] {
     [
-        format!("lib{name}-{name}0000c0ffee.rlib"),
         format!("lib{name}-{name}0000c0ffee.rmeta"),
         format!("{name}-{name}0000c0ffee.d"),
     ]
@@ -379,7 +379,7 @@ fn trail(daemon: &Daemon, since: usize) -> Vec<String> {
 }
 
 fn assert_same_library(first: &Path, second: &Path, name: &str) {
-    for file in &outputs(name)[..2] {
+    for file in &outputs(name)[..1] {
         assert_eq!(
             std::fs::read(first.join(file)).unwrap(),
             std::fs::read(second.join(file)).unwrap(),
@@ -388,13 +388,205 @@ fn assert_same_library(first: &Path, second: &Path, name: &str) {
             second.display()
         );
     }
-    let dep_info = &outputs(name)[2];
+    let dep_info = &outputs(name)[1];
     let first_d = String::from_utf8(std::fs::read(first.join(dep_info)).unwrap()).unwrap();
     let second_d = String::from_utf8(std::fs::read(second.join(dep_info)).unwrap()).unwrap();
     assert_eq!(
         first_d.replace(first.to_str().unwrap(), "<OUT>"),
         second_d.replace(second.to_str().unwrap(), "<OUT>"),
         "dep-info differs beyond the out-dir"
+    );
+}
+
+/// Cargo's original codegen command must execute even after enough identical
+/// runs would have satisfied the cache's sampling floor. The changed input is
+/// read by the assembler and absent from rustc's dep-info, so a stale replay
+/// would return the old value in a real linked executable.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_cargo_codegen_never_replays_an_untracked_assembler_input() {
+    let temporary = tempfile::Builder::new()
+        .prefix("rc-asm")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temporary.path();
+    let package = root.join("vendor/hidden_asm-1.0.0");
+    let app = root.join("app");
+    let cargo_home = root.join("cargo-home");
+    for directory in [package.join("src"), app.join("src"), cargo_home.clone()] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let payload = root.join("untracked-payload.bin");
+    let assembly = format!(
+        ".section .rodata\n.global rabs_hidden_payload\nrabs_hidden_payload:\n.incbin \"{}\"\n",
+        payload.display()
+    );
+    std::fs::write(
+        package.join("src/lib.rs"),
+        format!(
+            "macro_rules! import_payload {{ () => {{ core::arch::global_asm!({assembly:?}); }}; }}\n\
+             import_payload!();\nextern \"C\" {{ static rabs_hidden_payload: u32; }}\n\
+             pub fn value() -> u32 {{ unsafe {{ rabs_hidden_payload }} }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname='hidden_asm'\nversion='1.0.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    std::fs::write(package.join(".cargo-checksum.json"), "{\"files\":{}}\n").unwrap();
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with='fixture'\n\
+             [source.fixture]\ndirectory='{}'\n[net]\noffline=true\n",
+            root.join("vendor").display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname='asm_app'\nversion='0.1.0'\nedition='2021'\n\
+         [dependencies]\nhidden_asm='1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("src/main.rs"),
+        "fn main() { println!(\"{}\", hidden_asm::value()); }\n",
+    )
+    .unwrap();
+    let socket = root.join("d.sock");
+    let daemon = Daemon::start(root, &socket);
+    let compiler = real_rustc();
+    let build = |name: &str, wrapped: bool| {
+        let target = root.join(name);
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .args([
+                "build",
+                "--offline",
+                "--jobs=1",
+                "--message-format=json",
+                "--target-dir",
+            ])
+            .arg(&target)
+            .current_dir(&app)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", root.join("home"))
+            .env("CARGO_HOME", &cargo_home)
+            .env("RUSTC", &compiler)
+            .env("RABS_SOCKET_PATH", &socket)
+            .env("RABS_BREAKER_FILE", root.join("breaker"));
+        if wrapped {
+            command.env("RUSTC_WRAPPER", wrap());
+        }
+        let compiled = command.output().expect("real offline Cargo build");
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let records: Vec<serde_json::Value> = compiled
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let library = records
+            .iter()
+            .find(|record| {
+                record["reason"] == "compiler-artifact" && record["target"]["name"] == "hidden_asm"
+            })
+            .unwrap();
+        let archive = library["filenames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .find(|path| path.ends_with(".rlib"))
+            .map(PathBuf::from)
+            .unwrap();
+        let stem = archive
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("lib")
+            .unwrap();
+        let dep_info =
+            std::fs::read_to_string(archive.with_file_name(format!("{stem}.d"))).unwrap();
+        assert!(
+            !dep_info.contains(payload.to_str().unwrap()),
+            "fixture must exercise the missing read"
+        );
+        let executable = records
+            .iter()
+            .find(|record| {
+                record["reason"] == "compiler-artifact" && record["target"]["name"] == "asm_app"
+            })
+            .unwrap()["executable"]
+            .as_str()
+            .unwrap();
+        let executed = Command::new(executable).output().unwrap();
+        assert!(executed.status.success());
+        (
+            dep_info.replace(target.to_str().unwrap(), "<TARGET>"),
+            std::fs::read(archive).unwrap(),
+            executed.stdout,
+        )
+    };
+    let mut original = None;
+    let mut changed = None;
+    for (round, value) in [7_u32, 7, 7, 13].into_iter().enumerate() {
+        std::fs::write(&payload, value.to_le_bytes()).unwrap();
+        let mark = daemon.decisions().len();
+        let result = build(&format!("wrapped-{round}"), true);
+        assert_eq!(result.2, format!("{value}\n").as_bytes());
+        let decisions = daemon.decisions();
+        let decisions = &decisions[mark..];
+        assert!(
+            decisions.iter().any(|record| {
+                record["crate"] == "hidden_asm"
+                    && record["decision"] == "shadow"
+                    && record["reason"] == "LIVE_DEP_CODEGEN_READ_CLOSURE"
+            }),
+            "codegen did not take the explicit closure fallback: {decisions:?}"
+        );
+        assert!(
+            decisions.iter().all(|record| !matches!(
+                record["decision"].as_str(),
+                Some("execute" | "hit" | "served" | "committed" | "verified")
+            )),
+            "unclosed codegen gained cache authority: {decisions:?}"
+        );
+        if round == 0 {
+            original = Some(result);
+        } else if round == 3 {
+            changed = Some(result);
+        } else {
+            assert_eq!(original.as_ref(), Some(&result));
+        }
+    }
+    let original = original.unwrap();
+    let changed = changed.unwrap();
+    assert_eq!(
+        original.0, changed.0,
+        "dep-info did not observe the changed input"
+    );
+    assert_ne!(
+        original.1, changed.1,
+        "the original compiler consumed the changed bytes"
+    );
+    assert_eq!(
+        changed,
+        build("stock-after-mutation", false),
+        "wrapped fallback must match stock Cargo"
     );
 }
 
@@ -524,7 +716,7 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
     assert_same_library(&out_stock, &out_renewed, "leaf");
 
     // 3. A consumer keyed on its exact extern bytes climbs the same ladder.
-    let leaf_rmeta = |out: &Path| ("leaf", out.join(&outputs("leaf")[1]));
+    let leaf_rmeta = |out: &Path| ("leaf", out.join(&outputs("leaf")[0]));
     let mut demo_trails = Vec::new();
     for out in [
         &out_a,

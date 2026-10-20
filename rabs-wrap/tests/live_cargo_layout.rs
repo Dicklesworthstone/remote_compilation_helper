@@ -1,9 +1,10 @@
 //! Real Cargo acceptance of the opt-in final/intermediate layout projection.
 //!
 //! No hand-built rustc requests or preseeded CAS entries: offline Cargo plans
-//! a dependency, the real wrapper captures it, and independent builds must
-//! verify before a fresh layout can skip its compiler. A stock Cargo build in
-//! the same test supplies the artifact-byte and executable-output oracle.
+//! a dependency, the real wrapper captures it, and independent checks must
+//! verify before a fresh layout can skip its compiler. A stock Cargo check in
+//! the same test supplies the metadata-byte oracle, and downstream constant
+//! assertions verify values read from the dependency metadata.
 //! These tiny fixtures establish semantics, not a fleet speedup claim.
 #![cfg(target_os = "linux")]
 
@@ -68,8 +69,7 @@ impl Fixture {
             .prefix("rl")
             .tempdir_in("/tmp")
             .unwrap();
-        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = temporary.path();
         let package = root.join("vendor/layout_dep-1.0.0");
         std::fs::create_dir_all(package.join("src")).unwrap();
@@ -129,16 +129,11 @@ impl Fixture {
         }
     }
 
-    fn build(&self, layout: &Layout, wrapped: bool) -> Output {
-        self.build_with_env(layout, wrapped, &[])
+    fn check(&self, layout: &Layout, wrapped: bool) -> Output {
+        self.check_with_env(layout, wrapped, &[])
     }
 
-    fn build_with_env(
-        &self,
-        layout: &Layout,
-        wrapped: bool,
-        overrides: &[(&str, &str)],
-    ) -> Output {
+    fn check_with_env(&self, layout: &Layout, wrapped: bool, overrides: &[(&str, &str)]) -> Output {
         let mut command = timed(env!("CARGO"));
         command
             .current_dir(&layout.workspace)
@@ -160,7 +155,7 @@ impl Fixture {
             .env("SHLVL", "2")
             .env("_", env!("CARGO"))
             .envs(overrides.iter().copied())
-            .args(["build", "--offline", "--jobs=1", "--message-format=json"]);
+            .args(["check", "--offline", "--jobs=1", "--message-format=json"]);
         if wrapped {
             command.env("RUSTC_WRAPPER", WRAPPER);
         }
@@ -178,17 +173,29 @@ fn artifacts(output: &Output) -> Vec<Value> {
         .collect()
 }
 
-fn app_stdout(layout: &Layout, output: &Output) -> Vec<u8> {
-    let records = artifacts(output);
-    let executables: Vec<_> = records
-        .iter()
-        .filter(|record| record["target"]["name"] == "layout_app")
-        .filter_map(|record| record["executable"].as_str())
-        .collect();
-    assert_eq!(executables.len(), 1, "one actual Cargo executable record");
-    let executable = Path::new(executables[0]);
-    assert!(executable.starts_with(&layout.final_dir));
-    successful(&mut timed(executable)).stdout
+fn expect_values(layout: &Layout, values: &[(&str, Option<&str>)]) {
+    let mut source = String::from("fn main() {}\n");
+    for (expression, expected) in values {
+        source.push_str(&format!(
+            "const _: () = {{\n\
+             let actual: Option<&str> = {expression};\n\
+             let expected: Option<&str> = {expected:?};\n\
+             match (actual, expected) {{\n\
+                 (None, None) => (),\n\
+                 (Some(actual), Some(expected)) => {{\n\
+                     assert!(actual.len() == expected.len());\n\
+                     let mut index = 0;\n\
+                     while index < expected.len() {{\n\
+                         assert!(actual.as_bytes()[index] == expected.as_bytes()[index]);\n\
+                         index += 1;\n\
+                     }}\n\
+                 }},\n\
+                 _ => panic!(\"dependency metadata changed an optional value\"),\n\
+             }}\n\
+             }};\n"
+        ));
+    }
+    std::fs::write(layout.workspace.join("src/main.rs"), source).unwrap();
 }
 
 fn library_bytes(layout: &Layout) -> BTreeMap<String, Vec<u8>> {
@@ -204,9 +211,7 @@ fn library_bytes(layout: &Layout) -> BTreeMap<String, Vec<u8>> {
                 pending.push(entry.path());
             } else if kind.is_file() {
                 let name = entry.file_name().into_string().unwrap();
-                if name.starts_with("liblayout_dep-")
-                    && (name.ends_with(".rlib") || name.ends_with(".rmeta"))
-                {
+                if name.starts_with("liblayout_dep-") && name.ends_with(".rmeta") {
                     assert!(
                         files
                             .insert(name, std::fs::read(entry.path()).unwrap())
@@ -216,7 +221,7 @@ fn library_bytes(layout: &Layout) -> BTreeMap<String, Vec<u8>> {
             }
         }
     }
-    assert_eq!(files.len(), 2, "one complete rlib/rmeta output pair");
+    assert_eq!(files.len(), 1, "one complete metadata output");
     files
 }
 
@@ -276,7 +281,7 @@ impl Daemon {
             }
             assert!(
                 Instant::now() < deadline,
-                "no {terminal} after real Cargo build: {decisions:?}"
+                "no {terminal} after real Cargo check: {decisions:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -300,12 +305,13 @@ fn count(decisions: &[Value], kind: &str) -> usize {
 #[test]
 fn real_cargo_split_layouts_share_verified_artifacts_and_remain_fresh() {
     let fixture = Fixture::new();
-    fixture.source("pub fn message() -> &'static str { \"layout fixture\" }\n");
+    fixture.source("pub const MESSAGE: &str = \"layout fixture\";\n");
     let stock = fixture.layout("stock");
-    let stock_build =
-        fixture.build_with_env(&stock, false, &[("RCH_BUILD_SOURCE", "stock-workspace")]);
-    let expected = app_stdout(&stock, &stock_build);
-    assert_eq!(expected, b"layout fixture\n");
+    expect_values(
+        &stock,
+        &[("Some(layout_dep::MESSAGE)", Some("layout fixture"))],
+    );
+    fixture.check_with_env(&stock, false, &[("RCH_BUILD_SOURCE", "stock-workspace")]);
     let expected_artifacts = library_bytes(&stock);
     let daemon = Daemon::start(&fixture);
     let mut action_key: Option<String> = None;
@@ -316,8 +322,12 @@ fn real_cargo_split_layouts_share_verified_artifacts_and_remain_fresh() {
         ("served", "served", 0),
     ] {
         let layout = fixture.layout(name);
+        expect_values(
+            &layout,
+            &[("Some(layout_dep::MESSAGE)", Some("layout fixture"))],
+        );
         let mark = daemon.decisions().len();
-        let build = fixture.build_with_env(&layout, true, &[("RCH_BUILD_SOURCE", name)]);
+        fixture.check_with_env(&layout, true, &[("RCH_BUILD_SOURCE", name)]);
         let decisions = daemon.settled(mark, terminal);
         assert_eq!(count(&decisions, terminal), 1, "{decisions:?}");
         assert_eq!(count(&decisions, "execute"), executions, "{decisions:?}");
@@ -336,23 +346,16 @@ fn real_cargo_split_layouts_share_verified_artifacts_and_remain_fresh() {
         } else {
             action_key = Some(key.to_owned());
         }
-        assert_eq!(app_stdout(&layout, &build), expected);
         assert_eq!(library_bytes(&layout), expected_artifacts);
         if executions == 0 {
             // A cache installation must satisfy Cargo freshness, not just let
-            // this one compile/link finish with plausible files.
+            // this one typecheck finish with plausible files.
             let mark = daemon.decisions().len();
-            let rebuild =
-                fixture.build_with_env(&layout, true, &[("RCH_BUILD_SOURCE", name)]);
+            let rebuild = fixture.check_with_env(&layout, true, &[("RCH_BUILD_SOURCE", name)]);
             assert!(artifacts(&rebuild).iter().any(|record| {
                 record["target"]["name"] == "layout_dep" && record["fresh"] == true
             }));
-            assert_eq!(
-                daemon.decisions().len(),
-                mark,
-                "fresh build consulted RABS"
-            );
-            assert_eq!(app_stdout(&layout, &rebuild), expected);
+            assert_eq!(daemon.decisions().len(), mark, "fresh build consulted RABS");
         }
     }
 }
@@ -368,16 +371,19 @@ fn real_environment_reads_keep_each_layouts_value_and_never_replay() {
             } else {
                 format!("option_env!(\"{variable}\").unwrap_or(\"ABSENT\")")
             };
-            fixture.source(&format!("pub fn message() -> &'static str {{ {expression} }}\n"));
+            fixture.source(&format!("pub const MESSAGE: &str = {expression};\n"));
             for round in 0..2 {
                 let layout = fixture.layout(&format!("read-{index}-{read}-{round}"));
-                let mark = daemon.decisions().len();
-                let output = fixture.build(&layout, true);
                 let expected = [&layout.final_dir, &layout.alias_dir, &layout.intermediate][index];
-                assert_eq!(
-                    app_stdout(&layout, &output),
-                    format!("{}\n", expected.display()).as_bytes()
+                expect_values(
+                    &layout,
+                    &[(
+                        "Some(layout_dep::MESSAGE)",
+                        Some(expected.to_str().unwrap()),
+                    )],
                 );
+                let mark = daemon.decisions().len();
+                fixture.check(&layout, true);
                 // Capture refusal is not a build failure. Both invocations
                 // must still execute and observe their OWN inherited value.
                 // No reliance on a cache-denial diagnostic being printed.
@@ -397,30 +403,28 @@ fn real_environment_reads_keep_each_layouts_value_and_never_replay() {
 fn real_cargo_custom_environment_values_preserve_stock_behavior_and_cache_identity() {
     let fixture = Fixture::new();
     fixture.source(
-        "pub fn message() -> String {\n\
-         format!(\"{}|{:?}\", env!(\"DEPENDENCY_FLAVOR\"), option_env!(\"DEPENDENCY_OPTION\"))\n\
-         }\n",
+        "pub const FLAVOR: &str = env!(\"DEPENDENCY_FLAVOR\");\n\
+         pub const OPTIONAL: Option<&str> = option_env!(\"DEPENDENCY_OPTION\");\n",
     );
     let daemon = Daemon::start(&fixture);
     let mut distinct_keys = Vec::new();
-    for (index, flavor, optional, expected) in [
-        (0, "vanilla", None, "vanilla|None\n"),
-        (1, "vanilla", Some(""), "vanilla|Some(\"\")\n"),
-        (2, "vanilla", Some("extra"), "vanilla|Some(\"extra\")\n"),
-        (
-            3,
-            "spiced = balanced",
-            Some("extra"),
-            "spiced = balanced|Some(\"extra\")\n",
-        ),
+    for (index, flavor, optional) in [
+        (0, "vanilla", None),
+        (1, "vanilla", Some("")),
+        (2, "vanilla", Some("extra")),
+        (3, "spiced = balanced", Some("extra")),
     ] {
         let mut variables = vec![("DEPENDENCY_FLAVOR", flavor)];
         if let Some(value) = optional {
             variables.push(("DEPENDENCY_OPTION", value));
         }
         let stock = fixture.layout(&format!("env-{index}-stock"));
-        let stock_build = fixture.build_with_env(&stock, false, &variables);
-        assert_eq!(app_stdout(&stock, &stock_build), expected.as_bytes());
+        let values = [
+            ("Some(layout_dep::FLAVOR)", Some(flavor)),
+            ("layout_dep::OPTIONAL", optional),
+        ];
+        expect_values(&stock, &values);
+        fixture.check_with_env(&stock, false, &variables);
         let expected_artifacts = library_bytes(&stock);
         let mut action_key: Option<String> = None;
         for (round, terminal, executions) in [
@@ -430,8 +434,9 @@ fn real_cargo_custom_environment_values_preserve_stock_behavior_and_cache_identi
             ("served", "served", 0),
         ] {
             let layout = fixture.layout(&format!("env-{index}-{round}"));
+            expect_values(&layout, &values);
             let mark = daemon.decisions().len();
-            let build = fixture.build_with_env(&layout, true, &variables);
+            fixture.check_with_env(&layout, true, &variables);
             let decisions = daemon.settled(mark, terminal);
             assert_eq!(count(&decisions, terminal), 1, "{decisions:?}");
             assert_eq!(count(&decisions, "execute"), executions, "{decisions:?}");
@@ -450,7 +455,6 @@ fn real_cargo_custom_environment_values_preserve_stock_behavior_and_cache_identi
                 );
                 action_key = Some(key.to_owned());
             }
-            assert_eq!(app_stdout(&layout, &build), expected.as_bytes());
             assert_eq!(library_bytes(&layout), expected_artifacts);
         }
         distinct_keys.push(action_key.unwrap());
@@ -461,30 +465,26 @@ fn real_cargo_custom_environment_values_preserve_stock_behavior_and_cache_identi
 fn real_cargo_unkeyed_control_reads_preserve_values_and_never_publish_absence() {
     let fixture = Fixture::new();
     let daemon = Daemon::start(&fixture);
-    for (index, name) in [
-        "RABS_TEST_HINT",
-        "CARGO_RABS_TEST_HINT",
-        "RCH_BUILD_SOURCE",
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, name) in ["RABS_TEST_HINT", "CARGO_RABS_TEST_HINT", "RCH_BUILD_SOURCE"]
+        .into_iter()
+        .enumerate()
     {
         fixture.source(&format!(
-            "pub fn message() -> String {{ format!(\"{{:?}}\", option_env!(\"{name}\")) }}\n"
+            "pub const HINT: Option<&str> = option_env!(\"{name}\");\n"
         ));
-        for (round, value, expected) in [
-            ("absent", None, "None\n"),
-            ("empty", Some(""), "Some(\"\")\n"),
-            ("present", Some("exact control"), "Some(\"exact control\")\n"),
+        for (round, value) in [
+            ("absent", None),
+            ("empty", Some("")),
+            ("present", Some("exact control")),
         ] {
             let variables: Vec<_> = value.map(|value| (name, value)).into_iter().collect();
             let stock = fixture.layout(&format!("control-{index}-{round}-stock"));
-            let stock_build = fixture.build_with_env(&stock, false, &variables);
-            assert_eq!(app_stdout(&stock, &stock_build), expected.as_bytes());
+            expect_values(&stock, &[("layout_dep::HINT", value)]);
+            fixture.check_with_env(&stock, false, &variables);
             let layout = fixture.layout(&format!("control-{index}-{round}-wrapped"));
+            expect_values(&layout, &[("layout_dep::HINT", value)]);
             let mark = daemon.decisions().len();
-            let build = fixture.build_with_env(&layout, true, &variables);
-            assert_eq!(app_stdout(&layout, &build), expected.as_bytes());
+            fixture.check_with_env(&layout, true, &variables);
             assert_eq!(library_bytes(&layout), library_bytes(&stock));
             let decisions = daemon.settled(mark, "not-published");
             assert_eq!(count(&decisions, "execute"), 1, "{decisions:?}");
