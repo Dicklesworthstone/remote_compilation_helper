@@ -45,6 +45,9 @@ DEPENDENCY_POOL_KEY = "RABS_DEPENDENCY_WORKERS_JSON"
 DEPENDENCY_WORKER_FIELDS = ("listen", "worker_id", "worker_spki_sha256")
 MAX_DEPENDENCY_WORKERS = 32
 MAX_DEPENDENCY_CONFIG = 128 * 1024
+ROOT_ADMISSION_KEYS = (
+    "CARGO_RABS_ROOT_BUDGET_DIR", "CARGO_RABS_ROOT_CAPACITY", "CARGO_RABS_ROOT_CGROUP",
+)
 HELLO = {
     "kind": "hello",
     "transport": {"minimum_compatible": 1, "current": 1},
@@ -131,6 +134,16 @@ jobserver descriptors, stdin, stdout, stderr and the toolchain environment are
 not rewritten. On successful setup this invocation explicitly selects
 rabs-wrap via RUSTC_WRAPPER, overriding Cargo's build.rustc-wrapper config.
 No project or global Cargo config is edited.
+
+Explicit Linux local-root admission: set CARGO_RABS_ROOT_BUDGET_DIR,
+CARGO_RABS_ROOT_CAPACITY and CARGO_RABS_ROOT_CGROUP together. The native
+rabs-cargo-root helper then holds one durable host-local root credit through
+Cargo and descendant cleanup in an explicitly delegated cgroup-v2 subtree.
+This limits simultaneous Cargo trees; it does not replace Cargo's jobserver
+or impose a CPU limit. Unavailable delegation refuses before Cargo starts,
+including when daemon setup falls back to stock Cargo. These settings cannot
+combine with remote/canonical mode. CARGO_RABS_ROOT_HELPER selects an explicit
+helper executable. See docs/rabs-cargo-root.md for setup and crash quarantine.
 
 New daemon logs: <RABS_STATE_DIR>/cargo-launcher/daemon-<pid>-<time>.log.
 Daemon startup holds both state-directory and socket-endpoint lifetime locks.
@@ -359,6 +372,26 @@ def executable(name, override, env):
             # multi-call programs can depend on the invoked basename.
             return os.path.abspath(candidate)
     raise SetupError("{} is not installed (or {} is not executable)".format(name, override))
+
+
+def root_admission_helper(env):
+    """Resolve an explicit native owner; Python never supervises the build."""
+    if not any(key in env for key in ROOT_ADMISSION_KEYS):
+        return None
+    if not all(key in env for key in ROOT_ADMISSION_KEYS):
+        raise SetupError("local root admission requires all of " + ", ".join(ROOT_ADMISSION_KEYS))
+    if "CARGO_RABS_ROOT_ACTIVE" in env:
+        raise SetupError("nested cargo-rabs root admission is unsupported; use ordinary Cargo in the admitted tree")
+    capacity = env["CARGO_RABS_ROOT_CAPACITY"]
+    if not 1 <= len(capacity) <= 4 or not capacity.isascii() or not capacity.isdecimal() or not 1 <= int(capacity) <= 4096 or str(int(capacity)) != capacity:
+        raise SetupError("CARGO_RABS_ROOT_CAPACITY must be canonical decimal from 1 to 4096")
+    for key in ("CARGO_RABS_ROOT_BUDGET_DIR", "CARGO_RABS_ROOT_CGROUP"):
+        path = Path(env[key])
+        if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+            raise SetupError(key + " must be an ordinary absolute path")
+    if sys.platform != "linux":
+        raise SetupError("managed local Cargo roots require Linux cgroup v2")
+    return executable("rabs-cargo-root", "CARGO_RABS_ROOT_HELPER", env)
 
 
 def same_executable(value, expected, env):
@@ -1310,6 +1343,9 @@ def main():
     if raw[:1] == ["rabs"]:
         raw = raw[1:]
     if raw[:1] == ["--rabs-canonical"]:
+        if any(key in os.environ for key in ROOT_ADMISSION_KEYS):
+            print("cargo-rabs: local root admission cannot combine with canonical mode", file=sys.stderr)
+            return 2
         return run_canonical(raw[1:], dict(os.environ))
     try:
         args, no_start, required, remote = arguments(sys.argv[1:])
@@ -1321,6 +1357,9 @@ def main():
         return 0
     env = dict(os.environ)
     if remote:
+        if any(key in env for key in ROOT_ADMISSION_KEYS):
+            print("cargo-rabs: local root admission cannot combine with remote mode", file=sys.stderr)
+            return 2
         try:
             rch, command, child_env = remote_invocation(args, env)
         except (SetupError, OSError) as error:
@@ -1345,6 +1384,11 @@ def main():
         print("cargo-rabs: CARGO resolves to cargo-rabs itself", file=sys.stderr)
         return 127
     try:
+        root_helper = root_admission_helper(env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: local root admission refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
         cargo_env = prepare(env, no_start)
     except (SetupError, OSError, subprocess.SubprocessError) as error:
         print("cargo-rabs: {}; {}".format(
@@ -1354,8 +1398,11 @@ def main():
             return 2
         cargo_env = env
     try:
-        # No Popen/wait boundary around the build: preserve its PID, signals,
-        # jobserver descriptors, terminal streams, opaque argv and exit status.
+        if root_helper is not None:
+            # A single ownership handoff; an uncertain native outcome never
+            # retries or bypasses explicitly requested root admission.
+            os.execvpe(root_helper, [root_helper, "--", cargo] + args, cargo_env)
+        # With no explicit admission policy, retain the original exec boundary.
         os.execvpe(cargo, [cargo] + args, cargo_env)
     except OSError as error:
         print("cargo-rabs: cannot execute Cargo: {}".format(error), file=sys.stderr)

@@ -200,7 +200,7 @@ class InstallTests(unittest.TestCase):
         (scripts / "cargo-rabs").chmod(0o755)
         build = self.root / "custom-target" / "x86_64-unknown-linux-gnu"
         for name, profile in [("rabs-wrap", "wrapper-release"), ("rabsd", "daemon-release"),
-                              ("rabs-wkr", "daemon-release")]:
+                              ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release")]:
             directory = build / profile
             directory.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.bundle / name, directory / name)
@@ -353,7 +353,7 @@ class MainInstallerTests(unittest.TestCase):
         self.home.mkdir()
         self.native = shutil.which("true")
         self.assertIsNotNone(self.native)
-        for name in ("rch", "rchd", "rch-wkr", "rabs-wrap", "rabsd", "rabs-wkr"):
+        for name in ("rch", "rchd", "rch-wkr", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root"):
             shutil.copyfile(self.native, self.bundle / name)
             (self.bundle / name).chmod(0o755)
         for name in ("install-rabs", "cargo-rabs"):
@@ -516,7 +516,7 @@ esac
         for name in ("rch", "rabs-wrap"):
             shutil.copyfile(self.bundle / name, target / "wrapper-release" / name)
             (target / "wrapper-release" / name).chmod(0o755)
-        for name in ("rchd", "rch-wkr", "rabsd", "rabs-wkr"):
+        for name in ("rchd", "rch-wkr", "rabsd", "rabs-wkr", "rabs-cargo-root"):
             shutil.copyfile(self.bundle / name, target / "daemon-release" / name)
             (target / "daemon-release" / name).chmod(0o755)
         self.environment["CARGO_TARGET_DIR"] = str(target)

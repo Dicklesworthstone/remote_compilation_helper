@@ -5264,8 +5264,10 @@ dependencies = [
  "rabs-cas",
  "rabs-protocol",
  "rabs-sandbox",
+ "rustix",
  "serde_json",
  "sha2 0.11.0",
+ "signal-hook 0.4.4",
  "tempfile",
 ]
 

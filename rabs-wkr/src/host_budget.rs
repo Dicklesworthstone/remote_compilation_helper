@@ -10,8 +10,10 @@
 //! before its descendants have stopped. Each slot is therefore durably armed
 //! BEFORE spawn. An unlocked armed slot remains quarantined, even after its PID
 //! disappears or the worker restarts. Only the execution owner's explicit
-//! process-group AND stream-drain completion may clear it. No timeout, PID scan,
-//! ordinary Drop, or newly created inode manufactures cleanup evidence.
+//! cleanup proof may clear it: workers require process-group AND stream-drain
+//! completion; the separately versioned local-root domain requires the reaped
+//! Cargo leader AND an empty pinned cgroup. No timeout, PID scan, ordinary Drop,
+//! or newly created inode manufactures cleanup evidence.
 //!
 //! The immutable manifest pins directory/slot identities. State must stay on one
 //! local filesystem and must never be copied, replaced or edited while in use.
@@ -27,6 +29,8 @@ pub const DIRECTORY_ENV: &str = "RABS_WORKER_HOST_BUDGET_DIR";
 pub const CAPACITY_ENV: &str = "RABS_WORKER_HOST_SLOTS";
 pub const MAX_HOST_SLOTS: u32 = 4096;
 const VERSION: &str = "rabs-worker-host-budget-v1";
+#[cfg(target_os = "linux")]
+const ROOT_COUNT_VERSION: &str = "rabs-local-cargo-root-budget-v1";
 const MANIFEST: &str = "capacity.lock";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const FREE: &[u8] = b"free\n";
@@ -305,6 +309,18 @@ impl HostBudget {
     /// before any opener can grant work. An incomplete/corrupt prior manifest
     /// refuses rather than resetting possible ownership.
     pub fn open(root: &Path, capacity: u32) -> io::Result<Self> {
+        Self::open_domain(root, capacity, VERSION)
+    }
+
+    /// The native local Cargo supervisor counts whole trees rather than CPU
+    /// grants. A separate immutable version prevents accidentally mixing both
+    /// resource dimensions in one directory while sharing the lock substrate.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_root_count(root: &Path, capacity: u32) -> io::Result<Self> {
+        Self::open_domain(root, capacity, ROOT_COUNT_VERSION)
+    }
+
+    fn open_domain(root: &Path, capacity: u32, version: &'static str) -> io::Result<Self> {
         if capacity == 0 || capacity > MAX_HOST_SLOTS {
             return Err(invalid("host budget capacity must be between 1 and 4096"));
         }
@@ -362,7 +378,7 @@ impl HostBudget {
         let manifest_identity = validate_file(&manifest_path, &manifest.0, uid)?;
         if created {
             let mut bytes = format!(
-                "{VERSION}\ncapacity {capacity}\nroot {} {} {uid}\n",
+                "{version}\ncapacity {capacity}\nroot {} {} {uid}\n",
                 root_identity.device, root_identity.inode,
             );
             for index in 0..capacity {
@@ -383,7 +399,7 @@ impl HostBudget {
             }
         }
         let manifest_bytes = read_bounded(&manifest.0, MAX_MANIFEST_BYTES)?;
-        let slots = parse_manifest(&manifest_bytes, capacity, root_identity, uid)?;
+        let slots = parse_manifest(&manifest_bytes, capacity, root_identity, uid, version)?;
         let budget = Self {
             root: root.to_path_buf(),
             root_file,
@@ -513,12 +529,13 @@ fn parse_manifest(
     capacity: u32,
     root: Identity,
     uid: u32,
+    version: &str,
 ) -> io::Result<Vec<Identity>> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid("invalid host budget manifest"))?;
     let mut lines = text.lines();
     let expected_root = format!("root {} {} {uid}", root.device, root.inode);
     if !text.ends_with('\n')
-        || lines.next() != Some(VERSION)
+        || lines.next() != Some(version)
         || lines.next() != Some(format!("capacity {capacity}").as_str())
         || lines.next() != Some(expected_root.as_str())
     {
@@ -601,9 +618,11 @@ impl HostLease<'_> {
         Ok(())
     }
 
-    /// Called ONLY after managed wait returned success: that path has joined
-    /// BOTH bounded drain lanes and reaped the leader. Nonzero residual members
-    /// still refuse release. A wait/drain error or unwind must leave this armed.
+    /// Called ONLY after the execution owner's complete cleanup contract. A
+    /// worker's managed wait must join BOTH bounded drain lanes and reap its
+    /// leader. The local-root supervisor must reap Cargo and prove its pinned
+    /// cgroup unpopulated. Nonzero residual members refuse release. Any uncertain
+    /// wait/drain/containment result or unwind must leave this armed.
     pub(crate) fn finish(mut self, residual_group_members: u32) -> io::Result<()> {
         if residual_group_members != 0 {
             return Err(invalid("host execution lease retains residual descendants"));
@@ -774,6 +793,25 @@ mod tests {
             "fixed C must never shrink to fit"
         );
         assert!(budget.try_acquire(0).is_err());
+    }
+
+    #[test]
+    fn worker_cpu_and_cargo_root_dimensions_cannot_share_a_budget() {
+        let root = test_root();
+        let worker_path = root.join("worker");
+        let roots_path = root.join("roots");
+        let worker = HostBudget::open(&worker_path, 2).unwrap();
+        let roots = HostBudget::open_root_count(&roots_path, 2).unwrap();
+        assert!(HostBudget::open_root_count(&worker_path, 2).is_err());
+        assert!(HostBudget::open(&roots_path, 2).is_err());
+        assert!(worker.try_acquire(2).unwrap().is_some());
+        assert!(roots.try_acquire(2).unwrap().is_some());
+        assert_eq!(
+            HostBudget::open_root_count(&roots_path, 2)
+                .unwrap()
+                .capacity(),
+            2
+        );
     }
 
     #[test]

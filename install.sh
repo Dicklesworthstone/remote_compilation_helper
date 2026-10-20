@@ -700,17 +700,18 @@ try:
         paths = (api["source_files"](None, source_path) if source_kind == "--from-build"
                  else api["source_files"](source_path, None))
         machine = api["host_machine"]()
-        for name in ("rabs-wrap", "rabsd", "rabs-wkr"):
+        for name in ("rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root"):
             with paths[name].open("rb") as reader:
                 api["require_native_elf"](name, reader.read(64), machine)
     else:
         paths = {name: Path(source_path) / name
-                 for name in ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr")}
+                 for name in ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root")}
     probe_tool = shutil.which("true")
     if probe_tool is None:
         raise RuntimeError("wrapper verification requires an external true executable")
     for name, arguments in (("cargo-rabs", ["--help"]), ("rabsd", ["--version"]),
-                            ("rabs-wkr", ["--version"]), ("rabs-wrap", [probe_tool, "-vV"])):
+                            ("rabs-wkr", ["--version"]), ("rabs-cargo-root", ["--version"]),
+                            ("rabs-wrap", [probe_tool, "-vV"])):
         if not paths[name].is_file() or not os.access(paths[name], os.X_OK):
             raise RuntimeError(name + " is missing or not executable")
         try:
@@ -750,7 +751,7 @@ install_rabs_toolset() {
     if ! python3 -I "$installer" "$source_option" "$source_path" --bin-dir "$bin_dir"; then
         die "Requested RABS installation failed; inspect the reported error before retrying. For an existing unmanaged installation, choose a separate RCH_RABS_INSTALL_DIR."
     fi
-    success "Installed cargo-rabs, rabs-wrap, rabsd and rabs-wkr"
+    success "Installed cargo-rabs, rabs-wrap, rabsd, rabs-wkr and rabs-cargo-root"
 }
 
 build_rabs_toolset() {
