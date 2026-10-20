@@ -41,6 +41,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+mod recovery;
+
 const CONFIG_KEYS: [&str; 3] = [
     "RABS_DEPENDENCY_WORKER_LISTEN",
     "RABS_DEPENDENCY_WORKER_ID",
@@ -458,9 +460,7 @@ impl PendingRemote {
         verify_request(&request).map_err(settled)?;
         invocation.validation.verify(&request).map_err(settled)?;
         let retained = Arc::clone(&invocation.validation.retained);
-        let directory = tempfile::Builder::new()
-            .prefix("result-")
-            .tempdir_in(&remote.state)
+        let mut directory = recovery::ResultDirectory::new(&remote.state)
             .map_err(|error| settled(error.to_string()))?;
         let destination = directory.path().join("delivery");
         let paths = request
@@ -519,6 +519,15 @@ impl PendingRemote {
             .map_err(|error| settled(format!("prepare worker upload: {error}")))?;
         let owner: Arc<Mutex<Option<AdmittedRemote>>> = Arc::new(Mutex::new(None));
         let admitted_owner = Arc::clone(&owner);
+        // Persist exact recovery intent BEFORE execution can leave this process.
+        // A lost result must not also lose its request and private partial bytes.
+        directory
+            .record_request(
+                &wire,
+                &rabs_cas::metadata_store::digest_key(&request.key.action_key),
+                remote.configuration(),
+            )
+            .map_err(|error| settled(format!("persist remote recovery request: {error}")))?;
         let delivery = reservation.execute(
             &wire,
             &upload,
@@ -573,7 +582,17 @@ impl PendingRemote {
                 if let Some(owned) = owned.as_mut() {
                     owned.execution_finished = !failure.execution_may_have_run;
                 }
-                return Err((failure.detail, !failure.execution_may_have_run));
+                let detail = if failure.execution_may_have_run {
+                    format!(
+                        "{}; retained remote recovery directory: {}",
+                        failure.detail,
+                        directory.path().display(),
+                    )
+                } else {
+                    directory.execution_finished();
+                    failure.detail
+                };
+                return Err((detail, !failure.execution_may_have_run));
             }
         };
         let owned = owned
@@ -583,9 +602,19 @@ impl PendingRemote {
             .attempt
             .as_ref()
             .ok_or_else(|| ("delivery lost its admitted attempt".to_owned(), false))?;
-        verify_receipt(&delivery, &wire, attempt.authority.as_ref())
-            .map_err(|reason| (reason, false))?;
+        verify_receipt(&delivery, &wire, attempt.authority.as_ref()).map_err(|reason| {
+            (
+                format!(
+                    "{reason}; retained remote recovery directory: {}",
+                    directory.path().display(),
+                ),
+                false,
+            )
+        })?;
         owned.execution_finished = true;
+        // Complete execution is distinct from remote ACK confirmation. Keep a
+        // verified delivery for acknowledgment-only reconciliation when needed.
+        directory.delivery_finished(delivery.acknowledgments_confirmed);
         if cancellation.is_cancelled() {
             return Err(settled("caller left after private remote execution".into()));
         }
