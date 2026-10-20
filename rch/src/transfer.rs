@@ -1896,6 +1896,19 @@ fn add_portable_rsync_archive_args(cmd: &mut Command) {
     cmd.arg("--no-owner").arg("--no-group");
 }
 
+/// Source uploads (and their size estimate) preserve hard links. Without
+/// `--hard-links`, every link of a hard-linked source file lands on the
+/// worker as a separate full copy. music_theory_data_tool's model staging
+/// cache (430 linked files, 30 GB apparent on its dispatcher) cost ~29 GB of
+/// duplicates in each worker mirror on 2026-10-19, on workers whose free disk
+/// sets their slot count. An existing de-linked mirror is re-linked in place
+/// by its next upload, with nothing transferred. Upstream rsync and openrsync
+/// both support the flag. Enumeration, the content barrier and retrieval
+/// compare or fetch per path and stay without it.
+fn add_source_upload_hard_link_args(cmd: &mut Command) {
+    cmd.arg("--hard-links");
+}
+
 /// Anchor an artifact retrieval pattern so rsync only matches it at the
 /// transfer source root, NOT at any arbitrary depth in the source tree.
 /// Closes RCH bug `d7xc3` ("Artifact retrieval must not dirty local source
@@ -5050,6 +5063,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
+        add_source_upload_hard_link_args(&mut cmd);
         cmd.arg("--dry-run")
             .arg("--stats")
             .arg("-e")
@@ -5206,6 +5220,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
+        add_source_upload_hard_link_args(&mut cmd);
         cmd.arg("--partial")
             .arg("--partial-dir=.rch-partial")
             .arg("--stats") // Structured output for parse_rsync_bytes/files
@@ -5266,6 +5281,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
+        add_source_upload_hard_link_args(&mut cmd);
         // `--info=progress2 --info=stats2` on rsync 3.1+; `--progress --stats`
         // on openrsync / 2.6.9, which reject every `--info=` value (issue #66).
         cmd.arg("--partial")
@@ -12545,6 +12561,45 @@ Number of files transferred: 42
                 "{path}"
             );
             assert!(path.ends_with(" rch-source-rsync"), "{path}");
+        }
+    }
+
+    /// Uploads keep hard links (no full copy per link on the worker);
+    /// the per-path content barrier and retrieval do not change.
+    #[cfg(unix)]
+    #[test]
+    fn source_uploads_preserve_hard_links_but_barrier_and_retrieval_do_not() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "links".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        );
+        let worker = estimate_test_worker();
+        let has_flag = |command: &Command| {
+            command
+                .as_std()
+                .get_args()
+                .any(|arg| arg == "--hard-links" || arg == "-H")
+        };
+        for upload in [
+            pipeline.build_sync_command(&worker, "user@worker:/src", "/src", &[]),
+            pipeline.build_sync_streaming_command(&worker, "user@worker:/src", "/src", &[]),
+            pipeline.build_estimate_command(&worker),
+        ] {
+            assert!(has_flag(&upload), "{:?}", upload.as_std());
+        }
+        for other in [
+            pipeline.build_retrieve_command(&worker, "/src", &[]),
+            pipeline.build_retrieve_streaming_command(&worker, "/src", &[]),
+            pipeline.build_result_dir_retrieve_command(&worker, "/src", Path::new("results")),
+            flavour_test_pipeline(RsyncFlavor::Unknown, 0)
+                .with_owned_source_materialization()
+                .build_source_content_rsync_barrier_command(&flavour_test_worker(), &[], None),
+        ] {
+            assert!(!has_flag(&other), "{:?}", other.as_std());
         }
     }
 
