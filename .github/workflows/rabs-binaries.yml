@@ -131,6 +131,7 @@ jobs:
           cargo test --release -p rabs-wkr --lib cargo_home --locked
       - name: Cargo workspace outputs and independent delivery verification
         run: |
+          cargo test --release -p rabs-sandbox --lib canonical_namespace --locked
           cargo test --release -p rabs-sandbox --lib cargo_artifacts --locked
           cargo test --release -p rabs-sandbox --test cargo_artifacts --locked -- --nocapture
           cargo test --release -p rabs-wkr --lib cargo_capture --locked

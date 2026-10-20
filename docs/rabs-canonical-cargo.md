@@ -36,6 +36,13 @@ directory must contain ordinary executable `bin/cargo` and `bin/rustc` plus the
 runtime/sysroot files required by the existing toolchain capture contract. Rustup
 shims or symlinks are not a substitute for a complete toolchain dataset.
 
+Worker capability probing executes a no-op inside the same canonical base
+namespace used for builds, including private `/proc`, `/dev`, temporary storage
+and isolated networking. An installed bubblewrap and a successful basic user/PID
+namespace smoke test are insufficient. A host that cannot construct the complete
+base namespace does not advertise canonical execution or receive those builds;
+the worker does not substitute a broader mount view or weaker isolation.
+
 Create an operation parent outside the source/toolchain trees, owned by the user
 and mode 0700. Existing directories are not silently chmodded. Use this profile:
 

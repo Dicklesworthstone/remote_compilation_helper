@@ -41,16 +41,17 @@ use std::path::{Path, PathBuf};
 
 /// Measured isolation capabilities of the current host.
 ///
-/// Probing runs cheap read-only checks plus one `bwrap --unshare-user`
-/// smoke execution; the result is evidence, so callers persist it next to
-/// whatever the namespace produced.
+/// Probing runs cheap read-only checks plus the production canonical base
+/// namespace with a no-op command. The result is evidence, so callers persist
+/// it next to whatever the namespace produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostIsolationSupport {
     /// `bwrap` exists on PATH and `--version` succeeds.
     pub bubblewrap: Option<String>,
-    /// A no-op command inside `bwrap --unshare-user --unshare-pid` works —
-    /// the load-bearing check: unprivileged user namespaces usable end to
-    /// end, not merely advertised by a sysctl.
+    /// A no-op command succeeds inside the full canonical base namespace:
+    /// user/pid/ipc/uts/net isolation, private proc/dev/tmp, the recorded host
+    /// `/usr` view and a cleared environment. Basic userns creation alone does
+    /// not prove these mounts are permitted by the enclosing host/container.
     pub unprivileged_userns: bool,
     /// `overlay` appears in `/proc/filesystems` (future D004/D005 lowers).
     pub overlayfs: bool,
@@ -64,6 +65,12 @@ impl HostIsolationSupport {
     /// Probe the current host. On non-Linux everything is absent.
     #[must_use]
     pub fn probe() -> Self {
+        Self::probe_with_bubblewrap(Path::new("bwrap"))
+    }
+
+    // An explicit executable keeps fixture subprocesses independent of global
+    // PATH mutations. Production always selects the same bwrap as command_for.
+    fn probe_with_bubblewrap(executable: &Path) -> Self {
         if !cfg!(target_os = "linux") {
             return Self {
                 bubblewrap: None,
@@ -74,28 +81,41 @@ impl HostIsolationSupport {
             };
         }
 
-        let bubblewrap = std::process::Command::new("bwrap")
+        let bubblewrap = std::process::Command::new(executable)
             .arg("--version")
             .output()
             .ok()
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
 
-        let unprivileged_userns = bubblewrap.is_some()
-            && std::process::Command::new("bwrap")
-                .args([
-                    "--unshare-user",
-                    "--unshare-pid",
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "true",
-                ])
+        let unprivileged_userns = bubblewrap.as_ref().is_some_and(|version| {
+            // This provisional value ONLY permits pure argv construction. It
+            // never escapes as measured support: the subprocess below must
+            // establish every production base namespace and mount itself.
+            let provisional = Self {
+                bubblewrap: Some(version.clone()),
+                unprivileged_userns: true,
+                overlayfs: false,
+                cgroup_v2: false,
+                landlock: false,
+            };
+            let spec = CanonicalNamespaceSpec {
+                cwd: PathBuf::from(layout::TMP),
+                ..CanonicalNamespaceSpec::new()
+            };
+            let Ok(mut launch) = build_canonical_argv(&spec, &provisional, "/usr/bin/true", &[])
+            else {
+                return false;
+            };
+            launch.argv[0] = executable.as_os_str().to_owned();
+            command_for(&launch)
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map(|status| status.success())
-                .unwrap_or(false);
+                .unwrap_or(false)
+        });
 
         let overlayfs = std::fs::read_to_string("/proc/filesystems")
             .map(|s| s.lines().any(|l| l.trim_end().ends_with("overlay")))
@@ -574,6 +594,145 @@ mod tests {
         argv.iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_fixture(body: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::tempdir().unwrap();
+        let executable = owner.path().join("bwrap");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then\n\
+                 printf 'bubblewrap fixture\\n'; exit 0\n\
+                 fi\n\
+                 printf '%s\\000' \"$@\" > \"$0.argv\"\n\
+                 {body}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (owner, executable)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn support_probe_executes_the_production_canonical_base() {
+        // This subprocess records invocation and status handling only; it is
+        // not evidence that the kernel enforces a namespace.
+        let (owner, executable) = probe_fixture("exit 0");
+        let support = HostIsolationSupport::probe_with_bubblewrap(&executable);
+        assert!(support.unprivileged_userns);
+        let recorded = std::fs::read_to_string(owner.path().join("bwrap.argv")).unwrap();
+        let argv = recorded.split_terminator('\0').collect::<Vec<_>>();
+        let spec = CanonicalNamespaceSpec {
+            cwd: PathBuf::from(layout::TMP),
+            ..CanonicalNamespaceSpec::new()
+        };
+        let production =
+            build_canonical_argv(&spec, &full_support(), "/usr/bin/true", &[]).unwrap();
+        let expected = strs(&production.argv[1..]);
+        assert_eq!(
+            argv,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        for flag in [
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-net",
+            "--clearenv",
+            "--die-with-parent",
+        ] {
+            assert!(argv.contains(&flag), "missing production axis {flag}");
+        }
+        for pair in [
+            ["--proc", "/proc"],
+            ["--dev", "/dev"],
+            ["--tmpfs", layout::TMP],
+            ["--chdir", layout::TMP],
+            ["--", "/usr/bin/true"],
+        ] {
+            assert!(argv.windows(2).any(|window| window == pair), "{pair:?}");
+        }
+        assert!(
+            argv.windows(3)
+                .any(|window| window == ["--ro-bind", "/usr", "/usr"])
+        );
+        assert!(
+            !argv
+                .windows(3)
+                .any(|window| window == ["--ro-bind", "/", "/"])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_userns_smoke_cannot_admit_a_failed_private_proc_mount() {
+        let (_owner, executable) = probe_fixture(
+            "for arg do\n\
+             if [ \"$arg\" = --proc ]; then\n\
+             printf \"Can't mount proc on /newroot/proc: Operation not permitted\\n\" >&2\n\
+             exit 1\n\
+             fi\n\
+             done\n\
+             exit 0",
+        );
+        let smoke = std::process::Command::new(&executable)
+            .args([
+                "--unshare-user",
+                "--unshare-pid",
+                "--ro-bind",
+                "/",
+                "/",
+                "true",
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            smoke.success(),
+            "fixture must reproduce the old false positive"
+        );
+        let support = HostIsolationSupport::probe_with_bubblewrap(&executable);
+        assert!(support.bubblewrap.is_some());
+        assert!(!support.unprivileged_userns);
+        assert_eq!(
+            support.missing_for_canonical(),
+            ["unprivileged-user-namespaces"]
+        );
+        assert!(matches!(
+            build_canonical_argv(&CanonicalNamespaceSpec::new(), &support, "cargo", &[]),
+            Err(IsolationError::UnsupportedHost { .. })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn measured_support_agrees_with_actual_canonical_base_execution() {
+        let support = HostIsolationSupport::probe();
+        let spec = CanonicalNamespaceSpec {
+            cwd: PathBuf::from(layout::TMP),
+            ..CanonicalNamespaceSpec::new()
+        };
+        let launch = build_canonical_argv(&spec, &full_support(), "/usr/bin/true", &[]).unwrap();
+        let output = command_for(&launch).output();
+        let success = output.as_ref().is_ok_and(|output| output.status.success());
+        eprintln!(
+            "actual canonical base: success={success}; advertised={}; detail={}",
+            support.unprivileged_userns,
+            match &output {
+                Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
+                Err(error) => error.to_string(),
+            }
+        );
+        assert_eq!(
+            support.unprivileged_userns,
+            support.bubblewrap.is_some() && success
+        );
     }
 
     #[test]
