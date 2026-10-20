@@ -154,6 +154,71 @@ class CanonicalCargo(unittest.TestCase):
         self.assertNotIn("source_manifest", request, "launcher must not fabricate input evidence")
         self.assertNotIn("toolchain_identity", request, "native capture owns the identity")
 
+    def test_explicit_registry_cache_is_native_preparation_intent(self):
+        cargo_home = self.root / "approved Cargo home 雪"
+        cargo_home.mkdir(mode=0o700)
+        credentials = cargo_home / "credentials.toml"
+        credentials.write_text('[registry]\ntoken="must-not-be-read-by-launcher"\n')
+        self.profile.update(manifest="members/app/Cargo.toml", cargo_home_source=str(cargo_home))
+        self.save()
+        self.assertEqual(self.invoke()[0], 0)
+        request = self.records()[0]["request"]
+        self.assertEqual(request["cargo_source"], {
+            "manifest":"members/app/Cargo.toml", "cargo_home_source":str(cargo_home),
+        })
+        self.assertNotIn("must-not-be-read-by-launcher", json.dumps(request))
+        self.assertNotIn("cargo_home", request, "native capture must derive the transferred projection")
+        self.assertNotIn("source_manifest", request, "launcher cannot fabricate source evidence")
+        self.assertEqual(credentials.read_text(), '[registry]\ntoken="must-not-be-read-by-launcher"\n')
+        self.assertEqual(list(cargo_home.iterdir()), [credentials])
+
+    def test_registry_cache_requires_one_explicit_disjoint_directory(self):
+        cargo_home = self.root / "cargo-cache"
+        cargo_home.mkdir(mode=0o700)
+        alias = self.root / "cache-alias"
+        alias.symlink_to(cargo_home, target_is_directory=True)
+        nested = self.operations / "nested-cache"
+        # An input nested under the output parent must refuse before using it;
+        # keep that parent otherwise empty for assert_refused's side-effect check.
+        candidates = (None, True, 1, "relative/cache", str(alias), str(self.root / "absent"),
+                      str(self.source), str(self.toolchain), str(self.operations), str(self.root))
+        for value in candidates:
+            with self.subTest(value=value):
+                self.profile_path.write_text(json.dumps(dict(self.profile, cargo_home_source=value)))
+                self.assert_refused()
+        nested.mkdir(mode=0o700)
+        self.profile_path.write_text(json.dumps(dict(self.profile, cargo_home_source=str(nested))))
+        status, stdout, _, _ = self.invoke()
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, b"")
+        self.assertFalse(self.record.exists())
+        self.assertEqual(list(self.operations.iterdir()), [nested])
+
+    def test_registry_cache_and_vendor_cannot_be_combined(self):
+        cargo_home = self.root / "cargo-cache"
+        cargo_home.mkdir(mode=0o700)
+        self.profile.update(cargo_home_source=str(cargo_home), vendor="vendor")
+        self.save()
+        self.assert_refused()
+
+    def test_explicit_jobserver_grant_is_request_intent_not_compiler_environment(self):
+        for grant in (1, 2, 4096):
+            with self.subTest(grant=grant):
+                self.profile["jobserver_grant"] = grant
+                self.save()
+                self.assertEqual(self.invoke()[0], 0)
+                request = self.records()[-1]["request"]
+                self.assertEqual(request["jobserver_grant"], grant)
+                self.assertEqual(request["command_context"]["env"], {"CARGO_INCREMENTAL":"0"})
+                self.assertNotIn("-j", request["args"])
+                self.assertNotIn("--jobs", request["args"])
+
+    def test_ambiguous_or_unbounded_jobserver_grants_refuse_before_execution(self):
+        for grant in (None, True, False, "2", 2.0, 0, -1, 4097, [], {}):
+            with self.subTest(grant=grant):
+                self.profile_path.write_text(json.dumps(dict(self.profile, jobserver_grant=grant)))
+                self.assert_refused()
+
     def test_locked_offline_and_frozen_are_not_duplicated(self):
         for flags in (["--locked"], ["--offline"], ["--locked", "--offline"], ["--frozen"]):
             self.assertEqual(self.invoke(["build", "--bin=hello"] + flags)[0], 0)

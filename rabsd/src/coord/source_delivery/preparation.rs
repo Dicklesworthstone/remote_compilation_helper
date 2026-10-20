@@ -103,6 +103,14 @@ impl SourcePreparation {
                 !closure && specification.get("source_files").is_none(),
                 "cargo_source, source_roots and source_files are mutually exclusive",
             )?;
+            if cargo.cargo_home_projection().is_some() {
+                require(
+                    specification.get("cargo_home").is_none()
+                        && specification.get("dependency_context").is_none(),
+                    "automatic registry capture cannot replace an explicit Cargo home or dependency context",
+                )?;
+                cargo.validate_cache_boundary(base)?;
+            }
             roots.push(("workspace".to_owned(), base.to_path_buf()));
             selections.push(("workspace".to_owned(), vec![cargo.manifest().to_owned()]));
         } else if closure {
@@ -206,6 +214,12 @@ impl SourcePreparation {
 
     pub(super) fn root_count(&self) -> usize {
         self.roots.len()
+    }
+
+    pub(super) fn cargo_home_projection(&self) -> Option<Value> {
+        self.cargo
+            .as_ref()
+            .and_then(cargo::CargoSource::cargo_home_projection)
     }
 
     pub(super) fn capture(&self) -> io::Result<SourceUpload> {

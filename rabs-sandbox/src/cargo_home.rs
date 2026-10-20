@@ -7,9 +7,12 @@
 //! and workspace configuration; the canonical namespace still denies network.
 //! The input snapshot stays read-only; the independent Cargo home is writable
 //! scratch so Cargo may lock, unpack and maintain its own cache metadata.
+//! The isolated version also derives an independent read-only workspace with
+//! the transport prefix absent. Cache delivery must not add workspace members
+//! or alter directory enumeration by Cargo and build scripts.
 
 use crate::canonical_namespace::CanonicalNamespaceSpec;
-use crate::snapshot_capture::{MemberKind, capture_sealed_source};
+use crate::snapshot_capture::{MemberKind, SealedSourceSnapshot, capture_sealed_source};
 use crate::source_transfer::{MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SourceManifest, SourceReceiver};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -18,6 +21,10 @@ use std::path::{Path, PathBuf};
 
 /// An optional source-begin extension, explicitly echoed before source upload.
 pub const CARGO_HOME_SOURCE_VERSION: &str = "registry-cargo-home-v1";
+/// Cache transport members are excluded from the compiler-visible workspace.
+/// The legacy version retains its original visible-prefix semantics, including
+/// for saved operations and recovery requests.
+pub const ISOLATED_CARGO_HOME_SOURCE_VERSION: &str = "isolated-registry-cargo-home-v1";
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -47,10 +54,24 @@ pub struct CargoHomeProjection {
     prefix: String,
     source_digest: [u8; 32],
     files: SourceManifest,
+    workspace: Option<SourceManifest>,
 }
 
 impl CargoHomeProjection {
     pub fn new(prefix: &str, source: &SourceManifest) -> io::Result<Self> {
+        Self::for_version(CARGO_HOME_SOURCE_VERSION, prefix, source)
+    }
+
+    /// Decode the exact negotiated version. New behavior must never silently
+    /// reinterpret a previously admitted operation's source layout.
+    pub fn for_version(version: &str, prefix: &str, source: &SourceManifest) -> io::Result<Self> {
+        require(
+            matches!(
+                version,
+                CARGO_HOME_SOURCE_VERSION | ISOLATED_CARGO_HOME_SOURCE_VERSION
+            ),
+            "unsupported Cargo home projection version",
+        )?;
         require(
             !prefix.is_empty()
                 && prefix.len() <= 512
@@ -64,8 +85,10 @@ impl CargoHomeProjection {
         )?;
         let prefix_with_slash = format!("{prefix}/");
         let mut files = Vec::new();
+        let mut workspace = Vec::new();
         for file in source.files() {
             let Some(relative) = file.path.strip_prefix(&prefix_with_slash) else {
+                workspace.push(file.clone());
                 continue;
             };
             let mut parts = relative.split('/');
@@ -87,7 +110,21 @@ impl CargoHomeProjection {
             prefix: prefix.to_owned(),
             source_digest: source.digest(),
             files: SourceManifest::new(files)?,
+            workspace: if version == ISOLATED_CARGO_HOME_SOURCE_VERSION {
+                Some(SourceManifest::new(workspace)?)
+            } else {
+                None
+            },
         })
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &'static str {
+        if self.workspace.is_some() {
+            ISOLATED_CARGO_HOME_SOURCE_VERSION
+        } else {
+            CARGO_HOME_SOURCE_VERSION
+        }
     }
 
     #[must_use]
@@ -115,54 +152,80 @@ impl CargoHomeProjection {
         let root = source
             .sealed_root()
             .ok_or_else(|| invalid("Cargo home requires a sealed source"))?;
+        // Isolated mode derives BOTH views from one complete retained capture.
+        // The original source receiver remains unchanged for transfer identity,
+        // recovery and any source-byte reuse; it is never mounted as workspace.
+        let capture_root = if self.workspace.is_some() {
+            root.to_path_buf()
+        } else {
+            root.join(&self.prefix)
+        };
         let image = capture_sealed_source(
-            &[("cargo-home".to_owned(), root.join(&self.prefix))],
+            &[("cargo-home".to_owned(), capture_root)],
             false,
             2,
             MAX_SOURCE_BYTES,
         )
         .map_err(|_| invalid("Cargo home source capture refused"))?;
         checkpoint(&stopped)?;
-        // Inspect every selected file BEFORE creating a destination. Captured
-        // bytes must still match the original transfer identity, including mode.
-        for expected in self.files.files() {
-            let member = image
-                .manifest("cargo-home")
-                .and_then(|manifest| manifest.members.get(&expected.path));
-            let Some(MemberKind::Regular {
-                size,
-                content_sha256,
-                mode,
-                ..
-            }) = member
-            else {
-                return Err(invalid("Cargo home member is missing or not regular"));
-            };
+        let cache_prefix = self.workspace.as_ref().map(|_| self.prefix.as_str());
+        verify_members(&image, &self.files, cache_prefix)?;
+        if let Some(workspace) = &self.workspace {
+            verify_members(&image, workspace, None)?;
+        }
+        checkpoint(&stopped)?;
+        let (home_destination, workspace) = if let Some(workspace) = &self.workspace {
             require(
-                *size == expected.len
-                    && *content_sha256 == expected.sha256
-                    && (*mode & 0o111 != 0) == expected.executable,
-                "Cargo home source differs from the transferred bytes or mode",
+                destination.is_absolute() && destination.file_name().is_some(),
+                "isolated Cargo inputs require an absolute new directory",
             )?;
-        }
-        checkpoint(&stopped)?;
-        let mut receiver = SourceReceiver::create(destination, self.files.clone())?;
-        for expected in self.files.files() {
-            let bytes = image
-                .file_bytes("cargo-home", &expected.path)
-                .ok_or_else(|| invalid("retained Cargo home member missing"))?;
-            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
-                checkpoint(&stopped)?;
-                receiver.write_chunk(
-                    &expected.path,
-                    index as u64 * MAX_SOURCE_CHUNK as u64,
-                    chunk,
-                    Sha256::digest(chunk).into(),
-                )?;
+            let destination = fs::canonicalize(
+                destination
+                    .parent()
+                    .ok_or_else(|| invalid("isolated Cargo input parent missing"))?,
+            )?
+            .join(
+                destination
+                    .file_name()
+                    .ok_or_else(|| invalid("isolated Cargo input name missing"))?,
+            );
+            require(
+                !overlaps(&destination, root),
+                "isolated Cargo inputs require separate private storage",
+            )?;
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
             }
-        }
-        checkpoint(&stopped)?;
-        let root = receiver.seal()?.to_path_buf();
+            builder.create(&destination)?;
+            let projected = copy_members(
+                &image,
+                workspace,
+                None,
+                &destination.join("workspace"),
+                &stopped,
+            )?;
+            let directory = File::open(&projected)?;
+            (
+                destination.join("cargo-home"),
+                Some(PreparedWorkspace {
+                    root: projected,
+                    directory,
+                    source_root: root.to_path_buf(),
+                }),
+            )
+        } else {
+            (destination.to_path_buf(), None)
+        };
+        let root = copy_members(
+            &image,
+            &self.files,
+            cache_prefix,
+            &home_destination,
+            &stopped,
+        )?;
         checkpoint(&stopped)?;
         // This is intentionally independent writable runtime state, not an
         // immutable source owner. SourceReceiver's normalized read-only mode
@@ -180,8 +243,76 @@ impl CargoHomeProjection {
         }
         checkpoint(&stopped)?;
         let directory = File::open(&root)?;
-        Ok(PreparedCargoHome { root, directory })
+        Ok(PreparedCargoHome {
+            root,
+            directory,
+            workspace,
+        })
     }
+}
+
+fn captured_path(prefix: Option<&str>, path: &str) -> String {
+    prefix.map_or_else(|| path.to_owned(), |prefix| format!("{prefix}/{path}"))
+}
+
+/// Validate every selected member before creating either derived tree.
+fn verify_members(
+    image: &SealedSourceSnapshot,
+    files: &SourceManifest,
+    prefix: Option<&str>,
+) -> io::Result<()> {
+    for expected in files.files() {
+        let path = captured_path(prefix, &expected.path);
+        let member = image
+            .manifest("cargo-home")
+            .and_then(|manifest| manifest.members.get(&path));
+        let Some(MemberKind::Regular {
+            size,
+            content_sha256,
+            mode,
+            ..
+        }) = member
+        else {
+            return Err(invalid("Cargo input member is missing or not regular"));
+        };
+        require(
+            *size == expected.len
+                && *content_sha256 == expected.sha256
+                && (*mode & 0o111 != 0) == expected.executable,
+            "Cargo input differs from the transferred bytes or mode",
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_members(
+    image: &SealedSourceSnapshot,
+    files: &SourceManifest,
+    prefix: Option<&str>,
+    destination: &Path,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<PathBuf> {
+    checkpoint(stopped)?;
+    let mut receiver = SourceReceiver::create(destination, files.clone())?;
+    for expected in files.files() {
+        let path = captured_path(prefix, &expected.path);
+        let bytes = image
+            .file_bytes("cargo-home", &path)
+            .ok_or_else(|| invalid("retained Cargo input member missing"))?;
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            checkpoint(stopped)?;
+            receiver.write_chunk(
+                &expected.path,
+                index as u64 * MAX_SOURCE_CHUNK as u64,
+                chunk,
+                Sha256::digest(chunk).into(),
+            )?;
+        }
+    }
+    checkpoint(stopped)?;
+    let root = receiver.seal()?.to_path_buf();
+    checkpoint(stopped)?;
+    Ok(root)
 }
 
 /// Only successful copying and whole-projection verification create this value.
@@ -190,31 +321,46 @@ impl CargoHomeProjection {
 pub struct PreparedCargoHome {
     root: PathBuf,
     directory: File,
+    workspace: Option<PreparedWorkspace>,
+}
+
+#[derive(Debug)]
+struct PreparedWorkspace {
+    root: PathBuf,
+    directory: File,
+    source_root: PathBuf,
 }
 
 impl PreparedCargoHome {
-    /// Replace only the canonical Cargo-home mount, never HOME, source, outputs
-    /// or environment. All checks precede mutation. Caller must retain this
-    /// owner until compilation and every descendant writer have drained.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The compiler-visible source tree for isolated transport, or None for
+    /// legacy requests whose original source prefix remains visible.
+    #[must_use]
+    pub fn projected_workspace(&self) -> Option<&Path> {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.root.as_path())
+    }
+
+    /// Apply the negotiated Cargo-home and optional isolated-workspace views.
+    /// HOME, outputs, environment and cwd remain unchanged. All checks precede
+    /// mutation; the caller retains this owner through process/drain cleanup.
     pub fn apply_to(&self, spec: &mut CanonicalNamespaceSpec) -> io::Result<()> {
-        let current = fs::symlink_metadata(&self.root)?;
-        require(
-            current.is_dir(),
-            "prepared Cargo home is no longer an ordinary directory",
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let owned = self.directory.metadata()?;
-            require(
-                current.dev() == owned.dev() && current.ino() == owned.ino(),
-                "prepared Cargo home directory was replaced",
-            )?;
+        verify_directory(&self.root, &self.directory)?;
+        if let Some(workspace) = &self.workspace {
+            verify_directory(&workspace.root, &workspace.directory)?;
         }
         let visible = Path::new(crate::layout::CARGO_HOME);
-        let overlaps = |path: &Path| path.starts_with(visible) || visible.starts_with(path);
+        let home_overlaps = |path: &Path| overlaps(path, visible);
         require(
-            !spec.ro_binds.iter().any(|bind| overlaps(&bind.visible)),
+            !spec
+                .ro_binds
+                .iter()
+                .any(|bind| home_overlaps(&bind.visible)),
             "read-only mount shadows Cargo home",
         )?;
         let mut selected = None;
@@ -226,7 +372,7 @@ impl PreparedCargoHome {
                 )?;
             } else {
                 require(
-                    !overlaps(&bind.visible),
+                    !home_overlaps(&bind.visible),
                     "writable mount shadows Cargo home",
                 )?;
                 let backing = fs::canonicalize(&bind.backing)?;
@@ -237,9 +383,81 @@ impl PreparedCargoHome {
             }
         }
         let index = selected.ok_or_else(|| invalid("canonical Cargo home mount is missing"))?;
-        spec.rw_binds[index].backing = self.root.clone();
+        let mut workspace_slot = None;
+        if let Some(workspace) = &self.workspace {
+            let visible = Path::new(crate::layout::WORKSPACE);
+            for (read_only, binds) in [(true, &spec.ro_binds), (false, &spec.rw_binds)] {
+                for (slot, bind) in binds.iter().enumerate() {
+                    if bind.visible == visible {
+                        require(
+                            workspace_slot.replace((read_only, slot)).is_none(),
+                            "duplicate isolated workspace mount",
+                        )?;
+                        require(
+                            bind.backing == workspace.source_root || bind.backing == workspace.root,
+                            "workspace mount is not owned by this Cargo projection",
+                        )?;
+                        continue;
+                    }
+                    require(
+                        !overlaps(&bind.visible, visible),
+                        "another mount shadows the isolated workspace",
+                    )?;
+                    let backing = fs::canonicalize(&bind.backing)?;
+                    require(
+                        !overlaps(&backing, &workspace.root)
+                            && !overlaps(&backing, &workspace.source_root),
+                        "another mount aliases isolated or transport-only source",
+                    )?;
+                    if read_only {
+                        require(
+                            !overlaps(&backing, &self.root),
+                            "another mount exposes the prepared Cargo home",
+                        )?;
+                    }
+                }
+            }
+            require(
+                workspace_slot.is_some(),
+                "canonical workspace mount is missing",
+            )?;
+        }
+        let mut prepared = spec.clone();
+        prepared.rw_binds[index].backing = self.root.clone();
+        if let (Some(workspace), Some((read_only, slot))) = (&self.workspace, workspace_slot) {
+            if read_only {
+                prepared.ro_binds[slot].backing = workspace.root.clone();
+            } else {
+                let mut bind = prepared.rw_binds.remove(slot);
+                bind.backing = workspace.root.clone();
+                prepared.ro_binds.push(bind);
+            }
+        }
+        *spec = prepared;
         Ok(())
     }
+}
+
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn verify_directory(root: &Path, directory: &File) -> io::Result<()> {
+    let current = fs::symlink_metadata(root)?;
+    require(
+        current.is_dir() && fs::canonicalize(root)? == root,
+        "prepared Cargo input is no longer an ordinary owned directory",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owned = directory.metadata()?;
+        require(
+            current.dev() == owned.dev() && current.ino() == owned.ino(),
+            "prepared Cargo input directory was replaced",
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -448,5 +666,213 @@ mod tests {
         let before = spec.clone();
         assert!(prepared.apply_to(&mut spec).is_err());
         assert_eq!(spec, before);
+    }
+
+    fn isolated_fixture(parent: &Path) -> (SourceReceiver, CargoHomeProjection) {
+        let (source, _) = fixture(parent);
+        let projection = CargoHomeProjection::for_version(
+            ISOLATED_CARGO_HOME_SOURCE_VERSION,
+            "cache",
+            source.manifest(),
+        )
+        .unwrap();
+        (source, projection)
+    }
+
+    fn workspace_spec(parent: &Path, source: &Path) -> CanonicalNamespaceSpec {
+        let mut spec = spec(parent);
+        spec.rw_binds
+            .push(Bind::new(source, crate::layout::WORKSPACE));
+        spec
+    }
+
+    #[test]
+    fn isolated_cache_keeps_transport_members_out_of_workspace_enumeration() {
+        let parent = private();
+        let (source, projection) = isolated_fixture(parent.path());
+        let source_root = source.sealed_root().unwrap();
+        let original = source.manifest().clone();
+        let legacy = CargoHomeProjection::new("cache", source.manifest()).unwrap();
+        assert_eq!(legacy.version(), CARGO_HOME_SOURCE_VERSION);
+        assert_eq!(projection.version(), ISOLATED_CARGO_HOME_SOURCE_VERSION);
+        assert_ne!(projection, legacy);
+        assert!(CargoHomeProjection::for_version("unknown", "cache", source.manifest()).is_err());
+        let prepared = projection
+            .prepare(&source, &parent.path().join("isolated"), || false)
+            .unwrap();
+        let workspace = prepared.projected_workspace().unwrap();
+        let names = fs::read_dir(workspace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from("app")]);
+        assert_eq!(
+            fs::read(workspace.join("app/lib.rs")).unwrap(),
+            b"not a cache file"
+        );
+        assert_eq!(
+            fs::metadata(workspace.join("app/lib.rs")).unwrap().mode() & 0o777,
+            0o444
+        );
+        assert_ne!(
+            fs::metadata(workspace.join("app/lib.rs")).unwrap().ino(),
+            fs::metadata(source_root.join("app/lib.rs")).unwrap().ino()
+        );
+        assert!(source_root.join("cache").is_dir());
+        assert_eq!(source.manifest(), &original);
+        assert_eq!(
+            fs::read(prepared.root().join("registry/cache/example/pkg-1.crate")).unwrap(),
+            b"archive\0\xff"
+        );
+        assert!(
+            prepared
+                .root()
+                .join("registry/index/example/empty")
+                .is_file()
+        );
+        assert!(!prepared.root().join("app").exists());
+
+        let mut namespace = workspace_spec(parent.path(), source_root);
+        let before = namespace.clone();
+        prepared.apply_to(&mut namespace).unwrap();
+        assert!(
+            namespace
+                .ro_binds
+                .iter()
+                .any(|bind| bind.visible == Path::new(crate::layout::WORKSPACE)
+                    && bind.backing == workspace)
+        );
+        assert!(
+            !namespace
+                .rw_binds
+                .iter()
+                .any(|bind| bind.visible == Path::new(crate::layout::WORKSPACE))
+        );
+        assert!(
+            namespace
+                .rw_binds
+                .iter()
+                .any(|bind| bind.visible == Path::new(crate::layout::CARGO_HOME)
+                    && bind.backing == prepared.root())
+        );
+        assert_eq!(namespace.env, before.env);
+        assert_eq!(namespace.cwd, before.cwd);
+        assert!(!namespace.allows_network());
+        prepared.apply_to(&mut namespace).unwrap();
+
+        let old = legacy
+            .prepare(&source, &parent.path().join("legacy"), || false)
+            .unwrap();
+        assert!(old.projected_workspace().is_none());
+        let mut legacy_namespace = workspace_spec(parent.path(), source_root);
+        old.apply_to(&mut legacy_namespace).unwrap();
+        assert!(
+            legacy_namespace
+                .rw_binds
+                .iter()
+                .any(|bind| bind.visible == Path::new(crate::layout::WORKSPACE)
+                    && bind.backing == source_root)
+        );
+    }
+
+    #[test]
+    fn isolated_projection_checks_workspace_bytes_and_mode_before_creating_storage() {
+        for change in 0..3 {
+            let parent = private();
+            let (source, projection) = isolated_fixture(parent.path());
+            let path = source.sealed_root().unwrap().join("app/lib.rs");
+            match change {
+                0 => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&path, b"different source").unwrap();
+                }
+                1 => fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap(),
+                _ => {
+                    let saved = parent.path().join("replaced-source");
+                    fs::rename(&path, &saved).unwrap();
+                    symlink(saved, &path).unwrap();
+                }
+            }
+            let destination = parent.path().join("must-not-exist");
+            assert!(projection.prepare(&source, &destination, || false).is_err());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn isolated_destination_cannot_alias_its_sealed_transfer_tree() {
+        let parent = private();
+        let (source, projection) = isolated_fixture(parent.path());
+        let source_root = source.sealed_root().unwrap();
+        let alias = parent.path().join("source-alias");
+        symlink(source_root, &alias).unwrap();
+        assert!(
+            projection
+                .prepare(&source, &alias.join("nested"), || false)
+                .is_err()
+        );
+        assert!(!source_root.join("nested").exists());
+    }
+
+    #[test]
+    fn isolated_projection_cancellation_never_returns_one_half_of_the_pair() {
+        for stop_after_workspace in [true, false] {
+            let parent = private();
+            let (source, projection) = isolated_fixture(parent.path());
+            let destination = parent.path().join("cancelled");
+            let frontier = if stop_after_workspace {
+                destination.join("workspace/app/lib.rs")
+            } else {
+                destination.join("cargo-home/registry/cache/example/pkg-1.crate")
+            };
+            let error = projection
+                .prepare(&source, &destination, || frontier.exists())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(
+                fs::read(source.sealed_root().unwrap().join("app/lib.rs")).unwrap(),
+                b"not a cache file"
+            );
+            assert!(projection.prepare(&source, &destination, || false).is_err());
+        }
+    }
+
+    #[test]
+    fn isolated_mount_rejects_source_aliases_and_replaced_roots_atomically() {
+        let parent = private();
+        let (source, projection) = isolated_fixture(parent.path());
+        let source_root = source.sealed_root().unwrap();
+        let prepared = projection
+            .prepare(&source, &parent.path().join("isolated"), || false)
+            .unwrap();
+        let workspace = prepared.projected_workspace().unwrap();
+        for case in 0..6 {
+            let mut namespace = workspace_spec(parent.path(), source_root);
+            match case {
+                0 => {
+                    namespace.rw_binds.pop();
+                }
+                1 => namespace
+                    .ro_binds
+                    .push(Bind::new(source_root, crate::layout::WORKSPACE)),
+                2 => namespace
+                    .ro_binds
+                    .push(Bind::new(source_root, "/__rabs/repos/leaked-source")),
+                3 => namespace.rw_binds[1].backing = workspace.to_path_buf(),
+                4 => namespace
+                    .rw_binds
+                    .push(Bind::new(parent.path(), "/__rabs/workspace/hidden")),
+                _ => namespace.rw_binds.last_mut().unwrap().backing = parent.path().to_path_buf(),
+            }
+            let before = namespace.clone();
+            assert!(prepared.apply_to(&mut namespace).is_err(), "case {case}");
+            assert_eq!(namespace, before, "case {case}");
+        }
+        fs::rename(workspace, parent.path().join("retired-workspace")).unwrap();
+        fs::create_dir(workspace).unwrap();
+        let mut namespace = workspace_spec(parent.path(), source_root);
+        let before = namespace.clone();
+        assert!(prepared.apply_to(&mut namespace).is_err());
+        assert_eq!(namespace, before);
     }
 }

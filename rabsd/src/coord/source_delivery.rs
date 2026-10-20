@@ -11,7 +11,9 @@ mod toolchain;
 
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
-use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, CargoHomeProjection};
+use rabs_sandbox::cargo_home::{
+    CARGO_HOME_SOURCE_VERSION, CargoHomeProjection, ISOLATED_CARGO_HOME_SOURCE_VERSION,
+};
 use rabs_sandbox::generated_source::GeneratedSource;
 #[cfg(all(test, unix))]
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
@@ -88,13 +90,20 @@ fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result
     };
     require(
         home.as_object().is_some_and(|object| object.len() == 2)
-            && home["version"] == CARGO_HOME_SOURCE_VERSION,
+            && (home["version"] == CARGO_HOME_SOURCE_VERSION
+                || home["version"] == ISOLATED_CARGO_HOME_SOURCE_VERSION),
         "cargo_home requires a supported version and prefix",
     )?;
     let prefix = home["prefix"]
         .as_str()
         .ok_or_else(|| invalid("cargo_home prefix must be a string"))?;
-    CargoHomeProjection::new(prefix, manifest)?;
+    CargoHomeProjection::for_version(
+        home["version"]
+            .as_str()
+            .ok_or_else(|| invalid("cargo_home version must be a string"))?,
+        prefix,
+        manifest,
+    )?;
     Ok(())
 }
 
@@ -306,6 +315,9 @@ pub fn prepare_source_bundle(
     fields.remove("source_roots");
     fields.remove("cargo_source");
     fields.remove("toolchain_source");
+    if let Some(home) = inputs.cargo_home_projection() {
+        fields.insert("cargo_home".to_owned(), home);
+    }
     if let Some(prepared) = &toolchain {
         fields.remove("toolchain_backing");
         fields.insert(

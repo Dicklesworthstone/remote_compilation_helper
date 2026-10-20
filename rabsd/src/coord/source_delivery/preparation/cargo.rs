@@ -6,14 +6,16 @@
 //! build scripts, include! inputs, and optional/target dependencies retain their
 //! relative layout. No descriptor, cache authority, or compiler result is minted.
 
+mod registry;
 mod vendor;
 
 use super::super::{SourceUpload, invalid, require};
 use rabs_asupersync::process_groups::{GroupSignal, ManagedProcessGroup};
 use rabs_asupersync::region_tree::Attribution;
-use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
-use rabs_sandbox::source_transfer::MAX_SOURCE_FILES;
-use serde_json::Value;
+use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot, capture_sealed_source};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, MAX_SOURCE_FILES};
+use registry::RegistryCache;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -31,6 +33,7 @@ const MAX_PACKAGES: usize = 1024;
 pub(super) struct CargoSource {
     manifest: String,
     vendor: Option<String>,
+    cargo_home_source: Option<PathBuf>,
 }
 
 impl CargoSource {
@@ -38,11 +41,11 @@ impl CargoSource {
         require(
             value.as_object().is_some_and(|fields| {
                 fields.contains_key("manifest")
-                    && fields
-                        .keys()
-                        .all(|key| matches!(key.as_str(), "manifest" | "vendor"))
+                    && fields.keys().all(|key| {
+                        matches!(key.as_str(), "manifest" | "vendor" | "cargo_home_source")
+                    })
             }),
-            "cargo_source requires manifest and optional vendor",
+            "cargo_source requires manifest and optional vendor or cargo_home_source",
         )?;
         let manifest = value["manifest"]
             .as_str()
@@ -69,14 +72,41 @@ impl CargoSource {
                 Ok::<_, io::Error>(directory.to_owned())
             })
             .transpose()?;
+        let cargo_home_source = value
+            .get("cargo_home_source")
+            .map(registry::approved_home)
+            .transpose()?;
+        require(
+            vendor.is_none() || cargo_home_source.is_none(),
+            "cargo_source vendor and cargo_home_source are mutually exclusive",
+        )?;
         Ok(Self {
             manifest: manifest.to_owned(),
             vendor,
+            cargo_home_source,
         })
     }
 
     pub(super) fn manifest(&self) -> &str {
         &self.manifest
+    }
+
+    pub(super) fn cargo_home_projection(&self) -> Option<Value> {
+        self.cargo_home_source.as_ref().map(|_| {
+            json!({"version":rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION,
+                "prefix":registry::CACHE_PREFIX})
+        })
+    }
+
+    pub(super) fn validate_cache_boundary(&self, source: &Path) -> io::Result<()> {
+        if let Some(home) = &self.cargo_home_source {
+            let source = fs::canonicalize(source)?;
+            require(
+                !source.starts_with(home) && !home.starts_with(&source),
+                "cargo_home_source must be separate from the approved source anchor",
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn prepare(&self, image: Arc<SealedSourceSnapshot>) -> io::Result<SourceUpload> {
@@ -85,7 +115,12 @@ impl CargoSource {
             .as_deref()
             .map(|directory| VendoredSources::verify(&image, &self.manifest, directory))
             .transpose()?;
-        let files = validate_capture(&image, &self.manifest, vendor.as_ref())?;
+        let files = validate_capture(
+            &image,
+            &self.manifest,
+            vendor.as_ref(),
+            self.cargo_home_source.is_some(),
+        )?;
         // Planning starts only after a complete paired capture. Cargo never sees
         // a mutable original checkout or a mixture of pre/post-mutation files.
         let planning = tempfile::Builder::new()
@@ -117,14 +152,36 @@ impl CargoSource {
         fs::create_dir(&home)?;
         let cargo_home = planning_root.join("cargo-home");
         fs::create_dir(&cargo_home)?;
-        let mut command = Command::new(cargo);
-        command
-            .env_clear()
-            .current_dir(
-                root.join(&self.manifest)
+        let registry = self
+            .cargo_home_source
+            .as_ref()
+            .map(|approved| {
+                let mut locate =
+                    planning_command(&cargo, &rustc, &root, &self.manifest, &planning_root)?;
+                locate
+                    .args(["locate-project", "--workspace", "--message-format=json"])
+                    .arg("--manifest-path")
+                    .arg(root.join(&self.manifest));
+                let located: Value = serde_json::from_slice(&bounded_command(
+                    locate,
+                    &planning_root,
+                    METADATA_TIMEOUT,
+                    OUTPUT_LIMIT,
+                )?)
+                .map_err(|_| invalid("invalid Cargo workspace location"))?;
+                let workspace_manifest = captured_metadata_path(&image, &root, &located["root"])?;
+                let lock = workspace_manifest
                     .parent()
-                    .ok_or_else(|| invalid("Cargo manifest parent"))?,
-            )
+                    .ok_or_else(|| invalid("Cargo workspace manifest parent"))?
+                    .join("Cargo.lock")
+                    .strip_prefix(&root)
+                    .map_err(|_| invalid("Cargo workspace lock escapes captured source"))?
+                    .to_path_buf();
+                RegistryCache::capture(&image, &lock, approved, &cargo_home)
+            })
+            .transpose()?;
+        let mut command = planning_command(&cargo, &rustc, &root, &self.manifest, &planning_root)?;
+        command
             .args([
                 "metadata",
                 "--format-version=1",
@@ -133,35 +190,100 @@ impl CargoSource {
                 "--all-features",
             ])
             .arg("--manifest-path")
-            .arg(root.join(&self.manifest))
-            .env("HOME", home)
-            .env("CARGO_HOME", cargo_home)
-            .env("RUSTC", rustc)
-            .env("CARGO_TARGET_DIR", planning_root.join("target"));
-        for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
+            .arg(root.join(&self.manifest));
         let output = bounded_command(command, &planning_root, METADATA_TIMEOUT, OUTPUT_LIMIT)?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|error| invalid(&format!("invalid Cargo metadata JSON: {error}")))?;
-        validate_metadata(&image, &root, &self.manifest, &metadata, vendor.as_ref())?;
+        validate_metadata(
+            &image,
+            &root,
+            &self.manifest,
+            &metadata,
+            vendor.as_ref(),
+            registry
+                .as_ref()
+                .map(|registry| (registry, cargo_home.as_path())),
+        )?;
         verify_planning_bytes(&image, &root, &files)?;
-        SourceUpload::from_snapshot(image, "workspace", &files)
+        if let Some(registry) = registry {
+            let mut selected = files;
+            selected.extend(
+                registry
+                    .materialize(&root.join(registry::CACHE_PREFIX))?
+                    .into_iter()
+                    .map(|path| format!("{}/{path}", registry::CACHE_PREFIX)),
+            );
+            // Planning and byte comparison are complete; the private copy now
+            // owns the derived inputs. Release the original retained maps before
+            // paired recapture so a full cache does not require a third copy in
+            // memory merely to construct the final transfer image.
+            drop(registry);
+            drop(image);
+            let derived = Arc::new(
+                capture_sealed_source(
+                    &[("workspace".to_owned(), root)],
+                    false,
+                    2,
+                    MAX_SOURCE_BYTES,
+                )
+                .map_err(|error| {
+                    invalid(&format!("retained Cargo cache capture refused: {error:?}"))
+                })?,
+            );
+            // This new image is derived solely from the retained source and
+            // checksum-bound cache bytes. It is input delivery, not a resealed
+            // authoritative action descriptor or a cache-publication claim.
+            SourceUpload::from_snapshot(derived, "workspace", &selected)
+        } else {
+            SourceUpload::from_snapshot(image, "workspace", &files)
+        }
     }
+}
+
+fn planning_command(
+    cargo: &Path,
+    rustc: &Path,
+    root: &Path,
+    manifest: &str,
+    planning: &Path,
+) -> io::Result<Command> {
+    let mut command = Command::new(cargo);
+    command
+        .env_clear()
+        .current_dir(
+            root.join(manifest)
+                .parent()
+                .ok_or_else(|| invalid("Cargo manifest parent"))?,
+        )
+        .env("HOME", planning.join("home"))
+        .env("CARGO_HOME", planning.join("cargo-home"))
+        .env("RUSTC", rustc)
+        .env("CARGO_TARGET_DIR", planning.join("target"));
+    for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    Ok(command)
 }
 
 fn validate_capture(
     image: &SealedSourceSnapshot,
     manifest: &str,
     vendor: Option<&VendoredSources>,
+    cached_registry: bool,
 ) -> io::Result<Vec<String>> {
     let captured = image
         .manifest("workspace")
         .ok_or_else(|| invalid("missing captured Cargo anchor"))?;
     let mut files = Vec::new();
     for (path, kind) in &captured.members {
+        require(
+            !cached_registry
+                || (path != registry::CACHE_PREFIX
+                    && !path.starts_with(&format!("{}/", registry::CACHE_PREFIX))),
+            "approved source collides with the reserved rabs-cargo-home directory",
+        )?;
         require(
             !matches!(kind, MemberKind::Symlink { .. }),
             "automatic Cargo source preparation does not support symlinks",
@@ -220,6 +342,8 @@ fn validate_capture(
                 })?;
                 if let Some(vendor) = vendor {
                     vendor.validate_lock_sources(&lock)?;
+                } else if cached_registry {
+                    registry::validate_lock_sources(&lock)?;
                 } else if let Some(packages) = lock.get("package").and_then(toml::Value::as_array) {
                     require(
                         packages
@@ -651,6 +775,7 @@ fn validate_metadata(
     manifest: &str,
     value: &Value,
     vendor: Option<&VendoredSources>,
+    registry: Option<(&RegistryCache, &Path)>,
 ) -> io::Result<()> {
     require(value["version"] == 1, "unsupported Cargo metadata format")?;
     let workspace = Path::new(
@@ -676,6 +801,9 @@ fn validate_metadata(
     let locked = vendor
         .map(|vendor| vendor.bind_lock(image, &lock))
         .transpose()?;
+    if let Some((registry, _)) = registry {
+        registry.check_lock(&lock)?;
+    }
     let packages = value["packages"]
         .as_array()
         .filter(|packages| !packages.is_empty() && packages.len() <= MAX_PACKAGES)
@@ -685,6 +813,8 @@ fn validate_metadata(
     for package in packages {
         if let (Some(vendor), Some(locked)) = (vendor, locked.as_ref()) {
             vendor.check_package(root, package, locked)?;
+        } else if let Some((registry, home)) = registry {
+            registry.check_package(home, package)?;
         } else {
             require(
                 package.get("source").is_some_and(Value::is_null),
@@ -695,14 +825,21 @@ fn validate_metadata(
             .as_str()
             .ok_or_else(|| invalid("Cargo package identity missing"))?;
         require(ids.insert(id), "duplicate Cargo package identity")?;
-        let path = captured_metadata_path(image, root, &package["manifest_path"])?;
-        selected |= path == root.join(manifest);
+        let external = package
+            .get("source")
+            .is_some_and(|source| !source.is_null());
+        if registry.is_none() || !external {
+            let path = captured_metadata_path(image, root, &package["manifest_path"])?;
+            selected |= path == root.join(manifest);
+        }
         let targets = package["targets"]
             .as_array()
             .filter(|targets| !targets.is_empty())
             .ok_or_else(|| invalid("Cargo package has no target graph"))?;
-        for target in targets {
-            captured_metadata_path(image, root, &target["src_path"])?;
+        if registry.is_none() || !external {
+            for target in targets {
+                captured_metadata_path(image, root, &target["src_path"])?;
+            }
         }
     }
     // A virtual workspace manifest is not itself a package but is an exact
@@ -847,7 +984,7 @@ mod tests {
             1024,
         )
         .unwrap();
-        let files = validate_capture(&image, "Cargo.toml", None).unwrap();
+        let files = validate_capture(&image, "Cargo.toml", None, false).unwrap();
         let copy = tempfile::tempdir().unwrap();
         image.materialize_into(&copy.path().join("image")).unwrap();
         let root = copy.path().join("image/workspace");

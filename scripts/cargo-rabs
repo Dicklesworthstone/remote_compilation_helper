@@ -69,6 +69,8 @@ explicit upload boundary, profile and worker connection setup. This Linux-only
 profile uses a captured toolchain, fixed worker environment and new output tree;
 it is not transparent local-path replay, per-action scheduling or cache serving.
 Only named binary builds and the documented argument subset are accepted.
+Profiles may select an existing vendor tree or an explicit cargo_home_source
+for checksum-verified, locked crates.io dependencies from the offline cache.
 Cargo metadata may run locally; builds never do. No local/RCH fallback or
 automatic execution retry occurs. stdout is the native worker-build report,
 not Cargo JSON; full compiler diagnostics remain in the verified delivery.
@@ -1083,9 +1085,16 @@ def canonical_profile(path):
     profile = decode_object(data)
     required = {"version", "listen", "worker", "worker_spki_sha256",
                 "source_root", "toolchain_root", "operation_root"}
-    if (not required <= profile.keys() or profile.keys() - required - {"manifest", "vendor"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant"}
+    if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-cargo-v1"):
         raise SetupError("invalid canonical-cargo-v1 profile fields")
+    if "vendor" in profile and "cargo_home_source" in profile:
+        raise SetupError("canonical profile must select either vendor or cargo_home_source")
+    if "jobserver_grant" in profile:
+        grant = profile["jobserver_grant"]
+        if type(grant) is not int or not 1 <= grant <= 4096:
+            raise SetupError("canonical jobserver_grant must be an integer from 1 to 4096")
     import ipaddress
     import re
     address = profile["listen"]
@@ -1105,7 +1114,10 @@ def canonical_profile(path):
             or not isinstance(profile["worker_spki_sha256"], str)
             or re.fullmatch(r"[0-9a-f]{64}", profile["worker_spki_sha256"]) is None):
         raise SetupError("canonical worker identity and lowercase SHA-256 pin are required")
-    for field in ("source_root", "toolchain_root", "operation_root"):
+    roots = ("source_root", "toolchain_root", "operation_root")
+    if "cargo_home_source" in profile:
+        roots += ("cargo_home_source",)
+    for field in roots:
         path = Path(canonical_path(profile[field], absolute=True))
         # Do not normalize away an unsafe ancestor or follow a profile alias.
         for parent in reversed((path,) + tuple(path.parents)):
@@ -1119,6 +1131,12 @@ def canonical_profile(path):
         source = Path(profile[field])
         if operation == source or operation in source.parents or source in operation.parents:
             raise SetupError("canonical operation root must be disjoint from inputs")
+    if "cargo_home_source" in profile:
+        cargo_home = Path(profile["cargo_home_source"])
+        for field in ("source_root", "toolchain_root", "operation_root"):
+            other = Path(profile[field])
+            if cargo_home == other or cargo_home in other.parents or other in cargo_home.parents:
+                raise SetupError("canonical cargo_home_source must be disjoint from other roots")
     profile["manifest"] = canonical_path(profile.get("manifest", "Cargo.toml"))
     if Path(profile["manifest"]).name != "Cargo.toml":
         raise SetupError("canonical manifest must name Cargo.toml")
@@ -1225,6 +1243,10 @@ def canonical_invocation(profile_path, args, env):
     }
     if "vendor" in profile:
         specification["cargo_source"]["vendor"] = profile["vendor"]
+    if "cargo_home_source" in profile:
+        specification["cargo_source"]["cargo_home_source"] = profile["cargo_home_source"]
+    if "jobserver_grant" in profile:
+        specification["jobserver_grant"] = profile["jobserver_grant"]
     encoded_specification = json.dumps(specification, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     if len(encoded_specification) > MAX_FRAME:
         raise SetupError("canonical Cargo specification exceeds its frontend bound")
