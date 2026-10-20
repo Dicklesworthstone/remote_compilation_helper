@@ -4507,7 +4507,7 @@ pub async fn run_exec(
         let release_exit_code = result
             .as_ref()
             .map(|ok| ok.exit_code)
-            .unwrap_or_else(|error| remote_failure_exit_code(error));
+            .unwrap_or_else(remote_failure_exit_code);
         let release_timing = result.as_ref().ok().map(|ok| {
             let mut timing = ok.timing.clone();
             timing.total = Some(remote_elapsed);
@@ -5883,7 +5883,7 @@ async fn handle_selection_response(
     let release_exit_code = result
         .as_ref()
         .map(|ok| ok.exit_code)
-        .unwrap_or_else(|error| remote_failure_exit_code(error));
+        .unwrap_or_else(remote_failure_exit_code);
     // Add total elapsed time to the timing breakdown
     let release_timing = result.as_ref().ok().map(|ok| {
         let mut timing = ok.timing.clone();
