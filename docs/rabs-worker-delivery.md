@@ -74,6 +74,39 @@ remote execution. Keep the worker's reconnect loop running without `--once`;
 there is no idle worker queue in this first single-peer lane. Preserve its
 durable state across reconnects and restarts.
 
+For a systemd worker, the fleet deployment script can install those same
+identity and journal settings alongside the worker's TLS credentials:
+
+```sh
+RABS_WORKER_TLS_CA=/local/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/local/credentials/worker.pem \
+RABS_WORKER_TLS_KEY=/local/credentials/worker.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_ID=leaf-worker \
+RABS_WORKER_STATE_DIR=/var/lib/rabs/leaf-worker \
+  ./scripts/rabs_fleet_deploy.sh worker-ssh-alias \
+    coordinator.example.internal:7092 ./target/daemon-release/rabs-wkr
+```
+
+The three PEM paths are **local**; the state directory is on the **remote**
+worker. The worker ID must match `RABS_DEPENDENCY_WORKER_ID` above. After
+activation, the script prints the public certificate SPKI SHA-256 to use for
+`RABS_DEPENDENCY_WORKER_SPKI_SHA256`. Successful service startup does not prove
+that the coordinator has accepted a worker session.
+
+`RABS_WORKER_ID` and `RABS_WORKER_STATE_DIR` are optional. On a fresh install,
+omitting them preserves the worker's short-hostname identity and default
+durable state layout. During an upgrade, omitted values are copied from the
+active managed service while holding the deployment lock. Supplied values
+replace only their respective settings. IDs use 1–128 ASCII letters, digits,
+dots, underscores or hyphens and start with a letter or digit. The state path
+must be absolute, printable ASCII and at most 4096 characters; spaces and
+shell punctuation are transferred literally. Keep an existing worker's state
+path and identity stable. Changing its journal directory to retry a build
+abandons the history that prevents a completed or uncertain request from
+executing twice. Missing prior settings refuse an upgrade before replacing
+the binary or restarting the service.
+
 In another coordinator-side terminal, run ordinary Cargo through the live
 wrapper. Repeat the same worker selection here so launcher readiness verifies
 that the attached daemon has the requested remote capability:

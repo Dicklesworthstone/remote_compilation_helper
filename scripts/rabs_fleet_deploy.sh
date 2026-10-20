@@ -12,14 +12,19 @@
 #   RABS_WORKER_TLS_CERT=/local/worker.pem \
 #   RABS_WORKER_TLS_KEY=/local/worker.key \
 #   RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+#   RABS_WORKER_ID=leaf-worker \
+#   RABS_WORKER_STATE_DIR=/var/lib/rabs/leaf-worker \
 #   rabs_fleet_deploy.sh <worker-ssh-host> <coordinator-host:port> \
 #       [path-to-release-rabs-wkr]
 #
 # TLS paths above are LOCAL files. All four settings are required, including
 # for loopback. The CA authenticates the coordinator; the worker certificate
 # may be issued by a different CA. This script never creates or learns trust.
-# Credential generations are private and retained across deployment attempts;
-# activation never changes the durable worker identity or journal directory.
+# RABS_WORKER_ID and RABS_WORKER_STATE_DIR are optional service settings. Omit
+# them to retain the previous managed settings, or the worker's hostname/state
+# defaults on a fresh install. The state path is on the REMOTE worker. Never
+# change it to retry an uncertain execution: that would abandon its journal.
+# Credential generations are private and retained across deployment attempts.
 # Re-running replaces the binary + unit and explicitly restarts the service.
 # A successful deployment verifies service startup, not coordinator admission.
 set +x # Do not expose private PEM bytes if invoked with bash -x.
@@ -29,6 +34,7 @@ set -euo pipefail
 usage() {
   echo 'Usage: rabs_fleet_deploy.sh <worker-ssh-host> <coordinator-host:port> [local-rabs-wkr]' >&2
   echo 'Required: RABS_WORKER_TLS_CA/CERT/KEY (local PEM files), RABS_WORKER_TLS_SERVER_NAME' >&2
+  echo 'Optional: RABS_WORKER_ID, RABS_WORKER_STATE_DIR (absolute remote journal directory)' >&2
   exit 2
 }
 
@@ -96,6 +102,22 @@ fi
 TLS_SERVER_NAME=${RABS_WORKER_TLS_SERVER_NAME:-}
 dns_name "$TLS_SERVER_NAME" || ipv6_address "$TLS_SERVER_NAME" ||
   input_error 'RABS_WORKER_TLS_SERVER_NAME must be a DNS name or literal IP address'
+WORKER_ID_SET=0
+WORKER_STATE_SET=0
+if [[ ${RABS_WORKER_ID+x} == x ]]; then
+  [[ ${#RABS_WORKER_ID} -le 128 && $RABS_WORKER_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    input_error 'RABS_WORKER_ID must be 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit'
+  WORKER_ID_SET=1
+fi
+if [[ ${RABS_WORKER_STATE_DIR+x} == x ]]; then
+  # Bound the systemd EnvironmentFile value and refuse control/non-ASCII bytes
+  # before any SSH operation. Quotes and shell punctuation are encoded below,
+  # never interpolated into the remote command or expanded as a local path.
+  [[ $RABS_WORKER_STATE_DIR == /* && $RABS_WORKER_STATE_DIR != / && ${#RABS_WORKER_STATE_DIR} -le 4096 ]] &&
+    (export LC_ALL=C; [[ $RABS_WORKER_STATE_DIR =~ ^[[:print:]]+$ ]]) ||
+    input_error 'RABS_WORKER_STATE_DIR must be an absolute printable ASCII remote directory, up to 4096 characters'
+  WORKER_STATE_SET=1
+fi
 [[ -f $LOCAL_BIN && -x $LOCAL_BIN ]] || input_error "no executable release binary at $LOCAL_BIN"
 command -v openssl >/dev/null 2>&1 || input_error 'openssl is required to validate TLS credentials'
 
@@ -177,6 +199,8 @@ CERT_KEY_ID=$(openssl x509 -pubkey -noout < <(printf '%s' "$TLS_CERT_PEM") 2>/de
 PRIVATE_KEY_ID=$(openssl pkey -passin pass: -pubout -outform DER < <(printf '%s' "$TLS_KEY_PEM") 2>/dev/null |
   openssl dgst -sha256) || input_error 'cannot extract worker private key public identity'
 [[ $CERT_KEY_ID == "$PRIVATE_KEY_ID" ]] || input_error 'worker certificate and private key do not match'
+WORKER_SPKI_SHA256=${CERT_KEY_ID##* }
+[[ $WORKER_SPKI_SHA256 =~ ^[0-9a-f]{64}$ ]] || input_error 'cannot parse worker certificate SPKI SHA-256'
 
 emit() { printf '{"kind":"fleet-deploy","worker":"%s","step":"%s","status":"%s"}\n' "$WORKER" "$1" "$2"; }
 failed() { emit "$1" failed; printf 'rabs_fleet_deploy: %s\n' "$2" >&2; exit 1; }
@@ -238,14 +262,36 @@ upload_pem() {
 upload_pem ca.pem "$TLS_CA_PEM"
 upload_pem worker.pem "$TLS_CERT_PEM"
 upload_pem worker.key "$TLS_KEY_PEM"
-ssh "${SSH_OPTS[@]}" "root@$WORKER" \
-  "set -eu; umask 077; set -C; cat > '$STAGE/worker.env'; chmod 0600 '$STAGE/worker.env'" <<ENV ||
-  failed tls 'worker TLS environment transfer failed'
+
+# EnvironmentFile double quotes use POSIX double-quoted backslash rules;
+# escape every special character so the worker receives the exact path.
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=
+environment_setting() {
+  local value=$2
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//\$/\\\$}
+  value=${value//\`/\\\`}
+  printf '%s="%s"\n' "$1" "$value"
+}
+
+worker_environment() {
+  cat <<ENV
 RABS_WORKER_TLS_CA=$STAGE/ca.pem
 RABS_WORKER_TLS_CERT=$STAGE/worker.pem
 RABS_WORKER_TLS_KEY=$STAGE/worker.key
 RABS_WORKER_TLS_SERVER_NAME=$TLS_SERVER_NAME
 ENV
+  if [[ $WORKER_ID_SET == 1 ]]; then
+    environment_setting RABS_WORKER_ID "$RABS_WORKER_ID"
+  fi
+  if [[ $WORKER_STATE_SET == 1 ]]; then
+    environment_setting RABS_WORKER_STATE_DIR "$RABS_WORKER_STATE_DIR"
+  fi
+}
+worker_environment | ssh "${SSH_OPTS[@]}" "root@$WORKER" \
+  "set -eu; umask 077; set -C; cat > '$STAGE/worker.env'; chmod 0600 '$STAGE/worker.env'" ||
+  failed tls 'worker environment transfer failed'
 emit tls done
 
 # The staged executable shares the final binary's filesystem for atomic rename.
@@ -292,6 +338,38 @@ ssh "${SSH_OPTS[@]}" "root@$WORKER" "
   set -eu
   exec 9>/etc/rabs-wkr/deploy.lock
   flock -x 9
+  # Carry forward omitted runtime settings from the currently active managed
+  # unit while holding the activation lock. A credential-only redeploy must
+  # not select a fresh journal by silently restoring hostname/path defaults.
+  # Copy assignments as data; never source an environment file as shell code.
+  previous_environment=''
+  if [ -f /etc/systemd/system/rabs-wkr.service ]; then
+    while IFS= read -r line || [ -n \"\$line\" ]; do
+      case \"\$line\" in
+        EnvironmentFile=*)
+          test -z \"\$previous_environment\"
+          previous_environment=\${line#EnvironmentFile=}
+          ;;
+      esac
+    done < /etc/systemd/system/rabs-wkr.service
+  fi
+  if [ -n \"\$previous_environment\" ]; then
+    case \"\$previous_environment\" in
+      /etc/rabs-wkr/deploy.??????????/worker.env) ;;
+      *) echo 'existing worker service uses an unmanaged environment file' >&2; exit 1 ;;
+    esac
+    test -f \"\$previous_environment\"
+    while IFS= read -r line || [ -n \"\$line\" ]; do
+      case \"\$line\" in
+        RABS_WORKER_ID=*)
+          if [ '$WORKER_ID_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
+          ;;
+        RABS_WORKER_STATE_DIR=*)
+          if [ '$WORKER_STATE_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
+          ;;
+      esac
+    done < \"\$previous_environment\"
+  fi
   mv -f '$REMOTE_BIN_STAGE' '$REMOTE_BIN'
   install -m 0644 -o root -g root '$STAGE/rabs-wkr.service' /etc/systemd/system/rabs-wkr.service.new
   mv -f /etc/systemd/system/rabs-wkr.service.new /etc/systemd/system/rabs-wkr.service
@@ -303,3 +381,9 @@ ssh "${SSH_OPTS[@]}" "root@$WORKER" "
 emit unit done
 printf 'Installed %s on %s and restarted rabs-wkr.service for %s. Coordinator authentication was not checked.\n' \
   "$VER" "$WORKER" "$COORDINATOR" >&2
+if [[ $WORKER_ID_SET == 1 ]]; then
+  printf 'Coordinator enrollment: RABS_DEPENDENCY_WORKER_ID=%s\n' "$RABS_WORKER_ID" >&2
+else
+  printf 'Coordinator worker ID: retained from the managed service, otherwise the remote short hostname.\n' >&2
+fi
+printf 'Coordinator enrollment: RABS_DEPENDENCY_WORKER_SPKI_SHA256=%s\n' "$WORKER_SPKI_SHA256" >&2
