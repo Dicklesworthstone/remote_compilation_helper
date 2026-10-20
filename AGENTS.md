@@ -1010,7 +1010,7 @@ git push                # Push to remote
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
+2. **Run quality gates** (if code changed or after any git merge/rebase) - Tests, linters, and a workspace-wide `cargo check --workspace --all-targets` (`bd-44q54`; per-crate checks do not catch cross-crate or duplicate-symbol merge collisions)
 3. **Update issue status** - Close finished work, update in-progress items
 4. **Sync beads** - `br sync --flush-only` to export to JSONL
 5. **Hand off** - Provide context for next session
