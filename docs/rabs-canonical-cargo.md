@@ -8,17 +8,19 @@ tests on the selected worker and returns Cargo's final exit status:
 
 1. The launcher validates explicit source, toolchain, worker and destination
    intent and creates a new private operation directory.
-2. It execs the installed
-   `rabsd --worker-build-tls --replay-diagnostics --prepare-from ...` once.
+2. It execs the installed native driver once: normally
+   `rabsd --worker-build-tls --replay-diagnostics --prepare-from ...`, or
+   `rabsd --job-build --prepare-from ...` when `daemon_socket` is selected.
 3. The native driver captures the source graph, approved vendor tree or locked
    dependency cache, and complete toolchain. `request.json` is made durable only
-   after the captured input bundle is ready.
+   after the captured input bundle is ready. Daemon jobs retain allocation
+   intent until the queue selects their execution owner.
 4. The existing mutual-TLS worker exchange transfers the captured inputs and runs
    Cargo itself inside the worker's canonical namespace. Cargo's JSON reports
    identify its actual outputs; both peers verify those files against the complete
    captured output tree. Successful results install into a new private directory.
 5. After complete verified delivery, the native driver replays the exact retained
-   Cargo/test stdout and stderr. Its final result report is written to stderr.
+   Cargo/test stdout and stderr. Native operation reports are written to stderr.
    A failing test keeps its nonzero status and diagnostics; it does not install a
    successful artifact result or retry locally.
 
@@ -74,8 +76,10 @@ and mode 0700. Existing directories are not silently chmodded. Use this profile:
 `listen` is the **coordinator's local bind address**, not a worker address. Use
 an actual local IP and a nonzero port. The separately configured, authenticated
 worker must connect/reconnect to that address using its existing `--coordinator`
-mode. Concurrent operations need distinct listen endpoints (or the existing
-prepared-job service); this frontend does not allocate ports or start workers.
+mode. Direct operations need distinct listen endpoints when they run concurrently.
+The daemon mode below uses the existing prepared-job service to serialize jobs
+for the same worker and endpoint. This frontend does not allocate ports or start
+workers.
 
 The existing native TLS adapter uses `RABS_COORD_TLS_CA`, `RABS_COORD_TLS_CERT`
 and `RABS_COORD_TLS_KEY`. Configure the worker's matching trust separately.
@@ -94,6 +98,87 @@ validates its source-replacement config, lockfile and checksum-covered package
 closure. Unsupported configuration, escaping local dependencies and symlink
 sources refuse preparation; there is no fallback that uploads a larger guessed
 set.
+
+### Submit canonical builds to the running daemon
+
+Add an explicit local socket to the same profile to use durable background job
+ownership:
+
+```json
+"daemon_socket": "/home/builder/.cache/rch/rabsd.sock"
+```
+
+The socket must already exist, be private to the current user, and have ordinary
+directory ancestors. Its immediate parent must be owned by that user and not
+writable by others. Keep the endpoint outside the captured inputs. The launcher
+attaches to this daemon; it does not start or reconfigure it. Configure the
+daemon's own `RABS_STATE_DIR` and `RABS_COORD_TLS_CA`, `RABS_COORD_TLS_CERT`, and
+`RABS_COORD_TLS_KEY` before starting it. The background daemon owns the worker's
+TLS exchange and durable admission state.
+
+The native client captures the approved workspace, dependencies and toolchain
+once, submits that retained bundle under a new job ID, then waits for verified
+delivery. Worker request IDs are allocated when the daemon claims a queued job,
+while holding the selected worker's admission through dispatch. This prevents
+concurrent callers from allocating IDs in one order and reaching the worker in
+another. The queued template keeps explicit `request_id: "allocate"`; only the
+durably bound daemon record carries the actual numeric execution identity.
+No source recapture or new ID allocation occurs during result recovery.
+
+The command returns Cargo's actual exit code and replays the complete verified
+stdout and stderr. A lost client connection or an interrupted waiting client
+leaves the same durable job available for inspection. It does not submit another
+build or cancel the background job. `operation.json` in the printed operation
+directory records `job_id`, `daemon_socket`, and the submit/status/wait/cancel commands.
+For example, using that exact job ID:
+
+```sh
+RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-status JOB_ID
+RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-wait JOB_ID
+RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-cancel JOB_ID
+```
+
+The ordinary recovery frontend also recognizes a saved daemon operation:
+
+```sh
+cargo rabs --rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID
+```
+
+It uses the saved job ID and private daemon socket to invoke `--job-wait` once.
+The original profile, checkout, toolchain and captured bundle are not needed for
+this read-only wait/replay path. It does not resubmit the job. Direct-worker
+options such as `--resume-to`, `--delivery`, and `--prefix-from` do not apply to
+daemon-owned jobs. When an uncertain job needs explicit result-only recovery,
+use `rabsd --job-resume JOB_ID NEW_DELIVERY [PREFIX]` with the same
+`RABS_SOCKET_PATH`, then wait on that original job again.
+
+Waiting again is a read-only operation and replays a verified completed result.
+If the initial submission response was lost, inspect the same job first. The
+saved `job_submit_argv` invokes `--job-submit-allocated` with that exact ID,
+placement and retained bundle. Repeating this admission is idempotent: an
+existing job returns its original status and assigned worker ID; it does not
+queue another execution. A changed bundle or destination is refused. This is
+also the recovery route when capture completed but the first admission failed.
+If a daemon or transport failure leaves execution uncertain, inspect and recover
+that same job with the existing job recovery commands. A second invocation of
+`cargo rabs` creates a new job; it is not a recovery operation. The service keeps
+its existing bounded queue, per-worker ownership, cancellation, result-only
+reconnection and local-delivery recovery behavior. This mode adds no compiler
+cache or per-unit scheduling authority.
+
+### Reuse worker-local Cargo target state
+
+A reconnecting worker can opt into bounded private target reuse with
+`--target-cache-bytes 1073741824` for a 1 GiB pool. Identical captured inputs and
+command context may seed the next execution's private target directory, allowing
+Cargo to skip compilation it considers fresh. Cargo still executes each request,
+including the requested tests. Source, build-script, environment, toolchain,
+feature, or effective job-grant changes start with a fresh target.
+
+This pool survives coordinator reconnects within one worker process; it is
+disabled by default and does not persist across worker restarts. See
+[worker-local Cargo target state](rabs-target-state.md) for ownership, limits,
+runtime assumptions, and the worker events that report actual reuse.
 
 ### Use dependencies already cached by Cargo
 

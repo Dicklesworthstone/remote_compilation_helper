@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -27,8 +28,14 @@ loader.exec_module(launcher)
 DRIVER = r'''
 import json, os, pathlib, signal, sys
 args = sys.argv[1:]
-assert args[0:3] == ["--worker-build-tls", "--replay-diagnostics", "--prepare-from"], args
-source, specification, address, worker, pin, bundle, delivery, output = args[3:]
+job_id = None
+if args[0] == "--job-build":
+    assert args[0:2] == ["--job-build", "--prepare-from"], args
+    source, specification, job_id, address, worker, pin, bundle, delivery, output = args[2:]
+    assert len(job_id) == 32 and all(c in "0123456789abcdef" for c in job_id)
+else:
+    assert args[0:3] == ["--worker-build-tls", "--replay-diagnostics", "--prepare-from"], args
+    source, specification, address, worker, pin, bundle, delivery, output = args[3:]
 request = json.loads(pathlib.Path(specification).read_text())
 operation = pathlib.Path(specification).parent
 assert not pathlib.Path(bundle).exists()
@@ -48,6 +55,7 @@ assert request["toolchain_source"] + "/bin/cargo" == os.environ["CARGO"]
 assert request["toolchain_source"] + "/bin/rustc" == os.environ["RUSTC"]
 record = {"pid":os.getpid(), "argv":sys.argv, "request":request,
           "cwd":os.getcwd(), "tls":os.environ.get("RABS_COORD_TLS_KEY"),
+          "job_id":job_id, "socket":os.environ.get("RABS_SOCKET_PATH"),
           "operation":str(operation), "input":sys.stdin.buffer.read().hex()}
 fd = os.environ.get("TEST_INHERITED_FD")
 if fd:
@@ -90,6 +98,24 @@ with open(os.environ["TEST_DRIVER_RECORD"], "a") as result:
 sys.stdout.buffer.write(b"recovered stdout\x00\xff\n")
 sys.stdout.buffer.flush()
 sys.stderr.buffer.write(b"recovered stderr\x00\xfe\n")
+sys.stderr.buffer.flush()
+if os.environ.get("TEST_SIGNAL"):
+    os.kill(os.getpid(), signal.SIGTERM)
+sys.exit(int(os.environ.get("TEST_EXIT", "0")))
+'''
+
+JOB_RECOVERY_DRIVER = r'''
+# Executable handoff double; the actual daemon owns all completion verification.
+import json, os, signal, sys
+assert len(sys.argv) == 3 and sys.argv[1] == "--job-wait", sys.argv
+assert len(sys.argv[2]) == 32 and all(c in "0123456789abcdef" for c in sys.argv[2])
+record = {"pid": os.getpid(), "argv": sys.argv, "socket": os.environ.get("RABS_SOCKET_PATH"),
+          "state": os.environ.get("RABS_STATE_DIR"), "input": sys.stdin.buffer.read().hex()}
+with open(os.environ["TEST_DRIVER_RECORD"], "a") as result:
+    result.write(json.dumps(record) + "\n")
+sys.stdout.buffer.write(b"verified job stdout\x00\xff\n")
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(b"verified job stderr\x00\xfe\n")
 sys.stderr.buffer.flush()
 if os.environ.get("TEST_SIGNAL"):
     os.kill(os.getpid(), signal.SIGTERM)
@@ -139,6 +165,17 @@ class CanonicalCargo(unittest.TestCase):
             tool = self.toolchain / "bin" / name
             tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
             tool.chmod(0o700)
+
+    def select_daemon(self):
+        endpoint = self.root / "rabsd.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(str(endpoint))
+        listener.listen()
+        endpoint.chmod(0o600)
+        self.profile["daemon_socket"] = str(endpoint)
+        self.save()
+        return endpoint
 
     def invoke(self, cargo_args=None, env=None, prefix=None, input=b""):
         args = cargo_args if cargo_args is not None else ["build", "--bin", "hello"]
@@ -313,6 +350,91 @@ class CanonicalCargo(unittest.TestCase):
         status, _, _, _ = self.invoke(env=dict(self.env, TEST_SIGNAL="1"))
         self.assertEqual(status, -signal.SIGTERM)
         self.assertEqual(len(self.records()), 1)
+
+    def test_daemon_mode_hands_capture_and_wait_to_native_client_once(self):
+        endpoint = self.select_daemon()
+        env = dict(self.env, TEST_EXIT="101", RABS_SOCKET_PATH="/wrong/ambient.sock",
+                   RABS_COORD_TLS_KEY="/local/client/key")
+        status, stdout, stderr, pid = self.invoke(["test", "--workspace"], env=env)
+        self.assertEqual(status, 101)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["socket"], str(endpoint))
+        self.assertEqual(record["argv"][1:3], ["--job-build", "--prepare-from"])
+        self.assertEqual(record["request"]["request_id"], "allocate")
+        self.assertEqual(record["request"]["artifacts"]["cargo"], "cargo-test-json-v1")
+        self.assertNotIn("daemon_socket", record["request"])
+        self.assertNotIn("job_id", record["request"])
+        self.assertNotIn(env["RABS_COORD_TLS_KEY"], json.dumps(record["request"]))
+        operation = Path(record["operation"])
+        metadata = json.loads((operation / "operation.json").read_text())
+        self.assertEqual(operation.name, "cargo-" + record["job_id"])
+        self.assertEqual(metadata["job_id"], record["job_id"])
+        self.assertEqual(metadata["daemon_socket"], str(endpoint))
+        self.assertNotIn("prepared_build_argv", metadata)
+        self.assertEqual(metadata["job_submit_argv"],
+                         [str(self.driver), "--job-submit-allocated", record["job_id"]]
+                         + record["argv"][6:])
+        for command in ("status", "wait", "cancel"):
+            self.assertEqual(metadata["job_" + command + "_argv"],
+                             [str(self.driver), "--job-" + command, record["job_id"]])
+        self.assertFalse(metadata["automatic_retry"])
+        self.assertFalse(metadata["publication_authorized"])
+        self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+        self.assertIn(b"native-driver-diagnostic", stderr)
+
+    def test_daemon_jobs_keep_distinct_ids_and_do_not_retry_failed_submission(self):
+        self.select_daemon()
+        for status in (0, 1, 2, 125):
+            self.assertEqual(self.invoke(env=dict(self.env, TEST_EXIT=str(status)))[0], status)
+        records = self.records()
+        self.assertEqual(len(records), 4)
+        self.assertEqual(len({record["job_id"] for record in records}), 4)
+        self.assertTrue(all(record["request"]["request_id"] == "allocate" for record in records))
+        self.assertTrue(all(record["argv"][1] == "--job-build" for record in records))
+
+    def test_daemon_socket_requires_explicit_private_existing_endpoint(self):
+        endpoint = self.select_daemon()
+        alias = self.root / "socket-alias"
+        alias.symlink_to(endpoint)
+        regular = self.root / "regular"
+        regular.write_text("not a socket")
+        for value in (None, True, 1, "relative.sock", str(self.root / "missing.sock"),
+                      str(regular), str(alias), "/" + "s" * 108):
+            with self.subTest(value=value):
+                self.profile_path.write_text(json.dumps(dict(self.profile, daemon_socket=value)))
+                self.assert_refused()
+        endpoint.chmod(0o666)
+        self.save()
+        self.assert_refused()
+
+    def test_daemon_socket_inside_captured_inputs_is_refused(self):
+        endpoint = self.source / "rabsd.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(str(endpoint))
+        endpoint.chmod(0o600)
+        self.profile["daemon_socket"] = str(endpoint)
+        self.save()
+        self.assert_refused()
+
+    def test_daemon_socket_parent_alias_or_shared_write_permission_refuses(self):
+        parent = self.root / "daemon"
+        parent.mkdir(mode=0o700)
+        endpoint = parent / "rabsd.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(str(endpoint))
+        endpoint.chmod(0o600)
+        alias = self.root / "daemon-alias"
+        alias.symlink_to(parent, target_is_directory=True)
+        self.profile["daemon_socket"] = str(alias / "rabsd.sock")
+        self.save()
+        self.assert_refused()
+        self.profile["daemon_socket"] = str(endpoint)
+        parent.chmod(0o777)
+        self.save()
+        self.assert_refused()
 
     def test_inherited_descriptor_survives_only_the_launcher_handoff(self):
         read, write = os.pipe()
@@ -975,6 +1097,101 @@ sys.exit(2)
         self.assertIn(b"unsupported --resume", stderr)
         self.assertEqual(len(self.records()), 1)
         self.assertFalse(new.exists())
+
+    def retained_daemon_operation(self):
+        endpoint = self.select_daemon()
+        _, command, _ = launcher.canonical_invocation(
+            str(self.profile_path), ["check"], self.env)
+        self.assertEqual(command[1:3], ["--job-build", "--prepare-from"])
+        operation = Path(command[4]).parent
+        bundle = operation / "bundle"
+        bundle.mkdir(mode=0o700)
+        (bundle / "request.json").write_text('{"request_id":"allocate","kind":"canonical-exec"}')
+        (bundle / "request.json").chmod(0o600)
+        self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_RECOVERY_DRIVER)
+        return operation, endpoint
+
+    def test_daemon_recovery_rejoins_saved_job_without_original_inputs_or_bundle(self):
+        operation, endpoint = self.retained_daemon_operation()
+        metadata_path = operation / "operation.json"
+        metadata = json.loads(metadata_path.read_bytes())
+        # A retained executable spelling is intent, never executable authority.
+        for action in ("submit", "status", "wait", "cancel"):
+            metadata["job_" + action + "_argv"][0] = str(self.toolchain / "bin/cargo")
+        metadata_path.write_text(json.dumps(metadata))
+        record_bytes = metadata_path.read_bytes()
+        template_bytes = (operation / "bundle/request.json").read_bytes()
+        self.source.rename(self.root / "retired-checkout")
+        self.toolchain.rename(self.root / "retired-toolchain")
+        self.profile_path.rename(self.root / "retired-profile")
+        (operation / "bundle").rename(self.root / "retired-bundle")
+        env = dict(self.env, TEST_EXIT="101", RABS_SOCKET_PATH="/wrong/ambient.sock",
+                   RABS_STATE_DIR=str(self.root / "retained-daemon-state"))
+        code, stdout, stderr, pid = self.recover(operation, env=env, input=b"\x00\xffinput")
+        self.assertEqual(code, 101, stderr)
+        self.assertEqual(stdout, b"verified job stdout\x00\xff\n")
+        self.assertIn(b"verified job stderr\x00\xfe\n", stderr)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["argv"], [str(self.driver), "--job-wait", metadata["job_id"]])
+        self.assertEqual(record["socket"], str(endpoint))
+        self.assertEqual(record["state"], env["RABS_STATE_DIR"])
+        self.assertEqual(record["input"], "00ff696e707574")
+        self.assertEqual(metadata_path.read_bytes(), record_bytes)
+        self.assertEqual((self.root / "retired-bundle/request.json").read_bytes(), template_bytes)
+        self.assertEqual(list(self.operations.iterdir()), [operation])
+
+    def test_daemon_recovery_cannot_select_direct_receivers_or_submit_again(self):
+        operation, _ = self.retained_daemon_operation()
+        new = operation / "new-delivery"
+        for options in (("--resume-to", str(new)), ("--delivery", str(new)),
+                        ("--resume-to", str(new), "--prefix-from", str(operation / "delivery"))):
+            with self.subTest(options=options):
+                code, stdout, stderr, _ = self.recover(operation, *options)
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout, b"")
+                self.assertIn(b"--job-resume", stderr)
+                self.assertIn(b"--job-wait", stderr)
+        self.assertFalse(self.record.exists())
+        self.assertFalse(new.exists())
+
+    def test_daemon_recovery_rejects_changed_job_contract_or_socket(self):
+        operation, endpoint = self.retained_daemon_operation()
+        path = operation / "operation.json"
+        original = json.loads(path.read_bytes())
+        for field, value in (("job_id", "00" * 16), ("job_id", None), ("request_id", 7),
+                             ("prepared_build_argv", []), ("unknown", True),
+                             ("daemon_socket", str(self.root / "missing.sock"))):
+            with self.subTest(field=field, value=value):
+                path.write_text(json.dumps(dict(original, **{field: value})))
+                self.assert_recovery_refused(operation)
+        for action, index, value in (("wait", 1, "--job-submit"),
+                                     ("status", 2, "00" * 16),
+                                     ("submit", 1, "--worker-build-tls"),
+                                     ("submit", 4, "--worker"),
+                                     ("submit", 6, str(self.source))):
+            with self.subTest(action=action, index=index):
+                changed = json.loads(json.dumps(original))
+                changed["job_" + action + "_argv"][index] = value
+                path.write_text(json.dumps(changed))
+                self.assert_recovery_refused(operation)
+        path.write_text(json.dumps(original))
+        endpoint.chmod(0o666)
+        self.assert_recovery_refused(operation)
+
+    def test_daemon_recovery_native_failure_signal_and_exec_failure_never_retry(self):
+        operation, _ = self.retained_daemon_operation()
+        for status in (0, 1, 2, 101, 130):
+            self.assertEqual(self.recover(operation, env=dict(self.env, TEST_EXIT=str(status)))[0], status)
+        self.assertEqual(len(self.records()), 5)
+        self.assertEqual(self.recover(operation, env=dict(self.env, TEST_SIGNAL="1"))[0], -signal.SIGTERM)
+        self.assertEqual(len(self.records()), 6)
+        self.assertTrue(all(record["argv"][1] == "--job-wait" for record in self.records()))
+        self.driver.write_bytes(b"not an executable image\n")
+        code, stdout, _, _ = self.recover(operation)
+        self.assertEqual(code, 127)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(len(self.records()), 6)
 
 
 if __name__ == "__main__":

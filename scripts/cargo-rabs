@@ -83,20 +83,31 @@ Cargo metadata may run locally; builds never do. No local/RCH fallback or
 automatic execution retry occurs. After complete verified delivery, the native
 driver replays Cargo/test stdout and stderr exactly and sends its result report
 to stderr. Test stdout may include arbitrary harness output after Cargo's JSON.
-The native driver durably allocates each new worker request ID under the same
+Direct mode durably allocates each new worker request ID under the same
 RABS_STATE_DIR; keep that state across builds. spec.json and operation.json
-record allocation intent, not an assigned ID. The prepared bundle/request.json
+record allocation intent, not an assigned ID. Its prepared bundle/request.json
 contains the numeric execution identity used unchanged for result recovery.
+An optional daemon_socket in the profile submits captured inputs to an already
+running daemon's durable job queue and waits for verified diagnostics/results.
+The daemon allocates and saves the worker request ID when the queued job starts;
+this mode's bundle/request.json remains an explicit allocation template. The
+retained operation.json records its job ID for status, cancellation and recovery;
+exiting the waiting client does not cancel or retry that job.
 
 Canonical recovery: cargo rabs --rabs-recover /absolute/cargo-OPERATION
-This selects native --resume with the saved worker, pin and bundle/request.json,
-never --prepare-from. A complete delivery is verified/replayed offline. An absent
-delivery may be retrieved from the original pinned worker; an incomplete existing
-delivery is not overwritten. Use --resume-to /absolute/NEW-DELIVERY for a fresh
-receiver, optionally with --prefix-from /absolute/PARTIAL-DELIVERY for independently
-verified prefix reuse. Later use --delivery /absolute/RECOVERED-DELIVERY to verify
-and replay that complete receipt without downloading again. These path options
-are recovery-only, not Cargo arguments. --delivery and --resume-to are exclusive.
+Direct operations select native --resume with the saved worker, pin and
+bundle/request.json, never --prepare-from. A complete delivery is verified/replayed
+offline. An absent delivery may be retrieved from the original pinned worker;
+an incomplete existing delivery is not overwritten. Use --resume-to
+/absolute/NEW-DELIVERY for a fresh receiver, optionally with --prefix-from
+/absolute/PARTIAL-DELIVERY for independently verified prefix reuse. Later use
+--delivery /absolute/RECOVERED-DELIVERY to verify and replay that complete receipt
+without downloading again. These path options are recovery-only, not Cargo
+arguments. --delivery and --resume-to are exclusive.
+Daemon operations instead select native --job-wait for the saved job and socket.
+This waits for or replays its verified completion without submitting another job.
+An uncertain job needs explicit native --job-resume before waiting; direct
+delivery/prefix options are refused for daemon jobs to preserve daemon ownership.
 The original profile, checkout and toolchain are not needed. Keep the original
 operation/bundle paths, installed rabsd and matching RABS_STATE_DIR/TLS settings.
 The installed driver, not the saved executable pathname, is invoked exactly once;
@@ -1129,6 +1140,21 @@ def canonical_path(value, absolute=False):
     return value
 
 
+def canonical_daemon_endpoint(value):
+    endpoint = Path(canonical_path(value, absolute=True))
+    if len(os.fsencode(endpoint)) >= 108:
+        raise SetupError("canonical daemon socket exceeds the Linux socket path bound")
+    for parent in reversed(endpoint.parents):
+        if not stat.S_ISDIR(parent.lstat().st_mode):
+            raise SetupError("canonical daemon socket requires ordinary directory ancestors")
+    parent = endpoint.parent.lstat()
+    if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o022:
+        raise SetupError("canonical daemon socket parent must be owned by this user and not writable by others")
+    if socket_identity(str(endpoint)) is None:
+        raise SetupError("canonical daemon mode requires an existing private daemon socket")
+    return endpoint
+
+
 def canonical_profile(path, required_tools=("cargo", "rustc")):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(descriptor, "rb") as source:
@@ -1143,7 +1169,7 @@ def canonical_profile(path, required_tools=("cargo", "rustc")):
     profile = decode_object(data)
     required = {"version", "listen", "worker", "worker_spki_sha256",
                 "source_root", "toolchain_root", "operation_root"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-cargo-v1"):
         raise SetupError("invalid canonical-cargo-v1 profile fields")
@@ -1195,6 +1221,11 @@ def canonical_profile(path, required_tools=("cargo", "rustc")):
             other = Path(profile[field])
             if cargo_home == other or cargo_home in other.parents or other in cargo_home.parents:
                 raise SetupError("canonical cargo_home_source must be disjoint from other roots")
+    if "daemon_socket" in profile:
+        endpoint = canonical_daemon_endpoint(profile["daemon_socket"])
+        for field in ("source_root", "toolchain_root", "cargo_home_source"):
+            if field in profile and Path(profile[field]) in endpoint.parents:
+                raise SetupError("canonical daemon socket must be outside captured inputs")
     profile["manifest"] = canonical_path(profile.get("manifest", "Cargo.toml"))
     if Path(profile["manifest"]).name != "Cargo.toml":
         raise SetupError("canonical manifest must name Cargo.toml")
@@ -1388,16 +1419,28 @@ def canonical_invocation(profile_path, args, env):
     encoded_specification = json.dumps(specification, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     if len(encoded_specification) > MAX_FRAME:
         raise SetupError("canonical Cargo specification exceeds its frontend bound")
-    operation = Path(profile["operation_root"]) / ("cargo-" + secrets.token_hex(16))
+    operation_id = secrets.token_hex(16)
+    operation = Path(profile["operation_root"]) / ("cargo-" + operation_id)
     # Exclusive, retained state. No retry into an old operation and no deletion
     # on failure. The approved source/toolchain are untouched by this launcher.
     operation.mkdir(mode=0o700)
     bundle, delivery, output = (str(operation / name) for name in ("bundle", "delivery", "outputs"))
-    native = [daemon, "--worker-build-tls", "--replay-diagnostics", profile["listen"], profile["worker"],
-              profile["worker_spki_sha256"], bundle, delivery, output]
+    placement = [profile["listen"], profile["worker"], profile["worker_spki_sha256"], bundle, delivery, output]
+    if "daemon_socket" in profile:
+        native = [daemon, "--job-build", operation_id] + placement
+    else:
+        native = [daemon, "--worker-build-tls", "--replay-diagnostics"] + placement
     metadata = {"version": "canonical-cargo-v1", "request_id": specification["request_id"],
-                "operation_directory": str(operation), "prepared_build_argv": native,
+                "operation_directory": str(operation),
                 "automatic_retry": False, "publication_authorized": False}
+    if "daemon_socket" in profile:
+        metadata.update(job_id=operation_id, daemon_socket=profile["daemon_socket"],
+                        job_submit_argv=[daemon, "--job-submit-allocated", operation_id] + placement,
+                        job_status_argv=[daemon, "--job-status", operation_id],
+                        job_wait_argv=[daemon, "--job-wait", operation_id],
+                        job_cancel_argv=[daemon, "--job-cancel", operation_id])
+    else:
+        metadata["prepared_build_argv"] = native
     for name, value in (("spec.json", specification), ("operation.json", metadata)):
         descriptor = os.open(str(operation / name), os.O_WRONLY | os.O_CREAT | os.O_EXCL
                              | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -1417,7 +1460,11 @@ def canonical_invocation(profile_path, args, env):
     # TLS credentials stay local in env, never in the uploaded command context.
     child_env["CARGO"] = str(Path(profile["toolchain_root"]) / "bin/cargo")
     child_env["RUSTC"] = str(Path(profile["toolchain_root"]) / "bin/rustc")
-    command = native[:3] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[3:]
+    if "daemon_socket" in profile:
+        child_env["RABS_SOCKET_PATH"] = profile["daemon_socket"]
+        command = native[:2] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[2:]
+    else:
+        command = native[:3] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[3:]
     print("cargo-rabs: canonical operation retained at " + str(operation), file=sys.stderr, flush=True)
     return daemon, command, child_env
 
@@ -1499,11 +1546,53 @@ def canonical_recovery_record(operation):
     return decode_object(bytes(data))
 
 
+def canonical_job_recovery_invocation(operation, record, options, env):
+    """Rejoin the same durable job without accessing its allocation template.
+
+    Only the daemon owns the bound numeric request and delivery frontier. A
+    direct --resume on this operation's saved template would bypass that owner.
+    """
+    import re
+    job_id = record["job_id"]
+    if (type(job_id) is not str or re.fullmatch(r"[0-9a-f]{32}", job_id) is None
+            or operation.name != "cargo-" + job_id or record["request_id"] != "allocate"):
+        raise SetupError("invalid canonical daemon recovery job identity")
+    if options:
+        raise SetupError("daemon jobs require native --job-resume for explicit result recovery, then --job-wait; direct delivery/prefix options cannot bypass the saved daemon job")
+    saved_driver = None
+    for action in ("wait", "status", "cancel", "submit"):
+        saved = record["job_" + action + "_argv"]
+        command = "--job-submit-allocated" if action == "submit" else "--job-" + action
+        if (type(saved) is not list or len(saved) != (9 if action == "submit" else 3)
+                or any(type(value) is not str or not value or len(value) > 4096 or "\0" in value for value in saved)
+                or saved[1:3] != [command, job_id]):
+            raise SetupError("canonical daemon recovery record changed its fixed native job contract")
+        canonical_path(saved[0], absolute=True)
+        if saved_driver is None:
+            saved_driver = saved[0]
+        elif saved[0] != saved_driver:
+            raise SetupError("canonical daemon recovery record changed its saved driver identity")
+    saved = record["job_submit_argv"]
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", saved[4]) is None:
+        raise SetupError("invalid recorded canonical worker identity")
+    dependency_worker_endpoint(saved[3:6], ("listen", "worker", "worker_spki_sha256"))
+    if saved[6:] != [str(operation / name) for name in ("bundle", "delivery", "outputs")]:
+        raise SetupError("canonical daemon recovery record changed its fixed bundle/delivery/output paths")
+    endpoint = canonical_daemon_endpoint(record["daemon_socket"])
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    if os.path.samefile(daemon, __file__):
+        raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
+    child_env = dict(env)
+    child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
+    child_env["RABS_SOCKET_PATH"] = str(endpoint)
+    return daemon, [daemon, "--job-wait", job_id], child_env
+
+
 def canonical_recovery_invocation(args, env):
     """Construct one native recovery-only handoff. Saved argv is never executed.
 
-    The native --resume/--resume-from paths own all request/receipt validation,
-    TLS, byte recovery and installation, including refusal of partial receipts.
+    The native --resume/--resume-from or --job-wait paths own request/receipt
+    validation, TLS, byte recovery and installation, including partial refusals.
     No branch here can request execution, recapture inputs or allocate an ID.
     """
     if sys.platform != "linux":
@@ -1521,14 +1610,20 @@ def canonical_recovery_invocation(args, env):
         raise SetupError("canonical recovery requires one destination; prefix reuse requires --resume-to")
     operation = canonical_recovery_directory(args[0])
     record = canonical_recovery_record(operation)
-    fields = {"version", "request_id", "operation_directory", "prepared_build_argv",
-              "automatic_retry", "publication_authorized"}
+    fields = {"version", "request_id", "operation_directory", "automatic_retry", "publication_authorized"}
+    if "job_id" in record:
+        fields |= {"job_id", "daemon_socket", "job_submit_argv", "job_status_argv",
+                   "job_wait_argv", "job_cancel_argv"}
+    else:
+        fields.add("prepared_build_argv")
     request_id = record.get("request_id")
     if (record.keys() != fields or record["version"] != "canonical-cargo-v1"
             or record["operation_directory"] != str(operation)
             or record["automatic_retry"] is not False or record["publication_authorized"] is not False
             or not (request_id == "allocate" or type(request_id) is int and 0 < request_id < 2**64)):
         raise SetupError("invalid canonical recovery record identity or authority policy")
+    if "job_id" in record:
+        return canonical_job_recovery_invocation(operation, record, options, env)
     saved = record["prepared_build_argv"]
     if (type(saved) is not list or len(saved) != 9
             or any(type(value) is not str or not value or len(value) > 4096 or "\0" in value for value in saved)
