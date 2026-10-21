@@ -158,7 +158,7 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 4;
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -818,6 +818,7 @@ struct PartialTransferConfig {
     retrieval_min_free_bytes: Option<u64>,
     compression_level: Option<u32>,
     exclude_patterns: Option<Vec<String>>,
+    exclude_defaults_acknowledged: Option<Vec<String>>,
     remote_base: Option<String>,
     sync_timeout_ms: Option<u64>,
     source_sync_silence_timeout_secs: Option<u64>,
@@ -1458,6 +1459,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "selection.weights.disk",
         "transfer.compression_level",
         "transfer.exclude_patterns",
+        "transfer.exclude_defaults_acknowledged",
         "transfer.sync_timeout_ms",
         "transfer.source_sync_silence_timeout_secs",
         "transfer.rsync_bin",
@@ -1602,6 +1604,14 @@ fn apply_layer(
     if let Some(patterns) = layer.transfer.exclude_patterns.as_ref() {
         config.transfer.exclude_patterns = patterns.clone();
         set_source(sources, "transfer.exclude_patterns", source.clone());
+    }
+    if let Some(acknowledged) = layer.transfer.exclude_defaults_acknowledged.as_ref() {
+        config.transfer.exclude_defaults_acknowledged = acknowledged.clone();
+        set_source(
+            sources,
+            "transfer.exclude_defaults_acknowledged",
+            source.clone(),
+        );
     }
     if let Some(remote_base) = layer.transfer.remote_base.as_ref() {
         // Validate and normalize the remote_base path
@@ -3780,6 +3790,47 @@ identity_file = "/tmp/id_ed25519"
             .expect("general.enabled source present");
         assert_eq!(source, &ConfigValueSource::Default);
         info!("PASS: Default source detected for general.enabled");
+    }
+
+    /// bd-rqjaj: a user layer's acknowledged omissions survive a project layer
+    /// that replaces only the exclude list, and are attributed to the user file.
+    #[test]
+    fn exclude_defaults_acknowledged_layers_independently_of_the_exclude_list() {
+        let _guard = test_guard!();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(
+            &user_path,
+            "[transfer]\nexclude_patterns = [\"target/\"]\n\
+             exclude_defaults_acknowledged = [\"*.pem\", \"*.key\"]\n",
+        )
+        .expect("write user config");
+        std::fs::write(
+            &project_path,
+            "[transfer]\nexclude_patterns = [\"target/\", \".env\"]\n",
+        )
+        .expect("write project config");
+        let env_overrides: HashMap<String, String> = HashMap::new();
+
+        let loaded = load_config_with_sources_from_paths(
+            Some(&user_path),
+            Some(&project_path),
+            Some(&env_overrides),
+        )
+        .expect("layered config loads");
+
+        let transfer = &loaded.config.transfer;
+        assert_eq!(transfer.exclude_patterns, ["target/", ".env"]);
+        assert_eq!(transfer.exclude_defaults_acknowledged, ["*.pem", "*.key"]);
+        let omitted = transfer.unacknowledged_omitted_default_excludes();
+        assert!(omitted.iter().any(|pattern| pattern == ".ntm/"));
+        assert!(!omitted.iter().any(|pattern| pattern == ".env"));
+        assert!(!omitted.iter().any(|pattern| pattern == "*.pem"));
+        assert_eq!(
+            loaded.sources.get("transfer.exclude_defaults_acknowledged"),
+            Some(&ConfigValueSource::UserConfig(user_path.clone()))
+        );
     }
 
     #[test]

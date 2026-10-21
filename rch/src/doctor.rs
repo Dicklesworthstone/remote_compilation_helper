@@ -4322,7 +4322,7 @@ fn check_configuration(
     }
 
     if let Ok(config) = crate::config::load_config() {
-        let result = transfer_exclude_defaults_result(&config.transfer.exclude_patterns);
+        let result = transfer_exclude_defaults_result(&config.transfer);
         print_check_result(&result, ctx);
         checks.push(result);
     }
@@ -4335,13 +4335,10 @@ fn check_configuration(
 /// A configured `[transfer] exclude_patterns` list replaces rch's built-in
 /// defaults, so defaults added later (agent session state in #109, secret
 /// files) never reach a host whose list predates them, and its uploads ship
-/// them to workers (bd-rqjaj). Warn with the omitted defaults by name.
-fn transfer_exclude_defaults_result(configured: &[String]) -> CheckResult {
-    let missing: Vec<String> = rch_common::TransferConfig::default()
-        .exclude_patterns
-        .into_iter()
-        .filter(|pattern| !configured.contains(pattern))
-        .collect();
+/// them to workers (bd-rqjaj). Warn with the omitted defaults by name, except
+/// those listed in `exclude_defaults_acknowledged`.
+fn transfer_exclude_defaults_result(transfer: &rch_common::TransferConfig) -> CheckResult {
+    let missing = transfer.unacknowledged_omitted_default_excludes();
     if missing.is_empty() {
         return CheckResult {
             category: "configuration".to_string(),
@@ -4367,7 +4364,8 @@ fn transfer_exclude_defaults_result(configured: &[String]) -> CheckResult {
         suggestion: Some(
             "A configured exclude_patterns list replaces rch's defaults, so these paths are \
              uploaded to workers (agent state such as .ntm/, secrets such as .env). Add the \
-             ones you do not deliberately sync, or remove the list to use the defaults."
+             ones you do not deliberately sync, remove the list to use the defaults, or list \
+             deliberate omissions in [transfer] exclude_defaults_acknowledged."
                 .to_string(),
         ),
         fixable: false,
@@ -6263,15 +6261,19 @@ mod tests {
     /// with the omitted patterns; the defaults themselves (or a superset) pass.
     #[test]
     fn transfer_exclude_defaults_check_names_omitted_defaults() {
+        let with_patterns = |patterns: Vec<String>| rch_common::TransferConfig {
+            exclude_patterns: patterns,
+            ..Default::default()
+        };
         let defaults = rch_common::TransferConfig::default().exclude_patterns;
         assert_eq!(
-            transfer_exclude_defaults_result(&defaults).status,
+            transfer_exclude_defaults_result(&with_patterns(defaults.clone())).status,
             CheckStatus::Pass
         );
         let mut superset = defaults.clone();
         superset.push("scratch/".to_string());
         assert_eq!(
-            transfer_exclude_defaults_result(&superset).status,
+            transfer_exclude_defaults_result(&with_patterns(superset)).status,
             CheckStatus::Pass
         );
 
@@ -6280,7 +6282,7 @@ mod tests {
             .iter()
             .map(|pattern| pattern.to_string())
             .collect();
-        let result = transfer_exclude_defaults_result(&stale);
+        let result = transfer_exclude_defaults_result(&with_patterns(stale));
         assert_eq!(result.status, CheckStatus::Warning);
         let details = result.details.unwrap();
         for omitted in [".ntm/", ".beads-recovery/", ".env", "credentials.json"] {
@@ -6295,6 +6297,24 @@ mod tests {
                 "{present} is configured but reported: {details}"
             );
         }
+
+        // A deliberate omission (e.g. *.pem/*.key kept syncing for TLS test
+        // fixtures) is acknowledged and stays quiet; anything else still warns.
+        let mut acknowledged = with_patterns(defaults);
+        acknowledged
+            .exclude_patterns
+            .retain(|pattern| pattern != "*.pem" && pattern != "*.key");
+        acknowledged.exclude_defaults_acknowledged = vec!["*.pem".into(), "*.key".into()];
+        assert_eq!(
+            transfer_exclude_defaults_result(&acknowledged).status,
+            CheckStatus::Pass
+        );
+        acknowledged
+            .exclude_patterns
+            .retain(|pattern| pattern != ".env");
+        let result = transfer_exclude_defaults_result(&acknowledged);
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.details.as_deref(), Some(".env"));
     }
 
     /// #69: the remedy names the daemon's real socket, shell-quoted.

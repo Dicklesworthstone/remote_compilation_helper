@@ -3018,6 +3018,12 @@ pub struct TransferConfig {
     /// Patterns to exclude from transfer.
     #[serde(default = "default_excludes")]
     pub exclude_patterns: Vec<String>,
+    /// Built-in default exclude patterns that a custom `exclude_patterns` list
+    /// omits on purpose (for example `*.pem` when TLS test fixtures must reach
+    /// workers). Only the omitted-defaults diagnostics read it; it never
+    /// changes what is transferred (bd-rqjaj).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_defaults_acknowledged: Vec<String>,
     /// SSH keepalive interval in seconds (`ssh -o ServerAliveInterval=<N>`).
     ///
     /// When unset, build transfers use 15 seconds. Zero defers to OpenSSH configuration.
@@ -3160,6 +3166,7 @@ impl Default for TransferConfig {
             retrieval_min_free_bytes: 0,
             compression_level: 3,
             exclude_patterns: default_excludes(),
+            exclude_defaults_acknowledged: Vec::new(),
             ssh_server_alive_interval_secs: None,
             ssh_control_persist_secs: None,
             remote_base: default_remote_base(),
@@ -3183,6 +3190,21 @@ impl Default for TransferConfig {
 }
 
 impl TransferConfig {
+    /// Built-in default exclude patterns that `exclude_patterns` lacks and
+    /// `exclude_defaults_acknowledged` does not list. A configured list replaces
+    /// the defaults, so without this check defaults added after the list was
+    /// written (agent state, credentials) are dropped silently (bd-rqjaj).
+    #[must_use]
+    pub fn unacknowledged_omitted_default_excludes(&self) -> Vec<String> {
+        default_excludes()
+            .into_iter()
+            .filter(|pattern| {
+                !self.exclude_patterns.contains(pattern)
+                    && !self.exclude_defaults_acknowledged.contains(pattern)
+            })
+            .collect()
+    }
+
     /// Smallest accepted explicit source-sync timeout (one second).
     pub const MIN_SYNC_TIMEOUT_MS: u64 = 1_000;
     /// Largest accepted explicit or derived source-sync timeout (one hour).

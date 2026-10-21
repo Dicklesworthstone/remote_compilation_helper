@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, transfer.exclude_defaults_acknowledged, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -389,6 +389,31 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         println!("    {},", style.value(&format!("\"{}\"", pattern)));
     }
     println!("  ]");
+    if !config.transfer.exclude_defaults_acknowledged.is_empty() {
+        println!(
+            "  {} = {}",
+            style.key("exclude_defaults_acknowledged"),
+            format_with_source(
+                "transfer.exclude_defaults_acknowledged",
+                &style.value(&format!(
+                    "{:?}",
+                    config.transfer.exclude_defaults_acknowledged
+                )),
+                &value_sources
+            )
+        );
+    }
+    let omitted = config.transfer.unacknowledged_omitted_default_excludes();
+    if !omitted.is_empty() {
+        println!(
+            "  {}",
+            style.muted(&format!(
+                "# omits built-in defaults {} (this list replaces the defaults: add them, \
+                 or list deliberate omissions in exclude_defaults_acknowledged)",
+                omitted.join(", ")
+            ))
+        );
+    }
     println!(
         "  {} = {}",
         style.key("remote_base"),
@@ -922,6 +947,12 @@ pub(super) fn collect_value_sources(
         &mut values,
         "transfer.exclude_patterns",
         format!("{:?}", config.transfer.exclude_patterns),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "transfer.exclude_defaults_acknowledged",
+        format!("{:?}", config.transfer.exclude_defaults_acknowledged),
         sources,
     );
     push_value_source(
@@ -1461,6 +1492,9 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = parse_string_list(value, key)?;
         }
+        "transfer.exclude_defaults_acknowledged" => {
+            config.transfer.exclude_defaults_acknowledged = parse_string_list(value, key)?;
+        }
         "environment.allowlist" => {
             config.environment.allowlist = parse_string_list(value, key)?;
         }
@@ -1681,6 +1715,11 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = defaults.transfer.exclude_patterns;
             format!("{:?}", config.transfer.exclude_patterns)
+        }
+        "transfer.exclude_defaults_acknowledged" => {
+            config.transfer.exclude_defaults_acknowledged =
+                defaults.transfer.exclude_defaults_acknowledged;
+            format!("{:?}", config.transfer.exclude_defaults_acknowledged)
         }
         "environment.allowlist" => {
             config.environment.allowlist = defaults.environment.allowlist;

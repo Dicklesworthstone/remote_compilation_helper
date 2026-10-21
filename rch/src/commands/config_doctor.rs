@@ -346,17 +346,7 @@ fn check_glob_patterns(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnosti
 /// added protections (bd-rqjaj). This is a literal default-presence check, not a
 /// second rsync matcher or a claim that any particular file was transferred.
 fn check_transfer_defaults(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
-    let configured: std::collections::BTreeSet<&str> = config
-        .transfer
-        .exclude_patterns
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let missing: Vec<String> = rch_common::TransferConfig::default()
-        .exclude_patterns
-        .into_iter()
-        .filter(|pattern| !configured.contains(pattern.as_str()))
-        .collect();
+    let missing = config.transfer.unacknowledged_omitted_default_excludes();
     if missing.is_empty() {
         return;
     }
@@ -376,8 +366,9 @@ fn check_transfer_defaults(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagn
         )),
         remediation: Some(
             "Review and add the missing patterns to the effective [transfer] exclude_patterns \
-             list, or remove the overriding list to inherit current defaults. Check both \
-             user and project configuration. No exclusions or worker files were changed."
+             list, or remove the overriding list to inherit current defaults; list deliberate \
+             omissions in [transfer] exclude_defaults_acknowledged. Check both user and \
+             project configuration. No exclusions or worker files were changed."
                 .to_string(),
         ),
     });
@@ -616,7 +607,13 @@ mod tests {
     fn stale_custom_exclusions_name_credential_and_agent_state_defaults() {
         let mut config = RchConfig::default();
         for pattern in [".env", ".ntm/"] {
-            assert!(config.transfer.exclude_patterns.iter().any(|p| p == pattern));
+            assert!(
+                config
+                    .transfer
+                    .exclude_patterns
+                    .iter()
+                    .any(|p| p == pattern)
+            );
         }
         config
             .transfer
@@ -654,6 +651,28 @@ mod tests {
             assert!(diagnostics[0].message.contains("1 built-in"), "{omitted}");
             assert!(diagnostics[0].detail.as_deref().unwrap().contains(omitted));
         }
+    }
+
+    #[test]
+    fn acknowledged_omissions_are_quiet_and_others_still_warn() {
+        let mut config = RchConfig::default();
+        config
+            .transfer
+            .exclude_patterns
+            .retain(|p| p != "*.pem" && p != "*.key" && p != ".env");
+        config.transfer.exclude_defaults_acknowledged = vec!["*.pem".into(), "*.key".into()];
+        let mut diagnostics = Vec::new();
+        check_transfer_defaults(&config, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("1 built-in"));
+        let detail = diagnostics[0].detail.as_deref().unwrap();
+        assert!(detail.contains("\".env\""));
+        assert!(!detail.contains("*.pem") && !detail.contains("*.key"));
+
+        config.transfer.exclude_patterns.push(".env".into());
+        diagnostics.clear();
+        check_transfer_defaults(&config, &mut diagnostics);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
