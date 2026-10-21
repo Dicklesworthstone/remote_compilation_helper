@@ -13,7 +13,7 @@ use super::{
 };
 use crate::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
 use crate::coord::secure_worker_delivery::parse_worker_pin;
-use crate::coord::worker_delivery::{MAX_DELIVERY_BYTES, MAX_FRAME_BYTES};
+use crate::coord::worker_delivery::{Delivery, MAX_DELIVERY_BYTES, MAX_FRAME_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -264,20 +264,40 @@ impl PreparedCompletion {
         self.validate()?;
         checkpoint(until)?;
         self.check_receipt()?;
-        let directory = self.delivery.join("diagnostics");
-        ordinary_directory(&directory, false)?;
-        let before = fs::symlink_metadata(&directory)?;
-        let stdout = capture(&directory.join("stdout"), &self.stdout, until)?;
-        let stderr = capture(&directory.join("stderr"), &self.stderr, until)?;
-        ordinary_directory(&directory, false)?;
-        require(
-            same_identity(&before, &fs::symlink_metadata(&directory)?),
-            "diagnostic directory changed",
-        )?;
+        let snapshot = capture_streams(&self.delivery, &self.stdout, &self.stderr, until)?;
         self.check_receipt()?;
         checkpoint(until)?;
-        Ok(DiagnosticSnapshot { stdout, stderr })
+        Ok(snapshot)
     }
+}
+
+fn capture_streams(
+    delivery: &Path,
+    stdout: &DiagnosticStream,
+    stderr: &DiagnosticStream,
+    until: Instant,
+) -> io::Result<DiagnosticSnapshot> {
+    require(
+        canonical_hash(&stdout.sha256)
+            && canonical_hash(&stderr.sha256)
+            && stdout
+                .bytes
+                .checked_add(stderr.bytes)
+                .is_some_and(|bytes| bytes <= MAX_DELIVERY_BYTES),
+        "invalid or excessive diagnostic descriptors",
+    )?;
+    let directory = delivery.join("diagnostics");
+    ordinary_directory(&directory, false)?;
+    let before = fs::symlink_metadata(&directory)?;
+    let stdout = capture(&directory.join("stdout"), stdout, until)?;
+    let stderr = capture(&directory.join("stderr"), stderr, until)?;
+    ordinary_directory(&directory, false)?;
+    require(
+        same_identity(&before, &fs::symlink_metadata(&directory)?),
+        "diagnostic directory changed",
+    )?;
+    checkpoint(until)?;
+    Ok(DiagnosticSnapshot { stdout, stderr })
 }
 
 fn same_identity(before: &Metadata, after: &Metadata) -> bool {
@@ -382,6 +402,61 @@ pub struct DiagnosticSnapshot {
     stderr: File,
 }
 impl DiagnosticSnapshot {
+    /// Snapshot the diagnostics of an already verified synchronous delivery.
+    ///
+    /// The caller must obtain `delivery` from the live receiver or full local
+    /// recovery against its exact request and transport policy. This method
+    /// adds no execution, installation or cache authority, and invents no
+    /// daemon job identity. It binds both private stream copies to that same
+    /// durable receipt before returning any bytes for console replay.
+    pub fn from_delivery(delivery: &Delivery, until: Instant) -> io::Result<Self> {
+        checkpoint(until)?;
+        let receipt = &delivery.receipt;
+        require(
+            receipt["kind"] == "verified-worker-delivery"
+                && receipt["publication_authorized"] == false
+                && receipt["reexecute"] == false
+                && receipt["exit_code"]
+                    .as_u64()
+                    .is_some_and(|code| code <= 255),
+            "diagnostic replay requires a verified terminal delivery",
+        )?;
+        let descriptor = |name: &str| -> io::Result<DiagnosticStream> {
+            Ok(DiagnosticStream {
+                bytes: receipt[format!("{name}_bytes")]
+                    .as_u64()
+                    .ok_or_else(|| invalid("missing diagnostic length"))?,
+                sha256: receipt[format!("{name}_sha256")]
+                    .as_str()
+                    .ok_or_else(|| invalid("missing diagnostic digest"))?
+                    .to_owned(),
+            })
+        };
+        let check_receipt = || -> io::Result<()> {
+            ordinary_directory(&delivery.directory, false)?;
+            let bytes = read_bounded(
+                &delivery.directory.join("delivery.json"),
+                MAX_FRAME_BYTES,
+                true,
+            )?;
+            let retained: Value = serde_json::from_slice(&bytes)?;
+            require(
+                retained == *receipt,
+                "diagnostic receipt differs from the verified delivery",
+            )
+        };
+        check_receipt()?;
+        let snapshot = capture_streams(
+            &delivery.directory,
+            &descriptor("stdout")?,
+            &descriptor("stderr")?,
+            until,
+        )?;
+        check_receipt()?;
+        checkpoint(until)?;
+        Ok(snapshot)
+    }
+
     pub fn emit(
         mut self,
         stdout: &mut impl Write,
@@ -602,6 +677,144 @@ mod tests {
     }
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(10)
+    }
+
+    fn retained_delivery(fixture: &Fixture) -> Delivery {
+        recover_existing_delivery(
+            &fixture.request,
+            "worker",
+            &fixture.spec.delivery,
+            DeliveryTrust::PinnedWorker([1; 32]),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn synchronous_delivery_replays_success_failure_and_cancellation_without_a_job_proof() {
+        for (exit, stop) in [(0, None), (101, None), (130, Some("cancelled"))] {
+            let fixture = Fixture::new();
+            fixture.complete(exit, stop);
+            let delivery = retained_delivery(&fixture);
+            let receipt = delivery.receipt.clone();
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            DiagnosticSnapshot::from_delivery(&delivery, deadline())
+                .unwrap()
+                .emit(&mut stdout, &mut stderr, deadline())
+                .unwrap();
+            assert_eq!(stdout, STDOUT);
+            assert_eq!(stderr, STDERR);
+            assert_eq!(delivery.receipt, receipt);
+            assert_eq!(delivery.receipt["exit_code"], exit);
+            assert_eq!(fixture.spec.output.exists(), exit == 0);
+        }
+    }
+
+    #[test]
+    fn synchronous_replay_binds_both_streams_and_the_exact_retained_receipt() {
+        for changed in [
+            "stdout",
+            "stderr",
+            "receipt",
+            "descriptor",
+            "excessive",
+            "deadline",
+        ] {
+            let fixture = Fixture::new();
+            fixture.complete(101, None);
+            let mut delivery = retained_delivery(&fixture);
+            match changed {
+                "stdout" | "stderr" => {
+                    let path = fixture.spec.delivery.join("diagnostics").join(changed);
+                    // Equal length catches digest failures rather than only the
+                    // simpler file-length guard.
+                    let bytes = fs::read(&path).unwrap();
+                    fs::write(path, vec![b'x'; bytes.len()]).unwrap();
+                }
+                "receipt" => {
+                    let mut receipt = delivery.receipt.clone();
+                    receipt["request_id"] = json!(8);
+                    fs::write(
+                        fixture.spec.delivery.join("delivery.json"),
+                        serde_json::to_vec(&receipt).unwrap(),
+                    )
+                    .unwrap();
+                }
+                "descriptor" => {
+                    delivery.receipt["stderr_sha256"] = json!(hash(b"different stream"));
+                }
+                "excessive" => {
+                    delivery.receipt["stdout_bytes"] = json!(u64::MAX);
+                    delivery.receipt["stderr_bytes"] = json!(1);
+                    fs::write(
+                        fixture.spec.delivery.join("delivery.json"),
+                        serde_json::to_vec(&delivery.receipt).unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            assert!(
+                DiagnosticSnapshot::from_delivery(
+                    &delivery,
+                    if changed == "deadline" {
+                        Instant::now()
+                    } else {
+                        deadline()
+                    },
+                )
+                .is_err(),
+                "changed {changed} was accepted for console replay",
+            );
+            assert!(!fixture.spec.output.exists());
+        }
+    }
+
+    #[test]
+    fn synchronous_replay_snapshots_are_private_and_console_failure_never_retries() {
+        struct BrokenConsole {
+            bytes: Vec<u8>,
+            attempts: usize,
+        }
+        impl Write for BrokenConsole {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.attempts += 1;
+                if self.bytes.is_empty() {
+                    self.bytes.extend_from_slice(&bytes[..1]);
+                    Ok(1)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed console"))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.complete(101, None);
+        let delivery = retained_delivery(&fixture);
+        let snapshot = DiagnosticSnapshot::from_delivery(&delivery, deadline()).unwrap();
+        let second_snapshot = DiagnosticSnapshot::from_delivery(&delivery, deadline()).unwrap();
+        fs::write(fixture.spec.delivery.join("diagnostics/stdout"), b"changed").unwrap();
+        fs::write(fixture.spec.delivery.join("diagnostics/stderr"), b"changed").unwrap();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        snapshot.emit(&mut stdout, &mut stderr, deadline()).unwrap();
+        assert_eq!(stdout, STDOUT);
+        assert_eq!(stderr, STDERR);
+
+        let mut broken = BrokenConsole {
+            bytes: Vec::new(),
+            attempts: 0,
+        };
+        let mut error_stream = Vec::new();
+        let error = second_snapshot
+            .emit(&mut broken, &mut error_stream, deadline())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(broken.bytes, &STDOUT[..1]);
+        assert_eq!(broken.attempts, 2);
+        assert!(error_stream.is_empty());
     }
 
     #[test]

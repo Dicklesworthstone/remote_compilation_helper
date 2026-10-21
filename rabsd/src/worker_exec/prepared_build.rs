@@ -9,11 +9,15 @@ use super::{
     run_tls_operation_inner,
 };
 use rabsd::coord::delivery_recovery::{InstalledOutputs, install_delivery_outputs};
+use rabsd::coord::prepared_operation::DiagnosticSnapshot;
 use rabsd::coord::secure_worker_delivery::parse_worker_pin;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const DIAGNOSTIC_REPLAY_BUDGET: Duration = Duration::from_secs(300);
 
 /// Reject links in every existing ancestor, and require the immediate parent of
 /// a new directory to exist. The installer still publishes exclusively against
@@ -283,18 +287,44 @@ impl PreparedBuild<'_> {
         Ok((delivery, Some(installed)))
     }
 
-    fn report(&self) -> i32 {
+    fn report(&self, replay_diagnostics: bool) -> i32 {
+        let mut diagnostics_may_have_been_exposed = false;
         let result = self.execute().and_then(|(delivery, installed)| {
             let report = self.report_value(&delivery, installed.as_ref());
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "{report}")
-                .and_then(|()| stdout.flush())
-                .map_err(|error| DeliveryFailure {
-                    directory: self.directory.to_path_buf(),
-                    execution_may_have_run: true,
-                    transport_interrupted: false,
-                    detail: format!("build completed but its status could not be written: {error}"),
-                })?;
+            let failed = |error: io::Error| DeliveryFailure {
+                directory: self.directory.to_path_buf(),
+                execution_may_have_run: true,
+                transport_interrupted: false,
+                detail: format!(
+                    "build completed but its console output could not be delivered: {error}"
+                ),
+            };
+            if replay_diagnostics {
+                let until = Instant::now() + DIAGNOSTIC_REPLAY_BUDGET;
+                // The execution/recovery path has already verified this entire
+                // delivery. Capture and hash BOTH streams again before exposing
+                // either, so corruption cannot print only half a compiler result.
+                let snapshot =
+                    DiagnosticSnapshot::from_delivery(&delivery, until).map_err(failed)?;
+                diagnostics_may_have_been_exposed = true;
+                emit_report(
+                    &report,
+                    Some(snapshot),
+                    &mut io::stdout().lock(),
+                    &mut io::stderr().lock(),
+                    until,
+                )
+                .map_err(failed)?;
+            } else {
+                emit_report(
+                    &report,
+                    None,
+                    &mut io::stdout().lock(),
+                    &mut io::stderr().lock(),
+                    Instant::now() + DIAGNOSTIC_REPLAY_BUDGET,
+                )
+                .map_err(failed)?;
+            }
             let code = delivery.receipt["exit_code"]
                 .as_i64()
                 .and_then(|code| i32::try_from(code).ok())
@@ -314,6 +344,7 @@ impl PreparedBuild<'_> {
                         "kind":"worker-build-error", "directory":error.directory,
                         "output_directory":self.output, "detail":error.detail,
                         "execution_may_have_run":error.execution_may_have_run, "reexecute":false,
+                        "diagnostics_may_have_been_exposed":diagnostics_may_have_been_exposed,
                     })
                 );
                 1
@@ -330,7 +361,31 @@ impl PreparedBuild<'_> {
     }
 }
 
+/// Keep stdout entirely in the selected contract: the native JSON report, or
+/// the exact worker stdout. Diagnostic mode moves only our status to stderr;
+/// retained compiler/test bytes are never decoded, reformatted or retried.
+fn emit_report(
+    report: &Value,
+    diagnostics: Option<DiagnosticSnapshot>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    until: Instant,
+) -> io::Result<()> {
+    if let Some(snapshot) = diagnostics {
+        snapshot.emit(stdout, stderr, until)?;
+        writeln!(stderr, "{report}")?;
+        stderr.flush()
+    } else {
+        writeln!(stdout, "{report}")?;
+        stdout.flush()
+    }
+}
+
 fn run(args: &[String], tls: bool) -> i32 {
+    let (args, replay_diagnostics) = match args {
+        [flag, rest @ ..] if flag == "--replay-diagnostics" => (rest, true),
+        _ => (args, false),
+    };
     let (args, preparation) = match args {
         [flag, source, specification, rest @ ..] if flag == "--prepare-from" => {
             (rest, Some((source.as_str(), specification.as_str())))
@@ -347,12 +402,12 @@ fn run(args: &[String], tls: bool) -> i32 {
         })
     else {
         eprintln!(
-            "usage: rabsd --worker-build-{} [--prepare-from <absolute-source-root> <spec.json> | --resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
+            "usage: rabsd --worker-build-{} [--replay-diagnostics] [--prepare-from <absolute-source-root> <spec.json> | --resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
             if tls { "tls" } else { "loopback" },
             if tls { "<worker-spki-sha256> " } else { "" }
         );
         eprintln!(
-            "The bundle supplies request.json and source/. New execution installs successful verified outputs; resume retrieves a retained result without source upload or execution. --resume-from may reuse independently verified local prefixes in a NEW delivery directory."
+            "The bundle supplies request.json and source/. New execution installs successful verified outputs; resume retrieves a retained result without source upload or execution. --resume-from may reuse independently verified local prefixes in a NEW delivery directory. --replay-diagnostics replays the complete verified stdout/stderr on success or failure, with the JSON build report on stderr."
         );
         return 2;
     };
@@ -379,7 +434,7 @@ fn run(args: &[String], tls: bool) -> i32 {
         );
         return 1;
     }
-    build.report()
+    build.report(replay_diagnostics)
 }
 
 pub fn run_build(args: &[String]) -> i32 {
@@ -456,6 +511,116 @@ pub fn execute_prepared_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic_snapshot(stdout: &[u8], stderr: &[u8]) -> DiagnosticSnapshot {
+        use sha2::{Digest, Sha256};
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().canonicalize().unwrap();
+        fs::create_dir(directory.join("diagnostics")).unwrap();
+        let receipt = json!({
+            "kind":"verified-worker-delivery", "exit_code":101,
+            "publication_authorized":false, "reexecute":false,
+            "stdout_bytes":stdout.len(), "stdout_sha256":format!("{:x}", Sha256::digest(stdout)),
+            "stderr_bytes":stderr.len(), "stderr_sha256":format!("{:x}", Sha256::digest(stderr)),
+        });
+        fs::write(directory.join("diagnostics/stdout"), stdout).unwrap();
+        fs::write(directory.join("diagnostics/stderr"), stderr).unwrap();
+        fs::write(
+            directory.join("delivery.json"),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                directory.join("diagnostics"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            for name in ["diagnostics/stdout", "diagnostics/stderr", "delivery.json"] {
+                fs::set_permissions(directory.join(name), fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+        }
+        // This is a stream-routing fixture; the completion module separately
+        // exercises real receiver/recovery verification before snapshotting.
+        DiagnosticSnapshot::from_delivery(
+            &Delivery {
+                directory,
+                receipt,
+                acknowledgments_confirmed: true,
+                acknowledgment_error: None,
+                acknowledgment_interrupted: false,
+            },
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_keeps_worker_streams_exact_and_moves_only_status_to_stderr() {
+        let raw_stdout = b"test output\0\xff\n{\"reason\":\"build-finished\",\"success\":false}\n";
+        let raw_stderr = b"compiler/test diagnostic\xff";
+        let report = json!({"kind":"worker-build", "exit_code":101, "reexecute":false});
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        emit_report(
+            &report,
+            Some(diagnostic_snapshot(raw_stdout, raw_stderr)),
+            &mut stdout,
+            &mut stderr,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(stdout, raw_stdout);
+        assert!(stderr.starts_with(raw_stderr));
+        assert_eq!(
+            &stderr[raw_stderr.len()..],
+            format!("{report}\n").as_bytes()
+        );
+
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        emit_report(
+            &report,
+            None,
+            &mut stdout,
+            &mut stderr,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(stdout, format!("{report}\n").as_bytes());
+        assert!(
+            stderr.is_empty(),
+            "default native JSON contract is unchanged"
+        );
+    }
+
+    #[test]
+    fn failed_console_replay_never_emits_a_success_report_or_retries_output() {
+        struct ClosedConsole(usize);
+        impl Write for ClosedConsole {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed console"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stdout = ClosedConsole(0);
+        let mut stderr = Vec::new();
+        let error = emit_report(
+            &json!({"kind":"worker-build"}),
+            Some(diagnostic_snapshot(b"worker output", b"worker error")),
+            &mut stdout,
+            &mut stderr,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(stdout.0, 1);
+        assert!(stderr.is_empty());
+    }
 
     fn preparation_fixture(root: &Path) -> (PathBuf, PathBuf) {
         let source = root.join("source");

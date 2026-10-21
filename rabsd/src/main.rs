@@ -368,9 +368,10 @@ fn main() {
                  Execute with --source-root <bundle>/source and <bundle>/request.json, not the old checkout.\n\
                  OPERATOR: rabsd --worker-exec-loopback <127.0.0.1:port> <worker> <request.json> <new-absolute-directory>\n\
                  SECURE: rabsd --worker-exec-tls <IP:port> <worker> <worker-spki-sha256> <request.json> <new-absolute-directory>\n\
-                 BUILD: rabsd --worker-build-tls [--resume] <IP:port> <worker> <worker-spki-sha256> <bundle> <delivery> <outputs>\n\
-                 BUILD LOCAL: rabsd --worker-build-loopback [--resume] <127.0.0.1:port> <worker> <bundle> <delivery> <outputs>\n\
+                 BUILD: rabsd --worker-build-tls [--replay-diagnostics] [--resume] <IP:port> <worker> <worker-spki-sha256> <bundle> <delivery> <outputs>\n\
+                 BUILD LOCAL: rabsd --worker-build-loopback [--replay-diagnostics] [--resume] <127.0.0.1:port> <worker> <bundle> <delivery> <outputs>\n\
                  Build paths are absolute. Successful builds install every verified artifact into a new output tree.\n\
+                 --replay-diagnostics prints verified stdout/stderr on success or failure, with the JSON report on stderr.\n\
                  Repeating a complete build verifies local delivery and outputs without a worker; --resume never executes.\n\
                  DAEMON JOB: rabsd --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
                  Inspect/cancel: --job-status <id32hex> | --job-cancel <id32hex>\n\
