@@ -18,6 +18,9 @@ group cleanup, never a historical PID or a shared daemon's session.
 Diagnostic replay has a separate 100 ms delivery budget and the same 250 ms
 cleanup grace. A stalled stderr reader cannot hold Cargo before exec. Blocking
 kernel operations can still outlive cooperative deadlines with SIGKILL pending.
+Unconfirmed preparation cleanup refuses Cargo with exit 255; neither a prepared
+environment nor stock-Cargo fallback may cross that boundary. A lost child
+relationship is uncertainty, not permission to signal a remembered numeric PID.
 """
 
 import ast
@@ -46,6 +49,10 @@ SETUP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "S
 class PreparationCancelled(BaseException):
     def __init__(self, number):
         self.number = number
+
+
+class PreparationCleanupUnconfirmed(BaseException):
+    """No workload may start while preparation ownership is unresolved."""
 
 
 def cancel_preparation(number, _frame):
@@ -251,23 +258,31 @@ def prepare_child(original, response, log_descriptor, original_signal_mask, owne
 
 
 def cleanup_preparer(pid):
-    # The direct child has NOT been reaped, even after observed exit. Its PID
-    # therefore cannot have been recycled into an unrelated process/group.
+    # Require a kernel-owned, unreaped direct child before using its numeric
+    # identity. ECHILD is not proof of death: an outside reaper may already have
+    # relinquished that PID. WNOWAIT preserves the pin even for an exited child.
+    # This adapter is single-threaded and owns reaping after this observation.
     # cargo-rabs starts shared daemons in separate sessions; never kill them.
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, SETUP_SIGNALS)
     try:
+        try:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except OSError:
+            return False
         for send in (lambda: os.killpg(pid, signal.SIGKILL),
                      lambda: os.kill(pid, signal.SIGKILL)):
             try:
                 send()
             except ProcessLookupError:
                 pass
+            except OSError:
+                return False
         deadline = time.monotonic() + CLEANUP_SECONDS
         while True:
             try:
                 child, _ = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                return True
+            except OSError:
+                return False
             if child:
                 return True
             if time.monotonic() >= deadline:
@@ -359,6 +374,8 @@ def bounded_prepared_environment(original):
     log_read = log_write = None
     owner_read = owner_write = None
     pid = None
+    cleanup_confirmed = True
+    environment = original
     logs = bytearray()
     truncated = False
     failure = b""
@@ -401,7 +418,15 @@ def bounded_prepared_environment(original):
                     raise TimeoutError("RABS worker preparation deadline expired")
                 # WNOWAIT observes exit without relinquishing the identity used
                 # for cancellation and descendant cleanup in the finally block.
-                exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                try:
+                    exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                except ChildProcessError:
+                    # No longer our waitable child. Closing the owner pipe
+                    # still revokes the in-group watch, but this parent cannot
+                    # signal the old number or claim that cleanup succeeded.
+                    pid = None
+                    cleanup_confirmed = False
+                    raise PreparationCleanupUnconfirmed
                 if exited is not None and eof and log_eof:
                     if exited.si_code != os.CLD_EXITED or exited.si_status != 0:
                         raise RuntimeError("RABS preparation helper exited without success")
@@ -435,11 +460,10 @@ def bounded_prepared_environment(original):
         environment = report.get("environment")
         if not valid_environment(environment):
             raise RuntimeError("RABS preparation returned an invalid environment")
-        return environment
     except Exception as error:
         failure = ("rch: worker-local RABS setup unavailable: {}; using stock Cargo\n"
                    .format(str(error)[:4096])).encode("utf-8", errors="backslashreplace")
-        return original
+        environment = original
     finally:
         # A signal during cleanup must not skip reaping or leak raw pipe FDs.
         # The nested cleanup helper preserves this outer mask; pending signals
@@ -447,22 +471,46 @@ def bounded_prepared_environment(original):
         signal.pthread_sigmask(signal.SIG_BLOCK, SETUP_SIGNALS)
         try:
             try:
-                if pid and not cleanup_preparer(pid):
-                    failure += b"rch: RABS setup cleanup remains pending; acceleration not used\n"
+                if pid:
+                    try:
+                        cleanup_confirmed = cleanup_preparer(pid)
+                    except Exception:
+                        cleanup_confirmed = False
             finally:
                 for stream in (parent, child):
                     if stream is not None:
-                        stream.close()
+                        try:
+                            stream.close()
+                        except OSError:
+                            cleanup_confirmed = False
                 # Only the adapter holds the write end. Closing it after
                 # cleanup also retires the watch when cleanup remains pending.
                 for descriptor in (log_read, log_write, owner_read, owner_write):
                     if descriptor is not None:
-                        os.close(descriptor)
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            cleanup_confirmed = False
         finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            finally:
+                if not cleanup_confirmed:
+                    # A return from the try block would already have selected
+                    # its environment before finally ran. Refuse instead of
+                    # merely logging a failure and accidentally execing Cargo.
+                    # Do not replay speculative stock-fallback diagnostics from
+                    # the preparer as the result of this unconfirmed cleanup.
+                    try:
+                        replay_diagnostics(
+                            b"rch: RABS preparation cleanup is unconfirmed; Cargo was not run\n"
+                        )
+                    finally:
+                        raise PreparationCleanupUnconfirmed
         if truncated:
             logs.extend(b"rch: RABS preparation diagnostics truncated\n")
         replay_diagnostics(failure + logs)
+    return environment
 
 
 def main():
@@ -486,6 +534,10 @@ def main():
         return 130
     except PreparationCancelled as cancelled:
         return 128 + cancelled.number
+    except PreparationCleanupUnconfirmed:
+        # Existing orchestration treats 255 as uncertain remote completion,
+        # not a compiler failure or permission to rerun a possibly live setup.
+        return 255
     finally:
         for number, handler in previous_handlers.items():
             signal.signal(number, handler)

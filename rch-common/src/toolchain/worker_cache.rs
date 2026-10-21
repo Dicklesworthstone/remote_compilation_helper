@@ -136,6 +136,7 @@ mod tests {
         for suite in [
             "tests/test_rabs_worker_bootstrap.py",
             "tests/test_rabs_worker_lifetime.py",
+            "tests/test_rabs_worker_cleanup.py",
         ] {
             let output = std::process::Command::new("python3")
                 .args(["-I", "-S"])
