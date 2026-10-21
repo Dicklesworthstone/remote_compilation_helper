@@ -1,8 +1,9 @@
-//! Request-bound registry-cache replay into an operation-owned Cargo home.
+//! Request-bound dependency-cache replay into an operation-owned Cargo home.
 //!
 //! This is input delivery, not Cargo resolution evidence or action-cache
-//! authority. Only explicitly selected registry cache/index/source files are
-//! copied. Cargo configuration, credentials, installed binaries, global cache
+//! authority. Only explicitly selected registry files and, under a distinct
+//! version, reconstructed locked Git databases are copied. User Cargo
+//! configuration, credentials, installed binaries, global cache
 //! databases and lock files are NOT imported. Cargo keeps its original argv
 //! and workspace configuration; the canonical namespace still denies network.
 //! The input snapshot stays read-only; the independent Cargo home is writable
@@ -19,12 +20,19 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+mod git;
+pub use git::CAPTURED_GIT_CONFIG;
+
 /// An optional source-begin extension, explicitly echoed before source upload.
 pub const CARGO_HOME_SOURCE_VERSION: &str = "registry-cargo-home-v1";
 /// Cache transport members are excluded from the compiler-visible workspace.
 /// The legacy version retains its original visible-prefix semantics, including
 /// for saved operations and recovery requests.
 pub const ISOLATED_CARGO_HOME_SOURCE_VERSION: &str = "isolated-registry-cargo-home-v1";
+/// Isolated registry files and bounded reconstructed Git object databases.
+/// Older peers must refuse these inputs instead of reinterpreting the registry
+/// contract or importing arbitrary user Git configuration and checkouts.
+pub const ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION: &str = "isolated-registry-git-cargo-home-v1";
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -51,6 +59,7 @@ fn checkpoint(stopped: &impl Fn() -> bool) -> io::Result<()> {
 /// Host paths are neither accepted nor carried by this declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CargoHomeProjection {
+    version: &'static str,
     prefix: String,
     source_digest: [u8; 32],
     files: SourceManifest,
@@ -65,13 +74,12 @@ impl CargoHomeProjection {
     /// Decode the exact negotiated version. New behavior must never silently
     /// reinterpret a previously admitted operation's source layout.
     pub fn for_version(version: &str, prefix: &str, source: &SourceManifest) -> io::Result<Self> {
-        require(
-            matches!(
-                version,
-                CARGO_HOME_SOURCE_VERSION | ISOLATED_CARGO_HOME_SOURCE_VERSION
-            ),
-            "unsupported Cargo home projection version",
-        )?;
+        let version = match version {
+            CARGO_HOME_SOURCE_VERSION => CARGO_HOME_SOURCE_VERSION,
+            ISOLATED_CARGO_HOME_SOURCE_VERSION => ISOLATED_CARGO_HOME_SOURCE_VERSION,
+            ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION => ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION,
+            _ => return Err(invalid("unsupported Cargo home projection version")),
+        };
         require(
             !prefix.is_empty()
                 && prefix.len() <= 512
@@ -92,11 +100,14 @@ impl CargoHomeProjection {
                 continue;
             };
             let mut parts = relative.split('/');
+            let registry = parts.next() == Some("registry")
+                && matches!(parts.next(), Some("cache" | "index" | "src"))
+                && parts.next().is_some();
             require(
-                parts.next() == Some("registry")
-                    && matches!(parts.next(), Some("cache" | "index" | "src"))
-                    && parts.next().is_some(),
-                "Cargo home imports only registry/cache, registry/index and registry/src",
+                registry
+                    || (version == ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION
+                        && relative.starts_with("git/db/")),
+                "Cargo home imports only admitted registry files and reconstructed Git databases",
             )?;
             let mut selected = file.clone();
             selected.path = relative.to_owned();
@@ -104,13 +115,18 @@ impl CargoHomeProjection {
         }
         require(
             !files.is_empty(),
-            "Cargo home prefix has no declared registry files",
+            "Cargo home prefix has no declared cache files",
         )?;
+        let files = SourceManifest::new(files)?;
+        if version == ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION {
+            git::validate_manifest(&files)?;
+        }
         Ok(Self {
+            version,
             prefix: prefix.to_owned(),
             source_digest: source.digest(),
-            files: SourceManifest::new(files)?,
-            workspace: if version == ISOLATED_CARGO_HOME_SOURCE_VERSION {
+            files,
+            workspace: if version != CARGO_HOME_SOURCE_VERSION {
                 Some(SourceManifest::new(workspace)?)
             } else {
                 None
@@ -120,11 +136,7 @@ impl CargoHomeProjection {
 
     #[must_use]
     pub fn version(&self) -> &'static str {
-        if self.workspace.is_some() {
-            ISOLATED_CARGO_HOME_SOURCE_VERSION
-        } else {
-            CARGO_HOME_SOURCE_VERSION
-        }
+        self.version
     }
 
     #[must_use]
@@ -172,6 +184,9 @@ impl CargoHomeProjection {
         verify_members(&image, &self.files, cache_prefix)?;
         if let Some(workspace) = &self.workspace {
             verify_members(&image, workspace, None)?;
+        }
+        if self.version == ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION {
+            git::verify_contents(&image, &self.files, &self.prefix)?;
         }
         checkpoint(&stopped)?;
         let (home_destination, workspace) = if let Some(workspace) = &self.workspace {
