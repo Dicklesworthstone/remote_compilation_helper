@@ -10284,7 +10284,7 @@ mod tests {
         for (index, (workload, status, seconds, refuse)) in [
             ("printf built > artifact; printf ready", 0, 15, false),
             ("printf 'compiler failed' >&2; exit 101", 101, 15, false),
-            ("exec sleep 20", 137, 1, false),
+            ("sleep 20", 137, 1, false),
             ("printf forbidden > artifact", 120, 15, true),
         ]
         .into_iter()
