@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recover retained live RABS results without dispatching another compiler.
+"""Recover retained dependency or canonical Cargo results without recompiling.
 
 Linux, Python 3.9+. With no operation flag this only inspects private intent
 metadata; it does not verify output bytes or contact a worker. --resume-to and
@@ -9,6 +9,9 @@ Recovered bytes do not repair an abandoned coordinator action or authorize a
 Cargo compiler skip. No credentials, request arguments or environment values
 are printed. Keep the recovery and admission directories exclusively owned
 while operating; this is not a hostile same-user shared-directory interface.
+Canonical operations require the prepared bundle/request.json, never spec.json.
+Older operations did not record admission state: --canonical-state-dir must name
+their ORIGINAL state directory. No current HOME/environment default is inferred.
 """
 
 import argparse
@@ -22,12 +25,14 @@ from pathlib import Path
 import shutil
 import stat
 import sys
+from typing import Optional
 
 
 # rabs_asupersync::worker_transport::MAX_JSON_RECORD. The native operator also
 # enforces its current envelope bound before contacting a worker.
 MAX_RECORD = 1024 * 1024 - 64
 SCHEMA = "rabs-live-remote-recovery-v1"
+CANONICAL_SCHEMA = "rabs-canonical-cargo-recovery-v1"
 
 
 class Refused(Exception):
@@ -151,7 +156,7 @@ class Intent:
     state: Path
     request: bytes
     request_id: int
-    action_key: str
+    action_key: Optional[str]
     worker: str
     pin: str
     listen: str
@@ -159,6 +164,10 @@ class Intent:
     state_identity: tuple
     record_fingerprint: tuple
     request_fingerprint: tuple
+    record_name: str = "recovery.json"
+    request_folder: Optional[Path] = None
+    request_folder_identity: tuple = ()
+    origin: str = "live-dependency"
 
     def verify_unchanged(self):
         state_fd = open_directory(self.state)
@@ -171,15 +180,23 @@ class Intent:
         try:
             require(identity(os.fstat(root_fd)) == self.root_identity,
                     "recovery directory changed")
-            for name, expected in (("recovery.json", self.record_fingerprint),
-                                   ("request.json", self.request_fingerprint)):
-                require(fingerprint(os.stat(name, dir_fd=root_fd, follow_symlinks=False)) == expected,
-                        "recovery identity changed before handoff")
+            require(fingerprint(os.stat(self.record_name, dir_fd=root_fd,
+                                        follow_symlinks=False)) == self.record_fingerprint,
+                    "recovery identity changed before handoff")
         finally:
             os.close(root_fd)
+        request_fd = open_directory(self.request_folder or self.root)
+        try:
+            require(identity(os.fstat(request_fd)) == (self.request_folder_identity or self.root_identity),
+                    "prepared request directory changed")
+            require(fingerprint(os.stat("request.json", dir_fd=request_fd,
+                                        follow_symlinks=False)) == self.request_fingerprint,
+                    "recovery request changed before handoff")
+        finally:
+            os.close(request_fd)
 
 
-def load_intent(value):
+def load_live_intent(value):
     root = absolute(value)
     state = root.parent
     state_fd = open_directory(state)
@@ -233,6 +250,121 @@ def load_intent(value):
                     record_fingerprint, request_fingerprint)
     intent.verify_unchanged()
     return intent
+
+
+def load_canonical_intent(root, canonical_state):
+    """Read retained preparation intent; only native recovery verifies a result.
+
+    A numeric prepared request is a readiness marker, not evidence that it ran.
+    The worker still binds result-resume to its exact retained request digest.
+    Never use the saved executable/argv as a command, nor allocate another ID.
+    """
+    fd = open_directory(root)
+    try:
+        metadata = os.fstat(fd)
+        require(metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077 == 0,
+                "canonical operation must be private to the current user")
+        record_bytes, record_fingerprint = read_record(fd, "operation.json")
+        record = decode(record_bytes)
+        require(record.get("version") == "canonical-cargo-v1"
+                and absolute(record.get("operation_directory")) == root
+                and record.get("automatic_retry") is False
+                and record.get("publication_authorized") is False,
+                "unsupported canonical operation or recovery authority")
+        argv = record.get("prepared_build_argv")
+        require(isinstance(argv, list) and len(argv) == 9
+                and all(isinstance(arg, str) and 0 < len(arg) <= 4096 and "\0" not in arg for arg in argv)
+                and argv[1:3] == ["--worker-build-tls", "--replay-diagnostics"]
+                and argv[-3:] == [str(root / name) for name in ("bundle", "delivery", "outputs")],
+                "canonical operation changed its fixed prepared-build contract")
+        listen, worker, pin = argv[3:6]
+        require(0 < len(worker.encode("utf-8")) <= 1024
+                and all(ord(char) >= 32 and not 127 <= ord(char) <= 159 for char in worker),
+                "invalid recorded worker identity")
+        require(hex_digest(pin) and pin != "0" * 64, "invalid recorded worker SPKI pin")
+        listener(listen)
+        recovery = record.get("recovery")
+        if "recovery" in record:
+            require(isinstance(recovery, dict) and recovery.keys() == {
+                "schema", "transport_state_dir", "request_file", "partial_delivery", "recovery_mode",
+                "worker_id", "worker_spki_sha256", "listen", "reexecute", "publication_authorized",
+            }, "invalid canonical recovery fields")
+            require(recovery.get("schema") == CANONICAL_SCHEMA
+                    and recovery.get("request_file") == "bundle/request.json"
+                    and recovery.get("partial_delivery") == "delivery"
+                    and recovery.get("recovery_mode") == "resume-or-acknowledge-only"
+                    and recovery.get("reexecute") is False
+                    and recovery.get("publication_authorized") is False
+                    and [recovery.get(name) for name in ("listen", "worker_id", "worker_spki_sha256")]
+                    == [listen, worker, pin], "canonical recovery identity or authority mismatch")
+            state = absolute(recovery.get("transport_state_dir"))
+            require(canonical_state is None or absolute(canonical_state) == state,
+                    "cannot replace the recorded canonical admission state")
+        else:
+            require(canonical_state is not None,
+                    "older canonical operation requires --canonical-state-dir with its ORIGINAL admission state")
+            state = absolute(canonical_state)
+        require(state != root and state not in root.parents and root not in state.parents,
+                "canonical admission state and operation must not overlap")
+        bundle_fd = os.open("bundle", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=fd)
+        try:
+            bundle_metadata = os.fstat(bundle_fd)
+            require(bundle_metadata.st_uid == os.geteuid() and bundle_metadata.st_mode & 0o077 == 0,
+                    "prepared request directory must be private")
+            request_bytes, request_fingerprint = read_record(bundle_fd, "request.json")
+        finally:
+            os.close(bundle_fd)
+    finally:
+        os.close(fd)
+    request = decode(request_bytes)
+    request_id = request.get("request_id")
+    require(request.get("kind") == "canonical-exec" and type(request_id) is int
+            and 0 < request_id < 2**64, "canonical recovery needs the prepared numeric request, not allocation intent")
+    recorded_id = record.get("request_id")
+    require(recorded_id == "allocate" or (type(recorded_id) is int and recorded_id == request_id),
+            "prepared request differs from canonical operation identity")
+    artifacts = request.get("artifacts")
+    require(request.get("program") in ("/__rabs/toolchain/bin/cargo", "/__rabs/toolchain/bin/cargo-clippy")
+            and isinstance(request.get("source_manifest"), dict)
+            and "dependency_context" not in request
+            and isinstance(artifacts, dict) and artifacts.get("unit") == "cargo"
+            and artifacts.get("tree") == "tree-files-v1"
+            and artifacts.get("cargo") in ("cargo-json-v1", "cargo-test-json-v1"),
+            "prepared request is not a canonical Cargo operation")
+    state_fd = open_directory(state)
+    try:
+        state_metadata = os.fstat(state_fd)
+        require(state_metadata.st_uid == os.geteuid() and state_metadata.st_mode & 0o022 == 0,
+                "canonical admission state has unsafe ownership or permissions")
+        state_identity = identity(state_metadata)
+    finally:
+        os.close(state_fd)
+    intent = Intent(root, state, request_bytes, request_id, None, worker, pin, listen,
+                    identity(metadata), state_identity, record_fingerprint, request_fingerprint,
+                    "operation.json", root / "bundle", identity(bundle_metadata), "canonical-cargo")
+    intent.verify_unchanged()
+    return intent
+
+
+def load_intent(value, canonical_state=None):
+    root = absolute(value)
+    fd = open_directory(root)
+    try:
+        found = []
+        for name in ("recovery.json", "operation.json"):
+            try:
+                os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            found.append(name)
+    finally:
+        os.close(fd)
+    require(len(found) == 1, "directory must contain exactly one recovery intent format")
+    if found[0] == "recovery.json":
+        require(canonical_state is None, "canonical state override cannot change dependency admission")
+        return load_live_intent(value)
+    return load_canonical_intent(root, canonical_state)
 
 
 def private_directory(path):
@@ -316,7 +448,7 @@ def sealed_request(data):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("directory", help="retained result-* directory containing recovery.json")
+    parser.add_argument("directory", help="retained dependency result-* or canonical Cargo operation directory")
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--resume-to", metavar="NEW_DIRECTORY", help="retrieve results into a new directory")
     choice.add_argument("--acknowledge", metavar="DELIVERY_DIRECTORY", help="verify and acknowledge an existing delivery")
@@ -325,15 +457,18 @@ def main(argv=None):
     prefix.add_argument("--prefix-from", metavar="OLD_DIRECTORY",
                         help="reuse a later interrupted recovery as untrusted byte hints")
     parser.add_argument("--rabsd", help="native daemon executable, never taken from the recovery record")
+    parser.add_argument("--canonical-state-dir", metavar="ORIGINAL_STATE_DIRECTORY",
+                        help="original admission state, required only for older canonical operations")
     args = parser.parse_args(argv)
     try:
         require(sys.platform == "linux", "live RABS recovery currently requires Linux")
         require(not (args.no_prefix or args.prefix_from is not None) or args.resume_to is not None,
                 "prefix selection requires --resume-to")
-        intent = load_intent(args.directory)
+        intent = load_intent(args.directory, args.canonical_state_dir)
         if args.resume_to is None and args.acknowledge is None:
             print(json.dumps({"kind": "rabs-remote-recovery-intent", "directory": str(intent.root),
                               "request_id": intent.request_id, "action_key": intent.action_key,
+                              "origin": intent.origin,
                               "worker_id": intent.worker, "listen": intent.listen,
                               "transport_state_dir": str(intent.state), "outputs_verified": False,
                               "publication_authorized": False, "reexecute": False}, ensure_ascii=True))
@@ -345,8 +480,8 @@ def main(argv=None):
         for name in ("RABS_COORD_TLS_CA", "RABS_COORD_TLS_CERT", "RABS_COORD_TLS_KEY"):
             require(bool(env.get(name)), "recovery requires explicit coordinator TLS credentials")
             absolute(env[name])
-        # The worker admission ledger lives BELOW the ordinary daemon state root.
-        # Reusing the default root would lose its enrolled pin/boot fencing history.
+        # Preserve the exact original namespace, including dependency-workers
+        # for live attempts. A current environment/default is not that history.
         env["RABS_STATE_DIR"] = str(intent.state)
         intent.verify_unchanged()
         fd = sealed_request(intent.request)
