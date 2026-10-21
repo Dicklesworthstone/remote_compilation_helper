@@ -5,9 +5,24 @@ Cargo also passes layout settings through its environment. The exact environment
 policy keys these values, so separate agent/CI directories can still split
 otherwise identical dependency actions.
 
+The current live serving class is `--emit=metadata,dep-info`, as used by
+`cargo check`. Ordinary `cargo build` codegen still runs with its original
+arguments and environment. rustc's dep-info does not report every assembler
+input: `global_asm!` can introduce `.incbin` reads outside the captured package.
+Repeated identical builds cannot prove that those external bytes will stay
+unchanged. Such requests return `LIVE_DEP_CODEGEN_READ_CLOSURE` before toolchain
+warming or cache lookup, and the coordinator independently refuses admission,
+installation and publication. Older codegen publications remain retained history
+and cannot regain serving authority through their accumulated samples.
+
+This restriction applies equally to registry, Git and directory sources, and to
+link, object, assembly and LLVM outputs. Re-enabling codegen reuse requires an
+enforced complete input view under a distinct policy identity; a source-text scan
+or a switch that ignores the missing reads cannot supply that authority.
+
 ## Enable reuse through the launcher or daemon
 
-`cargo rabs build` enables the complete layout profile when it starts a new
+`cargo rabs check` enables the complete layout profile when it starts a new
 daemon. Separate agent target/build directories can then reuse eligible
 dependency results without an additional setting. The launcher's default is
 passed only to the new daemon; it does not introduce a new variable into Cargo's
@@ -42,10 +57,10 @@ the launcher, explicitly disable its complete-layout default. For example, with
 installed binaries and no existing daemon:
 
 ```sh
-cargo rabs build
+cargo rabs check
 
 # Or select only CARGO_TARGET_DIR reuse for a new daemon:
-RABS_REUSE_CARGO_LAYOUT=0 RABS_REUSE_CARGO_TARGET_DIR=1 cargo rabs build
+RABS_REUSE_CARGO_LAYOUT=0 RABS_REUSE_CARGO_TARGET_DIR=1 cargo rabs check
 ```
 
 The profile removes only eligible values from the compiler key. It does not

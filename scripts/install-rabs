@@ -43,7 +43,7 @@ import time
 import zlib
 
 
-TOOLS = ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr")
+TOOLS = ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root")
 VERSIONS = ".rabs-versions"
 CURRENT = ".rabs-current"
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
@@ -123,6 +123,7 @@ def source_files(bundle, build):
             "rabs-wrap": root / "wrapper-release" / "rabs-wrap",
             "rabsd": root / "daemon-release" / "rabsd",
             "rabs-wkr": root / "daemon-release" / "rabs-wkr",
+            "rabs-cargo-root": root / "daemon-release" / "rabs-cargo-root",
         }
     # Refuse incomplete sets before creating anything in the destination.
     for name, path in paths.items():

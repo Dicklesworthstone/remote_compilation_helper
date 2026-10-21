@@ -16,6 +16,7 @@ use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
     validate_tree_names,
 };
+use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -251,10 +252,11 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         Some(value) if value.as_str() == Some(TREE_FILES_VERSION) => true,
         Some(_) => return Err(invalid("unsupported artifact tree declaration")),
     };
+    let cargo = cargo_artifacts::requested(request)?;
     require(
         value
             .as_object()
-            .is_some_and(|v| v.len() == if tree { 3 } else { 2 }),
+            .is_some_and(|v| v.len() == 2 + usize::from(tree) + usize::from(cargo)),
         "invalid artifact declaration",
     )?;
     let unit = text(value, "unit")?;
@@ -272,7 +274,10 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         .get("files")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("artifact files"))?;
-    require(!files.is_empty() && files.len() <= 128, "artifact count")?;
+    require(
+        (cargo || !files.is_empty()) && files.len() <= 128,
+        "artifact count",
+    )?;
     let mut names = BTreeSet::new();
     for file in files {
         let name = file.as_str().ok_or_else(|| invalid("artifact name"))?;
@@ -290,7 +295,7 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
             parent = path.parent();
         }
     }
-    if tree {
+    if tree && !names.is_empty() {
         validate_tree_names(names.iter().map(String::as_str))?;
     }
     Ok(Some(Declaration {
@@ -566,6 +571,35 @@ pub(crate) fn verified_artifact_names(
         .into_iter()
         .map(|file| file.name)
         .collect())
+}
+
+/// Check Cargo's independently delivered stdout against the verified complete
+/// artifact manifest before accepting live delivery or restoring a retained one.
+/// A build-finished record alone never substitutes for actual compiler outputs.
+pub(crate) fn verify_cargo_artifacts(
+    request: &Value,
+    artifacts: &Value,
+    stdout: impl std::io::Read,
+) -> io::Result<()> {
+    if !cargo_artifacts::requested(request)? {
+        return Ok(());
+    }
+    verified_artifact_names(request, artifacts)?;
+    let report = CargoArtifactReport::read(stdout, "/__rabs/out/cargo")?;
+    let files = artifacts["files"]
+        .as_array()
+        .ok_or_else(|| invalid("Cargo artifact manifest"))?
+        .iter()
+        .map(|row| {
+            Ok((
+                text(row, "name")?,
+                row["executable"]
+                    .as_bool()
+                    .ok_or_else(|| invalid("Cargo artifact executable mode"))?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    report.validate_outputs(files)
 }
 
 /// Create each implied directory exactly once in a new, caller-owned output
@@ -1073,6 +1107,13 @@ pub fn receive_operation(
             None,
             &destination.join("diagnostics/stderr"),
         )?;
+        if artifacts.is_some() {
+            verify_cargo_artifacts(
+                request,
+                &result["artifact_manifest"],
+                File::open(destination.join("diagnostics/stdout"))?,
+            )?;
+        }
         if let Some(manifest) = &artifacts {
             create_artifact_directories(
                 &destination.join("artifacts"),
@@ -1183,6 +1224,7 @@ mod tests {
         sent: Vec<Value>,
         destination: PathBuf,
         fail_send: Option<&'static str>,
+        expected_stdout: Vec<u8>,
     }
     impl WorkerPeer for Script {
         fn send(&mut self, frame: &Value) -> io::Result<()> {
@@ -1194,7 +1236,7 @@ mod tests {
                 assert_eq!(receipt["kind"], "verified-worker-delivery");
                 assert_eq!(
                     std::fs::read(self.destination.join("diagnostics/stdout"))?,
-                    b"diagnostic\0\xff"
+                    self.expected_stdout
                 );
             }
             if frame["kind"].as_str() == self.fail_send {
@@ -1234,6 +1276,7 @@ mod tests {
             destination: destination.to_path_buf(),
             sent: vec![],
             fail_send: None,
+            expected_stdout: output.to_vec(),
             replies: VecDeque::from([
                 json!({"kind":"worker-hello","worker_id":"worker","canonical":true,"slots":4,
                 "boot_generation":1,"incarnation":"00000000000000000000000000000001","request_high_water":null,

@@ -521,16 +521,47 @@ fn linked_fixture() -> Fixture {
     fixture
 }
 
-/// Real files large enough to cross the streaming buffer boundary, not a
-/// claim that these fixture bytes are a valid rustc archive.
-fn linked_outputs(fixture: &Fixture) -> Vec<u8> {
+#[test]
+fn codegen_cannot_create_an_actor_or_use_an_existing_metadata_publication() {
+    let fixture = linked_fixture();
+    let request = fixture.request();
+    let key = request.key.action_key.clone();
+    assert!(matches!(
+        fixture.lane.decide(request),
+        LiveDecision::PassThrough(reason) if reason.starts_with("LIVE_DEP_CODEGEN_READ_CLOSURE")
+    ));
+    assert!(fixture.published(&key).is_none());
+    assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
+    assert_eq!(std::fs::read_dir(&fixture.out).unwrap().count(), 0);
+
+    let fixture = Fixture::new();
     fixture.outputs();
-    let archive = (0_u8..=255)
+    let (outcome, _) = fixture.begin().complete(&success());
+    assert_eq!(outcome, CompletionOutcome::Committed);
+    let mut request = fixture.request();
+    let key = request.key.action_key.clone();
+    let manifest = fixture.published(&key).unwrap();
+    // Even a stale caller holding a known persisted key cannot bypass the
+    // current serving gate by attaching a codegen invocation to that key.
+    request.plan.invocation.emit.push("link".into());
+    assert!(matches!(
+        fixture.lane.decide(request),
+        LiveDecision::PassThrough(reason) if reason.starts_with("LIVE_DEP_CODEGEN_READ_CLOSURE")
+    ));
+    assert_eq!(fixture.published(&key).as_deref(), Some(manifest.as_str()));
+    assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
+}
+
+/// Real files large enough to cross the streaming buffer boundary, not a
+/// claim that these fixture bytes are valid rustc metadata.
+fn streamed_outputs(fixture: &Fixture) -> Vec<u8> {
+    fixture.outputs();
+    let metadata = (0_u8..=255)
         .cycle()
         .take(2 * 64 * 1024 + 7)
         .collect::<Vec<_>>();
-    std::fs::write(fixture.out.join("libfoo-123.rlib"), &archive).unwrap();
-    archive
+    std::fs::write(fixture.out.join("libfoo-123.rmeta"), &metadata).unwrap();
+    metadata
 }
 
 fn gc_candidates(fixture: &Fixture) -> Vec<String> {
@@ -554,15 +585,11 @@ fn gc_candidates(fixture: &Fixture) -> Vec<String> {
 
 #[test]
 fn streamed_multiple_outputs_publish_only_as_one_complete_immutable_result() {
-    let fixture = linked_fixture();
+    let fixture = Fixture::new();
     let attempt = fixture.begin();
     let key = attempt.action_key().clone();
-    let archive = linked_outputs(&fixture);
-    let expected = [
-        ("libfoo-123.rmeta", b"original metadata fixture".as_slice()),
-        ("libfoo-123.rlib", archive.as_slice()),
-    ]
-    .map(|(name, bytes)| {
+    let metadata = streamed_outputs(&fixture);
+    let expected = [("libfoo-123.rmeta", metadata.as_slice())].map(|(name, bytes)| {
         (
             name,
             digest_set(bytes, DigestRequest::default(), None)
@@ -622,7 +649,7 @@ fn streamed_multiple_outputs_publish_only_as_one_complete_immutable_result() {
 
 #[test]
 fn missing_later_output_retires_streamed_attempt_without_partial_publication() {
-    let fixture = linked_fixture();
+    let fixture = Fixture::new();
     let request = fixture.request();
     let declared = request.plan.output_names();
     let capture_order = request
@@ -632,12 +659,12 @@ fn missing_later_output_retires_streamed_attempt_without_partial_publication() {
         .iter()
         .map(|declaration| declaration.virtual_path.clone())
         .collect::<Vec<_>>();
-    assert_eq!(declared.len(), 3);
+    assert_eq!(declared.len(), 2);
     let key = request.key.action_key.clone();
     let LiveDecision::Execute(attempt) = fixture.lane.decide(request) else {
         panic!("expected an admitted multi-output attempt");
     };
-    linked_outputs(&fixture);
+    streamed_outputs(&fixture);
     // Omit the last DECLARED artifact so the real capture must already have
     // staged and pinned at least one native output before the later failure.
     let missing = fixture.out.join(capture_order.last().unwrap());
@@ -682,6 +709,6 @@ fn missing_later_output_retires_streamed_attempt_without_partial_publication() {
     std::fs::rename(&retained, &missing).unwrap();
     let (outcome, known) = fixture.begin().complete(&success());
     assert_eq!(outcome, CompletionOutcome::Committed);
-    assert_eq!(known.len(), 2);
+    assert_eq!(known.len(), 1);
     assert!(fixture.published(&key).is_some());
 }

@@ -641,9 +641,20 @@ USAGE:
         /// heartbeat/release rails, syncs no artifacts back, and its remote
         /// exit status surfaces verbatim (no toolchain/worker-env rerun
         /// heuristics). The PreToolUse hook never sets this flag.
+        // The whole clean-overlay family is listed, not just --clean-overlay:
+        // clap stops enforcing `requires = "clean_overlay"` once --job conflicts
+        // it away, so `--job --base X --no-overlay` parsed and then died as an
+        // internal error (bd-ythy6).
         #[arg(
             long,
-            conflicts_with_all = ["clean_overlay", "source_content_receipt"]
+            conflicts_with_all = [
+                "clean_overlay",
+                "source_content_receipt",
+                "base",
+                "dependency_base",
+                "overlay_path",
+                "no_overlay",
+            ]
         )]
         job: bool,
         /// Repository-relative directory to sync back from the worker after
@@ -7478,6 +7489,51 @@ mod tests {
             "pytest",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_job_with_clean_overlay_family_flags() {
+        let _guard = test_guard!();
+        // bd-ythy6: without --clean-overlay these used to parse, because clap
+        // drops a `requires` whose target conflicts with a present arg, and
+        // then failed at run time as RCH-E504 "internal state". The conflict
+        // error's usage line must not suggest the rejected flags either.
+        for flags in [
+            &["--base", "HEAD", "--no-overlay"][..],
+            &["--base", "HEAD"][..],
+            &["--no-overlay"][..],
+            &["--overlay-path", "src/lib.rs"][..],
+            &["--dependency-base", "../dep=HEAD"][..],
+            &["--base", "HEAD", "--clean-overlay", "--no-overlay"][..],
+        ] {
+            let mut args = vec!["rch", "exec", "--job"];
+            args.extend_from_slice(flags);
+            args.extend_from_slice(&["--", "pytest"]);
+            let result = Cli::try_parse_from(&args);
+            assert!(result.is_err(), "{flags:?} must be refused with --job");
+            let Err(err) = result else { continue };
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flags:?}"
+            );
+            let usage = err.render().to_string();
+            let usage = usage
+                .lines()
+                .find(|line| line.contains("Usage:"))
+                .unwrap_or_default();
+            for rejected in [
+                "--base",
+                "--clean-overlay",
+                "--no-overlay",
+                "--overlay-path",
+            ] {
+                assert!(
+                    !(usage.contains("--job") && usage.contains(rejected)),
+                    "{flags:?}: usage suggests --job with {rejected}: {usage}"
+                );
+            }
+        }
     }
 
     #[test]

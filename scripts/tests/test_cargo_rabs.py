@@ -267,6 +267,82 @@ class LauncherTests(unittest.TestCase):
         self.assertIn(b"Usage: cargo rabs", result.stdout)
         self.assertEqual(self.starts(), [])
 
+    def root_settings(self, helper):
+        return {"CARGO_RABS_ROOT_BUDGET_DIR": str(self.root / "root-budget"),
+                "CARGO_RABS_ROOT_CAPACITY": "2",
+                "CARGO_RABS_ROOT_CGROUP": "/sys/fs/cgroup/explicit-delegation",
+                "CARGO_RABS_ROOT_HELPER": str(helper)}
+
+    def test_explicit_root_handoff_preserves_argv_and_jobserver_descriptors(self):
+        # Native-helper double proves only launcher handoff. The actual cgroup
+        # owner has separate Rust tests and requires real delegated cgroupfs.
+        helper = self.make_program("rabs-cargo-root", r'''
+import os, pathlib, sys
+assert sys.argv[1] == "--"
+pathlib.Path(os.environ["TEST_ROOT"], "root-handoff").write_text(str(os.getpid()))
+os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+''')
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"R")
+            changes = self.root_settings(helper)
+            changes.update({"TEST_JOBSERVER_FD": str(read_fd),
+                            "CARGO_MAKEFLAGS": "-j --jobserver-auth={},{}".format(read_fd, write_fd)})
+            args = ["check", "--manifest-path", "a path/Cargo.toml", os.fsdecode(b"non-utf8-\xff")]
+            result = self.launch(args, changes, pass_fds=(read_fd, write_fd))
+            value = self.cargo_result(result)
+            self.assertEqual(value["argv"], [os.fsencode(arg).hex() for arg in args])
+            self.assertEqual(value["jobserver"], b"R".hex())
+            self.assertEqual(value["env"]["CARGO_MAKEFLAGS"], changes["CARGO_MAKEFLAGS"])
+            self.assertEqual(str(value["pid"]), (self.root / "root-handoff").read_text())
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_root_refusal_never_retries_stock_cargo(self):
+        helper = self.make_program("rabs-cargo-root", "raise SystemExit(43)\n")
+        result = self.launch(["build"], self.root_settings(helper))
+        self.assertEqual(result.returncode, 43)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"cargo's own stderr", result.stderr)
+
+    def test_daemon_fallback_keeps_explicit_root_admission(self):
+        helper = self.make_program("rabs-cargo-root", r'''
+import os, pathlib, sys
+pathlib.Path(os.environ["TEST_ROOT"], "root-handoff").write_text("held")
+os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+''')
+        changes = self.root_settings(helper)
+        changes["TEST_CONFIG"] = "refuse"
+        result = self.launch(["build"], changes)
+        value = self.cargo_result(result)
+        self.assertTrue((self.root / "root-handoff").exists())
+        self.assertNotIn("RUSTC_WRAPPER", value["env"])
+        self.assertIn(b"running stock Cargo", result.stderr)
+
+    def test_root_configuration_refuses_before_daemon_or_cargo(self):
+        helper = self.make_program("rabs-cargo-root", "raise SystemExit(43)\n")
+        for changes in [
+                {"CARGO_RABS_ROOT_CAPACITY": "1"},
+                dict(self.root_settings(helper), CARGO_RABS_ROOT_CAPACITY="01"),
+                dict(self.root_settings(helper), CARGO_RABS_ROOT_CAPACITY="4097"),
+                dict(self.root_settings(helper), CARGO_RABS_ROOT_BUDGET_DIR="relative"),
+                dict(self.root_settings(helper), CARGO_RABS_ROOT_ACTIVE="1"),
+                dict(self.root_settings(helper), CARGO_RABS_ROOT_HELPER="/absent/helper")]:
+            with self.subTest(changes=changes):
+                result = self.launch(["build"], changes)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(self.starts(), [])
+
+    def test_root_admission_cannot_mix_with_remote_or_canonical(self):
+        for args in [["--rabs-remote", "build"], ["--rabs-canonical", "profile.json", "build"]]:
+            with self.subTest(args=args):
+                result = self.launch(args, {"CARGO_RABS_ROOT_CAPACITY": "1"})
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"cannot combine", result.stderr)
+                self.assertEqual(self.starts(), [])
+
     def test_first_build_starts_opted_in_service_and_preserves_cargo_contract(self):
         args = ["build", "--release", "--features", "a,b", "--manifest-path", "a path/Cargo.toml"]
         changes = {"RUSTC": "/toolchain/bin/rustc", "RUSTUP_TOOLCHAIN": "nightly-test",

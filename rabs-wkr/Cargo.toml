@@ -31,6 +31,12 @@ tempfile = "3.25.0"
 # satisfy the I14 boundary test; pin matches rabs-asupersync's A003 rule).
 asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519", default-features = false, features = ["proc-macros"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The explicit local Cargo-root helper uses safe descriptor-relative cgroup
+# access, pidfd signal delivery, and process signal flags; no pre_exec hooks.
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+signal-hook = "0.4.4"
+
 [dev-dependencies]
 tempfile = "3.25.0"
 
@@ -40,3 +46,7 @@ unsafe_code = "forbid"
 [[bin]]
 name = "rabs-wkr"
 path = "src/main.rs"
+
+[[bin]]
+name = "rabs-cargo-root"
+path = "src/bin/rabs-cargo-root.rs"

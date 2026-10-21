@@ -13,6 +13,7 @@ use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
 };
 use rabs_sandbox::canonical_mounts::UnitMount;
+use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
@@ -30,20 +31,22 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// A validated, nonempty output contract. No physical path is carried here.
+/// A validated output contract. Cargo may discover its nonempty required set
+/// after compilation; no physical path is carried here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactPlan {
     unit: String,
     files: BTreeSet<String>,
     directories: BTreeSet<String>,
     tree: bool,
+    cargo: bool,
 }
 
 impl ArtifactPlan {
     /// Reject aliases, traversal, duplicate files and file/directory conflicts
     /// before execution. Path spelling is preserved, never silently normalized.
     pub fn new(unit: String, paths: Vec<String>) -> io::Result<Self> {
-        Self::bounded(unit, paths, MAX_ARTIFACT_FILES)
+        Self::bounded(unit, paths, MAX_ARTIFACT_FILES, false)
     }
 
     /// Opt in to the complete regular-file output tree, with mandatory final
@@ -62,14 +65,37 @@ impl ArtifactPlan {
         Ok(plan)
     }
 
+    /// Cargo supplies hashed target names only after compilation. Its explicit
+    /// JSON contract must be resolved before this plan can capture any output.
+    fn new_cargo_tree(required: Vec<String>) -> io::Result<Self> {
+        if !cfg!(target_os = "linux") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cargo artifact tree capture requires Linux",
+            ));
+        }
+        let mut plan = Self::bounded("cargo".to_owned(), required, MAX_ARTIFACT_FILES, true)?;
+        if !plan.files.is_empty() {
+            rabs_sandbox::artifact_tree::validate_tree_names(plan.files())?;
+        }
+        plan.tree = true;
+        plan.cargo = true;
+        Ok(plan)
+    }
+
     /// A sealed result contains its COMPLETE exact set, not the original tree's
     /// minimum. Rehydration reconstructs only these names and never rediscovers
     /// outputs or permits a caller's exact declaration to exceed its own bound.
     pub(crate) fn from_retained(unit: String, paths: Vec<String>) -> io::Result<Self> {
-        Self::bounded(unit, paths, MAX_TREE_FILES)
+        Self::bounded(unit, paths, MAX_TREE_FILES, false)
     }
 
-    fn bounded(unit: String, paths: Vec<String>, limit: usize) -> io::Result<Self> {
+    fn bounded(
+        unit: String,
+        paths: Vec<String>,
+        limit: usize,
+        allow_empty: bool,
+    ) -> io::Result<Self> {
         if unit.is_empty()
             || unit.len() > 64
             || matches!(unit.as_str(), "." | "..")
@@ -79,7 +105,7 @@ impl ArtifactPlan {
         {
             return Err(invalid("invalid artifact unit"));
         }
-        if paths.is_empty() || paths.len() > limit {
+        if (!allow_empty && paths.is_empty()) || paths.len() > limit {
             return Err(invalid("artifact file count outside its bound"));
         }
         let mut files = BTreeSet::new();
@@ -110,6 +136,7 @@ impl ArtifactPlan {
             files,
             directories,
             tree: false,
+            cargo: false,
         })
     }
 
@@ -176,6 +203,41 @@ impl PreparedArtifacts {
         self.capture_with_dependency_inputs(None, stopped)
     }
 
+    /// Resolve Cargo's actual target files after process/drain cleanup, then
+    /// capture the complete tree using the ordinary descriptor-anchored path.
+    /// A caller cannot turn an unresolved Cargo plan into a successful capture.
+    pub(crate) fn capture_with_cargo_output(
+        mut self,
+        dependency_inputs: Option<&DependencyOutputInputs>,
+        stdout: impl Read,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        if !self.plan.cargo {
+            return self.capture_with_dependency_inputs(dependency_inputs, stopped);
+        }
+        if dependency_inputs.is_some() || stopped() {
+            return Err(invalid(
+                "Cargo artifact capture interrupted or has dependency-only inputs",
+            ));
+        }
+        let admitted_plan = self.plan.clone();
+        let report = CargoArtifactReport::read(stdout, &self.plan.virtual_root())?;
+        self.plan.files.extend(report.files().map(str::to_owned));
+        rabs_sandbox::artifact_tree::validate_tree_names(self.plan.files())?;
+        self.plan.cargo = false;
+        let mut captured = self.capture_with_dependency_inputs(None, stopped)?;
+        report.validate_outputs(
+            captured
+                .files
+                .iter()
+                .map(|(name, file)| (name.as_str(), file.executable)),
+        )?;
+        // Dynamic names constrain capture; they do not change the declaration
+        // admitted by ExecutionControl or the durable request fingerprint.
+        captured.plan = admitted_plan;
+        Ok(captured)
+    }
+
     /// A shared Cargo input/output directory contains owned mountpoints for
     /// retained dependency files. These may never collide with output names,
     /// become required parent directories, or silently enter a tree result.
@@ -205,6 +267,11 @@ impl PreparedArtifacts {
         dependency_inputs: Option<&DependencyOutputInputs>,
         stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
+        if self.plan.cargo {
+            return Err(invalid(
+                "Cargo artifact capture requires its complete JSON output",
+            ));
+        }
         if let Some(inputs) = dependency_inputs {
             self.validate_dependency_inputs(inputs)?;
         }
@@ -513,7 +580,7 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
     let object = value.as_object().ok_or("artifacts must be an object")?;
     if object
         .keys()
-        .any(|key| key != "unit" && key != "files" && key != "tree")
+        .any(|key| key != "unit" && key != "files" && key != "tree" && key != "cargo")
     {
         return Err("unsupported artifact declaration field".to_owned());
     }
@@ -522,6 +589,7 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
         Some(value) if value.as_str() == Some(TREE_FILES_VERSION) => true,
         Some(_) => return Err("unsupported artifact tree declaration".to_owned()),
     };
+    let cargo = cargo_artifacts::requested(request).map_err(|error| error.to_string())?;
     let unit = value
         .get("unit")
         .and_then(serde_json::Value::as_str)
@@ -529,8 +597,8 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
     let files = value
         .get("files")
         .and_then(serde_json::Value::as_array)
-        .filter(|files| !files.is_empty() && files.len() <= MAX_ARTIFACT_FILES)
-        .ok_or("artifact files must contain 1..=128 names")?;
+        .filter(|files| (cargo || !files.is_empty()) && files.len() <= MAX_ARTIFACT_FILES)
+        .ok_or("artifact files require a bounded required set or a Cargo artifact contract")?;
     let paths = files
         .iter()
         .map(|file| {
@@ -539,7 +607,9 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
                 .ok_or_else(|| "artifact names must be strings".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let plan = if tree {
+    let plan = if cargo {
+        ArtifactPlan::new_cargo_tree(paths)
+    } else if tree {
         ArtifactPlan::new_tree(unit.to_owned(), paths)
     } else {
         ArtifactPlan::new(unit.to_owned(), paths)
@@ -1272,5 +1342,73 @@ mod tests {
             tree["artifacts"]["tree"] = serde_json::json!(TREE_FILES_VERSION);
             assert!(parse_plan(&tree).unwrap().unwrap().tree);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_capture_requires_reported_outputs_and_keeps_the_full_tree() {
+        use rabs_sandbox::cargo_artifacts::CARGO_ARTIFACTS_VERSION;
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["check", "--workspace", "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":CARGO_ARTIFACTS_VERSION},
+        });
+        let plan = parse_plan(&request).unwrap().unwrap();
+        assert!(plan.cargo && plan.tree && plan.files.is_empty());
+        let report = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp-123.rmeta\"],\"executable\":null}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+        );
+        for case in 0..4 {
+            let prepared = PreparedArtifacts::new(plan.clone()).unwrap();
+            fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+            fs::write(
+                prepared.backing().join("debug/cargo-owned-extra"),
+                b"keep intermediate",
+            )
+            .unwrap();
+            if case != 1 {
+                fs::write(
+                    prepared.backing().join("debug/deps/libapp-123.rmeta"),
+                    b"compiler metadata",
+                )
+                .unwrap();
+            }
+            if case == 2 {
+                assert!(
+                    prepared.capture(|| false).is_err(),
+                    "unresolved Cargo plan must refuse"
+                );
+                continue;
+            }
+            let stdout = if case == 3 {
+                b"{\"reason\":\"build-finished\",\"success\":true}\n".as_slice()
+            } else {
+                report.as_bytes()
+            };
+            let captured = prepared.capture_with_cargo_output(None, stdout, || false);
+            if case == 0 {
+                let captured = captured.unwrap();
+                assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 2);
+                assert!(captured.file_identity("debug/cargo-owned-extra").is_some());
+                assert!(
+                    captured
+                        .file_identity("debug/deps/libapp-123.rmeta")
+                        .is_some()
+                );
+            } else {
+                assert!(captured.is_err(), "case {case}");
+            }
+        }
+        let mut invalid = request.clone();
+        invalid["args"][0] = serde_json::json!("test");
+        assert!(
+            parse_plan(&invalid).is_err(),
+            "running tests requires a separate execution contract"
+        );
+        invalid = request;
+        invalid["artifacts"]["cargo"] = serde_json::json!("cargo-json-v2");
+        assert!(parse_plan(&invalid).is_err());
     }
 }

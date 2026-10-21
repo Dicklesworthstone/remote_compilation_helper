@@ -1132,6 +1132,43 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_dynamic_outputs_preserve_admitted_plan_through_completion() {
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["check", "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-json-v1"},
+        });
+        let plan = crate::artifacts::parse_plan(&request).unwrap().unwrap();
+        let expected = plan.clone();
+        let mut task = ExecutionTask::spawn_with_artifacts(29, Duration::from_secs(5), plan.clone(), move |control| {
+            let prepared = crate::artifacts::PreparedArtifacts::new(plan.clone()).unwrap();
+            std::fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+            std::fs::write(prepared.backing().join("debug/deps/libapp-123.rmeta"), b"compiled metadata").unwrap();
+            std::fs::write(prepared.backing().join("debug/intermediate"), b"retained intermediate").unwrap();
+            let stdout = concat!(
+                "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+                "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp-123.rmeta\"],\"executable\":null}\n",
+                "{\"reason\":\"build-finished\",\"success\":true}\n",
+            );
+            let captured = prepared.capture_with_cargo_output(None, stdout.as_bytes(), || false).unwrap();
+            assert_eq!(captured.plan(), &plan, "output discovery must not change admission identity");
+            control.retain_artifacts(Ok(captured)).unwrap();
+            result(29)
+        }).unwrap();
+        let mut completion = wait(&mut task).unwrap();
+        let captured = completion.artifacts.as_mut().unwrap();
+        assert_eq!(captured.plan(), &expected);
+        assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            captured
+                .read_chunk("debug/deps/libapp-123.rmeta", 0, 64)
+                .unwrap(),
+            b"compiled metadata"
+        );
+    }
+
     #[test]
     fn failed_and_interrupted_executions_retain_diagnostics_but_never_artifacts() {
         for cancelled in [false, true] {

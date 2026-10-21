@@ -9,7 +9,9 @@
 
 mod cache;
 
-use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, CargoHomeProjection, PreparedCargoHome};
+#[cfg(test)]
+use rabs_sandbox::cargo_home::CARGO_HOME_SOURCE_VERSION;
+use rabs_sandbox::cargo_home::{CargoHomeProjection, PreparedCargoHome};
 use rabs_sandbox::source_transfer::{
     MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
 };
@@ -109,9 +111,7 @@ fn cargo_home_projection(
     let Some(home) = value.get("cargo_home") else {
         return Ok(None);
     };
-    if !home.as_object().is_some_and(|object| object.len() == 2)
-        || home["version"] != CARGO_HOME_SOURCE_VERSION
-    {
+    if !home.as_object().is_some_and(|object| object.len() == 2) {
         return Err(invalid(
             "cargo_home requires a supported version and prefix",
         ));
@@ -119,7 +119,10 @@ fn cargo_home_projection(
     let prefix = home["prefix"]
         .as_str()
         .ok_or("cargo_home prefix must be a string")?;
-    CargoHomeProjection::new(prefix, manifest)
+    let version = home["version"]
+        .as_str()
+        .ok_or("cargo_home version must be a string")?;
+    CargoHomeProjection::for_version(version, prefix, manifest)
         .map(Some)
         .map_err(|error| error.to_string())
 }
@@ -943,10 +946,7 @@ impl SourceOwner {
         if self.source_failed || request_id != self.request_id {
             return Err(refuse("source owner does not match execution admission"));
         }
-        let root = self
-            .receiver
-            .sealed_root()
-            .ok_or_else(|| refuse("execution source is not completely verified"))?;
+        let root = self.workspace_root()?;
         let workspace = Path::new(rabs_sandbox::layout::WORKSPACE);
         let index = spec
             .rw_binds
@@ -1001,6 +1001,24 @@ impl SourceOwner {
         Ok(())
     }
 
+    /// The exact negotiated compiler-visible tree. The sealed transfer tree
+    /// remains retained but isolated cache transport never exposes its prefix
+    /// through the execution request's physical workspace backing.
+    fn workspace_root(&self) -> io::Result<&std::path::Path> {
+        let source = self
+            .receiver
+            .sealed_root()
+            .ok_or_else(|| io::Error::other("execution source is not completely verified"))?;
+        if self.cargo_home.is_some() {
+            let prepared = self.prepared_cargo_home.as_ref().ok_or_else(|| {
+                io::Error::other("execution Cargo home is not completely prepared")
+            })?;
+            Ok(prepared.projected_workspace().unwrap_or(source))
+        } else {
+            Ok(source)
+        }
+    }
+
     /// Every readiness response uses the same post-I/O deadline frontier.
     /// Cached-file reuse and verification cannot renew the original budget.
     fn ready(&self) -> Result<Value, String> {
@@ -1012,8 +1030,7 @@ impl SourceOwner {
         if let Some(home) = &self.cargo_home {
             // Exact echo is the extension's support negotiation. Old workers
             // omit it, letting senders refuse BEFORE any cache bytes are sent.
-            reply["cargo_home"] =
-                json!({"version":CARGO_HOME_SOURCE_VERSION, "prefix":home.prefix()});
+            reply["cargo_home"] = json!({"version":home.version(), "prefix":home.prefix()});
         }
         if self.allow_cached_files {
             // This is the frozen initial missing set, not a new cache lookup on
@@ -1259,10 +1276,7 @@ impl SourceTransferState {
             return Err(invalid("execution Cargo home is not completely prepared"));
         }
         owner.within_budget()?;
-        let path = owner
-            .receiver
-            .sealed_root()
-            .ok_or("execution source is not completely verified")?;
+        let path = owner.workspace_root().map_err(|error| error.to_string())?;
         path.to_str()
             .map(|path| Some(path.to_owned()))
             .ok_or_else(|| invalid("worker staging path is not UTF-8"))

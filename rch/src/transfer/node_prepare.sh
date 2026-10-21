@@ -25,7 +25,29 @@ if [ -e package.json ] || [ -L package.json ]; then
         exit 121
     fi
     if [ -d node_modules/.bin ]; then
-        PATH="./node_modules/.bin${PATH:+:$PATH}"
+        # The workload can change directory before invoking a project tool.
+        # A relative PATH entry would then select another package's compiler
+        # (or a global one), not the tools whose installation just succeeded.
+        # Resolve the prepared bin directory now, independently of PWD/CDPATH.
+        # Keep pwd's terminating newline distinct from newlines in the path.
+        rch_prepare_bin=$(CDPATH= cd node_modules/.bin && pwd -P && printf x) || {
+            printf 'rch: prepared tool directory is unavailable; the command was not run\n' >&2
+            exit 121
+        }
+        rch_prepare_bin=${rch_prepare_bin%?}
+        rch_prepare_bin=${rch_prepare_bin%?}
+        case "$rch_prepare_bin" in
+            /*) ;;
+            *) printf 'rch: prepared tool directory is not absolute; the command was not run\n' >&2
+               exit 121 ;;
+        esac
+        # PATH has no quoting for a literal colon. Do not silently turn one
+        # prepared directory into several unrelated executable search roots.
+        case "$rch_prepare_bin" in
+            *:*) printf 'rch: prepared tool directory contains a PATH separator; the command was not run\n' >&2
+                 exit 121 ;;
+        esac
+        PATH="$rch_prepare_bin${PATH:+:$PATH}"
         export PATH
     fi
 fi

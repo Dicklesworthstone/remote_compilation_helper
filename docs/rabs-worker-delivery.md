@@ -310,6 +310,53 @@ execution retain their existing local path. `--rabs-require-daemon` guarantees
 matching daemon setup, not remote execution of every Cargo action. The original
 three-variable singleton configuration and its status fields remain supported.
 
+### Share a CPU budget between workers on the same host
+
+Separate worker processes can serve different coordinators or worker-pool slots
+while sharing one local execution budget. Configure every participating worker
+with the same private directory and fixed capacity:
+
+```sh
+install -d -m 700 "$HOME/.cache/rabs-host-budget"
+export RABS_WORKER_HOST_BUDGET_DIR="$HOME/.cache/rabs-host-budget"
+export RABS_WORKER_HOST_SLOTS=8
+```
+
+Start each worker with its own existing identity and state directory. The shared
+budget directory must be on a local filesystem with working OS file locks, have
+ordinary directory ancestors, and remain stable for the domain's lifetime.
+Both variables are required together. Capacity is an integer from 1 to 4096 and
+is persisted with the domain; another worker cannot reopen the same directory
+with a different capacity. Omitting both variables keeps the existing behavior.
+
+A request for `C` execution slots acquires all `C` shared credits immediately
+before spawning, after input and toolchain preparation. Cargo owns one implicit
+slot and its private FIFO receives only `C - 1` transferable tokens. Contention
+does not silently shrink the grant or change `NUM_JOBS`. Waiting remains bounded
+by the request deadline and observes cancellation. Transfers and source capture
+do not hold CPU credits. Live metadata-only rustc requests use a one-slot action
+grant and preserve their original keyed `NUM_JOBS` value.
+
+Canonical whole-Cargo requests can set `jobserver_grant` explicitly in their
+native request specification. For example, `"jobserver_grant": 2` under the
+eight-slot domain permits at most four such
+Cargo roots at once. A grant larger than the host capacity refuses. When omitted,
+the worker's existing machine-sized default still applies, so choose an explicit
+grant when the shared budget is smaller than the worker's reported capacity.
+
+Credits remain owned through process-group termination and diagnostic-stream
+draining. A normal completion or cancellation releases them only after cleanup
+proves no descendants remain. Each credit is durably marked before execution;
+worker crashes or uncertain cleanup leave those credits quarantined even after
+the OS unlocks the files. A missing PID is not evidence that descendants stopped.
+The initial implementation does not automatically clear quarantine: inspect and
+drain the affected execution before operator repair, and do not replace or reset
+the budget directory while any participating worker or descendant may remain.
+
+This bounds admitted cooperative execution across participating processes on
+one host. It is not a kernel CPU limit, cluster-wide fairness, or admission for
+workers configured with another directory or no shared budget.
+
 ### Run the native wrapper-to-worker oracle
 
 After the build above, run the explicit integration fixture on a host with
@@ -779,6 +826,19 @@ request must contain a source manifest and an artifact declaration; an explicit
 `tree-files-v1` declaration receives the full output tree, including Cargo's
 intermediate files. The compiler command still supplies its exact arguments,
 canonical working directory, environment, and explicit toolchain selection.
+
+Canonical Cargo requests can additionally declare `"cargo":"cargo-json-v1"`
+inside `artifacts`, with `"unit":"cargo"`, `"tree":"tree-files-v1"` and an
+empty `files` minimum. This explicit contract requires the native Cargo program,
+`--message-format=json`, `/__rabs/out/cargo` as the target directory, and a
+compilation command (`build`, `check`, or `test --no-run`). Cargo's completed
+artifact report supplies the actual required filenames and executable modes.
+The worker validates them while capturing the complete tree; the coordinator
+checks them independently before acknowledgement and again during offline
+recovery. A success-looking marker without compiler artifacts is insufficient.
+The contract does not run tests, publish cache entries or change request identity.
+See [canonical Cargo](rabs-canonical-cargo.md) for supported frontend selections
+and report bounds. Endpoints without this contract reject the new field.
 
 With the TLS environment described below, run:
 

@@ -45,6 +45,9 @@ DEPENDENCY_POOL_KEY = "RABS_DEPENDENCY_WORKERS_JSON"
 DEPENDENCY_WORKER_FIELDS = ("listen", "worker_id", "worker_spki_sha256")
 MAX_DEPENDENCY_WORKERS = 32
 MAX_DEPENDENCY_CONFIG = 128 * 1024
+ROOT_ADMISSION_KEYS = (
+    "CARGO_RABS_ROOT_BUDGET_DIR", "CARGO_RABS_ROOT_CAPACITY", "CARGO_RABS_ROOT_CGROUP",
+)
 HELLO = {
     "kind": "hello",
     "transport": {"minimum_compatible": 1, "current": 1},
@@ -59,7 +62,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-no-start        Only use an already-running daemon.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
-  --rabs-canonical FILE  Build named binaries through a canonical worker profile.
+  --rabs-canonical FILE  Compile selected Cargo targets through a canonical worker.
   --help                Show this help without starting a daemon or Cargo.
 
 Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
@@ -68,7 +71,10 @@ build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
 explicit upload boundary, profile and worker connection setup. This Linux-only
 profile uses a captured toolchain, fixed worker environment and new output tree;
 it is not transparent local-path replay, per-action scheduling or cache serving.
-Only named binary builds and the documented argument subset are accepted.
+Builds, checks and test --no-run accept ordinary workspace/target selection.
+Cargo's artifact reports identify the required real outputs in the captured tree.
+Profiles may select an existing vendor tree or an explicit cargo_home_source
+for checksum-verified, locked crates.io dependencies from the offline cache.
 Cargo metadata may run locally; builds never do. No local/RCH fallback or
 automatic execution retry occurs. stdout is the native worker-build report,
 not Cargo JSON; full compiler diagnostics remain in the verified delivery.
@@ -129,6 +135,16 @@ jobserver descriptors, stdin, stdout, stderr and the toolchain environment are
 not rewritten. On successful setup this invocation explicitly selects
 rabs-wrap via RUSTC_WRAPPER, overriding Cargo's build.rustc-wrapper config.
 No project or global Cargo config is edited.
+
+Explicit Linux local-root admission: set CARGO_RABS_ROOT_BUDGET_DIR,
+CARGO_RABS_ROOT_CAPACITY and CARGO_RABS_ROOT_CGROUP together. The native
+rabs-cargo-root helper then holds one durable host-local root credit through
+Cargo and descendant cleanup in an explicitly delegated cgroup-v2 subtree.
+This limits simultaneous Cargo trees; it does not replace Cargo's jobserver
+or impose a CPU limit. Unavailable delegation refuses before Cargo starts,
+including when daemon setup falls back to stock Cargo. These settings cannot
+combine with remote/canonical mode. CARGO_RABS_ROOT_HELPER selects an explicit
+helper executable. See docs/rabs-cargo-root.md for setup and crash quarantine.
 
 New daemon logs: <RABS_STATE_DIR>/cargo-launcher/daemon-<pid>-<time>.log.
 Daemon startup holds both state-directory and socket-endpoint lifetime locks.
@@ -357,6 +373,26 @@ def executable(name, override, env):
             # multi-call programs can depend on the invoked basename.
             return os.path.abspath(candidate)
     raise SetupError("{} is not installed (or {} is not executable)".format(name, override))
+
+
+def root_admission_helper(env):
+    """Resolve an explicit native owner; Python never supervises the build."""
+    if not any(key in env for key in ROOT_ADMISSION_KEYS):
+        return None
+    if not all(key in env for key in ROOT_ADMISSION_KEYS):
+        raise SetupError("local root admission requires all of " + ", ".join(ROOT_ADMISSION_KEYS))
+    if "CARGO_RABS_ROOT_ACTIVE" in env:
+        raise SetupError("nested cargo-rabs root admission is unsupported; use ordinary Cargo in the admitted tree")
+    capacity = env["CARGO_RABS_ROOT_CAPACITY"]
+    if not 1 <= len(capacity) <= 4 or not capacity.isascii() or not capacity.isdecimal() or not 1 <= int(capacity) <= 4096 or str(int(capacity)) != capacity:
+        raise SetupError("CARGO_RABS_ROOT_CAPACITY must be canonical decimal from 1 to 4096")
+    for key in ("CARGO_RABS_ROOT_BUDGET_DIR", "CARGO_RABS_ROOT_CGROUP"):
+        path = Path(env[key])
+        if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+            raise SetupError(key + " must be an ordinary absolute path")
+    if sys.platform != "linux":
+        raise SetupError("managed local Cargo roots require Linux cgroup v2")
+    return executable("rabs-cargo-root", "CARGO_RABS_ROOT_HELPER", env)
 
 
 def same_executable(value, expected, env):
@@ -1083,9 +1119,16 @@ def canonical_profile(path):
     profile = decode_object(data)
     required = {"version", "listen", "worker", "worker_spki_sha256",
                 "source_root", "toolchain_root", "operation_root"}
-    if (not required <= profile.keys() or profile.keys() - required - {"manifest", "vendor"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant"}
+    if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-cargo-v1"):
         raise SetupError("invalid canonical-cargo-v1 profile fields")
+    if "vendor" in profile and "cargo_home_source" in profile:
+        raise SetupError("canonical profile must select either vendor or cargo_home_source")
+    if "jobserver_grant" in profile:
+        grant = profile["jobserver_grant"]
+        if type(grant) is not int or not 1 <= grant <= 4096:
+            raise SetupError("canonical jobserver_grant must be an integer from 1 to 4096")
     import ipaddress
     import re
     address = profile["listen"]
@@ -1105,7 +1148,10 @@ def canonical_profile(path):
             or not isinstance(profile["worker_spki_sha256"], str)
             or re.fullmatch(r"[0-9a-f]{64}", profile["worker_spki_sha256"]) is None):
         raise SetupError("canonical worker identity and lowercase SHA-256 pin are required")
-    for field in ("source_root", "toolchain_root", "operation_root"):
+    roots = ("source_root", "toolchain_root", "operation_root")
+    if "cargo_home_source" in profile:
+        roots += ("cargo_home_source",)
+    for field in roots:
         path = Path(canonical_path(profile[field], absolute=True))
         # Do not normalize away an unsafe ancestor or follow a profile alias.
         for parent in reversed((path,) + tuple(path.parents)):
@@ -1119,6 +1165,12 @@ def canonical_profile(path):
         source = Path(profile[field])
         if operation == source or operation in source.parents or source in operation.parents:
             raise SetupError("canonical operation root must be disjoint from inputs")
+    if "cargo_home_source" in profile:
+        cargo_home = Path(profile["cargo_home_source"])
+        for field in ("source_root", "toolchain_root", "operation_root"):
+            other = Path(profile[field])
+            if cargo_home == other or cargo_home in other.parents or other in cargo_home.parents:
+                raise SetupError("canonical cargo_home_source must be disjoint from other roots")
     profile["manifest"] = canonical_path(profile.get("manifest", "Cargo.toml"))
     if Path(profile["manifest"]).name != "Cargo.toml":
         raise SetupError("canonical manifest must name Cargo.toml")
@@ -1133,14 +1185,14 @@ def canonical_profile(path):
 
 
 def canonical_build_arguments(args):
-    """Preserve supported argv and derive REAL mandatory binary outputs.
+    """Preserve compile-only Cargo intent and select the native artifact contract.
 
-    Do not use Cargo's incidental metadata files as an invented success marker.
-    Broader target classes need their own explicit output contract first.
+    Cargo's JSON reports supply actual library, metadata, binary and test names,
+    including toolchain-specific intermediate and target-triple layouts.
     """
     import re
-    if not args or args[0] != "build" or len(args) > 256:
-        raise SetupError("canonical mode requires build with explicit --bin NAME")
+    if not args or args[0] not in ("build", "check", "test") or len(args) > 256:
+        raise SetupError("canonical mode requires build, check or test --no-run")
     if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
         raise SetupError("canonical Cargo arguments exceed their bounds")
     try:
@@ -1148,13 +1200,16 @@ def canonical_build_arguments(args):
             arg.encode("utf-8")
     except UnicodeError as error:
         raise SetupError("canonical Cargo arguments must be UTF-8") from error
-    binaries = set()
-    release = False
     target = None
+    no_run = False
+    workspace = False
+    excluded = False
+    selections = set()
     at = 1
     while at < len(args):
         option, separator, value = args[at].partition("=")
-        if option in ("--bin", "--package", "-p", "--features", "-F", "--target", "--color"):
+        if option in ("--bin", "--example", "--test", "--bench", "--package", "-p",
+                      "--features", "-F", "--target", "--color", "--exclude"):
             if not separator:
                 at += 1
                 if at == len(args):
@@ -1162,11 +1217,11 @@ def canonical_build_arguments(args):
                 value = args[at]
             if not value or value.startswith("-"):
                 raise SetupError("invalid canonical Cargo option value")
-            if option == "--bin":
+            if option in ("--bin", "--example", "--test", "--bench"):
                 if (re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,127}", value) is None
-                        or value in binaries or len(binaries) >= 128):
-                    raise SetupError("canonical binary names must be unique literal names")
-                binaries.add(value)
+                        or (option, value) in selections or len(selections) >= 128):
+                    raise SetupError("canonical target names must be unique literal names")
+                selections.add((option, value))
             elif option == "--target":
                 if target is not None or value not in (
                     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
@@ -1176,18 +1231,26 @@ def canonical_build_arguments(args):
                 target = value
             elif option == "--color" and value not in ("auto", "always", "never"):
                 raise SetupError("invalid Cargo color choice")
+            elif option == "--exclude":
+                excluded = True
         elif not separator and option in ("--release", "-r"):
-            release = True
+            pass
+        elif not separator and option == "--no-run" and args[0] == "test" and not no_run:
+            no_run = True
+        elif not separator and option == "--workspace":
+            workspace = True
         elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
-                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q"):
+                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q",
+                                          "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets"):
             pass
         else:
             raise SetupError("unsupported canonical Cargo argument: " + args[at])
         at += 1
-    if not binaries:
-        raise SetupError("canonical mode requires at least one explicit --bin NAME")
-    prefix = ((target + "/") if target else "") + ("release/" if release else "debug/")
-    return list(args), [prefix + name for name in sorted(binaries)]
+    if args[0] == "test" and not no_run:
+        raise SetupError("canonical test mode requires --no-run; test execution is a separate operation")
+    if excluded and not workspace:
+        raise SetupError("canonical --exclude requires --workspace")
+    return list(args), []
 
 
 def canonical_invocation(profile_path, args, env):
@@ -1212,7 +1275,7 @@ def canonical_invocation(profile_path, args, env):
         for flag in ("--locked", "--offline"):
             if flag not in cargo_args:
                 cargo_args.append(flag)
-    cargo_args += ["--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
+    cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
     import secrets
     specification = {
         "kind": "canonical-exec", "request_id": secrets.randbits(64) or 1,
@@ -1221,10 +1284,14 @@ def canonical_invocation(profile_path, args, env):
                             "env": {"CARGO_INCREMENTAL": "0"}},
         "toolchain_source": profile["toolchain_root"],
         "cargo_source": {"manifest": profile["manifest"]},
-        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs},
+        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs, "cargo": "cargo-json-v1"},
     }
     if "vendor" in profile:
         specification["cargo_source"]["vendor"] = profile["vendor"]
+    if "cargo_home_source" in profile:
+        specification["cargo_source"]["cargo_home_source"] = profile["cargo_home_source"]
+    if "jobserver_grant" in profile:
+        specification["jobserver_grant"] = profile["jobserver_grant"]
     encoded_specification = json.dumps(specification, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     if len(encoded_specification) > MAX_FRAME:
         raise SetupError("canonical Cargo specification exceeds its frontend bound")
@@ -1288,6 +1355,9 @@ def main():
     if raw[:1] == ["rabs"]:
         raw = raw[1:]
     if raw[:1] == ["--rabs-canonical"]:
+        if any(key in os.environ for key in ROOT_ADMISSION_KEYS):
+            print("cargo-rabs: local root admission cannot combine with canonical mode", file=sys.stderr)
+            return 2
         return run_canonical(raw[1:], dict(os.environ))
     try:
         args, no_start, required, remote = arguments(sys.argv[1:])
@@ -1299,6 +1369,9 @@ def main():
         return 0
     env = dict(os.environ)
     if remote:
+        if any(key in env for key in ROOT_ADMISSION_KEYS):
+            print("cargo-rabs: local root admission cannot combine with remote mode", file=sys.stderr)
+            return 2
         try:
             rch, command, child_env = remote_invocation(args, env)
         except (SetupError, OSError) as error:
@@ -1323,6 +1396,11 @@ def main():
         print("cargo-rabs: CARGO resolves to cargo-rabs itself", file=sys.stderr)
         return 127
     try:
+        root_helper = root_admission_helper(env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: local root admission refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
         cargo_env = prepare(env, no_start)
     except (SetupError, OSError, subprocess.SubprocessError) as error:
         print("cargo-rabs: {}; {}".format(
@@ -1332,8 +1410,11 @@ def main():
             return 2
         cargo_env = env
     try:
-        # No Popen/wait boundary around the build: preserve its PID, signals,
-        # jobserver descriptors, terminal streams, opaque argv and exit status.
+        if root_helper is not None:
+            # A single ownership handoff; an uncertain native outcome never
+            # retries or bypasses explicitly requested root admission.
+            os.execvpe(root_helper, [root_helper, "--", cargo] + args, cargo_env)
+        # With no explicit admission policy, retain the original exec boundary.
         os.execvpe(cargo, [cargo] + args, cargo_env)
     except OSError as error:
         print("cargo-rabs: cannot execute Cargo: {}".format(error), file=sys.stderr)

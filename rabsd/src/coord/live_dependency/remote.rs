@@ -33,7 +33,9 @@ use rabs_sandbox::dependency_context::{
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
-use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits, capture_toolchain};
+use rabs_sandbox::toolchain_dataset::{
+    PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain,
+};
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -44,6 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod recovery;
+mod toolchains;
 
 const CONFIG_KEYS: [&str; 3] = [
     "RABS_DEPENDENCY_WORKER_LISTEN",
@@ -309,28 +312,9 @@ impl RemoteValidation {
     }
 }
 
-#[derive(Debug)]
-enum ToolchainMemo {
-    Warming(ToolchainCapture),
-    Ready(Arc<RetainedToolchain>),
-}
-
-/// One owned background warmup, never one copy per compiler invocation.
-/// Drop cancels the bounded filesystem walker and joins its owner.
-#[derive(Debug)]
-struct ToolchainCapture {
-    cancellation: OperationCancellation,
-    handle: Option<std::thread::JoinHandle<Result<Arc<RetainedToolchain>, String>>>,
-}
-
-impl Drop for ToolchainCapture {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
+// The original compiler AND sysroot spellings select preparation ownership.
+// Path equality is never content authority: every returned image is revalidated.
+type ToolchainMemo = toolchains::Cache<(PathBuf, PathBuf), RetainedToolchain>;
 
 impl RemoteDependencies {
     /// No variables selects the ordinary local lane. Partial or invalid explicit
@@ -416,6 +400,9 @@ impl RemoteDependencies {
         let visible_root = root.to_str().ok_or("non-UTF-8 original toolchain root")?;
         remote_dependency_shape(plan, directories, visible_root)
             .map_err(|error| error.to_string())?;
+        // Derive resource intent before copying a complete compiler tree. An
+        // unrepresentable or differently keyed invocation cannot request work.
+        metadata_execution_grant(plan, argv)?;
         let empty_loader = remote_empty_loader_directories(plan, visible_root)
             .map_err(|error| error.to_string())?;
         let loader_witness = observe_loader_directories(&empty_loader, || false)
@@ -501,79 +488,75 @@ impl RemoteDependencies {
         compiler: &Path,
     ) -> Result<Option<Arc<RetainedToolchain>>, String> {
         guard.verify_unchanged(compiler)?;
-        let mut memo = self
-            .toolchain
-            .lock()
-            .map_err(|_| "toolchain retention lock poisoned")?;
-        if let Some(ToolchainMemo::Warming(warmup)) = memo.as_mut() {
-            if !warmup
-                .handle
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-            {
-                return Ok(None);
-            }
-            let handle = warmup
-                .handle
-                .take()
-                .ok_or("toolchain warmup owner missing")?;
-            let outcome = handle
-                .join()
-                .map_err(|_| "toolchain warmup panicked".to_owned());
-            *memo = None;
-            let retained = outcome??;
-            *memo = Some(ToolchainMemo::Ready(retained));
-        }
-        if let Some(ToolchainMemo::Ready(retained)) = memo.as_ref()
-            && retained.guard.verify_unchanged(compiler).is_ok()
-            && retained
+        let key = (compiler.to_path_buf(), guard.sysroot().to_path_buf());
+        let retained = {
+            // A contended cache is preparation, never authority or an excuse
+            // to block the decision lane behind another compiler's scan.
+            let mut memo = match self.toolchain.try_lock() {
+                Ok(memo) => memo,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("toolchain retention lock poisoned".into());
+                }
+            };
+            let state = self.state.clone();
+            let capture_guard = guard.clone();
+            let capture_compiler = compiler.to_path_buf();
+            memo.get_or_insert_with(|| ToolchainMemo::new(toolchains::CAPACITY))
+                .poll(key.clone(), move |stopped| {
+                    if stopped.load(Ordering::Acquire) {
+                        return Err("toolchain capture cancelled".into());
+                    }
+                    capture_guard.verify_unchanged(&capture_compiler)?;
+                    let directory = tempfile::Builder::new()
+                        .prefix("compiler-")
+                        .tempdir_in(state)
+                        .map_err(|error| error.to_string())?;
+                    let image = capture_toolchain(
+                        capture_guard.sysroot(),
+                        &directory.path().join("tree"),
+                        None,
+                        &ToolchainLimits::default(),
+                        || stopped.load(Ordering::Acquire),
+                    )
+                    .map_err(|error| format!("capture complete original toolchain: {error}"))?;
+                    capture_guard.verify_unchanged(&capture_compiler)?;
+                    image
+                        .verify_source_unchanged(capture_guard.sysroot(), || {
+                            stopped.load(Ordering::Acquire)
+                        })
+                        .map_err(|error| error.to_string())?;
+                    Ok(RetainedToolchain {
+                        guard: capture_guard,
+                        image: Arc::new(image),
+                        _directory: directory,
+                    })
+                })?
+        };
+        let Some(retained) = retained else {
+            return Ok(None);
+        };
+        // Retain the generation before releasing the cache lock; eviction can
+        // never remove its backing while these filesystem checks or a later
+        // upload use it. Validate outside the lock so other ready toolchains
+        // make progress. Keep all original checks, not just a cached path hit.
+        if retained.guard.verify_unchanged(compiler).is_err()
+            || retained
                 .image
                 .verify_source_unchanged(guard.sysroot(), || false)
-                .is_ok()
+                .is_err()
         {
-            return Ok(Some(Arc::clone(retained)));
+            let mut memo = self
+                .toolchain
+                .lock()
+                .map_err(|_| "toolchain retention lock poisoned")?;
+            if let Some(cache) = memo.as_mut() {
+                cache.invalidate(&key, &retained);
+            }
+            return Ok(None);
         }
-        // A warmup never blocks the hot decision lane on a multi-GB copy.
-        // A waiting wrapper retries this same invocation after preparation;
-        // nonwaiting callers retain the ordinary local lane. Neither acquires
-        // a remote action key or execution authority from the pending copy.
-        let state = self.state.clone();
-        let guard = guard.clone();
-        let compiler = compiler.to_path_buf();
-        let cancellation = OperationCancellation::new();
-        let stopped = cancellation.clone();
-        let handle = std::thread::Builder::new()
-            .name("rabs-remote-toolchain".into())
-            .spawn(move || {
-                guard.verify_unchanged(&compiler)?;
-                let directory = tempfile::Builder::new()
-                    .prefix("compiler-")
-                    .tempdir_in(state)
-                    .map_err(|error| error.to_string())?;
-                let image = capture_toolchain(
-                    guard.sysroot(),
-                    &directory.path().join("tree"),
-                    None,
-                    &ToolchainLimits::default(),
-                    || stopped.is_cancelled(),
-                )
-                .map_err(|error| format!("capture complete original toolchain: {error}"))?;
-                guard.verify_unchanged(&compiler)?;
-                image
-                    .verify_source_unchanged(guard.sysroot(), || stopped.is_cancelled())
-                    .map_err(|error| error.to_string())?;
-                Ok(Arc::new(RetainedToolchain {
-                    guard,
-                    image: Arc::new(image),
-                    _directory: directory,
-                }))
-            })
-            .map_err(|error| error.to_string())?;
-        *memo = Some(ToolchainMemo::Warming(ToolchainCapture {
-            cancellation,
-            handle: Some(handle),
-        }));
-        Ok(None)
+        guard.verify_unchanged(compiler)?;
+        Ok(Some(retained))
     }
 }
 
@@ -713,16 +696,15 @@ impl PendingRemote {
         let request_id = reservation
             .allocate_request_id()
             .map_err(|error| settled(format!("allocate worker request: {error}")))?;
-        let wire = json!({
-            "kind":"canonical-exec", "request_id":request_id,
-            "program":request.plan.compiler, "args":invocation.argv[1..],
-            "source_manifest":upload.wire_manifest(),
-            "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
-            "toolchain_identity":toolchain_identity_value(retained.image.identity()),
-            "artifacts":{"unit":format!("dependency-{request_id:016x}"),
-                "files":request.plan.output_names()},
-            "dependency_context":context_value(&invocation.context),
-        });
+        let wire = metadata_execution_request(
+            &request.plan,
+            &invocation.argv,
+            &invocation.context,
+            upload.wire_manifest(),
+            retained.image.identity(),
+            request_id,
+        )
+        .map_err(settled)?;
         let upload = upload
             .with_shared_toolchain(Arc::clone(&retained.image), &wire)
             .map_err(|error| settled(format!("prepare worker upload: {error}")))?;
@@ -916,6 +898,69 @@ impl PendingRemote {
             validation: invocation.validation,
         })
     }
+}
+
+/// A standalone metadata compiler normally needs one implicit slot, but an
+/// explicit -Z threads=N frontend needs an N-slot worker-local jobserver to use
+/// its requested parallelism. NUM_JOBS is a keyed compiler environment value,
+/// not a per-action resource request; dispatcher descriptors cannot cross hosts.
+///
+/// This is resource intent, not admission. The worker still caps it to its own
+/// reported slots, obtains the existing weighted host lease and supplies only
+/// grant-1 transferable tokens. No token is acquired while inputs transfer.
+/// Keep the existing metadata-only and modeled-option gates: codegen, implicit
+/// host thread counts and future concurrency flags need their own policy.
+fn metadata_execution_grant(plan: &DependencyActionPlan, argv: &[String]) -> Result<u32, String> {
+    rabs_key::live_dependency::check_dependency_cache_read_closure(&plan.invocation)
+        .map_err(|error| error.to_string())?;
+    rabs_key::output_derivation::check_dependency_output_options(&plan.invocation)
+        .map_err(|error| error.to_string())?;
+    let presented = rabs_key::invocation::parse(argv, None)
+        .map_err(|error| format!("remote resource invocation: {error:?}"))?;
+    if argv.first().map(String::as_str) != Some(plan.compiler.as_str())
+        || presented.canonical_bytes() != plan.invocation.canonical_bytes()
+    {
+        return Err("remote execution argv differs from the keyed invocation".into());
+    }
+    let mut grant = 1;
+    for (name, value) in &plan.invocation.unstable {
+        if name == "threads" {
+            // The shared output adapter above validates every occurrence,
+            // including an invalid one later overridden. Preserve rustc's
+            // ordered last-value semantics, without rewriting any argument.
+            grant = value
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|count| *count != 0)
+                .ok_or("remote frontend threads require an explicit positive count")?;
+        }
+    }
+    Ok(grant)
+}
+
+/// Construct the exact request saved for recovery, authenticated on the wire
+/// and checked against the completed delivery receipt. Resource selection must
+/// happen here, never by mutating an already journaled or dispatched request.
+fn metadata_execution_request(
+    plan: &DependencyActionPlan,
+    argv: &[String],
+    context: &DependencyExecContext,
+    source_manifest: Value,
+    toolchain: &ToolchainIdentity,
+    request_id: u64,
+) -> Result<Value, String> {
+    let grant = metadata_execution_grant(plan, argv)?;
+    Ok(json!({
+        "kind":"canonical-exec", "request_id":request_id,
+        "program":plan.compiler, "args":argv[1..],
+        "jobserver_grant":grant,
+        "source_manifest":source_manifest,
+        "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
+        "toolchain_identity":toolchain_identity_value(toolchain),
+        "artifacts":{"unit":format!("dependency-{request_id:016x}"),
+            "files":plan.output_names()},
+        "dependency_context":context_value(context),
+    }))
 }
 
 fn context_value(context: &DependencyExecContext) -> Value {
@@ -1665,5 +1710,275 @@ mod installed_input_generation_tests {
             .verify_unchanged(Path::new(&fixture.plan.source_root))
             .unwrap();
         assert!(verify_package_generation(&fixture.package, &fixture.plan).is_err());
+    }
+}
+
+#[cfg(test)]
+mod execution_resource_tests {
+    use super::*;
+    use rabs_key::live_dependency::{LiveRustcRequest, plan_dependency_action};
+
+    const PACKAGE: &str = "/home/rabs/.cargo/registry/src/test-index/parallel-1.0.0";
+    const OUTPUT: &str = "/work/target/debug/deps";
+
+    struct Fixture {
+        argv: Vec<String>,
+        plan: DependencyActionPlan,
+        context: DependencyExecContext,
+        toolchain: ToolchainIdentity,
+    }
+
+    impl Fixture {
+        fn new(extra: &[&str]) -> Self {
+            let mut argv = vec![
+                "/toolchain/bin/rustc".into(),
+                format!("{PACKAGE}/src/lib.rs"),
+                "--crate-name=parallel".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--error-format=json".into(),
+                "--json=artifacts".into(),
+                format!("--out-dir={OUTPUT}"),
+                "-L".into(),
+                format!("dependency={OUTPUT}"),
+            ];
+            argv.extend(extra.iter().map(|value| (*value).to_owned()));
+            let env = vec![
+                ("HOME".into(), "/home/rabs".into()),
+                ("CARGO_MANIFEST_DIR".into(), PACKAGE.into()),
+                ("CARGO_PKG_NAME".into(), "parallel".into()),
+                ("NUM_JOBS".into(), "128".into()),
+                ("RUSTFLAGS".into(), "-Zthreads=64".into()),
+            ];
+            let plan = plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: PACKAGE,
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let context = DependencyExecContext::new(
+                plan.source_root.clone(),
+                plan.cwd.clone(),
+                "/toolchain".into(),
+                plan.compiler.clone(),
+                plan.out_dir.clone(),
+                plan.dependency_dirs.clone(),
+                plan.execution_env.clone(),
+                [0x11; 32],
+            )
+            .unwrap();
+            Self {
+                argv,
+                plan,
+                context,
+                toolchain: ToolchainIdentity {
+                    sha256: [0x22; 32],
+                    files: 2,
+                    bytes: 100,
+                },
+            }
+        }
+
+        fn request(&self) -> Result<Value, String> {
+            // These synthetic inventory identities exercise request assembly,
+            // not source/toolchain verification, compiler execution or TLS.
+            metadata_execution_request(
+                &self.plan,
+                &self.argv,
+                &self.context,
+                json!({"fixture":"unexecuted-source-manifest"}),
+                &self.toolchain,
+                17,
+            )
+        }
+    }
+
+    #[test]
+    fn unthreaded_metadata_keeps_the_existing_single_slot_request() {
+        let fixture = Fixture::new(&[]);
+        let wire = fixture.request().unwrap();
+        assert_eq!(wire["jobserver_grant"], 1);
+        assert_eq!(wire["kind"], "canonical-exec");
+        assert_eq!(wire["request_id"], 17);
+        assert_eq!(wire["program"], "/toolchain/bin/rustc");
+        assert_eq!(wire["args"], json!(fixture.argv[1..]));
+        assert_eq!(
+            wire["source_manifest"],
+            json!({"fixture":"unexecuted-source-manifest"})
+        );
+        assert_eq!(wire["toolchain_transfer"], TOOLCHAIN_TRANSFER_VERSION);
+        assert_eq!(
+            wire["toolchain_identity"],
+            toolchain_identity_value(&fixture.toolchain)
+        );
+        assert_eq!(wire["dependency_context"], context_value(&fixture.context));
+        assert_eq!(wire["artifacts"]["unit"], "dependency-0000000000000011");
+        assert_eq!(wire["artifacts"]["files"], json!(fixture.plan.output_names()));
+        assert_eq!(wire.as_object().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn explicit_frontend_parallelism_reaches_the_real_request_without_rewriting_it() {
+        for (flags, expected) in [
+            (vec!["-Zthreads=1"], 1),
+            (vec!["-Z", "threads=2"], 2),
+            (vec!["-Zthreads=8"], 8),
+            (vec!["-Z", "threads=0008"], 8),
+            (vec!["-Zthreads=64"], 64),
+        ] {
+            let fixture = Fixture::new(&flags);
+            let args_before = fixture.argv.clone();
+            let invocation_before = fixture.plan.invocation.canonical_bytes();
+            let environment_before = fixture.plan.execution_env.clone();
+            let keyed_before = fixture.plan.keyed_env.clone();
+            let wire = fixture.request().unwrap();
+            assert_eq!(wire["jobserver_grant"], expected, "{flags:?}");
+            assert_eq!(wire["args"], json!(args_before[1..]));
+            assert_eq!(fixture.argv, args_before);
+            assert_eq!(fixture.plan.invocation.canonical_bytes(), invocation_before);
+            assert_eq!(fixture.plan.execution_env, environment_before);
+            assert_eq!(fixture.plan.keyed_env, keyed_before);
+            assert_eq!(
+                wire["dependency_context"]["env"],
+                json!(fixture.context.env())
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_thread_controls_preserve_the_last_explicit_compiler_setting() {
+        for (flags, expected) in [
+            (vec!["-Zthreads=8", "-Z", "threads=2"], 2),
+            (vec!["-Z", "threads=2", "-Zthreads=8"], 8),
+            (vec!["-Zthreads=8", "-Zembed-metadata=no", "-Zthreads=1"], 1),
+        ] {
+            let fixture = Fixture::new(&flags);
+            let wire = fixture.request().unwrap();
+            assert_eq!(wire["jobserver_grant"], expected, "{flags:?}");
+            assert_eq!(wire["args"], json!(fixture.argv[1..]));
+        }
+    }
+
+    #[test]
+    fn metadata_grant_does_not_infer_jobs_from_environment_or_codegen_units() {
+        for flags in [vec![], vec!["-Ccodegen-units=256"], vec!["-Zembed-metadata=no"]] {
+            let fixture = Fixture::new(&flags);
+            assert_eq!(fixture.request().unwrap()["jobserver_grant"], 1);
+            assert!(
+                fixture
+                    .context
+                    .env()
+                    .iter()
+                    .any(|(name, value)| name == "NUM_JOBS" && value == "128")
+            );
+            assert!(
+                fixture
+                    .context
+                    .env()
+                    .iter()
+                    .any(|(name, value)| name == "RUSTFLAGS" && value == "-Zthreads=64")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_implicit_thread_counts_never_fall_back_to_one_slot() {
+        for value in [
+            "", "0", "-1", "+2", " 2", "2 ", "2.0", "0x8", "auto", "4294967296",
+        ] {
+            for overridden in [false, true] {
+                let mut fixture = Fixture::new(&[]);
+                fixture.argv.push(format!("-Zthreads={value}"));
+                if overridden {
+                    fixture.argv.push("-Zthreads=8".into());
+                }
+                // Deliberately bypass the planner here so this exercises the
+                // last pre-dispatch guard, not only planner rejection.
+                fixture.plan.invocation =
+                    rabs_key::invocation::parse(&fixture.argv, None).unwrap();
+                assert!(
+                    fixture.request().is_err(),
+                    "{value:?}, overridden={overridden}"
+                );
+            }
+        }
+        let mut fixture = Fixture::new(&[]);
+        fixture.argv.push("-Zthreads".into());
+        fixture.plan.invocation = rabs_key::invocation::parse(&fixture.argv, None).unwrap();
+        assert!(fixture.request().is_err());
+    }
+
+    #[test]
+    fn execution_cannot_borrow_another_invocations_resource_or_action_identity() {
+        let fixture = Fixture::new(&["-Zthreads=8"]);
+        let mut changed = fixture.argv.clone();
+        *changed.last_mut().unwrap() = "-Zthreads=2".into();
+        let mut other_compiler = fixture.argv.clone();
+        other_compiler[0] = "/other-toolchain/bin/rustc".into();
+        let mut other_source = fixture.argv.clone();
+        other_source[1] = format!("{PACKAGE}/src/other.rs");
+        for argv in [Vec::new(), changed, other_compiler, other_source] {
+            assert!(metadata_execution_grant(&fixture.plan, &argv).is_err());
+        }
+        assert_eq!(
+            metadata_execution_grant(&fixture.plan, &fixture.argv).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn resource_selection_does_not_expand_the_metadata_only_execution_class() {
+        for emit in [
+            "dep-info,link",
+            "dep-info,metadata,link",
+            "dep-info",
+            "metadata",
+        ] {
+            let mut fixture = Fixture::new(&["-Zthreads=8"]);
+            *fixture
+                .argv
+                .iter_mut()
+                .find(|arg| arg.starts_with("--emit="))
+                .unwrap() = format!("--emit={emit}");
+            fixture.plan.invocation = rabs_key::invocation::parse(&fixture.argv, None).unwrap();
+            assert!(fixture.request().is_err(), "{emit}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_binds_the_selected_cpu_grant_without_reexecution_authority() {
+        let fixture = Fixture::new(&["-Zthreads=8"]);
+        let wire = fixture.request().unwrap();
+        let parent = crate::test_util::private_tempdir();
+        let mut directory = recovery::ResultDirectory::new(parent.path()).unwrap();
+        directory
+            .record_request(
+                &wire,
+                "fixture-action",
+                &json!({"remote_protocol":1, "worker_id":"worker-a",
+                    "worker_spki_sha256":"ab".repeat(32), "listen":"127.0.0.1:9123"}),
+            )
+            .unwrap();
+        let path = directory.path().to_path_buf();
+        drop(directory);
+        let saved = std::fs::read(path.join("request.json")).unwrap();
+        assert_eq!(saved, serde_json::to_vec(&wire).unwrap());
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(path.join("recovery.json")).unwrap()).unwrap();
+        assert_eq!(record["request_sha256"], hex(&Sha256::digest(&saved)));
+        let mut changed = wire.clone();
+        changed["jobserver_grant"] = json!(1);
+        assert_ne!(
+            record["request_sha256"],
+            hex(&Sha256::digest(serde_json::to_vec(&changed).unwrap()))
+        );
+        assert_eq!(record["reexecute"], false);
+        assert_eq!(record["publication_authorized"], false);
+        assert_eq!(record["execution_state"], "unknown");
     }
 }

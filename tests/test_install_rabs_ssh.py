@@ -353,7 +353,7 @@ class SSHDeploymentTests(unittest.TestCase):
         (scripts / "cargo-rabs").chmod(0o755)
         target = checkout / "target" / "selected-platform"
         for name, profile in [("rabs-wrap", "wrapper-release"), ("rabsd", "daemon-release"),
-                              ("rabs-wkr", "daemon-release")]:
+                              ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release")]:
             directory = target / profile
             directory.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.bundle / name, directory / name)

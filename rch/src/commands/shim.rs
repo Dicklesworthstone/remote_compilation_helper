@@ -76,7 +76,10 @@ use crate::ui::theme::StatusIndicator;
 ///
 /// `7` preserves caller RCH_REQUIRE_REMOTE values and marks only the shim's
 /// default injection, bound to the exec process, for safe speed-gate admission.
-const SHIM_VERSION: &str = "7";
+///
+/// `8` routes package verification and explicit publish dry-runs through RCH.
+/// Actual publication and ambiguous/non-verification arguments remain local.
+const SHIM_VERSION: &str = "8";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -319,6 +322,41 @@ for a in "$@"; do
       exec_local "$@" ;;
   esac
 done
+# Package verification builds are already supported by RCH, but skipping them
+# here runs rustc on the dispatcher before RCH ever gets a placement decision.
+# This is only an argv routing prefilter; RCH's classifier and source/archive
+# contracts remain authoritative. Never treat an option VALUE as a dry-run
+# flag, or send real publication, listing, or --no-verify through this route.
+package_verification() {{
+  rch_packaging_command=$1
+  shift
+  rch_packaging_dry_run=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n) rch_packaging_dry_run=1; shift ;;
+      --workspace|--allow-dirty|--no-metadata|--exclude-lockfile|\
+      --all-features|--no-default-features|--keep-going|\
+      --locked|--offline|--frozen|--verbose|-v|-vv|-vvv|--quiet|-q)
+        shift ;;
+      --index|--registry|--token|--color|--config|-Z|-C|\
+      -p|--package|--exclude|-F|--features|-j|--jobs|--target|\
+      --target-dir|-m|--manifest-path|--lockfile-path|--message-format)
+        [ "$#" -ge 2 ] || return 1
+        case "$2" in ''|-*) return 1 ;; esac
+        shift 2 ;;
+      --index=?*|--registry=?*|--token=?*|--color=?*|--config=?*|\
+      -Z=?*|-C=?*|-p=?*|--package=?*|--exclude=?*|-F=?*|--features=?*|\
+      -j=?*|--jobs=?*|--target=?*|--target-dir=?*|-m=?*|\
+      --manifest-path=?*|--lockfile-path=?*|--message-format=?*|\
+      -j?*|-p?*|-F?*|-m?*|-Z?*)
+        shift ;;
+      # Unknown options might consume the next word. Do not guess: this also
+      # keeps --no-verify, --list/-l, help and argument separators local.
+      *) return 1 ;;
+    esac
+  done
+  [ "$rch_packaging_command" = package ] || [ "$rch_packaging_dry_run" = 1 ]
+}}
 # Inspect a function-local copy of argv. Never shift the caller's arguments or
 # reconstruct a shell command: option values can contain spaces, quotes, and
 # names such as "build". RCH still owns eligibility, topology and placement.
@@ -327,24 +365,36 @@ done
 # RCH's source-closure preflight must still approve or refuse that request.
 find_subcommand() {{
   rch_subcommand=
+  rch_packaging=0
+  rch_packaging_globals=1
   case "${{1:-}}" in +?*) shift ;; esac
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -v|-vv|-vvv|--verbose|-q|--quiet|--locked|--offline|--frozen) shift ;;
       --color|--config|-Z|-C)
         [ "$#" -ge 2 ] || return 0
+        case "$2" in ''|-*) rch_packaging_globals=0 ;; esac
         shift 2 ;;
       --color=?*|--config=?*|-Z?*|-C?*) shift ;;
-      --) shift; break ;;
+      --) rch_packaging_globals=0; shift; break ;;
       -*) return 0 ;;
       *) break ;;
     esac
   done
   rch_subcommand="${{1:-}}"
+  case "$rch_subcommand" in
+    package|publish)
+      if [ "$rch_packaging_globals" = 1 ] && package_verification "$@"; then
+        rch_packaging=1
+      fi ;;
+  esac
 }}
 find_subcommand "$@"
 case "$rch_subcommand" in
   build|b|test|t|check|c|clippy|bench|doc|nextest|run|r|zigbuild|xwin)
+    {offload} ;;
+  package|publish)
+    [ "$rch_packaging" = 1 ] || exec_local "$@"
     {offload} ;;
   *)
     exec_local "$@" ;;
@@ -1204,6 +1254,263 @@ mod tests {
         let body = cargo_shim_body(true);
         // The catch-all arm runs the real cargo for everything else.
         assert!(body.contains("*)\n    exec_local \"$@\" ;;"));
+    }
+
+    /// Observe the real rendered shim with inert executables. PATH contains
+    /// only this fixture: no host Cargo, rustup, compiler or registry is used.
+    #[cfg(unix)]
+    fn packaging_invocation(
+        strict: bool,
+        args: &[&str],
+        environment: &[(&str, &str)],
+        rch_available: bool,
+    ) -> std::process::Output {
+        let root = tempfile::tempdir().unwrap();
+        let tools = root.path().join("tools with ' quotes");
+        std::fs::create_dir(&tools).unwrap();
+        let shim = root.path().join("cargo");
+        write_exe(&shim, &cargo_shim_body(strict));
+        let stub = r#"#!/bin/sh
+printf '%s\n' "${0##*/}" >> "$RCH_SHIM_TEST_EVENTS"
+printf '%s\000' "${0##*/}" "${CARGO_BUILD_JOBS-unset}" \
+  "${RCH_REQUIRE_REMOTE-unset}" "${RCH_QUEUE_WHEN_BUSY-unset}" \
+  "${RCH_SPEED_GATE_SHIM_PID-unset}" "$$" "$@"
+exit "${RCH_SHIM_TEST_STATUS:-0}"
+"#;
+        for program in ["rch", "real-cargo", "rustup"] {
+            if program != "rch" || rch_available {
+                write_exe(&tools.join(program), stub);
+            }
+        }
+        let events = root.path().join("events");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg(&shim)
+            .args(args)
+            .current_dir(root.path())
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", &tools)
+            .env("LC_ALL", "C")
+            .env("RCH_REAL_CARGO", tools.join("real-cargo"))
+            .env("RCH_SHIM_TEST_EVENTS", &events)
+            .env("RCH_SPEED_GATE_SHIM_PID", "inherited-not-current");
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        let output = output_retrying_text_busy(&mut command);
+        let events = std::fs::read_to_string(events).unwrap();
+        assert_eq!(
+            events.lines().count(),
+            1,
+            "multiple execution routes: {events}"
+        );
+        assert!(output.stderr.is_empty(), "{output:?}");
+        output
+    }
+
+    #[cfg(unix)]
+    fn packaging_fields(output: &std::process::Output) -> Vec<&str> {
+        assert_eq!(output.stdout.last(), Some(&0), "{output:?}");
+        std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .split_terminator('\0')
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_verification_reaches_rch_without_rewriting_argv() {
+        for strict in [true, false] {
+            for args in [
+                vec!["package"],
+                vec!["package", "--locked", "--allow-dirty"],
+                vec!["package", "--workspace", "--exclude", "other"],
+                vec!["publish", "--dry-run"],
+                vec!["publish", "-n"],
+                vec!["publish", "--locked", "--registry", "staging", "--dry-run"],
+                vec!["publish", "-n", "-pcrate", "-j2", "-Ffeature"],
+                vec!["+nightly", "--color", "never", "publish", "--dry-run"],
+                vec!["--config", "build.jobs=2", "--offline", "package"],
+                vec![
+                    "-Zunstable-options",
+                    "package",
+                    "--lockfile-path",
+                    "scratch.lock",
+                ],
+            ] {
+                let output = packaging_invocation(strict, &args, &[], true);
+                assert!(output.status.success(), "{args:?}: {output:?}");
+                let fields = packaging_fields(&output);
+                assert_eq!(fields[0], "rch", "{args:?}");
+                assert_eq!(
+                    fields[1], "unset",
+                    "offload must not acquire a local job cap"
+                );
+                let mut expected = vec!["exec", "--", "cargo"];
+                expected.extend_from_slice(&args);
+                assert_eq!(&fields[6..], expected.as_slice());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_publication_listing_and_ambiguous_forms_stay_local() {
+        for args in [
+            vec!["publish"],
+            vec!["publish", "--registry", "staging"],
+            vec!["publish", "--token", "fixture-token"],
+            vec!["package", "--no-verify"],
+            vec!["publish", "--dry-run", "--no-verify"],
+            vec!["publish", "--no-verify", "-n"],
+            vec!["package", "--list"],
+            vec!["package", "-l"],
+            vec!["package", "--help"],
+            vec!["publish", "-n", "-h"],
+            vec!["publish", "--dry-run=false"],
+            vec!["publish", "--dry-run=true"],
+            vec!["publish", "--", "--dry-run"],
+            vec!["--", "publish", "-n"],
+            vec!["publish", "--future-option", "--dry-run"],
+            vec!["publish", "--dry-run", "--future-option"],
+            vec!["publish", "-nq"],
+            vec!["package", "positional"],
+            vec!["package", "--manifest-path"],
+            vec!["package", "--manifest-path="],
+            vec!["--config", "", "publish", "--dry-run"],
+            vec!["--config", "-n", "publish", "--dry-run"],
+        ] {
+            let output = packaging_invocation(true, &args, &[], true);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            let fields = packaging_fields(&output);
+            assert_eq!(fields[0], "real-cargo", "{args:?}");
+            assert_eq!(fields[1], "8");
+            assert_eq!(&fields[6..], args.as_slice());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_option_values_never_enable_a_dry_run() {
+        for flag in [
+            "--index", "--registry", "--token", "--color", "--config", "-Z", "-C",
+            "-p", "--package", "--exclude", "-F", "--features", "-j", "--jobs",
+            "--target", "--target-dir", "-m", "--manifest-path", "--lockfile-path",
+            "--message-format",
+        ] {
+            let inline = format!("{flag}=--dry-run");
+            for args in [
+                vec!["publish", flag, "--dry-run"],
+                vec!["publish", flag, "-n"],
+                vec!["publish", flag, "ordinary --dry-run text"],
+                vec!["publish", &inline],
+                vec!["publish", "--dry-run", flag, ""],
+                vec!["publish", "--dry-run", flag, "-n"],
+            ] {
+                let output = packaging_invocation(true, &args, &[], true);
+                assert!(output.status.success());
+                let fields = packaging_fields(&output);
+                assert_eq!(fields[0], "real-cargo", "{args:?}");
+                assert_eq!(&fields[6..], args.as_slice());
+            }
+            let args = ["publish", flag, "fixture", "--dry-run"];
+            let output = packaging_invocation(true, &args, &[], true);
+            assert!(output.status.success());
+            assert_eq!(packaging_fields(&output)[0], "rch", "{args:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_escape_hatches_keep_the_local_toolchain() {
+        for (key, value) in [
+            ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+            ("RCH_SHIM_LOCAL_IDE", "1"),
+            ("RUSTC_WORKSPACE_WRAPPER", "/fake/clippy-driver"),
+        ] {
+            let args = ["publish", "--dry-run"];
+            let output = packaging_invocation(true, &args, &[(key, value)], true);
+            assert!(output.status.success());
+            let fields = packaging_fields(&output);
+            assert_eq!(fields[0], "real-cargo", "{key}");
+            assert_eq!(&fields[6..], &args);
+            let args = ["+nightly", "publish", "--dry-run"];
+            let output = packaging_invocation(true, &args, &[(key, value)], true);
+            assert!(output.status.success());
+            let fields = packaging_fields(&output);
+            assert_eq!(fields[0], "rustup", "{key}");
+            assert_eq!(
+                &fields[6..],
+                &["run", "nightly", "cargo", "publish", "--dry-run"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_offload_keeps_caller_placement_controls() {
+        for strict in [true, false] {
+            for caller in [None, Some(""), Some("0"), Some("1")] {
+                let mut environment = vec![("RCH_QUEUE_WHEN_BUSY", "caller-queue")];
+                if let Some(value) = caller {
+                    environment.push(("RCH_REQUIRE_REMOTE", value));
+                }
+                let output = packaging_invocation(strict, &["package"], &environment, true);
+                assert!(output.status.success());
+                let fields = packaging_fields(&output);
+                assert_eq!(fields[0], "rch");
+                assert_eq!(
+                    fields[2],
+                    caller.unwrap_or(if strict { "1" } else { "unset" })
+                );
+                assert_eq!(fields[3], if strict { "1" } else { "caller-queue" });
+                assert_eq!(
+                    fields[4],
+                    if strict && caller.is_none() {
+                        fields[5]
+                    } else {
+                        "unset"
+                    }
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_arguments_and_failure_status_survive_the_handoff() {
+        let args = [
+            "publish",
+            "--dry-run",
+            "--manifest-path",
+            "dir with ' quote/Cargo.toml",
+            "--config",
+            "alias.note=\"$(echo not-executed); --no-verify\"",
+        ];
+        let output = packaging_invocation(true, &args, &[("RCH_SHIM_TEST_STATUS", "23")], true);
+        assert_eq!(output.status.code(), Some(23));
+        let fields = packaging_fields(&output);
+        assert_eq!(fields[0], "rch");
+        let mut expected = vec!["exec", "--", "cargo"];
+        expected.extend_from_slice(&args);
+        assert_eq!(&fields[6..], expected.as_slice());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaging_missing_rch_and_ide_formats_keep_the_local_route() {
+        for args in [vec!["package"], vec!["publish", "--dry-run"]] {
+            let output = packaging_invocation(true, &args, &[], false);
+            assert!(output.status.success());
+            let fields = packaging_fields(&output);
+            assert_eq!(fields[0], "real-cargo");
+            assert_eq!(&fields[6..], args.as_slice());
+        }
+        let args = ["package", "--message-format=json-diagnostic-short"];
+        let output = packaging_invocation(true, &args, &[], true);
+        assert!(output.status.success());
+        assert_eq!(packaging_fields(&output)[0], "real-cargo");
     }
 
     /// Execute a rendered shim body under `/bin/sh` in a sandbox and report

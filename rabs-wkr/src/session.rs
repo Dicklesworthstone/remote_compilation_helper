@@ -473,6 +473,25 @@ fn free_disk_mib(_dir: &std::path::Path) -> u64 {
 /// heads carry diagnostics; overflow streams to disk spill archives.
 const EXEC_STREAM_RESIDENT_BOUND: usize = 1024 * 1024;
 
+/// Worker-selected execution resources. A configured host budget coordinates
+/// independent workers in one domain; it never changes the logical grant in
+/// response to contention. The worker's original slot ceiling still applies.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionResources<'a> {
+    pub slots: u32,
+    pub host_budget: Option<&'a crate::host_budget::HostBudget>,
+}
+
+impl ExecutionResources<'_> {
+    #[must_use]
+    pub const fn new(slots: u32) -> Self {
+        Self {
+            slots,
+            host_budget: None,
+        }
+    }
+}
+
 /// Execute through the canonical sandbox with the default finite local budget.
 /// This synchronous interface is for blocking callers; async sessions must use
 /// `ExecutionTask` so the reactor continues handling control traffic.
@@ -481,7 +500,7 @@ pub fn execute_canonical(
     request: &CanonicalExecRequest,
     cargo_home_backing: &std::path::Path,
     home_backing: &std::path::Path,
-    slots: u32,
+    resources: ExecutionResources<'_>,
     spill_root: &std::path::Path,
 ) -> ExecResult {
     let Ok(control) = ExecutionControl::new(DEFAULT_EXECUTION_TIMEOUT) else {
@@ -491,7 +510,7 @@ pub fn execute_canonical(
         request,
         cargo_home_backing,
         home_backing,
-        slots,
+        resources,
         spill_root,
         &control,
     )
@@ -506,7 +525,7 @@ pub fn execute_canonical_controlled(
     request: &CanonicalExecRequest,
     cargo_home_backing: &std::path::Path,
     home_backing: &std::path::Path,
-    slots: u32,
+    resources: ExecutionResources<'_>,
     spill_root: &std::path::Path,
     control: &ExecutionControl,
 ) -> ExecResult {
@@ -514,7 +533,7 @@ pub fn execute_canonical_controlled(
         request,
         cargo_home_backing,
         home_backing,
-        slots,
+        resources,
         spill_root,
         control,
         None,
@@ -535,7 +554,7 @@ pub fn execute_uploaded_canonical_controlled(
     request: &CanonicalExecRequest,
     cargo_home_backing: &std::path::Path,
     home_backing: &std::path::Path,
-    slots: u32,
+    resources: ExecutionResources<'_>,
     spill_root: &std::path::Path,
     control: &ExecutionControl,
     source: &SourceOwner,
@@ -544,7 +563,7 @@ pub fn execute_uploaded_canonical_controlled(
         request,
         cargo_home_backing,
         home_backing,
-        slots,
+        resources,
         spill_root,
         control,
         Some(source),
@@ -584,7 +603,7 @@ fn execute_canonical_inner(
     request: &CanonicalExecRequest,
     cargo_home_backing: &std::path::Path,
     home_backing: &std::path::Path,
-    slots: u32,
+    resources: ExecutionResources<'_>,
     spill_root: &std::path::Path,
     control: &ExecutionControl,
     source: Option<&SourceOwner>,
@@ -597,6 +616,20 @@ fn execute_canonical_inner(
     };
     use std::process::Stdio;
     if control.reason().is_some() {
+        return exec_error(request.request_id);
+    }
+    let grant = request
+        .jobserver_grant
+        .unwrap_or(resources.slots)
+        .min(resources.slots)
+        .max(1);
+    if let Some(budget) = resources.host_budget
+        && grant > budget.capacity()
+    {
+        let _ = control.retain_outputs(Err(format!(
+            "fixed execution grant {grant} exceeds configured host capacity {}; set an explicit jobserver_grant within that capacity",
+            budget.capacity(),
+        )));
         return exec_error(request.request_id);
     }
     let support = HostIsolationSupport::probe();
@@ -797,7 +830,6 @@ fn execute_canonical_inner(
     };
     // Worker-local jobserver authority runs on the FINAL env: extra_env
     // may carry smuggled coordination keys, so replacement must see them.
-    let grant = request.jobserver_grant.unwrap_or(slots).min(slots).max(1);
     // One real FIFO budget is held until the process group and drains resolve.
     // Runtime coordination belongs in writable HOME, never in verified source.
     let bridge = match crate::jobserver::JobserverBridge::mint(grant, execution_home) {
@@ -873,7 +905,50 @@ fn execute_canonical_inner(
     if control.reason().is_some() {
         return exec_error(request.request_id);
     }
+    // Bulk source/toolchain preparation and final input verification precede
+    // host CPU admission. The entire fixed C is reserved; contention never
+    // changes NUM_JOBS or exposes a partially funded jobserver.
+    let mut host_lease = match resources
+        .host_budget
+        .map(|budget| budget.acquire(grant, || control.reason().is_some()))
+        .transpose()
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("host execution admission: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
+    if control.reason().is_some() {
+        return exec_error(request.request_id);
+    }
+    if let Some(lease) = host_lease.as_mut() {
+        if let Err(error) = lease.arm(request.request_id) {
+            let _ = control.retain_outputs(Err(format!("host execution ownership: {error}")));
+            return exec_error(request.request_id);
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "kind":"worker-host-budget-admitted", "request_id":request.request_id,
+                "grant":grant, "host_capacity":resources.host_budget.map(|budget| budget.capacity()),
+            })
+        );
+    }
+    if control.reason().is_some() {
+        // Durable arming can spend the remainder of the execution lease.
+        // There has still been no spawn attempt, so explicit cancellation can
+        // return those credits without pretending to have reaped a process.
+        if let Some(lease) = host_lease.take()
+            && let Err(error) = lease.abandon_unstarted()
+        {
+            let _ = control.retain_outputs(Err(format!("unstarted host lease cleanup: {error}")));
+        }
+        return exec_error(request.request_id);
+    }
     let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
+        // The spawn adapter can fail after creating a child. Its error does not
+        // carry complete cleanup evidence, so an armed host lease stays fenced.
         return exec_error(request.request_id);
     };
     let limits = rabs_asupersync::stream_drain::DrainLimits {
@@ -882,13 +957,33 @@ fn execute_canonical_inner(
     };
     // Live tails are observational only. The SAME managed wait still owns the
     // aggregate capture budget, cancellation, descendant cleanup and full spools.
-    let outcome = match group.wait_with_bounded_drain_preview(
+    let waited = group.wait_with_bounded_drain_preview(
         &limits,
         rabs_asupersync::stream_drain::DEFAULT_MAX_CAPTURE_BYTES,
         Some(control.output_observer()),
         || control.reason().is_some(),
-    ) {
+    );
+    drop(bridge);
+    match waited {
         Ok(output) => {
+            // Ok means the leader was reaped AND both bounded drain lanes
+            // joined. Residual descendants are a separate required zero proof.
+            // Generic wait/drain errors and unwinds never enter this release.
+            if let Some(lease) = host_lease.take() {
+                if let Err(error) = lease.finish(output.residual_group_members) {
+                    let _ = control.retain_outputs(Err(format!("host execution cleanup: {error}")));
+                    let mut result = exec_error(request.request_id);
+                    result.residual_group_members = output.residual_group_members;
+                    return result;
+                }
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "kind":"worker-host-budget-released", "request_id":request.request_id,
+                        "grant":grant, "residual_group_members":0,
+                    })
+                );
+            }
             // A same-credential host mutation is outside namespace isolation.
             // Detect retained backing changes before offering successful output;
             // read-only file modes alone are not a cryptographic seal.
@@ -957,9 +1052,15 @@ fn execute_canonical_inner(
                 && output.residual_group_members == 0
                 && control.reason().is_none()
             {
-                let capture = artifacts
-                    .capture_with_dependency_inputs(dependency_inputs.as_ref(), || {
-                        control.reason().is_some()
+                let capture = output
+                    .stdout
+                    .reader()
+                    .and_then(|stdout| {
+                        artifacts.capture_with_cargo_output(
+                            dependency_inputs.as_ref(),
+                            stdout,
+                            || control.reason().is_some(),
+                        )
                     })
                     .and_then(|captured| {
                         if let Some(inputs) = &generated_inputs {
@@ -990,9 +1091,7 @@ fn execute_canonical_inner(
             }
         }
         Err(_) => exec_error(request.request_id),
-    };
-    drop(bridge);
-    outcome
+    }
 }
 
 fn exec_error(request_id: u64) -> ExecResult {
@@ -1149,7 +1248,13 @@ mod tests {
             command_context: CommandContext::default(),
             dependency_context: None,
         };
-        let result = execute_canonical(&request, dir.path(), dir.path(), 4, dir.path());
+        let result = execute_canonical(
+            &request,
+            dir.path(),
+            dir.path(),
+            ExecutionResources::new(4),
+            dir.path(),
+        );
         assert!(!result.executed, "no fabricated success off-Linux");
     }
 
@@ -1169,8 +1274,14 @@ mod tests {
         };
         let control = ExecutionControl::new(std::time::Duration::from_secs(10)).unwrap();
         control.cancel(crate::execution::StopReason::Cancelled);
-        let result =
-            execute_canonical_controlled(&request, dir.path(), dir.path(), 2, dir.path(), &control);
+        let result = execute_canonical_controlled(
+            &request,
+            dir.path(),
+            dir.path(),
+            ExecutionResources::new(2),
+            dir.path(),
+            &control,
+        );
         assert!(!result.executed);
         assert_eq!(result.exit_code, 130);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);

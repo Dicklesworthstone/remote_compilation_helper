@@ -6,6 +6,8 @@
 //! precede its live-coordinator callback; a refused callback sends no inputs or
 //! execution request. The ordinary receiver verifies private delivery bytes.
 //! Publication, Cargo output installation and fallback remain with the caller.
+//! Typed transport failures temporarily exclude this worker from NEW placement;
+//! they never retry an execution or resolve its durable uncertainty.
 
 use super::secure_worker_delivery::{
     DEPENDENCY_CONTEXT_VERSION, OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook,
@@ -25,14 +27,50 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Includes both the outward reconnect and TLS handshake. The established ATP
 /// receiver separately bounds authentication, transfer, execution and cleanup.
 const CONNECT_BUDGET: Duration = Duration::from_secs(60);
+
+/// A bounded placement hint, not an execution lease or a result quarantine.
+/// Failed workers otherwise consume another connection budget on every turn
+/// through the live pool. The next ordinary request may probe after this delay;
+/// no timer, background task or second dispatch is created here.
+const FIRST_CONNECTION_COOLDOWN: Duration = Duration::from_secs(5);
+const MAX_CONNECTION_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct ConnectionCooldown {
+    failed_at: Option<Instant>,
+    delay: Duration,
+}
+
+impl ConnectionCooldown {
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        let failed_at = self.failed_at?;
+        // A regressed injected clock cannot make a failed worker available.
+        let elapsed = now.checked_duration_since(failed_at).unwrap_or_default();
+        let remaining = self.delay.saturating_sub(elapsed);
+        (!remaining.is_zero()).then_some(remaining)
+    }
+
+    fn interrupted(&mut self, now: Instant) {
+        self.delay = if self.failed_at.is_some() {
+            self.delay.saturating_mul(2).min(MAX_CONNECTION_COOLDOWN)
+        } else {
+            FIRST_CONNECTION_COOLDOWN
+        };
+        self.failed_at = Some(now);
+    }
+
+    fn completed(&mut self) {
+        *self = Self::default();
+    }
+}
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -65,6 +103,7 @@ pub struct RemoteDependencyTransport {
     state: PathBuf,
     tls: TlsFiles,
     occupied: AtomicBool,
+    cooldown: Mutex<ConnectionCooldown>,
 }
 
 impl RemoteDependencyTransport {
@@ -108,6 +147,7 @@ impl RemoteDependencyTransport {
             state,
             tls,
             occupied: AtomicBool::new(false),
+            cooldown: Mutex::new(ConnectionCooldown::default()),
         })
     }
 
@@ -151,7 +191,13 @@ impl RemoteDependencyTransport {
     /// Reserve before telling Cargo's wrapper that remote work is admitted.
     /// There is no queue or sleeping waiter. The owned guard is `Send`, so the
     /// caller can hand it from the socket handler to a bounded blocking lane.
+    /// Cooling workers return WouldBlock, so the existing pool tries its next
+    /// candidate before admitting this invocation. Expiry grants no authority.
     pub fn try_reserve(self: &Arc<Self>) -> io::Result<RemoteDependencyReservation> {
+        self.try_reserve_at(Instant::now())
+    }
+
+    fn try_reserve_at(self: &Arc<Self>, now: Instant) -> io::Result<RemoteDependencyReservation> {
         self.occupied
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
@@ -160,12 +206,58 @@ impl RemoteDependencyTransport {
                     "remote dependency worker is busy",
                 )
             })?;
-        Ok(RemoteDependencyReservation {
+        // Own release immediately: every cooldown/state refusal below must
+        // release the slot without opening a ledger or allocating a request ID.
+        let reservation = RemoteDependencyReservation {
             transport: Arc::clone(self),
             admission: None,
             request_id: None,
             dispatch_attempted: false,
-        })
+        };
+        let cooldown = self.cooldown.try_lock().map_err(|_| {
+            // Contended or poisoned local hints exclude only THIS candidate,
+            // never strand the slot or abort selection of a healthy peer.
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote dependency connectivity state unavailable",
+            )
+        })?;
+        if let Some(remaining) = cooldown.remaining(now) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "remote dependency worker cooling down ({} ms remaining)",
+                    remaining.as_millis(),
+                ),
+            ));
+        }
+        drop(cooldown);
+        Ok(reservation)
+    }
+
+    fn observe_delivery(
+        &self,
+        outcome: &Result<Delivery, DeliveryFailure>,
+        caller_cancelled: bool,
+        now: Instant,
+    ) {
+        // This runs before the reservation releases occupied. It must never
+        // replace a verified result or change execution_may_have_run if local
+        // bookkeeping fails. Only typed socket/deadline evidence penalizes a
+        // worker; compiler failures, policy refusals and local I/O do not.
+        let Ok(mut cooldown) = self.cooldown.lock() else {
+            return;
+        };
+        match outcome {
+            Ok(delivery) if delivery.acknowledgments_confirmed => cooldown.completed(),
+            Ok(delivery) if delivery.acknowledgment_interrupted && !caller_cancelled => {
+                cooldown.interrupted(now);
+            }
+            Err(failure) if failure.transport_interrupted && !caller_cancelled => {
+                cooldown.interrupted(now);
+            }
+            _ => {}
+        }
     }
 
     /// Convenience entry for callers that have not already offered remote work.
@@ -383,14 +475,17 @@ impl RemoteDependencyReservation {
                 invalid("execution request differs from its durable reserved worker ID"),
             ));
         }
-        self.transport.execute_reserved(
+        let outcome = self.transport.execute_reserved(
             self.admission.take(),
             request,
             upload,
             destination,
-            cancellation,
+            cancellation.clone(),
             Box::new(on_admitted),
-        )
+        );
+        self.transport
+            .observe_delivery(&outcome, cancellation.is_cancelled(), Instant::now());
+        outcome
     }
 }
 
@@ -608,6 +703,231 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    fn disconnected(execution_may_have_run: bool) -> Result<Delivery, DeliveryFailure> {
+        let mut failure = failure(
+            Path::new("/private/retained-result"),
+            worker_transport_error(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "fixture socket deadline",
+            )),
+        );
+        failure.execution_may_have_run = execution_may_have_run;
+        Err(failure)
+    }
+
+    fn delivered(confirmed: bool, interrupted: bool) -> Result<Delivery, DeliveryFailure> {
+        // Transport outcome fixture only, not claimed TLS/compiler execution.
+        Ok(Delivery {
+            directory: PathBuf::from("/private/retained-result"),
+            receipt: serde_json::json!({"exit_code": 1, "publication_authorized": false}),
+            acknowledgments_confirmed: confirmed,
+            acknowledgment_error: (!confirmed).then(|| "fixture ACK failure".into()),
+            acknowledgment_interrupted: interrupted,
+        })
+    }
+
+    #[test]
+    fn connectivity_failure_excludes_only_that_worker_without_allocating_work() {
+        let failed = transport();
+        let healthy = transport();
+        let now = Instant::now();
+        let owner = failed.try_reserve_at(now).unwrap();
+        let outcome = disconnected(false);
+        failed.observe_delivery(&outcome, false, now);
+        drop(owner);
+        for _ in 0..128 {
+            let error = failed.try_reserve_at(now).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(error.to_string().contains("cooling down"));
+            assert!(!failed.occupied.load(Ordering::Acquire));
+        }
+        let owner = healthy.try_reserve_at(now).unwrap();
+        assert!(owner.request_id.is_none());
+        assert!(owner.admission.is_none());
+        assert!(!owner.dispatch_attempted);
+        assert_eq!(
+            failed.cooldown.lock().unwrap().delay,
+            FIRST_CONNECTION_COOLDOWN,
+        );
+        let error = outcome.unwrap_err();
+        assert!(!error.execution_may_have_run);
+        assert!(error.transport_interrupted);
+        assert_eq!(error.directory, Path::new("/private/retained-result"));
+    }
+
+    #[test]
+    fn cooldown_is_bounded_exponential_and_polling_does_not_renew_it() {
+        let mut state = ConnectionCooldown::default();
+        let start = Instant::now();
+        assert_eq!(state.remaining(start), None);
+        let mut now = start;
+        for seconds in [5, 10, 20, 40, 60, 60, 60] {
+            state.interrupted(now);
+            let delay = Duration::from_secs(seconds);
+            assert_eq!(state.remaining(now), Some(delay));
+            for _ in 0..128 {
+                assert_eq!(state.remaining(now + delay / 2), Some(delay / 2));
+            }
+            assert_eq!(state.remaining(now + delay), None);
+            assert_eq!(state.remaining(start), Some(delay));
+            now += delay;
+        }
+        for _ in 0..1000 {
+            state.interrupted(now);
+            assert_eq!(state.remaining(now), Some(MAX_CONNECTION_COOLDOWN));
+        }
+        state.completed();
+        state.interrupted(now);
+        assert_eq!(state.remaining(now), Some(FIRST_CONNECTION_COOLDOWN));
+    }
+
+    #[test]
+    fn cooldown_expiry_allows_only_one_concurrent_probe_without_resetting_history() {
+        let transport = transport();
+        let now = Instant::now();
+        transport.observe_delivery(&disconnected(false), false, now);
+        let retry_at = now + FIRST_CONNECTION_COOLDOWN;
+        assert!(
+            transport
+                .try_reserve_at(retry_at - Duration::from_nanos(1))
+                .is_err(),
+        );
+        let all_reserved = Arc::new(std::sync::Barrier::new(16));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let transport = Arc::clone(&transport);
+            let all_reserved = Arc::clone(&all_reserved);
+            threads.push(std::thread::spawn(move || {
+                let owner = transport.try_reserve_at(retry_at);
+                let admitted = owner.is_ok();
+                if let Err(error) = &owner {
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                }
+                // Hold the sole successful guard until all contenders tried.
+                all_reserved.wait();
+                drop(owner);
+                admitted
+            }));
+        }
+        let winners = threads
+            .into_iter()
+            .map(|thread| usize::from(thread.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        assert!(!transport.occupied.load(Ordering::Acquire));
+        // An offer that is abandoned before execution proves no recovery.
+        drop(transport.try_reserve_at(retry_at).unwrap());
+        transport.observe_delivery(&disconnected(false), false, retry_at);
+        assert_eq!(
+            transport.cooldown.lock().unwrap().remaining(retry_at),
+            Some(FIRST_CONNECTION_COOLDOWN * 2),
+        );
+    }
+
+    #[test]
+    fn local_errors_and_caller_cancellation_neither_penalize_nor_rehabilitate() {
+        let transport = transport();
+        let now = Instant::now();
+        transport.observe_delivery(&disconnected(false), false, now);
+        let retry_at = now + FIRST_CONNECTION_COOLDOWN;
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::Other,
+        ] {
+            // Identical ErrorKinds/messages from a filesystem or policy seam
+            // have no typed transport provenance and cannot cool a worker.
+            let outcome = Err(failure(
+                Path::new("/private/retained-result"),
+                io::Error::new(kind, "socket timeout: misleading nontransport text"),
+            ));
+            transport.observe_delivery(&outcome, false, retry_at);
+        }
+        transport.observe_delivery(&disconnected(true), true, retry_at);
+        transport.observe_delivery(&delivered(false, true), true, retry_at);
+        transport.observe_delivery(&delivered(false, false), false, retry_at);
+        let state = transport.cooldown.lock().unwrap();
+        assert_eq!(state.failed_at, Some(now));
+        assert_eq!(state.delay, FIRST_CONNECTION_COOLDOWN);
+        drop(state);
+        assert!(transport.try_reserve_at(retry_at).is_ok());
+    }
+
+    #[test]
+    fn a_verified_exchange_resets_connectivity_even_for_a_failed_compilation() {
+        let transport = transport();
+        let now = Instant::now();
+        transport.observe_delivery(&disconnected(false), false, now);
+        let owner = transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).unwrap();
+        let complete = delivered(true, false);
+        transport.observe_delivery(&complete, false, now + FIRST_CONNECTION_COOLDOWN);
+        assert!(transport.cooldown.lock().unwrap().failed_at.is_none());
+        assert!(transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).is_err());
+        drop(owner);
+        assert!(transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).is_ok());
+        assert_eq!(complete.as_ref().unwrap().receipt["exit_code"], 1);
+        assert_eq!(
+            complete.as_ref().unwrap().receipt["publication_authorized"],
+            false,
+        );
+        transport.observe_delivery(
+            &disconnected(false),
+            false,
+            now + FIRST_CONNECTION_COOLDOWN,
+        );
+        assert_eq!(
+            transport.cooldown.lock().unwrap().delay,
+            FIRST_CONNECTION_COOLDOWN,
+        );
+    }
+
+    #[test]
+    fn lost_ack_cools_placement_without_discarding_verified_delivery() {
+        let transport = transport();
+        let now = Instant::now();
+        let complete = delivered(false, true);
+        transport.observe_delivery(&complete, false, now);
+        assert!(transport.try_reserve_at(now).is_err());
+        let delivery = complete.unwrap();
+        assert!(!delivery.acknowledgments_confirmed);
+        assert!(delivery.acknowledgment_interrupted);
+        assert_eq!(delivery.directory, Path::new("/private/retained-result"));
+        assert_eq!(
+            delivery.acknowledgment_error.as_deref(),
+            Some("fixture ACK failure"),
+        );
+    }
+
+    #[test]
+    fn uncertain_execution_remains_uncertain_after_cooldown_expires() {
+        let transport = transport();
+        let now = Instant::now();
+        let outcome = disconnected(true);
+        transport.observe_delivery(&outcome, false, now);
+        assert!(transport.try_reserve_at(now).is_err());
+        drop(transport.try_reserve_at(now + MAX_CONNECTION_COOLDOWN).unwrap());
+        // Availability is not drain proof, actor reconciliation or permission
+        // to retry this same request. The original result is unchanged.
+        let failure = outcome.unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(failure.transport_interrupted);
+        assert_eq!(failure.detail, "fixture socket deadline");
+    }
+
+    #[test]
+    fn contended_connectivity_state_never_strands_worker_capacity() {
+        let transport = transport();
+        let now = Instant::now();
+        let state = transport.cooldown.lock().unwrap();
+        assert_eq!(
+            transport.try_reserve_at(now).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        assert!(!transport.occupied.load(Ordering::Acquire));
+        drop(state);
+        assert!(transport.try_reserve_at(now).is_ok());
     }
 
     #[test]

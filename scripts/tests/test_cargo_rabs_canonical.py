@@ -36,6 +36,8 @@ assert not pathlib.Path(delivery).exists()
 assert not pathlib.Path(output).exists()
 assert request["program"] == "/__rabs/toolchain/bin/cargo"
 assert request["artifacts"]["tree"] == "tree-files-v1"
+assert request["artifacts"]["cargo"] == "cargo-json-v1"
+assert request["args"].count("--message-format=json") == 1
 assert request["toolchain_source"] + "/bin/cargo" == os.environ["CARGO"]
 assert request["toolchain_source"] + "/bin/rustc" == os.environ["RUSTC"]
 record = {"pid":os.getpid(), "argv":sys.argv, "request":request,
@@ -130,19 +132,20 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(json.loads(stdout)["kind"], "fixture-worker-build")
         self.assertIn(b"native-driver-diagnostic", stderr)
         self.assertEqual(record["request"]["command_context"]["env"], {"CARGO_INCREMENTAL":"0"})
-        self.assertEqual(record["request"]["artifacts"]["files"], ["debug/hello"])
+        self.assertEqual(record["request"]["artifacts"]["files"], [])
+        self.assertEqual(record["request"]["artifacts"]["cargo"], "cargo-json-v1")
 
-    def test_required_binaries_release_target_and_features_are_exact(self):
+    def test_binary_release_target_and_feature_intent_is_exact_without_guessing_paths(self):
         args = ["build", "--release", "--bin=one", "--bin", "two", "-p", "app",
                 "--target=aarch64-unknown-linux-gnu", "--features", "feature,quoted'雪",
                 "--no-default-features", "--color=never", "-vv"]
         self.assertEqual(self.invoke(args)[0], 0)
         request = self.records()[0]["request"]
         self.assertEqual(request["args"][:len(args)], args)
-        self.assertEqual(request["args"][len(args):], ["--locked", "--offline", "--manifest-path",
+        self.assertEqual(request["args"][len(args):], ["--locked", "--offline", "--message-format=json", "--manifest-path",
             "/__rabs/workspace/Cargo.toml", "--target-dir", "/__rabs/out/cargo"])
-        self.assertEqual(request["artifacts"]["files"],
-                         ["aarch64-unknown-linux-gnu/release/one", "aarch64-unknown-linux-gnu/release/two"])
+        self.assertEqual(request["artifacts"]["files"], [])
+        self.assertEqual(request["artifacts"]["cargo"], "cargo-json-v1")
 
     def test_member_and_explicit_vendor_go_to_shared_source_planner(self):
         self.profile.update(manifest="members/app/Cargo.toml", vendor="third_party/vendor")
@@ -153,6 +156,71 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(request["command_context"]["cwd"], "/__rabs/workspace/members/app")
         self.assertNotIn("source_manifest", request, "launcher must not fabricate input evidence")
         self.assertNotIn("toolchain_identity", request, "native capture owns the identity")
+
+    def test_explicit_registry_cache_is_native_preparation_intent(self):
+        cargo_home = self.root / "approved Cargo home 雪"
+        cargo_home.mkdir(mode=0o700)
+        credentials = cargo_home / "credentials.toml"
+        credentials.write_text('[registry]\ntoken="must-not-be-read-by-launcher"\n')
+        self.profile.update(manifest="members/app/Cargo.toml", cargo_home_source=str(cargo_home))
+        self.save()
+        self.assertEqual(self.invoke()[0], 0)
+        request = self.records()[0]["request"]
+        self.assertEqual(request["cargo_source"], {
+            "manifest":"members/app/Cargo.toml", "cargo_home_source":str(cargo_home),
+        })
+        self.assertNotIn("must-not-be-read-by-launcher", json.dumps(request))
+        self.assertNotIn("cargo_home", request, "native capture must derive the transferred projection")
+        self.assertNotIn("source_manifest", request, "launcher cannot fabricate source evidence")
+        self.assertEqual(credentials.read_text(), '[registry]\ntoken="must-not-be-read-by-launcher"\n')
+        self.assertEqual(list(cargo_home.iterdir()), [credentials])
+
+    def test_registry_cache_requires_one_explicit_disjoint_directory(self):
+        cargo_home = self.root / "cargo-cache"
+        cargo_home.mkdir(mode=0o700)
+        alias = self.root / "cache-alias"
+        alias.symlink_to(cargo_home, target_is_directory=True)
+        nested = self.operations / "nested-cache"
+        # An input nested under the output parent must refuse before using it;
+        # keep that parent otherwise empty for assert_refused's side-effect check.
+        candidates = (None, True, 1, "relative/cache", str(alias), str(self.root / "absent"),
+                      str(self.source), str(self.toolchain), str(self.operations), str(self.root))
+        for value in candidates:
+            with self.subTest(value=value):
+                self.profile_path.write_text(json.dumps(dict(self.profile, cargo_home_source=value)))
+                self.assert_refused()
+        nested.mkdir(mode=0o700)
+        self.profile_path.write_text(json.dumps(dict(self.profile, cargo_home_source=str(nested))))
+        status, stdout, _, _ = self.invoke()
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, b"")
+        self.assertFalse(self.record.exists())
+        self.assertEqual(list(self.operations.iterdir()), [nested])
+
+    def test_registry_cache_and_vendor_cannot_be_combined(self):
+        cargo_home = self.root / "cargo-cache"
+        cargo_home.mkdir(mode=0o700)
+        self.profile.update(cargo_home_source=str(cargo_home), vendor="vendor")
+        self.save()
+        self.assert_refused()
+
+    def test_explicit_jobserver_grant_is_request_intent_not_compiler_environment(self):
+        for grant in (1, 2, 4096):
+            with self.subTest(grant=grant):
+                self.profile["jobserver_grant"] = grant
+                self.save()
+                self.assertEqual(self.invoke()[0], 0)
+                request = self.records()[-1]["request"]
+                self.assertEqual(request["jobserver_grant"], grant)
+                self.assertEqual(request["command_context"]["env"], {"CARGO_INCREMENTAL":"0"})
+                self.assertNotIn("-j", request["args"])
+                self.assertNotIn("--jobs", request["args"])
+
+    def test_ambiguous_or_unbounded_jobserver_grants_refuse_before_execution(self):
+        for grant in (None, True, False, "2", 2.0, 0, -1, 4097, [], {}):
+            with self.subTest(grant=grant):
+                self.profile_path.write_text(json.dumps(dict(self.profile, jobserver_grant=grant)))
+                self.assert_refused()
 
     def test_locked_offline_and_frozen_are_not_duplicated(self):
         for flags in (["--locked"], ["--offline"], ["--locked", "--offline"], ["--frozen"]):
@@ -223,8 +291,10 @@ class CanonicalCargo(unittest.TestCase):
                 os.close(write)
 
     def test_unknown_and_ambiguous_output_controls_refuse_before_any_operation(self):
-        for args in (["check", "--bin=hello"], ["build"], ["run", "--bin=hello"],
-                     ["build", "--bins"], ["build", "--bin=hello", "--target-dir=/other"],
+        for args in (["run", "--bin=hello"], ["test"], ["test", "--no-run=false"],
+                     ["test", "--no-run", "--no-run"], ["build", "--no-run"],
+                     ["check", "--no-run"], ["test", "--no-run", "--", "filter"],
+                     ["build", "--exclude=member"], ["build", "--bin=hello", "--target-dir=/other"],
                      ["build", "--bin=hello", "--manifest-path=elsewhere"],
                      ["build", "--bin=hello", "--config", "x=y"],
                      ["build", "--bin=hello", "--profile=custom"],
@@ -237,6 +307,29 @@ class CanonicalCargo(unittest.TestCase):
                      ["+nightly", "build", "--bin=hello"]):
             with self.subTest(args=args):
                 self.assert_refused(args)
+
+    def test_workspace_library_check_and_test_compilation_use_real_artifact_reports(self):
+        cases = (
+            ["build"], ["build", "--workspace"], ["build", "--lib"],
+            ["build", "--bins"], ["build", "--examples", "--package", "app"],
+            ["build", "--workspace", "--exclude", "other", "--all-targets"],
+            ["check", "--workspace", "--all-targets"], ["check", "--bin=hello"],
+            ["check", "--lib", "--features=one,two"],
+            ["test", "--no-run", "--workspace"],
+            ["test", "--no-run", "--test", "integration", "--release"],
+            ["test", "--no-run", "--bin=hello"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                self.assertEqual(self.invoke(args)[0], 0)
+                request = self.records()[-1]["request"]
+                self.assertEqual(request["args"][:len(args)], args)
+                self.assertEqual(request["artifacts"], {
+                    "unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-json-v1",
+                })
+                self.assertEqual(request["args"].count("--message-format=json"), 1)
+                self.assertFalse((Path(self.records()[-1]["operation"]) / "outputs").exists(),
+                                 "the launcher must not fabricate compiler outputs")
 
     def test_launcher_mode_conflicts_cannot_reach_another_executor(self):
         for first in ("--rabs-no-start", "--rabs-require-daemon", "--rabs-remote"):

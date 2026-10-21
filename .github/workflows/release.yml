@@ -126,7 +126,7 @@ jobs:
           # USTAR avoids extension headers in the installer's bounded inventory.
           tar --format=ustar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
             -C "$PWD/target/${T}/wrapper-release" rch rabs-wrap \
-            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr rabsd rabs-wkr \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr rabsd rabs-wkr rabs-cargo-root \
             -C "$PWD/scripts" cargo-rabs install-rabs
           sha256sum dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
       - name: Verify native RABS archive installation and upgrade
@@ -138,6 +138,7 @@ jobs:
           PATH="$prefix/bin:$PATH" cargo rabs --help
           "$prefix/bin/rabs-wrap" "$(rustup which rustc)" --version
           "$prefix/bin/rabs-wkr" --version
+          "$prefix/bin/rabs-cargo-root" --version
           RABS_STATE_DIR="$prefix/state" RABS_SOCKET_PATH="$prefix/edge.sock" RABS_LIVE_DEPENDENCY=0 \
             "$prefix/bin/rabsd" --check-config > "$prefix/config.json"
           python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["kind"]=="rabsd-config" and c["live_dependency"] is False' "$prefix/config.json"
@@ -218,7 +219,7 @@ jobs:
           T=aarch64-unknown-linux-gnu
           tar --format=ustar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
             -C "$PWD/target/${T}/wrapper-release" rch rabs-wrap \
-            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr rabsd rabs-wkr \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr rabsd rabs-wkr rabs-cargo-root \
             -C "$PWD/scripts" cargo-rabs install-rabs
           sha256sum dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
       - name: Verify native RABS archive installation and upgrade
@@ -230,6 +231,7 @@ jobs:
           PATH="$prefix/bin:$PATH" cargo rabs --help
           "$prefix/bin/rabs-wrap" "$(rustup which rustc)" --version
           "$prefix/bin/rabs-wkr" --version
+          "$prefix/bin/rabs-cargo-root" --version
           RABS_STATE_DIR="$prefix/state" RABS_SOCKET_PATH="$prefix/edge.sock" RABS_LIVE_DEPENDENCY=0 \
             "$prefix/bin/rabsd" --check-config > "$prefix/config.json"
           python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["kind"]=="rabsd-config" and c["live_dependency"] is False' "$prefix/config.json"
@@ -579,7 +581,7 @@ jobs:
           ### Opt-in RABS (Linux GNU x86_64 and ARM64)
 
           The two Linux GNU archives also contain \`cargo-rabs\`, \`rabs-wrap\`,
-          \`rabsd\`, \`rabs-wkr\` and \`install-rabs\`. Normal RCH installation
+          \`rabsd\`, \`rabs-wkr\`, \`rabs-cargo-root\` and \`install-rabs\`. Normal RCH installation
           still installs only RCH. RABS requires an explicit installation:
           authenticate the archive with its Sigstore bundle and the expected
           release-workflow identity and issuer BEFORE extracting or executing it.

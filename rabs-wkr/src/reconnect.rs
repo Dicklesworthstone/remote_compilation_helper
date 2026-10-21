@@ -137,6 +137,7 @@ pub(super) fn run(
     report: CapabilityReport,
     once: bool,
     mut journal: WorkerJournal,
+    host_budget: Option<Arc<rabs_wkr::host_budget::HostBudget>>,
 ) -> i32 {
     // This strong scope spans reconnects but not process exit. The registry is
     // weak, so every ordinary return releases idle datasets AFTER session drain.
@@ -166,6 +167,7 @@ pub(super) fn run(
         let handle = runtime.handle();
         let endpoint = coordinator.clone();
         let capability = Arc::clone(&report);
+        let host_budget = host_budget.clone();
         let shutdown = controller.subscribe();
         let (outcome, returned_journal, admitted_for) =
             crate::block_on_worker_runtime(&runtime, async move {
@@ -183,6 +185,7 @@ pub(super) fn run(
                                 once,
                                 &mut journal,
                                 &mut admitted_at,
+                                host_budget,
                             ),
                         )
                         .await;

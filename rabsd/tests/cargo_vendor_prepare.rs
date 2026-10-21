@@ -21,6 +21,9 @@ const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const LABEL: &str = "exact\n雪";
 const WORKER: &str = "vendor-build-test";
 
+#[path = "cargo_vendor_prepare/registry.rs"]
+mod registry;
+
 fn hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -522,15 +525,27 @@ impl Fixture {
             serde_json::from_slice(&fs::read(bundle.join("request.json")).unwrap()).unwrap();
         let mut expected = self.specification.clone();
         expected.as_object_mut().unwrap().remove("cargo_source");
+        if self.specification["cargo_source"]
+            .get("cargo_home_source")
+            .is_some()
+        {
+            expected["cargo_home"] = json!({
+                "version":rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION,
+                "prefix":"rabs-cargo-home"});
+        }
         expected["source_manifest"] = request["source_manifest"].clone();
         assert_eq!(
             request, expected,
             "only preparation intent becomes a manifest"
         );
-        assert_eq!(
-            fs::read(bundle.join("source/.cargo/config.toml")).unwrap(),
-            fs::read(self.anchor.join(".cargo/config.toml")).unwrap()
-        );
+        if self.anchor.join(".cargo/config.toml").exists() {
+            assert_eq!(
+                fs::read(bundle.join("source/.cargo/config.toml")).unwrap(),
+                fs::read(self.anchor.join(".cargo/config.toml")).unwrap()
+            );
+        } else {
+            assert!(!bundle.join("source/.cargo/config.toml").exists());
+        }
         assert_eq!(
             fs::read(bundle.join("source/Cargo.lock")).unwrap(),
             fs::read(self.anchor.join("Cargo.lock")).unwrap()
@@ -870,6 +885,10 @@ fn uploaded_toolchain_builds_vendored_workspace_over_native_tls_and_recovers_off
 }
 
 fn run_vendored_native_tls_build(upload_toolchain: bool) {
+    run_native_tls_build(Fixture::new(), upload_toolchain);
+}
+
+fn run_native_tls_build(mut fixture: Fixture, upload_toolchain: bool) {
     let missing =
         rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical();
     assert!(
@@ -881,7 +900,6 @@ fn run_vendored_native_tls_build(upload_toolchain: bool) {
             .expect("set RABS_TEST_WORKER_BIN to the absolute rabs-wkr built from this revision"),
     );
     assert!(worker_binary.is_absolute() && worker_binary.is_file());
-    let mut fixture = Fixture::new();
     let (bundle, request) = if upload_toolchain {
         fixture.specification["toolchain_source"] =
             json!(fixture.cargo.parent().and_then(Path::parent).unwrap());
@@ -914,6 +932,13 @@ fn run_vendored_native_tls_build(upload_toolchain: bool) {
         fixture.owner.path().join("retired-checkout"),
     )
     .unwrap();
+    if let Some(home) = fixture.specification["cargo_source"]["cargo_home_source"].as_str() {
+        fs::rename(
+            home,
+            fixture.owner.path().join("retired-original-cargo-home"),
+        )
+        .unwrap();
+    }
     let credentials = fixture.owner.path().join("credentials");
     fs::create_dir(&credentials).unwrap();
     let certificates = Certificates::new(&credentials);

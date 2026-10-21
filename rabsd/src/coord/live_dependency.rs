@@ -49,7 +49,8 @@ use rabs_cas::publication::{
 };
 use rabs_key::live_dependency::{
     DependencyActionPlan, LIVE_DEPENDENCY_KEY_EPOCH, LIVE_DEPENDENCY_PROJECTION_EPOCH,
-    LiveDependencyKey, canonicalize_placements, dep_info_closure_violation, render_placements,
+    LiveDependencyKey, canonicalize_placements, check_dependency_cache_read_closure,
+    dep_info_closure_violation, render_placements,
 };
 use rabs_key::output_declarations::OutputClass;
 use rabs_key::typed_digest::compute;
@@ -111,6 +112,22 @@ pub struct LiveDependencyRequest {
 }
 
 impl LiveDependencyRequest {
+    fn verify_read_closure(&self) -> Result<(), String> {
+        check_dependency_cache_read_closure(&self.plan.invocation)
+            .map_err(|refusal| refusal.to_string())?;
+        let expected = rabs_key::output_derivation::derive_dependency_output_declarations(
+            &self.plan.invocation,
+            &self.plan.host_triple,
+        )
+        .map_err(|error| error.to_string())?;
+        if expected.canonical_bytes() != self.plan.outputs.canonical_bytes() {
+            return Err(
+                "LIVE_DEP_OUTPUTS: declared outputs differ from metadata invocation".into(),
+            );
+        }
+        Ok(())
+    }
+
     fn verify_toolchain(&self) -> Result<(), String> {
         self.toolchain
             .verify_unchanged(Path::new(&self.plan.compiler))
@@ -229,6 +246,9 @@ impl PendingServe {
     #[must_use]
     pub fn install(self) -> InstallResult {
         let plan = &self.request.plan;
+        if let Err(reason) = self.request.verify_read_closure() {
+            return InstallResult::Declined(reason);
+        }
         if let Some(validation) = &self.remote_validation
             && let Err(reason) = validation.verify(&self.request)
         {
@@ -674,7 +694,10 @@ impl LiveDependencyLane {
     /// and sampling gate, including any additional private verification run.
     #[must_use]
     pub fn decide(&self, request: LiveDependencyRequest) -> LiveDecision {
-        if let Err(reason) = request.verify_toolchain() {
+        if let Err(reason) = request
+            .verify_read_closure()
+            .and_then(|()| request.verify_toolchain())
+        {
             return LiveDecision::PassThrough(reason);
         }
         let request = match self.preview(request) {
@@ -696,6 +719,9 @@ impl LiveDependencyLane {
         &self,
         request: LiveDependencyRequest,
     ) -> Result<Result<PendingServe, LiveDependencyRequest>, String> {
+        // Retained codegen publications from an older daemon are immutable
+        // history, not current serving authority. Check before any lookup.
+        request.verify_read_closure()?;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let key = request.key.action_key.clone();
         let loaded = {
@@ -752,6 +778,7 @@ impl LiveDependencyLane {
         request: LiveDependencyRequest,
         worker: &WorkerSessionOffer,
     ) -> Result<Option<ExecutionAttempt>, String> {
+        request.verify_read_closure()?;
         let key = request.key.action_key.clone();
         let refusal = |error: SubmissionRefusal| format!("submission: {error:?}");
         if self.coord.submitted_actor(&key).map_err(refusal)?.is_some() {
@@ -954,6 +981,7 @@ impl ExecutionAttempt {
         physical_outputs: &Path,
         remote_receipt: Option<&serde_json::Value>,
     ) -> Result<CapturedLocalResult, String> {
+        self.request.verify_read_closure()?;
         self.advance(AttemptState::ProcessExited)?;
         if report.signal.is_some() || report.exit_code != Some(0) {
             return Err(format!(
@@ -1198,6 +1226,7 @@ impl ExecutionAttempt {
         &self,
         captured: CapturedLocalResult,
     ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
+        self.request.verify_read_closure()?;
         let CapturedLocalResult {
             offer,
             transcript,
