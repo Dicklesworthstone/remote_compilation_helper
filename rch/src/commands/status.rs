@@ -1259,6 +1259,54 @@ pub(super) fn merge_job_required_tools(
 /// Refine the classifier-only admit verdict with one non-owning daemon observation.
 /// Internal/protocol errors are not permission to execute or proof that the
 /// fleet is unavailable, so they remain explicitly unknown.
+fn no_admissible_rejection_summary(
+    encoded: &str,
+) -> Option<rch_common::admission_rejection::AdmissionRejectionSummary> {
+    use rch_common::admission_rejection::AdmissionRejectionCategory as C;
+    use std::collections::BTreeMap;
+
+    // The daemon's compact aggregate is a comma-separated set of stable
+    // category=count tokens. Never guess an unknown token into a weaker class:
+    // a mixed-version or malformed summary must leave admission unknown.
+    let mut by_category = BTreeMap::new();
+    let mut by_class = BTreeMap::new();
+    let mut rejected = 0usize;
+    for field in encoded.split(',') {
+        let (name, count) = field.trim().split_once('=')?;
+        let count = count.parse::<usize>().ok()?;
+        if count == 0 || count > 1_000_000 {
+            return None;
+        }
+        let category = match name {
+            "critical_pressure" | "admission_disk_floor" => C::CriticalPressure,
+            "insufficient_slots" | "insufficient_total_slots" => C::InsufficientSlots,
+            "circuit_open" | "quarantined" => C::CircuitOpen,
+            "telemetry_stale" => C::TelemetryStale,
+            "hard_preflight" | "preflight_blocked" => C::HardPreflight,
+            "missing_runtime" => C::MissingRuntime,
+            "missing_toolchain" => C::MissingToolchain,
+            "missing_rust_target" => C::MissingRustTarget,
+            "os_arch_mismatch" => C::OsArchMismatch,
+            "classifier_local_drift" => C::ClassifierLocalDrift,
+            "active_project_exclusion" | "convergence_failed" => C::ActiveProjectExclusion,
+            "project_excluded" => C::ProjectExcluded,
+            _ => return None,
+        };
+        rejected = rejected.checked_add(count)?;
+        *by_category.entry(category.as_str().to_string()).or_insert(0) += count;
+        *by_class.entry(category.class().as_str().to_string()).or_insert(0) += count;
+    }
+    if rejected == 0 {
+        return None;
+    }
+    Some(rch_common::admission_rejection::AdmissionRejectionSummary {
+        total_candidates: rejected,
+        rejected,
+        by_category,
+        by_class,
+    })
+}
+
 pub(super) fn refine_admit_from_selection(
     base: rch_common::admit_preflight::AdmitRecommendation,
     selection: &rch_common::SelectionResponse,
@@ -1275,15 +1323,21 @@ pub(super) fn refine_admit_from_selection(
     if selection.worker.is_some() {
         return Some(AdmitRecommendation::Offload);
     }
+    if let R::NoAdmissibleWorkers(encoded) = &selection.reason {
+        let summary = no_admissible_rejection_summary(encoded)?;
+        return Some(refine_recommendation(base, &summary));
+    }
     let category = match &selection.reason {
         R::AllWorkersBusy => C::InsufficientSlots,
         R::AllWorkersUnreachable | R::AllCircuitsOpen | R::NoWorkersPassedHealth => C::CircuitOpen,
-        R::AllWorkersFailedPreflight | R::NoAdmissibleWorkers(_) => C::HardPreflight,
+        R::AllWorkersFailedPreflight => C::HardPreflight,
         R::AllWorkersFailedConvergence => C::ActiveProjectExclusion,
         R::NoMatchingWorkers | R::NoWorkersConfigured => C::ProjectExcluded,
         R::NoWorkersWithRuntime(_) => C::MissingRuntime,
         R::SelectionError(_) => return None,
-        R::Success | R::AffinityPinned | R::AffinityFallback => return None,
+        R::NoAdmissibleWorkers(_) | R::Success | R::AffinityPinned | R::AffinityFallback => {
+            return None;
+        }
     };
     let summary = aggregate_rejections(
         1,
@@ -4887,6 +4941,68 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn admit_no_admissible_summary_preserves_health_vs_structural_weighting() {
+        use rch_common::admit_preflight::AdmitRecommendation;
+        use rch_common::{SelectionReason, SelectionResponse};
+        let response = |summary: &str| SelectionResponse {
+            worker: None,
+            reason: SelectionReason::NoAdmissibleWorkers(summary.to_string()),
+            build_id: None,
+            diagnostics: None,
+        };
+        for transient in [
+            "critical_pressure=1",
+            "insufficient_slots=4",
+            "insufficient_total_slots=2",
+            "critical_pressure=2,insufficient_slots=3",
+        ] {
+            assert_eq!(
+                refine_admit_from_selection(AdmitRecommendation::Offload, &response(transient)),
+                Some(AdmitRecommendation::Queue),
+                "{transient}"
+            );
+        }
+        for structural in [
+            "hard_preflight=1",
+            "missing_runtime=2",
+            "active_project_exclusion=1",
+            "critical_pressure=1,missing_toolchain=2",
+        ] {
+            assert_eq!(
+                refine_admit_from_selection(AdmitRecommendation::Offload, &response(structural)),
+                Some(AdmitRecommendation::Defer),
+                "{structural}"
+            );
+        }
+    }
+
+    #[test]
+    fn admit_no_admissible_summary_fails_unknown_on_malformed_or_future_tokens() {
+        use rch_common::admit_preflight::AdmitRecommendation;
+        use rch_common::{SelectionReason, SelectionResponse};
+        for summary in [
+            "",
+            "critical_pressure",
+            "critical_pressure=0",
+            "critical_pressure=not-a-number",
+            "future_reason=1",
+            "critical_pressure=1,future_reason=1",
+        ] {
+            let response = SelectionResponse {
+                worker: None,
+                reason: SelectionReason::NoAdmissibleWorkers(summary.to_string()),
+                build_id: None,
+                diagnostics: None,
+            };
+            assert_eq!(
+                refine_admit_from_selection(AdmitRecommendation::Offload, &response),
+                None,
+                "{summary}"
+            );
+        }
     }
 
     #[test]
