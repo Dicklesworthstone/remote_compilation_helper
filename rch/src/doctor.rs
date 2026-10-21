@@ -4321,8 +4321,58 @@ fn check_configuration(
         checks.push(result);
     }
 
+    if let Ok(config) = crate::config::load_config() {
+        let result = transfer_exclude_defaults_result(&config.transfer.exclude_patterns);
+        print_check_result(&result, ctx);
+        checks.push(result);
+    }
+
     if !ctx.is_json() {
         println!();
+    }
+}
+
+/// A configured `[transfer] exclude_patterns` list replaces rch's built-in
+/// defaults, so defaults added later (agent session state in #109, secret
+/// files) never reach a host whose list predates them, and its uploads ship
+/// them to workers (bd-rqjaj). Warn with the omitted defaults by name.
+fn transfer_exclude_defaults_result(configured: &[String]) -> CheckResult {
+    let missing: Vec<String> = rch_common::TransferConfig::default()
+        .exclude_patterns
+        .into_iter()
+        .filter(|pattern| !configured.contains(pattern))
+        .collect();
+    if missing.is_empty() {
+        return CheckResult {
+            category: "configuration".to_string(),
+            name: "transfer_excludes".to_string(),
+            status: CheckStatus::Pass,
+            message: "Transfer excludes include every built-in default".to_string(),
+            details: None,
+            suggestion: None,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        };
+    }
+    CheckResult {
+        category: "configuration".to_string(),
+        name: "transfer_excludes".to_string(),
+        status: CheckStatus::Warning,
+        message: format!(
+            "Custom [transfer] exclude_patterns omits {} built-in default(s)",
+            missing.len()
+        ),
+        details: Some(missing.join(", ")),
+        suggestion: Some(
+            "A configured exclude_patterns list replaces rch's defaults, so these paths are \
+             uploaded to workers (agent state such as .ntm/, secrets such as .env). Add the \
+             ones you do not deliberately sync, or remove the list to use the defaults."
+                .to_string(),
+        ),
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
     }
 }
 
@@ -6208,6 +6258,44 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// bd-rqjaj: a custom exclude list that predates newer defaults is named,
+    /// with the omitted patterns; the defaults themselves (or a superset) pass.
+    #[test]
+    fn transfer_exclude_defaults_check_names_omitted_defaults() {
+        let defaults = rch_common::TransferConfig::default().exclude_patterns;
+        assert_eq!(
+            transfer_exclude_defaults_result(&defaults).status,
+            CheckStatus::Pass
+        );
+        let mut superset = defaults.clone();
+        superset.push("scratch/".to_string());
+        assert_eq!(
+            transfer_exclude_defaults_result(&superset).status,
+            CheckStatus::Pass
+        );
+
+        // A pre-#109 fleet list: no agent-state or secret excludes.
+        let stale: Vec<String> = ["target/", "*.rlib", "node_modules/", ".beads/"]
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .collect();
+        let result = transfer_exclude_defaults_result(&stale);
+        assert_eq!(result.status, CheckStatus::Warning);
+        let details = result.details.unwrap();
+        for omitted in [".ntm/", ".beads-recovery/", ".env", "credentials.json"] {
+            assert!(
+                details.contains(omitted),
+                "{omitted} missing from {details}"
+            );
+        }
+        for present in ["target/", "node_modules/"] {
+            assert!(
+                !details.split(", ").any(|pattern| pattern == present),
+                "{present} is configured but reported: {details}"
+            );
+        }
+    }
 
     /// #69: the remedy names the daemon's real socket, shell-quoted.
     #[test]
