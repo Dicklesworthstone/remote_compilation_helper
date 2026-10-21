@@ -46,9 +46,10 @@ fn protocol(reply: &reply_json::Value) -> bool {
     matches!(reply.get("remote_protocol"), Some(reply_json::Value::Number(value)) if value == "1")
 }
 
-fn completed_failure(reply: &reply_json::Value) -> bool {
+fn completed_failure(reply: &reply_json::Value, key: &str) -> bool {
     field(reply, "kind") == Some("rustc-decision")
         && field(reply, "decision") == Some("remote-failed")
+        && field(reply, "action_key") == Some(key)
         && protocol(reply)
         && reply
             .get("execution_finished")
@@ -68,14 +69,23 @@ fn completed_failure(reply: &reply_json::Value) -> bool {
 /// include the retained recovery directory when a transport outcome is unknown.
 /// Discarding that reason strands the user behind a generic protocol error.
 /// Preserve it without treating a recovery hint as proof that work has stopped.
-fn failure_outcome(reply: &reply_json::Value) -> Option<Live> {
+fn failure_outcome(reply: &reply_json::Value, key: &str) -> Option<Live> {
     if field(reply, "kind") != Some("rustc-decision")
         || field(reply, "decision") != Some("remote-failed")
         || !protocol(reply)
     {
         return None;
     }
-    if completed_failure(reply) {
+    // A settlement belongs to exactly the accepted action. Neither a legacy
+    // unbound failure nor a different action's finished writer proves that
+    // this action is safe to execute locally, in either consent phase.
+    if field(reply, "action_key") != Some(key) {
+        return Some(Live::FailClosed(format!(
+            "RABS remote failure is not bound to the current action; local retry refused: {}",
+            failure_reason(reply),
+        )));
+    }
+    if completed_failure(reply, key) {
         return Some(Live::PassThrough);
     }
     Some(Live::FailClosed(format!(
@@ -125,7 +135,7 @@ pub(super) fn outcome(
     let Some(ready) = reply_json::parse(&line) else {
         return Ok(Live::FailClosed("malformed remote execution answer".into()));
     };
-    if let Some(failure) = failure_outcome(&ready) {
+    if let Some(failure) = failure_outcome(&ready, key) {
         return Ok(failure);
     }
     if field(&ready, "kind") != Some("rustc-decision")
@@ -181,7 +191,7 @@ fn completion(line: &str, key: &str) -> Live {
     let Some(reply) = reply_json::parse(line) else {
         return Live::FailClosed("malformed remote installation answer".into());
     };
-    if let Some(failure) = failure_outcome(&reply) {
+    if let Some(failure) = failure_outcome(&reply, key) {
         return failure;
     }
     if field(&reply, "kind") != Some("rustc-decision")
@@ -213,8 +223,11 @@ mod tests {
 
     #[test]
     fn remote_fallback_requires_both_execution_and_writer_settlement() {
-        let valid = r#"{"kind":"rustc-decision","decision":"remote-failed","remote_protocol":1,"execution_finished":true,"writer_returned":true,"compiler_skip_authorized":false}"#;
-        assert!(completed_failure(&reply_json::parse(valid).unwrap()));
+        let valid = r#"{"kind":"rustc-decision","decision":"remote-failed","remote_protocol":1,"action_key":"this-action","execution_finished":true,"writer_returned":true,"compiler_skip_authorized":false}"#;
+        assert!(completed_failure(
+            &reply_json::parse(valid).unwrap(),
+            "this-action"
+        ));
         for (from, to) in [
             (
                 "\"execution_finished\":true",
@@ -232,7 +245,7 @@ mod tests {
             ),
         ] {
             let reply = reply_json::parse(&valid.replace(from, to)).unwrap();
-            assert!(!completed_failure(&reply), "{from}");
+            assert!(!completed_failure(&reply, "this-action"), "{from}");
         }
     }
 
@@ -270,12 +283,14 @@ mod tests {
             completion(ready, "this-action"),
             Live::FailClosed(_)
         ));
-        assert!(!completed_failure(&reply_json::parse(ready).unwrap()));
+        assert!(!completed_failure(
+            &reply_json::parse(ready).unwrap(),
+            "this-action"
+        ));
     }
 
-    const RECOVERY_REASON: &str =
-        "worker transport lost; retained remote recovery directory: /state/dependency-workers/request-17";
-    const UNSETTLED: &str = r#"{"kind":"rustc-decision","decision":"remote-failed","remote_protocol":1,"execution_finished":false,"writer_returned":true,"compiler_skip_authorized":false}"#;
+    const RECOVERY_REASON: &str = "worker transport lost; retained remote recovery directory: /state/dependency-workers/request-17";
+    const UNSETTLED: &str = r#"{"kind":"rustc-decision","decision":"remote-failed","remote_protocol":1,"action_key":"this-action","execution_finished":false,"writer_returned":true,"compiler_skip_authorized":false}"#;
     const READY: &str = r#"{"kind":"rustc-decision","decision":"remote-ready","remote_protocol":1,"action_key":"this-action","capture":"capture-17","capture_protocol":1,"compiler_skip_authorized":false}"#;
 
     fn with_reason(frame: &str, reason: &str) -> String {
@@ -290,22 +305,35 @@ mod tests {
     fn uncertain_remote_failure_preserves_recovery_without_granting_a_retry() {
         let frame = with_reason(UNSETTLED, RECOVERY_REASON);
         let reply = reply_json::parse(&frame).unwrap();
-        assert!(!completed_failure(&reply));
-        assert!(matches!(failure_outcome(&reply), Some(Live::FailClosed(reason))
-            if reason.contains(RECOVERY_REASON) && reason.contains("local retry refused")));
-        assert!(matches!(completion(&frame, "this-action"), Live::FailClosed(reason)
-            if reason.contains(RECOVERY_REASON)));
+        assert!(!completed_failure(&reply, "this-action"));
+        assert!(
+            matches!(failure_outcome(&reply, "this-action"), Some(Live::FailClosed(reason))
+            if reason.contains(RECOVERY_REASON) && reason.contains("local retry refused"))
+        );
+        assert!(
+            matches!(completion(&frame, "this-action"), Live::FailClosed(reason)
+            if reason.contains(RECOVERY_REASON))
+        );
     }
 
     #[test]
     fn recovery_text_never_overrides_missing_or_ambiguous_settlement() {
         let settled = with_reason(
-            &UNSETTLED.replace("\"execution_finished\":false", "\"execution_finished\":true"),
+            &UNSETTLED.replace(
+                "\"execution_finished\":false",
+                "\"execution_finished\":true",
+            ),
             RECOVERY_REASON,
         );
-        assert!(matches!(completion(&settled, "this-action"), Live::PassThrough));
+        assert!(matches!(
+            completion(&settled, "this-action"),
+            Live::PassThrough
+        ));
         for (from, to) in [
-            ("\"execution_finished\":true", "\"execution_finished\":false"),
+            (
+                "\"execution_finished\":true",
+                "\"execution_finished\":false",
+            ),
             ("\"writer_returned\":true", "\"writer_returned\":false"),
             ("\"execution_finished\":true,", ""),
             ("\"writer_returned\":true,", ""),
@@ -326,18 +354,27 @@ mod tests {
             ),
         ] {
             assert_ne!(settled.replace(from, to), settled, "fixture did not change");
-            assert!(matches!(completion(&settled.replace(from, to), "this-action"),
-                Live::FailClosed(reason) if reason.contains(RECOVERY_REASON)), "{from}");
+            assert!(
+                matches!(completion(&settled.replace(from, to), "this-action"),
+                Live::FailClosed(reason) if reason.contains(RECOVERY_REASON)),
+                "{from}"
+            );
         }
         for (from, to) in [
             ("\"remote_protocol\":1", "\"remote_protocol\":2"),
-            ("\"remote_protocol\":1", "\"remote_protocol\":1,\"remote_protocol\":1"),
+            (
+                "\"remote_protocol\":1",
+                "\"remote_protocol\":1,\"remote_protocol\":1",
+            ),
             ("\"decision\":\"remote-failed\"", "\"decision\":\"other\""),
             ("\"kind\":\"rustc-decision\"", "\"kind\":\"other\""),
         ] {
             let frame = settled.replace(from, to);
-            assert!(failure_outcome(&reply_json::parse(&frame).unwrap()).is_none());
-            assert!(matches!(completion(&frame, "this-action"), Live::FailClosed(_)));
+            assert!(failure_outcome(&reply_json::parse(&frame).unwrap(), "this-action").is_none());
+            assert!(matches!(
+                completion(&frame, "this-action"),
+                Live::FailClosed(_)
+            ));
         }
     }
 
@@ -372,8 +409,10 @@ mod tests {
             ",\"reason\":\"first\",\"reason\":\"second\"",
         ] {
             let frame = format!("{}{field}}}", UNSETTLED.strip_suffix('}').unwrap());
-            assert!(matches!(completion(&frame, "this-action"), Live::FailClosed(reason)
-                if reason.contains("daemon supplied no usable failure reason")));
+            assert!(
+                matches!(completion(&frame, "this-action"), Live::FailClosed(reason)
+                if reason.contains("daemon supplied no usable failure reason"))
+            );
         }
     }
 
@@ -383,26 +422,36 @@ mod tests {
     fn failure_exchange(frame: String, after_install_consent: bool) -> (Live, Vec<String>) {
         let (client, peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        peer.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let daemon = std::thread::spawn(move || {
             let mut peer = BufReader::new(peer);
             let mut acknowledgments = Vec::new();
             let mut first = String::new();
             peer.read_line(&mut first).unwrap();
-            assert_eq!(first, "{\"kind\":\"rustc-remote-accept\",\"remote_protocol\":1,\"action_key\":\"this-action\"}\n");
+            assert_eq!(
+                first,
+                "{\"kind\":\"rustc-remote-accept\",\"remote_protocol\":1,\"action_key\":\"this-action\"}\n"
+            );
             acknowledgments.push(first);
             if after_install_consent {
                 writeln!(peer.get_mut(), "{READY}").unwrap();
                 let mut second = String::new();
                 peer.read_line(&mut second).unwrap();
-                assert_eq!(second, "{\"kind\":\"rustc-accept\",\"capture\":\"capture-17\"}\n");
+                assert_eq!(
+                    second,
+                    "{\"kind\":\"rustc-accept\",\"capture\":\"capture-17\"}\n"
+                );
                 acknowledgments.push(second);
             }
             peer.get_mut().write_all(frame.as_bytes()).unwrap();
             peer.get_ref().shutdown(std::net::Shutdown::Write).unwrap();
             let mut extra = Vec::new();
             peer.read_to_end(&mut extra).unwrap();
-            assert!(extra.is_empty(), "failure sent a retry or another installation ACK");
+            assert!(
+                extra.is_empty(),
+                "failure sent a retry or another installation ACK"
+            );
             acknowledgments
         });
         let offer = reply_json::parse(
@@ -419,8 +468,10 @@ mod tests {
 
     #[test]
     fn socket_failure_before_install_consent_surfaces_retained_recovery() {
-        let (result, acknowledgments) =
-            failure_exchange(format!("{}\n", with_reason(UNSETTLED, RECOVERY_REASON)), false);
+        let (result, acknowledgments) = failure_exchange(
+            format!("{}\n", with_reason(UNSETTLED, RECOVERY_REASON)),
+            false,
+        );
         assert!(matches!(result, Live::FailClosed(reason) if reason.contains(RECOVERY_REASON)));
         assert_eq!(acknowledgments.len(), 1);
     }
@@ -428,7 +479,10 @@ mod tests {
     #[test]
     fn socket_failure_after_install_consent_surfaces_retained_recovery() {
         let frame = UNSETTLED
-            .replace("\"execution_finished\":false", "\"execution_finished\":true")
+            .replace(
+                "\"execution_finished\":false",
+                "\"execution_finished\":true",
+            )
             .replace("\"writer_returned\":true", "\"writer_returned\":false");
         let (result, acknowledgments) =
             failure_exchange(format!("{}\n", with_reason(&frame, RECOVERY_REASON)), true);
@@ -438,14 +492,63 @@ mod tests {
 
     #[test]
     fn socket_settled_failure_retains_the_existing_fallback_boundary() {
-        let frame = UNSETTLED.replace("\"execution_finished\":false", "\"execution_finished\":true");
+        let frame = UNSETTLED.replace(
+            "\"execution_finished\":false",
+            "\"execution_finished\":true",
+        );
         for after_install_consent in [false, true] {
             let (result, acknowledgments) = failure_exchange(
                 format!("{}\n", with_reason(&frame, RECOVERY_REASON)),
                 after_install_consent,
             );
             assert!(matches!(result, Live::PassThrough));
-            assert_eq!(acknowledgments.len(), if after_install_consent { 2 } else { 1 });
+            assert_eq!(
+                acknowledgments.len(),
+                if after_install_consent { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn socket_foreign_or_unbound_settlement_never_authorizes_local_retry() {
+        let settled = UNSETTLED.replace(
+            "\"execution_finished\":false",
+            "\"execution_finished\":true",
+        );
+        let action = "\"action_key\":\"this-action\",";
+        for replacement in [
+            "",
+            "\"action_key\":\"other-action\",",
+            "\"action_key\":\"this-action-suffix\",",
+            "\"action_key\":\"\",",
+            "\"action_key\":null,",
+            "\"action_key\":17,",
+            "\"action_key\":\"this-action\",\"action_key\":\"this-action\",",
+            "\"action_key\":\"this-action\",\"action_key\":\"other-action\",",
+        ] {
+            let frame = settled.replace(action, replacement);
+            assert_ne!(frame, settled, "fixture did not change");
+            assert!(!completed_failure(
+                &reply_json::parse(&frame).unwrap(),
+                "this-action",
+            ));
+            for after_install_consent in [false, true] {
+                let (result, acknowledgments) = failure_exchange(
+                    format!("{}\n", with_reason(&frame, RECOVERY_REASON)),
+                    after_install_consent,
+                );
+                assert!(
+                    matches!(result, Live::FailClosed(reason)
+                        if reason.contains("not bound to the current action")
+                            && reason.contains("local retry refused")
+                            && reason.contains(RECOVERY_REASON)),
+                    "accepted a foreign or ambiguous settlement: {replacement:?}",
+                );
+                assert_eq!(
+                    acknowledgments.len(),
+                    if after_install_consent { 2 } else { 1 }
+                );
+            }
         }
     }
 

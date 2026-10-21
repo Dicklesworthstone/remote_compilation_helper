@@ -19,9 +19,13 @@ use std::time::Duration;
 const REMOTE_WAIT: Duration = Duration::from_secs(50 * 60);
 const INSTALLATION_WAIT: Duration = Duration::from_secs(60);
 
-fn failure(reason: impl ToString, finished: bool) -> String {
+// Even a settled failure authorizes fallback only for this accepted action.
+// Keep the identity on uncertain outcomes too, so diagnostic recovery and
+// later settlement cannot be confused with another worker execution.
+fn failure(key: &str, reason: impl ToString, finished: bool) -> String {
     json!({
         "kind":"rustc-decision", "decision":"remote-failed", "remote_protocol":1,
+        "action_key":key,
         "reason":reason.to_string(), "execution_finished":finished,
         "writer_returned":true, "compiler_skip_authorized":false,
     })
@@ -135,12 +139,12 @@ pub(super) async fn complete_on_connection(
     let worker_cancellation = cancellation.clone();
     let work = match permit.finish(move || (*pending).execute(worker_cancellation)) {
         Ok(work) => work,
-        Err(error) => return Some(failure(error, true)),
+        Err(error) => return Some(failure(&key, error, true)),
     };
     let mut owned = RemoteWork { work, cancellation };
     let result = match wait_owned(&mut owned, stream).await {
         Waited::Completed(Ok(result)) => result,
-        Waited::Completed(Err(error)) => return Some(failure(error, false)),
+        Waited::Completed(Err(error)) => return Some(failure(&key, error, false)),
         Waited::CallerLost => {
             owned.cancellation.cancel();
             // No output installation is possible from this abandoned result.
@@ -159,7 +163,7 @@ pub(super) async fn complete_on_connection(
                 "rabsd-remote-dependency-failed",
                 &[("key", &key), ("reason", &reason)],
             );
-            return Some(failure(reason, execution_finished));
+            return Some(failure(&key, reason, execution_finished));
         }
     };
     let installation = match wait_installation(installations, stream).await {
@@ -167,6 +171,7 @@ pub(super) async fn complete_on_connection(
         InstallationCapacity::CallerLost => return None,
         InstallationCapacity::TimedOut => {
             return Some(failure(
+                &key,
                 "remote result is complete but installation capacity did not become available",
                 true,
             ));
@@ -196,9 +201,9 @@ pub(super) async fn complete_on_connection(
         Ok(mut work) => Some(
             work.wait()
                 .await
-                .unwrap_or_else(|error| failure(error, true)),
+                .unwrap_or_else(|error| failure(&key, error, true)),
         ),
-        Err(error) => Some(failure(error, true)),
+        Err(error) => Some(failure(&key, error, true)),
     }
 }
 
@@ -210,7 +215,7 @@ fn install(live: Arc<LiveEdge>, pending: PendingRemoteInstall) -> String {
             installed,
         } => {
             if transcript.len() > MAX_TRANSCRIPT_BYTES {
-                return failure("remote transcript exceeds its declared bound", true);
+                return failure(&key, "remote transcript exceeds its declared bound", true);
             }
             for output in installed {
                 live.facts.remember(&output.path, output.sig, output.digest);
@@ -232,7 +237,7 @@ fn install(live: Arc<LiveEdge>, pending: PendingRemoteInstall) -> String {
                 "rabsd-remote-dependency-install-failed",
                 &[("key", &key), ("reason", &reason)],
             );
-            failure(reason, true)
+            failure(&key, reason, true)
         }
     }
 }
@@ -396,7 +401,9 @@ mod tests {
 
     #[test]
     fn uncertain_remote_work_never_authorizes_local_execution() {
-        let reply: Value = serde_json::from_str(&failure("lost worker session", false)).unwrap();
+        let reply: Value =
+            serde_json::from_str(&failure("this-action", "lost worker session", false)).unwrap();
+        assert_eq!(reply["action_key"], "this-action");
         assert_eq!(
             reply["writer_returned"], true,
             "the transport has no subscriber writer"
@@ -411,7 +418,9 @@ mod tests {
 
     #[test]
     fn settled_remote_refusal_is_a_typed_stock_compiler_fallback() {
-        let reply: Value = serde_json::from_str(&failure("unkeyed env-dep", true)).unwrap();
+        let reply: Value =
+            serde_json::from_str(&failure("this-action", "unkeyed env-dep", true)).unwrap();
+        assert_eq!(reply["action_key"], "this-action");
         assert_eq!(reply["execution_finished"], true);
         assert_eq!(reply["writer_returned"], true);
         assert_eq!(reply["compiler_skip_authorized"], false);
