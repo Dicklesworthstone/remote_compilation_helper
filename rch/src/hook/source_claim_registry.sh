@@ -143,13 +143,19 @@ closures_overlap() {
     # worker registry. A trie stores each component once, rather than copying
     # every ancestor prefix of every root. Names remain literal byte strings.
     # The roots stay on stdin (never awk -v or exec argv, both of which impose
-    # extra interpretation/size limits). $2 selects a validated record file or
-    # already resolved roots. Explicit framing detects a failed producer even
+    # extra interpretation/size limits). $2 selects a validated record file,
+    # resolved roots, or a complete validated inventory batch. Explicit framing
+    # detects a failed producer even
     # on POSIX shells without pipefail; no partial inventory proves disjointness.
     overlap_verdict=$(
         {
             printf '%s\n' "$1" &&
-            printf 'RCH_HELD_ROOTS_BEGIN\n' &&
+            {
+                case "$2" in
+                    (inventory) printf 'RCH_HELD_INVENTORY_BEGIN\n' ;;
+                    (*) printf 'RCH_HELD_ROOTS_BEGIN\n' ;;
+                esac
+            } &&
             {
                 # Leading-paren patterns: bash 3.2 (macOS /bin/sh) misparses
                 # a bare `pattern)` inside $(...) as closing the substitution.
@@ -158,6 +164,7 @@ closures_overlap() {
                     # refuses below, a corrupt record cannot pass as valid.
                     (file) LC_ALL=C tr '\000' '\r' < "$3" ;;
                     (roots) printf '%s\n' "$3" ;;
+                    (inventory) emit_held_claim_roots "$3" ;;
                     (*) false ;;
                 esac
             } &&
@@ -167,18 +174,31 @@ closures_overlap() {
             # and index(s, "") is 1, which refused every root. A shell value
             # cannot carry NUL either, so the check needs a real NUL to test.
             BEGIN { nodes = 1; phase = 0; nul = sprintf("%c", 0) }
-            $0 == "RCH_HELD_ROOTS_BEGIN" {
+            $0 == "RCH_HELD_ROOTS_BEGIN" || $0 == "RCH_HELD_INVENTORY_BEGIN" {
                 if (phase != 0 || !wanted) bad = 1
+                inventory = ($0 == "RCH_HELD_INVENTORY_BEGIN")
                 phase = 1
                 next
             }
+            $0 == "RCH_HELD_RECORD_BEGIN" {
+                if (phase != 1 || !inventory || record_open) bad = 1
+                record_open = 1
+                record_roots = 0
+                next
+            }
+            $0 == "RCH_HELD_RECORD_END" {
+                if (phase != 1 || !inventory || !record_open || !record_roots) bad = 1
+                record_open = 0
+                next
+            }
             $0 == "RCH_ROOTS_END" {
-                if (phase != 1 || !held) bad = 1
+                if (phase != 1 || !held || record_open) bad = 1
                 phase = 2
                 next
             }
             {
-                if (phase > 1 || substr($0, 1, 1) != "/" ||
+                if (phase > 1 || (phase == 1 && inventory && !record_open) ||
+                    substr($0, 1, 1) != "/" ||
                     index($0, "\r") || (length(nul) == 1 && index($0, nul))) {
                     bad = 1
                     next
@@ -204,6 +224,7 @@ closures_overlap() {
                     terminal[node] = 1
                 } else {
                     held++
+                    record_roots++
                     if (terminal[node]) overlap = 1
                     for (i = 2; i <= count; i++) {
                         key = node SUBSEP parts[i]
@@ -229,6 +250,79 @@ closures_overlap() {
         disjoint) return 1 ;;
         *) refuse 'invalid source root comparison verdict' ;;
     esac
+}
+
+# Reuse the requested index for a batch of owners, not once per record. Start
+# with one owner so an immediate conflict still returns promptly, then double
+# up to 64. This bounds buffered names (~13 KiB), avoids quadratic string
+# growth, and checks every owner without building a worker-wide root union.
+# Quarantine and identity validation still precede any overlap verdict.
+check_held_claims() {
+    held_claim_names=
+    held_batch_count=0
+    held_batch_limit=1
+    for held in "$registry"/*.claim "$registry"/*.pending; do
+        [ -e "$held" ] || [ -L "$held" ] || continue
+        case "$held" in *.pending)
+            if ! rch_claim_record_valid "$held"; then
+                rch_claim_quarantine_pending "$registry" "$held" || refuse 'cannot quarantine pending claim'
+                continue
+            fi
+            ;;
+        esac
+        validate_record "$held"
+        case "${held##*/}" in "$token".*)
+            [ "$operation" = recover ] || refuse 'source identity already claimed'
+            [ "$held" = "$active" ] || [ "$held" = "$pending" ] || refuse 'source identity roots changed'
+            matches_request "$held"
+            continue
+            ;;
+        esac
+        if [ -z "$held_claim_names" ]; then
+            held_claim_names=${held##*/}
+        else
+            held_claim_names="$held_claim_names
+${held##*/}"
+        fi
+        held_batch_count=$((held_batch_count + 1))
+        if [ "$held_batch_count" -eq "$held_batch_limit" ]; then
+            check_held_claim_batch
+        fi
+    done
+    if [ "$held_batch_count" -gt 0 ]; then
+        check_held_claim_batch
+    fi
+}
+
+check_held_claim_batch() {
+    if closures_overlap "$requested" inventory lexical; then
+        busy 'unfinished overlapping source owner'
+    fi
+    if closures_overlap "$requested_physical" inventory physical; then
+        busy 'unfinished overlapping physical source owner'
+    fi
+    held_claim_names=
+    held_batch_count=0
+    if [ "$held_batch_limit" -lt 64 ]; then
+        held_batch_limit=$((held_batch_limit * 2))
+    fi
+}
+
+emit_held_claim_roots() {
+    while IFS= read -r held_name; do
+        # Individual framing prevents an unterminated/empty record from being
+        # hidden by concatenation with the next owner's roots. The outer end
+        # marker is emitted ONLY if every read/resolution succeeds.
+        printf 'RCH_HELD_RECORD_BEGIN\n' || return 1
+        case "$1" in
+            lexical) LC_ALL=C tr '\000' '\r' < "$registry/$held_name" || return 1 ;;
+            physical) physical_roots < "$registry/$held_name" || return 1 ;;
+            *) return 1 ;;
+        esac
+        printf 'RCH_HELD_RECORD_END\n' || return 1
+    done <<RCH_HELD_CLAIM_NAMES
+$held_claim_names
+RCH_HELD_CLAIM_NAMES
 }
 
 # rch <= 2.1.16 created .cancelling with a plain `set -C` redirect, so a full
@@ -458,34 +552,11 @@ $requested
 RCH_REQUESTED_ROOTS
 ) || refuse 'cannot resolve physical source roots'
 
-# Complete pending records retain their source exclusion. Incomplete legacy
-# writes cannot have authorized activity and are quarantined under this lock;
-# active-record corruption still refuses admission because ownership is unknown.
-for held in "$registry"/*.claim "$registry"/*.pending; do
-    [ -e "$held" ] || [ -L "$held" ] || continue
-    case "$held" in *.pending)
-        if ! rch_claim_record_valid "$held"; then
-            rch_claim_quarantine_pending "$registry" "$held" || refuse 'cannot quarantine pending claim'
-            continue
-        fi
-        ;;
-    esac
-    validate_record "$held"
-    case "${held##*/}" in "$token".*)
-        [ "$operation" = recover ] || refuse 'source identity already claimed'
-        [ "$held" = "$active" ] || [ "$held" = "$pending" ] || refuse 'source identity roots changed'
-        matches_request "$held"
-        continue
-        ;;
-    esac
-    if closures_overlap "$requested" file "$held"; then
-        busy 'unfinished overlapping source owner'
-    fi
-    held_physical=$(physical_roots < "$held") || refuse 'cannot resolve physical source roots'
-    if closures_overlap "$requested_physical" roots "$held_physical"; then
-        busy 'unfinished overlapping physical source owner'
-    fi
-done
+# Stream batches through reusable requested-root indexes while retaining the
+# registry flock. Physical roots are resolved afresh inside this transaction;
+# lexical and physical indexes remain sequential with their existing memory
+# bound. No scratch file, record format or ownership transition changes.
+check_held_claims
 
 if [ "$operation" = topology ]; then
     # No active or complete pending lexical/physical source owner overlaps.
