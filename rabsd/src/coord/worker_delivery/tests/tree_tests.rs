@@ -183,6 +183,74 @@ fn missing_cargo_outputs_or_incomplete_reports_never_acknowledge_success() {
 }
 
 #[test]
+fn cargo_test_delivery_recovery_preserves_opaque_harness_output_and_final_status() {
+    let mut request = cargo_request();
+    request["args"][0] = json!("test");
+    request["args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("--"), json!("--nocapture")]);
+    request["artifacts"]["cargo"] = json!("cargo-test-json-v1");
+    let stdout = concat!(
+        "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"test\"]},",
+        "\"filenames\":[\"/__rabs/out/cargo/a\"],\"executable\":\"/__rabs/out/cargo/a\"}\n",
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+        "{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/test-stdout\"]}\n",
+        "{\"reason\":\"build-finished\",\"success\":false}\n",
+        "unparsed test stdout without a final newline",
+    );
+    for exit_code in [0, 101] {
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("tests");
+        let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+        if exit_code != 0 {
+            peer.replies[1]["exit_code"] = json!(exit_code);
+            peer.replies[1]["artifact_manifest"] = Value::Null;
+            peer.replies[1]["artifact_ack_required"] = json!(false);
+            peer.replies.truncate(4);
+            peer.replies.push_back(
+                json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
+            );
+        }
+        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(peer.replies.is_empty());
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(delivery.receipt["exit_code"], exit_code);
+        assert_eq!(
+            fs::read(destination.join("diagnostics/stdout")).unwrap(),
+            stdout.as_bytes()
+        );
+        assert_eq!(
+            delivery.receipt["artifact_manifest"].is_null(),
+            exit_code != 0
+        );
+        let recovered =
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .unwrap()
+                .unwrap();
+        assert_eq!(recovered.receipt, delivery.receipt);
+        assert_eq!(recovered.receipt["publication_authorized"], false);
+        assert!(
+            !peer
+                .sent
+                .iter()
+                .any(|frame| exit_code != 0 && frame["kind"] == "artifact-ack")
+        );
+    }
+
+    let owner = tempfile::tempdir().unwrap();
+    let destination = owner.path().join("contradictory-failure");
+    let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+    peer.replies[1]["exit_code"] = json!(101);
+    let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+    assert!(failure.detail.contains("failed-execution artifacts"));
+    assert!(
+        no_ack(&peer),
+        "a test failure cannot offer successful artifacts"
+    );
+}
+
+#[test]
 fn tree_delivery_verifies_every_file_before_ack_and_preserves_exact_request() {
     for lose_ack in [false, true] {
         let owner = tempfile::tempdir().unwrap();

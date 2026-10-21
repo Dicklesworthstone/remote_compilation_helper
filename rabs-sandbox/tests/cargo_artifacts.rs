@@ -7,7 +7,7 @@
 use rabs_sandbox::artifact_tree::TreeInventory;
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
-use rabs_sandbox::cargo_artifacts::CargoArtifactReport;
+use rabs_sandbox::cargo_artifacts::{CargoArtifactMode, CargoArtifactReport};
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
 use std::collections::BTreeSet;
 use std::fs;
@@ -115,9 +115,12 @@ fn real_workspace_build_check_and_test_compilation_capture_actual_outputs() {
             "{mode}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let report =
-            CargoArtifactReport::read(output.stdout.as_slice(), output_root.to_str().unwrap())
-                .unwrap();
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            CargoArtifactMode::Compilation,
+        )
+        .unwrap();
         let required = report.files().map(str::to_owned).collect::<BTreeSet<_>>();
         let inventory =
             TreeInventory::scan(&output_root, &required, 128 * 1024 * 1024, &|| false).unwrap();
@@ -196,9 +199,160 @@ fn real_workspace_build_check_and_test_compilation_capture_actual_outputs() {
     assert!(
         CargoArtifactReport::read(
             broken.stdout.as_slice(),
-            owner.path().join("broken-output").to_str().unwrap()
+            owner.path().join("broken-output").to_str().unwrap(),
+            CargoArtifactMode::Compilation,
         )
         .is_err()
+    );
+}
+
+#[test]
+fn real_test_execution_reports_keep_harness_output_and_native_failure_status() {
+    let (owner, root, home, tools) = workspace_fixture();
+    fs::write(
+        root.join("app/tests/integration.rs"),
+        r#"#[test]
+fn selected() {
+    assert_eq!(artifact_library::VALUE, 42);
+    assert!(std::env::args().any(|arg| arg == "--nocapture"));
+    println!("test-program-stdout");
+    println!("{{\"reason\":\"compiler-artifact\",\"filenames\":[\"/unowned/fake\"]}}");
+    println!("{{\"reason\":\"build-finished\",\"success\":false}}");
+    eprintln!("test-program-stderr");
+}
+#[test]
+fn deliberate_failure() { panic!("intentional test failure after successful compilation"); }
+"#,
+    )
+    .unwrap();
+    let output_root = owner.path().join("test-execution-output");
+    fs::create_dir(&output_root).unwrap();
+    fs::set_permissions(&output_root, fs::Permissions::from_mode(0o700)).unwrap();
+    for (filter, successful) in [("selected", true), ("deliberate_failure", false)] {
+        let output = cargo(&tools, &root, &home)
+            .args([
+                "test",
+                "--workspace",
+                "--tests",
+                filter,
+                "--locked",
+                "--offline",
+                "--message-format=json",
+                "--target-dir",
+            ])
+            .arg(&output_root)
+            .args(["--", "--exact", "--nocapture", "--test-threads=1"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            successful,
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            CargoArtifactMode::TestExecution,
+        )
+        .unwrap();
+        let required = report.files().map(str::to_owned).collect::<BTreeSet<_>>();
+        let inventory =
+            TreeInventory::scan(&output_root, &required, 128 * 1024 * 1024, &|| false).unwrap();
+        report
+            .validate_outputs(inventory.names().map(|name| {
+                let executable = fs::metadata(output_root.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111
+                    != 0;
+                (name, executable)
+            }))
+            .unwrap();
+        assert!(required.iter().any(|name| name.contains("integration-")));
+        assert!(!required.iter().any(|name| name.contains("fake")));
+        if successful {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let finished = stdout
+                .find("\"reason\":\"build-finished\"")
+                .expect("real Cargo completion");
+            let ran = stdout
+                .find("test-program-stdout")
+                .expect("test harness ran");
+            assert!(
+                finished < ran,
+                "Cargo must complete the report before starting tests"
+            );
+            assert!(stdout.contains("1 passed"));
+            assert!(
+                stdout.contains("/unowned/fake"),
+                "test stdout must retain its literal bytes"
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("test-program-stderr"));
+            assert!(
+                CargoArtifactReport::read(
+                    output.stdout.as_slice(),
+                    output_root.to_str().unwrap(),
+                    CargoArtifactMode::Compilation,
+                )
+                .is_err(),
+                "test stdout is not a compilation-only report"
+            );
+        } else {
+            // The compilation report legitimately succeeds; the worker must
+            // use the final Cargo process status before offering artifacts.
+            assert_eq!(output.status.code(), Some(101));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 failed"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("intentional test failure"));
+        }
+        inventory.verify(&|| false).unwrap();
+    }
+}
+
+#[test]
+fn real_doctest_execution_follows_the_same_cargo_report_boundary() {
+    let (owner, root, home, tools) = workspace_fixture();
+    fs::write(root.join("library/src/lib.rs"),
+        "/// ```\n/// assert_eq!(artifact_library::VALUE, 42);\n/// ```\npub fn documented() {}\ninclude!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n").unwrap();
+    let output_root = owner.path().join("doctest-output");
+    let output = cargo(&tools, &root, &home)
+        .env("RUSTDOC", tools.join("bin/rustdoc"))
+        .args([
+            "test",
+            "-p",
+            "artifact_library",
+            "--doc",
+            "--locked",
+            "--offline",
+            "--message-format=json",
+            "--target-dir",
+        ])
+        .arg(&output_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = CargoArtifactReport::read(
+        output.stdout.as_slice(),
+        output_root.to_str().unwrap(),
+        CargoArtifactMode::TestExecution,
+    )
+    .unwrap();
+    assert!(report.files().any(|name| name.ends_with(".rlib")));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "the documentation example must actually execute"
+    );
+    assert!(
+        stdout.find("\"reason\":\"build-finished\"").unwrap()
+            < stdout.find("running 1 test").unwrap()
     );
 }
 
@@ -296,8 +450,12 @@ fn canonical_namespace_build_check_and_test_compilation_capture_actual_outputs()
             "canonical {mode}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let report =
-            CargoArtifactReport::read(output.stdout.as_slice(), "/__rabs/out/cargo").unwrap();
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            "/__rabs/out/cargo",
+            CargoArtifactMode::Compilation,
+        )
+        .unwrap();
         let required = report.files().map(str::to_owned).collect::<BTreeSet<_>>();
         let inventory =
             TreeInventory::scan(&output_root, &required, 128 * 1024 * 1024, &|| false).unwrap();

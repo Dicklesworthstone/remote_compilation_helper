@@ -256,7 +256,7 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
     require(
         value
             .as_object()
-            .is_some_and(|v| v.len() == 2 + usize::from(tree) + usize::from(cargo)),
+            .is_some_and(|v| v.len() == 2 + usize::from(tree) + usize::from(cargo.is_some())),
         "invalid artifact declaration",
     )?;
     let unit = text(value, "unit")?;
@@ -275,7 +275,7 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("artifact files"))?;
     require(
-        (cargo || !files.is_empty()) && files.len() <= 128,
+        (cargo.is_some() || !files.is_empty()) && files.len() <= 128,
         "artifact count",
     )?;
     let mut names = BTreeSet::new();
@@ -581,11 +581,11 @@ pub(crate) fn verify_cargo_artifacts(
     artifacts: &Value,
     stdout: impl std::io::Read,
 ) -> io::Result<()> {
-    if !cargo_artifacts::requested(request)? {
+    let Some(mode) = cargo_artifacts::requested(request)? else {
         return Ok(());
-    }
+    };
     verified_artifact_names(request, artifacts)?;
-    let report = CargoArtifactReport::read(stdout, "/__rabs/out/cargo")?;
+    let report = CargoArtifactReport::read(stdout, "/__rabs/out/cargo", mode)?;
     let files = artifacts["files"]
         .as_array()
         .ok_or_else(|| invalid("Cargo artifact manifest"))?

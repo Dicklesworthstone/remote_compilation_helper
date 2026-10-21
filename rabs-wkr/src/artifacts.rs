@@ -13,7 +13,7 @@ use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
 };
 use rabs_sandbox::canonical_mounts::UnitMount;
-use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
+use rabs_sandbox::cargo_artifacts::{self, CargoArtifactMode, CargoArtifactReport};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
@@ -39,7 +39,7 @@ pub struct ArtifactPlan {
     files: BTreeSet<String>,
     directories: BTreeSet<String>,
     tree: bool,
-    cargo: bool,
+    cargo: Option<CargoArtifactMode>,
 }
 
 impl ArtifactPlan {
@@ -67,7 +67,7 @@ impl ArtifactPlan {
 
     /// Cargo supplies hashed target names only after compilation. Its explicit
     /// JSON contract must be resolved before this plan can capture any output.
-    fn new_cargo_tree(required: Vec<String>) -> io::Result<Self> {
+    fn new_cargo_tree(required: Vec<String>, mode: CargoArtifactMode) -> io::Result<Self> {
         if !cfg!(target_os = "linux") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -79,7 +79,7 @@ impl ArtifactPlan {
             rabs_sandbox::artifact_tree::validate_tree_names(plan.files())?;
         }
         plan.tree = true;
-        plan.cargo = true;
+        plan.cargo = Some(mode);
         Ok(plan)
     }
 
@@ -136,7 +136,7 @@ impl ArtifactPlan {
             files,
             directories,
             tree: false,
-            cargo: false,
+            cargo: None,
         })
     }
 
@@ -212,19 +212,19 @@ impl PreparedArtifacts {
         stdout: impl Read,
         stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
-        if !self.plan.cargo {
+        let Some(mode) = self.plan.cargo else {
             return self.capture_with_dependency_inputs(dependency_inputs, stopped);
-        }
+        };
         if dependency_inputs.is_some() || stopped() {
             return Err(invalid(
                 "Cargo artifact capture interrupted or has dependency-only inputs",
             ));
         }
         let admitted_plan = self.plan.clone();
-        let report = CargoArtifactReport::read(stdout, &self.plan.virtual_root())?;
+        let report = CargoArtifactReport::read(stdout, &self.plan.virtual_root(), mode)?;
         self.plan.files.extend(report.files().map(str::to_owned));
         rabs_sandbox::artifact_tree::validate_tree_names(self.plan.files())?;
-        self.plan.cargo = false;
+        self.plan.cargo = None;
         let mut captured = self.capture_with_dependency_inputs(None, stopped)?;
         report.validate_outputs(
             captured
@@ -267,7 +267,7 @@ impl PreparedArtifacts {
         dependency_inputs: Option<&DependencyOutputInputs>,
         stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
-        if self.plan.cargo {
+        if self.plan.cargo.is_some() {
             return Err(invalid(
                 "Cargo artifact capture requires its complete JSON output",
             ));
@@ -597,7 +597,7 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
     let files = value
         .get("files")
         .and_then(serde_json::Value::as_array)
-        .filter(|files| (cargo || !files.is_empty()) && files.len() <= MAX_ARTIFACT_FILES)
+        .filter(|files| (cargo.is_some() || !files.is_empty()) && files.len() <= MAX_ARTIFACT_FILES)
         .ok_or("artifact files require a bounded required set or a Cargo artifact contract")?;
     let paths = files
         .iter()
@@ -607,8 +607,8 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
                 .ok_or_else(|| "artifact names must be strings".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let plan = if cargo {
-        ArtifactPlan::new_cargo_tree(paths)
+    let plan = if let Some(mode) = cargo {
+        ArtifactPlan::new_cargo_tree(paths, mode)
     } else if tree {
         ArtifactPlan::new_tree(unit.to_owned(), paths)
     } else {
@@ -1354,7 +1354,8 @@ mod tests {
             "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":CARGO_ARTIFACTS_VERSION},
         });
         let plan = parse_plan(&request).unwrap().unwrap();
-        assert!(plan.cargo && plan.tree && plan.files.is_empty());
+        assert_eq!(plan.cargo, Some(CargoArtifactMode::Compilation));
+        assert!(plan.tree && plan.files.is_empty());
         let report = concat!(
             "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
             "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp-123.rmeta\"],\"executable\":null}\n",
@@ -1410,5 +1411,41 @@ mod tests {
         invalid = request;
         invalid["artifacts"]["cargo"] = serde_json::json!("cargo-json-v2");
         assert!(parse_plan(&invalid).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_test_capture_keeps_execution_intent_and_ignores_harness_json() {
+        use std::os::unix::fs::PermissionsExt;
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["test", "--message-format=json", "--target-dir", "/__rabs/out/cargo", "--", "--nocapture"],
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":"cargo-test-json-v1"},
+        });
+        let plan = parse_plan(&request).unwrap().unwrap();
+        assert_eq!(plan.cargo, Some(CargoArtifactMode::TestExecution));
+        let prepared = PreparedArtifacts::new(plan.clone()).unwrap();
+        fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+        let executable = prepared.backing().join("debug/deps/integration-123");
+        fs::write(&executable, b"test executable fixture").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let stdout = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"test\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/debug/deps/integration-123\"],",
+            "\"executable\":\"/__rabs/out/cargo/debug/deps/integration-123\"}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+            "{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n",
+            "{literal unterminated test output",
+        );
+        let captured = prepared
+            .capture_with_cargo_output(None, stdout.as_bytes(), || false)
+            .unwrap();
+        assert_eq!(captured.plan(), &plan);
+        assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 1);
+        assert!(
+            captured
+                .file_identity("debug/deps/integration-123")
+                .is_some()
+        );
     }
 }

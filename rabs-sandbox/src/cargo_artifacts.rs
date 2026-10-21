@@ -1,4 +1,4 @@
-//! Cargo-selected output names for canonical build, check and test compilation.
+//! Cargo-selected output names for canonical build, check and test execution.
 //!
 //! Cargo owns target selection and hashed output names. Its complete bounded JSON
 //! stream supplies the required artifacts; the existing tree capture must still
@@ -12,6 +12,15 @@ use std::io::{self, BufRead, BufReader, Read};
 
 /// Explicit opt-in under artifacts.cargo; old endpoints must reject this field.
 pub const CARGO_ARTIFACTS_VERSION: &str = "cargo-json-v1";
+/// Test execution has arbitrary program output after Cargo's build-finished.
+/// Its native final process status, never that JSON record, decides success.
+pub const CARGO_TEST_ARTIFACTS_VERSION: &str = "cargo-test-json-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoArtifactMode {
+    Compilation,
+    TestExecution,
+}
 /// Bound the whole stream, including non-JSON output from procedural macros.
 pub const MAX_CARGO_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 /// Do not allocate an unbounded line before checking the stream budget.
@@ -23,17 +32,22 @@ fn invalid(message: &str) -> io::Error {
 }
 
 /// Validate the command as well as the version before execution admission.
-/// The JSON contract applies only to compilation commands, never run/test output
-/// after build-finished. The caller separately validates the artifact names.
-pub fn requested(request: &Value) -> io::Result<bool> {
+/// The version distinguishes compilation-only output from tests' arbitrary
+/// stdout after build-finished. The caller separately validates artifact names
+/// and the final native process status before offering a successful result.
+pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
     let Some(contract) = request
         .get("artifacts")
         .and_then(|value| value.get("cargo"))
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    if contract.as_str() != Some(CARGO_ARTIFACTS_VERSION)
-        || request["artifacts"]["tree"].as_str() != Some(TREE_FILES_VERSION)
+    let mode = match contract.as_str() {
+        Some(CARGO_ARTIFACTS_VERSION) => CargoArtifactMode::Compilation,
+        Some(CARGO_TEST_ARTIFACTS_VERSION) => CargoArtifactMode::TestExecution,
+        _ => return Err(invalid("unsupported Cargo artifact contract")),
+    };
+    if request["artifacts"]["tree"].as_str() != Some(TREE_FILES_VERSION)
         || request["artifacts"]["unit"].as_str() != Some("cargo")
         || request["program"].as_str() != Some("/__rabs/toolchain/bin/cargo")
         || request.get("dependency_context").is_some()
@@ -54,7 +68,7 @@ pub fn requested(request: &Value) -> io::Result<bool> {
     let command = args[0];
     if !matches!(command, "build" | "check" | "test") {
         return Err(invalid(
-            "Cargo artifact contract requires build, check or test --no-run",
+            "Cargo artifact contract requires build, check or test",
         ));
     }
     let mut format = false;
@@ -62,6 +76,11 @@ pub fn requested(request: &Value) -> io::Result<bool> {
     let mut no_run = false;
     let mut at = 1;
     while at < args.len() {
+        // Every remaining byte belongs to the selected test harness. In
+        // particular --no-run/--help/--target-dir here are not Cargo options.
+        if args[at] == "--" && mode == CargoArtifactMode::TestExecution {
+            break;
+        }
         let (option, inline) = args[at]
             .split_once('=')
             .map_or((args[at], None), |(option, value)| (option, Some(value)));
@@ -102,10 +121,14 @@ pub fn requested(request: &Value) -> io::Result<bool> {
         }
         at += 1;
     }
-    if !format || !target || (command == "test" && !no_run) {
+    let matching_command = match mode {
+        CargoArtifactMode::Compilation => command != "test" || no_run,
+        CargoArtifactMode::TestExecution => command == "test" && !no_run,
+    };
+    if !format || !target || !matching_command {
         return Err(invalid("incomplete Cargo compilation artifact contract"));
     }
-    Ok(true)
+    Ok(Some(mode))
 }
 
 /// Required real compiler outputs, reconstructed independently by both peers.
@@ -118,8 +141,9 @@ pub struct CargoArtifactReport {
 impl CargoArtifactReport {
     /// Read Cargo's actual stdout, preserving unrelated output in its original
     /// diagnostic stream. Non-JSON lines are allowed, as Cargo cannot control
-    /// procedural macro stdout. Malformed JSON-shaped records fail closed.
-    pub fn read(reader: impl Read, output_root: &str) -> io::Result<Self> {
+    /// procedural macro stdout. Malformed JSON-shaped records fail closed in
+    /// the compilation report; test output after build-finished stays opaque.
+    pub fn read(reader: impl Read, output_root: &str, mode: CargoArtifactMode) -> io::Result<Self> {
         if !output_root.starts_with('/') || output_root.ends_with('/') {
             return Err(invalid("Cargo output root must be an absolute directory"));
         }
@@ -133,6 +157,26 @@ impl CargoArtifactReport {
         let mut compiled_target = false;
         let mut artifact_messages = 0_usize;
         loop {
+            if finished && mode == CargoArtifactMode::TestExecution {
+                // Stock Cargo emits build-finished before starting test
+                // programs. Their stdout is opaque: even a JSON-shaped record
+                // or an unterminated/long line cannot add an artifact or change
+                // compilation success. Still consume and bound the entire
+                // verified stream without buffering an arbitrary test line.
+                loop {
+                    let available = reader.fill_buf()?;
+                    if available.is_empty() {
+                        break;
+                    }
+                    let count = available.len();
+                    total = total
+                        .checked_add(count as u64)
+                        .filter(|total| *total <= MAX_CARGO_REPORT_BYTES)
+                        .ok_or_else(|| invalid("Cargo artifact report exceeds its byte bound"))?;
+                    reader.consume(count);
+                }
+                break;
+            }
             line.clear();
             loop {
                 let available = reader.fill_buf()?;
@@ -303,7 +347,10 @@ mod tests {
             "args":["build", "--message-format=json", "--target-dir", OUTPUT_ROOT],
             "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION,
                 "files":[], "cargo":CARGO_ARTIFACTS_VERSION}});
-        assert!(requested(&base).unwrap());
+        assert_eq!(
+            requested(&base).unwrap(),
+            Some(CargoArtifactMode::Compilation)
+        );
         for command in ["check", "test"] {
             let mut request = base.clone();
             request["args"][0] = json!(command);
@@ -314,7 +361,10 @@ mod tests {
                     .unwrap()
                     .push(json!("--no-run"));
             }
-            assert!(requested(&request).unwrap());
+            assert_eq!(
+                requested(&request).unwrap(),
+                Some(CargoArtifactMode::Compilation)
+            );
         }
         for extra in [
             "--message-format=human",
@@ -334,7 +384,152 @@ mod tests {
         }
         let mut plain = base;
         plain["artifacts"].as_object_mut().unwrap().remove("cargo");
-        assert!(!requested(&plain).unwrap());
+        assert_eq!(requested(&plain).unwrap(), None);
+    }
+
+    #[test]
+    fn test_execution_requires_its_own_contract_and_keeps_harness_options_opaque() {
+        let base = json!({"program":"/__rabs/toolchain/bin/cargo",
+            "args":["test", "--workspace", "--message-format=json", "--target-dir", OUTPUT_ROOT],
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION,
+                "files":[], "cargo":CARGO_TEST_ARTIFACTS_VERSION}});
+        assert_eq!(
+            requested(&base).unwrap(),
+            Some(CargoArtifactMode::TestExecution)
+        );
+        for command in ["build", "check", "run"] {
+            let mut request = base.clone();
+            request["args"][0] = json!(command);
+            assert!(requested(&request).is_err());
+        }
+        let mut compilation = base.clone();
+        compilation["args"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("--no-run"));
+        assert!(requested(&compilation).is_err());
+        compilation["artifacts"]["cargo"] = json!(CARGO_ARTIFACTS_VERSION);
+        assert_eq!(
+            requested(&compilation).unwrap(),
+            Some(CargoArtifactMode::Compilation)
+        );
+        let mut harness = base.clone();
+        harness["args"].as_array_mut().unwrap().extend(
+            [
+                "--",
+                "--nocapture",
+                "--no-run",
+                "--help",
+                "--target-dir",
+                "/elsewhere",
+                "--message-format=json",
+            ]
+            .map(|arg| json!(arg)),
+        );
+        assert_eq!(
+            requested(&harness).unwrap(),
+            Some(CargoArtifactMode::TestExecution)
+        );
+        harness["artifacts"]["cargo"] = json!(CARGO_ARTIFACTS_VERSION);
+        assert!(requested(&harness).is_err());
+        let mut late_options = base;
+        late_options["args"] = json!([
+            "test",
+            "--",
+            "--message-format=json",
+            "--target-dir",
+            OUTPUT_ROOT
+        ]);
+        assert!(
+            requested(&late_options).is_err(),
+            "test arguments cannot supply Cargo controls"
+        );
+    }
+
+    #[test]
+    fn test_stdout_cannot_change_the_completed_cargo_artifact_report() {
+        let prefix = stream(&[
+            record(
+                "test",
+                &["/out/deps/integration-123"],
+                Some("/out/deps/integration-123"),
+            ),
+            json!({"reason":"build-finished", "success":true}),
+        ]);
+        for tail in [
+            b"test result: ok. 1 passed\n".as_slice(),
+            b"{not a Cargo message}\n".as_slice(),
+            b"{\"reason\":\"build-finished\",\"success\":false}\n".as_slice(),
+            b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n".as_slice(),
+            b"\xff\x00unterminated test stdout".as_slice(),
+        ] {
+            let report = CargoArtifactReport::read(
+                prefix.as_slice().chain(tail),
+                "/out",
+                CargoArtifactMode::TestExecution,
+            )
+            .unwrap();
+            assert_eq!(report.files().collect::<Vec<_>>(), ["deps/integration-123"]);
+            report
+                .validate_outputs([("deps/integration-123", true)])
+                .unwrap();
+        }
+        assert!(
+            CargoArtifactReport::read(
+                prefix
+                    .as_slice()
+                    .chain(b"{not a Cargo message}\n".as_slice()),
+                "/out",
+                CargoArtifactMode::Compilation,
+            )
+            .is_err(),
+            "compilation-only messages must retain strict framing"
+        );
+        for records in [
+            vec![record("test", &["/out/deps/integration-123"], None)],
+            vec![
+                record("test", &["/out/deps/integration-123"], None),
+                json!({"reason":"build-finished", "success":false}),
+            ],
+            vec![
+                json!({"reason":"build-finished", "success":true}),
+                record("test", &["/out/deps/integration-123"], None),
+            ],
+        ] {
+            assert!(
+                CargoArtifactReport::read(
+                    stream(&records).as_slice(),
+                    "/out",
+                    CargoArtifactMode::TestExecution,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_stdout_has_a_total_byte_bound_without_a_json_line_limit() {
+        let prefix = stream(&[
+            record("test", &["/out/deps/test-123"], Some("/out/deps/test-123")),
+            json!({"reason":"build-finished", "success":true}),
+        ]);
+        let budget = MAX_CARGO_REPORT_BYTES - prefix.len() as u64;
+        assert!(
+            CargoArtifactReport::read(
+                prefix.as_slice().chain(io::repeat(b'x').take(budget)),
+                "/out",
+                CargoArtifactMode::TestExecution,
+            )
+            .is_ok()
+        );
+        assert!(
+            CargoArtifactReport::read(
+                prefix.as_slice().chain(io::repeat(b'x').take(budget + 1)),
+                "/out",
+                CargoArtifactMode::TestExecution,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -357,7 +552,9 @@ mod tests {
             ),
             json!({"reason":"build-finished", "success":true}),
         ]);
-        let report = CargoArtifactReport::read(bytes.as_slice(), "/out").unwrap();
+        let report =
+            CargoArtifactReport::read(bytes.as_slice(), "/out", CargoArtifactMode::Compilation)
+                .unwrap();
         assert_eq!(report.files().count(), 4);
         report
             .validate_outputs([
@@ -399,11 +596,21 @@ mod tests {
                 json!({"reason":"build-finished", "success":true}),
             ],
         ] {
-            assert!(CargoArtifactReport::read(stream(&records).as_slice(), "/out").is_err());
+            assert!(
+                CargoArtifactReport::read(
+                    stream(&records).as_slice(),
+                    "/out",
+                    CargoArtifactMode::Compilation,
+                )
+                .is_err()
+            );
         }
         let mut bytes = stream(&[artifact, json!({"reason":"build-finished", "success":true})]);
         bytes.pop();
-        assert!(CargoArtifactReport::read(bytes.as_slice(), "/out").is_err());
+        assert!(
+            CargoArtifactReport::read(bytes.as_slice(), "/out", CargoArtifactMode::Compilation,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -421,7 +628,9 @@ mod tests {
                 json!({"reason":"build-finished", "success":true}),
             ]);
             assert!(
-                CargoArtifactReport::read(bytes.as_slice(), "/out").is_err(),
+                CargoArtifactReport::read(
+                    bytes.as_slice(), "/out", CargoArtifactMode::Compilation,
+                ).is_err(),
                 "{paths:?}"
             );
         }
@@ -429,7 +638,10 @@ mod tests {
             record("bin", &["/out/app"], Some("/out/other")),
             json!({"reason":"build-finished", "success":true}),
         ]);
-        assert!(CargoArtifactReport::read(bytes.as_slice(), "/out").is_err());
+        assert!(
+            CargoArtifactReport::read(bytes.as_slice(), "/out", CargoArtifactMode::Compilation,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -439,9 +651,22 @@ mod tests {
             record("lib", &["/out/deps/libapp.rmeta"], None),
             json!({"reason":"build-finished", "success":true}),
         ]));
-        assert!(CargoArtifactReport::read(bytes.as_slice(), "/out").is_ok());
+        assert!(
+            CargoArtifactReport::read(bytes.as_slice(), "/out", CargoArtifactMode::Compilation,)
+                .is_ok()
+        );
         let huge = vec![b'a'; MAX_CARGO_MESSAGE_BYTES + 1];
-        assert!(CargoArtifactReport::read(huge.as_slice(), "/out").is_err());
-        assert!(CargoArtifactReport::read(b"{bad json}\n".as_slice(), "/out").is_err());
+        assert!(
+            CargoArtifactReport::read(huge.as_slice(), "/out", CargoArtifactMode::Compilation,)
+                .is_err()
+        );
+        assert!(
+            CargoArtifactReport::read(
+                b"{bad json}\n".as_slice(),
+                "/out",
+                CargoArtifactMode::Compilation,
+            )
+            .is_err()
+        );
     }
 }

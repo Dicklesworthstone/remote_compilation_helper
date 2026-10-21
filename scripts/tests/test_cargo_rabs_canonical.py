@@ -27,8 +27,8 @@ loader.exec_module(launcher)
 DRIVER = r'''
 import json, os, pathlib, signal, sys
 args = sys.argv[1:]
-assert args[0:2] == ["--worker-build-tls", "--prepare-from"], args
-source, specification, address, worker, pin, bundle, delivery, output = args[2:]
+assert args[0:3] == ["--worker-build-tls", "--replay-diagnostics", "--prepare-from"], args
+source, specification, address, worker, pin, bundle, delivery, output = args[3:]
 request = json.loads(pathlib.Path(specification).read_text())
 operation = pathlib.Path(specification).parent
 assert not pathlib.Path(bundle).exists()
@@ -36,8 +36,10 @@ assert not pathlib.Path(delivery).exists()
 assert not pathlib.Path(output).exists()
 assert request["program"] == "/__rabs/toolchain/bin/cargo"
 assert request["artifacts"]["tree"] == "tree-files-v1"
-assert request["artifacts"]["cargo"] == "cargo-json-v1"
-assert request["args"].count("--message-format=json") == 1
+cargo_args = request["args"][:request["args"].index("--")] if "--" in request["args"] else request["args"]
+test_execution = cargo_args[0] == "test" and "--no-run" not in cargo_args
+assert request["artifacts"]["cargo"] == ("cargo-test-json-v1" if test_execution else "cargo-json-v1")
+assert cargo_args.count("--message-format=json") == 1
 assert request["toolchain_source"] + "/bin/cargo" == os.environ["CARGO"]
 assert request["toolchain_source"] + "/bin/rustc" == os.environ["RUSTC"]
 record = {"pid":os.getpid(), "argv":sys.argv, "request":request,
@@ -49,7 +51,9 @@ if fd:
 with open(os.environ["TEST_DRIVER_RECORD"], "a") as result:
     result.write(json.dumps(record) + "\n")
 print("native-driver-diagnostic", file=sys.stderr, flush=True)
-print(json.dumps({"kind":"fixture-worker-build", "pid":os.getpid()}), flush=True)
+sys.stdout.buffer.write(b"fixture Cargo stdout\x00\xff\n")
+sys.stdout.buffer.flush()
+print(json.dumps({"kind":"fixture-worker-build", "pid":os.getpid()}), file=sys.stderr, flush=True)
 if os.environ.get("TEST_SIGNAL"):
     os.kill(os.getpid(), signal.SIGTERM)
 sys.exit(int(os.environ.get("TEST_EXIT", "0")))
@@ -129,7 +133,8 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(record["cwd"], str(self.root))
         self.assertEqual(record["tls"], env["RABS_COORD_TLS_KEY"])
         self.assertNotIn(env["RABS_COORD_TLS_KEY"], json.dumps(record["request"]))
-        self.assertEqual(json.loads(stdout)["kind"], "fixture-worker-build")
+        self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+        self.assertIn(b'"kind": "fixture-worker-build"', stderr)
         self.assertIn(b"native-driver-diagnostic", stderr)
         self.assertEqual(record["request"]["command_context"]["env"], {"CARGO_INCREMENTAL":"0"})
         self.assertEqual(record["request"]["artifacts"]["files"], [])
@@ -253,6 +258,7 @@ class CanonicalCargo(unittest.TestCase):
             self.assertFalse(metadata["automatic_retry"])
             self.assertFalse(metadata["publication_authorized"])
             self.assertNotIn("--prepare-from", metadata["prepared_build_argv"])
+            self.assertEqual(metadata["prepared_build_argv"][2], "--replay-diagnostics")
 
     def test_native_failure_never_runs_a_second_driver_or_local_compiler(self):
         for status in (1, 2, 101, 125):
@@ -291,9 +297,11 @@ class CanonicalCargo(unittest.TestCase):
                 os.close(write)
 
     def test_unknown_and_ambiguous_output_controls_refuse_before_any_operation(self):
-        for args in (["run", "--bin=hello"], ["test"], ["test", "--no-run=false"],
+        for args in (["run", "--bin=hello"], ["test", "--no-run=false"],
                      ["test", "--no-run", "--no-run"], ["build", "--no-run"],
                      ["check", "--no-run"], ["test", "--no-run", "--", "filter"],
+                     ["test", "--no-run", "filter"], ["test", "--doc", "--no-run"],
+                     ["test", "one-filter", "another-filter"], ["build", "--no-fail-fast"],
                      ["build", "--exclude=member"], ["build", "--bin=hello", "--target-dir=/other"],
                      ["build", "--bin=hello", "--manifest-path=elsewhere"],
                      ["build", "--bin=hello", "--config", "x=y"],
@@ -330,6 +338,36 @@ class CanonicalCargo(unittest.TestCase):
                 self.assertEqual(request["args"].count("--message-format=json"), 1)
                 self.assertFalse((Path(self.records()[-1]["operation"]) / "outputs").exists(),
                                  "the launcher must not fabricate compiler outputs")
+
+    def test_canonical_tests_keep_filters_harness_bytes_and_final_native_status(self):
+        cases = (
+            (["test"], []),
+            (["test", "--workspace", "--no-fail-fast"], ["--", "--test-threads=1"]),
+            (["test", "--test", "integration", "selected::case"], ["--", "--exact", "--nocapture"]),
+            (["test", "--lib", "name=literal雪"], ["--", "--skip", "value with spaces'雪"]),
+            (["test", "--doc"], []),
+            (["test", "--locked"], ["--", "--offline", "--message-format=json", "--no-run", "--help"]),
+        )
+        for before, after in cases:
+            with self.subTest(before=before, after=after):
+                status, stdout, stderr, pid = self.invoke(before + after, env=dict(self.env, TEST_EXIT="101"))
+                self.assertEqual(status, 101, "Cargo/test failure must remain observable")
+                record = self.records()[-1]
+                request = record["request"]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(request["artifacts"]["cargo"], "cargo-test-json-v1")
+                self.assertEqual(request["args"][:len(before)], before)
+                driver_args = request["args"][:-len(after)] if after else request["args"]
+                self.assertEqual(driver_args.count("--locked"), 1)
+                self.assertEqual(driver_args.count("--offline"), 1)
+                self.assertEqual(driver_args.count("--message-format=json"), 1)
+                self.assertEqual(driver_args[-2:], ["--target-dir", "/__rabs/out/cargo"])
+                if after:
+                    self.assertEqual(request["args"][-len(after):], after)
+                self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+                self.assertIn(b'"kind": "fixture-worker-build"', stderr)
+                self.assertIn(b"native-driver-diagnostic", stderr)
+                self.assertFalse((Path(record["operation"]) / "outputs").exists())
 
     def test_launcher_mode_conflicts_cannot_reach_another_executor(self):
         for first in ("--rabs-no-start", "--rabs-require-daemon", "--rabs-remote"):
@@ -376,7 +414,7 @@ class CanonicalCargo(unittest.TestCase):
         self.profile["listen"] = "[::1]:45123"
         self.save()
         self.assertEqual(self.invoke()[0], 0)
-        self.assertEqual(self.records()[0]["argv"][5], "[::1]:45123")
+        self.assertEqual(self.records()[0]["argv"][6], "[::1]:45123")
 
     def test_unsafe_or_input_nested_operation_roots_are_not_chmodded_or_used(self):
         self.operations.chmod(0o770)
@@ -471,7 +509,7 @@ class CanonicalCargo(unittest.TestCase):
         status, stdout, _, _ = self.invoke(cargo_args=[], prefix=["--help"])
         self.assertEqual(status, 0)
         self.assertIn(b"--rabs-canonical", stdout)
-        self.assertIn(b"not Cargo JSON", stdout)
+        self.assertIn(b"complete verified delivery", stdout)
         self.assertFalse(self.record.exists())
         self.assertEqual(list(self.operations.iterdir()), [])
 

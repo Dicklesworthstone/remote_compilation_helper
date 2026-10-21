@@ -62,7 +62,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-no-start        Only use an already-running daemon.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
-  --rabs-canonical FILE  Compile selected Cargo targets through a canonical worker.
+  --rabs-canonical FILE  Build, check or test through a canonical worker.
   --help                Show this help without starting a daemon or Cargo.
 
 Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
@@ -71,13 +71,16 @@ build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
 explicit upload boundary, profile and worker connection setup. This Linux-only
 profile uses a captured toolchain, fixed worker environment and new output tree;
 it is not transparent local-path replay, per-action scheduling or cache serving.
-Builds, checks and test --no-run accept ordinary workspace/target selection.
+Builds, checks and tests accept ordinary workspace/target selection. Test filters
+and arguments after -- are preserved; --no-run remains compilation-only.
 Cargo's artifact reports identify the required real outputs in the captured tree.
+Test execution success requires Cargo's final exit, never build-finished alone.
 Profiles may select an existing vendor tree or an explicit cargo_home_source
 for checksum-verified, locked crates.io dependencies from the offline cache.
 Cargo metadata may run locally; builds never do. No local/RCH fallback or
-automatic execution retry occurs. stdout is the native worker-build report,
-not Cargo JSON; full compiler diagnostics remain in the verified delivery.
+automatic execution retry occurs. After complete verified delivery, the native
+driver replays Cargo/test stdout and stderr exactly and sends its result report
+to stderr. Test stdout may include arbitrary harness output after Cargo's JSON.
 
 Remote mode requires a matching RCH installation and configured POSIX workers.
 It execs `rch exec --source-content-receipt -- cargo ...`, with remote execution
@@ -1185,14 +1188,14 @@ def canonical_profile(path):
 
 
 def canonical_build_arguments(args):
-    """Preserve compile-only Cargo intent and select the native artifact contract.
+    """Preserve Cargo compilation/test intent and its test-harness arguments.
 
     Cargo's JSON reports supply actual library, metadata, binary and test names,
     including toolchain-specific intermediate and target-triple layouts.
     """
     import re
     if not args or args[0] not in ("build", "check", "test") or len(args) > 256:
-        raise SetupError("canonical mode requires build, check or test --no-run")
+        raise SetupError("canonical mode requires build, check or test")
     if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
         raise SetupError("canonical Cargo arguments exceed their bounds")
     try:
@@ -1204,9 +1207,16 @@ def canonical_build_arguments(args):
     no_run = False
     workspace = False
     excluded = False
+    test_filter = False
     selections = set()
     at = 1
     while at < len(args):
+        if args[at] == "--":
+            if args[0] != "test" or no_run:
+                raise SetupError("test-harness arguments require canonical test execution")
+            # The remaining bounded UTF-8 arguments belong to the program,
+            # including strings that look like Cargo or launcher options.
+            break
         option, separator, value = args[at].partition("=")
         if option in ("--bin", "--example", "--test", "--bench", "--package", "-p",
                       "--features", "-F", "--target", "--color", "--exclude"):
@@ -1239,15 +1249,19 @@ def canonical_build_arguments(args):
             no_run = True
         elif not separator and option == "--workspace":
             workspace = True
+        elif not separator and option in ("--no-fail-fast", "--doc") and args[0] == "test":
+            pass
         elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
                                           "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q",
                                           "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets"):
             pass
+        elif args[0] == "test" and not args[at].startswith("-") and not test_filter:
+            test_filter = True
         else:
             raise SetupError("unsupported canonical Cargo argument: " + args[at])
         at += 1
-    if args[0] == "test" and not no_run:
-        raise SetupError("canonical test mode requires --no-run; test execution is a separate operation")
+    if no_run and (test_filter or "--doc" in args):
+        raise SetupError("test filters and --doc require canonical test execution")
     if excluded and not workspace:
         raise SetupError("canonical --exclude requires --workspace")
     return list(args), []
@@ -1266,6 +1280,10 @@ def canonical_invocation(profile_path, args, env):
     )):
         raise SetupError("nested canonical/remote dispatch is not supported")
     cargo_args, outputs = canonical_build_arguments(args)
+    separator = cargo_args.index("--") if "--" in cargo_args else len(cargo_args)
+    harness_args = cargo_args[separator:]
+    cargo_args = cargo_args[:separator]
+    test_execution = cargo_args[0] == "test" and "--no-run" not in cargo_args
     profile = canonical_profile(profile_path)
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     if os.path.samefile(daemon, __file__):
@@ -1276,6 +1294,7 @@ def canonical_invocation(profile_path, args, env):
             if flag not in cargo_args:
                 cargo_args.append(flag)
     cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
+    cargo_args += harness_args
     import secrets
     specification = {
         "kind": "canonical-exec", "request_id": secrets.randbits(64) or 1,
@@ -1284,7 +1303,8 @@ def canonical_invocation(profile_path, args, env):
                             "env": {"CARGO_INCREMENTAL": "0"}},
         "toolchain_source": profile["toolchain_root"],
         "cargo_source": {"manifest": profile["manifest"]},
-        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs, "cargo": "cargo-json-v1"},
+        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs,
+                      "cargo": "cargo-test-json-v1" if test_execution else "cargo-json-v1"},
     }
     if "vendor" in profile:
         specification["cargo_source"]["vendor"] = profile["vendor"]
@@ -1300,7 +1320,7 @@ def canonical_invocation(profile_path, args, env):
     # on failure. The approved source/toolchain are untouched by this launcher.
     operation.mkdir(mode=0o700)
     bundle, delivery, output = (str(operation / name) for name in ("bundle", "delivery", "outputs"))
-    native = [daemon, "--worker-build-tls", profile["listen"], profile["worker"],
+    native = [daemon, "--worker-build-tls", "--replay-diagnostics", profile["listen"], profile["worker"],
               profile["worker_spki_sha256"], bundle, delivery, output]
     metadata = {"version": "canonical-cargo-v1", "request_id": specification["request_id"],
                 "operation_directory": str(operation), "prepared_build_argv": native,
@@ -1324,7 +1344,7 @@ def canonical_invocation(profile_path, args, env):
     # TLS credentials stay local in env, never in the uploaded command context.
     child_env["CARGO"] = str(Path(profile["toolchain_root"]) / "bin/cargo")
     child_env["RUSTC"] = str(Path(profile["toolchain_root"]) / "bin/rustc")
-    command = native[:2] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[2:]
+    command = native[:3] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[3:]
     print("cargo-rabs: canonical operation retained at " + str(operation), file=sys.stderr, flush=True)
     return daemon, command, child_env
 
