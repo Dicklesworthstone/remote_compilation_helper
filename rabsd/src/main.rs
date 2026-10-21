@@ -267,6 +267,15 @@ const WORKER_PREPARE_USAGE: &str = "usage: rabsd --worker-prepare <absolute-sour
 /// executable request. Bound it before capture and let the shared preparation
 /// path validate its fields and construct the sole source-manifest identity.
 fn prepare_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value> {
+    prepare_from_arguments_with(args, |_| Ok(()))
+}
+
+/// The combined TLS build may reserve an ID before the immutable request is
+/// constructed. Standalone preparation keeps exact caller-supplied identities.
+fn prepare_from_arguments_with(
+    args: &[String],
+    before_capture: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>,
+) -> std::io::Result<serde_json::Value> {
     use rabsd::coord::source_delivery::prepare_source_bundle;
     use rabsd::coord::worker_delivery::MAX_FRAME_BYTES;
     use std::io::{self, Read};
@@ -311,7 +320,8 @@ fn prepare_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value>
             "specification exceeds request bound",
         ));
     }
-    let specification = serde_json::from_slice(&bytes)?;
+    let mut specification = serde_json::from_slice(&bytes)?;
+    before_capture(&mut specification)?;
     prepare_source_bundle(Path::new(source), &specification, Path::new(destination))
 }
 
@@ -373,6 +383,9 @@ fn main() {
                  Build paths are absolute. Successful builds install every verified artifact into a new output tree.\n\
                  --replay-diagnostics prints verified stdout/stderr on success or failure, with the JSON report on stderr.\n\
                  Repeating a complete build verifies local delivery and outputs without a worker; --resume never executes.\n\
+                 Combined TLS --prepare-from accepts request_id: \"allocate\" in local specifications only.\n\
+                 It durably reserves a worker ID under RABS_STATE_DIR and holds admission through dispatch.\n\
+                 Saved bundles and recovery always keep their original numeric request IDs.\n\
                  DAEMON JOB: rabsd --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
                  Inspect/cancel: --job-status <id32hex> | --job-cancel <id32hex>\n\
                  Wait and replay diagnostics: --job-wait <id32hex> [timeout-seconds]\n\

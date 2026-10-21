@@ -86,14 +86,20 @@ impl PinnedWorkerAdmission {
         })
     }
 
-    /// Allocate only after the wrapper accepts remote execution, on its
-    /// dedicated blocking lane. The receipt is committed and synced before the
-    /// caller can include this ID in an immutable saved request.
+    /// Reserve an ID for explicitly requested new work on a blocking lane.
+    /// The receipt is committed and synced before the caller constructs its
+    /// immutable request. Retain THIS admission owner through preparation and
+    /// pass it into authenticated delivery: releasing and reopening it could
+    /// let a later request overtake this one at the worker's high-water fence.
+    /// A failed preparation burns its ID. Allocation grants no execution rights.
     ///
     /// This allocator owns a dedicated worker journal. A manually dispatched
     /// future ID on that worker remains a pre-dispatch high-water refusal; an
     /// already saved request is never rewritten from a peer's hello.
-    pub(crate) fn allocate_request_id(&self) -> io::Result<u64> {
+    ///
+    /// # Errors
+    /// Invalid/exhausted allocation history or unavailable durable storage.
+    pub fn allocate_request_id(&self) -> io::Result<u64> {
         let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let floor = u64::try_from(elapsed.as_nanos())
             .map_err(|_| invalid("worker request clock seed exceeds u64"))?;
