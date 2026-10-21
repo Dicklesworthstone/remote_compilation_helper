@@ -1,6 +1,92 @@
 # Fixed command argument; the namespace program stays on stdin. This is only
 # pre-intent namespace setup, never a source grant, pair lock or build workload.
 set -eu
+# Native fallback for workers without GNU coreutils (including stock macOS).
+# This implements only the fixed timer ABI below, not arbitrary timeout flags.
+# The timer itself leads a new session/group and stays alive through escalation:
+# its own membership, never a remembered/reaped child PID, authorizes killpg.
+# fork/exec avoids Popen's synchronous exec-error pipe becoming an unbounded
+# wait when launching a helper from a stalled filesystem. stdin and inherited
+# authority descriptors pass through unchanged; no namespace bytes are read here.
+# Call only in a substitution, background job or explicit subshell. exec must
+# replace that shell so its caller observes the timer itself, not a shell that
+# prints an extra "Killed" diagnostic while relaying the timer status.
+rch_namespace_python_timer() {
+    exec python3 -I -S -c '
+import os
+import signal
+import sys
+import time
+
+child = None
+group = None
+interrupted = 0
+
+def interrupt(signum, _frame):
+    global interrupted
+    if not interrupted:
+        interrupted = signum
+
+def kill_owned_group():
+    # This process never changes groups after setsid. Killing ourselves as
+    # part of the group is intentional and yields the same 137 receipt as GNU.
+    os.killpg(group, signal.SIGKILL)
+    os._exit(73)
+
+try:
+    if (len(sys.argv) < 4 or sys.argv[1] != "--kill-after=1"
+            or sys.argv[2] not in ("1", "2", "15")
+            or sys.platform not in ("linux", "darwin")):
+        os._exit(73)
+    os.setsid()
+    group = os.getpid()
+    if os.getpgrp() != group:
+        os._exit(73)
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, interrupt)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    # Ignore SIGPIPE only in the timer. A delivery helper still sees the
+    # default disposition; a broken reader cannot strand the timer itself.
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    deadline = time.monotonic() + int(sys.argv[2])
+    child = os.fork()
+    if child == 0:
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
+            signal.signal(signum, signal.SIG_DFL)
+        try:
+            os.execvp(sys.argv[3], sys.argv[3:])
+        except OSError:
+            os._exit(127)
+    terminating = False
+    while True:
+        now = time.monotonic()
+        if not terminating and (interrupted or now >= deadline):
+            terminating = True
+            deadline = now + 1
+            # Our handler catches this too. Never exit on the direct child
+            # after this boundary: TERM-resistant descendants need the KILL.
+            os.killpg(group, interrupted or signal.SIGTERM)
+        if terminating:
+            if now >= deadline:
+                kill_owned_group()
+        else:
+            waited, status = os.waitpid(child, os.WNOHANG)
+            if waited:
+                child = None
+                if os.WIFEXITED(status):
+                    os._exit(os.WEXITSTATUS(status))
+                if os.WIFSIGNALED(status):
+                    os._exit(128 + os.WTERMSIG(status))
+                os._exit(73)
+        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+except BaseException:
+    # A failed timer must not leave an already-started initializer behind.
+    # Do not print to potentially blocked SSH pipes on this cleanup path.
+    if child is not None and child != 0 and group is not None:
+        kill_owned_group()
+    os._exit(73)
+' "$@"
+}
 # GNU timeout kills its whole process group on --kill-after; uutils timeout
 # (Ubuntu 25.10+ /usr/bin/timeout) kills only its direct child, leaving a
 # TERM-resistant descendant holding the registry lock. Ubuntu keeps GNU's as
@@ -12,8 +98,10 @@ elif command -v gtimeout >/dev/null 2>&1; then
 elif command -v timeout >/dev/null 2>&1 &&
     timeout --version 2>/dev/null | head -n 1 | grep -q 'GNU coreutils'; then
     rch_namespace_timer=timeout
+elif command -v python3 >/dev/null 2>&1; then
+    rch_namespace_timer=rch_namespace_python_timer
 else
-    printf '%s\n' 'RCH: namespace setup requires GNU timeout (gnutimeout or gtimeout)' >&2
+    printf '%s\n' 'RCH: namespace setup requires GNU timeout (gnutimeout or gtimeout) or Python 3' >&2
     exit 73
 fi
 umask 077
@@ -24,17 +112,17 @@ control=$("$rch_namespace_timer" --kill-after=1 1 mktemp -d \
 cleanup() {
     # Fixed names in our private directory, never source/claim/recovery paths.
     # Cleanup is best effort and bounded; it cannot change the delivery result.
-    "$rch_namespace_timer" --kill-after=1 1 sh -c '
+    ("$rch_namespace_timer" --kill-after=1 1 sh -c '
         rm -f -- "$1/stdout.pipe" "$1/stderr.pipe" "$1/stdout" \
             "$1/stderr" "$1/result"
         rmdir -- "$1"
-    ' rch-namespace-cleanup "$control" >/dev/null 2>&1 || :
+    ' rch-namespace-cleanup "$control") >/dev/null 2>&1 || :
 }
 trap cleanup 0
 # Save the upload before starting a background command. POSIX shells otherwise
 # substitute /dev/null for its stdin. The observer never consumes program bytes.
 exec 3<&0
-# GNU timeout creates a private process group. Do NOT use --foreground. The
+# Both timer backends create a private process group. Do NOT use --foreground. The
 # monitor's terminal action kills that exact, still-owned group (including the
 # timer and itself); no remembered PID or process-table scan authorizes a kill.
 # EOF is insufficient: a grandchild can close both pipes and retain a mutex or

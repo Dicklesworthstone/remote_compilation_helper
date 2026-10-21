@@ -17,6 +17,7 @@ fn source_namespace_control_bounds_processes_and_complete_output() {
         "scripts/tests/test_source_namespace_control.py",
         "scripts/test_namespace_group_teardown.py",
         "scripts/tests/test_source_namespace_delivery.py",
+        "scripts/tests/test_source_namespace_native_timer.py",
     ] {
         let output = std::process::Command::new("python3")
             .arg(root.join(suite))
