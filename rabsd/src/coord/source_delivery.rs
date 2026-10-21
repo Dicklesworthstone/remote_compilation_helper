@@ -926,12 +926,16 @@ impl SourceUpload {
         let missing = self.missing_files(&reply)?;
         // Four bounded chunks fit below the worker's eight-frame / 2 MiB
         // deferred-source limit, including maximum encoded paths and hashes.
-        // Batch across files too: tiny dependency inputs must not each cost a
-        // full round trip. Retain only expected acknowledgment descriptors,
-        // never another copy of the already sealed source payload.
-        let mut outstanding = Vec::with_capacity(SOURCE_WINDOW);
-        let acknowledge_batch = |peer: &mut P, outstanding: &mut Vec<(&str, u64)>| {
-            for (path, next) in outstanding.drain(..) {
+        // Keep the window full across files: one validated acknowledgment
+        // releases one slot, not the whole batch. Retain only exact ACK debts,
+        // never another copy of the already sealed source payload. A failure
+        // returns from this operation immediately, without retrying its tail.
+        let mut outstanding = std::collections::VecDeque::with_capacity(SOURCE_WINDOW);
+        let acknowledge_one =
+            |peer: &mut P, outstanding: &mut std::collections::VecDeque<(&str, u64)>| {
+                let &(path, next) = outstanding
+                    .front()
+                    .ok_or_else(|| invalid("source upload has no pending acknowledgment"))?;
                 let reply = peer.receive()?;
                 check(&reply, "source-chunk-accepted")?;
                 require(
@@ -939,9 +943,11 @@ impl SourceUpload {
                         && reply["next_offset"].as_u64() == Some(next),
                     "source acknowledgment does not cover the transmitted range",
                 )?;
-            }
-            Ok::<(), io::Error>(())
-        };
+                // An invalid or lost ACK must not return credit or permit
+                // another source chunk. Keep the debt through validation.
+                let _ = outstanding.pop_front();
+                Ok::<(), io::Error>(())
+            };
         for file in self.manifest.files() {
             if missing
                 .as_ref()
@@ -958,16 +964,18 @@ impl SourceUpload {
                     "path":file.path, "offset":offset, "data_hex":hex(chunk),
                     "chunk_sha256":hex(&Sha256::digest(chunk))}),
                 )?;
-                outstanding.push((file.path.as_str(), next));
+                outstanding.push_back((file.path.as_str(), next));
                 if outstanding.len() == SOURCE_WINDOW {
-                    acknowledge_batch(peer, &mut outstanding)?;
+                    acknowledge_one(peer, &mut outstanding)?;
                 }
             }
         }
         // No seal, ownership transfer or execution can precede acknowledgment
-        // of EVERY transmitted chunk, including the final partial batch. Any
+        // of EVERY transmitted chunk, including the remaining window. Any
         // failed write, malformed reply or deadline aborts without retrying.
-        acknowledge_batch(peer, &mut outstanding)?;
+        while !outstanding.is_empty() {
+            acknowledge_one(peer, &mut outstanding)?;
+        }
         // Even a completely warm projection needs this exact final seal. A
         // missing-file hint by itself grants neither execution nor publication.
         peer.send(&json!({"kind":"source-seal", "request_id":id, "manifest_sha256":identity}))?;
