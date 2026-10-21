@@ -289,11 +289,6 @@ fn validate_capture(
             "automatic Cargo source preparation does not support symlinks",
         )?;
         if matches!(kind, MemberKind::Regular { .. }) {
-            require(
-                !is_cargo_config(Path::new(path))
-                    || vendor.is_some_and(|vendor| vendor.allows_config(path)),
-                "Cargo config requires the explicitly validated vendor source-replacement mode",
-            )?;
             files.push(path.clone());
             require(
                 files.len() <= MAX_SOURCE_FILES,
@@ -304,6 +299,26 @@ fn validate_capture(
             // not independent workspace roots for the planning command.
             if vendor.is_some_and(|vendor| vendor.contains(path)) {
                 continue;
+            }
+            if is_cargo_config(Path::new(path)) {
+                if let Some(vendor) = vendor {
+                    // The vendor adapter validates its one source-replacement
+                    // config, including the shared compiler settings below.
+                    require(
+                        vendor.allows_config(path),
+                        "vendor preparation does not admit another Cargo config layer",
+                    )?;
+                } else {
+                    let bytes = image
+                        .file_bytes("workspace", path)
+                        .filter(|bytes| bytes.len() <= OUTPUT_LIMIT as usize)
+                        .ok_or_else(|| invalid("missing or oversized captured Cargo config"))?;
+                    let text = std::str::from_utf8(bytes)
+                        .map_err(|_| invalid("captured Cargo config is not UTF-8"))?;
+                    let value = toml::from_str(text)
+                        .map_err(|_| invalid("malformed captured Cargo config"))?;
+                    validate_cargo_config(&value, false)?;
+                }
             }
             if Path::new(path)
                 .file_name()
@@ -369,6 +384,238 @@ fn is_cargo_config(path: &Path) -> bool {
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|name| name == ".cargo")
+}
+
+/// Admit captured compiler configuration without delegating command, input or
+/// output ownership to it. These bytes remain unchanged in both the planning
+/// copy and the worker upload; Cargo owns config layering and flag precedence.
+/// Source replacements need the vendor adapter's separate closure validation.
+fn validate_cargo_config(value: &toml::Value, vendor_sources: bool) -> io::Result<()> {
+    let top = value
+        .as_table()
+        .ok_or_else(|| invalid("captured Cargo config must be a table"))?;
+    for (section, value) in top {
+        match section.as_str() {
+            "source" | "registries" if vendor_sources => {}
+            "build" => {
+                let build = value
+                    .as_table()
+                    .ok_or_else(|| invalid("Cargo build config must be a table"))?;
+                for (name, value) in build {
+                    require(
+                        matches!(name.as_str(), "rustflags" | "rustdocflags"),
+                        "captured Cargo build config supports only rustflags and rustdocflags",
+                    )?;
+                    validate_compiler_flags(value)?;
+                }
+            }
+            "target" => {
+                let targets = value
+                    .as_table()
+                    .filter(|targets| targets.len() <= 64)
+                    .ok_or_else(|| invalid("Cargo target config must be a bounded table"))?;
+                for (target, value) in targets {
+                    // Named triples and Cargo's cfg selectors are not file
+                    // paths. Cargo, rather than a second cfg parser, resolves
+                    // and merges matching selectors in its ordinary order.
+                    let named = !target.is_empty()
+                        && target.len() <= 128
+                        && target
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte));
+                    let conditional = target.starts_with("cfg(")
+                        && target.ends_with(')')
+                        && target.len() <= 1024
+                        && !target.chars().any(char::is_control);
+                    require(
+                        named || conditional,
+                        "Cargo target config requires a named triple or cfg selector",
+                    )?;
+                    let fields = value
+                        .as_table()
+                        .ok_or_else(|| invalid("Cargo target settings must be a table"))?;
+                    for (name, value) in fields {
+                        require(
+                            name == "rustflags",
+                            "captured Cargo target config supports only rustflags",
+                        )?;
+                        validate_compiler_flags(value)?;
+                    }
+                }
+            }
+            "llvm-cov" => {
+                // Stock Cargo does not consume this tool's exclude globs.
+                // Retain this repository's existing metadata without treating
+                // arbitrary unknown tables as permission to configure Cargo.
+                let fields = value
+                    .as_table()
+                    .ok_or_else(|| invalid("llvm-cov metadata must be a table"))?;
+                for (name, value) in fields {
+                    require(name == "exclude", "unsupported llvm-cov metadata")?;
+                    let patterns = value
+                        .as_array()
+                        .filter(|patterns| patterns.len() <= 256)
+                        .ok_or_else(|| invalid("llvm-cov exclude must be a bounded array"))?;
+                    for pattern in patterns {
+                        require(
+                            pattern.as_str().is_some_and(|pattern| {
+                                pattern.len() <= 4096 && !pattern.chars().any(char::is_control)
+                            }),
+                            "llvm-cov exclude entries must be bounded strings",
+                        )?;
+                    }
+                }
+            }
+            _ => return Err(invalid("unsupported captured Cargo configuration section")),
+        }
+    }
+    Ok(())
+}
+
+fn compiler_flag_arguments(value: &toml::Value) -> io::Result<Vec<&str>> {
+    // Cargo splits string-form flags on whitespace; it does not shell-parse
+    // them. Array elements retain their exact argument boundaries, including
+    // spaces inside a cfg expression. Never normalize or rewrite either form.
+    let flags = match value {
+        toml::Value::String(text) if text.len() <= 16 * 1024 => {
+            text.split_whitespace().collect::<Vec<_>>()
+        }
+        toml::Value::Array(values) if values.len() <= 256 => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo compiler flag arrays require strings"))
+            })
+            .collect::<io::Result<Vec<_>>>()?,
+        _ => {
+            return Err(invalid(
+                "Cargo compiler flags require a bounded string or array",
+            ));
+        }
+    };
+    require(
+        flags.len() <= 256
+            && flags.iter().map(|flag| flag.len()).sum::<usize>() <= 16 * 1024
+            && flags.iter().all(|flag| {
+                !flag.is_empty() && flag.len() <= 4096 && !flag.chars().any(char::is_control)
+            }),
+        "captured Cargo compiler flags exceed their bounds",
+    )?;
+    Ok(flags)
+}
+
+fn validate_compiler_flags(value: &toml::Value) -> io::Result<()> {
+    let flags = compiler_flag_arguments(value)?;
+    let mut flags = flags.into_iter();
+    while let Some(flag) = flags.next() {
+        if matches!(flag, "-g" | "-O") {
+            continue;
+        }
+        let (option, value) = if matches!(
+            flag,
+            "--cfg"
+                | "--check-cfg"
+                | "-A"
+                | "--allow"
+                | "-W"
+                | "--warn"
+                | "-D"
+                | "--deny"
+                | "-F"
+                | "--forbid"
+                | "-C"
+                | "--codegen"
+                | "-Z"
+        ) {
+            (
+                flag,
+                flags
+                    .next()
+                    .ok_or_else(|| invalid("Cargo compiler flag lacks its value"))?,
+            )
+        } else if let Some((option, value)) = flag.split_once('=')
+            && option.starts_with("--")
+        {
+            (option, value)
+        } else if let Some(option) = ["-A", "-W", "-D", "-F", "-C", "-Z"]
+            .into_iter()
+            .find(|option| flag.starts_with(option))
+        {
+            (option, &flag[option.len()..])
+        } else {
+            return Err(invalid("unsupported captured Cargo compiler flag"));
+        };
+        require(
+            !value.is_empty() && !value.starts_with(['-', '@']),
+            "invalid captured Cargo compiler flag value",
+        )?;
+        match option {
+            "--cfg" | "--check-cfg" => {}
+            "-A" | "--allow" | "-W" | "--warn" | "-D" | "--deny" | "-F" | "--forbid" => {
+                require(
+                    value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_:-".contains(&byte)),
+                    "captured Cargo lint flags require a literal lint name",
+                )?;
+            }
+            "-C" | "--codegen" => validate_scalar_codegen(value)?,
+            "-Z" => {
+                require(
+                    value.strip_prefix("threads=").is_some_and(positive_count),
+                    "captured Cargo unstable flags support only explicit bounded threads",
+                )?;
+            }
+            _ => return Err(invalid("unsupported captured Cargo compiler option")),
+        }
+    }
+    Ok(())
+}
+
+fn positive_count(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u32>()
+            .is_ok_and(|value| (1..=4096).contains(&value))
+}
+
+fn validate_scalar_codegen(value: &str) -> io::Result<()> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| invalid("captured Cargo codegen flags require explicit values"))?;
+    let boolean = || {
+        matches!(
+            value,
+            "y" | "yes" | "on" | "true" | "n" | "no" | "off" | "false"
+        )
+    };
+    let accepted = match name {
+        "opt-level" => matches!(value, "0" | "1" | "2" | "3" | "s" | "z"),
+        "debuginfo" => matches!(
+            value,
+            "0" | "1"
+                | "2"
+                | "none"
+                | "limited"
+                | "full"
+                | "line-tables-only"
+                | "line-directives-only"
+        ),
+        "debug-assertions" | "overflow-checks" | "embed-bitcode" | "force-frame-pointers" => {
+            boolean()
+        }
+        "codegen-units" => positive_count(value),
+        "panic" => matches!(value, "abort" | "unwind"),
+        "lto" => matches!(value, "thin" | "fat") || boolean(),
+        "strip" => matches!(value, "none" | "debuginfo" | "symbols"),
+        _ => false,
+    };
+    require(
+        accepted,
+        "unsupported or non-scalar captured Cargo codegen option",
+    )
 }
 
 // This is a containment preflight, not a second dependency resolver. Cargo owns
@@ -916,6 +1163,139 @@ mod tests {
     use super::*;
     use rabs_sandbox::snapshot_capture::capture_sealed_source;
     use serde_json::json;
+
+    #[test]
+    fn captured_compiler_config_preserves_common_flags_and_cargo_target_selectors() {
+        for text in [
+            "[build]\nrustflags=['-Z','threads=4']\nrustdocflags=['-Dwarnings']\n[llvm-cov]\nexclude=['*/tests/*','*/benches/*','*/examples/*']\n",
+            "[build]\nrustflags='--cfg rabs_fixture -Copt-level=2 --deny=warnings'\n",
+            "[build]\nrustflags=['--cfg', 'label=\"two words\"', '--check-cfg=cfg(label, values(\"two words\"))']\n",
+            "[target.x86_64-unknown-linux-gnu]\nrustflags=['-C','panic=abort']\n[target.'cfg(unix)']\nrustflags=['--cfg=on_unix', '-Zthreads=4']\n",
+            "[build]\nrustflags=[]\nrustdocflags=''\n",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            let original = value.clone();
+            validate_cargo_config(&value, false).unwrap();
+            assert_eq!(value, original, "validation must not rewrite Cargo intent");
+        }
+    }
+
+    #[test]
+    fn compiler_flag_strings_follow_cargo_whitespace_not_shell_quoting() {
+        let value = toml::Value::String("--cfg 'label=two words'".into());
+        assert_eq!(
+            compiler_flag_arguments(&value).unwrap(),
+            ["--cfg", "'label=two", "words'"]
+        );
+        assert!(validate_compiler_flags(&value).is_err());
+        let value = toml::Value::Array(vec![
+            toml::Value::String("--cfg".into()),
+            toml::Value::String("label=\"two words\"".into()),
+        ]);
+        validate_compiler_flags(&value).unwrap();
+        assert_eq!(
+            compiler_flag_arguments(&value).unwrap()[1],
+            "label=\"two words\""
+        );
+    }
+
+    #[test]
+    fn captured_config_cannot_replace_tools_inputs_outputs_or_execution_policy() {
+        for text in [
+            "[build]\nrustc='outside-rustc'",
+            "[build]\nrustc-wrapper='outside-wrapper'",
+            "[build]\nrustc-workspace-wrapper='outside-wrapper'",
+            "[build]\nrustdoc='outside-rustdoc'",
+            "[build]\ntarget-dir='../outside'",
+            "[build]\nbuild-dir='../outside'",
+            "[build]\ntarget='../outside.json'",
+            "[build]\njobs=999",
+            "[build]\nincremental=true",
+            "[env]\nRUSTC_WRAPPER={value='outside',force=true}",
+            "[alias]\nbuild='!outside'",
+            "[unstable]\nbuild-std=true",
+            "[source.crates-io]\nreplace-with='outside'",
+            "[registries.other]\nindex='file:///outside'",
+            "[target.x86_64-unknown-linux-gnu]\nlinker='outside-linker'",
+            "[target.'cfg(unix)']\nrunner=['outside-runner']",
+            "[target.x86_64-unknown-linux-gnu.native]\nrustc-link-search=['/outside']",
+            "[target.'../outside.json']\nrustflags=['-Dwarnings']",
+            "[llvm-cov]\nunknown-command='outside'",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            assert!(validate_cargo_config(&value, false).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn captured_flags_refuse_path_effects_response_files_and_unmodeled_modes() {
+        for flags in [
+            vec!["@/outside/flags"],
+            vec!["--sysroot", "/outside"],
+            vec!["-L", "native=/outside"],
+            vec!["--extern=dep=/outside/libdep.rmeta"],
+            vec!["--out-dir=/outside"],
+            vec!["--emit=metadata=/outside/result"],
+            vec!["--error-format=human"],
+            vec!["-Clinker=/outside/linker"],
+            vec!["-Clink-arg=@/outside/response"],
+            vec!["-Cincremental=/outside"],
+            vec!["-Csave-temps=yes"],
+            vec!["-Cextra-filename=owned"],
+            vec!["-Cllvm-args=-load=/outside/plugin.so"],
+            vec!["-Zcodegen-backend=/outside/backend.so"],
+            vec!["-Zunstable-options"],
+            vec!["-Zthreads"],
+            vec!["-Zthreads=0"],
+            vec!["-Zthreads=4097"],
+            vec!["-Zthreads=4294967296"],
+            vec!["--cfg", "--sysroot=/outside"],
+            vec!["-C"],
+            vec!["-D", "@/outside"],
+            vec!["--cfg", "contains\nnewline"],
+            vec!["--unknown=value"],
+        ] {
+            let value = toml::Value::Array(flags.iter().map(|flag| (*flag).into()).collect());
+            assert!(validate_compiler_flags(&value).is_err(), "{flags:?}");
+        }
+        for flags in [
+            vec!["-g", "-O", "-Coverflow-checks=yes", "-Cdebug-assertions=no"],
+            vec!["-C", "codegen-units=1", "--codegen=embed-bitcode=false"],
+            vec![
+                "-Cdebuginfo=line-tables-only",
+                "-Cstrip=symbols",
+                "-Clto=thin",
+            ],
+            vec!["-Adead_code", "--warn=clippy::all", "-F", "unsafe-code"],
+        ] {
+            let value = toml::Value::Array(flags.iter().map(|flag| (*flag).into()).collect());
+            validate_compiler_flags(&value).unwrap();
+        }
+    }
+
+    #[test]
+    fn captured_config_rejects_wrong_types_and_excessive_flag_payloads() {
+        for text in [
+            "build='bad'",
+            "[build]\nrustflags=7",
+            "[build]\nrustflags=['--cfg',true]",
+            "[target]\nx86_64-unknown-linux-gnu='bad'",
+            "[llvm-cov]\nexclude='not-an-array'",
+            "[llvm-cov]\nexclude=[42]",
+        ] {
+            assert!(
+                validate_cargo_config(&toml::from_str(text).unwrap(), false).is_err(),
+                "{text}"
+            );
+        }
+        for value in [
+            toml::Value::String(" ".repeat(16 * 1024 + 1)),
+            toml::Value::Array(vec![toml::Value::String("-g".into()); 257]),
+            toml::Value::Array(vec![toml::Value::String("--cfg=long".repeat(4096))]),
+        ] {
+            assert!(validate_compiler_flags(&value).is_err());
+        }
+    }
 
     #[test]
     fn declaration_and_manifest_paths_cannot_escape_the_approved_anchor() {

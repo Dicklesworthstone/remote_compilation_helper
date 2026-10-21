@@ -695,15 +695,10 @@ fn validate_config(
     base: &Path,
     directory: &str,
 ) -> io::Result<SourceReplacements> {
+    super::validate_cargo_config(value, true)?;
     let top = value
         .as_table()
-        .filter(|top| {
-            top.keys()
-                .all(|key| matches!(key.as_str(), "source" | "registries"))
-        })
-        .ok_or_else(|| {
-            invalid("vendor config may contain only source replacement and registry indexes")
-        })?;
+        .ok_or_else(|| invalid("vendor config must be a table"))?;
     let sources = top
         .get("source")
         .and_then(toml::Value::as_table)

@@ -513,6 +513,99 @@ fn automatic_cargo_virtual_workspace_and_nontrivial_anchor_layout_are_supported(
 }
 
 #[test]
+fn automatic_cargo_preserves_layered_and_target_specific_compiler_configuration() {
+    for target_specific in [false, true] {
+        let fixture = AutomaticFixture::new();
+        let config = if target_specific {
+            concat!(
+                "[build]\nrustflags=['--cfg=rabs_ignored']\n",
+                "[target.'cfg(unix)']\nrustflags=['--cfg=rabs_target', ",
+                "'--check-cfg=cfg(rabs_target)', '--check-cfg=cfg(rabs_ignored)', '-Copt-level=1']\n",
+            )
+        } else {
+            concat!(
+                "[llvm-cov]\nexclude=['*/tests/*','*/benches/*','*/examples/*']\n",
+                "[build]\nrustflags=['--cfg=rabs_root', '--check-cfg=cfg(rabs_root)', ",
+                "'--check-cfg=cfg(rabs_child)', '-Z','threads=4']\n",
+                "rustdocflags=['-Dwarnings']\n",
+            )
+        };
+        fs::create_dir(fixture.source.join(".cargo")).unwrap();
+        fs::write(fixture.source.join(".cargo/config.toml"), config).unwrap();
+        if !target_specific {
+            fs::create_dir(fixture.source.join("app/.cargo")).unwrap();
+            fs::write(
+                fixture.source.join("app/.cargo/config.toml"),
+                "[build]\nrustflags=['--cfg','rabs_child']\n",
+            )
+            .unwrap();
+        }
+        let guard = if target_specific {
+            concat!(
+                "#[cfg(not(rabs_target))] compile_error!(\"target config was lost\");\n",
+                "#[cfg(rabs_ignored)] compile_error!(\"Cargo flag precedence changed\");\n",
+            )
+        } else {
+            "#[cfg(not(all(rabs_root,rabs_child)))] compile_error!(\"Cargo config layers were lost\");\n"
+        };
+        let original = fs::read_to_string(fixture.source.join("app/src/main.rs")).unwrap();
+        fs::write(
+            fixture.source.join("app/src/main.rs"),
+            format!("{guard}{original}"),
+        )
+        .unwrap();
+        let (bundle, status, _, stderr) = fixture.prepare("configured", &fixture.spec);
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        let source = bundle.join("source");
+        assert_eq!(
+            fs::read(source.join(".cargo/config.toml")).unwrap(),
+            config.as_bytes()
+        );
+        if !target_specific {
+            assert_eq!(
+                fs::read(source.join("app/.cargo/config.toml")).unwrap(),
+                fs::read(fixture.source.join("app/.cargo/config.toml")).unwrap()
+            );
+        }
+        // Only the retained config may determine this build. The original
+        // checkout becomes unavailable before Cargo or rustc is launched.
+        fs::rename(&fixture.source, fixture.root.path().join("retired-source")).unwrap();
+        let home = fixture.root.path().join("cargo-home");
+        fs::create_dir(&home).unwrap();
+        let target = fixture.root.path().join("configured-target");
+        let mut cargo = Command::new(std::env::var_os("CARGO").unwrap());
+        cargo.env_clear();
+        for key in [
+            "PATH",
+            "HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "LD_LIBRARY_PATH",
+            "RUSTC",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                cargo.env(key, value);
+            }
+        }
+        cargo
+            .current_dir(source.join("app"))
+            .args(["build", "--frozen", "--all-features", "--jobs=1"])
+            .arg("--target-dir")
+            .arg(&target)
+            .env("CARGO_HOME", &home);
+        let (status, _, stderr) = run(fixture.root.path(), &mut cargo, Duration::from_secs(60));
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        let (status, stdout, stderr) = run(
+            fixture.root.path(),
+            &mut Command::new(target.join("debug/auto_app")),
+            Duration::from_secs(5),
+        );
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"42:5:13:7\n");
+    }
+}
+
+#[test]
 fn automatic_cargo_rejects_escaping_symlink_config_unlocked_and_conflicting_inputs() {
     for case in 0..11 {
         let fixture = AutomaticFixture::new();

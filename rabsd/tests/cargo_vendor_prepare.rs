@@ -560,6 +560,57 @@ fn real_preparation_and_frozen_cargo_build_use_captured_transitive_and_build_scr
 }
 
 #[test]
+fn vendored_build_preserves_captured_compiler_flags_with_source_replacements() {
+    let fixture = Fixture::new();
+    let config = fs::read_to_string(fixture.anchor.join(".cargo/config.toml")).unwrap();
+    write(
+        &fixture.anchor,
+        ".cargo/config.toml",
+        format!(
+            "{config}\n[build]\nrustflags=['--cfg=rabs_captured_config', '--check-cfg=cfg(rabs_captured_config)', '-Copt-level=1', '-Zthreads=4']\nrustdocflags=['-Dwarnings']\n[llvm-cov]\nexclude=['*/tests/*']\n"
+        ),
+    );
+    write(
+        &fixture.anchor,
+        "app/src/main.rs",
+        concat!(
+            "#[cfg(not(rabs_captured_config))] compile_error!(\"captured flags were lost\");\n",
+            "fn main() { println!(\"{}:{}\", registry_dep::answer()+local_dep::answer(), env!(\"BUILD_LABEL\")); }\n",
+        ),
+    );
+    // This executes the actual preparer and then real frozen Cargo over the
+    // retained source after retiring the original checkout. The source bundle
+    // and config bytes must still reconstruct the exact selected build.
+    run_captured_vendor_build(fixture);
+}
+
+#[test]
+fn vendor_source_replacements_do_not_bypass_compiler_config_validation() {
+    for extra in [
+        "[build]\nrustc-wrapper='outside'\n",
+        "[build]\nrustflags=['-Clinker=/outside']\n",
+        "[target.'cfg(unix)']\nrunner='outside'\n",
+        "[env]\nRUSTFLAGS='--sysroot=/outside'\n",
+    ] {
+        let fixture = Fixture::new();
+        let config = fs::read_to_string(fixture.anchor.join(".cargo/config.toml")).unwrap();
+        write(
+            &fixture.anchor,
+            ".cargo/config.toml",
+            format!("{config}\n{extra}"),
+        );
+        let (bundle, status, stdout, stderr) = fixture.prepare("config-refused");
+        assert!(!status.success());
+        assert!(stdout.is_empty());
+        assert!(!bundle.exists());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stderr).unwrap()["kind"],
+            "worker-prepare-failed"
+        );
+    }
+}
+
+#[test]
 fn alternate_registry_preparation_and_build_use_exact_captured_git_and_sparse_indexes() {
     for (index, source) in [
         (
