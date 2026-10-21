@@ -106,8 +106,16 @@ without downloading again. These path options are recovery-only, not Cargo
 arguments. --delivery and --resume-to are exclusive.
 Daemon operations instead select native --job-wait for the saved job and socket.
 This waits for or replays its verified completion without submitting another job.
-An uncertain job needs explicit native --job-resume before waiting; direct
-delivery/prefix options are refused for daemon jobs to preserve daemon ownership.
+For an uncertain daemon job, --resume-to requests native --job-resume, optionally
+with --prefix-from. --delivery requests native --job-recover-local for a complete
+delivery already owned by that job. --acknowledge /absolute/OWNED-DELIVERY requests
+native --job-acknowledge to reconcile lost worker release acknowledgments; it is
+daemon-only. These actions report native job-control status, NOT compiler success
+or replayed diagnostics. Run --rabs-recover on the same operation without options
+afterward to wait for verified completion. Inspect that same job after any lost
+response; the launcher never retries a control request or creates a new job.
+--resume-to, --delivery and --acknowledge are mutually exclusive. Only resume
+accepts --prefix-from. Daemon recovery never selects a direct worker receiver.
 The original profile, checkout and toolchain are not needed. Keep the original
 operation/bundle paths, installed rabsd and matching RABS_STATE_DIR/TLS settings.
 The installed driver, not the saved executable pathname, is invoked exactly once;
@@ -1547,18 +1555,18 @@ def canonical_recovery_record(operation):
 
 
 def canonical_job_recovery_invocation(operation, record, options, env):
-    """Rejoin the same durable job without accessing its allocation template.
+    """Recover through the same durable owner, never its allocation template.
 
     Only the daemon owns the bound numeric request and delivery frontier. A
     direct --resume on this operation's saved template would bypass that owner.
+    Control actions hand off once and return native admission/status, not the
+    historical compiler result. Only a later explicit --job-wait replays it.
     """
     import re
     job_id = record["job_id"]
     if (type(job_id) is not str or re.fullmatch(r"[0-9a-f]{32}", job_id) is None
             or operation.name != "cargo-" + job_id or record["request_id"] != "allocate"):
         raise SetupError("invalid canonical daemon recovery job identity")
-    if options:
-        raise SetupError("daemon jobs require native --job-resume for explicit result recovery, then --job-wait; direct delivery/prefix options cannot bypass the saved daemon job")
     saved_driver = None
     for action in ("wait", "status", "cancel", "submit"):
         saved = record["job_" + action + "_argv"]
@@ -1578,6 +1586,39 @@ def canonical_job_recovery_invocation(operation, record, options, env):
     dependency_worker_endpoint(saved[3:6], ("listen", "worker", "worker_spki_sha256"))
     if saved[6:] != [str(operation / name) for name in ("bundle", "delivery", "outputs")]:
         raise SetupError("canonical daemon recovery record changed its fixed bundle/delivery/output paths")
+    command = ["--job-wait", job_id]
+    if options:
+        # The record fixes ownership, not the contents of a result. In
+        # particular, do not open/rewrite request.json: daemon submissions may
+        # retain an allocation template rather than the numeric wire request.
+        bundle, original_delivery, output = (operation / name for name in ("bundle", "delivery", "outputs"))
+        overlap = lambda a, b: a == b or a in b.parents or b in a.parents
+        new = "--resume-to" in options
+        selection = "--resume-to" if new else "--delivery" if "--delivery" in options else "--acknowledge"
+        destination = canonical_recovery_directory(options[selection], allow_missing=new)
+        if new:
+            if os.path.lexists(destination):
+                raise SetupError("canonical --resume-to requires a new delivery directory")
+        else:
+            metadata = destination.lstat()
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("canonical daemon recovery delivery must be private to this user")
+        protected = (bundle, output, original_delivery) if new else (bundle, output)
+        if any(overlap(destination, path) for path in protected):
+            raise SetupError("canonical daemon recovery delivery overlaps retained state")
+        action = "--job-resume" if new else "--job-recover-local" if selection == "--delivery" else "--job-acknowledge"
+        command = [action, job_id, str(destination)]
+        if "--prefix-from" in options:
+            prefix = canonical_recovery_directory(options["--prefix-from"])
+            metadata = prefix.lstat()
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("canonical recovery prefix must be private to this user")
+            if any(overlap(prefix, path) for path in (bundle, output, destination)):
+                raise SetupError("canonical recovery prefix overlaps a destination or retained bundle")
+            command.append(str(prefix))
+        # Other retained attempts and daemon-state paths are known only to the
+        # durable owner. Its existing admission/receipt checks remain final;
+        # a locally valid path is never evidence of a result or a free worker.
     endpoint = canonical_daemon_endpoint(record["daemon_socket"])
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     if os.path.samefile(daemon, __file__):
@@ -1585,14 +1626,14 @@ def canonical_job_recovery_invocation(operation, record, options, env):
     child_env = dict(env)
     child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
     child_env["RABS_SOCKET_PATH"] = str(endpoint)
-    return daemon, [daemon, "--job-wait", job_id], child_env
+    return daemon, [daemon] + command, child_env
 
 
 def canonical_recovery_invocation(args, env):
     """Construct one native recovery-only handoff. Saved argv is never executed.
 
-    The native --resume/--resume-from or --job-wait paths own request/receipt
-    validation, TLS, byte recovery and installation, including partial refusals.
+    The native direct-recovery or daemon-job paths own request/receipt validation,
+    TLS, byte recovery, release and installation, including partial refusals.
     No branch here can request execution, recapture inputs or allocate an ID.
     """
     if sys.platform != "linux":
@@ -1602,10 +1643,10 @@ def canonical_recovery_invocation(args, env):
     options = {}
     for index in range(1, len(args), 2):
         flag, value = args[index:index + 2]
-        if flag not in ("--resume-to", "--delivery", "--prefix-from") or flag in options:
+        if flag not in ("--resume-to", "--delivery", "--prefix-from", "--acknowledge") or flag in options:
             raise SetupError("unknown or duplicate canonical recovery option")
         options[flag] = value
-    if ("--resume-to" in options and "--delivery" in options
+    if (len(options.keys() & {"--resume-to", "--delivery", "--acknowledge"}) > 1
             or "--prefix-from" in options and "--resume-to" not in options):
         raise SetupError("canonical recovery requires one destination; prefix reuse requires --resume-to")
     operation = canonical_recovery_directory(args[0])
@@ -1624,6 +1665,8 @@ def canonical_recovery_invocation(args, env):
         raise SetupError("invalid canonical recovery record identity or authority policy")
     if "job_id" in record:
         return canonical_job_recovery_invocation(operation, record, options, env)
+    if "--acknowledge" in options:
+        raise SetupError("canonical --acknowledge requires a daemon-owned operation")
     saved = record["prepared_build_argv"]
     if (type(saved) is not list or len(saved) != 9
             or any(type(value) is not str or not value or len(value) > 4096 or "\0" in value for value in saved)

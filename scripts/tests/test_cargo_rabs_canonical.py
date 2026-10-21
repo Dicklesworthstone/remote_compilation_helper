@@ -123,6 +123,30 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
 '''
 
 
+JOB_CONTROL_DRIVER = r'''
+# Only the executable handoff is tested here. This records literal arguments;
+# it does not implement a job store, verify a receipt or emulate worker release.
+import json, os, signal, sys
+action = sys.argv[1]
+assert action in ("--job-resume", "--job-recover-local", "--job-acknowledge"), sys.argv
+assert len(sys.argv) in ((4, 5) if action == "--job-resume" else (4,)), sys.argv
+assert len(sys.argv[2]) == 32 and all(c in "0123456789abcdef" for c in sys.argv[2])
+record = {"pid": os.getpid(), "argv": sys.argv, "socket": os.environ.get("RABS_SOCKET_PATH"),
+          "state": os.environ.get("RABS_STATE_DIR"), "input": sys.stdin.buffer.read().hex()}
+if os.environ.get("TEST_INHERITED_FD"):
+    record["inherited"] = os.read(int(os.environ["TEST_INHERITED_FD"]), 1024).hex()
+with open(os.environ["TEST_DRIVER_RECORD"], "a") as result:
+    result.write(json.dumps(record) + "\n")
+sys.stdout.buffer.write(b'{"kind":"fixture-job-control-status","compiler_success":null}\n')
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(b"fixture control diagnostic\x00\xfe\n")
+sys.stderr.buffer.flush()
+if os.environ.get("TEST_SIGNAL"):
+    os.kill(os.getpid(), signal.SIGTERM)
+sys.exit(int(os.environ.get("TEST_EXIT", "0")))
+'''
+
+
 class CanonicalCargo(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="rabs-canonical-test-")
@@ -1144,14 +1168,17 @@ sys.exit(2)
     def test_daemon_recovery_cannot_select_direct_receivers_or_submit_again(self):
         operation, _ = self.retained_daemon_operation()
         new = operation / "new-delivery"
-        for options in (("--resume-to", str(new)), ("--delivery", str(new)),
-                        ("--resume-to", str(new), "--prefix-from", str(operation / "delivery"))):
+        # Explicit result controls now use the owning daemon (tested below).
+        # They still cannot select a direct receiver or any submission API.
+        for options in (("--prepare-from", str(new)), ("--worker-build-tls", str(new)),
+                        ("--job-submit", str(new)), ("--job-submit-allocated", str(new)),
+                        ("--job-build", str(new)), ("--resume", str(new)),
+                        ("--job-resume", str(new)), ("--resubmit", str(new))):
             with self.subTest(options=options):
                 code, stdout, stderr, _ = self.recover(operation, *options)
                 self.assertEqual(code, 2)
                 self.assertEqual(stdout, b"")
-                self.assertIn(b"--job-resume", stderr)
-                self.assertIn(b"--job-wait", stderr)
+                self.assertIn(b"unknown or duplicate", stderr)
         self.assertFalse(self.record.exists())
         self.assertFalse(new.exists())
 
@@ -1192,6 +1219,246 @@ sys.exit(2)
         self.assertEqual(code, 127)
         self.assertEqual(stdout, b"")
         self.assertEqual(len(self.records()), 6)
+
+
+    def daemon_result_fixture(self):
+        operation, endpoint = self.retained_daemon_operation()
+        self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_CONTROL_DRIVER)
+        delivery = operation / "delivery"
+        delivery.mkdir(mode=0o700)
+        (delivery / "partial").write_bytes(b"retained partial bytes\x00\xff")
+        metadata = json.loads((operation / "operation.json").read_bytes())
+        return operation, endpoint, delivery, operation / "new-delivery", metadata
+
+    def test_daemon_result_resume_preserves_job_identity_and_exec_ownership(self):
+        operation, endpoint, old, new, metadata = self.daemon_result_fixture()
+        before = {str(p.relative_to(operation)): p.read_bytes()
+                  for p in operation.rglob("*") if p.is_file()}
+        env = dict(self.env, RABS_SOCKET_PATH="/wrong/ambient.sock",
+                   RABS_STATE_DIR=str(self.root / "state"))
+        code, stdout, stderr, pid = self.recover(operation, "--resume-to", str(new),
+                                                env=env, input=b"\x00\xffinput")
+        self.assertEqual(code, 0, stderr)
+        record, = self.records()
+        self.assertEqual(record["argv"], [str(self.driver), "--job-resume", metadata["job_id"], str(new)])
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["socket"], str(endpoint))
+        self.assertEqual(record["state"], env["RABS_STATE_DIR"])
+        self.assertEqual(record["input"], "00ff696e707574")
+        self.assertIsNone(json.loads(stdout)["compiler_success"], "admission is not a build result")
+        self.assertIn(b"fixture control diagnostic\x00\xfe", stderr)
+        self.assertEqual({str(p.relative_to(operation)): p.read_bytes()
+                          for p in operation.rglob("*") if p.is_file()}, before)
+        self.assertFalse(new.exists(), "only the native owner may create the receiver")
+        self.assertTrue(old.is_dir())
+
+    def test_daemon_result_prefix_and_literal_paths_remain_native_input(self):
+        operation, _, old, _, metadata = self.daemon_result_fixture()
+        # Shell punctuation and Unicode are path bytes, never a shell program.
+        new = self.root / "delivery '雪'; $(touch injected)"
+        prefix = self.root / "partial '雪'"
+        old.rename(prefix)
+        saved = (prefix / "partial").read_bytes()
+        for options in (("--resume-to", str(new), "--prefix-from", str(prefix)),
+                        ("--prefix-from", str(prefix), "--resume-to", str(new))):
+            code, _, stderr, _ = self.recover(operation, *options)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(self.records()[-1]["argv"], [str(self.driver), "--job-resume",
+                             metadata["job_id"], str(new), str(prefix)])
+        self.assertEqual(len(self.records()), 2)
+        self.assertEqual((prefix / "partial").read_bytes(), saved)
+        self.assertFalse(new.exists())
+        self.assertFalse((self.root / "injected").exists())
+
+    def test_daemon_result_local_recovery_and_release_need_no_original_inputs(self):
+        operation, endpoint, delivery, _, metadata = self.daemon_result_fixture()
+        # Even an executable in saved argv is not selected as today's driver.
+        for action in ("submit", "status", "wait", "cancel"):
+            metadata["job_" + action + "_argv"][0] = str(self.toolchain / "bin/cargo")
+        metadata_path = operation / "operation.json"
+        metadata_path.write_text(json.dumps(metadata))
+        saved = metadata_path.read_bytes()
+        for path, name in ((operation / "bundle", "retired-bundle"),
+                           (self.source, "retired-source"), (self.toolchain, "retired-toolchain"),
+                           (self.profile_path, "retired-profile")):
+            path.rename(self.root / name)
+        external = self.root / "another-owned-delivery"
+        external.mkdir(mode=0o700)
+        for option, native in (("--delivery", "--job-recover-local"),
+                               ("--acknowledge", "--job-acknowledge")):
+            for selected in (delivery, external):
+                code, stdout, stderr, _ = self.recover(operation, option, str(selected))
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(self.records()[-1]["argv"],
+                                 [str(self.driver), native, metadata["job_id"], str(selected)])
+                self.assertEqual(self.records()[-1]["socket"], str(endpoint))
+                self.assertIsNone(json.loads(stdout)["compiler_success"])
+        self.assertEqual(metadata_path.read_bytes(), saved)
+        self.assertEqual((delivery / "partial").read_bytes(), b"retained partial bytes\x00\xff")
+        self.assertEqual((self.root / "retired-bundle/request.json").read_text(),
+                         '{"request_id":"allocate","kind":"canonical-exec"}')
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_daemon_result_native_refusals_and_exec_failures_do_not_retry(self):
+        operation, _, delivery, new, _ = self.daemon_result_fixture()
+        for option, selected in (("--resume-to", new), ("--delivery", delivery),
+                                 ("--acknowledge", delivery)):
+            for status in (1, 2, 78, 101, 125):
+                with self.subTest(option=option, status=status):
+                    before = len(self.records()) if self.record.exists() else 0
+                    code, stdout, stderr, _ = self.recover(operation, option, str(selected),
+                                                         env=dict(self.env, TEST_EXIT=str(status)))
+                    self.assertEqual(code, status, stderr)
+                    self.assertTrue(self.record.exists(), "the explicitly selected native control was not reached")
+                    self.assertEqual(len(self.records()), before + 1)
+                    self.assertEqual(json.loads(stdout)["kind"], "fixture-job-control-status")
+        self.assertTrue(self.record.exists(), "no native control handoff was observed")
+        self.assertEqual(len(self.records()), 15)
+        self.assertFalse(new.exists())
+        self.driver.write_bytes(b"not an executable image\n")
+        for option, selected in (("--resume-to", new), ("--delivery", delivery),
+                                 ("--acknowledge", delivery)):
+            self.assertEqual(self.recover(operation, option, str(selected))[0], 127)
+        self.assertEqual(len(self.records()), 15)
+
+    def test_daemon_result_signal_and_inherited_descriptor_survive_handoff(self):
+        operation, _, delivery, new, _ = self.daemon_result_fixture()
+        for option, selected in (("--resume-to", new), ("--delivery", delivery),
+                                 ("--acknowledge", delivery)):
+            read, write = os.pipe()
+            try:
+                os.write(write, b"owned-jobserver-fixture")
+                os.close(write)
+                write = None
+                child = subprocess.Popen(
+                    [sys.executable, "-I", "-S", str(LAUNCHER), "--rabs-recover", str(operation),
+                     option, str(selected)], env=dict(self.env, TEST_INHERITED_FD=str(read), TEST_SIGNAL="1"),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    pass_fds=(read,), cwd=self.root,
+                )
+                try:
+                    child.communicate(timeout=8)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=3)
+                    child.stdout.close()
+                    child.stderr.close()
+                self.assertEqual(child.returncode, -signal.SIGTERM)
+                record = self.records()[-1]
+                self.assertEqual(record["pid"], child.pid)
+                self.assertEqual(bytes.fromhex(record["inherited"]), b"owned-jobserver-fixture")
+            finally:
+                os.close(read)
+                if write is not None:
+                    os.close(write)
+        self.assertEqual(len(self.records()), 3)
+        self.assertFalse(self.forbidden.exists())
+
+    def test_daemon_result_destinations_reject_aliases_overlaps_and_unsafe_modes(self):
+        operation, _, delivery, new, _ = self.daemon_result_fixture()
+        output = operation / "outputs"
+        output.mkdir(mode=0o700)
+        alias = self.root / "delivery-alias"
+        alias.symlink_to(delivery, target_is_directory=True)
+        ordinary = self.root / "ordinary"
+        ordinary.write_bytes(b"not a directory")
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        common = (operation, self.root, operation / "bundle", output, alias,
+                  alias / "new", ordinary, fifo, self.root / "absent/child",
+                  Path("relative"), operation / "../escape")
+        for candidate in common + (delivery, delivery / "nested"):
+            self.assert_recovery_refused(operation, "--resume-to", str(candidate))
+        for option in ("--delivery", "--acknowledge"):
+            for candidate in common + (new,):
+                self.assert_recovery_refused(operation, option, str(candidate))
+            for mode in (0o755, 0o770, 0o707):
+                delivery.chmod(mode)
+                self.assert_recovery_refused(operation, option, str(delivery))
+            delivery.chmod(0o700)
+        self.assertFalse(self.record.exists())
+        self.assertEqual((delivery / "partial").read_bytes(), b"retained partial bytes\x00\xff")
+        self.assertFalse(new.exists())
+
+    def test_daemon_result_prefixes_reject_unsafe_or_overlapping_inputs(self):
+        operation, _, delivery, new, _ = self.daemon_result_fixture()
+        alias = self.root / "prefix-alias"
+        alias.symlink_to(delivery, target_is_directory=True)
+        for candidate in (operation, operation / "bundle", new, alias, self.root,
+                          self.root / "absent", delivery / "partial"):
+            self.assert_recovery_refused(operation, "--resume-to", str(new),
+                                         "--prefix-from", str(candidate))
+        delivery.chmod(0o755)
+        self.assert_recovery_refused(operation, "--resume-to", str(new), "--prefix-from", str(delivery))
+        delivery.chmod(0o700)
+        # A child destination under the supplied prefix would mutate the hint.
+        other = self.root / "other-prefix"
+        other.mkdir(mode=0o700)
+        self.assert_recovery_refused(operation, "--resume-to", str(other / "new"),
+                                     "--prefix-from", str(other))
+        self.assertFalse(self.record.exists())
+        self.assertFalse(new.exists())
+
+    def test_daemon_result_control_selectors_are_exclusive_and_bounded(self):
+        operation, _, delivery, new, _ = self.daemon_result_fixture()
+        choices = (("--resume-to", str(new)), ("--delivery", str(delivery)),
+                   ("--acknowledge", str(delivery)))
+        for left in choices:
+            for right in choices:
+                self.assert_recovery_refused(operation, *(left + right))
+        for selection in choices[1:]:
+            self.assert_recovery_refused(operation, *(selection + ("--prefix-from", str(delivery))))
+        for options in (("--acknowledge",), ("--acknowledge", str(delivery), "--wait"),
+                        ("--prefix-from", str(delivery)),
+                        ("--resume-to", str(new), "--prefix-from", str(delivery), "--acknowledge", str(delivery))):
+            self.assert_recovery_refused(operation, *options)
+        self.assertFalse(self.record.exists())
+        self.assertFalse(new.exists())
+
+    def test_daemon_result_record_validation_precedes_every_control(self):
+        operation, endpoint, delivery, new, original = self.daemon_result_fixture()
+        record_path = operation / "operation.json"
+        controls = (("--resume-to", str(new)), ("--delivery", str(delivery)),
+                    ("--acknowledge", str(delivery)))
+        for field, value in (("job_id", "00" * 16), ("request_id", 7),
+                             ("automatic_retry", True), ("publication_authorized", True),
+                             ("job_wait_argv", [str(self.driver), "--job-submit", original["job_id"]])):
+            record_path.write_text(json.dumps(dict(original, **{field: value})))
+            for control in controls:
+                self.assert_recovery_refused(operation, *control)
+        record_path.write_text(json.dumps(original))
+        endpoint.chmod(0o666)
+        for control in controls:
+            self.assert_recovery_refused(operation, *control)
+        self.assertFalse(self.record.exists())
+
+    def test_daemon_result_controls_require_an_explicit_later_wait_for_diagnostics(self):
+        operation, _, delivery, new, metadata = self.daemon_result_fixture()
+        code, stdout, stderr, _ = self.recover(operation, "--resume-to", str(new))
+        self.assertEqual(code, 0, stderr)
+        self.assertIsNone(json.loads(stdout)["compiler_success"])
+        self.assertEqual(len(self.records()), 1, "no implicit wait, second receiver or resubmission")
+        self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_RECOVERY_DRIVER)
+        code, stdout, stderr, _ = self.recover(operation, env=dict(self.env, TEST_EXIT="101"))
+        self.assertEqual(code, 101, stderr)
+        self.assertEqual(stdout, b"verified job stdout\x00\xff\n")
+        self.assertEqual([r["argv"][1] for r in self.records()], ["--job-resume", "--job-wait"])
+        self.assertTrue(all(r["argv"][2] == metadata["job_id"] for r in self.records()))
+        self.assertFalse(new.exists())
+        self.assertTrue(delivery.is_dir())
+
+    def test_direct_operations_cannot_use_daemon_release_control(self):
+        operation = self.retained_operation()
+        delivery = operation / "delivery"
+        delivery.mkdir(mode=0o700)
+        before = (operation / "bundle/request.json").read_bytes()
+        code, stdout, stderr, _ = self.recover(operation, "--acknowledge", str(delivery))
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, b"")
+        self.assertIn(b"requires a daemon-owned operation", stderr)
+        self.assertFalse(self.record.exists())
+        self.assertEqual((operation / "bundle/request.json").read_bytes(), before)
 
 
 if __name__ == "__main__":
