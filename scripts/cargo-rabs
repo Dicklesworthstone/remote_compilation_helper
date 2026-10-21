@@ -63,6 +63,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
   --rabs-canonical FILE  Build, check, lint or test through a canonical worker.
+  --rabs-recover DIR     Recover a retained canonical operation; never execute it again.
   --help                Show this help without starting a daemon or Cargo.
 
 Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
@@ -86,6 +87,21 @@ The native driver durably allocates each new worker request ID under the same
 RABS_STATE_DIR; keep that state across builds. spec.json and operation.json
 record allocation intent, not an assigned ID. The prepared bundle/request.json
 contains the numeric execution identity used unchanged for result recovery.
+
+Canonical recovery: cargo rabs --rabs-recover /absolute/cargo-OPERATION
+This selects native --resume with the saved worker, pin and bundle/request.json,
+never --prepare-from. A complete delivery is verified/replayed offline. An absent
+delivery may be retrieved from the original pinned worker; an incomplete existing
+delivery is not overwritten. Use --resume-to /absolute/NEW-DELIVERY for a fresh
+receiver, optionally with --prefix-from /absolute/PARTIAL-DELIVERY for independently
+verified prefix reuse. Later use --delivery /absolute/RECOVERED-DELIVERY to verify
+and replay that complete receipt without downloading again. These path options
+are recovery-only, not Cargo arguments. --delivery and --resume-to are exclusive.
+The original profile, checkout and toolchain are not needed. Keep the original
+operation/bundle paths, installed rabsd and matching RABS_STATE_DIR/TLS settings.
+The installed driver, not the saved executable pathname, is invoked exactly once;
+receipt verification and installation remain native. No counter/journal reset,
+local compilation, new request identity, or execution retry is introduced.
 
 Remote mode requires a matching RCH installation and configured POSIX workers.
 It execs `rch exec --source-content-receipt -- cargo ...`, with remote execution
@@ -1052,8 +1068,8 @@ def arguments(argv):
             required = True
         elif args[0] == "--rabs-remote":
             remote = True
-        elif args[0] == "--rabs-canonical":
-            raise SetupError("--rabs-canonical must be the first and only launcher mode")
+        elif args[0] in ("--rabs-canonical", "--rabs-recover"):
+            raise SetupError(args[0] + " must be the first and only launcher mode")
         else:
             break
         args.pop(0)
@@ -1424,6 +1440,161 @@ def run_canonical(args, env):
         return 127
 
 
+def canonical_recovery_directory(value, allow_missing=False):
+    """Validate a recovery path without creating, resolving or repairing it."""
+    path = Path(canonical_path(value, absolute=True))
+    for parent in reversed((path,) + tuple(path.parents)):
+        try:
+            metadata = parent.lstat()
+        except FileNotFoundError:
+            if allow_missing and parent == path:
+                continue
+            raise
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SetupError("canonical recovery paths require ordinary directory ancestors")
+    return path
+
+
+def canonical_recovery_record(operation):
+    """Read private launcher intent, never an execution or result receipt.
+
+    Retained state must stay exclusively operator-owned during handoff. Like
+    native recovery this is not an interface for hostile same-user mutation.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    directory = os.open(operation, flags | os.O_DIRECTORY)
+    try:
+        owner = os.fstat(directory)
+        if owner.st_uid != os.geteuid() or stat.S_IMODE(owner.st_mode) & 0o077:
+            raise SetupError("canonical recovery operation must be private to this user")
+        descriptor = os.open("operation.json", flags | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            before = os.fstat(descriptor)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o077
+                    or not 0 < before.st_size <= MAX_FRAME):
+                raise SetupError("canonical recovery record must be a bounded private single-link file")
+            data = bytearray()
+            while len(data) <= MAX_FRAME:
+                chunk = os.read(descriptor, min(4096, MAX_FRAME + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            signature = lambda m: (m.st_dev, m.st_ino, m.st_uid, m.st_mode, m.st_nlink,
+                                   m.st_size, m.st_mtime_ns, m.st_ctime_ns)
+            named = os.stat("operation.json", dir_fd=directory, follow_symlinks=False)
+            if (len(data) != before.st_size or len(data) > MAX_FRAME
+                    or signature(before) != signature(os.fstat(descriptor))
+                    or signature(before) != signature(named)):
+                raise SetupError("canonical recovery record changed while reading")
+        finally:
+            os.close(descriptor)
+        canonical_recovery_directory(str(operation))
+        named = operation.lstat()
+        if (owner.st_dev, owner.st_ino, owner.st_uid, owner.st_mode) != (
+                named.st_dev, named.st_ino, named.st_uid, named.st_mode):
+            raise SetupError("canonical recovery operation changed while reading")
+    finally:
+        os.close(directory)
+    return decode_object(bytes(data))
+
+
+def canonical_recovery_invocation(args, env):
+    """Construct one native recovery-only handoff. Saved argv is never executed.
+
+    The native --resume/--resume-from paths own all request/receipt validation,
+    TLS, byte recovery and installation, including refusal of partial receipts.
+    No branch here can request execution, recapture inputs or allocate an ID.
+    """
+    if sys.platform != "linux":
+        raise SetupError("canonical recovery currently requires Linux")
+    if not args or len(args) not in (1, 3, 5) or args[0].startswith("--"):
+        raise SetupError("--rabs-recover requires an absolute operation directory and recovery path options")
+    options = {}
+    for index in range(1, len(args), 2):
+        flag, value = args[index:index + 2]
+        if flag not in ("--resume-to", "--delivery", "--prefix-from") or flag in options:
+            raise SetupError("unknown or duplicate canonical recovery option")
+        options[flag] = value
+    if ("--resume-to" in options and "--delivery" in options
+            or "--prefix-from" in options and "--resume-to" not in options):
+        raise SetupError("canonical recovery requires one destination; prefix reuse requires --resume-to")
+    operation = canonical_recovery_directory(args[0])
+    record = canonical_recovery_record(operation)
+    fields = {"version", "request_id", "operation_directory", "prepared_build_argv",
+              "automatic_retry", "publication_authorized"}
+    request_id = record.get("request_id")
+    if (record.keys() != fields or record["version"] != "canonical-cargo-v1"
+            or record["operation_directory"] != str(operation)
+            or record["automatic_retry"] is not False or record["publication_authorized"] is not False
+            or not (request_id == "allocate" or type(request_id) is int and 0 < request_id < 2**64)):
+        raise SetupError("invalid canonical recovery record identity or authority policy")
+    saved = record["prepared_build_argv"]
+    if (type(saved) is not list or len(saved) != 9
+            or any(type(value) is not str or not value or len(value) > 4096 or "\0" in value for value in saved)
+            or saved[1:3] != ["--worker-build-tls", "--replay-diagnostics"]):
+        raise SetupError("canonical recovery record does not name the fixed native build contract")
+    # The old executable may have moved or been replaced. Validate its spelling
+    # but resolve today's installed rabsd independently; never execute this argv.
+    canonical_path(saved[0], absolute=True)
+    import re
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", saved[4]) is None:
+        raise SetupError("invalid recorded canonical worker identity")
+    dependency_worker_endpoint(saved[3:6], ("listen", "worker", "worker_spki_sha256"))
+    bundle, original_delivery, output = (operation / name for name in ("bundle", "delivery", "outputs"))
+    if saved[6:] != [str(bundle), str(original_delivery), str(output)]:
+        raise SetupError("canonical recovery record changed its fixed bundle/delivery/output paths")
+    canonical_recovery_directory(str(bundle))
+    canonical_recovery_directory(str(output), allow_missing=True)
+    overlap = lambda a, b: a == b or a in b.parents or b in a.parents
+    destination = original_delivery
+    if "--resume-to" in options or "--delivery" in options:
+        new = "--resume-to" in options
+        destination = canonical_recovery_directory(
+            options["--resume-to" if new else "--delivery"], allow_missing=new)
+        if new and os.path.lexists(destination):
+            raise SetupError("canonical --resume-to requires a new delivery directory")
+        if (overlap(destination, bundle) or overlap(destination, output)
+                or destination != original_delivery and overlap(destination, original_delivery)):
+            raise SetupError("canonical recovery destination overlaps retained state")
+        if not new:
+            metadata = destination.lstat()
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("canonical recovered delivery must be private to this user")
+    else:
+        canonical_recovery_directory(str(destination), allow_missing=True)
+    recovery = ["--resume"]
+    if "--prefix-from" in options:
+        prefix = canonical_recovery_directory(options["--prefix-from"])
+        metadata = prefix.lstat()
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise SetupError("canonical recovery prefix must be private to this user")
+        if any(overlap(prefix, path) for path in (bundle, output, destination)):
+            raise SetupError("canonical recovery prefix overlaps a destination or retained bundle")
+        recovery = ["--resume-from", str(prefix)]
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    if os.path.samefile(daemon, __file__):
+        raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
+    command = [daemon, "--worker-build-tls", "--replay-diagnostics"] + recovery
+    command += saved[3:6] + [str(bundle), str(destination), str(output)]
+    child_env = dict(env)
+    child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
+    return daemon, command, child_env
+
+
+def run_canonical_recovery(args, env):
+    try:
+        daemon, command, child_env = canonical_recovery_invocation(args, env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: canonical recovery refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
+        os.execvpe(daemon, command, child_env)
+    except OSError as error:
+        print("cargo-rabs: cannot execute canonical recovery driver: {}".format(error), file=sys.stderr)
+        return 127
+
+
 def main():
     # Keep the preparation import API and all older modes unchanged. This
     # explicit profile transfers ownership directly to the existing native
@@ -1431,6 +1602,8 @@ def main():
     raw = sys.argv[1:]
     if raw[:1] == ["rabs"]:
         raw = raw[1:]
+    if raw[:1] == ["--rabs-recover"]:
+        return run_canonical_recovery(raw[1:], dict(os.environ))
     if raw[:1] == ["--rabs-canonical"]:
         if any(key in os.environ for key in ROOT_ADMISSION_KEYS):
             print("cargo-rabs: local root admission cannot combine with canonical mode", file=sys.stderr)

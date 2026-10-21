@@ -63,6 +63,39 @@ if os.environ.get("TEST_SIGNAL"):
 sys.exit(int(os.environ.get("TEST_EXIT", "0")))
 '''
 
+RECOVERY_DRIVER = r'''
+# Executable native-driver double, not an implementation of receipt verification.
+import json, os, pathlib, signal, sys
+args = sys.argv[1:]
+assert args[:2] == ["--worker-build-tls", "--replay-diagnostics"], args
+assert "--prepare-from" not in args and "allocate" not in args, args
+if args[2] == "--resume":
+    prefix, positional = None, args[3:]
+else:
+    assert args[2] == "--resume-from", args
+    prefix, positional = args[3], args[4:]
+assert len(positional) == 6, positional
+address, worker, pin, bundle, delivery, output = positional
+request = json.loads((pathlib.Path(bundle) / "request.json").read_bytes())
+assert type(request["request_id"]) is int and request["request_id"] == 2**64 - 17
+record = {"pid": os.getpid(), "argv": sys.argv, "request_id": request["request_id"],
+          "prefix": prefix, "delivery": delivery, "output": output,
+          "delivery_exists": pathlib.Path(delivery).exists(),
+          "state": os.environ.get("RABS_STATE_DIR"),
+          "input": sys.stdin.buffer.read().hex()}
+if os.environ.get("TEST_INHERITED_FD"):
+    record["inherited"] = os.read(int(os.environ["TEST_INHERITED_FD"]), 1024).hex()
+with open(os.environ["TEST_DRIVER_RECORD"], "a") as result:
+    result.write(json.dumps(record) + "\n")
+sys.stdout.buffer.write(b"recovered stdout\x00\xff\n")
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(b"recovered stderr\x00\xfe\n")
+sys.stderr.buffer.flush()
+if os.environ.get("TEST_SIGNAL"):
+    os.kill(os.getpid(), signal.SIGTERM)
+sys.exit(int(os.environ.get("TEST_EXIT", "0")))
+'''
+
 
 class CanonicalCargo(unittest.TestCase):
     def setUp(self):
@@ -691,6 +724,257 @@ sys.exit(78)
         self.assertIn(b"complete verified delivery", stdout)
         self.assertFalse(self.record.exists())
         self.assertEqual(list(self.operations.iterdir()), [])
+
+    def retained_operation(self):
+        # Only the saved layout is a fixture. The launcher and exec are real;
+        # native digest/TLS/output checks are not simulated by this test driver.
+        _, command, _ = launcher.canonical_invocation(
+            str(self.profile_path), ["check"], self.env)
+        operation = Path(command[5]).parent
+        bundle = operation / "bundle"
+        bundle.mkdir(mode=0o700)
+        request = bundle / "request.json"
+        request.write_bytes(b'{"request_id":18446744073709551599,"kind":"canonical-exec"}')
+        request.chmod(0o600)
+        self.driver.write_text("#!" + sys.executable + " -S\n" + RECOVERY_DRIVER)
+        return operation
+
+    def recover(self, operation, *options, env=None, input=b""):
+        return self.invoke([], env=env, prefix=["--rabs-recover", str(operation), *options], input=input)
+
+    def assert_recovery_refused(self, operation, *options):
+        before = self.record.read_bytes() if self.record.exists() else None
+        code, stdout, stderr, _ = self.recover(operation, *options)
+        self.assertEqual(code, 2, stderr)
+        self.assertEqual(stdout, b"")
+        self.assertIn(b"recovery refused", stderr)
+        self.assertEqual(self.record.read_bytes() if self.record.exists() else None, before)
+
+    def test_recovery_handoff_never_prepares_and_needs_no_original_inputs(self):
+        operation = self.retained_operation()
+        before = {str(p.relative_to(operation)): p.read_bytes()
+                  for p in operation.rglob("*") if p.is_file()}
+        self.source.rename(self.root / "retired-checkout")
+        self.toolchain.rename(self.root / "retired-toolchain")
+        self.profile_path.rename(self.root / "retired-profile")
+        env = dict(self.env, TEST_EXIT="101", RABS_STATE_DIR=str(self.root / "state"))
+        code, stdout, stderr, pid = self.recover(operation, env=env, input=b"\x00\xffinput")
+        self.assertEqual(code, 101)
+        self.assertEqual(stdout, b"recovered stdout\x00\xff\n")
+        self.assertIn(b"recovered stderr\x00\xfe\n", stderr)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["input"], "00ff696e707574")
+        self.assertEqual(record["state"], env["RABS_STATE_DIR"])
+        self.assertEqual(record["argv"][1:4],
+                         ["--worker-build-tls", "--replay-diagnostics", "--resume"])
+        self.assertEqual(record["delivery"], str(operation / "delivery"))
+        self.assertEqual(record["output"], str(operation / "outputs"))
+        self.assertEqual(record["request_id"], 2**64 - 17)
+        self.assertEqual(before, {str(p.relative_to(operation)): p.read_bytes()
+                                 for p in operation.rglob("*") if p.is_file()})
+        self.assertEqual(list(self.operations.iterdir()), [operation])
+
+    def test_recovery_to_new_delivery_preserves_partial_bytes_and_prefix_intent(self):
+        operation = self.retained_operation()
+        partial = operation / "delivery"
+        partial.mkdir(mode=0o700)
+        (partial / "partial").write_bytes(b"keep incomplete output")
+        new = operation / "recovered"
+        code, _, _, _ = self.recover(operation, "--resume-to", str(new))
+        self.assertEqual(code, 0)
+        record = self.records()[-1]
+        self.assertEqual(record["delivery"], str(new))
+        self.assertIsNone(record["prefix"])
+        self.assertFalse(record["delivery_exists"])
+        code, _, _, _ = self.recover(operation, "--prefix-from", str(partial), "--resume-to", str(new))
+        self.assertEqual(code, 0)
+        record = self.records()[-1]
+        self.assertEqual(record["argv"][3:5], ["--resume-from", str(partial)])
+        self.assertEqual(record["prefix"], str(partial))
+        self.assertEqual((partial / "partial").read_bytes(), b"keep incomplete output")
+        self.assertFalse(new.exists(), "only the native receiver may create delivery state")
+
+    def test_recovery_does_not_execute_an_executable_from_saved_argv(self):
+        operation = self.retained_operation()
+        path = operation / "operation.json"
+        metadata = json.loads(path.read_bytes())
+        metadata["prepared_build_argv"][0] = str(self.toolchain / "bin/cargo")
+        path.write_text(json.dumps(metadata))
+        self.assertEqual(self.recover(operation)[0], 0)
+        record, = self.records()
+        self.assertEqual(record["argv"][0], str(self.driver))
+
+    def test_recovery_refusals_signals_and_exec_errors_never_retry(self):
+        operation = self.retained_operation()
+        for status in (1, 2, 101, 125):
+            self.assertEqual(self.recover(operation, env=dict(self.env, TEST_EXIT=str(status)))[0], status)
+        self.assertEqual(len(self.records()), 4)
+        self.assertEqual(self.recover(operation, env=dict(self.env, TEST_SIGNAL="1"))[0], -signal.SIGTERM)
+        self.assertEqual(len(self.records()), 5)
+        self.driver.write_bytes(b"not an executable image\n")
+        code, stdout, _, _ = self.recover(operation)
+        self.assertEqual(code, 127)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(len(self.records()), 5)
+
+    def test_recovery_rejects_extra_options_without_creating_another_operation(self):
+        operation = self.retained_operation()
+        new = str(operation / "new")
+        for options in (("build",), ("--prepare-from",), ("--resume",), ("--resume-to",),
+                        ("--resume-to", new, "--resume-to", new),
+                        ("--prefix-from", str(operation / "delivery")),
+                        ("--rabs-remote",), ("--rabs-canonical", str(self.profile_path))):
+            with self.subTest(options=options):
+                self.assert_recovery_refused(operation, *options)
+        self.assertEqual(list(self.operations.iterdir()), [operation])
+
+    def test_recovery_refuses_unsafe_record_types_permissions_and_identity(self):
+        operation = self.retained_operation()
+        path = operation / "operation.json"
+        original = path.read_bytes()
+        for data in (b"{", b"[]", b" " * (launcher.MAX_FRAME + 1),
+                     b'{"version":"canonical-cargo-v1",' + original[1:]):
+            path.write_bytes(data)
+            self.assert_recovery_refused(operation)
+        path.write_bytes(original)
+        path.chmod(0o644)
+        self.assert_recovery_refused(operation)
+        path.chmod(0o600)
+        held = operation / "original-record"
+        path.rename(held)
+        path.symlink_to(held)
+        self.assert_recovery_refused(operation)
+        path.rename(operation / "retained-link")
+        os.mkfifo(path, 0o600)
+        self.assert_recovery_refused(operation)
+        path.rename(operation / "retained-fifo")
+        os.link(held, path)
+        self.assert_recovery_refused(operation)
+
+    def test_recovery_refuses_moved_or_aliased_operations_and_unsafe_ancestors(self):
+        operation = self.retained_operation()
+        alias = self.root / "operation-alias"
+        alias.symlink_to(operation, target_is_directory=True)
+        self.assert_recovery_refused(alias)
+        parent_alias = self.root / "parent-alias"
+        parent_alias.symlink_to(self.operations, target_is_directory=True)
+        self.assert_recovery_refused(parent_alias / operation.name)
+        operation.chmod(0o770)
+        self.assert_recovery_refused(operation)
+        operation.chmod(0o700)
+        moved = self.operations / "moved-operation"
+        operation.rename(moved)
+        self.assert_recovery_refused(moved)
+
+    def test_recovery_record_cannot_select_other_authority_or_paths(self):
+        operation = self.retained_operation()
+        path = operation / "operation.json"
+        original = json.loads(path.read_bytes())
+        changes = [("automatic_retry", True), ("publication_authorized", True),
+                   ("request_id", True), ("request_id", 0), ("request_id", 2**64),
+                   ("version", "unknown"), ("operation_directory", str(self.root)),
+                   ("unknown", False)]
+        for field, value in changes:
+            with self.subTest(field=field, value=value):
+                path.write_text(json.dumps(dict(original, **{field: value})))
+                self.assert_recovery_refused(operation)
+        for index, value in ((1, "--worker-exec-loopback"), (2, "--prepare-from"),
+                             (3, "hostname.example:1"), (4, "--worker"),
+                             (5, "00" * 32), (6, str(self.source)),
+                             (7, str(self.root / "other")), (8, str(operation / "bundle/outputs"))):
+            with self.subTest(index=index):
+                changed = json.loads(json.dumps(original))
+                changed["prepared_build_argv"][index] = value
+                path.write_text(json.dumps(changed))
+                self.assert_recovery_refused(operation)
+
+    def test_recovery_destinations_and_prefixes_cannot_overlap_or_follow_links(self):
+        operation = self.retained_operation()
+        partial = operation / "delivery"
+        partial.mkdir(mode=0o700)
+        alias = operation / "prefix-alias"
+        alias.symlink_to(partial, target_is_directory=True)
+        new = operation / "new"
+        for destination in (operation, operation / "bundle/child", partial,
+                            partial / "child", operation / "outputs/child",
+                            alias / "child", self.root / "absent/child"):
+            self.assert_recovery_refused(operation, "--resume-to", str(destination))
+        for prefix in (alias, operation, operation / "bundle", self.root / "missing"):
+            self.assert_recovery_refused(operation, "--resume-to", str(new), "--prefix-from", str(prefix))
+        partial.chmod(0o755)
+        self.assert_recovery_refused(operation, "--resume-to", str(new), "--prefix-from", str(partial))
+        self.assertFalse(new.exists())
+        self.assertEqual(list(partial.iterdir()), [])
+
+    def test_recovery_mode_is_exclusive_and_does_not_turn_into_local_cargo_args(self):
+        operation = self.retained_operation()
+        for first in ("--rabs-no-start", "--rabs-require-daemon", "--rabs-remote", "--rabs-canonical"):
+            code, stdout, _, _ = self.invoke([], prefix=[first, "--rabs-recover", str(operation)])
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, b"")
+        self.assertFalse(self.record.exists())
+
+    def test_recovery_is_intent_only_and_keeps_environment_and_saved_numeric_id(self):
+        operation = self.retained_operation()
+        request = operation / "bundle/request.json"
+        before = request.read_bytes()
+        env = dict(self.env, RABS_STATE_DIR=str(self.root / "admission"), RABS_COORD_TLS_KEY="/private/key")
+        original_env = dict(env)
+        daemon, command, child_env = launcher.canonical_recovery_invocation([str(operation)], env)
+        self.assertEqual(daemon, str(self.driver))
+        self.assertEqual(command[1:4], ["--worker-build-tls", "--replay-diagnostics", "--resume"])
+        self.assertEqual(env, original_env)
+        self.assertEqual(child_env["RABS_STATE_DIR"], env["RABS_STATE_DIR"])
+        self.assertEqual(child_env["RABS_COORD_TLS_KEY"], env["RABS_COORD_TLS_KEY"])
+        self.assertNotIn(env["RABS_COORD_TLS_KEY"], command)
+        self.assertEqual(request.read_bytes(), before)
+        self.assertFalse(Path(env["RABS_STATE_DIR"]).exists())
+        self.assertFalse(self.record.exists())
+
+    def test_recovery_can_replay_an_alternate_complete_delivery_without_the_old_one(self):
+        operation = self.retained_operation()
+        completed = operation / "recovered-delivery"
+        completed.mkdir(mode=0o700)
+        (completed / "delivery.json").write_text("fixture only; native verification is not simulated")
+        # An unrelated object now occupying the original delivery spelling must
+        # not be opened when the caller selects a different retained receipt.
+        target = self.root / "unrelated"
+        target.mkdir(mode=0o700)
+        (target / "sentinel").write_bytes(b"keep")
+        (operation / "delivery").symlink_to(target, target_is_directory=True)
+        self.assertEqual(self.recover(operation, "--delivery", str(completed))[0], 0)
+        record, = self.records()
+        self.assertEqual(record["delivery"], str(completed))
+        self.assertTrue(record["delivery_exists"])
+        self.assertEqual(record["argv"][3], "--resume")
+        self.assertEqual((target / "sentinel").read_bytes(), b"keep")
+        self.assert_recovery_refused(operation)
+
+    def test_recovery_selection_is_exclusive_and_unsupported_native_mode_stays_refused(self):
+        operation = self.retained_operation()
+        completed = operation / "recovered-delivery"
+        completed.mkdir(mode=0o700)
+        new = operation / "new"
+        for options in (("--delivery", str(completed), "--resume-to", str(new)),
+                        ("--delivery", str(completed), "--prefix-from", str(completed)),
+                        ("--delivery", str(completed), "--delivery", str(completed)),
+                        ("--delivery", str(self.root / "missing"))):
+            self.assert_recovery_refused(operation, *options)
+        self.driver.write_text("#!" + sys.executable + " -S\n" + r'''
+import json, os, sys
+with open(os.environ["TEST_DRIVER_RECORD"], "a") as record:
+    record.write(json.dumps({"argv": sys.argv}) + "\n")
+assert "--resume" in sys.argv and "--prepare-from" not in sys.argv
+print("fixture: unsupported --resume", file=sys.stderr)
+sys.exit(2)
+''')
+        code, stdout, stderr, _ = self.recover(operation)
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, b"")
+        self.assertIn(b"unsupported --resume", stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertFalse(new.exists())
 
 
 if __name__ == "__main__":
