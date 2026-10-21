@@ -231,7 +231,8 @@ impl SourcePreparation {
                 .map_err(|error| invalid(&format!("source closure capture refused: {error:?}")))?,
         );
         if let Some(cargo) = &self.cargo {
-            cargo.prepare(image)
+            let (image, files) = cargo.prepare(image)?;
+            SourceUpload::from_snapshot(image, "workspace", &files)
         } else if self.closure {
             SourceUpload::from_snapshot_closure(image, &self.selections)
         } else {

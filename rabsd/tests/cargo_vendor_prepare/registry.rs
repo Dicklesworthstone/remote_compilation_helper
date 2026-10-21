@@ -53,7 +53,7 @@ fn archive(home: &Path, name: &str, files: &[(&str, &str)], dependencies: Value)
 }
 
 fn fixture() -> Fixture {
-    let owner = tempfile::tempdir().unwrap();
+    let owner = private_tempdir();
     let anchor = owner.path().join("approved source");
     let home = owner.path().join("approved cargo home");
     fs::create_dir(&anchor).unwrap();
@@ -313,6 +313,280 @@ fn cached_crates_io_preparation_and_real_build_use_only_locked_archives_in_an_is
         fs::read(workspace.join("Cargo.lock")).unwrap(),
         original_lock
     );
+}
+
+#[test]
+fn cached_git_and_registry_sources_rebuild_offline_without_original_history_or_configuration() {
+    use rabs_sandbox::cargo_home::{CAPTURED_GIT_CONFIG, ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION};
+    let fixture = fixture();
+    let (git_fixture, revision) = Fixture::git_with_history(true);
+    let git_lock: toml::Value =
+        toml::from_str(&fs::read_to_string(git_fixture.anchor.join("Cargo.lock")).unwrap())
+            .unwrap();
+    let git_packages = git_lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| {
+            package
+                .get("source")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|source| source.starts_with("git+"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        git_packages.len(),
+        2,
+        "workspace-inherited Git packages remain distinct"
+    );
+    let source = git_packages[0]["source"].as_str().unwrap();
+    let url = source
+        .strip_prefix("git+")
+        .unwrap()
+        .split_once("?rev=")
+        .unwrap()
+        .0;
+    let manifest_path = fixture.anchor.join("app/Cargo.toml");
+    let original_manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        manifest_path,
+        format!("{original_manifest}git_dep={{git='{url}',rev='{revision}'}}\n"),
+    )
+    .unwrap();
+    write(
+        &fixture.anchor,
+        "app/src/main.rs",
+        "fn main() { println!(\"{}:{}:{}\", cache_dep::answer()+local_dep::answer(), git_dep::answer(), env!(\"BUILD_LABEL\")); }\n",
+    );
+    let mut lock: toml::Value =
+        toml::from_str(&fs::read_to_string(fixture.anchor.join("Cargo.lock")).unwrap()).unwrap();
+    let packages = lock["package"].as_array_mut().unwrap();
+    packages
+        .iter_mut()
+        .find(|package| package["name"].as_str() == Some("vendor_app"))
+        .unwrap()["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .push("git_dep".into());
+    packages.extend(git_packages);
+    write(
+        &fixture.anchor,
+        "Cargo.lock",
+        toml::to_string(&lock).unwrap(),
+    );
+    let original_lock = fs::read(fixture.anchor.join("Cargo.lock")).unwrap();
+    let approved = PathBuf::from(
+        fixture.specification["cargo_source"]["cargo_home_source"]
+            .as_str()
+            .unwrap(),
+    );
+    let original_db = fs::read_dir(
+        git_fixture
+            .owner
+            .path()
+            .join("retired-seed-cargo-home/git/db"),
+    )
+    .unwrap()
+    .map(Result::unwrap)
+    .next()
+    .unwrap()
+    .path();
+    let namespace = original_db
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let database = approved.join("git/db").join(&namespace);
+    fs::rename(&original_db, &database).unwrap();
+    let mut parent = command("git");
+    parent
+        .arg("-C")
+        .arg(git_fixture.owner.path().join("retired-original-git"))
+        .args(["rev-parse", &format!("{revision}^")])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let (status, stdout, stderr) = Process::spawn(fixture.owner.path(), "git-parent", &mut parent)
+        .wait(Duration::from_secs(10));
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    let parent = String::from_utf8(stdout).unwrap().trim().to_owned();
+    assert_eq!(parent.len(), 40);
+    // These bytes would poison native Git/Cargo if original configuration or
+    // expanded checkouts were used before constructing the private object view.
+    write(&database, "config", PRIVATE_MARKER);
+    write(&database, "HEAD", PRIVATE_MARKER);
+    write(&database, "refs/heads/private", PRIVATE_MARKER);
+    let hook_marker = fixture.owner.path().join("original-hook-executed");
+    write(
+        &database,
+        "hooks/post-checkout",
+        format!("#!/bin/sh\nprintf executed > '{}'\n", hook_marker.display()),
+    );
+    fs::set_permissions(
+        database.join("hooks/post-checkout"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &approved,
+        &format!(
+            "git/checkouts/{namespace}/{}/dep/src/lib.rs",
+            &revision[..7]
+        ),
+        "compile_error!(\"mutable original Git checkout was used\");\n",
+    );
+    let (bundle, request) = fixture.prepared();
+    assert_eq!(
+        request["cargo_home"]["version"],
+        ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION
+    );
+    assert!(!request.to_string().contains(approved.to_str().unwrap()));
+    assert!(!hook_marker.exists());
+    let manifest = rabsd::coord::source_delivery::request_manifest(&request)
+        .unwrap()
+        .unwrap();
+    let prefix = format!("rabs-cargo-home/git/db/{namespace}/");
+    let git_files = manifest
+        .files()
+        .iter()
+        .filter(|file| file.path.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    assert_eq!(git_files.len(), 6);
+    assert_eq!(
+        manifest
+            .files()
+            .iter()
+            .filter(|file| file.path.starts_with("rabs-cargo-home/registry/"))
+            .count(),
+        5
+    );
+    assert_eq!(
+        fs::read(bundle.join("source").join(&prefix).join("config")).unwrap(),
+        CAPTURED_GIT_CONFIG
+    );
+    for path in ["HEAD", "shallow", "refs/heads/rabs-captured"] {
+        assert_eq!(
+            fs::read(bundle.join("source").join(&prefix).join(path)).unwrap(),
+            format!("{revision}\n").as_bytes()
+        );
+    }
+    for file in manifest.files() {
+        assert!(
+            !file.path.contains("git/checkouts/")
+                && !file.path.contains("/hooks/")
+                && !file.path.contains("credentials")
+        );
+        let bytes = fs::read(bundle.join("source").join(&file.path)).unwrap();
+        assert!(
+            !bytes
+                .windows(PRIVATE_MARKER.len())
+                .any(|window| window == PRIVATE_MARKER.as_bytes())
+        );
+    }
+    // An alternate database is not a permitted escape hatch for a missing
+    // object, even when the explicitly selected commit is otherwise complete.
+    write(&database, "objects/info/alternates", "/outside/objects\n");
+    let (refused_bundle, status, _, stderr) = fixture.prepare("git-alternate-refused");
+    assert!(!status.success());
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("alternates"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!refused_bundle.exists());
+    assert_eq!(
+        fs::read(fixture.anchor.join("Cargo.lock")).unwrap(),
+        original_lock
+    );
+    fs::rename(
+        &approved,
+        fixture.owner.path().join("retired-original-cargo-home"),
+    )
+    .unwrap();
+    fs::rename(
+        &fixture.anchor,
+        fixture.owner.path().join("retired-original-workspace"),
+    )
+    .unwrap();
+
+    let projection = CargoHomeProjection::for_version(
+        ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION,
+        "rabs-cargo-home",
+        &manifest,
+    )
+    .unwrap();
+    let mut received =
+        SourceReceiver::create(&fixture.owner.path().join("received-git"), manifest.clone())
+            .unwrap();
+    for file in manifest.files() {
+        let bytes = fs::read(bundle.join("source").join(&file.path)).unwrap();
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            received
+                .write_chunk(
+                    &file.path,
+                    (index * MAX_SOURCE_CHUNK) as u64,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )
+                .unwrap();
+        }
+    }
+    received.seal().unwrap();
+    let projected = projection
+        .prepare(
+            &received,
+            &fixture.owner.path().join("runtime-git-home"),
+            || false,
+        )
+        .unwrap();
+    let workspace = projected.projected_workspace().unwrap();
+    assert!(!workspace.join("rabs-cargo-home").exists());
+    assert!(!projected.root().join("git/checkouts").exists());
+    let mut history = command("git");
+    history
+        .arg("--git-dir")
+        .arg(projected.root().join("git/db").join(&namespace))
+        .args(["cat-file", "-e", &parent])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let (status, _, _) = Process::spawn(fixture.owner.path(), "excluded-git-parent", &mut history)
+        .wait(Duration::from_secs(10));
+    assert!(
+        !status.success(),
+        "unselected Git ancestors must not be delivered"
+    );
+    let target = fixture.owner.path().join("mixed-native-target");
+    let mut cargo = command(&fixture.cargo);
+    cargo
+        .current_dir(workspace)
+        .args(["build", "--frozen", "--jobs=1", "-p", "vendor_app"])
+        .arg("--target-dir")
+        .arg(&target)
+        .env("CARGO_HOME", projected.root())
+        .env("RUSTC", &fixture.rustc)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("BUILD_LABEL", LABEL);
+    let (status, _, stderr) = Process::spawn(
+        fixture.owner.path(),
+        "mixed-cached-source-build",
+        &mut cargo,
+    )
+    .wait(Duration::from_secs(90));
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    let (status, stdout, stderr) = Process::spawn(
+        fixture.owner.path(),
+        "mixed-cached-source-binary",
+        &mut command(target.join("debug/vendor_app")),
+    )
+    .wait(Duration::from_secs(5));
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, format!("42:40:{LABEL}\n").as_bytes());
+    assert_eq!(
+        fs::read(workspace.join("Cargo.lock")).unwrap(),
+        original_lock
+    );
+    assert!(!hook_marker.exists());
 }
 
 #[test]

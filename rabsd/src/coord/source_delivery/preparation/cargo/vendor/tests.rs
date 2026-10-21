@@ -124,7 +124,7 @@ fn alternate_registry_indexes_bind_names_lock_and_resolved_source_exactly() {
         alternate_registry_fixture(root.path(), index, source);
         let retained = image(root.path());
         let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
-        validate_capture(&retained, "app/Cargo.toml", Some(&vendor)).unwrap();
+        validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false).unwrap();
         let locked = vendor
             .bind_lock(&retained, Path::new("app/Cargo.lock"))
             .unwrap();
@@ -141,6 +141,7 @@ fn alternate_registry_indexes_bind_names_lock_and_resolved_source_exactly() {
             "app/Cargo.toml",
             &resolved,
             Some(&vendor),
+            None,
         )
         .unwrap();
         // A valid checksum/name/version under another registry is a different
@@ -152,7 +153,8 @@ fn alternate_registry_indexes_bind_names_lock_and_resolved_source_exactly() {
                 planning,
                 "app/Cargo.toml",
                 &resolved,
-                Some(&vendor)
+                Some(&vendor),
+                None,
             )
             .is_err()
         );
@@ -292,7 +294,7 @@ fn vendor_selection_is_explicit_bounded_and_does_not_change_legacy_mode() {
     );
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
-    assert!(validate_capture(&image(root.path()), "app/Cargo.toml", None).is_err());
+    assert!(validate_capture(&image(root.path()), "app/Cargo.toml", None, false).is_err());
 }
 
 #[test]
@@ -301,7 +303,7 @@ fn coherent_vendor_tree_binds_lock_and_metadata_without_rereading_checkout() {
     fixture(root.path());
     let retained = image(root.path());
     let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
-    let files = validate_capture(&retained, "app/Cargo.toml", Some(&vendor)).unwrap();
+    let files = validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false).unwrap();
     assert_eq!(files.len(), 8);
     assert!(files.contains(&format!("{DEP}/data.txt")));
     let locked = vendor
@@ -327,6 +329,7 @@ fn coherent_vendor_tree_binds_lock_and_metadata_without_rereading_checkout() {
         "app/Cargo.toml",
         &metadata(planning),
         Some(&vendor),
+        None,
     )
     .unwrap();
     assert!(verify(root.path()).is_err());
@@ -502,7 +505,8 @@ fn resolved_registry_packages_cannot_change_source_name_version_root_or_lock_mem
                 planning,
                 "app/Cargo.toml",
                 &changed,
-                Some(&vendor)
+                Some(&vendor),
+                None,
             )
             .is_err(),
             "case {case}"
@@ -601,7 +605,7 @@ fn locked_git_sources_preserve_literal_selectors_and_coexist_with_registry_packa
         let source = git_fixture(root.path(), selector);
         let retained = image(root.path());
         let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
-        let selected = validate_capture(&retained, "app/Cargo.toml", Some(&vendor)).unwrap();
+        let selected = validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false).unwrap();
         assert!(selected.contains(&format!("{GIT_DEP}/{CHECKSUM_FILE}")));
         let locked = vendor
             .bind_lock(&retained, Path::new("app/Cargo.lock"))
@@ -614,6 +618,7 @@ fn locked_git_sources_preserve_literal_selectors_and_coexist_with_registry_packa
             "app/Cargo.toml",
             &git_metadata(planning, &source),
             Some(&vendor),
+            None,
         )
         .unwrap();
     }
@@ -640,7 +645,8 @@ fn git_lock_and_metadata_bind_the_full_revision_not_only_name_version_or_referen
                 planning,
                 "app/Cargo.toml",
                 &git_metadata(planning, &wrong),
-                Some(&vendor)
+                Some(&vendor),
+                None,
             )
             .is_err(),
             "{wrong}"
@@ -649,7 +655,15 @@ fn git_lock_and_metadata_bind_the_full_revision_not_only_name_version_or_referen
     let mut value = git_metadata(planning, &source);
     value["packages"][2]["source"] = Value::Null;
     assert!(
-        validate_metadata(&retained, planning, "app/Cargo.toml", &value, Some(&vendor)).is_err()
+        validate_metadata(
+            &retained,
+            planning,
+            "app/Cargo.toml",
+            &value,
+            Some(&vendor),
+            None
+        )
+        .is_err()
     );
     let exact = format!("git+{GIT_URL}?rev={GIT_REVISION}#{}", "a".repeat(40));
     assert!(
@@ -752,7 +766,7 @@ fn undeclared_git_dependencies_and_ambiguous_replacements_are_refused_before_car
         let retained = image(root.path());
         let checked =
             VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").and_then(|vendor| {
-                validate_capture(&retained, "app/Cargo.toml", Some(&vendor))?;
+                validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false)?;
                 vendor.bind_lock(&retained, Path::new("app/Cargo.lock"))
             });
         assert!(checked.is_err(), "case {case}");
@@ -863,7 +877,7 @@ fn local_reclassification_of_vendor_packages_is_refused_before_metadata_can_read
     )
     .unwrap();
     assert!(
-        validate_capture(&image(root.path()), "app/Cargo.toml", Some(&vendor))
+        validate_capture(&image(root.path()), "app/Cargo.toml", Some(&vendor), false)
             .unwrap_err()
             .to_string()
             .contains("local Cargo package selection")

@@ -6,10 +6,10 @@
 //! build scripts, include! inputs, and optional/target dependencies retain their
 //! relative layout. No descriptor, cache authority, or compiler result is minted.
 
+mod git;
 mod registry;
 mod vendor;
 
-use super::super::{SourceUpload, invalid, require};
 use rabs_asupersync::process_groups::{GroupSignal, ManagedProcessGroup};
 use rabs_asupersync::region_tree::Attribution;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot, capture_sealed_source};
@@ -28,6 +28,18 @@ use vendor::{SourceReplacements, VendoredSources};
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PACKAGES: usize = 1024;
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn require(condition: bool, message: &str) -> io::Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(invalid(message))
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct CargoSource {
@@ -109,7 +121,12 @@ impl CargoSource {
         Ok(())
     }
 
-    pub(super) fn prepare(&self, image: Arc<SealedSourceSnapshot>) -> io::Result<SourceUpload> {
+    /// Return retained input bytes and their explicit selection. The coordinator
+    /// constructs and validates the transport projection from this same image.
+    pub(super) fn prepare(
+        &self,
+        image: Arc<SealedSourceSnapshot>,
+    ) -> io::Result<(Arc<SealedSourceSnapshot>, Vec<String>)> {
         let vendor = self
             .vendor
             .as_deref()
@@ -233,9 +250,9 @@ impl CargoSource {
             // This new image is derived solely from the retained source and
             // checksum-bound cache bytes. It is input delivery, not a resealed
             // authoritative action descriptor or a cache-publication claim.
-            SourceUpload::from_snapshot(derived, "workspace", &selected)
+            Ok((derived, selected))
         } else {
-            SourceUpload::from_snapshot(image, "workspace", &files)
+            Ok((image, files))
         }
     }
 }
@@ -258,6 +275,9 @@ fn planning_command(
         .env("HOME", planning.join("home"))
         .env("CARGO_HOME", planning.join("cargo-home"))
         .env("RUSTC", rustc)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("CARGO_TARGET_DIR", planning.join("target"));
     for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
         if let Some(value) = std::env::var_os(key) {
@@ -334,11 +354,12 @@ fn validate_capture(
                 let value: toml::Value = toml::from_str(text).map_err(|error| {
                     invalid(&format!("captured Cargo manifest {path}: {error}"))
                 })?;
-                validate_manifest_paths(
+                validate_manifest_paths_with_cache(
                     Path::new(path).parent().unwrap_or(Path::new("")),
                     &value,
                     vendor.map(|vendor| &vendor.sources),
                     false,
+                    cached_registry,
                 )?;
             }
             if Path::new(path)
@@ -627,6 +648,16 @@ fn validate_manifest_paths(
     sources: Option<&SourceReplacements>,
     vendored_git: bool,
 ) -> io::Result<()> {
+    validate_manifest_paths_with_cache(base, value, sources, vendored_git, false)
+}
+
+fn validate_manifest_paths_with_cache(
+    base: &Path,
+    value: &toml::Value,
+    sources: Option<&SourceReplacements>,
+    vendored_git: bool,
+    cached_git: bool,
+) -> io::Result<()> {
     for field in ["package", "project"] {
         if let Some(package) = value.get(field) {
             for field in ["workspace", "readme", "license-file", "build"] {
@@ -673,14 +704,14 @@ fn validate_manifest_paths(
             }
         }
     }
-    validate_dependency_sections(base, value, sources, vendored_git)?;
+    validate_dependency_sections(base, value, sources, vendored_git, cached_git)?;
     if let Some(targets) = value.get("target").and_then(toml::Value::as_table) {
         for target in targets.values() {
-            validate_dependency_sections(base, target, sources, vendored_git)?;
+            validate_dependency_sections(base, target, sources, vendored_git, cached_git)?;
         }
     }
     if let Some(workspace) = value.get("workspace") {
-        validate_dependency_sections(base, workspace, sources, vendored_git)?;
+        validate_dependency_sections(base, workspace, sources, vendored_git, cached_git)?;
         for field in ["members", "default-members", "exclude"] {
             if let Some(paths) = workspace.get(field).and_then(toml::Value::as_array) {
                 for path in paths {
@@ -704,11 +735,11 @@ fn validate_manifest_paths(
     }
     if let Some(patches) = value.get("patch").and_then(toml::Value::as_table) {
         for dependencies in patches.values() {
-            validate_dependencies(base, dependencies, sources, vendored_git)?;
+            validate_dependencies(base, dependencies, sources, vendored_git, cached_git)?;
         }
     }
     if let Some(replacements) = value.get("replace") {
-        validate_dependencies(base, replacements, sources, vendored_git)?;
+        validate_dependencies(base, replacements, sources, vendored_git, cached_git)?;
     }
     Ok(())
 }
@@ -725,6 +756,7 @@ fn validate_dependency_sections(
     value: &toml::Value,
     sources: Option<&SourceReplacements>,
     vendored_git: bool,
+    cached_git: bool,
 ) -> io::Result<()> {
     for field in [
         "dependencies",
@@ -734,7 +766,7 @@ fn validate_dependency_sections(
         "build_dependencies",
     ] {
         if let Some(dependencies) = value.get(field) {
-            validate_dependencies(base, dependencies, sources, vendored_git)?;
+            validate_dependencies(base, dependencies, sources, vendored_git, cached_git)?;
         }
     }
     Ok(())
@@ -745,6 +777,7 @@ fn validate_dependencies(
     value: &toml::Value,
     sources: Option<&SourceReplacements>,
     vendored_git: bool,
+    cached_git: bool,
 ) -> io::Result<()> {
     if let Some(dependencies) = value.as_table() {
         for dependency in dependencies.values() {
@@ -755,11 +788,15 @@ fn validate_dependencies(
                         .check_registry_dependency(fields)?;
                 }
                 if fields.contains_key("git") {
-                    sources
-                        .ok_or_else(|| {
-                            invalid("Git dependencies require an explicitly verified vendor source")
-                        })?
-                        .check_dependency(fields)?;
+                    if let Some(sources) = sources {
+                        sources.check_dependency(fields)?;
+                    } else {
+                        require(
+                            cached_git,
+                            "Git dependencies require an explicitly verified vendor source or approved Cargo home",
+                        )?;
+                        git::validate_dependency(fields)?;
+                    }
                 }
                 // Cargo keeps original sibling paths in vendored Git manifests,
                 // but resolves those dependencies from that Git source's directory
@@ -838,7 +875,7 @@ fn local_tool(name: &str, scratch: &Path) -> io::Result<PathBuf> {
         let explicit = PathBuf::from(explicit);
         require(
             explicit.is_absolute(),
-            "explicit CARGO/RUSTC must name an absolute local executable",
+            "explicit planning tools must name absolute local executables",
         )?;
         explicit
     } else {
@@ -923,18 +960,35 @@ impl Drop for OwnedGroup {
 }
 
 fn bounded_command(
+    command: Command,
+    scratch: &Path,
+    timeout: Duration,
+    limit: u64,
+) -> io::Result<Vec<u8>> {
+    bounded_command_with_input(command, scratch, timeout, limit, None)
+}
+
+fn bounded_command_with_input(
     mut command: Command,
     scratch: &Path,
     timeout: Duration,
     limit: u64,
+    input: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     let logs = tempfile::Builder::new()
         .prefix("metadata-output-")
         .tempdir_in(scratch)?;
     let stdout = logs.path().join("stdout");
     let stderr = logs.path().join("stderr");
+    let stdin = if let Some(input) = input {
+        let path = logs.path().join("stdin");
+        fs::write(&path, input)?;
+        Stdio::from(File::open(path)?)
+    } else {
+        Stdio::null()
+    };
     command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(File::create(&stdout)?)
         .stderr(File::create(&stderr)?);
     let mut owned = OwnedGroup {
@@ -1088,6 +1142,9 @@ fn validate_metadata(
                 captured_metadata_path(image, root, &target["src_path"])?;
             }
         }
+    }
+    if let Some((registry, home)) = registry {
+        registry.verify_git_checkouts(home, packages)?;
     }
     // A virtual workspace manifest is not itself a package but is an exact
     // captured Cargo input and must be the metadata workspace's manifest.
@@ -1420,13 +1477,6 @@ mod tests {
             bounded_command(valid, scratch.path(), Duration::from_secs(5), 1024).unwrap(),
             b"bounded"
         );
-    }
-
-    #[test]
-    fn unresolved_cargo_plans_are_refused_before_execution_or_resume() {
-        let request = json!({"cargo_source":{"manifest":"Cargo.toml"}});
-        let error = super::super::super::request_manifest(&request).unwrap_err();
-        assert!(error.to_string().contains("--worker-prepare"));
     }
 
     #[test]

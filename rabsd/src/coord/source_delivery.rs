@@ -13,6 +13,7 @@ use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, 
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
 use rabs_sandbox::cargo_home::{
     CARGO_HOME_SOURCE_VERSION, CargoHomeProjection, ISOLATED_CARGO_HOME_SOURCE_VERSION,
+    ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION,
 };
 use rabs_sandbox::generated_source::GeneratedSource;
 #[cfg(all(test, unix))]
@@ -81,7 +82,7 @@ fn manifest_value(manifest: &SourceManifest) -> Value {
         })).collect::<Vec<_>>()})
 }
 
-/// Decode only JSON shape; the worker shares the sandbox's registry-only
+/// Decode only JSON shape; the worker shares the sandbox's versioned cache
 /// projection policy. The original field remains unchanged in the saved request
 /// and its fingerprint. This validates intent, not Cargo resolution provenance.
 fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result<()> {
@@ -91,7 +92,8 @@ fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result
     require(
         home.as_object().is_some_and(|object| object.len() == 2)
             && (home["version"] == CARGO_HOME_SOURCE_VERSION
-                || home["version"] == ISOLATED_CARGO_HOME_SOURCE_VERSION),
+                || home["version"] == ISOLATED_CARGO_HOME_SOURCE_VERSION
+                || home["version"] == ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION),
         "cargo_home requires a supported version and prefix",
     )?;
     let prefix = home["prefix"]
@@ -177,7 +179,7 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
 /// That mode may run compiler probes, never builds. Explicit vendor selection
 /// adds checked crates.io and locked Git directory sources. Other Cargo config
 /// and symlinks refuse; manifests and source replacements are not rewritten.
-/// Optional cargo_home selects a registry-only prefix in an explicitly selected
+/// Optional cargo_home selects an admitted cache prefix in an explicitly selected
 /// manifest; its version/prefix is preserved for worker-side private Cargo-home replay.
 ///
 /// The directory contains source/ and request.json. All selected source files
@@ -315,7 +317,22 @@ pub fn prepare_source_bundle(
     fields.remove("source_roots");
     fields.remove("cargo_source");
     fields.remove("toolchain_source");
-    if let Some(home) = inputs.cargo_home_projection() {
+    if let Some(mut home) = inputs.cargo_home_projection() {
+        let prefix = home["prefix"]
+            .as_str()
+            .ok_or_else(|| invalid("prepared Cargo home prefix missing"))?;
+        let git_prefix = format!("{prefix}/git/db/");
+        if upload
+            .manifest
+            .files()
+            .iter()
+            .any(|file| file.path.starts_with(&git_prefix))
+        {
+            // Negotiate the stronger shape only when the captured bundle
+            // actually contains reconstructed Git objects. Registry-only
+            // requests retain their existing exact saved-operation version.
+            home["version"] = json!(ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION);
+        }
         fields.insert("cargo_home".to_owned(), home);
     }
     if let Some(prepared) = &toolchain {
@@ -1048,6 +1065,13 @@ mod tests {
 
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
+
+    #[test]
+    fn unresolved_cargo_plans_are_refused_before_execution_or_resume() {
+        let request = json!({"cargo_source":{"manifest":"Cargo.toml"}});
+        let error = request_manifest(&request).unwrap_err();
+        assert!(error.to_string().contains("--worker-prepare"));
+    }
 
     fn fixture(root: &std::path::Path) -> (SourceUpload, Value, Vec<u8>) {
         std::fs::create_dir(root.join("src")).unwrap();

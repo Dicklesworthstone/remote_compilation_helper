@@ -2,10 +2,10 @@
 //!
 //! A lockfile selects package identities; its SHA-256 checksums select archive
 //! bytes. Cargo remains the resolver and consumes only a fresh private home.
-//! Expanded user sources, credentials, Cargo configuration, Git and unrelated
+//! Expanded user sources, credentials, Cargo configuration and unrelated
 //! index entries are never opened. This supplies inputs, not cache authority.
 
-use super::{MAX_PACKAGES, OUTPUT_LIMIT, invalid, require, validate_manifest_paths};
+use super::{MAX_PACKAGES, OUTPUT_LIMIT, git, invalid, require, validate_manifest_paths};
 use flate2::read::MultiGzDecoder;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, MAX_SOURCE_FILES};
@@ -19,10 +19,32 @@ use std::path::{Component, Path, PathBuf};
 pub(super) const CACHE_PREFIX: &str = "rabs-cargo-home";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const MAX_NAMESPACES: usize = 8;
-const MAX_ARCHIVE_MEMBERS: usize = 100_000;
+pub(super) const MAX_ARCHIVE_MEMBERS: usize = 100_000;
 
 type PackageIdentity = (String, String);
 type LockedPackages = BTreeMap<PackageIdentity, [u8; 32]>;
+
+fn archive_checksum(value: &str) -> io::Result<[u8; 32]> {
+    require(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "source digest must be 64 lowercase hex digits",
+    )?;
+    let mut digest = [0_u8; 32];
+    for (slot, pair) in digest.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
+        let digit = |byte: u8| {
+            if byte <= b'9' {
+                byte - b'0'
+            } else {
+                byte - b'a' + 10
+            }
+        };
+        *slot = (digit(pair[0]) << 4) | digit(pair[1]);
+    }
+    Ok(digest)
+}
 
 pub(super) fn approved_home(value: &Value) -> io::Result<PathBuf> {
     let text = value
@@ -95,20 +117,25 @@ fn locked_packages(lock: &toml::Value) -> io::Result<LockedPackages> {
                     .ok_or_else(|| invalid("invalid locked package source"))
             })
             .transpose()?;
-        require(
-            source.is_none() || source == Some(CRATES_IO),
-            "cached registry capture supports crates.io only; Git and alternate registries require verified vendor sources",
-        )?;
+        if let Some(source) = source
+            && source != CRATES_IO
+        {
+            git::locked_revision(source)?;
+            require(
+                package.get("checksum").is_none(),
+                "locked Git package must not carry a registry checksum",
+            )?;
+        }
         require(
             identities.insert((name, version, source)),
             "duplicate locked package identity",
         )?;
-        if source.is_some() {
+        if source == Some(CRATES_IO) {
             let checksum = package
                 .get("checksum")
                 .and_then(toml::Value::as_str)
                 .ok_or_else(|| invalid("locked crates.io package requires a SHA-256 checksum"))?;
-            let digest = super::super::super::digest(&Value::String(checksum.to_owned()))?;
+            let digest = archive_checksum(checksum)?;
             require(
                 selected
                     .insert((name.to_owned(), version.to_owned()), digest)
@@ -121,7 +148,7 @@ fn locked_packages(lock: &toml::Value) -> io::Result<LockedPackages> {
 }
 
 #[cfg(unix)]
-fn open_home(path: &Path) -> io::Result<File> {
+pub(super) fn open_home(path: &Path) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags, open, openat};
     require(path.is_absolute(), "Cargo cache root must be absolute")?;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -139,14 +166,14 @@ fn open_home(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn open_home(_path: &Path) -> io::Result<File> {
+pub(super) fn open_home(_path: &Path) -> io::Result<File> {
     Err(invalid(
         "cached registry capture requires descriptor-relative Unix filesystem access",
     ))
 }
 
 #[cfg(unix)]
-fn open_selected(root: &File, path: &str, directory: bool) -> io::Result<File> {
+pub(super) fn open_selected(root: &File, path: &str, directory: bool) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags, openat};
     let components: Vec<_> = path.split('/').collect();
     require(
@@ -167,7 +194,7 @@ fn open_selected(root: &File, path: &str, directory: bool) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn open_selected(_root: &File, _path: &str, _directory: bool) -> io::Result<File> {
+pub(super) fn open_selected(_root: &File, _path: &str, _directory: bool) -> io::Result<File> {
     Err(invalid(
         "cached registry capture requires descriptor-relative Unix filesystem access",
     ))
@@ -461,6 +488,7 @@ pub(super) struct RegistryCache {
     lock: PathBuf,
     files: BTreeMap<String, Vec<u8>>,
     packages: BTreeMap<(String, String, String), CapturedPackage>,
+    git: Option<git::GitCache>,
 }
 
 impl RegistryCache {
@@ -485,8 +513,8 @@ impl RegistryCache {
         .map_err(|_| invalid("Cargo lock is malformed"))?;
         let locked = locked_packages(&lock_value)?;
         require(
-            !locked.is_empty(),
-            "cargo_home_source requires at least one locked crates.io package",
+            !locked.is_empty() || git::has_locked_packages(&lock_value),
+            "cargo_home_source requires at least one locked crates.io or full-revision Git package",
         )?;
         let workspace = image
             .manifest("workspace")
@@ -502,11 +530,16 @@ impl RegistryCache {
             }
         }
         let root = open_home(approved)?;
-        let namespaces = index_namespaces(&root)?;
+        let namespaces = if locked.is_empty() {
+            Vec::new()
+        } else {
+            index_namespaces(&root)?
+        };
         let mut captured = Self {
             lock: lock.to_path_buf(),
             files: BTreeMap::new(),
             packages: BTreeMap::new(),
+            git: None,
         };
         let mut found = BTreeSet::new();
         let mut expanded_remaining = MAX_SOURCE_BYTES;
@@ -567,6 +600,22 @@ impl RegistryCache {
                 "selected Cargo cache changed between capture passes",
             )?;
         }
+        if git::has_locked_packages(&lock_value) {
+            let (git, files) = git::GitCache::capture(
+                &root,
+                &lock_value,
+                cargo_home
+                    .parent()
+                    .ok_or_else(|| invalid("private Cargo home parent missing"))?,
+                remaining,
+                &mut expanded_remaining,
+                &mut expanded_members,
+            )?;
+            for (path, bytes) in files {
+                captured.insert(path, bytes, &mut remaining, &mut file_count)?;
+            }
+            captured.git = Some(git);
+        }
         captured.materialize(cargo_home)?;
         Ok(captured)
     }
@@ -623,6 +672,18 @@ impl RegistryCache {
     pub(super) fn check_package(&self, home: &Path, package: &Value) -> io::Result<()> {
         if package.get("source").is_some_and(Value::is_null) {
             return Ok(());
+        }
+        if package["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("git+"))
+        {
+            return self
+                .git
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid("resolved Git package was not selected from the approved Cargo home")
+                })?
+                .check_package(home, package);
         }
         require(
             package["source"] == CRATES_IO,
@@ -697,6 +758,13 @@ impl RegistryCache {
                 <[u8; 32]>::from(Sha256::digest(&bytes)) == *expected,
                 "unpacked registry manifest or target differs from its captured archive",
             )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_git_checkouts(&self, home: &Path, packages: &[Value]) -> io::Result<()> {
+        if let Some(git) = &self.git {
+            git.verify_checkouts(home, packages)?;
         }
         Ok(())
     }
@@ -828,13 +896,25 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_is_the_archive_authority_and_only_crates_io_is_admitted() {
+    fn lockfile_binds_archive_checksums_and_rejects_unmodeled_sources() {
         let valid = format!(
             "version=4\n[[package]]\nname='fixture'\nversion='1.0.0'\nsource='{CRATES_IO}'\nchecksum='{}'\n",
             "ab".repeat(32)
         );
         let lock: toml::Value = toml::from_str(&valid).unwrap();
         assert_eq!(locked_packages(&lock).unwrap().len(), 1);
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let git: toml::Value = toml::from_str(&format!(
+            "version=4\n[[package]]\nname='fixture'\nversion='1.0.0'\nsource='git+https://example.invalid/pkg?rev={revision}#{revision}'\n"
+        )).unwrap();
+        assert!(locked_packages(&git).unwrap().is_empty());
+        assert!(git::has_locked_packages(&git));
+        let mut checksummed_git = git;
+        checksummed_git["package"][0]
+            .as_table_mut()
+            .unwrap()
+            .insert("checksum".into(), "ab".repeat(32).into());
+        assert!(locked_packages(&checksummed_git).is_err());
         for invalid in [
             valid.replace(CRATES_IO, "registry+https://private.invalid/index"),
             valid.replace(CRATES_IO, "git+https://example.invalid/pkg#revision"),

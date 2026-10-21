@@ -11,7 +11,7 @@ tests on the selected worker and returns Cargo's final exit status:
 2. It execs the installed
    `rabsd --worker-build-tls --replay-diagnostics --prepare-from ...` once.
 3. The native driver captures the source graph, approved vendor tree or locked
-   registry cache, and complete toolchain. `request.json` is made durable only
+   dependency cache, and complete toolchain. `request.json` is made durable only
    after the captured input bundle is ready.
 4. The existing mutual-TLS worker exchange transfers the captured inputs and runs
    Cargo itself inside the worker's canonical namespace. Cargo's JSON reports
@@ -97,14 +97,14 @@ set.
 
 ### Use dependencies already cached by Cargo
 
-For a locked crates.io graph, replace `vendor` with an explicit absolute
+For a locked crates.io or supported pinned-Git graph, replace `vendor` with an explicit absolute
 `cargo_home_source` in the profile:
 
 ```json
 "cargo_home_source": "/home/builder/.cargo"
 ```
 
-This selects the crates.io sparse registry cache. The native preparer reads
+For crates.io packages, this selects the sparse registry cache. The native preparer reads
 `Cargo.lock` from the captured workspace, selects the required `.crate` archives
 and sparse index records, verifies archive SHA-256 values against that lockfile,
 and checks archive paths and bounded unpacked contents before Cargo uses them.
@@ -112,6 +112,30 @@ It runs offline Cargo metadata against a fresh private Cargo home and verifies
 the resolved graph against the retained inputs. The lockfile must remain
 unchanged. Missing cache entries, checksum mismatches and unsupported registry
 sources refuse preparation before remote execution.
+
+Git dependencies are supported when their manifest uses an explicit full
+40-character lowercase commit `rev`, and `Cargo.lock` selects that exact same
+commit. The approved Cargo home must already contain its complete object data
+under `git/db`; a checkout alone is insufficient. The Linux preparing host needs
+Git and `prlimit` available as local executables. This does not require those
+tools on the worker: captured Cargo reconstructs its own private checkouts.
+
+The preparer opens ordinary object files through retained descriptors, without
+reading the original repository configuration or executing its hooks. It packs
+only the selected commits and their complete trees and blobs into fresh minimal
+databases, marks those commits as shallow roots, and verifies each generated
+pack with Git. Unselected ancestor commits and unrelated repository history are
+not transferred. Native Git helpers have a 2 GiB address-space limit, bounded
+output and process-group deadlines; expanded registry and Git sources share the
+existing source byte and file limits. The metadata probe checks each resolved
+Git package's full locked identity, contained manifest and target paths, and the
+bytes and executable modes of its checkout against the selected objects.
+
+Moving branches/tags, abbreviated revisions, credential-bearing URLs, object
+alternates, partial clones, Git submodules and symlinks are outside this cached
+Git profile. Missing or unsupported inputs refuse before remote execution.
+Manifests, lockfiles and captured project configuration retain their original
+bytes; no source replacement is synthesized for this mode.
 
 The cache must contain the locked graph, including optional and target-specific
 dependencies needed by the planner's `--all-features` metadata check. A successful
@@ -130,11 +154,20 @@ writable planning or worker directory. User configuration,
 credentials, Git checkouts and previously expanded `registry/src` trees are not
 imported. This mode neither fetches missing dependencies nor runs `cargo vendor`.
 
+A bundle containing reconstructed Git databases negotiates
+`isolated-registry-git-cargo-home-v1`. Each database contains only generated
+fixed configuration, detached HEAD, bounded shallow roots, a fixed generated
+ref, and one verified pack/index pair. Both peers validate this distinct shape;
+the worker checks the retained control bytes before constructing either private
+view. Older endpoints refuse the new version before source upload. Registry-only
+bundles keep their existing version and behavior.
+
 `cargo_home_source` and `vendor` are mutually exclusive. The selected Cargo home
 must have ordinary directory ancestors and be disjoint from the source,
 toolchain and operation roots. The source anchor must not already contain the
-reserved `rabs-cargo-home` directory. Git dependencies and alternate registries
-still require the approved vendor route. Cache capture does not authorize action
+reserved `rabs-cargo-home` directory. Alternate registries and Git graphs outside
+the full-revision cache profile still require the supported approved vendor
+route. Cache capture does not authorize action
 cache publication or a compiler skip.
 
 ### Captured compiler configuration
@@ -366,6 +399,20 @@ It poisons the original expanded registry sources and user configuration, retire
 the original source/cache directories after preparation, and asserts that build
 scripts see exactly the original workspace entries. Separate malformed-input
 cases must refuse before publishing a prepared bundle.
+
+The mixed-cache integration fixture adds a parented pinned Git repository with
+two packages and a build script alongside registry dependencies. It poisons the
+original Git configuration, refs, hooks and checkout, prepares through the
+production API, and retires both original roots before a frozen Cargo build
+against the projected inputs. It checks that the original lockfile is unchanged,
+the expected application output is produced, the parent commit is absent from
+the reconstructed database, and object alternates refuse before publication:
+
+```sh
+cargo test -p rabsd --test cargo_vendor_prepare \
+  registry::cached_git_and_registry_sources_rebuild_offline_without_original_history_or_configuration \
+  --locked -- --exact --nocapture
+```
 
 The authenticated worker fixture is explicitly opt-in on a canonical-capable
 Linux host with OpenSSL and matching built binaries:

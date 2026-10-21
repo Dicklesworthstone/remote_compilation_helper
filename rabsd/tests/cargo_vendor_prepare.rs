@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -20,6 +21,12 @@ const LOG_LIMIT: u64 = 4 * 1024 * 1024;
 const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const LABEL: &str = "exact\n雪";
 const WORKER: &str = "vendor-build-test";
+
+fn private_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
 
 #[path = "cargo_vendor_prepare/registry.rs"]
 mod registry;
@@ -174,7 +181,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = private_tempdir();
         let anchor = owner.path().join("approved source");
         fs::create_dir(&anchor).unwrap();
         let cargo = fs::canonicalize(std::env::var_os("CARGO").expect("Cargo test runner"))
@@ -324,7 +331,10 @@ impl Fixture {
         fixture
     }
     fn git() -> (Self, String) {
-        let owner = tempfile::tempdir().unwrap();
+        Self::git_with_history(false)
+    }
+    fn git_with_history(parented: bool) -> (Self, String) {
+        let owner = private_tempdir();
         let anchor = owner.path().join("approved source");
         fs::create_dir(&anchor).unwrap();
         let cargo = fs::canonicalize(std::env::var_os("CARGO").expect("Cargo test runner"))
@@ -382,6 +392,13 @@ impl Fixture {
             stdout
         };
         git("git-init", &["init", "--initial-branch=main"]);
+        if parented {
+            write(
+                &repository,
+                "dep/payload.txt",
+                "superseded-private-ancestor-payload\n",
+            );
+        }
         git("git-add", &["add", "."]);
         git(
             "git-commit",
@@ -398,6 +415,25 @@ impl Fixture {
                 "captured Git source",
             ],
         );
+        if parented {
+            write(&repository, "dep/payload.txt", "40\n");
+            git("git-selected-add", &["add", "dep/payload.txt"]);
+            git(
+                "git-selected-commit",
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-m",
+                    "selected Git source",
+                ],
+            );
+        }
         let revision = String::from_utf8(git("git-revision", &["rev-parse", "HEAD"]))
             .unwrap()
             .trim()
@@ -529,8 +565,14 @@ impl Fixture {
             .get("cargo_home_source")
             .is_some()
         {
+            let lock = fs::read_to_string(self.anchor.join("Cargo.lock")).unwrap();
+            let version = if lock.contains("git+") {
+                rabs_sandbox::cargo_home::ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION
+            } else {
+                rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION
+            };
             expected["cargo_home"] = json!({
-                "version":rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION,
+                "version":version,
                 "prefix":"rabs-cargo-home"});
         }
         expected["source_manifest"] = request["source_manifest"].clone();
