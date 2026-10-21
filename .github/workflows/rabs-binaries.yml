@@ -24,6 +24,7 @@ on:
       - 'scripts/install-rabs'
       - 'scripts/rabs-recover'
       - 'scripts/tests/test_rabs_recover.py'
+      - 'scripts/tests/test_rabs_recover_canonical.py'
       - 'tests/test_install_rabs*.py'
       - 'tests/test_rabs_sprt_evidence.py'
       - 'tests/test_rabs_worker_cache.py'
@@ -69,7 +70,9 @@ jobs:
       - name: Canonical Cargo frontend (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_canonical.py -v
       - name: Retained remote recovery (native driver, explicit daemon fixture)
-        run: python3 -I -S scripts/tests/test_rabs_recover.py -v
+        run: |
+          python3 -I -S scripts/tests/test_rabs_recover.py -v
+          python3 -I -S scripts/tests/test_rabs_recover_canonical.py -v
       - name: Capture recovery SQL and interruption model (not a Rust execution proof)
         run: python3 tests/test_rabs_capture_recovery.py -v
       - name: Indexed evidence queries (native SQLite, not Rust execution)
