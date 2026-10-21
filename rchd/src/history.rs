@@ -878,6 +878,7 @@ impl BuildHistory {
         Ok(Some(state))
     }
 
+    #[cfg(test)]
     pub(crate) fn reserved_disk_headroom_gib(&self, worker_id: &str) -> u64 {
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         reserved_disk_headroom(&active, worker_id)
@@ -927,6 +928,7 @@ impl BuildHistory {
 
     /// Diagnostic estimate only: this never releases an active reservation.
     /// Learned growth minus a worker's observed drop is not admission credit.
+    #[cfg(test)]
     pub(crate) fn pending_footprint_gib(&self, worker_id: &str) -> f64 {
         let builds: Vec<(String, String, f64)> = self
             .active
