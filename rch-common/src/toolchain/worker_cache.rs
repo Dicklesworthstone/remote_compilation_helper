@@ -11,9 +11,13 @@ const WORKER_PREPARE: &str = include_str!("worker_cache.py");
 // RCH's Windows worker also runs Git's sh. Refuse the Linux-only accelerator
 // before importing Python or the launcher on other platforms. Missing Python
 // likewise preserves the original executable and argv. No eval or retry.
+// Isolate interpreter startup before any adapter import: project modules,
+// PYTHONPATH and site hooks otherwise run before preparation's deadline and
+// cancellation guards. Keep PYTHON* in the environment for Cargo/build scripts;
+// these interpreter flags apply only to the worker's stdlib-only bootstrap.
 const PLATFORM_RUNNER: &str = r#"program=$1; shift
 if [ "$(uname -s 2>/dev/null)" = Linux ] && command -v python3 >/dev/null 2>&1; then
-    exec python3 -c "$program" "$@"
+    exec python3 -I -S -c "$program" "$@"
 fi
 exec "$@""#;
 
@@ -116,5 +120,31 @@ mod tests {
         assert!(wrapped.starts_with("sh -c "));
         assert!(wrapped.ends_with(&format!("rustup run 'nightly; echo injected' {command}")));
         assert_eq!(wrapped.matches("rch-rabs-worker").count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_bootstrap_isolates_python_without_changing_cargo_inputs() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let fixture = tempfile::tempdir().expect("bootstrap fixture").keep();
+        let runner = fixture.join("runner.sh");
+        let adapter = fixture.join("adapter.py");
+        std::fs::write(&runner, PLATFORM_RUNNER).expect("write compiled runner");
+        std::fs::write(&adapter, WORKER_PREPARE).expect("write compiled adapter");
+        let output = std::process::Command::new("python3")
+            .args(["-I", "-S"])
+            .arg(root.join("tests/test_rabs_worker_bootstrap.py"))
+            .env("RCH_TEST_WORKER_RUNNER", &runner)
+            .env("RCH_TEST_WORKER_ADAPTER", &adapter)
+            .output()
+            .expect("execute native worker-bootstrap regressions");
+        assert!(
+            output.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }
