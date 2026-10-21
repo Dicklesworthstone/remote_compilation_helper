@@ -931,6 +931,45 @@ ask a worker to run an arbitrary command "to check for a tool" would be a
 remote execution primitive wearing a capability-probe hat; declaring the argv
 in operator config keeps the set of probe commands finite and reviewable.
 
+### Worker Execution Policy (Linux workers)
+
+A worker can lower the priority of the builds RCH runs on it, or confine them
+to a systemd slice, independently of `rchd`'s own service settings. The policy
+is set on the worker, in exactly one of these files:
+
+- `/etc/rch/worker-execution.conf`, owned by root, or
+- `~/.config/rch/worker-execution.conf` of the SSH user, owned by that user or
+  by root.
+
+```ini
+version=1
+nice=10
+systemd_slice=jobs.slice
+systemd_manager=user
+```
+
+`version=1` is required, plus at least one of `nice` (-20 to 19) and
+`systemd_slice` (an existing, active `*.slice` unit). `systemd_manager` (`user`,
+the default, or `system`) names the manager that owns the slice and is only
+valid together with `systemd_slice`. Every setting in the file is enforced
+before the build starts. The launch is refused, never run unconfined, when the
+file is unsafe (not a regular single-link ASCII file of at most 8 KiB, writable
+by group or others, wrongly owned), has unknown or duplicate keys, or exists in
+both places, and when enforcement fails (no `busctl`, `systemctl` or `timeout`,
+an inactive slice, a failed priority change, a cgroup placement it cannot
+confirm, or a non-Linux worker). The launcher writes the cause to its stderr as
+`RCH_WORKER_POLICY_REFUSED:<reason>`, and what it applied as
+`RCH_WORKER_EXECUTION_POLICY:nice=…,slice=…,manager=…,scope=…`.
+
+With a slice, RCH attaches the build's existing process-group leader to a
+transient scope in that slice, so the watchdog, cancellation and recovery keep
+working, and cleanup covers the whole cgroup. Without a policy file, builds run
+as before.
+
+The policy covers the tracked build payload only. Source sync, pre-launch
+package bootstrap and untracked execution are not confined, so it does not on
+its own make a shared developer machine safe to admit as a worker (#104).
+
 ---
 
 ## Output Modes
