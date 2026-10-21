@@ -124,6 +124,9 @@ set -e
 # observer or its pipe writers alive. This group has no namespace mutators.
 "$rch_namespace_timer" --kill-after=1 2 sh -c '
 set -eu
+# Keep the timer alive until group KILL even when a pipe writer ignores TERM.
+# Otherwise GNU timeout can reap this shell while that descendant is blocked.
+trap "while :; do sleep 1; done" HUP INT TERM PIPE
 control=$1
 IFS= read -r status < "$control/result" || exit 73
 case "$status" in ""|*[!0-9]*) exit 73 ;; esac
@@ -136,4 +139,13 @@ cat -- "$control/stderr" >&2 || exit 73
 [ "$status" -eq 0 ] || exit "$status"
 printf "RCH_TOPOLOGY_OK\n" | cmp -s - "$control/stdout" || exit 73
 cat -- "$control/stdout"
-' rch-namespace-delivery "$control"
+' rch-namespace-delivery "$control" </dev/null &
+delivery=$!
+set +e
+# A foreground timer killed during delivery makes the observer shell print
+# "Killed" to the same full stderr pipe, defeating the delivery deadline.
+# Keep payload streams unchanged and silence only the observer's wait notice.
+wait "$delivery" 2>/dev/null
+delivery_status=$?
+set -e
+exit "$delivery_status"
