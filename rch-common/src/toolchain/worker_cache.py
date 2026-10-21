@@ -10,6 +10,11 @@ maximum 35000). The default is CARGO_RABS_STARTUP_MS plus 2000 ms, or 7000 ms
 without a launcher override. Cleanup adds at most 250 ms of cooperative wait;
 a kernel-blocked helper can retain pending SIGKILL. Cargo execution has no new
 timeout. Existing/shared daemons are outside the preparer's process group.
+An in-group watchdog also enforces the original setup deadline and observes a
+private owner pipe. Adapter death closes that pipe even on SIGKILL; a stopped
+adapter cannot suspend this independent deadline. No installed code starts
+until the watchdog acknowledges readiness. Its live membership authorizes
+group cleanup, never a historical PID or a shared daemon's session.
 Diagnostic replay has a separate 100 ms delivery budget and the same 250 ms
 cleanup grace. A stalled stderr reader cannot hold Cargo before exec. Blocking
 kernel operations can still outlive cooperative deadlines with SIGKILL pending.
@@ -139,7 +144,67 @@ def preparation_seconds(environment):
                            MAX_PREPARE_MS) / 1000
 
 
-def prepare_child(original, response, log_descriptor, original_signal_mask):
+def watch_preparer(owner, ready, deadline):
+    # This child stays IN the newly created preparer group. Its own membership
+    # pins that group even if the preparer exits or the adapter is killed. No
+    # stdin, log, response or jobserver descriptor may be kept open by the watch.
+    group = os.getpgrp()
+    if group <= 1 or group == os.getpid():
+        os._exit(1)
+    try:
+        for number in SETUP_SIGNALS:
+            signal.signal(number, signal.SIG_IGN)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        for entry in os.listdir("/proc/self/fd"):
+            descriptor = int(entry)
+            if descriptor not in (owner, ready):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        with selectors.DefaultSelector() as selector:
+            selector.register(owner, selectors.EVENT_READ)
+            # Readiness is written only after ownership and observation are in
+            # place. An absent owner or expired budget cannot admit preparation.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or selector.select(0):
+                return
+            if os.write(ready, b"1") != 1:
+                return
+            os.close(ready)
+            while remaining > 0:
+                if selector.select(remaining):
+                    break  # EOF or unexpected data both revoke ownership.
+                remaining = deadline - time.monotonic()
+    finally:
+        # Never print here: even a failed watch must not block on diagnostics.
+        # This process never changes groups or runs installed code. KILL also
+        # retires this watchdog; shared daemons start in separate sessions.
+        os.killpg(group, signal.SIGKILL)
+        os._exit(1)
+
+
+def arm_preparer_watch(owner, deadline):
+    ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
+    try:
+        watch = os.fork()
+        if watch == 0:
+            try:
+                watch_preparer(owner, ready_write, deadline)
+            finally:
+                os._exit(1)
+        os.close(ready_write)
+        ready_write = None
+        if os.read(ready_read, 1) != b"1":
+            raise RuntimeError("RABS preparation lifetime watch did not start")
+    finally:
+        os.close(ready_read)
+        if ready_write is not None:
+            os.close(ready_write)
+        os.close(owner)
+
+
+def prepare_child(original, response, log_descriptor, original_signal_mask, owner, deadline):
     # This is a fresh, single-threaded Python adapter, not a daemon runtime.
     # The parent retains Cargo's stdin, process identity and jobserver FDs.
     # Setup helpers must neither consume those tokens nor keep their pipes alive.
@@ -150,7 +215,7 @@ def prepare_child(original, response, log_descriptor, original_signal_mask):
     os.dup2(null, 0)
     os.dup2(log_descriptor, 1)
     os.dup2(log_descriptor, 2)
-    keep = {0, 1, 2, response.fileno()}
+    keep = {0, 1, 2, response.fileno(), owner}
     for entry in os.listdir("/proc/self/fd"):
         descriptor = int(entry)
         if descriptor not in keep:
@@ -158,6 +223,9 @@ def prepare_child(original, response, log_descriptor, original_signal_mask):
                 os.close(descriptor)
             except OSError:
                 pass
+    # Do this before restoring signals or importing installed launcher code.
+    # Watchdog creation/registration failure cannot start unowned preparation.
+    arm_preparer_watch(owner, deadline)
     # Fork inherited the parent's short ownership-transfer mask. Restore the
     # caller's mask only after session/handler/descriptor isolation, before any
     # installed preparation code or shared-daemon startup can inherit it.
@@ -289,6 +357,7 @@ def bounded_prepared_environment(original):
     deadline = time.monotonic() + budget
     parent = child = None
     log_read = log_write = None
+    owner_read = owner_write = None
     pid = None
     logs = bytearray()
     truncated = False
@@ -300,17 +369,21 @@ def bounded_prepared_environment(original):
     try:
         parent, child = socket.socketpair()
         log_read, log_write = os.pipe2(os.O_CLOEXEC)
+        owner_read, owner_write = os.pipe2(os.O_CLOEXEC)
         pid = os.fork()
         if pid == 0:
             try:
                 parent.close()
                 os.close(log_read)
-                prepare_child(original, child, log_write, previous)
+                os.close(owner_write)
+                prepare_child(original, child, log_write, previous, owner_read, deadline)
             except BaseException:
                 os._exit(1)
             os._exit(0)
         child.close()
         child = None
+        os.close(owner_read)
+        owner_read = None
         os.close(log_write)
         log_write = None
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
@@ -380,7 +453,9 @@ def bounded_prepared_environment(original):
                 for stream in (parent, child):
                     if stream is not None:
                         stream.close()
-                for descriptor in (log_read, log_write):
+                # Only the adapter holds the write end. Closing it after
+                # cleanup also retires the watch when cleanup remains pending.
+                for descriptor in (log_read, log_write, owner_read, owner_write):
                     if descriptor is not None:
                         os.close(descriptor)
         finally:

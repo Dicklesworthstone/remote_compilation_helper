@@ -133,18 +133,23 @@ mod tests {
         let adapter = fixture.join("adapter.py");
         std::fs::write(&runner, PLATFORM_RUNNER).expect("write compiled runner");
         std::fs::write(&adapter, WORKER_PREPARE).expect("write compiled adapter");
-        let output = std::process::Command::new("python3")
-            .args(["-I", "-S"])
-            .arg(root.join("tests/test_rabs_worker_bootstrap.py"))
-            .env("RCH_TEST_WORKER_RUNNER", &runner)
-            .env("RCH_TEST_WORKER_ADAPTER", &adapter)
-            .output()
-            .expect("execute native worker-bootstrap regressions");
-        assert!(
-            output.status.success(),
-            "stdout={}\nstderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+        for suite in [
+            "tests/test_rabs_worker_bootstrap.py",
+            "tests/test_rabs_worker_lifetime.py",
+        ] {
+            let output = std::process::Command::new("python3")
+                .args(["-I", "-S"])
+                .arg(root.join(suite))
+                .env("RCH_TEST_WORKER_RUNNER", &runner)
+                .env("RCH_TEST_WORKER_ADAPTER", &adapter)
+                .output()
+                .expect("execute native worker-bootstrap regressions");
+            assert!(
+                output.status.success(),
+                "suite={suite}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 }
