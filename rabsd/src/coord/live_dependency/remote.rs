@@ -1173,6 +1173,8 @@ impl PendingRemoteInstall {
                 }
                 super::finish_installation(
                     &request.dependencies,
+                    &request.package,
+                    plan,
                     render_placements(&self.canonical_transcript, plan),
                     installed,
                 )

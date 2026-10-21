@@ -216,14 +216,28 @@ pub enum InstallResult {
 }
 
 /// Finish only after the synchronous materializer and output verification have
-/// returned. Dependency observations exclude this action's exact declared
-/// output names, so its own writes are permitted while changed input bytes or
-/// candidate membership must still prevent a successful compiler skip.
+/// returned. Recheck the SAME package/generated-input observations used for
+/// keying, not a refreshed memo. A local hit has no RemoteValidation to do this
+/// for it. Dependency observations exclude this action's exact declared output
+/// names, so its own writes are permitted without accepting changed inputs.
 fn finish_installation(
     dependencies: &DependencyFacts,
+    package: &PackageFacts,
+    plan: &DependencyActionPlan,
     transcript: Vec<u8>,
     installed: Vec<KnownOutput>,
 ) -> InstallResult {
+    if let Err(reason) = package
+        .verify_unchanged(Path::new(&plan.source_root))
+        .and_then(|()| package.verify_generated_disjoint(plan))
+    {
+        // Writes have finished: this is a settled failure, not an unwritten
+        // decline. Return neither the transcript nor known-output identities
+        // under the stale key. Never undo outputs another writer may now own.
+        return InstallResult::Fault(format!(
+            "package inputs changed during installation: {reason}"
+        ));
+    }
     if let Err(reason) = dependencies.verify_unchanged() {
         return InstallResult::Fault(format!(
             "dependency inputs changed during installation: {reason}"
@@ -293,7 +307,7 @@ impl PendingServe {
                     };
                     if committed.role == OutputRole::DepInfo {
                         continue;
-                    }
+                    };
                     match known_installed_output(path, &committed.object.0) {
                         Ok(output) => installed.push(output),
                         Err(reason) => return InstallResult::Fault(reason),
@@ -312,6 +326,8 @@ impl PendingServe {
                 }
                 finish_installation(
                     &self.request.dependencies,
+                    &self.request.package,
+                    plan,
                     render_placements(&self.canonical_transcript, plan),
                     installed,
                 )
@@ -1292,18 +1308,37 @@ mod installed_output_tests {
         _directory: tempfile::TempDir,
         input: PathBuf,
         dependencies: Arc<DependencyFacts>,
+        package: Arc<PackageFacts>,
+        plan: DependencyActionPlan,
         cas: LiveCas,
         outputs: Vec<PlannedActionOutput>,
     }
 
     impl SharedDirectoryInstall {
         fn new() -> Self {
+            Self::with_generated(None)
+        }
+
+        fn with_generated(populated: Option<bool>) -> Self {
             let directory = crate::test_util::private_tempdir();
             let cargo = directory.path().join("cargo");
             let package = cargo.join("registry/src/install-index/consumer-1.0.0");
             let out = directory.path().join("target/debug/deps");
             std::fs::create_dir_all(&package).unwrap();
             std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(package.join("lib.rs"), b"pub const VALUE: u32 = 17;").unwrap();
+            let generated = populated.map(|populated| {
+                let root = directory.path().join("target/debug/build/consumer-unit/out");
+                std::fs::create_dir_all(&root).unwrap();
+                if populated {
+                    std::fs::write(root.join("value.rs"), b"pub const GENERATED: u32 = 17;")
+                        .unwrap();
+                }
+                let unit = root.parent().unwrap();
+                std::fs::write(unit.join("output"), b"cargo::rustc-cfg=generated\n").unwrap();
+                std::fs::write(unit.join("root-output"), root.to_str().unwrap()).unwrap();
+                root
+            });
             let input = out.join("libupstream.rmeta");
             std::fs::write(&input, b"retained upstream metadata").unwrap();
             // Old outputs already present are excluded by the plan, just as
@@ -1323,7 +1358,7 @@ mod installed_output_tests {
                 "--extern".into(),
                 format!("upstream={}", input.display()),
             ];
-            let env = vec![
+            let mut env = vec![
                 ("CARGO_HOME".into(), cargo.to_str().unwrap().into()),
                 (
                     "CARGO_MANIFEST_DIR".into(),
@@ -1331,6 +1366,9 @@ mod installed_output_tests {
                 ),
                 ("CARGO_PKG_NAME".into(), "consumer".into()),
             ];
+            if let Some(root) = &generated {
+                env.push(("OUT_DIR".into(), root.to_str().unwrap().into()));
+            }
             let plan = plan_dependency_action(
                 LiveRustcRequest {
                     argv: &argv,
@@ -1340,7 +1378,11 @@ mod installed_output_tests {
                 "x86_64-unknown-linux-gnu",
             )
             .unwrap();
-            let dependencies = LiveFacts::new().dependencies(&plan).unwrap();
+            let facts = LiveFacts::new();
+            let dependencies = facts.dependencies(&plan).unwrap();
+            let package = facts
+                .package(&package, plan.source_kind, generated.as_deref())
+                .unwrap();
             assert_eq!(dependencies.directories[0].artifacts.len(), 1);
             let cas = mount_and_reconcile(&directory.path().join("cas")).unwrap();
             let outputs = plan
@@ -1376,12 +1418,18 @@ mod installed_output_tests {
                 _directory: directory,
                 input,
                 dependencies,
+                package,
+                plan,
                 cas,
                 outputs,
             }
         }
 
         fn install(&self, during_tail: impl Fn()) -> InstallResult {
+            self.package
+                .verify_unchanged(Path::new(&self.plan.source_root))
+                .unwrap();
+            self.package.verify_generated_disjoint(&self.plan).unwrap();
             self.dependencies.verify_unchanged().unwrap();
             let mut store = self.cas.store().lock().unwrap();
             let receipt = materialize_action_outputs_prepared(
@@ -1414,6 +1462,8 @@ mod installed_output_tests {
                 .collect();
             finish_installation(
                 &self.dependencies,
+                &self.package,
+                &self.plan,
                 b"compiler transcript\n".to_vec(),
                 installed,
             )
@@ -1467,6 +1517,118 @@ mod installed_output_tests {
                     .iter()
                     .all(|output| output.destination.is_file())
             );
+        }
+    }
+
+    #[test]
+    fn unchanged_generated_inputs_remain_servable_after_materialization() {
+        for populated in [false, true] {
+            let fixture = SharedDirectoryInstall::with_generated(Some(populated));
+            let InstallResult::Served {
+                transcript,
+                installed,
+            } = fixture.install(|| {})
+            else {
+                panic!("unchanged generated inputs must remain servable: {populated}");
+            };
+            assert_eq!(transcript, b"compiler transcript\n");
+            assert_eq!(installed.len(), 1);
+            assert_eq!(fixture.package.generated_files.len(), usize::from(populated));
+        }
+    }
+
+    fn assert_package_installation_fault(fixture: &SharedDirectoryInstall, result: InstallResult) {
+        assert!(
+            matches!(result, InstallResult::Fault(ref reason)
+                if reason.starts_with("package inputs changed during installation:")),
+            "changed package inputs cannot return a transcript or known-output memo: {result:?}"
+        );
+        // The synchronous materializer completed. Neither rollback nor an
+        // unwritten-decline claim is permitted after this frontier.
+        assert!(fixture.outputs.iter().all(|output| output.destination.is_file()));
+        assert_eq!(
+            std::fs::read(fixture.input.with_file_name("libconsumer.rmeta")).unwrap(),
+            b"verified replacement metadata",
+        );
+        // Isolate the missing package fence: the existing dependency-only
+        // completion gate still accepts these same dependency observations.
+        fixture.dependencies.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn package_mutation_during_materialization_cannot_return_served() {
+        for mutation in ["rewrite", "added", "removed", "same-bytes-replaced"] {
+            let fixture = SharedDirectoryInstall::new();
+            let source = Path::new(&fixture.plan.source_root);
+            let result = fixture.install(|| match mutation {
+                "rewrite" => {
+                    std::fs::write(source.join("lib.rs"), b"pub const VALUE: u32 = 99;")
+                        .unwrap();
+                }
+                "added" => {
+                    std::fs::write(source.join("introduced.rs"), b"new input").unwrap();
+                }
+                "removed" => {
+                    std::fs::rename(
+                        source.join("lib.rs"),
+                        fixture._directory.path().join("retained-source"),
+                    )
+                    .unwrap();
+                }
+                "same-bytes-replaced" => {
+                    let replacement = fixture._directory.path().join("replacement-source");
+                    std::fs::write(&replacement, std::fs::read(source.join("lib.rs")).unwrap())
+                        .unwrap();
+                    std::fs::rename(
+                        source.join("lib.rs"),
+                        fixture._directory.path().join("old-source"),
+                    )
+                    .unwrap();
+                    std::fs::rename(replacement, source.join("lib.rs")).unwrap();
+                }
+                _ => unreachable!(),
+            });
+            assert_package_installation_fault(&fixture, result);
+        }
+    }
+
+    #[test]
+    fn generated_inputs_and_cargo_records_changed_during_installation_cannot_return_served() {
+        for mutation in ["generated", "added", "removed", "stdout", "root-output"] {
+            let fixture = SharedDirectoryInstall::with_generated(Some(mutation != "added"));
+            let generated = Path::new(fixture.plan.generated_root.as_ref().unwrap());
+            let result = fixture.install(|| match mutation {
+                "generated" => {
+                    std::fs::write(generated.join("value.rs"), b"changed generated input").unwrap();
+                }
+                "added" => {
+                    std::fs::write(generated.join("introduced.rs"), b"formerly absent input")
+                        .unwrap();
+                }
+                "removed" => {
+                    std::fs::rename(
+                        generated.join("value.rs"),
+                        fixture._directory.path().join("retained-generated-input"),
+                    )
+                    .unwrap();
+                }
+                "stdout" => {
+                    std::fs::write(
+                        generated.parent().unwrap().join("output"),
+                        b"cargo::rustc-cfg=changed\n",
+                    )
+                    .unwrap();
+                }
+                "root-output" => {
+                    std::fs::write(
+                        generated.parent().unwrap().join("root-output"),
+                        b"/another/generated/root",
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            });
+            assert_package_installation_fault(&fixture, result);
         }
     }
 
