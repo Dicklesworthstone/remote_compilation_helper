@@ -5516,7 +5516,8 @@ use rabs_recorder::record_invocation;
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
 pub(crate) use daemon_ipc::{
-    RestartAdmissionWait, query_daemon, query_daemon_dry_run, release_worker,
+    RestartAdmissionWait, query_admission_preview, query_daemon, query_daemon_dry_run,
+    release_worker,
     restart_admission_is_closed, restart_admission_wait_bound, wait_for_restart_admission,
 };
 use daemon_ipc::{

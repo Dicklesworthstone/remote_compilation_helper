@@ -7,7 +7,7 @@ mod load;
 
 use crate::hook::{
     cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
-    preferred_workers, query_daemon_dry_run, required_runtime_for_kind,
+    preferred_workers, query_admission_preview, query_daemon_dry_run, required_runtime_for_kind,
 };
 use crate::status_types::{
     DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
@@ -1237,9 +1237,9 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 /// `rch admit -- <command>`: a fast, read-only admission preflight. Classifies
 /// the command, derives the capabilities a worker must have, and returns a
 /// decisive Offload / Local / Queue / Defer recommendation before any expensive
-/// work starts. Pure classification — no network side effects; the daemon
-/// candidate/rejection query that further refines the recommendation lands with
-/// the selection-RPC work (bd-...12.3).
+/// work starts. Offload-eligible commands are refined through the daemon's
+/// versioned non-reserving admission-preview route; an unavailable observation
+/// is reported as unknown instead of fabricating execution permission.
 pub(super) fn merge_job_required_tools(
     mut tools: Vec<String>,
     config_tools: &[String],
@@ -1254,6 +1254,57 @@ pub(super) fn merge_job_required_tools(
         }
     }
     tools
+}
+
+/// Refine the classifier-only admit verdict with one non-owning daemon observation.
+/// Internal/protocol errors are not permission to execute or proof that the
+/// fleet is unavailable, so they remain explicitly unknown.
+pub(super) fn refine_admit_from_selection(
+    base: rch_common::admit_preflight::AdmitRecommendation,
+    selection: &rch_common::SelectionResponse,
+) -> Option<rch_common::admit_preflight::AdmitRecommendation> {
+    use rch_common::SelectionReason as R;
+    use rch_common::admission_rejection::{
+        AdmissionRejectionCategory as C, CandidateRejection, aggregate_rejections,
+    };
+    use rch_common::admit_preflight::{AdmitRecommendation, refine_recommendation};
+
+    if base != AdmitRecommendation::Offload {
+        return Some(base);
+    }
+    if selection.worker.is_some() {
+        return Some(AdmitRecommendation::Offload);
+    }
+    let category = match &selection.reason {
+        R::AllWorkersBusy => C::InsufficientSlots,
+        R::AllWorkersUnreachable | R::AllCircuitsOpen | R::NoWorkersPassedHealth => C::CircuitOpen,
+        R::AllWorkersFailedPreflight | R::NoAdmissibleWorkers(_) => C::HardPreflight,
+        R::AllWorkersFailedConvergence => C::ActiveProjectExclusion,
+        R::NoMatchingWorkers | R::NoWorkersConfigured => C::ProjectExcluded,
+        R::NoWorkersWithRuntime(_) => C::MissingRuntime,
+        R::SelectionError(_) => return None,
+        R::Success | R::AffinityPinned | R::AffinityFallback => return None,
+    };
+    let summary = aggregate_rejections(
+        1,
+        &[CandidateRejection {
+            worker_id: "fleet".to_string(),
+            category,
+        }],
+    );
+    Some(refine_recommendation(base, &summary))
+}
+
+#[derive(serde::Serialize)]
+struct AdmitOutput<'a> {
+    #[serde(flatten)]
+    preflight: &'a rch_common::admit_preflight::AdmitPreflight,
+    recommendation: Option<rch_common::admit_preflight::AdmitRecommendation>,
+    observation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection: Option<&'a rch_common::SelectionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_error: Option<&'a str>,
 }
 
 pub(super) fn format_admit_required_capabilities(
@@ -1301,8 +1352,11 @@ pub async fn admit(
 ) -> Result<()> {
     use rch_common::admit_preflight::preflight;
 
-    let require_tool = if job && let Ok(config) = crate::config::load_config() {
-        merge_job_required_tools(require_tool, &config.jobs.required_tools, true)
+    let config = crate::config::load_config().ok();
+    let require_tool = if job {
+        config.as_ref().map_or(require_tool.clone(), |config| {
+            merge_job_required_tools(require_tool.clone(), &config.jobs.required_tools, true)
+        })
     } else {
         require_tool
     };
@@ -1331,8 +1385,67 @@ pub async fn admit(
         pf.with_required_tools(require_tool)
     };
 
+    let mut live_selection = None;
+    let mut observation_error = None;
+    let mut recommendation = Some(pf.base_recommendation);
+    let mut observation = "not_needed";
+    if pf.base_recommendation == rch_common::admit_preflight::AdmitRecommendation::Offload {
+        observation = "unknown";
+        if let Some(config) = config.as_ref() {
+            let details = rch_common::classify_command_detailed(command);
+            let kind = details.classification.kind;
+            let topology_policy = config.path_topology.to_policy();
+            let project = extract_project_name_with_policy(&topology_policy);
+            let estimated_cores = estimate_cores_for_command(kind, command, &config.compilation);
+            let project_root = std::env::current_dir().ok();
+            let normalized_project_root = project_root.as_ref().and_then(|path| {
+                normalize_project_path_with_policy(path, &topology_policy)
+                    .map(|normalized| normalized.canonical_path().to_path_buf())
+                    .ok()
+            });
+            let toolchain = project_root
+                .as_ref()
+                .or(normalized_project_root.as_ref())
+                .and_then(|root| detect_toolchain(root).ok());
+            let request = rch_common::admission_preview::PreviewRequest {
+                protocol_version: rch_common::admission_preview::PROTOCOL_VERSION,
+                project,
+                command: command.to_string(),
+                estimated_cores,
+                disk_headroom_gib: config.compilation.disk_headroom_gib,
+                preferred_workers: preferred_workers(),
+                toolchain,
+                required_runtime: required_runtime_for_kind(kind),
+                job_mode: job,
+                required_tools: pf.required.needs_tools.clone(),
+            };
+            match query_admission_preview(&config.general.socket_path, &request).await {
+                Ok(preview) => {
+                    recommendation =
+                        refine_admit_from_selection(pf.base_recommendation, &preview.selection);
+                    observation = if recommendation.is_some() { "observed" } else { "unknown" };
+                    live_selection = Some(preview.selection);
+                }
+                Err(error) => {
+                    recommendation = None;
+                    observation_error = Some(error.to_string());
+                }
+            }
+        } else {
+            recommendation = None;
+            observation_error = Some("configuration unavailable".to_string());
+        }
+    }
+
+    let report = AdmitOutput {
+        preflight: &pf,
+        recommendation,
+        observation,
+        selection: live_selection.as_ref(),
+        observation_error: observation_error.as_deref(),
+    };
     if ctx.is_json() {
-        ctx.json(&ApiResponse::ok("admit", &pf))?;
+        ctx.json(&ApiResponse::ok("admit", &report))?;
         return Ok(());
     }
 
@@ -1340,11 +1453,16 @@ pub async fn admit(
     println!("{}", style.format_header("RCH Admit"));
     println!();
     println!("{} {}", style.key("Recommendation:"), {
-        let r = pf.base_recommendation.as_str();
-        match pf.base_recommendation {
-            rch_common::admit_preflight::AdmitRecommendation::Offload => style.format_success(r),
-            rch_common::admit_preflight::AdmitRecommendation::Local => style.format_warning(r),
-            _ => style.value(r).to_string(),
+        match recommendation {
+            Some(value) => {
+                let r = value.as_str();
+                match value {
+                    rch_common::admit_preflight::AdmitRecommendation::Offload => style.format_success(r),
+                    rch_common::admit_preflight::AdmitRecommendation::Local => style.format_warning(r),
+                    _ => style.value(r).to_string(),
+                }
+            }
+            None => style.format_warning("unknown"),
         }
     });
     if pf.job_mode {
@@ -1377,6 +1495,20 @@ pub async fn admit(
     );
     if pf.proof_policy {
         println!("{} {}", style.key("Proof policy:"), style.value("strict"));
+    }
+    println!("{} {}", style.key("Observation:"), style.value(observation));
+    if let Some(selection) = live_selection.as_ref() {
+        println!(
+            "{} {}",
+            style.key("Daemon reason:"),
+            style.value(&selection.reason.to_string())
+        );
+        if let Some(worker) = selection.worker.as_ref() {
+            println!("{} {}", style.key("Worker:"), style.value(worker.id.as_str()));
+        }
+    }
+    if let Some(error) = observation_error.as_deref() {
+        println!("{} {}", style.key("Observation error:"), style.warning(error));
     }
     println!();
     println!("{}", style.muted(&pf.detail));
@@ -3708,7 +3840,7 @@ mod tests {
                     stdout,
                     OutputWriter::stderr(),
                 );
-                // Classification only: no compiler, daemon or worker is run.
+                // Read-only preview may contact rchd; no compiler, reservation, or worker is run.
                 let result = admit("cargo build --release", false, Vec::new(), &ctx).await;
                 if closed {
                     let error = result.unwrap_err();
@@ -3738,6 +3870,8 @@ mod tests {
                     assert_eq!(report["data"]["family"], "cargo_build");
                     assert_eq!(report["data"]["base_recommendation"], "offload");
                     assert_eq!(report["data"]["required"]["needs_cargo"], true);
+                    assert!(report["data"]["observation"].is_string());
+                    assert!(report["data"].get("recommendation").is_some());
                 }
             }
         }
@@ -4712,6 +4846,62 @@ mod tests {
         assert_eq!(
             merge_job_required_tools(vec!["clang".to_string()], &config_tools, false),
             vec!["clang".to_string()]
+        );
+    }
+
+    #[test]
+    fn admit_live_selection_refines_capacity_and_capability_denials() {
+        use rch_common::admit_preflight::AdmitRecommendation;
+        use rch_common::{SelectionReason, SelectionResponse};
+        let response = |reason| SelectionResponse {
+            worker: None,
+            reason,
+            build_id: None,
+            diagnostics: None,
+        };
+        assert_eq!(
+            refine_admit_from_selection(
+                AdmitRecommendation::Offload,
+                &response(SelectionReason::AllWorkersBusy),
+            ),
+            Some(AdmitRecommendation::Queue)
+        );
+        assert_eq!(
+            refine_admit_from_selection(
+                AdmitRecommendation::Offload,
+                &response(SelectionReason::NoWorkersWithRuntime("bun".into())),
+            ),
+            Some(AdmitRecommendation::Defer)
+        );
+        assert_eq!(
+            refine_admit_from_selection(
+                AdmitRecommendation::Offload,
+                &response(SelectionReason::AllWorkersFailedConvergence),
+            ),
+            Some(AdmitRecommendation::Defer)
+        );
+        assert_eq!(
+            refine_admit_from_selection(
+                AdmitRecommendation::Offload,
+                &response(SelectionReason::SelectionError("uncertain".into())),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn admit_local_preflight_never_becomes_remote_from_observation() {
+        use rch_common::admit_preflight::AdmitRecommendation;
+        use rch_common::{SelectionReason, SelectionResponse};
+        let response = SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
+            diagnostics: None,
+        };
+        assert_eq!(
+            refine_admit_from_selection(AdmitRecommendation::Local, &response),
+            Some(AdmitRecommendation::Local)
         );
     }
 

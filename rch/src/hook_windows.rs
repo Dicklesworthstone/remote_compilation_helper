@@ -159,6 +159,14 @@ pub(crate) async fn query_daemon(
     Err(PlatformError::UnixSocketUnsupported)?
 }
 
+/// Query the versioned read-only admission-preview route.
+pub(crate) async fn query_admission_preview(
+    _socket_path: &str,
+    _request: &rch_common::admission_preview::PreviewRequest,
+) -> anyhow::Result<rch_common::admission_preview::PreviewResponse> {
+    Err(PlatformError::UnixSocketUnsupported)?
+}
+
 /// Ask which worker a build would get without reserving anything.
 ///
 /// On non-Unix platforms this returns an error, like [`query_daemon`].

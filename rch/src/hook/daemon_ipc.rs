@@ -469,6 +469,40 @@ pub(crate) async fn query_daemon_dry_run(
     .await
 }
 
+/// Query the versioned, non-owning admission-preview route. Unlike a dry-run
+/// flag on a reservation endpoint, this route cannot be silently ignored by an
+/// older daemon: an unsupported daemon rejects the route instead of admitting a
+/// build. The response is accepted only if the shared protocol validates that
+/// it contains no build ownership and that worker/reason fields are consistent.
+pub(crate) async fn query_admission_preview(
+    socket_path: &str,
+    request: &rch_common::admission_preview::PreviewRequest,
+) -> anyhow::Result<rch_common::admission_preview::PreviewResponse> {
+    request.validate().map_err(anyhow::Error::new)?;
+    if !Path::new(socket_path).exists() {
+        return Err(DaemonError::SocketNotFound {
+            socket_path: socket_path.to_string(),
+        }
+        .into());
+    }
+    let stream = timeout(daemon_io_timeout(), UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Daemon connect timed out after {}ms",
+                daemon_io_timeout().as_millis()
+            )
+        })??;
+    let (reader, mut writer) = stream.into_split();
+    let line = request.request_line().map_err(anyhow::Error::new)?;
+    write_daemon_request(&mut writer, line.as_bytes(), daemon_io_timeout()).await?;
+    let body = read_daemon_body(reader, daemon_io_timeout(), false).await?;
+    let response: rch_common::admission_preview::PreviewResponse =
+        serde_json::from_str(&body).context("invalid admission-preview response")?;
+    response.validate().map_err(anyhow::Error::new)?;
+    Ok(response)
+}
+
 #[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
 async fn query_daemon_with_mode(
     socket_path: &str,
@@ -1256,6 +1290,54 @@ mod bounded_ipc_tests {
             response.unwrap().reason,
             SelectionReason::NoWorkersConfigured
         );
+    }
+
+    #[tokio::test]
+    async fn admission_preview_uses_dedicated_non_owning_route_and_validates_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admission-preview.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let request = rch_common::admission_preview::PreviewRequest {
+            protocol_version: rch_common::admission_preview::PROTOCOL_VERSION,
+            project: "project with spaces".into(),
+            command: "./run job --arg='a&b'".into(),
+            estimated_cores: 3,
+            disk_headroom_gib: 9,
+            preferred_workers: vec![WorkerId::new("worker-a")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            job_mode: true,
+            required_tools: vec!["clang".into()],
+        };
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("GET /admission-preview?request="), "{line}");
+            assert!(!line.contains("/select-worker"), "{line}");
+            writer
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n\r\n",
+                        "{\"protocol_version\":1,\"selection\":{",
+                        "\"worker\":null,\"reason\":\"all_workers_busy\",",
+                        "\"build_id\":null,\"diagnostics\":null}}"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        };
+        let client = query_admission_preview(path.to_str().unwrap(), &request);
+        let (response, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server)
+        })
+        .await
+        .unwrap();
+        let response = response.unwrap();
+        assert!(response.selection.build_id.is_none());
+        assert!(matches!(response.selection.reason, SelectionReason::AllWorkersBusy));
     }
 
     async fn caller_fixture(
