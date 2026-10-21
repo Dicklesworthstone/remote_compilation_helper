@@ -2,8 +2,8 @@
 
 `cargo rabs --rabs-canonical PROFILE.json -- build --workspace` connects ordinary
 Cargo workspace builds to RABS's existing canonical worker path. The same path
-supports `check`, `test`, and `test --no-run`, with Cargo selecting the requested
-libraries, binaries, examples and test executables. Ordinary `test` runs those
+supports `check`, `clippy`, `test`, and `test --no-run`, with Cargo selecting the
+requested libraries, binaries, examples and test executables. Ordinary `test` runs those
 tests on the selected worker and returns Cargo's final exit status:
 
 1. The launcher validates explicit source, toolchain, worker and destination
@@ -41,6 +41,11 @@ and `rabsd` on the preparing host and `rabs-wkr` on the worker. The native toolc
 directory must contain ordinary executable `bin/cargo` and `bin/rustc` plus the
 runtime/sysroot files required by the existing toolchain capture contract. Rustup
 shims or symlinks are not a substitute for a complete toolchain dataset.
+For `clippy`, that same captured dataset must also contain ordinary executable
+`bin/cargo-clippy` and `bin/clippy-driver`. The launcher invokes the captured
+Clippy program directly and binds its Cargo and rustc companions to the captured
+absolute paths, so dispatcher or worker PATH entries cannot select a different
+Clippy installation.
 
 Worker capability probing executes a no-op inside the same canonical base
 namespace used for builds, including private `/proc`, `/dev`, temporary storage
@@ -157,11 +162,12 @@ Cargo; no broader source capture or hidden local execution is substituted.
 
 ## Supported command contract
 
-The first command must be `build`, `check`, or `test`. For example:
+The first command must be `build`, `check`, `clippy`, or `test`. For example:
 
 ```sh
 cargo rabs --rabs-canonical PROFILE.json -- build --workspace
 cargo rabs --rabs-canonical PROFILE.json -- check --workspace --all-targets
+cargo rabs --rabs-canonical PROFILE.json -- clippy --workspace --all-targets --all-features -- -D warnings
 cargo rabs --rabs-canonical PROFILE.json -- test --workspace --no-run
 cargo rabs --rabs-canonical PROFILE.json -- test --workspace --no-fail-fast
 cargo rabs --rabs-canonical PROFILE.json -- test --test integration selected::case -- --exact --nocapture
@@ -182,6 +188,17 @@ inserted before the delimiter. Cargo remains responsible for selection,
 doctests, ignored tests, list/help modes and the final process exit. The captured
 toolchain must contain `rustdoc` when the selected command needs it.
 
+`clippy` supports the same package, target and feature selections, plus
+`--no-deps`. After its `--` delimiter, it accepts bounded lint controls: `-A`,
+`-W`, `-D`, `-F`, `--allow`, `--warn`, `--deny`, `--forbid`, `--force-warn`, and
+`--cap-lints`. Short lint flags accept attached or separate names, including
+names such as `clippy::bool_comparison`; long flags accept separate or `=value`
+forms. Required locked/offline, output and JSON controls are inserted before the
+delimiter. Source-fixing mode, response files, output paths and arbitrary compiler
+flags are not admitted through this lint-only argument contract. A denied lint
+retains Clippy's nonzero exit and verified diagnostics and cannot produce a
+successful artifact result.
+
 Supported build options are `--features`/`-F`, `--all-features`,
 `--no-default-features`, `--release`/`-r`, `--locked`, `--offline`, `--frozen`,
 `--color`, `--verbose`/`-v`/`-vv`, `--quiet`/`-q`, and one optional `--target` from:
@@ -195,8 +212,9 @@ resolution and may reject an otherwise syntactically supported request.
 
 The profile owns `--manifest-path`, `--target-dir` and `--message-format=json`.
 Custom profiles, target JSON, `--config`, unstable Cargo flags, `+toolchain`, `run`,
-test-harness arguments on compilation-only commands, and unknown Cargo
-options refuse before preparation. The selected toolchain also supplies local Cargo metadata probes; a
+test-harness arguments on compilation-only commands, arguments other than the
+supported lint controls after Clippy's delimiter, and unknown Cargo options
+refuse before preparation. The selected toolchain also supplies local Cargo metadata probes; a
 `cargo +nightly rabs` launcher selection does not override that explicit dataset.
 Cargo is always locked/offline, without duplicating supplied flags.
 
@@ -321,7 +339,11 @@ inventory, executes the produced application and integration-test binary, and
 checks that a real compiler error cannot become a successful report. Further
 real Cargo tests execute a selected integration test, preserve deliberately
 JSON-shaped harness output, return a failing test's exit 101 despite successful
-compilation, and execute a documentation example with rustdoc. Worker
+compilation, and execute a documentation example with rustdoc. The real Clippy
+fixture uses captured toolchain companions with Rust tools absent from PATH,
+checks warning-only success and denied-lint exit 101, and then checks a clean
+workspace with all targets, all features and warnings denied. Its successful
+reports are verified against the complete captured output inventory. Worker
 capture/completion tests preserve the original admitted declaration while
 discovering dynamic outputs. Coordinator scripted-peer tests cover refusal before
 acknowledgement and revalidation during offline recovery; they do not substitute

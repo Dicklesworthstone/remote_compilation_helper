@@ -1,4 +1,4 @@
-//! Cargo-selected output names for canonical build, check and test execution.
+//! Cargo-selected output names for canonical build, check, Clippy and tests.
 //!
 //! Cargo owns target selection and hashed output names. Its complete bounded JSON
 //! stream supplies the required artifacts; the existing tree capture must still
@@ -49,7 +49,6 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
     };
     if request["artifacts"]["tree"].as_str() != Some(TREE_FILES_VERSION)
         || request["artifacts"]["unit"].as_str() != Some("cargo")
-        || request["program"].as_str() != Some("/__rabs/toolchain/bin/cargo")
         || request.get("dependency_context").is_some()
     {
         return Err(invalid("unsupported Cargo artifact contract"));
@@ -66,16 +65,37 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         })
         .collect::<io::Result<Vec<_>>>()?;
     let command = args[0];
-    if !matches!(command, "build" | "check" | "test") {
+    if !matches!(command, "build" | "check" | "clippy" | "test") {
         return Err(invalid(
-            "Cargo artifact contract requires build, check or test",
+            "Cargo artifact contract requires build, check, clippy or test",
         ));
+    }
+    // cargo-clippy is an external Cargo command. Naming its retained binary
+    // directly prevents a missing component from falling through to a host
+    // PATH entry. It locates clippy-driver beside itself; its child Cargo and
+    // rustc are explicitly bound to the same captured toolchain.
+    let program = if command == "clippy" {
+        if request["command_context"]["env"]["CARGO"] != "/__rabs/toolchain/bin/cargo"
+            || request["command_context"]["env"]["RUSTC"] != "/__rabs/toolchain/bin/rustc"
+        {
+            return Err(invalid("Clippy requires captured Cargo and rustc bindings"));
+        }
+        "/__rabs/toolchain/bin/cargo-clippy"
+    } else {
+        "/__rabs/toolchain/bin/cargo"
+    };
+    if request["program"].as_str() != Some(program) {
+        return Err(invalid("Cargo artifact command requires its captured tool"));
     }
     let mut format = false;
     let mut target = false;
     let mut no_run = false;
     let mut at = 1;
     while at < args.len() {
+        if args[at] == "--" && command == "clippy" && mode == CargoArtifactMode::Compilation {
+            validate_clippy_lints(&args[at + 1..])?;
+            break;
+        }
         // Every remaining byte belongs to the selected test harness. In
         // particular --no-run/--help/--target-dir here are not Cargo options.
         if args[at] == "--" && mode == CargoArtifactMode::TestExecution {
@@ -112,6 +132,13 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
                 }
             }
             "--no-run" if inline.is_none() && command == "test" && !no_run => no_run = true,
+            "--fix" | "--allow-dirty" | "--allow-staged" | "--allow-no-vcs" | "--explain"
+                if command == "clippy" =>
+            {
+                return Err(invalid(
+                    "Clippy artifact capture requires a read-only lint run",
+                ));
+            }
             "--no-run" | "--" | "--help" | "-h" | "--version" | "-V" => {
                 return Err(invalid(
                     "Cargo artifact command does not compile the selected targets",
@@ -129,6 +156,61 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         return Err(invalid("incomplete Cargo compilation artifact contract"));
     }
     Ok(Some(mode))
+}
+
+/// Only lint controls may cross Clippy's argument separator. In particular,
+/// cargo-clippy's CLIPPY_ARGS delimiter cannot occur in lowercase lint names,
+/// so an encoded argument cannot become a second compiler option.
+fn validate_clippy_lints(args: &[&str]) -> io::Result<()> {
+    if args.len() > 128 || args.iter().map(|arg| arg.len()).sum::<usize>() > 16 * 1024 {
+        return Err(invalid("Clippy lint arguments exceed their bounds"));
+    }
+    let short = ["-A", "-W", "-D", "-F"];
+    let long = [
+        "--allow",
+        "--warn",
+        "--force-warn",
+        "--deny",
+        "--forbid",
+        "--cap-lints",
+    ];
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        let (option, value) = if short.contains(&arg) || long.contains(&arg) {
+            (
+                arg,
+                args.next()
+                    .ok_or_else(|| invalid("Clippy lint option lacks its value"))?,
+            )
+        } else if let Some((option, value)) = arg.split_once('=')
+            && long.contains(&option)
+        {
+            (option, value)
+        } else if let Some(option) = short.into_iter().find(|option| arg.starts_with(option)) {
+            (option, &arg[option.len()..])
+        } else {
+            return Err(invalid("Clippy accepts only lint controls after --"));
+        };
+        let valid = if option == "--cap-lints" {
+            matches!(value, "allow" | "warn" | "deny" | "forbid")
+        } else {
+            value.len() <= 256
+                && value.split("::").all(|part| {
+                    part.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                        && part.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-')
+                        })
+                })
+        };
+        if !valid {
+            return Err(invalid(
+                "Clippy requires literal lowercase lint names or a lint cap",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Required real compiler outputs, reconstructed independently by both peers.
@@ -385,6 +467,127 @@ mod tests {
         let mut plain = base;
         plain["artifacts"].as_object_mut().unwrap().remove("cargo");
         assert_eq!(requested(&plain).unwrap(), None);
+    }
+
+    fn clippy_request() -> Value {
+        json!({"program":"/__rabs/toolchain/bin/cargo-clippy",
+            "args":["clippy", "--workspace", "--all-targets", "--message-format=json",
+                "--target-dir", OUTPUT_ROOT],
+            "command_context":{"env":{"CARGO":"/__rabs/toolchain/bin/cargo",
+                "RUSTC":"/__rabs/toolchain/bin/rustc"}},
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION,
+                "files":[], "cargo":CARGO_ARTIFACTS_VERSION}})
+    }
+
+    #[test]
+    fn clippy_requires_captured_tools_and_preserves_compilation_report_semantics() {
+        for lints in [
+            vec![],
+            vec!["-D", "warnings"],
+            vec![
+                "--warn=clippy::pedantic",
+                "-Aclippy::module-name-repetitions",
+            ],
+            vec![
+                "--allow",
+                "dead_code",
+                "-Funsafe-code",
+                "--force-warn",
+                "unused",
+            ],
+            vec!["--cap-lints=warn"],
+        ] {
+            let mut request = clippy_request();
+            request["args"]
+                .as_array_mut()
+                .unwrap()
+                .extend(std::iter::once("--").chain(lints).map(|arg| json!(arg)));
+            assert_eq!(
+                requested(&request).unwrap(),
+                Some(CargoArtifactMode::Compilation)
+            );
+            request["artifacts"]["cargo"] = json!(CARGO_TEST_ARTIFACTS_VERSION);
+            assert!(requested(&request).is_err());
+        }
+        for (field, value) in [("CARGO", "/usr/bin/cargo"), ("RUSTC", "rustc")] {
+            let mut request = clippy_request();
+            request["command_context"]["env"][field] = json!(value);
+            assert!(requested(&request).is_err());
+        }
+        let mut request = clippy_request();
+        request["program"] = json!("/__rabs/toolchain/bin/cargo");
+        assert!(
+            requested(&request).is_err(),
+            "Cargo's external-command search is not a captured Clippy identity"
+        );
+        request["program"] = json!("/__rabs/toolchain/bin/cargo-clippy");
+        request["args"][0] = json!("build");
+        assert!(requested(&request).is_err());
+    }
+
+    #[test]
+    fn clippy_lint_tail_cannot_replace_inputs_outputs_or_request_source_mutation() {
+        for lints in [
+            vec!["-D"],
+            vec!["-D", "--emit=link"],
+            vec!["-D", "warnings__CLIPPY_HACKERY__--print"],
+            vec!["--warn=clippy:all"],
+            vec!["--warn=clippy::all\n--print=sysroot"],
+            vec!["--cap-lints=unknown"],
+            vec!["--fix"],
+            vec!["--emit=metadata"],
+            vec!["--sysroot=/outside"],
+            vec!["--out-dir=/outside"],
+            vec!["--extern=other=/outside"],
+            vec!["--cfg=hidden_mode"],
+            vec!["-Copt-level=3"],
+            vec!["-Zthreads=4"],
+            vec!["@response"],
+            vec!["--message-format=json", "--target-dir", OUTPUT_ROOT],
+        ] {
+            let mut request = clippy_request();
+            request["args"].as_array_mut().unwrap().extend(
+                std::iter::once("--")
+                    .chain(lints.iter().copied())
+                    .map(|arg| json!(arg)),
+            );
+            assert!(
+                requested(&request).is_err(),
+                "unmodeled Clippy tail: {lints:?}"
+            );
+        }
+        for option in [
+            "--fix",
+            "--allow-dirty",
+            "--allow-staged",
+            "--allow-no-vcs",
+            "--explain",
+            "--no-run",
+        ] {
+            let mut request = clippy_request();
+            request["args"].as_array_mut().unwrap().push(json!(option));
+            assert!(
+                requested(&request).is_err(),
+                "unmodeled Clippy option: {option}"
+            );
+        }
+        let mut request = clippy_request();
+        request["args"] = json!([
+            "clippy",
+            "--",
+            "--message-format=json",
+            "--target-dir",
+            OUTPUT_ROOT
+        ]);
+        assert!(
+            requested(&request).is_err(),
+            "lint arguments cannot supply Cargo controls"
+        );
+        assert!(validate_clippy_lints(&vec!["-Awarnings"; 129]).is_err());
+        let long = format!("-A{}", "a".repeat(257));
+        assert!(validate_clippy_lints(&[&long]).is_err());
+        let ordinary = format!("-A{}", "a".repeat(256));
+        assert!(validate_clippy_lints(&vec![ordinary.as_str(); 128]).is_err());
     }
 
     #[test]

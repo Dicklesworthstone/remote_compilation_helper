@@ -62,7 +62,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-no-start        Only use an already-running daemon.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
-  --rabs-canonical FILE  Build, check or test through a canonical worker.
+  --rabs-canonical FILE  Build, check, lint or test through a canonical worker.
   --help                Show this help without starting a daemon or Cargo.
 
 Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
@@ -71,8 +71,9 @@ build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
 explicit upload boundary, profile and worker connection setup. This Linux-only
 profile uses a captured toolchain, fixed worker environment and new output tree;
 it is not transparent local-path replay, per-action scheduling or cache serving.
-Builds, checks and tests accept ordinary workspace/target selection. Test filters
-and arguments after -- are preserved; --no-run remains compilation-only.
+Builds, checks, Clippy and tests accept ordinary workspace/target selection.
+Clippy accepts lint controls after -- and uses the captured cargo-clippy/driver.
+Test filters and arguments after -- are preserved; --no-run remains compilation-only.
 Cargo's artifact reports identify the required real outputs in the captured tree.
 Test execution success requires Cargo's final exit, never build-finished alone.
 Profiles may select an existing vendor tree or an explicit cargo_home_source
@@ -1108,7 +1109,7 @@ def canonical_path(value, absolute=False):
     return value
 
 
-def canonical_profile(path):
+def canonical_profile(path, required_tools=("cargo", "rustc")):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(descriptor, "rb") as source:
         before = os.fstat(source.fileno())
@@ -1179,23 +1180,59 @@ def canonical_profile(path):
         raise SetupError("canonical manifest must name Cargo.toml")
     if "vendor" in profile:
         canonical_path(profile["vendor"])
-    for name in ("cargo", "rustc"):
+    for name in required_tools:
         tool = Path(profile["toolchain_root"]) / "bin" / name
         if (not stat.S_ISDIR(tool.parent.lstat().st_mode)
                 or not stat.S_ISREG(tool.lstat().st_mode) or not os.access(tool, os.X_OK)):
-            raise SetupError("canonical toolchain requires ordinary executable cargo and rustc")
+            raise SetupError("canonical toolchain requires ordinary executable " + name)
     return profile
 
 
+def canonical_clippy_lints(args):
+    """Allow literal lint controls, without adding another rustc command surface.
+
+    cargo-clippy encodes these arguments in CLIPPY_ARGS with an internal
+    delimiter. Lowercase lint identifiers exclude that delimiter as well as
+    response files, paths, output switches and argument-looking lint values.
+    """
+    import re
+    if len(args) > 128 or sum(len(arg) for arg in args) > 16384:
+        raise SetupError("canonical Clippy lint arguments exceed their bounds")
+    short = ("-A", "-W", "-D", "-F")
+    long = ("--allow", "--warn", "--force-warn", "--deny", "--forbid", "--cap-lints")
+    at = 0
+    while at < len(args):
+        option, separator, value = args[at].partition("=")
+        if args[at] in short + long:
+            option = args[at]
+            at += 1
+            if at == len(args):
+                raise SetupError("canonical Clippy lint option requires a value")
+            value = args[at]
+        elif separator and option in long:
+            pass
+        elif args[at][:2] in short:
+            option, value = args[at][:2], args[at][2:]
+        else:
+            raise SetupError("canonical Clippy accepts only lint controls after --")
+        if option == "--cap-lints":
+            if value not in ("allow", "warn", "deny", "forbid"):
+                raise SetupError("invalid canonical Clippy lint cap")
+        elif (len(value) > 256
+              or re.fullmatch(r"[a-z][a-z0-9_-]*(?:::[a-z][a-z0-9_-]*)*", value) is None):
+            raise SetupError("canonical Clippy requires literal lowercase lint names")
+        at += 1
+
+
 def canonical_build_arguments(args):
-    """Preserve Cargo compilation/test intent and its test-harness arguments.
+    """Preserve Cargo compilation/lint/test intent and bounded trailing arguments.
 
     Cargo's JSON reports supply actual library, metadata, binary and test names,
     including toolchain-specific intermediate and target-triple layouts.
     """
     import re
-    if not args or args[0] not in ("build", "check", "test") or len(args) > 256:
-        raise SetupError("canonical mode requires build, check or test")
+    if not args or args[0] not in ("build", "check", "clippy", "test") or len(args) > 256:
+        raise SetupError("canonical mode requires build, check, clippy or test")
     if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
         raise SetupError("canonical Cargo arguments exceed their bounds")
     try:
@@ -1212,7 +1249,9 @@ def canonical_build_arguments(args):
     at = 1
     while at < len(args):
         if args[at] == "--":
-            if args[0] != "test" or no_run:
+            if args[0] == "clippy":
+                canonical_clippy_lints(args[at + 1:])
+            elif args[0] != "test" or no_run:
                 raise SetupError("test-harness arguments require canonical test execution")
             # The remaining bounded UTF-8 arguments belong to the program,
             # including strings that look like Cargo or launcher options.
@@ -1251,6 +1290,8 @@ def canonical_build_arguments(args):
             workspace = True
         elif not separator and option in ("--no-fail-fast", "--doc") and args[0] == "test":
             pass
+        elif not separator and option == "--no-deps" and args[0] == "clippy":
+            pass
         elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
                                           "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q",
                                           "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets"):
@@ -1281,10 +1322,12 @@ def canonical_invocation(profile_path, args, env):
         raise SetupError("nested canonical/remote dispatch is not supported")
     cargo_args, outputs = canonical_build_arguments(args)
     separator = cargo_args.index("--") if "--" in cargo_args else len(cargo_args)
-    harness_args = cargo_args[separator:]
+    trailing_args = cargo_args[separator:]
     cargo_args = cargo_args[:separator]
     test_execution = cargo_args[0] == "test" and "--no-run" not in cargo_args
-    profile = canonical_profile(profile_path)
+    clippy = cargo_args[0] == "clippy"
+    required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
+    profile = canonical_profile(profile_path, required_tools)
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     if os.path.samefile(daemon, __file__):
         raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
@@ -1294,13 +1337,20 @@ def canonical_invocation(profile_path, args, env):
             if flag not in cargo_args:
                 cargo_args.append(flag)
     cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
-    cargo_args += harness_args
+    cargo_args += trailing_args
+    command_env = {"CARGO_INCREMENTAL": "0"}
+    if clippy:
+        # Launch the captured subcommand directly. Neither Cargo's external
+        # subcommand search nor cargo-clippy's child Cargo may select a host
+        # tool when the explicitly selected dataset is incomplete.
+        command_env.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
     import secrets
     specification = {
         "kind": "canonical-exec", "request_id": secrets.randbits(64) or 1,
-        "program": "/__rabs/toolchain/bin/cargo", "args": cargo_args,
+        "program": "/__rabs/toolchain/bin/cargo-clippy" if clippy else "/__rabs/toolchain/bin/cargo",
+        "args": cargo_args,
         "command_context": {"version": "env-cwd-v1", "cwd": str(Path(manifest).parent),
-                            "env": {"CARGO_INCREMENTAL": "0"}},
+                            "env": command_env},
         "toolchain_source": profile["toolchain_root"],
         "cargo_source": {"manifest": profile["manifest"]},
         "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs,

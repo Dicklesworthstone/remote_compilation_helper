@@ -34,10 +34,14 @@ operation = pathlib.Path(specification).parent
 assert not pathlib.Path(bundle).exists()
 assert not pathlib.Path(delivery).exists()
 assert not pathlib.Path(output).exists()
-assert request["program"] == "/__rabs/toolchain/bin/cargo"
 assert request["artifacts"]["tree"] == "tree-files-v1"
 cargo_args = request["args"][:request["args"].index("--")] if "--" in request["args"] else request["args"]
 test_execution = cargo_args[0] == "test" and "--no-run" not in cargo_args
+clippy = cargo_args[0] == "clippy"
+assert request["program"] == ("/__rabs/toolchain/bin/cargo-clippy" if clippy else "/__rabs/toolchain/bin/cargo")
+if clippy:
+    assert request["command_context"]["env"]["CARGO"] == "/__rabs/toolchain/bin/cargo"
+    assert request["command_context"]["env"]["RUSTC"] == "/__rabs/toolchain/bin/rustc"
 assert request["artifacts"]["cargo"] == ("cargo-test-json-v1" if test_execution else "cargo-json-v1")
 assert cargo_args.count("--message-format=json") == 1
 assert request["toolchain_source"] + "/bin/cargo" == os.environ["CARGO"]
@@ -96,6 +100,12 @@ class CanonicalCargo(unittest.TestCase):
 
     def save(self):
         self.profile_path.write_text(json.dumps(self.profile))
+
+    def install_clippy(self):
+        for name in ("cargo-clippy", "clippy-driver"):
+            tool = self.toolchain / "bin" / name
+            tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
+            tool.chmod(0o700)
 
     def invoke(self, cargo_args=None, env=None, prefix=None, input=b""):
         args = cargo_args if cargo_args is not None else ["build", "--bin", "hello"]
@@ -368,6 +378,80 @@ class CanonicalCargo(unittest.TestCase):
                 self.assertIn(b'"kind": "fixture-worker-build"', stderr)
                 self.assertIn(b"native-driver-diagnostic", stderr)
                 self.assertFalse((Path(record["operation"]) / "outputs").exists())
+
+    def test_canonical_clippy_binds_captured_tools_and_keeps_lint_controls_after_cargo_flags(self):
+        self.install_clippy()
+        cases = (
+            (["clippy"], []),
+            (["clippy", "--workspace", "--all-targets", "--all-features"], ["--", "-D", "warnings"]),
+            (["clippy", "--no-deps", "-p", "app"],
+             ["--", "--warn=clippy::pedantic", "-Aclippy::module-name-repetitions", "--forbid", "unsafe_code"]),
+            (["clippy", "--frozen"], ["--", "--force-warn", "unused", "--cap-lints=warn"]),
+        )
+        for before, after in cases:
+            with self.subTest(before=before, after=after):
+                env = dict(self.env, TEST_EXIT="101", CLIPPY_ARGS="ambient-not-uploaded",
+                           RUSTC_WORKSPACE_WRAPPER="/outside/wrapper")
+                status, stdout, stderr, pid = self.invoke(before + after, env=env)
+                self.assertEqual(status, 101, "a denied lint must preserve the native failure")
+                record = self.records()[-1]
+                request = record["request"]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(request["program"], "/__rabs/toolchain/bin/cargo-clippy")
+                self.assertEqual(request["artifacts"]["cargo"], "cargo-json-v1")
+                self.assertEqual(request["command_context"]["env"], {
+                    "CARGO_INCREMENTAL":"0", "CARGO":"/__rabs/toolchain/bin/cargo",
+                    "RUSTC":"/__rabs/toolchain/bin/rustc",
+                })
+                self.assertEqual(request["args"][:len(before)], before)
+                controls = request["args"][:-len(after)] if after else request["args"]
+                self.assertEqual(controls.count("--message-format=json"), 1)
+                self.assertEqual(controls[-2:], ["--target-dir", "/__rabs/out/cargo"])
+                if after:
+                    self.assertEqual(request["args"][-len(after):], after)
+                self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+                self.assertIn(b'"kind": "fixture-worker-build"', stderr)
+                self.assertFalse((Path(record["operation"]) / "outputs").exists())
+
+    def test_clippy_requires_both_ordinary_executable_components_before_operation_creation(self):
+        self.assert_refused(["clippy"])
+        self.install_clippy()
+        driver = self.toolchain / "bin/clippy-driver"
+        saved = self.toolchain / "bin/retained-driver"
+        driver.rename(saved)
+        self.assert_refused(["clippy"])
+        saved.rename(driver)
+        driver.chmod(0o600)
+        self.assert_refused(["clippy"])
+        driver.chmod(0o700)
+        driver.rename(saved)
+        driver.symlink_to(saved)
+        self.assert_refused(["clippy"])
+        # Other commands need only their existing Cargo/rustc tool set.
+        self.assertEqual(self.invoke(["check"])[0], 0)
+
+    def test_clippy_refuses_fix_modes_argument_injection_and_unbounded_lint_controls(self):
+        self.install_clippy()
+        for args in (
+            ["clippy", "--fix"], ["clippy", "--allow-dirty"],
+            ["clippy", "--allow-staged"], ["clippy", "--allow-no-vcs"],
+            ["clippy", "--explain", "clippy::all"], ["clippy", "--no-run"],
+            ["clippy", "filter"], ["clippy", "--", "--fix"],
+            ["clippy", "--", "-D"], ["clippy", "--", "-D", "--emit=metadata"],
+            ["clippy", "--", "-Dwarnings__CLIPPY_HACKERY__--print"],
+            ["clippy", "--", "--warn=clippy:all"],
+            ["clippy", "--", "--cap-lints=unknown"],
+            ["clippy", "--", "--cfg=other"], ["clippy", "--", "-Copt-level=3"],
+            ["clippy", "--", "-Zthreads=4"], ["clippy", "--", "@response"],
+            ["clippy", "--", "--sysroot=/outside"], ["clippy", "--", "--out-dir=/outside"],
+            ["clippy", "--", "--extern=other=/outside"],
+            ["clippy", "--", "--message-format=json", "--target-dir", "/outside"],
+            ["clippy", "--"] + ["-Awarnings"] * 129,
+            ["clippy", "--", "-A" + "a" * 257],
+            ["clippy", "--"] + ["-A" + "a" * 256] * 128,
+        ):
+            with self.subTest(args=args[:5]):
+                self.assert_refused(args)
 
     def test_launcher_mode_conflicts_cannot_reach_another_executor(self):
         for first in ("--rabs-no-start", "--rabs-require-daemon", "--rabs-remote"):

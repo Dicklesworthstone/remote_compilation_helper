@@ -1,4 +1,4 @@
-//! Real Cargo output discovery for workspace builds, checks and test compilation.
+//! Real Cargo output discovery for workspace builds, checks, Clippy and tests.
 //! Stock local Cargo and an opt-in canonical namespace exercise production
 //! JSON/tree validation. Neither substitutes for worker/TLS integration or
 //! authorizes cache serving.
@@ -26,7 +26,11 @@ fn toolchain() -> PathBuf {
 }
 
 fn cargo(toolchain: &Path, root: &Path, home: &Path) -> Command {
-    let mut command = Command::new(toolchain.join("bin/cargo"));
+    cargo_tool(toolchain, root, home, "cargo")
+}
+
+fn cargo_tool(toolchain: &Path, root: &Path, home: &Path, program: &str) -> Command {
+    let mut command = Command::new(toolchain.join("bin").join(program));
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -204,6 +208,106 @@ fn real_workspace_build_check_and_test_compilation_capture_actual_outputs() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn real_clippy_uses_captured_companions_and_denied_lints_cannot_report_success() {
+    let (owner, root, home, tools) = workspace_fixture();
+    for name in ["cargo-clippy", "clippy-driver"] {
+        let path = tools.join("bin").join(name);
+        let metadata = fs::symlink_metadata(&path)
+            .unwrap_or_else(|error| panic!("the pinned toolchain requires {name}: {error}"));
+        assert!(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    }
+    let library = root.join("library/src/lib.rs");
+    let original = fs::read_to_string(&library).unwrap();
+    fs::write(
+        &library,
+        format!("{original}\npub fn lint_probe(value: bool) -> bool {{ value == true }}\n"),
+    )
+    .unwrap();
+    for (label, lints, successful) in [
+        ("warning", vec!["-W", "clippy::bool_comparison"], true),
+        ("denied", vec!["-Dclippy::bool_comparison"], false),
+        ("clean", vec!["-D", "warnings"], true),
+    ] {
+        if label == "clean" {
+            fs::write(&library, &original).unwrap();
+        }
+        let output_root = owner.path().join(format!("clippy-{label}"));
+        fs::create_dir(&output_root).unwrap();
+        fs::set_permissions(&output_root, fs::Permissions::from_mode(0o700)).unwrap();
+        // This is the frontend's exact direct-program contract. The fixture
+        // PATH contains no Rust toolchain; adjacent clippy-driver plus the
+        // explicit CARGO/RUSTC bindings must supply every compiler tool.
+        let output = cargo_tool(&tools, &root, &home, "cargo-clippy")
+            .env("CARGO", tools.join("bin/cargo"))
+            .args([
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--locked",
+                "--offline",
+                "--message-format=json",
+                "--target-dir",
+            ])
+            .arg(&output_root)
+            .arg("--")
+            .args(lints)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            successful,
+            "{label}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if label != "clean" {
+            assert!(
+                output.stdout.split(|byte| *byte == b'\n').any(|line| {
+                    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|message| {
+                        message["reason"] == "compiler-message"
+                            && message["message"]["code"]["code"] == "clippy::bool_comparison"
+                            && message["message"]["level"]
+                                == if successful { "warning" } else { "error" }
+                    })
+                }),
+                "the real Clippy lint must execute, not just ordinary cargo check"
+            );
+        }
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            CargoArtifactMode::Compilation,
+        );
+        if successful {
+            let report = report.unwrap();
+            let required = report.files().map(str::to_owned).collect::<BTreeSet<_>>();
+            assert!(required.iter().any(|name| name.ends_with(".rmeta")));
+            let inventory =
+                TreeInventory::scan(&output_root, &required, 128 * 1024 * 1024, &|| false).unwrap();
+            report
+                .validate_outputs(inventory.names().map(|name| {
+                    let executable = fs::metadata(output_root.join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111
+                        != 0;
+                    (name, executable)
+                }))
+                .unwrap();
+            inventory.verify(&|| false).unwrap();
+        } else {
+            assert_eq!(output.status.code(), Some(101));
+            assert!(
+                report.is_err(),
+                "denied lints must never offer a successful artifact report"
+            );
+        }
+    }
 }
 
 #[test]
