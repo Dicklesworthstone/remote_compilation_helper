@@ -14,6 +14,7 @@ struct FilesPeer {
     corrupt: Option<(usize, &'static str, Value)>,
     fail_send: Option<usize>,
     fail_read: Option<usize>,
+    obstruct_next: Option<&'static str>,
 }
 
 impl FilesPeer {
@@ -49,6 +50,7 @@ impl FilesPeer {
         Self {
             inner, files, manifest, pending: VecDeque::new(), trace: Vec::new(),
             sent: 0, received: 0, peak: 0, corrupt: None, fail_send: None, fail_read: None,
+            obstruct_next: None,
         }
     }
 
@@ -81,6 +83,10 @@ impl FilesPeer {
 
 impl WorkerPeer for FilesPeer {
     fn send(&mut self, frame: &Value) -> io::Result<()> {
+        if matches!(frame["kind"].as_str(), Some("output-ack" | "artifact-ack")) {
+            assert!(self.pending.is_empty(), "no release while file responses remain");
+            self.check_files(&self.inner.destination);
+        }
         self.inner.send(frame)?;
         if frame["kind"] != "artifact-read" {
             return Ok(());
@@ -93,6 +99,19 @@ impl WorkerPeer for FilesPeer {
         self.peak = self.peak.max(self.pending.len());
         let index = self.sent;
         self.sent += 1;
+        if index == 0 && let Some(kind) = self.obstruct_next {
+            // Install a conflicting destination after one range is in flight.
+            // This is a real create-new refusal, not a forged network error.
+            let next = self.inner.destination.join("artifacts").join(&self.files[1].0);
+            match kind {
+                "file" => std::fs::write(next, b"preexisting output")?,
+                "directory" => std::fs::create_dir(next)?,
+                "symlink" => std::os::unix::fs::symlink(
+                    self.inner.destination.join("diagnostics/stdout"), next,
+                )?,
+                _ => panic!("unknown destination obstruction"),
+            }
+        }
         if self.fail_send == Some(index) {
             return Err(worker_transport_error(io::Error::new(io::ErrorKind::BrokenPipe, "partly accepted range")));
         }
@@ -276,5 +295,95 @@ fn result_resume_shares_the_window_across_complete_unaligned_and_missing_hints()
         let old = previous.join("artifacts").join(name);
         if length != 0 { assert_eq!(std::fs::read(old).unwrap(), bytes[..length]); }
         else { assert!(!old.exists()); }
+    }
+}
+
+#[test]
+fn local_destination_refusal_does_not_drain_or_overwrite_pending_files() {
+    for obstruction in ["file", "directory", "symlink"] {
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("delivery");
+        let mut peer = FilesPeer::new(&destination, &[17; 6], DeliveryMode::Execute);
+        peer.obstruct_next = Some(obstruction);
+        let request = peer.request();
+        let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(!failure.transport_interrupted, "local failure cannot penalize transport");
+        assert_eq!(peer.sent, 1);
+        assert_eq!(peer.received, 0);
+        assert_eq!(peer.pending.len(), 1);
+        let artifacts = destination.join("artifacts");
+        assert_eq!(std::fs::read(artifacts.join(&peer.files[0].0)).unwrap(), b"");
+        assert!(!artifacts.join(&peer.files[2].0).exists());
+        let blocked = artifacts.join(&peer.files[1].0);
+        match obstruction {
+            "file" => assert_eq!(std::fs::read(blocked).unwrap(), b"preexisting output"),
+            "directory" => assert!(std::fs::symlink_metadata(blocked).unwrap().is_dir()),
+            "symlink" => assert!(std::fs::symlink_metadata(blocked).unwrap().file_type().is_symlink()),
+            _ => unreachable!(),
+        }
+        assert_eq!(std::fs::read(destination.join("diagnostics/stdout")).unwrap(), peer.inner.expected_stdout);
+        peer.no_release(&destination);
+    }
+}
+
+#[test]
+fn complete_bad_resume_hint_stops_before_consuming_earlier_queued_ranges() {
+    for at in 1..4 {
+        let owner = tempfile::tempdir().unwrap();
+        let previous = owner.path().join("previous");
+        let destination = owner.path().join("resumed");
+        let mut peer = FilesPeer::new(&destination, &[17; 6], DeliveryMode::Resume);
+        let bad_file = previous.join("artifacts").join(&peer.files[at].0);
+        std::fs::create_dir_all(bad_file.parent().unwrap()).unwrap();
+        let mut bad_bytes = peer.files[at].1.clone();
+        bad_bytes[0] ^= 1;
+        std::fs::write(&bad_file, &bad_bytes).unwrap();
+        let source = ResumeSource::open(&previous).unwrap();
+        let request = peer.request();
+        let failure = receive_operation(
+            &mut ResumePeer::new(&mut peer, &source), &request, "worker",
+            &destination, DeliveryMode::Resume,
+        ).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(failure.detail.contains("complete file digest mismatch"));
+        assert!(!failure.transport_interrupted);
+        assert_eq!(peer.sent, at);
+        assert_eq!(peer.received, 0);
+        assert_eq!(peer.pending.len(), at);
+        assert_eq!(std::fs::read(&bad_file).unwrap(), bad_bytes);
+        assert!(!peer.inner.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+        peer.no_release(&destination);
+    }
+}
+
+#[test]
+fn lost_release_ack_keeps_the_whole_verified_pipelined_delivery_recoverable() {
+    use crate::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+
+    for lost in ["output-ack", "artifact-ack", "artifact-reply"] {
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("delivery");
+        let mut peer = FilesPeer::new(&destination, &[0, 1, CHUNK_BYTES + 7, 2, 17], DeliveryMode::Execute);
+        let request = peer.request();
+        match lost {
+            "artifact-reply" => { peer.inner.replies.pop_back(); }
+            _ => peer.inner.fail_send = Some(lost),
+        }
+        let result = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(!result.acknowledgments_confirmed);
+        assert!(result.acknowledgment_error.is_some());
+        assert!(peer.pending.is_empty());
+        assert_eq!(peer.trace, trace_for(&peer.files, &[0; 5]));
+        peer.check_files(&destination);
+        let marker = std::fs::read(destination.join("delivery.json")).unwrap();
+        assert!(!destination.join("delivery.pending").exists());
+        let recovered = recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap().unwrap();
+        assert_eq!(recovered.receipt, result.receipt);
+        assert_eq!(std::fs::read(destination.join("delivery.json")).unwrap(), marker);
+        peer.check_files(&destination);
+        assert_eq!(peer.inner.sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
+        assert_eq!(result.receipt["publication_authorized"], false);
     }
 }
