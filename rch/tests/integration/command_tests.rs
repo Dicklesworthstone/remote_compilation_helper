@@ -1917,6 +1917,25 @@ fn run_exec_against_absent_daemon(
     resolved_toolchain: bool,
     require_remote: bool,
 ) -> FallbackGateRun {
+    run_isolated_exec(
+        "",
+        allow_local_fallback,
+        resolved_toolchain,
+        require_remote,
+        &["--", "cargo", "check"],
+    )
+}
+
+/// [`run_exec_against_absent_daemon`] with extra `[general]` config lines and
+/// explicit `rch --json exec` arguments (flags, `--`, then the command).
+#[cfg(unix)]
+fn run_isolated_exec(
+    general_extra: &str,
+    allow_local_fallback: bool,
+    resolved_toolchain: bool,
+    require_remote: bool,
+    exec_args: &[&str],
+) -> FallbackGateRun {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1963,7 +1982,7 @@ fn run_exec_against_absent_daemon(
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[general]\nsocket_path = \"{socket}\"\n\n\
+            "[general]\nsocket_path = \"{socket}\"\n{general_extra}\n\
              [self_healing]\nhook_starts_daemon = false\n\n\
              [compilation]\nallow_local_fallback = {allow_local_fallback}\n\n\
              [path_topology]\ncanonical_root = \"{projects}\"\nalias_root = \"{alias}\"\n",
@@ -1986,7 +2005,8 @@ fn run_exec_against_absent_daemon(
         .env("RCH_RESTART_ADMISSION_WAIT_SECS", "0")
         .current_dir(&project)
         .stdin(std::process::Stdio::null())
-        .args(["--json", "exec", "--", "cargo", "check"]);
+        .args(["--json", "exec"])
+        .args(exec_args);
     if resolved_toolchain {
         command.env("RUSTUP_TOOLCHAIN", "stable");
     }
@@ -2093,4 +2113,93 @@ fn exec_require_remote_refusal_outranks_allow_local_fallback() {
             .unwrap_or_else(|| panic!("no RCH-I012 refusal incident: {:?}", run.incidents));
         assert_eq!(refusal["local_fallback_allowed"], false, "{context}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_require_remote_flag_refuses_a_non_compilation_command() {
+    init_test_logging();
+    // #123: `--require-remote` is RCH_REQUIRE_REMOTE=1 for one call. The
+    // isolated environment has no RCH_REQUIRE_REMOTE, so the flag alone must
+    // turn the silent local run (the control) into the RCH-E301 refusal.
+    // The command prints the marker but never spells it, so rch's own log of
+    // the command text cannot satisfy or break the checks below.
+    let marker = "non-compilation-ran-locally";
+    let print_marker = ["printf", "%s-%s\\n", "non-compilation", "ran-locally"];
+    let control = run_isolated_exec(
+        "",
+        true,
+        true,
+        false,
+        &[&["--"][..], &print_marker[..]].concat(),
+    );
+    let context = format!("control: stderr={}", control.stderr);
+    assert_eq!(control.status.code(), Some(0), "{context}");
+    assert!(
+        control.stdout.contains(marker) || control.stderr.contains(marker),
+        "{context}"
+    );
+    assert_eq!(control.envelope()["outcome"], "completed", "{context}");
+
+    let run = run_isolated_exec(
+        "",
+        true,
+        true,
+        false,
+        &[&["--require-remote", "--"][..], &print_marker[..]].concat(),
+    );
+    let context = format!("--require-remote: stderr={}", run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{context}");
+    assert!(
+        !run.stdout.contains(marker) && !run.stderr.contains(marker),
+        "the command ran locally; {context}"
+    );
+    assert_contains(
+        &run.stderr,
+        "remote required; refusing local fallback [RCH-E301] (non-compilation command)",
+    );
+    assert_eq!(run.envelope()["outcome"], "refused", "{context}");
+    let refusal = run
+        .incident("RCH-I012")
+        .unwrap_or_else(|| panic!("no RCH-I012 refusal incident: {:?}", run.incidents));
+    assert_eq!(refusal["local_fallback_allowed"], false, "{context}");
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_require_remote_flag_outranks_force_local_config() {
+    init_test_logging();
+    // #123: RCH_REQUIRE_REMOTE=1 yields to an explicit `force_local = true`
+    // because the cargo shim exports it into every agent (bd-nfo8f). The flag
+    // is always the caller's own request, so like `--worker` it refuses
+    // instead of running the build locally.
+    let env_only = run_isolated_exec(
+        "force_local = true\n",
+        true,
+        true,
+        true,
+        &["--", "cargo", "check"],
+    );
+    let context = format!("RCH_REQUIRE_REMOTE=1: stderr={}", env_only.stderr);
+    assert_eq!(env_only.status.code(), Some(0), "{context}");
+    assert!(
+        env_only.local_cargo_ran,
+        "config force_local must run locally; {context}"
+    );
+
+    let run = run_isolated_exec(
+        "force_local = true\n",
+        true,
+        true,
+        false,
+        &["--require-remote", "--", "cargo", "check"],
+    );
+    let context = format!("--require-remote: stderr={}", run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{context}");
+    assert!(!run.local_cargo_ran, "cargo ran locally; {context}");
+    assert_contains(
+        &run.stderr,
+        "remote required; refusing local fallback (force_local)",
+    );
+    assert_eq!(run.envelope()["outcome"], "refused", "{context}");
 }

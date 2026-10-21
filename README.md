@@ -965,7 +965,7 @@ plan for any command is shown by `rch diagnose <command> --json` under
 |---|---|---|
 | Requested worker | `RCH_WORKER` (`RCH_WORKERS`) | Request specific worker(s) by id. Still passes capability/admission checks; an inadmissible requested worker is **refused** with a stable `RCH-Innn` reason code and a next action — never silently swapped. |
 | Requested profile | `RCH_PRESET` | Named execution profile (recorded as `requested_profile`). |
-| Strict remote (fail-closed) | `RCH_REQUIRE_REMOTE` | Refuse local fallback (proof mode). Takes precedence over `RCH_FORCE_REMOTE`. |
+| Strict remote (fail-closed) | `RCH_REQUIRE_REMOTE`; per call `rch exec --require-remote` | Refuse local fallback (proof mode). Takes precedence over `RCH_FORCE_REMOTE`. |
 | Force remote (fail-open) | `RCH_FORCE_REMOTE` | Always attempt offload (bypass local-time/speedup gating) but still fail open to local. Distinct from `RCH_REQUIRE_REMOTE`. |
 | Queue when busy | `RCH_QUEUE_WHEN_BUSY` (default `1`) | Wait for a busy worker instead of falling back to local. Set `0` to disable. |
 | Wait timeout | `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (`RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker: default 330, or 6 h for `rch exec --job`. The daemon caps a compilation's wait at `[queue] timeout_secs` (300) and a job's at 24 h. |
@@ -1085,6 +1085,14 @@ When local fallback is not acceptable, set `RCH_REQUIRE_REMOTE=1` on the
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+`rch exec --require-remote -- <cmd>` asks the same for one call without
+touching the environment. Because it is always the caller's own request (the
+cargo shim exports `RCH_REQUIRE_REMOTE=1` into every agent), it also outranks
+config that would run the command locally (`force_local`, `enabled = false`,
+the execution allowlist), as `--worker` does. A non-compilation command is
+refused with `RCH-E301` instead of running locally; to run one on a worker, use
+`rch exec --job -- <cmd>`.
 
 ### Exact source-content receipts
 

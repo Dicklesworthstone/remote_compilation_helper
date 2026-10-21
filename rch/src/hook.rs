@@ -3703,6 +3703,7 @@ pub async fn run_exec(
     result_dirs: Vec<PathBuf>,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
+    caller_requires_remote: bool,
     command_parts: Vec<String>,
     out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
@@ -3756,7 +3757,12 @@ pub async fn run_exec(
         );
     }
     let exact_worker_requested = exact_worker.is_some();
+    // `--require-remote` (#123) is the per-call RCH_REQUIRE_REMOTE=1. Being
+    // an explicit argument rather than an inherited env value (the shim bakes
+    // RCH_REQUIRE_REMOTE=1 into every agent), it also outranks config local
+    // policy below, as `--worker` does.
     let require_remote = exec_requires_remote()
+        || caller_requires_remote
         || clean_overlay
         || source_content_receipt
         || cargo_json_stdout
@@ -3859,6 +3865,7 @@ pub async fn run_exec(
                 || source_content_receipt
                 || cargo_json_stdout
                 || exact_worker_requested
+                || caller_requires_remote
                 || required_tools_requested
         } else {
             require_remote || role_requires_remote(config.general.role)

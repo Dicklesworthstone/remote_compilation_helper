@@ -686,6 +686,13 @@ USAGE:
         /// Refuses local execution or a different worker when unavailable.
         #[arg(long, value_name = "ID", value_parser = parse_exec_worker)]
         worker: Option<rch_common::WorkerId>,
+        /// Run on a remote worker or refuse; never execute this command locally.
+        /// The per-invocation form of RCH_REQUIRE_REMOTE=1, and like --worker it
+        /// also outranks config that would run the command locally (force_local,
+        /// a disabled offload, the execution allowlist). A non-compilation
+        /// command is refused (RCH-E301) unless --job admits it to a worker.
+        #[arg(long)]
+        require_remote: bool,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2485,6 +2492,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 result_dir,
                 require_tool,
                 worker,
+                require_remote,
                 command,
             } => {
                 hook::run_exec(
@@ -2498,6 +2506,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     result_dir,
                     require_tool,
                     worker,
+                    require_remote,
                     command,
                     &ctx,
                 )
@@ -3682,8 +3691,9 @@ fn policies() -> Vec<PolicyCapability> {
                     .to_string(),
             reason_code: Some("RCH-I012".to_string()),
             next_action:
-                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>`; a refusal surfaces \
-                 RCH-I012 instead of silently running locally."
+                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>` or, for one call, \
+                 `rch exec --require-remote -- <build cmd>`; a refusal surfaces RCH-I012 instead \
+                 of silently running locally."
                     .to_string(),
         },
         PolicyCapability {
@@ -7188,6 +7198,7 @@ mod tests {
                 result_dir,
                 require_tool: _,
                 worker: _,
+                require_remote: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -7235,6 +7246,7 @@ mod tests {
                 result_dir,
                 require_tool: _,
                 worker: _,
+                require_remote: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -7440,6 +7452,34 @@ mod tests {
             "check",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_exec_require_remote_flag() {
+        let _guard = test_guard!();
+        let parsed = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::Exec {
+                require_remote,
+                job,
+                command,
+                ..
+            }) => (require_remote, job, command),
+            _ => panic!("expected Commands::Exec for {args:?}"), // ubs:ignore — test assertion for an unexpected parser result.
+        };
+        assert_eq!(
+            parsed(&["rch", "exec", "--", "true"]),
+            (false, false, vec!["true".to_string()])
+        );
+        assert_eq!(
+            parsed(&["rch", "exec", "--require-remote", "--", "true"]),
+            (true, false, vec!["true".to_string()])
+        );
+        // With --job the non-compilation command runs on a worker or fails;
+        // the flag is redundant there but accepted.
+        assert_eq!(
+            parsed(&["rch", "exec", "--job", "--require-remote", "--", "true"]),
+            (true, true, vec!["true".to_string()])
+        );
     }
 
     #[test]

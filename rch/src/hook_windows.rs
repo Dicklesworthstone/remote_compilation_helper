@@ -59,11 +59,17 @@ pub async fn run_exec(
     result_dirs: Vec<PathBuf>,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
+    caller_requires_remote: bool,
     command_parts: Vec<String>,
     _out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
     if exact_worker.is_some() {
         anyhow::bail!("--worker remote admission requires the Unix daemon transport");
+    }
+    if caller_requires_remote {
+        anyhow::bail!(
+            "--require-remote: remote execution requires the Unix daemon transport; no local command was started"
+        );
     }
     if clean_overlay
         || base.is_some()
