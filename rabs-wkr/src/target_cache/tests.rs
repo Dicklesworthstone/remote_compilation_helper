@@ -439,6 +439,242 @@ fn pending_seeds_count_toward_both_bounds_and_drop_releases_reservations() {
     assert_eq!(many.state.lock().unwrap().reservations, 0);
 }
 
+#[test]
+fn impossible_reservations_preserve_warm_bytes_and_lru_until_pending_copy_finishes() {
+    let cache = Arc::new(TargetCache::new(12).unwrap());
+    for tag in [1, 2] {
+        stage_small(&cache, TargetKey([tag; 32])).0.publish();
+    }
+    let (pending, _, _) = stage_small(&cache, TargetKey([3; 32]));
+    let paths: Vec<_> = cache
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|seed| seed.tree.directory.path().to_path_buf())
+        .collect();
+    // Four bytes are already owned by an unpublished copy. No eviction can
+    // admit nine more under a twelve-byte limit. Repeated refusals must not
+    // turn all subsequent builds cold or perturb the eviction order.
+    for _ in 0..3 {
+        assert!(cache.reserve(9).is_none());
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.retained_bytes, 8);
+        assert_eq!(state.reserved_bytes, 4);
+        assert_eq!(state.reservations, 1);
+        assert_eq!(
+            state.entries.iter().map(|seed| seed.key).collect::<Vec<_>>(),
+            vec![TargetKey([1; 32]), TargetKey([2; 32])]
+        );
+        for path in &paths {
+            assert_eq!(fs::read(path.join("artifact")).unwrap(), b"seed");
+        }
+    }
+    drop(pending);
+    assert_eq!(cache.state.lock().unwrap().reserved_bytes, 0);
+    let (source, plan, _, _) = small_fixture();
+    for tag in [1, 2] {
+        let (_, restored) = cache
+            .acquire(
+                TargetKey([tag; 32]),
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                4,
+                &|| false,
+            )
+            .unwrap();
+        let restored = restored.expect("refused admission must leave the warm seed usable");
+        assert_eq!(
+            fs::read(restored.backing().join("artifact")).unwrap(),
+            b"seed"
+        );
+    }
+}
+
+#[test]
+fn staging_refusal_preserves_prior_seed_and_allows_later_publication() {
+    let cache = Arc::new(TargetCache::new(12).unwrap());
+    stage_small(&cache, TargetKey([1; 32])).0.publish();
+    let held = cache.reserve(8).unwrap();
+    let (source, plan, target, _) = small_fixture();
+    fs::write(target.backing().join("artifact"), b"larger").unwrap();
+    let captured = target
+        .capture_with_dependency_inputs(None, || false)
+        .unwrap();
+    let new_attempt = || {
+        cache
+            .acquire(
+                TargetKey([2; 32]),
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                2,
+                &|| false,
+            )
+            .unwrap()
+            .0
+    };
+    assert!(
+        new_attempt()
+            .stage(&target, &captured, &|| false)
+            .unwrap()
+            .is_none()
+    );
+    {
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].key, TargetKey([1; 32]));
+        assert_eq!(state.retained_bytes, 4);
+        assert_eq!(state.reserved_bytes, 8);
+        assert_eq!(state.reservations, 1);
+    }
+    drop(held);
+    new_attempt()
+        .stage(&target, &captured, &|| false)
+        .unwrap()
+        .unwrap()
+        .publish();
+    let state = cache.state.lock().unwrap();
+    assert_eq!(state.retained_bytes, 10);
+    assert_eq!(state.entries.len(), 2);
+    assert_eq!(state.reserved_bytes, 0);
+    assert_eq!(state.reservations, 0);
+}
+
+#[test]
+fn feasible_reservations_keep_lru_eviction_exact_boundaries_and_entry_limits() {
+    let cache = Arc::new(TargetCache::new(16).unwrap());
+    for tag in [1, 2, 3] {
+        stage_small(&cache, TargetKey([tag; 32])).0.publish();
+    }
+    let held = cache.reserve(4).unwrap();
+    let next = cache.reserve(4).unwrap();
+    {
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.retained_bytes, 8);
+        assert_eq!(state.reserved_bytes, 8);
+        assert_eq!(state.reservations, 2);
+        assert_eq!(
+            state.entries.iter().map(|seed| seed.key).collect::<Vec<_>>(),
+            vec![TargetKey([2; 32]), TargetKey([3; 32])]
+        );
+    }
+    // Exact remaining capacity is admissible, not a false >= refusal.
+    let boundary = cache.reserve(8).unwrap();
+    assert!(cache.state.lock().unwrap().entries.is_empty());
+    assert_eq!(cache.state.lock().unwrap().reserved_bytes, 16);
+    assert!(cache.reserve(1).is_none());
+    drop((boundary, next, held));
+    assert_eq!(cache.state.lock().unwrap().reserved_bytes, 0);
+    assert_eq!(cache.state.lock().unwrap().reservations, 0);
+
+    stage_small(&cache, TargetKey([4; 32])).0.publish();
+    let mut empty: Vec<_> = (0..MAX_TARGET_CACHE_ENTRIES - 1)
+        .map(|_| cache.reserve(0).unwrap())
+        .collect();
+    assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+    empty.push(cache.reserve(0).unwrap());
+    assert!(cache.state.lock().unwrap().entries.is_empty());
+    assert!(cache.reserve(0).is_none());
+    drop(empty);
+    assert_eq!(cache.state.lock().unwrap().reservations, 0);
+}
+
+#[test]
+fn failed_output_allocation_does_not_evict_or_promote_a_valid_seed() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    for tag in [1, 2] {
+        stage_small(&cache, TargetKey([tag; 32])).0.publish();
+    }
+    let (source, plan, _, _) = small_fixture();
+    let (_, restored) = cache
+        .acquire(
+            TargetKey([1; 32]),
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected destination allocation failure",
+                ))
+            },
+            3,
+            &|| false,
+        )
+        .unwrap();
+    assert!(restored.is_none());
+    {
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.retained_bytes, 8);
+        assert_eq!(
+            state.entries.iter().map(|seed| seed.key).collect::<Vec<_>>(),
+            vec![TargetKey([1; 32]), TargetKey([2; 32])]
+        );
+    }
+    let (_, restored) = cache
+        .acquire(
+            TargetKey([1; 32]),
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || PreparedArtifacts::new(plan.clone()),
+            4,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(restored.unwrap().backing().join("artifact")).unwrap(),
+        b"seed"
+    );
+}
+
+#[test]
+fn cancelled_restore_preserves_seed_but_never_bypasses_later_verification() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let key = TargetKey([1; 32]);
+    stage_small(&cache, key).0.publish();
+    let (source, plan, _, _) = small_fixture();
+    let stopped = std::cell::Cell::new(false);
+    let error = cache
+        .acquire(
+            key,
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || {
+                let output = PreparedArtifacts::new(plan.clone())?;
+                stopped.set(true);
+                Ok(output)
+            },
+            2,
+            &|| stopped.get(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+    ));
+    let path = {
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.retained_bytes, 4);
+        state.entries[0].tree.directory.path().join("artifact")
+    };
+    assert_eq!(fs::read(&path).unwrap(), b"seed");
+    // Retention is not trust. A corrupt retained seed must still be refused
+    // and evicted by the unchanged verification on the next attempted hit.
+    fs::write(path, b"evil").unwrap();
+    let (_, restored) = cache
+        .acquire(
+            key,
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || PreparedArtifacts::new(plan.clone()),
+            3,
+            &|| false,
+        )
+        .unwrap();
+    assert!(restored.is_none());
+    let state = cache.state.lock().unwrap();
+    assert!(state.entries.is_empty());
+    assert_eq!(state.retained_bytes, 0);
+    assert_eq!(state.reserved_bytes, 0);
+}
+
 struct ThreadWake(std::thread::Thread);
 impl Wake for ThreadWake {
     fn wake(self: Arc<Self>) {

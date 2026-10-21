@@ -223,8 +223,10 @@ impl TargetCache {
         if let Ok(mut state) = self.state.try_lock() {
             if let Some(index) = state.entries.iter().position(|seed| seed.key == key) {
                 let seed = &state.entries[index];
+                let mut restore_started = false;
                 let reuse = (|| {
                     let output = new_output()?;
+                    restore_started = true;
                     seed.tree.restore(output.backing(), stopped)?;
                     seed.source.restore(&inputs, stopped)?;
                     Ok::<_, io::Error>(output)
@@ -238,9 +240,20 @@ impl TargetCache {
                         state.entries.push_back(seed);
                     }
                     Err(error) => {
-                        let seed = state.entries.remove(index).expect("located seed");
-                        state.retained_bytes -= seed.tree.bytes;
-                        drop(seed);
+                        // Failure to allocate this attempt's destination, or
+                        // cancellation while copying, is not seed corruption.
+                        // Keep its bytes and LRU position; a future hit still
+                        // performs the entire independent verification/copy.
+                        if restore_started
+                            && !matches!(
+                                error.kind(),
+                                io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+                            )
+                        {
+                            let seed = state.entries.remove(index).expect("located seed");
+                            state.retained_bytes -= seed.tree.bytes;
+                            drop(seed);
+                        }
                         eprintln!(
                             "{}",
                             serde_json::json!({"kind":"worker-target-state-refused", "request_id":request_id, "error":error.to_string()})
@@ -277,6 +290,13 @@ impl TargetCache {
             return None;
         }
         let mut state = self.state.try_lock().ok()?;
+        // Pending copies cannot be evicted. Reject an impossible reservation
+        // before removing any warm seed: even emptying the entire LRU would
+        // not make it fit. The same lock covers this check and all eviction.
+        let available_bytes = self.max_bytes.checked_sub(state.reserved_bytes)?;
+        if bytes > available_bytes || state.reservations >= MAX_TARGET_CACHE_ENTRIES {
+            return None;
+        }
         while state.retained_bytes + state.reserved_bytes + bytes > self.max_bytes
             || state.entries.len() + state.reservations >= MAX_TARGET_CACHE_ENTRIES
         {
