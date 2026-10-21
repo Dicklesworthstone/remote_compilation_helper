@@ -122,7 +122,7 @@ pub struct JobserverBridge {
     /// ARE the free-slot budget.
     _writer: std::fs::File,
     /// Private runtime backing, dropped after the holding writer closes.
-    _directory: tempfile::TempDir,
+    _directory: Option<tempfile::TempDir>,
     /// Total admitted slots, including the command's implicit slot.
     slots: u32,
     /// The full MAKEFLAGS value to install (budget + fifo auth with the
@@ -179,7 +179,7 @@ impl JobserverBridge {
         Ok(Self {
             host_path,
             _writer: writer,
-            _directory: directory,
+            _directory: Some(directory),
             slots,
             makeflags,
         })
@@ -189,6 +189,47 @@ impl JobserverBridge {
     #[must_use]
     pub fn makeflags(&self) -> &str {
         &self.makeflags
+    }
+
+    /// An exact-input target clone uses a NEW private HOME on every attempt.
+    /// Give that attempt's independent FIFO a stable canonical name so the
+    /// actual environment can be keyed verbatim. NOREPLACE never overwrites a
+    /// prior or caller-created node; the ordinary mint/cleanup budget is kept.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mint_for_private_home(
+        grant_slots: u32,
+        home: &tempfile::TempDir,
+    ) -> std::io::Result<Self> {
+        let mut bridge = Self::mint(grant_slots, home.path())?;
+        let stable = home.path().join(".rabs-cargo-jobserver.fifo");
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &bridge.host_path,
+            rustix::fs::CWD,
+            &stable,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
+        bridge.host_path = stable;
+        // The randomized mint directory is now empty. It must not remain
+        // visible in the otherwise fresh HOME of an exact-input Cargo run.
+        drop(bridge._directory.take());
+        bridge.makeflags = format!(
+            "-j{} --jobserver-auth=fifo:{}/.rabs-cargo-jobserver.fifo",
+            bridge.slots,
+            rabs_sandbox::layout::HOME,
+        );
+        Ok(bridge)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn mint_for_private_home(
+        _grant_slots: u32,
+        _home: &tempfile::TempDir,
+    ) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "private Cargo target state requires Linux",
+        ))
     }
 
     /// Install one authority for Cargo and make on the FINAL environment.
@@ -233,25 +274,68 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn private_home_bridges_have_stable_environment_and_independent_fifo_owners() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let a = JobserverBridge::mint_for_private_home(3, &first).unwrap();
+        let b = JobserverBridge::mint_for_private_home(3, &second).unwrap();
+        assert_eq!(a.makeflags(), b.makeflags());
+        assert_ne!(a.host_path, b.host_path);
+        let left = std::fs::metadata(&a.host_path).unwrap();
+        let right = std::fs::metadata(&b.host_path).unwrap();
+        assert!(left.file_type().is_fifo());
+        assert!(right.file_type().is_fifo());
+        assert_ne!(left.ino(), right.ino());
+        assert_eq!(std::fs::read_dir(first.path()).unwrap().count(), 1);
+        assert!(JobserverBridge::mint_for_private_home(3, &first).is_err());
+        assert_eq!(std::fs::metadata(&a.host_path).unwrap().ino(), left.ino());
+        drop(a);
+        assert_eq!(std::fs::read_dir(first.path()).unwrap().count(), 0);
+        assert!(b.host_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn dependency_bridge_preserves_num_jobs_absent_empty_and_exact_value() {
         let root = tempfile::tempdir().unwrap();
         let bridge = JobserverBridge::mint(3, root.path()).unwrap();
         for original in [None, Some(""), Some("19")] {
             let mut env = env_of(&[
-                ("CUSTOM", "exact value"), ("CARGO_MAKEFLAGS", "--jobserver-auth=999,1000"),
-                ("MFLAGS", "stale"), ("MAKEFLAGS", "-j777"),
+                ("CUSTOM", "exact value"),
+                ("CARGO_MAKEFLAGS", "--jobserver-auth=999,1000"),
+                ("MFLAGS", "stale"),
+                ("MAKEFLAGS", "-j777"),
             ]);
             if let Some(value) = original {
                 env.push(("NUM_JOBS".into(), value.into()));
             }
             JobserverBridge::apply_dependency(&mut env, &bridge);
-            let number = env.iter().find(|(name, _)| name == "NUM_JOBS").map(|(_, value)| value.as_str());
+            let number = env
+                .iter()
+                .find(|(name, _)| name == "NUM_JOBS")
+                .map(|(_, value)| value.as_str());
             assert_eq!(number, original);
-            assert_eq!(env.iter().filter(|(name, _)| name == "MAKEFLAGS").count(), 1);
-            assert_eq!(env.iter().find(|(name, _)| name == "MAKEFLAGS").unwrap().1, bridge.makeflags());
-            assert_eq!(env.iter().find(|(name, _)| name == "CARGO_MAKEFLAGS").unwrap().1, bridge.makeflags());
+            assert_eq!(
+                env.iter().filter(|(name, _)| name == "MAKEFLAGS").count(),
+                1
+            );
+            assert_eq!(
+                env.iter().find(|(name, _)| name == "MAKEFLAGS").unwrap().1,
+                bridge.makeflags()
+            );
+            assert_eq!(
+                env.iter()
+                    .find(|(name, _)| name == "CARGO_MAKEFLAGS")
+                    .unwrap()
+                    .1,
+                bridge.makeflags()
+            );
             assert!(!env.iter().any(|(name, _)| name == "MFLAGS"));
-            assert_eq!(env.iter().find(|(name, _)| name == "CUSTOM").unwrap().1, "exact value");
+            assert_eq!(
+                env.iter().find(|(name, _)| name == "CUSTOM").unwrap().1,
+                "exact value"
+            );
         }
     }
 
@@ -348,7 +432,10 @@ mod tests {
         let first = JobserverBridge::mint(2, home.path()).unwrap();
         let second = JobserverBridge::mint(3, home.path()).unwrap();
         assert_ne!(first.host_path, second.host_path);
-        assert_ne!(first._directory.path(), second._directory.path());
+        assert_ne!(
+            first._directory.as_ref().unwrap().path(),
+            second._directory.as_ref().unwrap().path()
+        );
         assert!(
             first
                 .makeflags()
@@ -356,14 +443,14 @@ mod tests {
         );
         assert!(!first.makeflags().contains("/__rabs/workspace"));
         assert_eq!(
-            std::fs::metadata(first._directory.path())
+            std::fs::metadata(first._directory.as_ref().unwrap().path())
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777,
             0o700
         );
-        let first_dir = first._directory.path().to_path_buf();
+        let first_dir = first._directory.as_ref().unwrap().path().to_path_buf();
         drop(first);
         assert!(!first_dir.exists());
         assert!(

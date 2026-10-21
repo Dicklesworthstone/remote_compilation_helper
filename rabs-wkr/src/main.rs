@@ -486,10 +486,12 @@ fn main() {
         Some("--help") => {
             println!(
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
-                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]\n\
+                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--target-cache-bytes N]\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Reconnects with bounded backoff after session loss; execution is never replayed.\n\
                  --once performs one session only, without reconnecting.\n\
+                 --target-cache-bytes opts into bounded private Cargo target seeds (default 0/off).\n\
+                 Exact inputs may reuse local target state; Cargo still executes every time.\n\
                  Select output_transfer=ranges-v1 and artifact_transfer=files-v1 in session-ok\n\
                  to retrieve diagnostics and declared compiled artifacts.\n\
                  Select source_transfer=source-files-v1 to upload verified source before execution.\n\
@@ -518,6 +520,7 @@ fn main() {
             .unwrap_or_else(|| "worker".to_string())
     });
     let mut once = false;
+    let mut target_cache_bytes = 0_u64;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -528,6 +531,17 @@ fn main() {
                 }
             }
             "--once" => once = true,
+            "--target-cache-bytes" => {
+                target_cache_bytes = match iter.next().and_then(|value| value.parse::<u64>().ok()) {
+                    Some(bytes) if bytes <= rabs_wkr::target_cache::MAX_TARGET_CACHE_BYTES => bytes,
+                    _ => {
+                        eprintln!(
+                            "rabs-wkr: --target-cache-bytes requires an integer from 0 to 8589934592"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+            }
             other => {
                 eprintln!("rabs-wkr: unknown argument {other:?} (see --help)");
                 std::process::exit(2);
@@ -543,6 +557,17 @@ fn main() {
         Err(error) => {
             eprintln!("rabs-wkr: shared host budget configuration: {error}");
             std::process::exit(1);
+        }
+    };
+    let target_cache = if target_cache_bytes == 0 {
+        None
+    } else {
+        match rabs_wkr::target_cache::TargetCache::new(target_cache_bytes) {
+            Ok(cache) => Some(std::sync::Arc::new(cache)),
+            Err(error) => {
+                eprintln!("rabs-wkr: target state configuration: {error}");
+                std::process::exit(1);
+            }
         }
     };
     // Persist ownership before any runtime task or network advertisement. An IO
@@ -568,7 +593,10 @@ fn main() {
         report,
         once,
         journal,
-        host_budget,
+        reconnect::RuntimeResources {
+            host_budget,
+            target_cache,
+        },
     ));
 }
 
@@ -1559,7 +1587,7 @@ async fn session_loop(
     once: bool,
     journal: &mut WorkerJournal,
     admitted_at: &mut Option<std::time::Instant>,
-    host_budget: Option<std::sync::Arc<HostBudget>>,
+    resources: reconnect::RuntimeResources,
 ) -> Result<(), String> {
     let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
     cx.trace("rabs-wkr connected to coordinator");
@@ -1574,6 +1602,8 @@ async fn session_loop(
             ResultRecipient::LoopbackFixture
         }
     };
+    let target_scope =
+        rabs_wkr::target_cache::TargetCacheScope::new(&report.worker_id, coordinator, &recipient);
     let (
         capture_output,
         capture_artifacts,
@@ -1742,7 +1772,8 @@ async fn session_loop(
             let home = home.clone();
             let spills = spills.clone();
             let slots = report.slots;
-            let host_budget = host_budget.clone();
+            let host_budget = resources.host_budget.clone();
+            let target_cache = resources.target_cache.clone();
             let id = request.request_id;
             let retention = retain_result
                 .then(|| RetentionTarget::from_admitted(&journal_root, id, recipient.clone()))
@@ -1757,6 +1788,7 @@ async fn session_loop(
                 let resources = ExecutionResources {
                     slots,
                     host_budget: host_budget.as_deref(),
+                    target_cache: target_cache.as_ref().map(|cache| (cache, target_scope)),
                 };
                 match source.as_ref() {
                     Some(source) => execute_uploaded_canonical_controlled(
@@ -1972,6 +2004,7 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
 }
 
 #[cfg(test)]
+#[path = "tests"]
 mod tests {
     use super::*;
     use asupersync::io::ReadBuf;
@@ -1982,6 +2015,7 @@ mod tests {
     use std::task::{Context, Wake, Waker};
     use std::time::Instant;
 
+    #[path = "../main/tests/dependency_tests.rs"]
     mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;

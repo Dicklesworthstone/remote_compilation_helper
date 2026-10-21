@@ -129,6 +129,13 @@ fn shutdown_exit(report: &CapabilityReport, journal: &WorkerJournal) -> i32 {
     i32::from(!clean)
 }
 
+/// Worker-owned resources retained across reconnects and dropped after drain.
+#[derive(Clone)]
+pub(super) struct RuntimeResources {
+    pub host_budget: Option<Arc<rabs_wkr::host_budget::HostBudget>>,
+    pub target_cache: Option<Arc<rabs_wkr::target_cache::TargetCache>>,
+}
+
 /// Run until process shutdown or an unrecoverable journal failure. `once` keeps
 /// the explicit one-session operator/test contract, including no connect retry.
 /// Socket errors and peer EOF never cause the caller to replay a compiler.
@@ -137,7 +144,7 @@ pub(super) fn run(
     report: CapabilityReport,
     once: bool,
     mut journal: WorkerJournal,
-    host_budget: Option<Arc<rabs_wkr::host_budget::HostBudget>>,
+    resources: RuntimeResources,
 ) -> i32 {
     // This strong scope spans reconnects but not process exit. The registry is
     // weak, so every ordinary return releases idle datasets AFTER session drain.
@@ -167,7 +174,7 @@ pub(super) fn run(
         let handle = runtime.handle();
         let endpoint = coordinator.clone();
         let capability = Arc::clone(&report);
-        let host_budget = host_budget.clone();
+        let resources = resources.clone();
         let shutdown = controller.subscribe();
         let (outcome, returned_journal, admitted_for) =
             crate::block_on_worker_runtime(&runtime, async move {
@@ -185,7 +192,7 @@ pub(super) fn run(
                                 once,
                                 &mut journal,
                                 &mut admitted_at,
-                                host_budget,
+                                resources,
                             ),
                         )
                         .await;

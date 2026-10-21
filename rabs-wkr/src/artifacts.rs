@@ -151,6 +151,10 @@ impl ArtifactPlan {
     pub fn files(&self) -> impl Iterator<Item = &str> {
         self.files.iter().map(String::as_str)
     }
+
+    pub(crate) const fn cargo_mode(&self) -> Option<CargoArtifactMode> {
+        self.cargo
+    }
 }
 
 /// Fresh output backing owned by exactly one execution. The host path is never
@@ -173,10 +177,28 @@ impl PreparedArtifacts {
             builder.permissions(fs::Permissions::from_mode(0o700));
         }
         let directory = builder.tempdir()?;
+        Self::with_directory(plan, directory)
+    }
+
+    fn with_directory(plan: ArtifactPlan, directory: tempfile::TempDir) -> io::Result<Self> {
         for relative in &plan.directories {
             fs::create_dir_all(directory.path().join(relative))?;
         }
         Ok(Self { plan, directory })
+    }
+
+    /// Stable physical fixture paths model canonical mount destinations without
+    /// pretending a host test has entered the production mount namespace.
+    #[cfg(test)]
+    pub(crate) fn fixture(plan: ArtifactPlan, parent: &Path) -> io::Result<Self> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("target").rand_bytes(0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        Self::with_directory(plan, builder.tempdir_in(parent)?)
     }
 
     /// Worker-local backing for the canonical mount, not a wire destination.
@@ -207,7 +229,7 @@ impl PreparedArtifacts {
     /// capture the complete tree using the ordinary descriptor-anchored path.
     /// A caller cannot turn an unresolved Cargo plan into a successful capture.
     pub(crate) fn capture_with_cargo_output(
-        mut self,
+        &self,
         dependency_inputs: Option<&DependencyOutputInputs>,
         stdout: impl Read,
         stopped: impl Fn() -> bool,
@@ -220,12 +242,12 @@ impl PreparedArtifacts {
                 "Cargo artifact capture interrupted or has dependency-only inputs",
             ));
         }
-        let admitted_plan = self.plan.clone();
         let report = CargoArtifactReport::read(stdout, &self.plan.virtual_root(), mode)?;
-        self.plan.files.extend(report.files().map(str::to_owned));
-        rabs_sandbox::artifact_tree::validate_tree_names(self.plan.files())?;
-        self.plan.cargo = None;
-        let mut captured = self.capture_with_dependency_inputs(None, stopped)?;
+        let mut resolved = self.plan.clone();
+        resolved.files.extend(report.files().map(str::to_owned));
+        rabs_sandbox::artifact_tree::validate_tree_names(resolved.files())?;
+        resolved.cargo = None;
+        let mut captured = self.capture_tree(&resolved, stopped)?;
         report.validate_outputs(
             captured
                 .files
@@ -234,7 +256,7 @@ impl PreparedArtifacts {
         )?;
         // Dynamic names constrain capture; they do not change the declaration
         // admitted by ExecutionControl or the durable request fingerprint.
-        captured.plan = admitted_plan;
+        captured.plan = self.plan.clone();
         Ok(captured)
     }
 
@@ -263,7 +285,7 @@ impl PreparedArtifacts {
     /// guard. Arbitrary undeclared files remain errors. The original output
     /// directory stays owned until both capture and the final guard check end.
     pub(crate) fn capture_with_dependency_inputs(
-        self,
+        &self,
         dependency_inputs: Option<&DependencyOutputInputs>,
         stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
@@ -278,7 +300,7 @@ impl PreparedArtifacts {
         if self.plan.tree {
             #[cfg(target_os = "linux")]
             {
-                let captured = self.capture_tree(stopped)?;
+                let captured = self.capture_tree(&self.plan, stopped)?;
                 if let Some(inputs) = dependency_inputs {
                     inputs.verify(self.backing())?;
                 }
@@ -377,17 +399,29 @@ impl PreparedArtifacts {
         Ok(captured)
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn capture_tree(
+        &self,
+        _plan: &ArtifactPlan,
+        _stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "artifact tree capture requires Linux",
+        ))
+    }
+
     #[cfg(target_os = "linux")]
-    fn capture_tree(&self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
+    fn capture_tree(
+        &self,
+        plan: &ArtifactPlan,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         use std::os::unix::fs::PermissionsExt;
 
-        let inventory = TreeInventory::scan(
-            self.backing(),
-            &self.plan.files,
-            MAX_ARTIFACT_BYTES,
-            &stopped,
-        )?;
+        let inventory =
+            TreeInventory::scan(self.backing(), &plan.files, MAX_ARTIFACT_BYTES, &stopped)?;
         let mut files = BTreeMap::new();
         for name in inventory.names() {
             let file = inventory.open_file(name)?;
@@ -412,7 +446,7 @@ impl PreparedArtifacts {
             );
         }
         inventory.verify(&stopped)?;
-        let bundle = finish_capture(self.plan.clone(), files)?;
+        let bundle = finish_capture(plan.clone(), files)?;
         if bundle.total_bytes != inventory.total_bytes() {
             return Err(invalid("artifact tree changed length during capture"));
         }
@@ -566,6 +600,10 @@ impl CapturedArtifacts {
         self.files
             .get(name)
             .map(|file| (file.bytes.len(), file.bytes.sha256(), file.executable))
+    }
+
+    pub(crate) fn file_names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
     }
 }
 

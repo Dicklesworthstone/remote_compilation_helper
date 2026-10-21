@@ -28,4 +28,5 @@ pub mod root_admission;
 pub mod session;
 pub mod source_task;
 pub mod source_transfer;
+pub mod target_cache;
 pub mod toolchain_transfer;

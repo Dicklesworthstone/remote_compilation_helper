@@ -280,6 +280,32 @@ mod linux {
             self.files.keys().map(String::as_str)
         }
 
+        /// Inventoried directories, including the empty name for the root.
+        /// Private Cargo target clones preserve empty OUT_DIRs as well as files;
+        /// the artifact transport continues to describe only regular files.
+        pub fn directory_names(&self) -> impl Iterator<Item = &str> {
+            self.directories.keys().map(String::as_str)
+        }
+
+        /// Open a directory through the same anchored, no-follow inventory.
+        /// The descriptor may be used to preserve its original timestamp in a
+        /// separate private clone, never to change an immutable shared object.
+        pub fn open_directory(&self, name: &str) -> io::Result<File> {
+            let expected = self
+                .directories
+                .get(name)
+                .ok_or_else(|| invalid("unknown tree directory"))?;
+            let directory = if name.is_empty() {
+                self.root.try_clone()?
+            } else {
+                self.open(name, OFlags::RDONLY | OFlags::DIRECTORY)?
+            };
+            if &Stamp::of(&directory.metadata()?) != expected {
+                return Err(invalid("artifact directory changed during capture"));
+            }
+            Ok(directory)
+        }
+
         /// Counts each exported alias's bytes because each is copied independently.
         #[must_use]
         pub const fn total_bytes(&self) -> u64 {

@@ -119,6 +119,7 @@ pub struct ExecutionControl {
     lease: Arc<Mutex<Option<ExecutionLease>>>,
     output: Arc<Mutex<OutputCapture>>,
     artifacts: Arc<Mutex<ArtifactCapture>>,
+    target_seed: Arc<Mutex<Option<crate::target_cache::PendingTargetSeed>>>,
     preview: Arc<LiveOutputPreview>,
 }
 
@@ -170,6 +171,7 @@ impl ExecutionControl {
             lease: Arc::new(Mutex::new(lease)),
             output: Arc::new(Mutex::new(OutputCapture::default())),
             artifacts: Arc::new(Mutex::new(ArtifactCapture::default())),
+            target_seed: Arc::new(Mutex::new(None)),
             preview: Arc::new(LiveOutputPreview::default()),
         })
     }
@@ -336,6 +338,23 @@ impl ExecutionControl {
         Ok(())
     }
 
+    /// Keep optional hot state private until completion validates cleanup,
+    /// diagnostics, artifacts and the frozen interruption frontier together.
+    pub(crate) fn retain_target_seed(
+        &self,
+        seed: crate::target_cache::PendingTargetSeed,
+    ) -> io::Result<()> {
+        let mut pending = self
+            .target_seed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending.is_some() || self.state.load(Ordering::Acquire) & FINISHED != 0 {
+            return Err(io::Error::other("target state already completed"));
+        }
+        *pending = Some(seed);
+        Ok(())
+    }
+
     /// Freeze the result frontier, including interrupted executions. Retain
     /// the first stop reason while rejecting all later capture writes. Taking
     /// the capture locks in one fixed order makes the freeze atomic relative
@@ -343,6 +362,7 @@ impl ExecutionControl {
     pub(crate) fn finish(&self) -> Option<StopReason> {
         let _output = self.output.lock().unwrap_or_else(|e| e.into_inner());
         let _artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
+        let _target_seed = self.target_seed.lock().unwrap_or_else(|e| e.into_inner());
         let mut lease = self.lease.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.observe_reason(&mut lease, Instant::now());
         if let Some(lease) = lease.as_mut() {
@@ -372,6 +392,13 @@ fn complete_result(
     mut result: ExecResult,
     stop_reason: Option<StopReason>,
 ) -> Result<ExecutionCompletion, String> {
+    // Taking ownership immediately also releases the reservation on every
+    // error/early return. A failed result can never leave a publishable seed.
+    let target_seed = control
+        .target_seed
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
     // Process cleanup is a prerequisite for EVERY completion, including
     // digest-only requests, compiler failures and interrupted executions.
     // Otherwise a resumable result can outlive children that still mutate
@@ -422,6 +449,16 @@ fn complete_result(
         // them before cancellation won. Diagnostics remain available separately.
         None
     };
+    drop(capture);
+    if result.executed
+        && result.exit_code == 0
+        && stop_reason.is_none()
+        && artifacts.is_some()
+        && control.state.load(Ordering::Acquire) == FINISHED
+        && let Some(seed) = target_seed
+    {
+        seed.publish();
+    }
     Ok(ExecutionCompletion {
         result,
         stop_reason,

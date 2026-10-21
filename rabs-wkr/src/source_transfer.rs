@@ -1019,6 +1019,44 @@ impl SourceOwner {
         }
     }
 
+    /// The verified runtime workspace and complete transport identity for an
+    /// optional worker-local Cargo target clone. This conveys no action-cache
+    /// authority and never grants a caller-selected path access to the pool.
+    pub(crate) fn target_cache_inputs(
+        &self,
+        request_id: u64,
+    ) -> io::Result<crate::target_cache::WorkspaceInputs> {
+        if self.source_failed || request_id != self.request_id || !self.execution_owned {
+            return Err(io::Error::other(
+                "target state requires an admitted source owner",
+            ));
+        }
+        let root = self.workspace_root()?.to_path_buf();
+        let projection = self
+            .cargo_home
+            .as_ref()
+            .map(|home| (home.version().to_owned(), home.prefix().to_owned()));
+        let source = self.receiver.manifest();
+        let files = source
+            .files()
+            .iter()
+            .filter(|file| {
+                !projection.as_ref().is_some_and(|(version, prefix)| {
+                    version != rabs_sandbox::cargo_home::CARGO_HOME_SOURCE_VERSION
+                        && file.path.starts_with(&format!("{prefix}/"))
+                })
+            })
+            .cloned()
+            .collect();
+        Ok(crate::target_cache::WorkspaceInputs {
+            root,
+            manifest: SourceManifest::new(files)?,
+            full_source_digest: source.digest(),
+            projection,
+            runtime_owner: None,
+        })
+    }
+
     /// Every readiness response uses the same post-I/O deadline frontier.
     /// Cached-file reuse and verification cannot renew the original budget.
     fn ready(&self) -> Result<Value, String> {

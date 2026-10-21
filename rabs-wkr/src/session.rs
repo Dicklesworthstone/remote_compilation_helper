@@ -480,6 +480,10 @@ const EXEC_STREAM_RESIDENT_BOUND: usize = 1024 * 1024;
 pub struct ExecutionResources<'a> {
     pub slots: u32,
     pub host_budget: Option<&'a crate::host_budget::HostBudget>,
+    pub target_cache: Option<(
+        &'a std::sync::Arc<crate::target_cache::TargetCache>,
+        crate::target_cache::TargetCacheScope,
+    )>,
 }
 
 impl ExecutionResources<'_> {
@@ -488,6 +492,7 @@ impl ExecutionResources<'_> {
         Self {
             slots,
             host_budget: None,
+            target_cache: None,
         }
     }
 }
@@ -672,8 +677,28 @@ fn execute_canonical_inner(
     // The peer supplies only a declaration; this execution owns fresh physical
     // backing. Use D005's existing mount builder and keep the owner alive until
     // the process and drains have resolved and the exact output set is captured.
-    let artifacts = match control
-        .artifact_plan()
+    let artifact_plan = control.artifact_plan();
+    let hot_inputs = if resources.target_cache.is_some()
+        && request.dependency_context.is_none()
+        && request.toolchain_identity.is_some()
+        && artifact_plan
+            .as_ref()
+            .is_some_and(|plan| plan.cargo_mode().is_some())
+    {
+        source.and_then(|source| {
+            match source.target_cache_inputs(request.request_id) {
+                Ok(inputs) => Some(inputs),
+                Err(error) => {
+                    eprintln!("{}", serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":error.to_string()}));
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+    let mut artifacts = match artifact_plan
+        .clone()
         .map(PreparedArtifacts::new)
         .transpose()
     {
@@ -686,9 +711,11 @@ fn execute_canonical_inner(
     // A dependency execution must not inherit files written into the worker's
     // persistent canonical HOME by a prior command. Only this fresh owner and
     // its jobserver FIFO are visible at the runtime mount, until drains resolve.
-    let dependency_home = if request.dependency_context.is_some() {
+    // Hot Cargo state also uses an independent fresh HOME: a prior command's
+    // runtime files must not become unkeyed inputs of a later target clone.
+    let private_home = if request.dependency_context.is_some() || hot_inputs.is_some() {
         match tempfile::Builder::new()
-            .prefix("rabs-dependency-home-")
+            .prefix("rabs-private-home-")
             .tempdir()
         {
             Ok(directory) => Some(directory),
@@ -701,9 +728,28 @@ fn execute_canonical_inner(
     } else {
         None
     };
-    let execution_home = dependency_home
+    let execution_home = private_home
         .as_ref()
         .map_or(home_backing, |directory| directory.path());
+    let private_cargo_home = if hot_inputs.is_some() {
+        match tempfile::Builder::new()
+            .prefix("rabs-target-cargo-home-")
+            .tempdir()
+        {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                let _ = control.retain_outputs(Err(format!("Cargo runtime preparation: {error}")));
+                return exec_error(request.request_id);
+            }
+        }
+    } else {
+        None
+    };
+    // A captured Cargo-home projection replaces this empty backing through the
+    // source owner's existing validation; no persistent mutable home is seeded.
+    let execution_cargo_home = private_cargo_home
+        .as_ref()
+        .map_or(cargo_home_backing, |directory| directory.path());
     // This fresh empty tree is a separate owner: exposing it under writable
     // HOME as well would let a compiler populate a supposedly empty input.
     let dependency_empty = if request.dependency_context.is_some() {
@@ -799,8 +845,8 @@ fn execute_canonical_inner(
             let mut plan = CanonicalMountPlan::new(
                 toolchain.root(),
                 &request.workspace_backing,
-                cargo_home_backing,
-                home_backing,
+                execution_cargo_home,
+                execution_home,
             );
             if let Some(artifacts) = &artifacts {
                 plan.out_units.push(artifacts.mount());
@@ -828,16 +874,111 @@ fn execute_canonical_inner(
             return exec_error(request.request_id);
         }
     };
+    // Existing source protection validates the ORIGINAL sealed owner first.
+    // Only an independently verified copy may have its timestamps restored for
+    // Cargo freshness. Hold this owner even if optional target acquisition fails.
+    let hot_inputs = hot_inputs.and_then(|inputs| {
+        let original = inputs.root.clone();
+        match inputs.private_runtime_clone(&|| control.reason().is_some()) {
+            Ok(runtime) => {
+                let bind = spec.ro_binds.iter_mut().find(|bind| {
+                    bind.visible == std::path::Path::new(rabs_sandbox::layout::WORKSPACE)
+                        && bind.backing == original
+                });
+                if let Some(bind) = bind {
+                    bind.backing = runtime.root.clone();
+                    Some(runtime)
+                } else {
+                    eprintln!("{}", serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":"sealed source mount was not found for private runtime cloning"}));
+                    None
+                }
+            }
+            Err(error) => {
+                eprintln!("{}", serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":error.to_string()}));
+                None
+            }
+        }
+    });
+    if let Err(error) = toolchain.validate_namespace(&spec)
+        && request.dependency_context.is_none()
+    {
+        let _ = control.retain_outputs(Err(format!("runtime source clone isolation: {error}")));
+        return exec_error(request.request_id);
+    }
     // Worker-local jobserver authority runs on the FINAL env: extra_env
     // may carry smuggled coordination keys, so replacement must see them.
     // One real FIFO budget is held until the process group and drains resolve.
     // Runtime coordination belongs in writable HOME, never in verified source.
-    let bridge = match crate::jobserver::JobserverBridge::mint(grant, execution_home) {
+    let bridge = match if hot_inputs.is_some() {
+        crate::jobserver::JobserverBridge::mint_for_private_home(
+            grant,
+            private_home.as_ref().expect("hot Cargo has a private HOME"),
+        )
+    } else {
+        crate::jobserver::JobserverBridge::mint(grant, execution_home)
+    } {
         Ok(bridge) => bridge,
         Err(_) => return exec_error(request.request_id),
     };
-    let launch = if let Some(context) = &request.dependency_context {
+    if request.dependency_context.is_some() {
         crate::jobserver::JobserverBridge::apply_dependency(&mut spec.env, &bridge);
+    } else {
+        crate::jobserver::JobserverBridge::apply(&mut spec.env, &bridge);
+    }
+    let mut target_attempt = None;
+    if let (Some((cache, scope)), Some(inputs), Some(plan)) = (
+        resources.target_cache,
+        hot_inputs.as_ref(),
+        artifact_plan.as_ref(),
+    ) {
+        let prepared =
+            crate::target_cache::target_key(scope, request, inputs, &spec, &support, plan, grant)
+                .and_then(|key| {
+                    cache.acquire(
+                        key,
+                        inputs.clone(),
+                        || PreparedArtifacts::new(plan.clone()),
+                        request.request_id,
+                        &|| control.reason().is_some(),
+                    )
+                });
+        match prepared {
+            Ok((attempt, restored)) => {
+                if let Some(restored) = restored {
+                    let current = artifacts
+                        .as_ref()
+                        .expect("Cargo target has an artifact owner");
+                    let visible = std::path::PathBuf::from(plan.virtual_root());
+                    let bind = spec
+                        .rw_binds
+                        .iter_mut()
+                        .find(|bind| bind.visible == visible && bind.backing == current.backing());
+                    let Some(bind) = bind else {
+                        let _ = control
+                            .retain_outputs(Err("Cargo target mount ownership changed".to_owned()));
+                        return exec_error(request.request_id);
+                    };
+                    bind.backing = restored.backing().to_path_buf();
+                    artifacts = Some(restored);
+                    if let Err(error) = toolchain.validate_namespace(&spec) {
+                        let _ = control
+                            .retain_outputs(Err(format!("target clone mount isolation: {error}")));
+                        return exec_error(request.request_id);
+                    }
+                }
+                target_attempt = Some(attempt);
+            }
+            Err(error) => {
+                // Hot state is optional. The fresh target remains owned and no
+                // partially verified clone can reach the namespace launcher.
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":error.to_string()})
+                );
+            }
+        }
+    }
+    let launch = if let Some(context) = &request.dependency_context {
         rabs_sandbox::dependency_context::build_dependency_argv(
             context,
             &spec,
@@ -846,7 +987,6 @@ fn execute_canonical_inner(
             &request.args,
         )
     } else {
-        crate::jobserver::JobserverBridge::apply(&mut spec.env, &bridge);
         build_canonical_argv(&spec, &support, &request.program, &request.args)
     };
     let launch = match launch {
@@ -1068,6 +1208,20 @@ fn execute_canonical_inner(
                         }
                         Ok(captured)
                     });
+                if let (Some(attempt), Ok(captured)) = (target_attempt, &capture) {
+                    match attempt.stage(&artifacts, captured, &|| control.reason().is_some()) {
+                        Ok(Some(seed)) => {
+                            let _ = control.retain_target_seed(seed);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":error.to_string()})
+                            );
+                        }
+                    }
+                }
                 // Retain failure as evidence. A zero compiler exit is NOT a
                 // successful completion if its requested artifact set is missing.
                 if control
