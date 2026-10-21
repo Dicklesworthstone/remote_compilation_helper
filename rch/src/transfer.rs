@@ -3150,12 +3150,24 @@ impl TransferPipeline {
         // umask: a leaked 077 made every remote output 0600/0700, and rsync -a
         // carried those modes home.
         let supervisor = format!(
-            "trap '' HUP; ( {command}\n); s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
+            "trap '' HUP; ( {command}\n) </dev/null; s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
             identity = quote(identity),
             pending = quote(&format!("{path}.pending")),
             done = quote(path),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
         );
+        // The disk/process wrappers already contain quoted scripts. Passing
+        // their composition as one more `sh -c` argument can exceed Linux's
+        // per-argument limit before the supervisor even starts (bd-l4rh4).
+        // Feed the script literally instead; only the shell reads this stdin,
+        // while the workload still receives /dev/null. Keep nohup so channel
+        // loss cannot kill the supervisor before it publishes its receipt.
+        let delimiter = loop {
+            let candidate = format!("RCH_SUPERVISOR_{}", uuid::Uuid::new_v4().simple());
+            if !supervisor.lines().any(|line| line == candidate) {
+                break candidate;
+            }
+        };
         // Each follower copies its log by byte offset and decides completion
         // itself: it samples the receipt BEFORE the size, so once the receipt
         // exists the size it reads is final, and it leaves only after a pass
@@ -3189,7 +3201,7 @@ impl TransferPipeline {
         // ordinary compiler failure would incorrectly authorize release.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
-             nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
+             nohup sh -s >{out} 2>{err} <<'{delimiter}' &\n{supervisor}\n{delimiter}\n\
              p=$!; \
              rch_follow() {{ h=; trap '[ -z \"$h\" ] || kill \"$h\" 2>/dev/null; exit 1' TERM; \
                o=0; while :; do if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
@@ -3214,7 +3226,6 @@ impl TransferPipeline {
             err = quote(&format!("{path}.stderr")),
             out_progress = quote(&format!("{path}.stdout.progress")),
             err_progress = quote(&format!("{path}.stderr.progress")),
-            supervisor = quote(&supervisor),
             done = quote(path),
             identity = quote(identity),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
@@ -10231,6 +10242,112 @@ mod tests {
         assert!(stdout.ends_with("line-19999\n"), "tail was cut");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "last\n");
         assert!(std::path::Path::new(&receipt).is_file());
+    }
+
+    /// A real shell must start a supervisor larger than Linux MAX_ARG_STRLEN,
+    /// without expanding its contents or exposing the script as workload stdin.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_execution_large_script_preserves_literal_bytes_and_stdin() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let receipt = directory.join("completion");
+        let pipeline = disk_budget_test_pipeline(&directory, None, 15)
+            .with_recovery_completion(receipt.to_str().unwrap().into(), "large".into());
+        let literal = "$(printf expanded) `printf expanded` $HOME 'quoted'";
+        let command = pipeline.durable_execution_command(format!(
+            "# {}\nif read -r unexpected; then exit 99; fi; printf '%s' {}; printf 'last\\n' >&2; exit 3",
+            "x".repeat(256 * 1024),
+            escape(Cow::Borrowed(literal)),
+        ));
+        let script = directory.join("command.sh");
+        std::fs::write(&script, &command).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("sh").arg(&script).kill_on_drop(true).output(),
+        )
+        .await
+        .expect("large supervisor must finish")
+        .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        assert_eq!(output.stdout, literal.as_bytes());
+        assert_eq!(output.stderr, b"last\n");
+        assert_eq!(std::fs::read_to_string(receipt).unwrap(), "large 3\n");
+    }
+
+    /// Exercise the actual disk + process-identity + durable composition that
+    /// exceeded the argv limit, including refusal and deadline receipts.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_execution_composed_disk_budget_preserves_all_outcomes() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (index, (workload, status, seconds, refuse)) in [
+            ("printf built > artifact; printf ready", 0, 15, false),
+            ("printf 'compiler failed' >&2; exit 101", 101, 15, false),
+            ("exec sleep 20", 137, 1, false),
+            ("printf forbidden > artifact", 120, 15, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = retained.join(index.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let receipt = directory.join("completion");
+            let mut pipeline =
+                disk_budget_test_pipeline(&directory, Some(index as u64 + 1), seconds)
+                    .with_recovery_completion(receipt.to_str().unwrap().into(), "composed".into());
+            if refuse {
+                pipeline = pipeline.with_disk_budget(Some(rch_common::BuildDiskBudget {
+                    max_growth_bytes: 8 << 20,
+                    min_free_bytes: u64::MAX,
+                }));
+            }
+            let command =
+                pipeline.durable_execution_command(pipeline.build_remote_command(workload, None));
+            let script = directory.join("command.sh");
+            std::fs::write(&script, command).unwrap();
+            let output = tokio::time::timeout(
+                Duration::from_secs(15),
+                Command::new("sh")
+                    .arg(&script)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &directory)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("composed supervisor must finish")
+            .unwrap();
+            let result = CommandResult {
+                exit_code: output.status.code().unwrap(),
+                stdout: String::from_utf8(output.stdout).unwrap(),
+                stderr: String::from_utf8(output.stderr).unwrap(),
+                duration_ms: 0,
+            };
+            assert_eq!(result.exit_code, status, "case {index}: {result:?}");
+            assert_eq!(
+                std::fs::read_to_string(&receipt).unwrap(),
+                format!("composed {status}\n")
+            );
+            if refuse {
+                let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
+                assert!(
+                    !error
+                        .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+                        .unwrap()
+                        .started
+                );
+                assert!(!directory.join("artifact").exists());
+            } else {
+                pipeline.ensure_remote_disk_budget(&result).unwrap();
+            }
+            if status == 0 {
+                assert_eq!(result.stdout, "ready");
+                assert_eq!(std::fs::read(directory.join("artifact")).unwrap(), b"built");
+            }
+        }
     }
 
     /// The build must create its outputs under the caller's umask; only the
