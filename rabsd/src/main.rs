@@ -276,7 +276,30 @@ fn prepare_from_arguments_with(
     args: &[String],
     before_capture: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>,
 ) -> std::io::Result<serde_json::Value> {
-    use rabsd::coord::source_delivery::prepare_source_bundle;
+    prepare_from_arguments_using(
+        args,
+        before_capture,
+        rabsd::coord::source_delivery::prepare_source_bundle,
+    )
+}
+
+fn prepare_template_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value> {
+    prepare_from_arguments_using(
+        args,
+        |_| Ok(()),
+        rabsd::coord::source_delivery::prepare_source_template,
+    )
+}
+
+fn prepare_from_arguments_using(
+    args: &[String],
+    before_capture: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>,
+    prepare: impl FnOnce(
+        &std::path::Path,
+        &serde_json::Value,
+        &std::path::Path,
+    ) -> std::io::Result<serde_json::Value>,
+) -> std::io::Result<serde_json::Value> {
     use rabsd::coord::worker_delivery::MAX_FRAME_BYTES;
     use std::io::{self, Read};
     use std::path::Path;
@@ -322,7 +345,7 @@ fn prepare_from_arguments_with(
     }
     let mut specification = serde_json::from_slice(&bytes)?;
     before_capture(&mut specification)?;
-    prepare_source_bundle(Path::new(source), &specification, Path::new(destination))
+    prepare(Path::new(source), &specification, Path::new(destination))
 }
 
 /// Preparation has no execution side effects, even on error. Return a single
@@ -385,8 +408,12 @@ fn main() {
                  Repeating a complete build verifies local delivery and outputs without a worker; --resume never executes.\n\
                  Combined TLS --prepare-from accepts request_id: \"allocate\" in local specifications only.\n\
                  It durably reserves a worker ID under RABS_STATE_DIR and holds admission through dispatch.\n\
-                 Saved bundles and recovery always keep their original numeric request IDs.\n\
+                 Direct build bundles and result recovery keep their original assigned numeric request IDs.\n\
                  DAEMON JOB: rabsd --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
+                 CAPTURE AND QUEUE: rabsd --job-build --prepare-from <source-root> <spec.json> <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
+                 --job-build requires request_id: \"allocate\", captures immutable inputs, queues once, then replays verified diagnostics.\n\
+                 Worker IDs are assigned only when the daemon claims each job. Client exit does not cancel it; use --job-cancel.\n\
+                 Retry admission of that SAME saved template/ID: --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
                  Inspect/cancel: --job-status <id32hex> | --job-cancel <id32hex>\n\
                  Wait and replay diagnostics: --job-wait <id32hex> [timeout-seconds]\n\
                  Follow live NDJSON previews: --job-follow <id32hex> [timeout-seconds]\n\
@@ -421,7 +448,9 @@ fn main() {
             std::process::exit(worker_exec::run_build_tls(&args[1..]));
         }
         Some(
-            "--job-submit"
+            "--job-build"
+            | "--job-submit"
+            | "--job-submit-allocated"
             | "--job-status"
             | "--job-wait"
             | "--job-follow"

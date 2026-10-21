@@ -29,7 +29,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod prepared_build;
-pub use prepared_build::{execute_prepared_operation, run_build, run_build_tls};
+pub use prepared_build::{
+    execute_prepared_operation, prepare_daemon_build, run_build, run_build_tls,
+};
 
 use rabsd::coord::secure_worker_delivery::OperationCancellation;
 
@@ -734,11 +736,9 @@ fn accept_tls_worker(
     // with our own still-held store lock. Recovery never allocates an ID.
     let admission = match reserved {
         Some(reserved) => reserved.into_admission(worker, pin, request_id)?,
-        None => PinnedWorkerAdmission::open(
-            &worker_admission_state(),
-            worker,
-            parse_worker_pin(pin)?,
-        )?,
+        None => {
+            PinnedWorkerAdmission::open(&worker_admission_state(), worker, parse_worker_pin(pin)?)?
+        }
     };
     let runtime = RuntimeBuilder::current_thread()
         .build()

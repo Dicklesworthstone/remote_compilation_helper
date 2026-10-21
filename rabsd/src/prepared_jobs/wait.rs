@@ -98,6 +98,7 @@ fn follow(
     mut sleep: impl FnMut(Duration),
 ) -> io::Result<Completion> {
     let mut identity: Option<String> = None;
+    let mut request_identity: Option<Option<u64>> = None;
     loop {
         remaining(until)?;
         let request = json!({"kind":"prepared-status", "operation_id":id});
@@ -117,6 +118,26 @@ fn follow(
             return Err(invalid("job request identity changed while waiting"));
         }
         identity = Some(digest.clone());
+        let request_id = match status.get("request_id") {
+            Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| invalid("invalid job worker request identity"))?,
+            ),
+            None => return Err(invalid("job status lacks its worker request identity")),
+        };
+        if let Some(previous) = request_identity {
+            match (previous, request_id) {
+                (None, None) => {}
+                (None, Some(id)) if id > 0 => {}
+                (Some(before), Some(after)) if before == after => {}
+                _ => return Err(invalid("job worker request identity changed while waiting")),
+            }
+        }
+        // A queued allocation template may acquire one positive worker ID.
+        // Numeric v1 jobs keep their original ID, including the historical 0.
+        request_identity = Some(request_id);
         match status["state"].as_str() {
             Some("queued" | "running" | "cancelling") => {
                 sleep(remaining(until)?.min(POLL_INTERVAL));
@@ -315,6 +336,44 @@ mod tests {
                 "identity changed"
             } else {
                 "lost status"
+            }));
+        }
+    }
+
+    #[test]
+    fn allocated_wait_accepts_only_one_positive_worker_identity_transition() {
+        for (before, after, accepted) in [
+            (Value::Null, json!(7), true),
+            (Value::Null, json!(0), false),
+            (json!(7), json!(8), false),
+            (json!(7), Value::Null, false),
+            (json!(0), json!(0), true),
+        ] {
+            let mut pending = status("queued");
+            pending["operation"]["request_id"] = before;
+            pending["operation"]["execution_may_have_run"] = json!(false);
+            let mut running = status("running");
+            running["operation"]["request_id"] = after.clone();
+            let mut uncertain = status("uncertain");
+            uncertain["operation"]["request_id"] = after;
+            let mut replies = std::collections::VecDeque::from([pending, running, uncertain]);
+            let mut calls = 0;
+            let error = follow(
+                ID,
+                Instant::now() + Duration::from_secs(2),
+                |query, _| {
+                    assert_eq!(query["kind"], "prepared-status");
+                    calls += 1;
+                    Ok(replies.pop_front().unwrap())
+                },
+                |_| {},
+            )
+            .unwrap_err();
+            assert_eq!(calls, if accepted { 3 } else { 2 });
+            assert!(error.to_string().contains(if accepted {
+                "uncertain"
+            } else {
+                "worker request identity changed"
             }));
         }
     }

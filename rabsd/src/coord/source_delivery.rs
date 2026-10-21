@@ -203,6 +203,40 @@ pub fn prepare_source_bundle(
     specification: &Value,
     destination: &Path,
 ) -> io::Result<Value> {
+    prepare_source_bundle_inner(source_root, specification, destination, false)
+}
+
+/// Capture immutable inputs for a daemon job whose worker request ID is not yet
+/// allocated. The saved request remains explicit LOCAL allocation intent and is
+/// rejected by every execution-wire validator. Only the daemon's exclusive
+/// claimed owner may bind an actual ID, immediately before authenticated dispatch.
+///
+/// # Errors
+/// The same capture/placement errors as [`prepare_source_bundle`], or any
+/// specification that does not request exactly `request_id: "allocate"`.
+pub fn prepare_source_template(
+    source_root: &Path,
+    specification: &Value,
+    destination: &Path,
+) -> io::Result<Value> {
+    require(
+        specification["kind"] == "canonical-exec"
+            && specification["request_id"].as_str() == Some("allocate"),
+        "daemon source templates require explicit request allocation intent",
+    )?;
+    let mut probe = specification.clone();
+    // This zero exists only during the ordinary source/request validators. It
+    // is never written to request.json, returned as an identity, or dispatched.
+    probe["request_id"] = json!(0);
+    prepare_source_bundle_inner(source_root, &probe, destination, true)
+}
+
+fn prepare_source_bundle_inner(
+    source_root: &Path,
+    specification: &Value,
+    destination: &Path,
+    allocation_intent: bool,
+) -> io::Result<Value> {
     let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
     require(
         destination.is_absolute()
@@ -354,6 +388,9 @@ pub fn prepare_source_bundle(
         upload = upload.with_toolchain(toolchain, &request)?;
     }
     upload.validate_request(&request)?;
+    if allocation_intent {
+        request["request_id"] = json!("allocate");
+    }
     let request_bytes = serde_json::to_vec(&request)?;
     let source = destination.join("source");
     let mut receiver = SourceReceiver::create(&source, upload.manifest.clone())?;
@@ -398,7 +435,7 @@ pub fn prepare_source_bundle(
     File::open(&destination)?.sync_all()?;
     File::open(&parent)?.sync_all()?;
     Ok(
-        json!({"kind":"prepared-source-bundle", "directory":destination,
+        json!({"kind":if allocation_intent {"prepared-source-template"} else {"prepared-source-bundle"}, "directory":destination,
         "source_root":source, "request_path":request_path, "request_id":request["request_id"],
         "request_sha256":hex(&Sha256::digest(&request_bytes)),
         "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
@@ -1754,6 +1791,43 @@ mod tests {
             "toolchain_backing":"/opt/rust-toolchain", "args":["src/lib.rs", "--crate-type", "lib"],
             "source_files":["src/lib.rs", "empty"], "timeout_ms":120000,
             "extension":{"keep":"exactly"}})
+    }
+
+    #[test]
+    fn daemon_template_retains_allocation_intent_and_exact_inputs_without_becoming_a_wire_request()
+    {
+        let checkout = tempfile::tempdir().unwrap();
+        let (_, _, bytes) = fixture(checkout.path());
+        let owner = tempfile::tempdir().unwrap();
+        let mut spec = preparation_specification();
+        spec["request_id"] = json!("allocate");
+        let directory = owner.path().join("template");
+        assert!(prepare_source_bundle(checkout.path(), &spec, &directory).is_err());
+        assert!(!directory.exists());
+        let prepared = prepare_source_template(checkout.path(), &spec, &directory).unwrap();
+        assert_eq!(prepared["kind"], "prepared-source-template");
+        assert_eq!(prepared["request_id"], "allocate");
+        let request_bytes = fs::read(directory.join("request.json")).unwrap();
+        let request: Value = serde_json::from_slice(&request_bytes).unwrap();
+        assert_eq!(request["request_id"], "allocate");
+        assert_eq!(request["args"], spec["args"]);
+        assert_eq!(request["extension"], spec["extension"]);
+        assert_eq!(
+            fs::read(directory.join("source/src/lib.rs")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            prepared["request_sha256"],
+            hex(&Sha256::digest(&request_bytes))
+        );
+        assert!(validate_request(&request).is_err());
+        let mut assigned = request;
+        assigned["request_id"] = json!(8001);
+        validate_request(&assigned).unwrap();
+        let next = owner.path().join("numeric-is-not-an-intent");
+        spec["request_id"] = json!(8001);
+        assert!(prepare_source_template(checkout.path(), &spec, &next).is_err());
+        assert!(!next.exists());
     }
 
     #[test]

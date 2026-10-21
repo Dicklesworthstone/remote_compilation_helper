@@ -75,18 +75,42 @@ impl ReservedWorkerAdmission {
         Ok(())
     }
 
+    fn bind_request(&mut self, request: &Value) -> io::Result<()> {
+        super::validate_request(request)?;
+        if self.request_sha256.is_some() || request["request_id"].as_u64() != Some(self.request_id)
+        {
+            return Err(invalid(
+                "daemon request differs from its worker reservation",
+            ));
+        }
+        self.request_sha256 = Some(
+            Sha256::digest(serde_json::to_vec(request)?)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
+        Ok(())
+    }
+
     fn validate_identity(&self, worker: &str, pin: &str, request_id: &Value) -> io::Result<()> {
         if worker != self.worker
             || parse_worker_pin(pin)? != self.pin
             || request_id.as_u64() != Some(self.request_id)
             || self.request_sha256.is_none()
         {
-            return Err(invalid("request differs from its reserved worker admission"));
+            return Err(invalid(
+                "request differs from its reserved worker admission",
+            ));
         }
         Ok(())
     }
 
-    pub(super) fn validate_request(&self, worker: &str, pin: &str, request: &Value) -> io::Result<()> {
+    pub(super) fn validate_request(
+        &self,
+        worker: &str,
+        pin: &str,
+        request: &Value,
+    ) -> io::Result<()> {
         self.validate_identity(worker, pin, &request["request_id"])?;
         let digest: String = Sha256::digest(serde_json::to_vec(request)?)
             .iter()
@@ -154,15 +178,7 @@ struct PreparedBuild<'a> {
 }
 
 impl PreparedBuild<'_> {
-    /// Preparation and execution share this one CLI process. In particular,
-    /// do not start a second orchestration child between a mutable checkout
-    /// and the existing retained-request execution/recovery boundary.
-    fn prepare_from(
-        &self,
-        source: &str,
-        specification: &str,
-        state: &Path,
-    ) -> io::Result<Option<ReservedWorkerAdmission>> {
+    fn validate_preparation(&self, source: &str) -> io::Result<()> {
         if self.mode != DeliveryMode::Execute || self.resume_from.is_some() {
             return Err(invalid(
                 "source preparation cannot be combined with result recovery",
@@ -201,6 +217,19 @@ impl PreparedBuild<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Preparation and execution share this one CLI process. In particular,
+    /// do not start a second orchestration child between a mutable checkout
+    /// and the existing retained-request execution/recovery boundary.
+    fn prepare_from(
+        &self,
+        source: &str,
+        specification: &str,
+        state: &Path,
+    ) -> io::Result<Option<ReservedWorkerAdmission>> {
+        self.validate_preparation(source)?;
         let mut reserved = None;
         // Only this combined TLS operation may replace explicit local allocation
         // intent. Saved numeric requests, standalone preparation, and recovery
@@ -250,7 +279,12 @@ impl PreparedBuild<'_> {
 
     /// Keep allocation metadata outside the source anchor, compiler tree and
     /// new outputs. Existing state ancestors may not be filesystem aliases.
-    fn validate_allocation_state(&self, state: &Path, source: &str, spec: &Value) -> io::Result<()> {
+    fn validate_allocation_state(
+        &self,
+        state: &Path,
+        source: &str,
+        spec: &Value,
+    ) -> io::Result<()> {
         named_directory(state)?;
         let mut prefix = PathBuf::new();
         for component in state.components() {
@@ -267,7 +301,9 @@ impl PreparedBuild<'_> {
             .into_iter()
             .any(overlaps)
         {
-            return Err(invalid("worker allocation state overlaps build inputs or outputs"));
+            return Err(invalid(
+                "worker allocation state overlaps build inputs or outputs",
+            ));
         }
         if let Some(toolchain) = spec.get("toolchain_source").and_then(Value::as_str) {
             let toolchain = fs::canonicalize(toolchain)?;
@@ -614,13 +650,84 @@ pub fn run_build_tls(args: &[String]) -> i32 {
     run(args, true)
 }
 
+/// The foreground daemon client captures only immutable inputs. No worker ID is
+/// allocated until the existing durable queue claims this exact template.
+pub fn prepare_daemon_build(
+    spec: &rabsd::coord::prepared_operation::PreparedOperationSpec,
+    source: &str,
+    specification: &str,
+) -> io::Result<Value> {
+    let build = PreparedBuild {
+        address: &spec.address,
+        worker: &spec.worker,
+        pin: Some(&spec.worker_spki_sha256),
+        bundle: &spec.bundle,
+        directory: &spec.delivery,
+        output: &spec.output,
+        mode: DeliveryMode::Execute,
+        resume_from: None,
+    };
+    build.validate_preparation(source)?;
+    crate::prepare_template_from_arguments(&[
+        source.to_owned(),
+        specification.to_owned(),
+        spec.bundle
+            .to_str()
+            .ok_or_else(|| invalid("bundle path must be UTF-8"))?
+            .to_owned(),
+    ])
+}
+
 /// Run one durable daemon claim without writing CLI output or subscribing to
 /// process signals. The caller owns a dedicated blocking thread and persists
 /// the returned outcome through `OperationClaim::finish` before releasing it.
 pub fn execute_prepared_operation(
-    claim: &rabsd::coord::prepared_operation::OperationClaim,
+    claim: &mut rabsd::coord::prepared_operation::OperationClaim,
 ) -> rabsd::coord::prepared_operation::OperationOutcome {
     use rabsd::coord::prepared_operation::OperationOutcome;
+    let reserved = if claim.needs_request_allocation() {
+        let mut allocate = || -> io::Result<ReservedWorkerAdmission> {
+            let spec = claim.spec();
+            let state = super::worker_admission_state();
+            let build = PreparedBuild {
+                address: &spec.address,
+                worker: &spec.worker,
+                pin: Some(&spec.worker_spki_sha256),
+                bundle: &spec.bundle,
+                directory: &spec.delivery,
+                output: &spec.output,
+                mode: DeliveryMode::Execute,
+                resume_from: None,
+            };
+            build.validate_allocation_state(
+                &state,
+                spec.bundle
+                    .join("source")
+                    .to_str()
+                    .ok_or_else(|| invalid("source bundle must be UTF-8"))?,
+                claim.request(),
+            )?;
+            let mut reserved = ReservedWorkerAdmission::open(
+                &state,
+                &spec.worker,
+                parse_worker_pin(&spec.worker_spki_sha256)?,
+            )?;
+            claim.bind_request_id(reserved.request_id)?;
+            reserved.bind_request(claim.request())?;
+            Ok(reserved)
+        };
+        match allocate() {
+            Ok(reserved) => Some(reserved),
+            Err(error) => {
+                return OperationOutcome::Failed {
+                    detail: error.to_string(),
+                    execution_may_have_run: false,
+                };
+            }
+        }
+    } else {
+        None
+    };
     let spec = claim.spec();
     let build = PreparedBuild {
         address: &spec.address,
@@ -653,7 +760,7 @@ pub fn execute_prepared_operation(
         )
         .map(|delivery| (delivery, None))
     } else {
-        build.execute_bound(claim.request(), Some(control), None)
+        build.execute_bound(claim.request(), Some(control), reserved)
     };
     match outcome {
         Ok((delivery, installed)) => {
@@ -690,8 +797,8 @@ mod tests {
         let receipt = json!({
             "kind":"verified-worker-delivery", "exit_code":101,
             "publication_authorized":false, "reexecute":false,
-            "stdout_bytes":stdout.len(), "stdout_sha256":format!("{:x}", Sha256::digest(stdout)),
-            "stderr_bytes":stderr.len(), "stderr_sha256":format!("{:x}", Sha256::digest(stderr)),
+            "stdout_bytes":stdout.len(), "stdout_sha256":Sha256::digest(stdout).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "stderr_bytes":stderr.len(), "stderr_sha256":Sha256::digest(stderr).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         });
         fs::write(directory.join("diagnostics/stdout"), stdout).unwrap();
         fs::write(directory.join("diagnostics/stderr"), stderr).unwrap();
@@ -1134,7 +1241,9 @@ mod tests {
             preview: None,
             on_listening: &mut on_listening,
         };
-        let error = build.execute_bound(&request, Some(control), None).unwrap_err();
+        let error = build
+            .execute_bound(&request, Some(control), None)
+            .unwrap_err();
         assert!(
             error.detail.contains("captured source differs from"),
             "{}",
@@ -1263,7 +1372,9 @@ mod tests {
         let id = request["request_id"].as_u64().unwrap();
         assert!(id > 0);
         assert_eq!(id, reservation.request_id);
-        reservation.validate_request("worker", &pin, &request).unwrap();
+        reservation
+            .validate_request("worker", &pin, &request)
+            .unwrap();
         assert_eq!(fs::read(&spec).unwrap(), original);
         assert!(!delivery.exists());
         assert!(!output.exists());
@@ -1337,7 +1448,11 @@ mod tests {
             .unwrap();
         let request = build.request().unwrap();
         assert!(reserved.validate_request("other", &pin, &request).is_err());
-        assert!(reserved.validate_request("worker", &"02".repeat(32), &request).is_err());
+        assert!(
+            reserved
+                .validate_request("worker", &"02".repeat(32), &request)
+                .is_err()
+        );
         let mut other = request.clone();
         other["request_id"] = json!(reserved.request_id + 1);
         assert!(reserved.validate_request("worker", &pin, &other).is_err());
@@ -1345,7 +1460,9 @@ mod tests {
         other["program"] = json!("another-compiler");
         // Refuse before source capture, credentials or a listener, even though
         // the modified command still carries the allocated numeric identity.
-        let error = build.execute_bound(&other, None, Some(reserved)).unwrap_err();
+        let error = build
+            .execute_bound(&other, None, Some(reserved))
+            .unwrap_err();
         assert!(error.detail.contains("changed after worker reservation"));
         assert!(!error.execution_may_have_run);
         assert!(!delivery.exists());
@@ -1383,7 +1500,10 @@ mod tests {
         );
         // Inspect the production allocator's durable receipt count: merely
         // observing a larger wall-clock-derived ID would not prove a burn.
-        let namespace = format!("{:x}", Sha256::digest(b"worker"));
+        let namespace: String = Sha256::digest(b"worker")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let cas = rabsd::janitor::store::mount_and_reconcile(
             &state.join("worker-admission").join(namespace),
         )
@@ -1400,7 +1520,11 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(rows.len(), 2, "failed preparation must durably burn its own ID");
+        assert_eq!(
+            rows.len(),
+            2,
+            "failed preparation must durably burn its own ID"
+        );
         let [SqlValue::Text(burned)] = rows[1].as_slice() else {
             panic!("missing durable allocation value");
         };
@@ -1486,7 +1610,10 @@ mod tests {
         // execution. Real preparation and durable ownership are covered above.
         let request = json!({"request_id":reserved.request_id, "kind":"canonical-exec"});
         assert!(reserved.validate_request("worker", &pin, &request).is_err());
-        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&request).unwrap()));
+        let hash: String = Sha256::digest(serde_json::to_vec(&request).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let report = json!({"kind":"prepared-source-bundle", "request_id":reserved.request_id,
             "request_sha256":hash});
         reserved.bind_prepared(&report).unwrap();
@@ -1496,7 +1623,9 @@ mod tests {
             pin: Some(&pin),
             ..preparation_build(&root)
         };
-        let error = build.execute_bound(&request, None, Some(reserved)).unwrap_err();
+        let error = build
+            .execute_bound(&request, None, Some(reserved))
+            .unwrap_err();
         assert!(error.detail.contains("not result recovery"));
         assert!(error.execution_may_have_run);
         assert!(PinnedWorkerAdmission::open(&state, "worker", [1; 32]).is_ok());
@@ -1519,7 +1648,11 @@ mod tests {
             ..preparation_build(&root)
         };
         for state in [
-            source.join("state"), bundle.clone(), delivery.clone(), output.clone(), root.clone(),
+            source.join("state"),
+            bundle.clone(),
+            delivery.clone(),
+            output.clone(),
+            root.clone(),
         ] {
             assert!(
                 build

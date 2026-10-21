@@ -2,6 +2,7 @@
 //! The coordinator region owns every blocking executor through shutdown. A
 //! client disconnect never drops a queued job or authorizes another execution.
 
+mod build;
 mod follow;
 mod wait;
 
@@ -71,11 +72,11 @@ impl Drivers {
                                 return Err(format!("prepared job claim: {error}"));
                             }
                         };
-                        let Some(claim) = claim else {
+                        let Some(mut claim) = claim else {
                             store.wait_for_work(IDLE_WAIT);
                             continue;
                         };
-                        let outcome = crate::worker_exec::execute_prepared_operation(&claim);
+                        let outcome = crate::worker_exec::execute_prepared_operation(&mut claim);
                         if let Err(error) = claim.finish(outcome) {
                             stopped.store(true, Ordering::Release);
                             let _ = store.stop();
@@ -185,8 +186,8 @@ fn request(args: &[String]) -> Result<Value, &'static str> {
         return Err("job ID must be exactly 32 lowercase hexadecimal digits");
     }
     match args.first().map(String::as_str) {
-        Some("--job-submit") if args.len() == 8 => Ok(json!({
-            "kind":"prepared-submit", "operation":{
+        Some("--job-submit" | "--job-submit-allocated") if args.len() == 8 => Ok(json!({
+            "kind":if args[0] == "--job-submit-allocated" { "prepared-submit-allocated" } else { "prepared-submit" }, "operation":{
                 "id":id, "address":args[2], "worker":args[3],
                 "worker_spki_sha256":args[4], "bundle":args[5],
                 "delivery":args[6], "output":args[7],
@@ -369,6 +370,9 @@ async fn exchange_frames(
 }
 
 pub(crate) fn run(args: &[String], socket: &str) -> i32 {
+    if args.first().is_some_and(|arg| arg == "--job-build") {
+        return build::run(args, socket);
+    }
     if args.first().is_some_and(|arg| arg == "--job-wait") {
         return wait::run(args, socket);
     }
@@ -381,6 +385,7 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
             eprintln!(
                 "rabsd: {detail}\n\
                 --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <output>\n\
+                --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <template-bundle> <delivery> <output>\n\
                 --job-status <id32hex>\n\
                 --job-wait <id32hex> [timeout-seconds]\n\
                 --job-follow <id32hex> [timeout-seconds]\n\
@@ -422,6 +427,30 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocated_submit_reuses_the_exact_job_and_paths_under_a_distinct_intent_api() {
+        let mut values: Vec<String> = [
+            "--job-submit-allocated",
+            "0123456789abcdef0123456789abcdef",
+            "127.0.0.1:7091",
+            "worker",
+            "ab",
+            "/bundle",
+            "/delivery",
+            "/output",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let allocated = request(&values).unwrap();
+        assert_eq!(allocated["kind"], "prepared-submit-allocated");
+        values[0] = "--job-submit".into();
+        let numeric = request(&values).unwrap();
+        assert_eq!(numeric["kind"], "prepared-submit");
+        assert_eq!(allocated["operation"], numeric["operation"]);
+        assert!(request(&values[..7]).is_err());
+    }
 
     #[test]
     fn client_deadline_covers_a_pending_connection_and_drops_it() {

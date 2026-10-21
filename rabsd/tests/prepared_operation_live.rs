@@ -2,12 +2,12 @@
 //!
 //! The ordinary tests hold an actual TLS listener without connecting a worker:
 //! they exercise queue ownership, cancellation and crash recovery, not compiler
-//! execution. The explicit canonical-host test runs the real worker and rustc.
+//! execution. The explicit canonical-host tests run the real worker and rustc.
 //! Unsupported Unix sockets or missing OpenSSL fail, rather than become a pass.
 #![cfg(target_os = "linux")]
 
 use rabs_asupersync::worker_transport::TlsFiles;
-use rabsd::coord::source_delivery::prepare_source_bundle;
+use rabsd::coord::source_delivery::{prepare_source_bundle, prepare_source_template};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::fs::{self, File};
@@ -395,6 +395,10 @@ impl Fixture {
     }
 
     fn prepare(&self, number: u64, native: bool) -> Job {
+        self.prepare_with_allocation(number, native, false)
+    }
+
+    fn prepare_with_allocation(&self, number: u64, native: bool, allocated: bool) -> Job {
         let source = self.owner.path().join(format!("source-{number}"));
         fs::create_dir(&source).unwrap();
         fs::write(
@@ -450,14 +454,194 @@ impl Fixture {
             delivery: self.owner.path().join(format!("delivery-{number}")),
             output: self.owner.path().join(format!("output-{number}")),
         };
-        let request = json!({"kind":"canonical-exec", "request_id":number, "program":program, "args":args,
+        let mut request = json!({"kind":"canonical-exec", "request_id":number, "program":program, "args":args,
             "toolchain_source":toolchain, "toolchain_backing":toolchain, "source_files":["lib.rs"],
             "timeout_ms":90000, "jobserver_grant":1,
             "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace", "env":{"PREPARED_LABEL":"native-Δ"}},
             "artifacts":{"unit":"build", "files":[artifact]}});
-        prepare_source_bundle(&source, &request, &job.bundle).unwrap();
+        if allocated {
+            request["request_id"] = json!("allocate");
+            prepare_source_template(&source, &request, &job.bundle).unwrap();
+        } else {
+            prepare_source_bundle(&source, &request, &job.bundle).unwrap();
+        }
         job
     }
+
+    /// Exercise native source/toolchain capture and daemon admission without
+    /// connecting a worker. These bytes are explicitly not a compiler fixture.
+    fn start_allocated_build(&self, number: u64) -> (Job, Process) {
+        let source = self.owner.path().join(format!("allocated-source-{number}"));
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("input.txt"), b"retained allocation fixture\n").unwrap();
+        let toolchain = self
+            .owner
+            .path()
+            .join(format!("allocated-toolchain-{number}"));
+        fs::create_dir_all(toolchain.join("bin")).unwrap();
+        let executable = toolchain.join("bin/fixture");
+        fs::write(&executable, b"#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let specification = self.owner.path().join(format!("allocation-{number}.json"));
+        fs::write(
+            &specification,
+            serde_json::to_vec(&json!({
+                "kind":"canonical-exec", "request_id":"allocate",
+                "program":"/__rabs/toolchain/bin/fixture", "args":[],
+                "toolchain_source":toolchain, "source_files":["input.txt"],
+                "timeout_ms":90000, "jobserver_grant":1,
+                "artifacts":{"unit":"build", "files":["result.bin"]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let job = Job {
+            id: format!("{number:032x}"),
+            worker: "prepared-worker".into(),
+            bundle: self.owner.path().join(format!("allocated-bundle-{number}")),
+            delivery: self
+                .owner
+                .path()
+                .join(format!("allocated-delivery-{number}")),
+            output: self.owner.path().join(format!("allocated-output-{number}")),
+        };
+        let mut cmd = self.command();
+        cmd.args(["--job-build", "--prepare-from"])
+            .arg(source)
+            .arg(specification)
+            .arg(&job.id)
+            .arg("127.0.0.1:0")
+            .arg(&job.worker)
+            .arg(self.certificates.pin())
+            .arg(&job.bundle)
+            .arg(&job.delivery)
+            .arg(&job.output);
+        let client = Process::spawn(self.owner.path(), &self.next_name("job-build"), &mut cmd);
+        (job, client)
+    }
+
+    fn wait_for_submission(&self, job: &Job, client: &mut Process) -> Value {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (status, reply) = self.cli(&["--job-status".into(), job.id.clone()]);
+            if status.success() {
+                assert_eq!(reply["kind"], "prepared-operation");
+                assert_eq!(reply["operation"]["id"], job.id);
+                return reply["operation"].clone();
+            }
+            assert_eq!(reply["kind"], "prepared-operation-error");
+            assert!(
+                client.child.try_wait().unwrap().is_none(),
+                "job-build exited before admission: {}",
+                String::from_utf8_lossy(&read_log(&client.stderr))
+            );
+            assert!(
+                Instant::now() < until,
+                "job-build did not submit its retained inputs: {}",
+                String::from_utf8_lossy(&read_log(&client.stderr))
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn allocated_cli_jobs_wait_without_ids_and_survive_the_waiting_client() {
+    let fixture = Fixture::new();
+    let blocker = fixture.prepare(1, false);
+    let mut daemon = fixture.daemon();
+    fixture.operation(&fixture.submission(&blocker));
+    fixture.wait_for(&blocker, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+
+    let (job, mut client) = fixture.start_allocated_build(101);
+    let queued = fixture.wait_for_submission(&job, &mut client);
+    assert_eq!(queued["state"], "queued");
+    assert!(queued["request_id"].is_null());
+    assert_eq!(queued["execution_may_have_run"], false);
+    let template = fs::read(job.bundle.join("request.json")).unwrap();
+    let intent: Value = serde_json::from_slice(&template).unwrap();
+    assert_eq!(intent["request_id"], "allocate");
+    assert!(!job.delivery.exists());
+    assert!(!job.output.exists());
+
+    client.crash();
+    assert_eq!(fixture.status(&job)["state"], "queued");
+    let mut retained_submission = fixture.submission(&job);
+    retained_submission[0] = "--job-submit-allocated".into();
+    let confirmed = fixture.operation(&retained_submission);
+    assert_eq!(confirmed["state"], "queued");
+    assert_eq!(confirmed["request_sha256"], queued["request_sha256"]);
+    assert!(confirmed["request_id"].is_null());
+    fixture.operation(&["--job-cancel".into(), blocker.id.clone()]);
+    let running = fixture.wait_for(&job, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 1));
+    assert_eq!(running["request_sha256"], queued["request_sha256"]);
+    assert_eq!(fs::read(job.bundle.join("request.json")).unwrap(), template);
+    let confirmed = fixture.operation(&retained_submission);
+    assert_eq!(confirmed["state"], "running");
+    assert_eq!(confirmed["request_id"], running["request_id"]);
+    assert_eq!(confirmed["attempt"], running["attempt"]);
+
+    fixture.operation(&["--job-cancel".into(), job.id.clone()]);
+    let cancelled = fixture.wait_for(&job, Duration::from_secs(15), |status| {
+        status["state"] == "cancelled"
+    });
+    assert_eq!(cancelled["request_id"], running["request_id"]);
+    assert_eq!(cancelled["execution_may_have_run"], false);
+    assert_eq!(cancelled["outputs_installed"], false);
+    let mut command = fixture.command();
+    command.args(["--job-wait", &job.id, "5"]);
+    let mut wait = Process::spawn(fixture.owner.path(), "allocated-wait", &mut command);
+    assert_eq!(wait.wait(Duration::from_secs(10)).code(), Some(130));
+    assert!(read_log(&wait.stdout).is_empty());
+    assert!(!job.delivery.exists());
+    assert!(!job.output.exists());
+    daemon.terminate();
+}
+
+#[test]
+fn allocated_cli_job_keeps_its_bound_request_after_daemon_restart() {
+    let fixture = Fixture::new();
+    let mut daemon = fixture.daemon();
+    let (job, mut client) = fixture.start_allocated_build(102);
+    fixture.wait_for_submission(&job, &mut client);
+    let running = fixture.wait_for(&job, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 0));
+    let template = fs::read(job.bundle.join("request.json")).unwrap();
+    daemon.crash();
+    assert!(!client.wait(Duration::from_secs(15)).success());
+    assert!(read_log(&client.stdout).is_empty());
+
+    let mut restarted = fixture.daemon();
+    let recovered = fixture.status(&job);
+    assert_eq!(recovered["state"], "uncertain");
+    assert_eq!(recovered["execution_may_have_run"], true);
+    assert_eq!(recovered["request_id"], running["request_id"]);
+    assert_eq!(recovered["request_sha256"], running["request_sha256"]);
+    assert_eq!(recovered["attempt"], running["attempt"]);
+    assert_eq!(fs::read(job.bundle.join("request.json")).unwrap(), template);
+    let mut command = fixture.command();
+    command.args(["--job-wait", &job.id, "5"]);
+    let mut wait = Process::spawn(
+        fixture.owner.path(),
+        "uncertain-allocated-wait",
+        &mut command,
+    );
+    assert!(!wait.wait(Duration::from_secs(10)).success());
+    assert!(read_log(&wait.stdout).is_empty());
+    let after_wait = fixture.status(&job);
+    assert_eq!(after_wait["state"], "uncertain");
+    assert_eq!(after_wait["request_id"], recovered["request_id"]);
+    assert_eq!(after_wait["attempt"], recovered["attempt"]);
+    assert!(!job.delivery.exists());
+    assert!(!job.output.exists());
+    restarted.terminate();
 }
 
 #[test]
@@ -587,6 +771,16 @@ fn killed_daemon_preserves_uncertainty_and_never_redispatches_on_restart() {
 #[test]
 #[ignore = "requires canonical-capable Linux and matching RABS_TEST_WORKER_BIN; runs the actual worker and installed rustc"]
 fn daemon_prepared_job_compiles_over_native_tls_and_reuses_the_verified_completion() {
+    native_tls_prepared_job(false);
+}
+
+#[test]
+#[ignore = "requires canonical-capable Linux and matching RABS_TEST_WORKER_BIN; runs the actual worker and installed rustc"]
+fn daemon_allocated_job_compiles_over_native_tls_and_reuses_the_verified_completion() {
+    native_tls_prepared_job(true);
+}
+
+fn native_tls_prepared_job(allocated: bool) {
     let missing =
         rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical();
     assert!(
@@ -598,10 +792,18 @@ fn daemon_prepared_job_compiles_over_native_tls_and_reuses_the_verified_completi
     );
     assert!(worker.is_absolute() && worker.is_file());
     let fixture = Fixture::new();
-    let job = fixture.prepare(4, true);
+    let job = fixture.prepare_with_allocation(4, true, allocated);
     let request = fs::read(job.bundle.join("request.json")).unwrap();
+    let mut submission = fixture.submission(&job);
+    if allocated {
+        submission[0] = "--job-submit-allocated".into();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request).unwrap()["request_id"],
+            "allocate"
+        );
+    }
     let mut daemon = fixture.daemon();
-    fixture.operation(&fixture.submission(&job));
+    fixture.operation(&submission);
     let running = fixture.wait_for(&job, Duration::from_secs(15), |status| {
         status["state"] == "running" && status["listen_address"].is_string()
     });
@@ -649,17 +851,13 @@ fn daemon_prepared_job_compiles_over_native_tls_and_reuses_the_verified_completi
     let verified: Value = serde_json::from_slice(&receipt).unwrap();
     assert_eq!(verified["transport_authenticated"], true);
     assert_eq!(verified["worker_spki_sha256"], fixture.certificates.pin());
-    assert_eq!(
-        fixture.operation(&fixture.submission(&job))["state"],
-        "completed"
-    );
+    assert_eq!(verified["request_id"], running["request_id"]);
+    assert_eq!(completed["request_id"], running["request_id"]);
+    assert_eq!(fixture.operation(&submission)["state"], "completed");
     daemon.terminate();
     let mut restarted = fixture.daemon();
     assert_eq!(fixture.status(&job)["state"], "completed");
-    assert_eq!(
-        fixture.operation(&fixture.submission(&job))["state"],
-        "completed"
-    );
+    assert_eq!(fixture.operation(&submission)["state"], "completed");
     assert_eq!(fs::read(job.bundle.join("request.json")).unwrap(), request);
     assert_eq!(
         fs::read(job.delivery.join("delivery.json")).unwrap(),

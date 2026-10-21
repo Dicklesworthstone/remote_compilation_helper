@@ -81,8 +81,13 @@ enum StoredMode {
 pub struct OperationStatus {
     pub id: String,
     pub state: OperationState,
+    /// Domain-separated job identity. Version 1 binds the numeric request;
+    /// version 2 binds the immutable allocation intent. Actual delivery always
+    /// verifies the separately retained full numeric execution request.
     pub request_sha256: String,
-    pub request_id: u64,
+    /// Pending daemon allocation has no worker identity. Numeric identities are
+    /// exposed only after the exclusive claim has durably bound the request.
+    pub request_id: Option<u64>,
     /// Durable claim number, zero until the first execution owner is admitted.
     pub attempt: u64,
     /// Number of automatically scheduled result/ACK recovery attempts. These
@@ -145,6 +150,10 @@ struct Record {
     spec: PreparedOperationSpec,
     request: Value,
     request_sha256: String,
+    /// Version 2 additionally binds the complete numeric execution request.
+    /// The stable intent fingerprint deliberately excludes its assigned ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allocated_request_sha256: Option<String>,
     order: u64,
     attempt: u64,
     #[serde(default)]
@@ -170,14 +179,16 @@ struct Record {
 }
 
 impl Record {
+    fn allocation_pending(&self) -> bool {
+        self.version == 2 && self.request["request_id"].as_str() == Some("allocate")
+    }
+
     fn status(&self) -> OperationStatus {
         OperationStatus {
             id: self.spec.id.clone(),
             state: self.state,
             request_sha256: self.request_sha256.clone(),
-            request_id: self.request["request_id"]
-                .as_u64()
-                .expect("validated request"),
+            request_id: self.request["request_id"].as_u64(),
             attempt: self.attempt,
             automatic_recoveries: self.automatic_recoveries,
             recovery_pending: self.recovery_pending,
@@ -396,6 +407,44 @@ fn validate_bound_request(request: &Value) -> io::Result<()> {
     )
 }
 
+/// Allocation intent is accepted only on the explicit local daemon API. Probe
+/// all ordinary execution/source/toolchain constraints without turning the
+/// template into a wire request or assigning it a placeholder identity.
+fn validate_allocation_template(request: &Value) -> io::Result<()> {
+    require(
+        request["kind"] == "canonical-exec" && request["request_id"].as_str() == Some("allocate"),
+        "daemon allocation requires an explicit prepared request template",
+    )?;
+    let mut probe = request.clone();
+    probe["request_id"] = serde_json::json!(0);
+    validate_bound_request(&probe)
+}
+
+fn record_request_digest(version: u32, request: &Value) -> io::Result<String> {
+    match version {
+        1 => request_digest(request),
+        2 => {
+            let mut intent = request.clone();
+            intent["request_id"] = serde_json::json!("allocate");
+            let bytes = serde_json::to_vec(&intent)?;
+            require(
+                bytes.len() <= MAX_FRAME_BYTES,
+                "prepared intent exceeds frame budget",
+            )?;
+            let mut hash = Sha256::new();
+            hash.update(b"rabs.prepared-operation.allocated-intent.v1\0");
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+            Ok(hash
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect())
+        }
+        _ => Err(invalid("unsupported prepared operation record version")),
+    }
+}
+
 fn request_digest(request: &Value) -> io::Result<String> {
     let bytes = serde_json::to_vec(request)?;
     require(
@@ -592,14 +641,20 @@ impl PreparedOperationStore {
                 .cloned()
                 .collect();
             for mut record in recover {
-                record.state = OperationState::Uncertain;
-                record.execution_may_have_run = true;
+                let pending = record.allocation_pending();
+                record.state = if pending {
+                    OperationState::FailedBeforeStart
+                } else {
+                    OperationState::Uncertain
+                };
+                record.execution_may_have_run = !pending;
                 record.listen_address = None;
                 record.recovery_pending = false;
-                record.detail = Some(
+                record.detail = Some(if pending {
+                    "daemon owner stopped before binding a worker request; no execution was dispatched"
+                } else {
                     "daemon owner stopped before a terminal result; explicit resume required"
-                        .into(),
-                );
+                }.into());
                 store.replace(&mut state, record)?;
             }
         }
@@ -669,18 +724,43 @@ impl PreparedOperationStore {
     }
 
     pub fn submit(&self, spec: PreparedOperationSpec) -> io::Result<OperationStatus> {
+        self.submit_inner(spec, false)
+    }
+
+    /// Admit a fully captured template, leaving request allocation to its sole
+    /// claimed execution owner. Queue order cannot be overtaken by allocating
+    /// IDs in clients, and a client disconnect does not relinquish saved work.
+    pub fn submit_allocated(&self, spec: PreparedOperationSpec) -> io::Result<OperationStatus> {
+        self.submit_inner(spec, true)
+    }
+
+    fn submit_inner(
+        &self,
+        spec: PreparedOperationSpec,
+        allocate: bool,
+    ) -> io::Result<OperationStatus> {
         self.validate_paths(&spec)?;
         let request: Value = serde_json::from_slice(&read_bounded(
             &spec.bundle.join("request.json"),
             MAX_FRAME_BYTES,
             false,
         )?)?;
-        validate_bound_request(&request)?;
-        let fingerprint = request_digest(&request)?;
+        let version = if allocate { 2 } else { 1 };
+        if allocate {
+            validate_allocation_template(&request)?;
+        } else {
+            validate_bound_request(&request)?;
+        }
+        let fingerprint = record_request_digest(version, &request)?;
         let existing_status = |record: Record| -> io::Result<OperationStatus> {
+            let mut accepted = record.request.clone();
+            if allocate {
+                accepted["request_id"] = serde_json::json!("allocate");
+            }
             require(
-                record.spec == spec
-                    && record.request == request
+                record.version == version
+                    && record.spec == spec
+                    && accepted == request
                     && record.request_sha256 == fingerprint,
                 "operation id already belongs to another request or destination",
             )?;
@@ -729,11 +809,12 @@ impl PreparedOperationStore {
             check_paths(existing)?;
         }
         let record = Record {
-            version: 1,
+            version,
             delivery: spec.delivery.clone(),
             spec,
             request,
             request_sha256: fingerprint,
+            allocated_request_sha256: None,
             order: state.next_order,
             attempt: 0,
             automatic_recoveries: 0,
@@ -1005,7 +1086,7 @@ impl PreparedOperationStore {
             .checked_add(1)
             .ok_or_else(|| invalid("operation attempts exhausted"))?;
         // Persist this before the callback can listen, upload, or send execution.
-        record.execution_may_have_run = true;
+        record.execution_may_have_run = !record.allocation_pending();
         let cancellation = OperationCancellation::default();
         let mut spec = record.spec.clone();
         spec.delivery = record.delivery.clone();
@@ -1027,6 +1108,7 @@ impl PreparedOperationStore {
             store: Arc::clone(self),
             spec,
             request: record.request.clone(),
+            allocation_pending: record.allocation_pending(),
             mode: record.mode,
             resume_from: record.resume_from.clone(),
             attempt: record.attempt,
@@ -1069,6 +1151,7 @@ pub struct OperationClaim {
     store: Arc<PreparedOperationStore>,
     spec: PreparedOperationSpec,
     request: Value,
+    allocation_pending: bool,
     mode: StoredMode,
     resume_from: Option<PathBuf>,
     attempt: u64,
@@ -1083,6 +1166,64 @@ impl OperationClaim {
     }
     pub fn request(&self) -> &Value {
         &self.request
+    }
+
+    pub fn needs_request_allocation(&self) -> bool {
+        self.allocation_pending
+    }
+
+    /// Bind once while the caller retains the exclusive pinned-worker admission
+    /// that supplied this ID. Persistence precedes any execution-capable network
+    /// work. A crash after binding retains this request for result-only recovery;
+    /// neither this owner nor a restarted daemon may allocate a replacement.
+    pub fn bind_request_id(&mut self, request_id: u64) -> io::Result<()> {
+        require(
+            request_id > 0 && self.allocation_pending,
+            "worker request is not awaiting allocation",
+        )?;
+        let mut state = self.store.lock_state()?;
+        let mut record = self.current(&state)?;
+        require(
+            state.accepting
+                && !self.cancellation.is_cancelled()
+                && !record.cancel_requested
+                && record.allocation_pending()
+                && record.mode == StoredMode::Execute,
+            "worker request allocation cancelled or already bound",
+        )?;
+        let old_weight = record.weight()?;
+        record.request["request_id"] = serde_json::json!(request_id);
+        validate_bound_request(&record.request)?;
+        let execution_bytes = serde_json::to_vec(&record.request)?;
+        require(
+            execution_bytes.len() <= MAX_FRAME_BYTES,
+            "bound worker request exceeds frame budget",
+        )?;
+        record.allocated_request_sha256 = Some(
+            Sha256::digest(execution_bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
+        require(
+            record_request_digest(record.version, &record.request)? == record.request_sha256,
+            "worker request binding changed its admitted intent",
+        )?;
+        // Persist the execution frontier with the assigned request. The native
+        // adapter still owns the reservation and validates every byte at handoff.
+        record.execution_may_have_run = true;
+        let new_weight = record.weight()?;
+        let retained_bytes = state
+            .retained_bytes
+            .checked_sub(old_weight)
+            .and_then(|bytes| bytes.checked_add(new_weight))
+            .filter(|bytes| *bytes <= MAX_RETAINED_BYTES)
+            .ok_or_else(|| invalid("operation storage budget exceeded while binding request"))?;
+        self.store.replace(&mut state, record.clone())?;
+        state.retained_bytes = retained_bytes;
+        self.request = record.request;
+        self.allocation_pending = false;
+        Ok(())
     }
     pub fn mode(&self) -> DeliveryMode {
         if self.mode == StoredMode::Execute {
@@ -1108,6 +1249,10 @@ impl OperationClaim {
     }
 
     pub fn listening(&self, address: SocketAddr) -> io::Result<()> {
+        require(
+            !self.allocation_pending,
+            "unbound request cannot listen for a worker",
+        )?;
         let mut state = self.store.lock_state()?;
         let mut record = self.current(&state)?;
         require(
@@ -1270,6 +1415,20 @@ impl OperationClaim {
         };
         let mut record = self.current(&state)?;
         record.listen_address = None;
+        require(
+            !record.allocation_pending()
+                || matches!(
+                    &outcome,
+                    OperationOutcome::Failed {
+                        execution_may_have_run: false,
+                        ..
+                    } | OperationOutcome::TransportInterrupted {
+                        execution_may_have_run: false,
+                        ..
+                    }
+                ),
+            "unallocated operation cannot report an execution outcome",
+        )?;
         match outcome {
             OperationOutcome::Completed { result } | OperationOutcome::Cancelled { result } => {
                 let delivery = &result["delivery"];
@@ -1435,12 +1594,19 @@ impl Drop for OperationClaim {
             && record.attempt == self.attempt
             && state.active.contains_key(&self.spec.id)
         {
-            record.state = OperationState::Uncertain;
-            record.execution_may_have_run = true;
+            let pending = record.allocation_pending();
+            record.state = if pending {
+                OperationState::FailedBeforeStart
+            } else {
+                OperationState::Uncertain
+            };
+            record.execution_may_have_run = !pending;
             record.listen_address = None;
-            record.detail = Some(
-                "dispatch owner ended without terminal evidence; explicit resume required".into(),
-            );
+            record.detail = Some(if pending {
+                "dispatch owner ended before binding a worker request; no execution was dispatched"
+            } else {
+                "dispatch owner ended without terminal evidence; explicit resume required"
+            }.into());
             if !state.poisoned {
                 let _ = self.store.replace(&mut state, record);
             }

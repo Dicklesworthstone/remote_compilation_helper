@@ -455,6 +455,7 @@ async fn handle_connection(
                     value.get("kind").and_then(|k| k.as_str()),
                     Some(
                         "prepared-submit"
+                            | "prepared-submit-allocated"
                             | "prepared-status"
                             | "prepared-cancel"
                             | "prepared-resume"
@@ -469,7 +470,9 @@ async fn handle_connection(
                 // filesystem work. Neither may occupy the cancellation/status
                 // lane or the reactor while hashing a large delivered tree.
                 let lane = match value["kind"].as_str() {
-                    Some("prepared-submit" | "prepared-resume") => &limits.prepared_admission,
+                    Some("prepared-submit" | "prepared-submit-allocated" | "prepared-resume") => {
+                        &limits.prepared_admission
+                    }
                     Some("prepared-completion" | "prepared-recover-local") => {
                         &limits.materialization
                     }
@@ -836,7 +839,7 @@ fn prepared_reply(
             .as_str()
             .ok_or_else(|| invalid("missing request kind"))?;
         let fields: &[&str] = match kind {
-            "prepared-submit" => &["kind", "operation"],
+            "prepared-submit" | "prepared-submit-allocated" => &["kind", "operation"],
             "prepared-status" | "prepared-cancel" => &["kind", "operation_id"],
             "prepared-completion" => &["kind", "operation_id", "request_sha256"],
             "prepared-preview" => &[
@@ -893,10 +896,14 @@ fn prepared_reply(
                 "reexecute":false,
             }));
         }
-        let status = if kind == "prepared-submit" {
+        let status = if matches!(kind, "prepared-submit" | "prepared-submit-allocated") {
             let spec: PreparedOperationSpec = serde_json::from_value(request["operation"].clone())
                 .map_err(|error| invalid(&format!("invalid prepared operation: {error}")))?;
-            operations.submit(spec)?
+            if kind == "prepared-submit-allocated" {
+                operations.submit_allocated(spec)?
+            } else {
+                operations.submit(spec)?
+            }
         } else {
             let id = request["operation_id"]
                 .as_str()

@@ -72,6 +72,267 @@ fn prepared_request(spec: &PreparedOperationSpec) -> Value {
     serde_json::from_slice(&fs::read(spec.bundle.join("request.json")).unwrap()).unwrap()
 }
 
+fn allocation_template(fixture: &Fixture, sequence: u64, worker: u16) -> PreparedOperationSpec {
+    // This suite tests durable control state. Real template capture and native
+    // daemon admission have separate source-delivery and subprocess coverage.
+    let spec = fixture.spec(sequence, worker);
+    let mut request = prepared_request(&spec);
+    request["request_id"] = json!("allocate");
+    fs::write(
+        spec.bundle.join("request.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    spec
+}
+
+#[test]
+fn allocated_jobs_bind_once_in_claim_order_without_changing_submission_identity() {
+    let fixture = Fixture::new();
+    let first = allocation_template(&fixture, 701, 71);
+    let second = allocation_template(&fixture, 702, 71);
+    let original = prepared_request(&first);
+    let store = fixture.open();
+    assert!(
+        store.submit(first.clone()).is_err(),
+        "wire request admission cannot accept allocation intent"
+    );
+    let initial = store.submit_allocated(first.clone()).unwrap();
+    store.submit_allocated(second.clone()).unwrap();
+    assert_eq!(initial.request_id, None);
+    assert_eq!(
+        serde_json::to_value(&initial).unwrap()["request_id"],
+        Value::Null
+    );
+    let mut claim = store.claim_next().unwrap().unwrap();
+    assert_eq!(claim.spec().id, first.id);
+    assert!(claim.needs_request_allocation());
+    assert!(claim.listening(first.address.parse().unwrap()).is_err());
+    assert!(claim.bind_request_id(0).is_err());
+    assert!(store.claim_next().unwrap().is_none());
+    assert_eq!(store.status(&second.id).unwrap().unwrap().request_id, None);
+    claim.bind_request_id(9001).unwrap();
+    assert!(!claim.needs_request_allocation());
+    assert!(claim.bind_request_id(9002).is_err());
+    let bound = store.submit_allocated(first.clone()).unwrap();
+    assert_eq!(bound.request_sha256, initial.request_sha256);
+    assert_eq!(bound.request_id, Some(9001));
+    assert_eq!(
+        prepared_request(&first),
+        original,
+        "saved template is never rewritten"
+    );
+    assert_eq!(claim.request()["request_id"], 9001);
+    assert_ne!(
+        delivery_request_digest(claim.request()),
+        initial.request_sha256
+    );
+    fail_before_dispatch(claim);
+    let mut next = store.claim_next().unwrap().unwrap();
+    assert_eq!(next.spec().id, second.id);
+    next.bind_request_id(9002).unwrap();
+    fail_before_dispatch(next);
+    drop(store);
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened.submit_allocated(first).unwrap().request_id,
+        Some(9001)
+    );
+    assert_eq!(
+        reopened.submit_allocated(second).unwrap().request_id,
+        Some(9002)
+    );
+}
+
+#[test]
+fn allocated_queue_restart_does_not_allocate_or_reclaim_lost_prebinding_owner() {
+    let fixture = Fixture::new();
+    let spec = allocation_template(&fixture, 703, 72);
+    let store = fixture.open();
+    let fingerprint = store.submit_allocated(spec.clone()).unwrap().request_sha256;
+    drop(store);
+    let reopened = fixture.open();
+    let status = reopened.status(&spec.id).unwrap().unwrap();
+    assert_eq!(status.state, OperationState::Queued);
+    assert_eq!(status.request_id, None);
+    assert_eq!(status.request_sha256, fingerprint);
+    let claim = reopened.claim_next().unwrap().unwrap();
+    assert!(
+        !reopened
+            .status(&spec.id)
+            .unwrap()
+            .unwrap()
+            .execution_may_have_run
+    );
+    let path = fixture.store_root.join(format!("{}.json", spec.id));
+    // Preserve the actual durable bytes at the pre-binding crash boundary.
+    // Restoring them below models abrupt process loss, not an orderly Drop.
+    let interrupted = fs::read(&path).unwrap();
+    drop(claim);
+    drop(reopened);
+    fs::write(path, interrupted).unwrap();
+    let reopened = fixture.open();
+    let status = reopened.status(&spec.id).unwrap().unwrap();
+    assert_eq!(status.state, OperationState::FailedBeforeStart);
+    assert_eq!(status.request_id, None);
+    assert!(!status.execution_may_have_run);
+    assert!(reopened.claim_next().unwrap().is_none());
+    assert!(
+        reopened
+            .resume(&spec.id, fixture.root.join("never-resume-unbound"), None)
+            .is_err()
+    );
+}
+
+#[test]
+fn allocated_bound_request_survives_restart_only_as_the_same_recoverable_execution() {
+    let fixture = Fixture::new();
+    let spec = allocation_template(&fixture, 704, 73);
+    let store = fixture.open();
+    let fingerprint = store.submit_allocated(spec.clone()).unwrap().request_sha256;
+    let mut claim = store.claim_next().unwrap().unwrap();
+    claim.bind_request_id(9003).unwrap();
+    claim.listening(spec.address.parse().unwrap()).unwrap();
+    let request = claim.request().clone();
+    drop(claim);
+    drop(store);
+    let reopened = fixture.open();
+    let status = reopened.submit_allocated(spec.clone()).unwrap();
+    assert_eq!(status.state, OperationState::Uncertain);
+    assert_eq!(status.request_id, Some(9003));
+    assert_eq!(status.request_sha256, fingerprint);
+    assert!(reopened.claim_next().unwrap().is_none());
+    reopened
+        .resume(&spec.id, fixture.root.join("allocated-resume"), None)
+        .unwrap();
+    let mut resumed = reopened.claim_next().unwrap().unwrap();
+    assert_eq!(resumed.mode(), DeliveryMode::Resume);
+    assert!(!resumed.needs_request_allocation());
+    assert!(resumed.bind_request_id(9004).is_err());
+    assert_eq!(resumed.request(), &request);
+    uncertain(resumed);
+}
+
+#[test]
+fn allocated_pending_cancellation_cannot_assign_or_report_worker_execution() {
+    let fixture = Fixture::new();
+    let spec = allocation_template(&fixture, 705, 74);
+    let store = fixture.open();
+    store.submit_allocated(spec.clone()).unwrap();
+    let mut claim = store.claim_next().unwrap().unwrap();
+    store.cancel(&spec.id).unwrap();
+    assert!(claim.bind_request_id(9005).is_err());
+    fail_before_dispatch(claim);
+    let status = store.status(&spec.id).unwrap().unwrap();
+    assert_eq!(status.state, OperationState::Cancelled);
+    assert_eq!(status.exit_code, Some(130));
+    assert_eq!(status.request_id, None);
+    assert!(!status.execution_may_have_run);
+    drop(store);
+    assert_eq!(
+        fixture.open().status(&spec.id).unwrap().unwrap().state,
+        OperationState::Cancelled
+    );
+}
+
+#[test]
+fn allocated_record_reopen_checks_intent_and_complete_numeric_request_independently() {
+    for change in [
+        "request_id",
+        "args",
+        "allocated_request_sha256",
+        "request_sha256",
+    ] {
+        let fixture = Fixture::new();
+        let spec = allocation_template(&fixture, 706, 75);
+        let store = fixture.open();
+        store.submit_allocated(spec.clone()).unwrap();
+        let mut claim = store.claim_next().unwrap().unwrap();
+        claim.bind_request_id(9006).unwrap();
+        drop(claim);
+        drop(store);
+        let path = fixture.store_root.join(format!("{}.json", spec.id));
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        match change {
+            "request_id" => record["request"]["request_id"] = json!(9007),
+            "args" => record["request"]["args"][0] = json!("other.rs"),
+            name => record[name] = json!("00".repeat(32)),
+        }
+        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(
+            PreparedOperationStore::open(&fixture.store_root).is_err(),
+            "accepted modified {change}"
+        );
+    }
+}
+
+#[test]
+fn allocated_completion_checks_the_numeric_wire_fingerprint_instead_of_the_stable_intent() {
+    let fixture = Fixture::new();
+    let spec = allocation_template(&fixture, 707, 76);
+    let store = fixture.open();
+    let stable = store.submit_allocated(spec.clone()).unwrap().request_sha256;
+    let mut claim = store.claim_next().unwrap().unwrap();
+    claim.bind_request_id(9008).unwrap();
+    let mut wrong = adapter_result(&claim, 101, Value::Null, true);
+    wrong["delivery"]["receipt"]["request_sha256"] = json!(stable);
+    assert!(
+        claim
+            .finish(OperationOutcome::Completed { result: wrong })
+            .is_err()
+    );
+    assert_eq!(
+        store.status(&spec.id).unwrap().unwrap().state,
+        OperationState::Uncertain
+    );
+
+    let good = allocation_template(&fixture, 708, 77);
+    let stable = store.submit_allocated(good.clone()).unwrap().request_sha256;
+    let mut claim = store.claim_next().unwrap().unwrap();
+    claim.bind_request_id(9009).unwrap();
+    let result = adapter_result(&claim, 101, Value::Null, true);
+    let completed = claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    assert_eq!(completed.request_id, Some(9009));
+    assert_eq!(completed.request_sha256, stable);
+    assert_eq!(completed.exit_code, Some(101));
+    assert_eq!(completed.state, OperationState::Completed);
+    drop(store);
+    assert_eq!(
+        fixture.open().status(&good.id).unwrap().unwrap().request_id,
+        Some(9009)
+    );
+}
+
+#[test]
+fn allocated_binding_with_uncertain_persistence_never_reissues_the_claim() {
+    let fixture = Fixture::new();
+    let spec = allocation_template(&fixture, 709, 78);
+    let store = fixture.open();
+    store.submit_allocated(spec.clone()).unwrap();
+    let mut claim = store.claim_next().unwrap().unwrap();
+    store
+        .fail_after_rename
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(claim.bind_request_id(9010).is_err());
+    assert!(
+        store.status(&spec.id).is_err(),
+        "uncertain persistence poisons live admission"
+    );
+    drop(claim);
+    drop(store);
+    let reopened = fixture.open();
+    let status = reopened.status(&spec.id).unwrap().unwrap();
+    assert_eq!(status.state, OperationState::Uncertain);
+    assert_eq!(status.request_id, Some(9010));
+    assert_eq!(
+        reopened.submit_allocated(spec).unwrap().request_id,
+        Some(9010)
+    );
+    assert!(reopened.claim_next().unwrap().is_none());
+}
+
 fn delivery_request_digest(request: &Value) -> String {
     Sha256::digest(serde_json::to_vec(request).unwrap())
         .iter()

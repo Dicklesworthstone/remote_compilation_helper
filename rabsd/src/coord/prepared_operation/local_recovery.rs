@@ -200,6 +200,7 @@ impl PreparedOperationStore {
                 store: Arc::clone(self),
                 spec,
                 request: record.request,
+                allocation_pending: false,
                 mode: StoredMode::LocalRecovery,
                 resume_from: None,
                 attempt: record.attempt,
