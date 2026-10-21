@@ -781,9 +781,10 @@ async fn handle_connection_with_metrics(
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     request_metrics: Option<rch_telemetry::metrics::Metrics>,
 ) -> Result<()> {
-    // Bind maintenance to the connection owner's observed birth before any
-    // await. A delayed request may not acquire rights under a recycled PID.
-    // Keep the PID separately for operator-action log attribution.
+    // Bind maintenance, and a pre-2.1 client's release (GH #119), to the
+    // connection owner's observed birth before any await. A delayed request
+    // may not acquire rights under a recycled PID. Keep the PID separately
+    // for operator-action log attribution.
     let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
     let maintenance_peer = MaintenancePeer::capture(peer_pid);
     let (reader, mut writer) = stream.into_split();
@@ -851,7 +852,7 @@ async fn handle_connection_with_metrics(
                     request.timing = Some(timing);
                 }
             }
-            handle_release_worker(&ctx, request).await?;
+            handle_release_worker_from(&ctx, request, maintenance_peer.as_ref()).await?;
             ("{}".to_string(), "application/json")
         }
         Ok(ApiRequest::RecordBuild {
@@ -3854,32 +3855,85 @@ fn lease_waits_for_restart_admission(lease: &DurableJobLease) -> bool {
         && !lease.terminal_acknowledged
 }
 
-/// Handle a release-worker request.
+/// Handle a release-worker request that has no connection peer.
+#[cfg(test)]
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
+    handle_release_worker_from(ctx, request, None).await
+}
+
+/// Handle a release-worker request.
+///
+/// `peer` is the release connection's kernel-reported process, captured when
+/// the connection was accepted. It is consulted only for a release that omits
+/// `local_wrapper_id` (GH #119, see [`BuildHistory::legacy_release_wrapper`]).
+async fn handle_release_worker_from(
+    ctx: &DaemonContext,
+    mut request: ReleaseRequest,
+    peer: Option<&MaintenancePeer>,
+) -> Result<()> {
     anyhow::ensure!(
         request.disk_peak_output_bytes.is_none() || request.exit_code.is_some(),
         "Disk output measurement requires an explicit release exit code"
     );
     let _release_guard = ctx.history.lock_releases().await;
+    if request.local_wrapper_id.is_none()
+        && let (Some(build_id), Some(peer)) = (request.build_id, peer)
+        && let Some(wrapper) = ctx.history.legacy_release_wrapper(
+            build_id,
+            request.worker_id.as_str(),
+            peer.pid,
+            &peer.identity,
+        )
+    {
+        info!(
+            build_id,
+            worker_id = %request.worker_id,
+            local_wrapper_id = %wrapper,
+            client_pid = peer.pid,
+            "Accepting a release without local_wrapper_id from the build's own client \
+             process (pre-2.1 client, GH #119)"
+        );
+        request.local_wrapper_id = Some(wrapper);
+    }
     let started = std::time::Instant::now();
     let exit_code = request.exit_code.unwrap_or(0);
     let worker_disk_full = exit_code != 0 && request.worker_disk_full;
     let (release_worker_id, release_slots, record, remote_command_started, worker_endpoint) =
         if let Some(build_id) = request.build_id {
-            let completion = ctx.history.complete_durable_with_disk_fault(
-                build_id,
-                request.worker_id.as_str(),
-                request.local_wrapper_id.as_deref(),
-                crate::history::BuildCompletion {
-                    exit_code,
-                    duration_ms: request.duration_ms,
-                    bytes_transferred: request.bytes_transferred,
-                    disk_peak_output_bytes: request.disk_peak_output_bytes,
-                    timing: request.timing,
-                    cancellation: None,
-                },
-                worker_disk_full.then_some(request.worker_disk_roots),
-            )?;
+            let completion = ctx
+                .history
+                .complete_durable_with_disk_fault(
+                    build_id,
+                    request.worker_id.as_str(),
+                    request.local_wrapper_id.as_deref(),
+                    crate::history::BuildCompletion {
+                        exit_code,
+                        duration_ms: request.duration_ms,
+                        bytes_transferred: request.bytes_transferred,
+                        disk_peak_output_bytes: request.disk_peak_output_bytes,
+                        timing: request.timing,
+                        cancellation: None,
+                    },
+                    worker_disk_full.then_some(request.worker_disk_roots),
+                )
+                .inspect_err(|error| {
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        let recorded = ctx.history.active_build(build_id);
+                        let recorded = recorded.as_ref();
+                        warn!(
+                            build_id,
+                            worker_id = %request.worker_id,
+                            presented_wrapper =
+                                request.local_wrapper_id.as_deref().unwrap_or("<none>"),
+                            recorded_worker =
+                                recorded.map_or("<none>", |state| state.worker_id.as_str()),
+                            recorded_wrapper = recorded
+                                .and_then(|state| state.local_wrapper_id.as_deref())
+                                .unwrap_or("<none>"),
+                            "Refusing release: build ownership mismatch"
+                        );
+                    }
+                })?;
             // A retry acknowledges only its original, owner-validated fault.
             // Its newly supplied flags/paths cannot rewrite a terminal build.
             let Some((state, record)) = completion else {
@@ -10587,6 +10641,179 @@ mod tests {
         assert!(result.is_err());
         // An unowned legacy request cannot free another build's reservation.
         assert_eq!(worker.available_slots().await, 4);
+    }
+
+    /// Select a build the way every client since v1.0.56 does: with a wrapper
+    /// identity and this test process as its hook process.
+    async fn select_wrapper_owned_build(ctx: &DaemonContext, worker_id: &str) -> (u64, String) {
+        let wrapper = format!("rchw-{}", Uuid::new_v4());
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "legacy-client-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![WorkerId::new(worker_id)],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            required_tools: Vec::new(),
+            hook_pid: Some(crate::history::observable_test_process_id()),
+        };
+        let response =
+            handle_select_worker_with_wrapper(ctx, request, false, None, Some(wrapper.clone()))
+                .await
+                .unwrap();
+        assert_eq!(response.worker.unwrap().id.as_str(), worker_id);
+        (response.build_id.unwrap(), wrapper)
+    }
+
+    /// Serve one request over a real socket pair, so the daemon reads its peer
+    /// from the kernel exactly as it does in production.
+    async fn serve_socket_request(ctx: &DaemonContext, line: &str) -> (Result<()>, String) {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let peer_pid = server.peer_cred().unwrap().pid().unwrap();
+        assert_eq!(
+            u32::try_from(peer_pid).unwrap(),
+            crate::history::observable_test_process_id(),
+            "the socket peer and the procfs identity must name this test process"
+        );
+        let (shutdown_tx, _) = tokio::sync::mpsc::channel(1);
+        let connection = tokio::spawn(handle_connection(server, ctx.clone(), shutdown_tx));
+        client.write_all(line.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        (connection.await.unwrap(), response)
+    }
+
+    /// GH #119: v1.0.56-v2.0.x clients select with `local_wrapper_id` but
+    /// release without it. The build's own client process must still be able
+    /// to release it, over the real socket route and with the v2.0.x request
+    /// line byte for byte.
+    #[tokio::test]
+    async fn legacy_client_release_without_wrapper_frees_its_own_build() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("legacy", 8)).await;
+        set_test_build_disk(&pool, "legacy", 100.0).await;
+        let ctx = make_test_context(pool.clone());
+        let worker = pool.get(&WorkerId::new("legacy")).await.unwrap();
+        let (build_id, wrapper) = select_wrapper_owned_build(&ctx, "legacy").await;
+        assert_eq!(worker.used_slots(), 4);
+
+        let (result, response) = serve_socket_request(
+            &ctx,
+            &format!(
+                "POST /release-worker?worker=legacy&slots=4&build_id={build_id}&exit_code=0\n"
+            ),
+        )
+        .await;
+        result.unwrap();
+        assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+        assert_eq!(worker.used_slots(), 0);
+        assert!(ctx.history.active_build(build_id).is_none());
+        // The terminal receipt keeps the recorded owner: the same release
+        // presented by that owner is an acknowledged repeat.
+        assert!(
+            ctx.history
+                .complete_durable(
+                    build_id,
+                    "legacy",
+                    Some(&wrapper),
+                    crate::history::BuildCompletion {
+                        exit_code: 0,
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        disk_peak_output_bytes: None,
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// GH #119: the legacy acceptance is no ownership bypass. A wrapper-less
+    /// release from any process but the build's client, one naming another
+    /// worker, and a current client's wrong wrapper (even from the owner
+    /// process) are all still refused, and the slots stay reserved.
+    #[tokio::test]
+    async fn release_without_wrapper_is_refused_unless_the_builds_own_client_sends_it() {
+        use rch_common::process_identity::ProcessStart;
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("legacy", 8)).await;
+        pool.add_worker(make_test_worker("other", 8)).await;
+        set_test_build_disk(&pool, "legacy", 100.0).await;
+        let ctx = make_test_context(pool.clone());
+        let worker = pool.get(&WorkerId::new("legacy")).await.unwrap();
+        let (build_id, wrapper) = select_wrapper_owned_build(&ctx, "legacy").await;
+        let owner = MaintenancePeer::capture(
+            i32::try_from(crate::history::observable_test_process_id()).ok(),
+        )
+        .unwrap();
+        let mut recycled = owner.clone();
+        recycled.identity.start = match recycled.identity.start {
+            ProcessStart::Linux { ticks } => ProcessStart::Linux { ticks: ticks + 1 },
+            ProcessStart::Darwin {
+                seconds,
+                microseconds,
+            } => ProcessStart::Darwin {
+                seconds: seconds + 1,
+                microseconds,
+            },
+        };
+        let mut other_pid = owner.clone();
+        other_pid.pid += 1;
+        let release = |worker_id: &str, local_wrapper_id: Option<&str>| ReleaseRequest {
+            local_wrapper_id: local_wrapper_id.map(str::to_owned),
+            worker_id: WorkerId::new(worker_id),
+            slots: 4,
+            build_id: Some(build_id),
+            disk_peak_output_bytes: None,
+            exit_code: Some(0),
+            duration_ms: None,
+            bytes_transferred: None,
+            timing: None,
+            worker_fault: false,
+            worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
+            worker_disk_roots: Vec::new(),
+        };
+
+        for (case, request, peer) in [
+            ("no peer", release("legacy", None), None),
+            ("recycled PID", release("legacy", None), Some(&recycled)),
+            ("another process", release("legacy", None), Some(&other_pid)),
+            ("another worker", release("other", None), Some(&owner)),
+            (
+                "wrong wrapper from the owner",
+                release("legacy", Some("rchw-not-the-owner")),
+                Some(&owner),
+            ),
+        ] {
+            assert!(
+                handle_release_worker_from(&ctx, request, peer)
+                    .await
+                    .is_err(),
+                "{case}: release must be refused"
+            );
+            assert_eq!(worker.used_slots(), 4, "{case}: slots must stay reserved");
+            assert!(ctx.history.active_build(build_id).is_some(), "{case}");
+        }
+
+        // The current protocol is unchanged: the owner's wrapper releases it.
+        handle_release_worker_from(&ctx, release("legacy", Some(&wrapper)), Some(&recycled))
+            .await
+            .unwrap();
+        assert_eq!(worker.used_slots(), 0);
+        assert!(ctx.history.active_build(build_id).is_none());
     }
 
     #[tokio::test]

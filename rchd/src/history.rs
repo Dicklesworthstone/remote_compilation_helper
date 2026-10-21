@@ -2566,6 +2566,42 @@ impl BuildHistory {
         Ok(())
     }
 
+    /// The wrapper a pre-2.1 client leaves out of its own release (GH #119).
+    ///
+    /// Clients v1.0.56 through v2.0.x send `local_wrapper_id` with
+    /// `select-worker`, so their builds record one, but not with
+    /// `release-worker`, which gained it in 2.1.0. Their release therefore
+    /// fails the exact owner check in [`Self::complete_durable`], and the
+    /// finished build keeps its slots until the stuck detector can confirm a
+    /// remote cancel, which the old watchdog's orphaned timer blocks for the
+    /// build timeout.
+    ///
+    /// Every 2.1+ client presents the wrapper it selected with. A release that
+    /// omits it while the build recorded one is that legacy shape, and it is
+    /// accepted only from the build's own client: the kernel-reported peer of
+    /// the release connection must be the hook process recorded at selection,
+    /// with the same PID and the same birth identity. A build without a
+    /// recorded birth identity, another worker, or any other process gets
+    /// `None` and stays under the exact check.
+    pub(crate) fn legacy_release_wrapper(
+        &self,
+        build_id: u64,
+        worker_id: &str,
+        peer_pid: u32,
+        peer_identity: &rch_common::process_identity::ProcessIdentity,
+    ) -> Option<String> {
+        let active = self.active.read().unwrap_or_else(|e| e.into_inner());
+        let state = active.get(&build_id)?;
+        let wrapper = state.local_wrapper_id.as_ref()?;
+        let recorded = state.hook_process_identity.as_deref()?;
+        let peer_identity = peer_identity.to_record()?;
+        (state.worker_id == worker_id
+            && state.hook_pid > 1
+            && state.hook_pid == peer_pid
+            && recorded == peer_identity)
+            .then(|| wrapper.clone())
+    }
+
     /// One locked transition owns both the durable terminal receipt and release.
     pub fn complete_durable(
         &self,
@@ -2930,6 +2966,107 @@ mod tests {
     use rch_common::{WorkerId, test_guard};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    /// GH #119: a pre-2.1 client's wrapper-less release resolves to the
+    /// recorded wrapper only for the build's own hook process.
+    #[test]
+    fn legacy_release_wrapper_requires_the_builds_own_hook_process() {
+        use rch_common::process_identity::{ProcessIdentity, ProcessStart};
+        let history = BuildHistory::new(10);
+        let pid = observable_test_process_id();
+        let wrapper = format!("rchw-{}", uuid::Uuid::new_v4());
+        let build = history.start_active_build_with_wrapper(
+            "legacy-project".into(),
+            "w".into(),
+            "cargo build".into(),
+            pid,
+            Some(wrapper.clone()),
+            2,
+            BuildLocation::Remote,
+        );
+        let identity =
+            ProcessIdentity::from_record(build.hook_process_identity.as_deref().unwrap()).unwrap();
+        let mut reborn = identity.clone();
+        reborn.start = match reborn.start {
+            ProcessStart::Linux { ticks } => ProcessStart::Linux { ticks: ticks + 1 },
+            ProcessStart::Darwin {
+                seconds,
+                microseconds,
+            } => ProcessStart::Darwin {
+                seconds: seconds + 1,
+                microseconds,
+            },
+        };
+
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid, &identity),
+            Some(wrapper.clone())
+        );
+        // Another worker, another PID, or the same PID with another birth
+        // (a recycled PID) is not the build's client.
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "other", pid, &identity),
+            None
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid + 1, &identity),
+            None
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid, &reborn),
+            None
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id + 1000, "w", pid, &identity),
+            None
+        );
+
+        // No recorded wrapper: nothing to resolve; the exact check already
+        // matches a wrapper-less release. No recorded birth: never resolved.
+        let unwrapped = history.start_active_build(
+            "plain".into(),
+            "w".into(),
+            "cargo build".into(),
+            pid,
+            1,
+            BuildLocation::Remote,
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(unwrapped.id, "w", pid, &identity),
+            None
+        );
+        let unidentified = history.start_active_build_with_wrapper(
+            "no-birth".into(),
+            "w".into(),
+            "cargo build".into(),
+            0,
+            Some(format!("rchw-{}", uuid::Uuid::new_v4())),
+            1,
+            BuildLocation::Remote,
+        );
+        assert!(unidentified.hook_process_identity.is_none());
+        assert_eq!(
+            history.legacy_release_wrapper(unidentified.id, "w", 0, &identity),
+            None
+        );
+
+        // The exact owner check itself is unchanged: a wrapper-less release
+        // is still refused, and the resolved wrapper completes the build.
+        let refused = history
+            .complete_durable(build.id, "w", None, disk_budget_completion(0))
+            .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            history
+                .complete_durable(build.id, "w", Some(&wrapper), disk_budget_completion(0))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid, &identity),
+            None
+        );
+    }
 
     #[test]
     fn live_checkout_fences_are_per_project_and_expire() {
