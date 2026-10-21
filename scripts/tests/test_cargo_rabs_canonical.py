@@ -589,6 +589,101 @@ class CanonicalCargo(unittest.TestCase):
                                              "required":"1", "cache":"1"})
         self.assertEqual(list(self.operations.iterdir()), [])
 
+    def test_every_canonical_mode_delegates_worker_ids_to_native_preparation(self):
+        self.install_clippy()
+        cases = (["build"], ["check", "--workspace"], ["test", "--no-run"],
+                 ["test", "--doc"], ["test", "selected", "--", "--exact"],
+                 ["clippy", "--workspace", "--", "-D", "warnings"])
+        for args in cases:
+            with self.subTest(args=args):
+                status, _, _, pid = self.invoke(args)
+                self.assertEqual(status, 0)
+                record = self.records()[-1]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(record["request"]["request_id"], "allocate")
+                operation = Path(record["operation"])
+                metadata = json.loads((operation / "operation.json").read_text())
+                self.assertEqual(metadata["request_id"], "allocate", "intent is not an assigned ID")
+                self.assertEqual(record["argv"][1:4],
+                                 ["--worker-build-tls", "--replay-diagnostics", "--prepare-from"])
+                # Recovery uses the already prepared bundle, not spec.json or
+                # another allocation. No native execution is simulated here.
+                self.assertNotIn("--prepare-from", metadata["prepared_build_argv"])
+                self.assertEqual(metadata["prepared_build_argv"][-3], str(operation / "bundle"))
+                self.assertFalse(metadata["automatic_retry"])
+                self.assertFalse(metadata["publication_authorized"])
+
+    def test_random_entropy_is_only_for_private_operation_names_not_worker_ids(self):
+        # Even adversarial/decreasing random values must never enter the worker
+        # request journal. Do not replace the native allocator with a Python one.
+        import secrets
+        env = dict(self.env, RABS_STATE_DIR=str(self.root / "shared-admission"))
+        before = dict(env)
+        operations = []
+        with patch.object(secrets, "randbits", side_effect=AssertionError("random worker ID")):
+            for _ in range(3):
+                _, argv, child_env = launcher.canonical_invocation(
+                    str(self.profile_path), ["check"], env)
+                specification = Path(argv[5])
+                self.assertEqual(json.loads(specification.read_text())["request_id"], "allocate")
+                self.assertEqual(child_env["RABS_STATE_DIR"], env["RABS_STATE_DIR"])
+                operations.append(specification.parent)
+        self.assertEqual(env, before)
+        self.assertEqual(len(set(operations)), 3)
+        self.assertFalse(Path(env["RABS_STATE_DIR"]).exists(), "only native admission may create its ledger")
+        self.assertFalse(self.record.exists(), "preparing intent must not execute or probe the driver")
+
+    def test_allocation_refusal_is_not_retried_with_a_random_or_numeric_id(self):
+        # This executable double refuses allocation. It is not a model of the
+        # native SQLite allocator, TLS admission, or worker high-water state.
+        self.driver.write_text("#!" + sys.executable + " -S\n" + r'''
+import json, os, pathlib, sys
+specification = pathlib.Path(sys.argv[5])
+request = json.loads(specification.read_text())
+with open(os.environ["TEST_DRIVER_RECORD"], "a") as record:
+    record.write(json.dumps({"request": request, "operation": str(specification.parent)}) + "\n")
+if request["request_id"] != "allocate":
+    sys.exit(79)
+print("fixture: native request allocation unavailable", file=sys.stderr)
+sys.exit(78)
+''')
+        status, stdout, stderr, _ = self.invoke()
+        self.assertEqual(status, 78)
+        self.assertEqual(stdout, b"")
+        self.assertIn(b"native request allocation unavailable", stderr)
+        record, = self.records()
+        operation = Path(record["operation"])
+        self.assertEqual(json.loads((operation / "spec.json").read_text()), record["request"])
+        self.assertEqual(sorted(p.name for p in operation.iterdir()), ["operation.json", "spec.json"])
+        self.assertEqual(len(list(self.operations.iterdir())), 1)
+
+    def test_concurrent_launchers_keep_allocation_native_and_operation_intent_separate(self):
+        children = []
+        try:
+            for _ in range(8):
+                children.append(subprocess.Popen(
+                    [sys.executable, "-I", "-S", str(LAUNCHER), "--rabs-canonical",
+                     str(self.profile_path), "check"], env=self.env, cwd=self.root,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ))
+            for child in children:
+                _, stderr = child.communicate(timeout=8)
+                self.assertEqual(child.returncode, 0, stderr)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=3)
+                for stream in (child.stdout, child.stderr):
+                    stream.close()
+        records = self.records()
+        self.assertEqual(len(records), 8)
+        self.assertEqual({r["pid"] for r in records}, {child.pid for child in children})
+        self.assertEqual(len({r["operation"] for r in records}), 8)
+        for record in records:
+            self.assertEqual(record["request"]["request_id"], "allocate")
+        self.assertFalse(self.forbidden.exists())
+
     def test_help_describes_canonical_limits_without_loading_profile(self):
         status, stdout, _, _ = self.invoke(cargo_args=[], prefix=["--help"])
         self.assertEqual(status, 0)

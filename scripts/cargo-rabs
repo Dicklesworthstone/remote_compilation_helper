@@ -82,6 +82,10 @@ Cargo metadata may run locally; builds never do. No local/RCH fallback or
 automatic execution retry occurs. After complete verified delivery, the native
 driver replays Cargo/test stdout and stderr exactly and sends its result report
 to stderr. Test stdout may include arbitrary harness output after Cargo's JSON.
+The native driver durably allocates each new worker request ID under the same
+RABS_STATE_DIR; keep that state across builds. spec.json and operation.json
+record allocation intent, not an assigned ID. The prepared bundle/request.json
+contains the numeric execution identity used unchanged for result recovery.
 
 Remote mode requires a matching RCH installation and configured POSIX workers.
 It execs `rch exec --source-content-receipt -- cargo ...`, with remote execution
@@ -1346,7 +1350,10 @@ def canonical_invocation(profile_path, args, env):
         command_env.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
     import secrets
     specification = {
-        "kind": "canonical-exec", "request_id": secrets.randbits(64) or 1,
+        # This is LOCAL preparation intent. The combined TLS driver reserves a
+        # durable monotonic ID and holds its worker admission through dispatch.
+        # Random operation names below isolate storage; they are not wire IDs.
+        "kind": "canonical-exec", "request_id": "allocate",
         "program": "/__rabs/toolchain/bin/cargo-clippy" if clippy else "/__rabs/toolchain/bin/cargo",
         "args": cargo_args,
         "command_context": {"version": "env-cwd-v1", "cwd": str(Path(manifest).parent),
