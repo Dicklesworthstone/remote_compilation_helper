@@ -720,26 +720,24 @@ fn download(
     };
     // Empty files retain the ordinary zero-length range check. A complete
     // nonempty prefix skips range I/O, never the complete-file hash below.
-    // Keep at most four ordinary range requests in flight. The worker serves
-    // ordered immutable ranges; no new wire operation or speculative bytes are
-    // needed. Drain each batch before writing more requests, and retain the
-    // existing transport's one absolute transfer deadline throughout.
+    // Keep at most four ordinary range requests in flight. Only a validated,
+    // written oldest chunk releases credit. Refill that slot before receiving
+    // the next chunk instead of draining each four-request batch. The same
+    // absolute transport deadline and complete-file verification remain active.
     let mut requested = offset;
     let mut outstanding = 0_usize;
     while offset < item.len || item.len == 0 {
-        if outstanding == 0 {
-            for _ in 0..RANGE_WINDOW {
-                let mut request = json!({"kind":if artifact {"artifact-read"} else {"output-read"},
-                    "request_id":id,"offset":requested,"max_bytes":CHUNK_BYTES});
-                request[if artifact { "name" } else { "stream" }] = json!(item.name);
-                // A partial write aborts the whole operation. Never retry the
-                // batch or fall back to execution when its outcome is unknown.
-                peer.send(&request)?;
-                outstanding += 1;
-                requested += (item.len - requested).min(CHUNK_BYTES as u64);
-                if requested == item.len {
-                    break;
-                }
+        while outstanding < RANGE_WINDOW && (requested < item.len || item.len == 0) {
+            let mut request = json!({"kind":if artifact {"artifact-read"} else {"output-read"},
+                "request_id":id,"offset":requested,"max_bytes":CHUNK_BYTES});
+            request[if artifact { "name" } else { "stream" }] = json!(item.name);
+            // A partial write aborts the operation with pending ranges intact.
+            // Never retry, drain the tail, or fall back to execution here.
+            peer.send(&request)?;
+            outstanding += 1;
+            requested += (item.len - requested).min(CHUNK_BYTES as u64);
+            if requested == item.len {
+                break;
             }
         }
         let chunk = receive(peer, worker)?;
@@ -1214,6 +1212,7 @@ pub fn receive_operation(
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod range_pipeline_tests;
     mod tree_tests;
 
     use super::*;
