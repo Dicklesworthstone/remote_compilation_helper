@@ -9,7 +9,9 @@
 //! again. Failed directories are retained, never repaired in place or deleted.
 //! Explicit resume may copy local prefixes, but verifies the complete new files.
 
+mod ranges;
 mod reuse;
+use ranges::download;
 pub use reuse::{ResumePeer, ResumeSource};
 
 use rabs_sandbox::artifact_tree::{
@@ -696,119 +698,6 @@ fn sync_tree_directories(root: &Path) -> io::Result<()> {
     File::open(root)?.sync_all()
 }
 
-fn download(
-    peer: &mut impl WorkerPeer,
-    worker: &str,
-    id: u64,
-    item: &Item,
-    manifest_hash: Option<&str>,
-    path: &Path,
-) -> io::Result<()> {
-    const RANGE_WINDOW: usize = 4;
-    let artifact = manifest_hash.is_some();
-    let mut file = create_file(path)?;
-    let mut hasher = Sha256::new();
-    let mut offset = match peer.resume_source() {
-        Some(source) => source.copy_prefix(
-            if artifact { "artifacts" } else { "diagnostics" },
-            &item.name,
-            item.len,
-            &mut file,
-            &mut hasher,
-        )?,
-        None => 0,
-    };
-    // Empty files retain the ordinary zero-length range check. A complete
-    // nonempty prefix skips range I/O, never the complete-file hash below.
-    // Keep at most four ordinary range requests in flight. Only a validated,
-    // written oldest chunk releases credit. Refill that slot before receiving
-    // the next chunk instead of draining each four-request batch. The same
-    // absolute transport deadline and complete-file verification remain active.
-    let mut requested = offset;
-    let mut outstanding = 0_usize;
-    while offset < item.len || item.len == 0 {
-        while outstanding < RANGE_WINDOW && (requested < item.len || item.len == 0) {
-            let mut request = json!({"kind":if artifact {"artifact-read"} else {"output-read"},
-                "request_id":id,"offset":requested,"max_bytes":CHUNK_BYTES});
-            request[if artifact { "name" } else { "stream" }] = json!(item.name);
-            // A partial write aborts the operation with pending ranges intact.
-            // Never retry, drain the tail, or fall back to execution here.
-            peer.send(&request)?;
-            outstanding += 1;
-            requested += (item.len - requested).min(CHUNK_BYTES as u64);
-            if requested == item.len {
-                break;
-            }
-        }
-        let chunk = receive(peer, worker)?;
-        require(
-            text(&chunk, "kind")?
-                == if artifact {
-                    "artifact-chunk"
-                } else {
-                    "output-chunk"
-                },
-            "expected byte chunk",
-        )?;
-        require(
-            number(&chunk, "request_id")? == id
-                && text(&chunk, if artifact { "name" } else { "stream" })? == item.name
-                && number(&chunk, "offset")? == offset
-                && number(&chunk, "total_bytes")? == item.len
-                && digest(&chunk, "sha256")? == item.sha256,
-            "chunk identity mismatch",
-        )?;
-        if let Some(hash) = manifest_hash {
-            require(
-                digest(&chunk, "manifest_sha256")? == hash
-                    && chunk.get("executable").and_then(Value::as_bool) == Some(item.executable),
-                "chunk manifest/mode mismatch",
-            )?;
-        }
-        let count = (item.len - offset).min(CHUNK_BYTES as u64) as usize;
-        let encoded = text(&chunk, "data_hex")?;
-        require(
-            is_hex(encoded, count * 2),
-            "chunk encoding or length mismatch",
-        )?;
-        let mut bytes = Vec::with_capacity(count);
-        for pair in encoded.as_bytes().as_chunks::<2>().0 {
-            let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
-            bytes.push(digit(pair[0]) * 16 + digit(pair[1]));
-        }
-        let next = offset + count as u64; // bounded by declared length, never unchecked peer arithmetic
-        require(
-            number(&chunk, "next_offset")? == next
-                && chunk.get("eof").and_then(Value::as_bool) == Some(next == item.len)
-                && digest(&chunk, "chunk_sha256")? == hash(&bytes),
-            "chunk range or digest mismatch",
-        )?;
-        file.write_all(&bytes)?;
-        hasher.update(&bytes);
-        offset = next;
-        outstanding -= 1;
-        if offset == item.len {
-            break;
-        }
-    }
-    let actual: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    require(actual == item.sha256, "complete file digest mismatch")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(if item.executable {
-            0o700
-        } else {
-            0o600
-        }))?;
-    }
-    file.sync_all()
-}
-
 fn acknowledge(
     peer: &mut impl WorkerPeer,
     worker: &str,
@@ -1117,17 +1006,13 @@ pub fn receive_operation(
                 &destination.join("artifacts"),
                 manifest.files.iter().map(|file| file.name.as_str()),
             )?;
-            for file in &manifest.files {
-                let path = destination.join("artifacts").join(&file.name);
-                download(
-                    peer,
-                    expected_worker,
-                    id,
-                    file,
-                    Some(&manifest.sha256),
-                    &path,
-                )?;
-            }
+            ranges::download_artifacts(
+                peer,
+                expected_worker,
+                id,
+                manifest,
+                &destination.join("artifacts"),
+            )?;
         }
         sync_tree_directories(destination)?;
         // Sync parent ancestry too: a power loss must not erase a newly linked
@@ -1212,6 +1097,7 @@ pub fn receive_operation(
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod cross_file_range_tests;
     mod range_pipeline_tests;
     mod tree_tests;
 
@@ -2224,7 +2110,8 @@ mod tests {
         use super::super::source_delivery::SourcePeer;
 
         let source = tempfile::tempdir().unwrap();
-        let (upload, mut request) = source_request(source.path());
+        let (upload, request) = source_request(source.path());
+        let mut request = request;
         request["command_context"] = explicit_context();
         for supported in [false, true] {
             let parent = tempfile::tempdir().unwrap();
@@ -2251,8 +2138,8 @@ mod tests {
                 );
             } else {
                 assert!(!result.unwrap_err().execution_may_have_run);
-                assert!(peer.sent.is_empty());
                 assert!(!destination.exists());
+                assert!(peer.sent.is_empty());
             }
         }
     }
@@ -2306,7 +2193,7 @@ mod tests {
     }
 
     fn heartbeat() -> Value {
-        json!({"kind":"heartbeat", "worker_id":"worker", "active_request_id":7})
+        json!({"kind":"heartbeat", "worker_id":"worker","active_request_id":7})
     }
 
     #[test]
