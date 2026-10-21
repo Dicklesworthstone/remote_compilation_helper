@@ -6,7 +6,7 @@
 
 use rch_common::{
     Classification, ClassificationTier, PlacementPlan, RequiredRuntime, SelectedWorker,
-    SelectionDiagnostics, SelectionReason, WorkerCapabilities, WorkerConfig,
+    SelectionDiagnostics, SelectionReason, WorkerCapabilities, WorkerConfig, WorkerId,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -517,6 +517,36 @@ pub struct DiagnoseWorkerSelection {
     pub reason: SelectionReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<SelectionDiagnostics>,
+    /// Every worker the daemon considered: the selected one, and why each
+    /// other one was not chosen (GH #125). Absent when the daemon reported
+    /// no per-worker diagnostics (an rchd older than this rch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<Vec<DiagnoseWorkerInventoryEntry>>,
+}
+
+/// One worker's place in a simulated selection.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct DiagnoseWorkerInventoryEntry {
+    pub worker_id: WorkerId,
+    pub outcome: DiagnoseWorkerOutcome,
+    /// The selector's reason, e.g. `available slots 2 < 4`.
+    pub reason: String,
+    /// The selector's stable reason codes, e.g. `slots.insufficient`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnoseWorkerOutcome {
+    /// The worker this build would get.
+    Selected,
+    /// Passed every gate; another eligible worker ranked higher.
+    Eligible,
+    /// Usable only if no eligible worker exists (fail-open fallback).
+    FallbackCandidate,
+    /// Denied by a gate; `reason` says which.
+    Excluded,
 }
 
 /// Pipeline step for dry-run output.

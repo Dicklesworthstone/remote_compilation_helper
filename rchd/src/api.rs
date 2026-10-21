@@ -2562,11 +2562,18 @@ async fn handle_select_worker_dry_run(
 ) -> SelectionResponse {
     // Same exclusions as a real request: a worker already building this
     // project would not be handed a second build of it.
-    let excluded_worker_ids = project_excluded_workers(ctx, &request.project);
-    let result = ctx
+    let exclusions = project_exclusions(ctx, &request.project);
+    let excluded_worker_ids: std::collections::HashSet<String> =
+        exclusions.keys().cloned().collect();
+    // A preview is what `rch diagnose` shows, so it reports every worker's
+    // decision even when it selects one (GH #125).
+    let mut result = ctx
         .worker_selector
-        .preview_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
+        .preview_with_inventory(&ctx.pool, request, &excluded_worker_ids)
         .await;
+    if let Some(diagnostics) = result.diagnostics.as_mut() {
+        describe_project_exclusions(diagnostics, &exclusions);
+    }
     let worker = match result.worker {
         Some(worker) => {
             // Read slot/score state before taking the config lock: tokio's
@@ -3789,22 +3796,104 @@ fn project_excluded_workers(
     ctx: &DaemonContext,
     project: &str,
 ) -> std::collections::HashSet<String> {
+    project_exclusions(ctx, project).into_keys().collect()
+}
+
+/// Why selection skips a worker for one project. Selection only needs the
+/// set; `rch diagnose` names the cause (GH #125).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectExclusion {
+    /// Every project lane on the worker holds an active build of it.
+    LanesFull,
+    /// A failed build's client lease still owns the project's source there.
+    SourceFenced,
+    /// The worker's live checkout of the project refused a source sync.
+    LiveCheckout,
+    /// Another owner held the project's source there past the admission wait.
+    SourceBusy,
+}
+
+impl ProjectExclusion {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::LanesFull => "project.lanes_full",
+            Self::SourceFenced => "project.source_fenced",
+            Self::LiveCheckout => "project.live_checkout_fenced",
+            Self::SourceBusy => "project.source_busy_fenced",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::LanesFull => "every project lane on this worker holds an active build",
+            Self::SourceFenced => {
+                "a failed build's client lease still owns this project's source on this worker"
+            }
+            Self::LiveCheckout => {
+                "this worker's live checkout of the project refused a source sync"
+            }
+            Self::SourceBusy => "another owner holds this project's source on this worker",
+        }
+    }
+}
+
+/// The workers excluded for `project`, each with the first cause found.
+fn project_exclusions(
+    ctx: &DaemonContext,
+    project: &str,
+) -> std::collections::HashMap<String, ProjectExclusion> {
     // A worker is full for this project once every one of its project lanes
     // holds an active build (bd-sgvod; one lane unless daemon.toml says more).
-    let mut excluded: std::collections::HashSet<String> = ctx
+    let mut excluded: std::collections::HashMap<String, ProjectExclusion> = ctx
         .history
         .active_build_counts_for_project(project)
         .into_iter()
         .filter(|(worker, count)| *count >= ctx.pool.project_lanes(worker) as usize)
-        .map(|(worker, _)| worker)
+        .map(|(worker, _)| (worker, ProjectExclusion::LanesFull))
         .collect();
-    excluded.extend(
-        ctx.history
-            .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
-    );
-    excluded.extend(ctx.history.live_checkout_fenced_workers(project));
-    excluded.extend(ctx.history.source_busy_fenced_workers(project));
+    let fences = [
+        (
+            ctx.history
+                .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
+            ProjectExclusion::SourceFenced,
+        ),
+        (
+            ctx.history.live_checkout_fenced_workers(project),
+            ProjectExclusion::LiveCheckout,
+        ),
+        (
+            ctx.history.source_busy_fenced_workers(project),
+            ProjectExclusion::SourceBusy,
+        ),
+    ];
+    for (workers, cause) in fences {
+        for worker in workers {
+            excluded.entry(worker).or_insert(cause);
+        }
+    }
     excluded
+}
+
+/// Name each project exclusion's actual cause in the per-worker diagnostics.
+/// The selector reports them all as `active_project_exclusion` because it
+/// sees only the excluded set; that code stays for existing consumers.
+fn describe_project_exclusions(
+    diagnostics: &mut rch_common::SelectionDiagnostics,
+    exclusions: &std::collections::HashMap<String, ProjectExclusion>,
+) {
+    for worker in &mut diagnostics.workers {
+        let Some(cause) = exclusions.get(worker.worker_id.as_str()) else {
+            continue;
+        };
+        if worker
+            .reason_codes
+            .iter()
+            .any(|code| code == "active_project_exclusion")
+        {
+            worker.final_reason = cause.reason().to_string();
+            worker.reason_codes.push(cause.reason_code().to_string());
+        }
+    }
 }
 
 pub(crate) fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
@@ -6187,6 +6276,90 @@ mod tests {
                 .active_workers_for_project("dry-run-project")
                 .is_empty()
         );
+    }
+
+    /// GH #125: the dry run behind `rch diagnose` reports every configured
+    /// worker's decision even when it selects one, names a project
+    /// exclusion's actual cause, and marks workers outside a requested set.
+    #[tokio::test]
+    async fn dry_run_selection_inventories_every_worker_with_its_reason() {
+        use rch_common::WorkerSelectionDiagnosticDecision as Decision;
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        for id in ["chosen", "busy", "fenced"] {
+            pool.add_worker(make_test_worker(id, 8)).await;
+            set_test_build_disk(&pool, id, 100.0).await;
+        }
+        let busy = pool.get(&WorkerId::new("busy")).await.unwrap();
+        assert!(busy.reserve_slots(6).await);
+        let ctx = make_test_context(pool);
+        ctx.history
+            .fence_live_checkout("inventory-project", "fenced");
+        let mut request = SelectionRequest {
+            job_mode: false,
+            project: "inventory-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            required_tools: Vec::new(),
+            hook_pid: None,
+        };
+        let entry = |response: &SelectionResponse, id: &str| {
+            response
+                .diagnostics
+                .as_ref()
+                .expect("a dry run always reports per-worker diagnostics")
+                .workers
+                .iter()
+                .find(|worker| worker.worker_id.as_str() == id)
+                .unwrap_or_else(|| panic!("no diagnostic for {id}"))
+                .clone()
+        };
+
+        let response = handle_select_worker_dry_run(&ctx, &request).await;
+        assert_eq!(response.worker.as_ref().unwrap().id.as_str(), "chosen");
+        assert_eq!(response.diagnostics.as_ref().unwrap().workers.len(), 3);
+        let chosen = entry(&response, "chosen");
+        assert_eq!(chosen.final_decision, Decision::Allow, "{chosen:?}");
+        let busy_entry = entry(&response, "busy");
+        assert_eq!(busy_entry.final_decision, Decision::Deny);
+        assert_eq!(busy_entry.reason_codes, vec!["slots.insufficient"]);
+        let fenced = entry(&response, "fenced");
+        assert_eq!(fenced.final_decision, Decision::Deny);
+        assert!(fenced.active_project_excluded);
+        assert_eq!(
+            fenced.reason_codes,
+            vec!["active_project_exclusion", "project.live_checkout_fenced"]
+        );
+        assert_eq!(fenced.final_reason, ProjectExclusion::LiveCheckout.reason());
+        // A preview reserves nothing, and the plain preview other callers use
+        // still attaches diagnostics only to a failed selection.
+        assert_eq!(busy.used_slots(), 6);
+        assert!(ctx.history.active_builds().is_empty());
+        let plain = ctx
+            .worker_selector
+            .preview_with_exclusions(&ctx.pool, &request, &std::collections::HashSet::new())
+            .await;
+        assert!(plain.worker.is_some() && plain.diagnostics.is_none());
+
+        request.preferred_workers = vec![WorkerId::new("chosen")];
+        let response = handle_select_worker_dry_run(&ctx, &request).await;
+        assert_eq!(response.worker.as_ref().unwrap().id.as_str(), "chosen");
+        assert_eq!(entry(&response, "chosen").final_decision, Decision::Allow);
+        for id in ["busy", "fenced"] {
+            let other = entry(&response, id);
+            assert_eq!(other.final_decision, Decision::Deny, "{id}");
+            assert_eq!(other.reason_codes, vec!["selection.not_requested"], "{id}");
+            assert_eq!(
+                other.final_reason, "not in the requested worker set",
+                "{id}"
+            );
+        }
     }
 
     #[test]

@@ -35,7 +35,8 @@ use super::config::collect_value_sources;
 use super::helpers::{humanize_duration, runtime_label, urlencoding_encode};
 use super::types::{
     DiagnoseDaemonStatus, DiagnoseDecision, DiagnoseResponse, DiagnoseThreshold,
-    DiagnoseWorkerSelection, DryRunPipelineStep, DryRunSummary,
+    DiagnoseWorkerInventoryEntry, DiagnoseWorkerOutcome, DiagnoseWorkerSelection,
+    DryRunPipelineStep, DryRunSummary,
 };
 use super::workers::{
     collect_local_capability_warnings, has_any_capabilities, probe_local_capabilities,
@@ -477,6 +478,87 @@ fn refine_diagnose_placement(
     plan
 }
 
+/// Every worker the daemon considered for a simulated selection, the
+/// selected one marked (GH #125). `None` when the daemon sent no per-worker
+/// diagnostics, which an rchd older than this rch does after a success.
+pub(super) fn build_worker_inventory(
+    selected: Option<&rch_common::WorkerId>,
+    reason: &rch_common::SelectionReason,
+    diagnostics: Option<&rch_common::SelectionDiagnostics>,
+) -> Option<Vec<DiagnoseWorkerInventoryEntry>> {
+    use rch_common::WorkerSelectionDiagnosticDecision as Decision;
+    let selected_reason = match reason {
+        rch_common::SelectionReason::Success => "selected".to_string(),
+        other => format!("selected ({other})"),
+    };
+    let mut inventory: Vec<DiagnoseWorkerInventoryEntry> = diagnostics?
+        .workers
+        .iter()
+        .map(|worker| {
+            let is_selected = selected == Some(&worker.worker_id);
+            let outcome = match worker.final_decision {
+                _ if is_selected => DiagnoseWorkerOutcome::Selected,
+                Decision::Allow => DiagnoseWorkerOutcome::Eligible,
+                Decision::FallbackCandidate => DiagnoseWorkerOutcome::FallbackCandidate,
+                Decision::Deny => DiagnoseWorkerOutcome::Excluded,
+            };
+            let reason = match worker.final_decision {
+                Decision::Allow if is_selected => selected_reason.clone(),
+                // Selected despite its own gate, e.g. as the fail-open fallback.
+                _ if is_selected => format!("{selected_reason}; {}", worker.final_reason),
+                _ => worker.final_reason.clone(),
+            };
+            DiagnoseWorkerInventoryEntry {
+                worker_id: worker.worker_id.clone(),
+                outcome,
+                reason,
+                reason_codes: worker.reason_codes.clone(),
+            }
+        })
+        .collect();
+    if let Some(selected) = selected
+        && !inventory.iter().any(|entry| &entry.worker_id == selected)
+    {
+        inventory.push(DiagnoseWorkerInventoryEntry {
+            worker_id: selected.clone(),
+            outcome: DiagnoseWorkerOutcome::Selected,
+            reason: selected_reason,
+            reason_codes: Vec::new(),
+        });
+    }
+    Some(inventory)
+}
+
+fn print_worker_inventory(style: &Theme, selection: &DiagnoseWorkerSelection) {
+    let Some(inventory) = selection.inventory.as_ref() else {
+        println!(
+            "  {} {}",
+            style.key("Inventory:"),
+            style.muted("unavailable (the daemon reported no per-worker diagnostics; it may be older than rch)")
+        );
+        return;
+    };
+    println!("  {}", style.key("Inventory:"));
+    for entry in inventory {
+        let outcome = match entry.outcome {
+            DiagnoseWorkerOutcome::Selected => style.success("selected"),
+            DiagnoseWorkerOutcome::Eligible => style.value("eligible"),
+            DiagnoseWorkerOutcome::FallbackCandidate => style.warning("fallback"),
+            DiagnoseWorkerOutcome::Excluded => style.warning("excluded"),
+        };
+        let codes = if entry.reason_codes.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", entry.reason_codes.join(", "))
+        };
+        println!(
+            "    {outcome} {} {}",
+            style.value(entry.worker_id.as_str()),
+            style.muted(&format!("{}{codes}", entry.reason))
+        );
+    }
+}
+
 pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
     use rch_common::classify_command_detailed;
 
@@ -619,6 +701,11 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                     worker: response.worker.clone(),
                     reason: response.reason.clone(),
                     diagnostics: response.diagnostics.clone(),
+                    inventory: build_worker_inventory(
+                        response.worker.as_ref().map(|worker| &worker.id),
+                        &response.reason,
+                        response.diagnostics.as_ref(),
+                    ),
                 });
                 if let Some(worker) = response.worker.as_ref() {
                     debug!(
@@ -801,6 +888,11 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 println!();
                 println!("{} ~{}ms", style.key("Total estimated:"), total_ms);
             }
+        }
+        if let Some(selection) = worker_selection.as_ref() {
+            println!();
+            println!("{}", style.highlight("Worker Selection (simulated)"));
+            print_worker_inventory(style, selection);
         }
         println!();
         println!(
@@ -1037,6 +1129,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 );
             }
         }
+        print_worker_inventory(style, selection);
     } else if !would_intercept {
         println!(
             "  {} {}",
@@ -3857,6 +3950,7 @@ mod tests {
             }),
             reason: rch_common::SelectionReason::Success,
             diagnostics: Some(diagnostics),
+            inventory: None,
         });
 
         let refined = refine_diagnose_placement(plan, &selection);
@@ -3865,6 +3959,122 @@ mod tests {
             rch_common::RequestedWorkerStatus::Honored
         );
         assert_eq!(refined.effective_worker.as_deref(), Some("available"));
+    }
+
+    /// GH #125: the diagnose inventory lists every worker the daemon
+    /// considered, marks the selected one and keeps each other's reason.
+    #[test]
+    fn diagnose_worker_inventory_marks_the_selection_and_every_exclusion() {
+        use rch_common::WorkerSelectionDiagnosticDecision as Decision;
+        let worker = |id: &str, decision: Decision, reason: &str, codes: &[&str]| {
+            rch_common::WorkerSelectionDiagnostic {
+                worker_id: rch_common::WorkerId::new(id),
+                status: "healthy".to_string(),
+                circuit_state: "closed".to_string(),
+                pressure_state: "healthy".to_string(),
+                pressure_reason_code: "pressure.healthy".to_string(),
+                success_rate: Some(1.0),
+                min_success_rate: 0.8,
+                fallback_min_success_rate: 0.5,
+                required_runtime: RequiredRuntime::Rust,
+                runtime_available: true,
+                available_slots: 8,
+                total_slots: 8,
+                estimated_cores: 4,
+                active_project_excluded: false,
+                final_decision: decision,
+                final_reason: reason.to_string(),
+                reason_codes: codes.iter().map(|code| (*code).to_string()).collect(),
+            }
+        };
+        let diagnostics = rch_common::SelectionDiagnostics {
+            required_runtime: RequiredRuntime::Rust,
+            estimated_cores: 4,
+            min_success_rate: 0.8,
+            fallback_min_success_rate: 0.5,
+            active_project_exclusion_count: 0,
+            workers: vec![
+                worker("chosen", Decision::Allow, "eligible", &[]),
+                worker("runner-up", Decision::Allow, "eligible", &[]),
+                worker(
+                    "loaded",
+                    Decision::FallbackCandidate,
+                    "high load 3.10 > 2.00 per core",
+                    &["preflight.high_load"],
+                ),
+                worker(
+                    "busy",
+                    Decision::Deny,
+                    "available slots 2 < 4",
+                    &["slots.insufficient"],
+                ),
+            ],
+        };
+        let selected = rch_common::WorkerId::new("chosen");
+        let inventory = build_worker_inventory(
+            Some(&selected),
+            &rch_common::SelectionReason::Success,
+            Some(&diagnostics),
+        )
+        .unwrap();
+        let summary: Vec<(&str, DiagnoseWorkerOutcome, &str)> = inventory
+            .iter()
+            .map(|entry| {
+                (
+                    entry.worker_id.as_str(),
+                    entry.outcome,
+                    entry.reason.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("chosen", DiagnoseWorkerOutcome::Selected, "selected"),
+                ("runner-up", DiagnoseWorkerOutcome::Eligible, "eligible"),
+                (
+                    "loaded",
+                    DiagnoseWorkerOutcome::FallbackCandidate,
+                    "high load 3.10 > 2.00 per core"
+                ),
+                (
+                    "busy",
+                    DiagnoseWorkerOutcome::Excluded,
+                    "available slots 2 < 4"
+                ),
+            ]
+        );
+        assert_eq!(inventory[3].reason_codes, vec!["slots.insufficient"]);
+        let json = serde_json::to_value(&inventory).unwrap();
+        assert_eq!(json[0]["outcome"], "selected");
+        assert_eq!(json[2]["outcome"], "fallback_candidate");
+        assert_eq!(json[3]["outcome"], "excluded");
+        assert!(json[0].get("reason_codes").is_none());
+
+        // A fail-open selection keeps the selector's own reason.
+        let fallback = rch_common::WorkerId::new("loaded");
+        let inventory = build_worker_inventory(
+            Some(&fallback),
+            &rch_common::SelectionReason::AffinityFallback,
+            Some(&diagnostics),
+        )
+        .unwrap();
+        assert_eq!(inventory[2].outcome, DiagnoseWorkerOutcome::Selected);
+        assert_eq!(
+            inventory[2].reason,
+            format!(
+                "selected ({}); high load 3.10 > 2.00 per core",
+                rch_common::SelectionReason::AffinityFallback
+            )
+        );
+        assert_eq!(inventory[0].outcome, DiagnoseWorkerOutcome::Eligible);
+
+        // No selector diagnostics (an older daemon): no inventory, not an
+        // empty one that would claim no worker was considered.
+        assert_eq!(
+            build_worker_inventory(Some(&selected), &rch_common::SelectionReason::Success, None),
+            None
+        );
     }
 
     #[test]

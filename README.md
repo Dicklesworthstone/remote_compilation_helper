@@ -980,6 +980,16 @@ outcome, and a `diagnostics` list. Any control value that cannot be applied as
 written (an unrecognized value or a superseded alias) surfaces a diagnostic
 rather than being silently ignored.
 
+The simulated selection also lists every worker the daemon considered, under
+`data.worker_selection.inventory` (human output: `Inventory:` under `Worker
+Selection (simulated)`). Each entry is `selected`, `eligible` (passed every
+gate, ranked lower), `fallback_candidate` or `excluded`, with the selector's
+reason and reason codes, for example `available slots 2 < 4`
+(`slots.insufficient`), `not in the requested worker set`
+(`selection.not_requested`), or a project exclusion such as
+`project.live_checkout_fenced`. A daemon older than the client reports no
+inventory after a successful selection.
+
 ---
 
 ## Monitoring and Observability

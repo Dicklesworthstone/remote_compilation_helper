@@ -809,6 +809,36 @@ impl WorkerSelector {
         request: &SelectionRequest,
         excluded_worker_ids: &HashSet<String>,
     ) -> SelectionResult {
+        self.preview_round()
+            .select_in_round(pool, request, excluded_worker_ids)
+            .await
+    }
+
+    /// [`Self::preview_with_exclusions`] that always reports every configured
+    /// worker's decision, also when it selects one (`rch diagnose`, GH #125).
+    /// The inventory comes from the same round, so it reads the admission
+    /// verdicts that round's preview used.
+    pub async fn preview_with_inventory(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+    ) -> SelectionResult {
+        let round = self.preview_round();
+        let mut result = round
+            .select_in_round(pool, request, excluded_worker_ids)
+            .await;
+        if result.diagnostics.is_none() {
+            result.diagnostics = Some(
+                round
+                    .build_selection_diagnostics(pool, request, excluded_worker_ids)
+                    .await,
+            );
+        }
+        result
+    }
+
+    fn preview_round(&self) -> Self {
         let mut round = self.clone();
         round.preview = true;
         round.admission_gate = self
@@ -816,8 +846,6 @@ impl WorkerSelector {
             .as_ref()
             .map(|gate| Arc::new(gate.for_selection()));
         round
-            .select_in_round(pool, request, excluded_worker_ids)
-            .await
     }
 
     async fn select_in_round(
@@ -1647,7 +1675,14 @@ impl WorkerSelector {
             };
 
             let (final_decision, final_reason) =
-                if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
+                if outside_requested_set(request, worker_id.as_str()) {
+                    // `get_eligible_workers` drops these before any other gate.
+                    push_reason_code(&mut reason_codes, "selection.not_requested");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        "not in the requested worker set".to_string(),
+                    )
+                } else if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
                     push_reason_code(&mut reason_codes, "worker.status_not_assignable");
                     (
                         WorkerSelectionDiagnosticDecision::Deny,
@@ -3868,6 +3903,16 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
     if !reason_codes.iter().any(|existing| existing.eq(reason_code)) {
         reason_codes.push(reason_code.to_string());
     }
+}
+
+/// An explicit worker request is an allow-set, not a preference: a worker
+/// outside it is never a candidate.
+fn outside_requested_set(request: &SelectionRequest, worker_id: &str) -> bool {
+    !request.preferred_workers.is_empty()
+        && !request
+            .preferred_workers
+            .iter()
+            .any(|requested| requested.as_str() == worker_id)
 }
 
 /// Append the OS-gate count to a combined admission summary.

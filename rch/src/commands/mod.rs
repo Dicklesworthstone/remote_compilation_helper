@@ -946,6 +946,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::NoAdmissibleWorkers("insufficient_slots=1".to_string()),
             diagnostics: None,
+            inventory: None,
         };
 
         let json = serde_json::to_value(&worker_selection).unwrap();
@@ -1237,6 +1238,7 @@ mod tests {
             worker: Some(worker),
             reason: SelectionReason::Success,
             diagnostics: None,
+            inventory: None,
         };
         let summary = build_dry_run_summary(
             true,
@@ -1263,6 +1265,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
             diagnostics: None,
+            inventory: None,
         };
         let summary = build_dry_run_summary(
             true,
@@ -1350,6 +1353,7 @@ mod tests {
                     reason_codes: vec!["pressure.critical".to_string()],
                 }],
             }),
+            inventory: None,
         };
         let dry_run = build_dry_run_summary(
             true,
