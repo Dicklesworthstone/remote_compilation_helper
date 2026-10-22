@@ -71,12 +71,13 @@ including that actual grant, participates in the match.
 
 ### Reuse after local Rust-source edits
 
-For an unprojected workspace, a compatible target can also survive edits to
-existing, non-executable `.rs` files belonging to local/path packages, including
-`build.rs`. Every file name and executable bit remains exact. Non-Rust files
-(including manifests, lockfiles, Cargo configuration and data read by build
-scripts) and all files underneath a `.cargo-checksum.json` package root remain
-content-exact. Added, removed or renamed files select a fresh target.
+For an unprojected workspace, a compatible target can survive edits, additions,
+removals and renames of non-executable `.rs` files belonging to local/path
+packages, including `build.rs`. Non-Rust files (including manifests, lockfiles,
+Cargo configuration and data read by build scripts), executable inputs, and all
+files underneath a `.cargo-checksum.json` package root remain exact in content,
+membership and executable mode. Changing those inputs still selects a fresh
+target. Unknown commands and arguments retain exact-invocation reuse only.
 
 This first edit family does not cover `cargo_home_source` projections: the
 workspace manifest alone cannot certify their separately captured registry/Git
@@ -85,13 +86,22 @@ packages remain exact because Cargo does not track registry/Git source mtimes.
 The input capture/planning checks still validate the complete current source.
 
 The worker compares the previous and current manifests, never incoming mtimes,
-to identify edits. Unchanged files receive their retained timestamps only in
-the new private workspace. Edited files and their parent directories receive
-the current worker time, which must be strictly later than every retained source
-and target timestamp, including Cargo's fingerprint and build-script records.
+to identify edits and membership changes. It copies only the current source
+tree: removed modules and directories are not restored from an older workspace.
+Unchanged files receive their retained timestamps in the new private workspace.
+Edited or added files and all surviving parent directories of changed, added,
+removed or renamed files receive the current worker time. On membership changes,
+ancestor `Cargo.toml` files also receive that time, without changing their bytes,
+so default package-scanning build scripts cannot miss a deletion with no changed
+file left behind. Unrelated packages retain their previous timestamps.
+
+The current worker time must be strictly later than every retained source and
+target timestamp, including Cargo's fingerprint and build-script records.
 The worker reads back the complete timestamp plan and re-verifies current bytes.
 A regressed clock or inadequate filesystem timestamp precision refuses optional
 restoration and builds cold; output timestamps are never changed to force a hit.
+Directory mode changes and empty-directory changes unrelated to the admitted
+Rust membership changes also refuse optional restoration.
 
 Cargo still runs and decides which local units/dependents to rebuild. Tests run
 again even when their compiled state can be reused. The exact invocation key,

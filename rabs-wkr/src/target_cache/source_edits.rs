@@ -2,22 +2,25 @@
 //!
 //! Cargo tracks local/path-package source mtimes, but does not do so for registry
 //! and Git packages. Keep all directory-source packages (identified by their
-//! checksum document), non-Rust files, file membership and executable modes
-//! exact. Captured Cargo-home projections remain outside this first edit family:
-//! their full transport identity cannot be derived from the workspace alone.
+//! checksum document), non-Rust files and executable inputs exact. Local Rust
+//! files may be edited, added, removed or renamed. Captured Cargo-home projections
+//! remain outside this edit family: their full transport identity cannot be
+//! derived from the workspace alone.
 //! Unknown Cargo arguments/commands are excluded by the caller's existing gate.
 //!
 //! A matching family only selects a seed. Both trees are independently verified
 //! and copied; every changed input and its parent directories must become newer
-//! than ALL retained source and target timestamps. Unchanged input timestamps
-//! and every output timestamp are preserved. A regressed clock or a filesystem
-//! that cannot represent the requested timestamps yields a cold build, not a
+//! than ALL retained source and target timestamps. Membership changes also dirty
+//! ancestor Cargo manifests for old-style build-script package scans. All other
+//! unchanged input times and every output timestamp are preserved. A regressed
+//! clock or a filesystem that cannot represent the requested timestamps yields
+//! a cold build, not a
 //! stale fingerprint. The current command and its artifact report still run.
 
 use super::{Seed, SourceTimes, WorkspaceInputs, checkpoint, invalid};
 use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::time::SystemTime;
@@ -47,30 +50,34 @@ fn editable(file: &SourceFile, protected: &BTreeSet<&Path>) -> bool {
         .any(|parent| protected.contains(parent))
 }
 
-/// A length-framed family digest retains names, membership, modes and all
-/// non-editable bytes. An eligible .rs file retains its name/mode, not its old
-/// size/content. This value is NEVER a source manifest or a compiler action key.
+/// A length-framed family digest retains every non-editable input's name, mode
+/// and bytes. Editable Rust membership is checked by the timestamp planner, not
+/// collapsed into an action key: the exact source manifest remains unchanged.
 pub(super) fn identity(inputs: &WorkspaceInputs) -> Option<[u8; 32]> {
     if inputs.projection.is_some() || inputs.full_source_digest != inputs.manifest.digest() {
         return None;
     }
     let protected = protected_roots(&inputs.manifest);
     let mut hash = Sha256::new();
-    hash.update(b"rabs.private-cargo-source-edits.v1\0");
-    hash.update((inputs.manifest.files().len() as u64).to_be_bytes());
-    let mut has_editable = false;
+    hash.update(b"rabs.private-cargo-source-edits.v2\0");
+    let immutable = inputs
+        .manifest
+        .files()
+        .iter()
+        .filter(|file| !editable(file, &protected))
+        .count();
+    hash.update((immutable as u64).to_be_bytes());
     for file in inputs.manifest.files() {
-        let edit = editable(file, &protected);
-        has_editable |= edit;
+        if editable(file, &protected) {
+            continue;
+        }
         hash.update((file.path.len() as u64).to_be_bytes());
         hash.update(file.path.as_bytes());
-        hash.update([u8::from(file.executable), u8::from(edit)]);
-        if !edit {
-            hash.update(file.len.to_be_bytes());
-            hash.update(file.sha256);
-        }
+        hash.update([u8::from(file.executable)]);
+        hash.update(file.len.to_be_bytes());
+        hash.update(file.sha256);
     }
-    has_editable.then(|| hash.finalize().into())
+    (immutable < inputs.manifest.files().len()).then(|| hash.finalize().into())
 }
 
 /// Compute a timestamp plan before copying. The existing descriptor-anchored
@@ -89,11 +96,18 @@ pub(super) fn timestamps(
     if identity(inputs).is_none_or(|family| seed.edit_family != Some(family)) {
         return Err(invalid("source edit is outside the retained Cargo seed family"));
     }
-    let previous = seed.source_manifest.files();
-    let current = inputs.manifest.files();
-    if previous.len() != current.len() {
-        return Err(invalid("source-edit file membership changed"));
-    }
+    let previous: BTreeMap<_, _> = seed
+        .source_manifest
+        .files()
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let current: BTreeMap<_, _> = inputs
+        .manifest
+        .files()
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
     // Do not invent future times or move outputs backwards. On a clock rollback
     // we can always execute cold. Include source times for Cargo's old-style
     // build-script newest-file checks, and directories for recursive directives.
@@ -112,39 +126,107 @@ pub(super) fn timestamps(
         ));
     }
     let protected = protected_roots(&inputs.manifest);
-    let mut wanted = seed.source.clone();
-    let mut edits = 0;
-    for (old, new) in previous.iter().zip(current) {
+    let old_protected = protected_roots(&seed.source_manifest);
+    let mut changed = BTreeSet::new();
+    for (name, old) in &previous {
         checkpoint(stopped)?;
-        if old.path != new.path || old.executable != new.executable {
-            return Err(invalid("source-edit layout or executable mode changed"));
+        if !current.contains_key(name) {
+            if !editable(old, &old_protected) {
+                return Err(invalid("source edit removed an immutable Cargo input"));
+            }
+            changed.insert(*name);
         }
-        if old.len == new.len && old.sha256 == new.sha256 {
-            continue;
+    }
+    for (name, new) in &current {
+        checkpoint(stopped)?;
+        if let Some(old) = previous.get(name) {
+            if old.executable != new.executable {
+                return Err(invalid("source-edit executable mode changed"));
+            }
+            if old.len == new.len && old.sha256 == new.sha256 {
+                continue;
+            }
         }
         if !editable(new, &protected) {
             return Err(invalid("source edit changed an immutable Cargo input"));
         }
-        *wanted
-            .files
-            .get_mut(&new.path)
-            .ok_or_else(|| invalid("edited source has no retained timestamp"))? = now;
-        for parent in Path::new(&new.path).ancestors().skip(1) {
-            let name = parent
-                .to_str()
-                .ok_or_else(|| invalid("non-UTF-8 source-edit parent"))?;
-            wanted
-                .directories
-                .get_mut(name)
-                .ok_or_else(|| invalid("edited source has no retained parent"))?
-                .modified = now;
-        }
-        edits += 1;
+        changed.insert(*name);
     }
-    if edits == 0 {
+    if changed.is_empty() {
         return Err(invalid(
             "changed manifest contains no supported Rust-source edit",
         ));
+    }
+    let mut parents = BTreeSet::new();
+    for name in &changed {
+        checkpoint(stopped)?;
+        for parent in Path::new(name).ancestors().skip(1) {
+            parents.insert(
+                parent
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF-8 source-edit parent"))?,
+            );
+        }
+    }
+    // Reconstruct membership from the CURRENT verified tree, never from the
+    // retained workspace. Removed files/directories must not be resurrected.
+    // Keep the old fast path for content-only edits with the same file names.
+    let membership_changed = !previous.keys().eq(current.keys());
+    let mut wanted = if !membership_changed {
+        seed.source.clone()
+    } else {
+        let mut current_times = SourceTimes::capture(inputs, stopped)?;
+        for (name, modified) in &mut current_times.files {
+            if let Some(old) = seed.source.files.get(name) {
+                *modified = *old;
+            }
+        }
+        for (name, directory) in &mut current_times.directories {
+            checkpoint(stopped)?;
+            if let Some(old) = seed.source.directories.get(name) {
+                if directory.mode != old.mode {
+                    return Err(invalid("source-edit directory mode changed"));
+                }
+                directory.modified = old.modified;
+            } else if !parents.contains(name.as_str()) {
+                return Err(invalid("source edit introduced an unrelated directory"));
+            }
+        }
+        for name in seed.source.directories.keys() {
+            if !current_times.directories.contains_key(name)
+                && !parents.contains(name.as_str())
+            {
+                return Err(invalid("source edit removed an unrelated directory"));
+            }
+        }
+        current_times
+    };
+    for name in &changed {
+        checkpoint(stopped)?;
+        if let Some(modified) = wanted.files.get_mut(*name) {
+            *modified = now;
+        }
+    }
+    // A removal has no file to timestamp. Dirty every surviving ancestor,
+    // including the root, so directory-scanning build scripts see removals and
+    // renames as well as additions. Missing ancestors stay absent in the clone.
+    for name in parents {
+        checkpoint(stopped)?;
+        if let Some(directory) = wanted.directories.get_mut(name) {
+            directory.modified = now;
+        }
+        if membership_changed {
+            // A removed file may no longer contribute to Cargo's old-style
+            // package newest-file fingerprint. Its containing Cargo.toml is
+            // still present and content-exact, but must signal that membership
+            // changed. Unrelated packages retain their original timestamps.
+            let manifest = Path::new(name).join("Cargo.toml");
+            if let Some(manifest) = manifest.to_str()
+                && let Some(modified) = wanted.files.get_mut(manifest)
+            {
+                *modified = now;
+            }
+        }
     }
     Ok(wanted)
 }
@@ -239,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_family_keeps_non_rust_bytes_vendor_sources_membership_and_modes_exact() {
+    fn edit_family_keeps_non_rust_bytes_vendor_sources_and_modes_exact() {
         let root = source();
         write(root.path(), "vendor/dep/.cargo-checksum.json", "{}");
         write(root.path(), "vendor/dep/src/lib.rs", "pub fn dependency() {}\n");
@@ -257,6 +339,8 @@ mod tests {
         assert_ne!(identity(&observe(root.path())), Some(expected));
         fs::set_permissions(root.path().join("src/lib.rs"), fs::Permissions::from_mode(0o600)).unwrap();
         write(root.path(), "src/added.rs", b"new member");
+        assert_eq!(identity(&observe(root.path())), Some(expected));
+        write(root.path(), "src/added.txt", b"new immutable member");
         assert_ne!(identity(&observe(root.path())), Some(expected));
     }
 
@@ -382,6 +466,188 @@ mod tests {
         assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
         assert_eq!(SourceTimes::capture(&changed, &|| false).unwrap(), before);
         assert!(restore_fixture(&cache, changed).1.is_some());
+    }
+
+    #[test]
+    fn module_membership_restores_only_the_current_tree_and_dirties_surviving_parents() {
+        for operation in ["add", "remove-file", "remove-directory", "rename"] {
+            let root = source();
+            let parked = private_directory("rabs-removed-modules-").unwrap();
+            write(root.path(), "src/nested/old.rs", "pub fn old() {}\n");
+            write(root.path(), "dep/Cargo.toml", "[package]\nname='stable'\n");
+            let cache = Arc::new(TargetCache::new(4096).unwrap());
+            stage_fixture(&cache, observe(root.path()));
+            let seed = Arc::clone(&cache.state.lock().unwrap().entries[0]);
+            let target_time = seed.tree.files["artifact"].modified;
+            let retained = seed.source.clone();
+            match operation {
+                "add" => write(root.path(), "src/new/deep.rs", b"new Rust source"),
+                "remove-file" => fs::rename(
+                    root.path().join("src/nested/old.rs"), parked.path().join("old.rs"),
+                ).unwrap(),
+                "remove-directory" => fs::rename(
+                    root.path().join("src/nested"), parked.path().join("nested"),
+                ).unwrap(),
+                "rename" => fs::rename(
+                    root.path().join("src/nested"), root.path().join("src/renamed"),
+                ).unwrap(),
+                _ => unreachable!(),
+            }
+            let current = observe(root.path());
+            let original_times = SourceTimes::capture(&current, &|| false).unwrap();
+            let (attempt, restored) = restore_fixture(&cache, current.clone());
+            let restored = restored.expect("local Rust membership should retain the target");
+            assert!(attempt.times.directories[""].modified > target_time, "{operation}");
+            assert!(attempt.times.directories["src"].modified > target_time, "{operation}");
+            assert!(attempt.times.files["Cargo.toml"] > target_time, "{operation}");
+            assert_eq!(attempt.times.files["dep/lib.rs"], retained.files["dep/lib.rs"]);
+            assert_eq!(attempt.times.files["dep/Cargo.toml"], retained.files["dep/Cargo.toml"]);
+            assert_eq!(attempt.times.directories["dep"], retained.directories["dep"]);
+            assert_eq!(attempt.times.files.keys().map(String::as_str).collect::<Vec<_>>(),
+                current.manifest.files().iter().map(|file| file.path.as_str()).collect::<Vec<_>>());
+            for file in current.manifest.files() {
+                let original = root.path().join(&file.path);
+                let copied = attempt.inputs.root.join(&file.path);
+                assert_eq!(fs::read(&copied).unwrap(), fs::read(&original).unwrap());
+                assert_ne!(fs::metadata(&copied).unwrap().ino(), fs::metadata(original).unwrap().ino());
+                if !retained.files.contains_key(&file.path) {
+                    assert!(attempt.times.files[&file.path] > target_time);
+                }
+            }
+            if operation != "add" {
+                assert!(!attempt.inputs.root.join("src/nested/old.rs").exists());
+            }
+            if matches!(operation, "remove-directory" | "rename") {
+                assert!(!attempt.inputs.root.join("src/nested").exists());
+                assert!(!attempt.times.directories.contains_key("src/nested"));
+            }
+            assert_eq!(fs::metadata(restored.backing().join("artifact")).unwrap().modified().unwrap(), target_time);
+            assert_eq!(SourceTimes::capture(&current, &|| false).unwrap(), original_times);
+            assert_eq!(seed.source, retained, "a predecessor's evidence is immutable");
+            let captured = restored.capture_with_dependency_inputs(None, || false).unwrap();
+            attempt.stage(&restored, &captured, &|| false).unwrap().unwrap().publish();
+            let (again, _) = restore_fixture(&cache, current.clone());
+            assert_eq!(again.inputs.manifest.digest(), current.manifest.digest());
+        }
+    }
+
+    #[test]
+    fn immutable_membership_refuses_even_with_a_forged_compatible_hint() {
+        for (name, operation) in [
+            ("data.txt", "add"), ("data.txt", "remove"), ("data.txt", "rename"),
+            ("vendor/pkg/src/lib.rs", "add"), ("vendor/pkg/src/lib.rs", "remove"),
+            ("vendor/pkg/src/lib.rs", "rename"), ("script.rs", "executable"),
+        ] {
+            let root = source();
+            let parked = private_directory("rabs-immutable-inputs-").unwrap();
+            write(root.path(), "vendor/pkg/.cargo-checksum.json", "{}");
+            if operation != "add" {
+                write(root.path(), name, b"retained input");
+            }
+            let cache = Arc::new(TargetCache::new(4096).unwrap());
+            let original = observe(root.path());
+            let family = identity(&original).map(TargetKey);
+            stage_fixture(&cache, original);
+            match operation {
+                "add" => write(root.path(), name, b"new input"),
+                "remove" => fs::rename(root.path().join(name), parked.path().join("old")).unwrap(),
+                "rename" => fs::rename(root.path().join(name), root.path().join(format!("{name}.moved"))).unwrap(),
+                "executable" => fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o700)).unwrap(),
+                _ => unreachable!(),
+            }
+            let changed = observe(root.path());
+            assert_ne!(identity(&changed).map(TargetKey), family, "{name} {operation}");
+            let before = SourceTimes::capture(&changed, &|| false).unwrap();
+            let (attempt, restored) = cache.acquire(
+                TargetKey(changed.manifest.digest()), family, changed.clone(),
+                || panic!("immutable membership reached target allocation"), 2, &|| false,
+            ).unwrap();
+            assert!(restored.is_none());
+            assert!(attempt.inputs.runtime_owner.is_none());
+            assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+            assert_eq!(SourceTimes::capture(&changed, &|| false).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn membership_cannot_smuggle_unrelated_directory_changes_or_modes() {
+        for mode_change in [false, true] {
+            let root = source();
+            let cache = Arc::new(TargetCache::new(4096).unwrap());
+            stage_fixture(&cache, observe(root.path()));
+            let seed = Arc::clone(&cache.state.lock().unwrap().entries[0]);
+            write(root.path(), "src/new.rs", b"new Rust input");
+            if mode_change {
+                let old = seed.source.directories["dep"].mode;
+                fs::set_permissions(root.path().join("dep"), fs::Permissions::from_mode(old ^ 0o050)).unwrap();
+            } else {
+                fs::create_dir(root.path().join("unrelated-empty-directory")).unwrap();
+            }
+            let changed = observe(root.path());
+            let before = SourceTimes::capture(&changed, &|| false).unwrap();
+            let latest = seed.tree.files["artifact"].modified + Duration::from_secs(10);
+            assert!(timestamps(&seed, &changed, latest, &|| false).is_err());
+            let (attempt, restored) = restore_fixture(&cache, changed.clone());
+            assert!(restored.is_none());
+            assert!(attempt.inputs.runtime_owner.is_none());
+            assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+            assert_eq!(SourceTimes::capture(&changed, &|| false).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn membership_refuses_clock_rollback_and_cancellation_without_losing_the_seed() {
+        let root = source();
+        let cache = Arc::new(TargetCache::new(4096).unwrap());
+        stage_fixture(&cache, observe(root.path()));
+        let seed = Arc::clone(&cache.state.lock().unwrap().entries[0]);
+        write(root.path(), "src/nested/added.rs", b"new Rust input");
+        let current = observe(root.path());
+        let before = SourceTimes::capture(&current, &|| false).unwrap();
+        assert!(timestamps(&seed, &current, SystemTime::UNIX_EPOCH, &|| false).is_err());
+        assert_eq!(timestamps(&seed, &current, SystemTime::now(), &|| true).unwrap_err().kind(), io::ErrorKind::Interrupted);
+        let stop = std::cell::Cell::new(false);
+        let output_path = std::cell::RefCell::new(None::<PathBuf>);
+        let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+        let result = cache.acquire(
+            TargetKey(current.manifest.digest()), identity(&current).map(TargetKey), current.clone(),
+            || {
+                let output = PreparedArtifacts::new(plan)?;
+                *output_path.borrow_mut() = Some(output.backing().to_path_buf());
+                stop.set(true);
+                Ok(output)
+            }, 2, &|| stop.get(),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!output_path.borrow().as_ref().unwrap().exists());
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+        assert_eq!(SourceTimes::capture(&current, &|| false).unwrap(), before);
+        assert!(restore_fixture(&cache, current).1.is_some());
+    }
+
+    #[test]
+    fn a_new_module_changed_after_observation_cannot_reuse_or_publish_target_state() {
+        let root = source();
+        let cache = Arc::new(TargetCache::new(4096).unwrap());
+        stage_fixture(&cache, observe(root.path()));
+        write(root.path(), "src/added.rs", b"admitted bytes");
+        let observed = observe(root.path());
+        write(root.path(), "src/added.rs", b"different bytes after observation");
+        let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+        assert!(cache.acquire(
+            TargetKey(observed.manifest.digest()), identity(&observed).map(TargetKey), observed,
+            || PreparedArtifacts::new(plan), 2, &|| false,
+        ).is_err());
+        let current = observe(root.path());
+        let (attempt, output) = restore_fixture(&cache, current);
+        let output = output.unwrap();
+        write(&attempt.inputs.root, "src/added.rs", b"changed after restoration");
+        let captured = output.capture_with_dependency_inputs(None, || false).unwrap();
+        assert!(attempt.stage(&output, &captured, &|| false).is_err());
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.reservations, 0);
+        assert_eq!(state.reserved_bytes, 0);
     }
 
     const MAIN: &str = r#"fn answer() -> u32 { edit_dep::value() + include!(concat!(env!("OUT_DIR"), "/generated.rs")) + OFFSET }
@@ -574,5 +840,98 @@ fn main() { println!("{}", answer()); }
         let cold = fixture.run(&cache, "test", false);
         cold.fresh("edit_dep", false);
         assert_eq!(cold.test_runs, 1);
+    }
+
+    #[test]
+    fn real_cargo_module_add_rename_remove_reuses_dependencies_and_matches_cold_outputs() {
+        let fixture = CargoFixture::new();
+        let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+        assert_eq!(fixture.run(&cache, "build", false).output.unwrap().0, b"11\n");
+        write(&fixture.source, "src/extra.rs", "pub fn bonus() -> u32 { 3 }\n");
+        fixture.edit("src/main.rs", format!("mod extra;\n{}", MAIN.replace("OFFSET", "extra::bonus()")));
+        let added = fixture.run(&cache, "build", true);
+        added.fresh("edit_dep", true);
+        added.fresh("edit_app", false);
+        assert_eq!(added.output.unwrap().0, b"14\n");
+
+        fs::rename(fixture.source.join("src/extra.rs"), fixture.source.join("src/renamed.rs")).unwrap();
+        fixture.edit("src/main.rs", format!("mod renamed;\n{}", MAIN.replace("OFFSET", "renamed::bonus()")));
+        let renamed = fixture.run(&cache, "build", true);
+        renamed.fresh("edit_dep", true);
+        renamed.fresh("edit_app", false);
+        assert_eq!(renamed.output.unwrap().0, b"14\n");
+
+        fs::rename(fixture.source.join("src/renamed.rs"), fixture.root.path().join("retired-module.rs")).unwrap();
+        // Different from the initial exact key: this must restore the most
+        // recent compatible seed and genuinely handle the removed member.
+        fixture.edit("src/main.rs", MAIN.replace("OFFSET", "5"));
+        let removed = fixture.run(&cache, "build", true);
+        removed.fresh("edit_dep", true);
+        removed.fresh("edit_app", false);
+        let expected = removed.output.unwrap();
+        assert_eq!(expected.0, b"16\n");
+        let independent = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+        let cold = fixture.run(&independent, "build", false);
+        cold.fresh("edit_dep", false);
+        assert_eq!(cold.output.unwrap(), expected, "refactored warm and cold outputs differ");
+    }
+
+    const DIRECTORY_BUILD: &str = r#"fn sum(path: &std::path::Path) -> u32 {
+    std::fs::read_dir(path).unwrap().map(|entry| {
+        let path = entry.unwrap().path();
+        if path.is_dir() { sum(&path) }
+        else { std::fs::read_to_string(path).unwrap().trim().parse::<u32>().unwrap() }
+    }).sum()
+}
+fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let count = std::fs::read_to_string(out.join("build-runs")).ok()
+        .map(|v| v.parse::<u32>().unwrap()).unwrap_or(0) + 1;
+    std::fs::write(out.join("build-runs"), count.to_string()).unwrap();
+    std::fs::write(out.join("generated.rs"), (100 * count + sum(std::path::Path::new("scan"))).to_string()).unwrap();
+    println!("cargo:rerun-if-changed=scan");
+}
+"#;
+
+    #[test]
+    fn real_cargo_directory_build_scripts_observe_additions_removals_and_renames() {
+        let fixture = CargoFixture::new();
+        fixture.edit("build.rs", DIRECTORY_BUILD);
+        write(&fixture.source, "scan/left.rs", b"2");
+        write(&fixture.source, "scan/nested/right.rs", b"3");
+        let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+        assert_eq!(fixture.run(&cache, "build", false).output.unwrap().0, b"106\n");
+        write(&fixture.source, "scan/new/deep.rs", b"5");
+        File::open(fixture.source.join("scan/new/deep.rs")).unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1))).unwrap();
+        let added = fixture.run(&cache, "build", true);
+        added.fresh("edit_dep", true);
+        assert_eq!(added.output.unwrap().0, b"211\n");
+        fs::rename(fixture.source.join("scan/nested"), fixture.root.path().join("removed-scan")).unwrap();
+        let removed = fixture.run(&cache, "build", true);
+        removed.fresh("edit_dep", true);
+        assert_eq!(removed.output.unwrap().0, b"308\n");
+        fs::rename(fixture.source.join("scan/new"), fixture.source.join("scan/renamed")).unwrap();
+        let renamed = fixture.run(&cache, "build", true);
+        renamed.fresh("edit_dep", true);
+        assert_eq!(renamed.output.unwrap().0, b"408\n", "same-byte rename must rerun the scanner");
+        // An exact repeat must remain genuinely fresh, not invalidate the
+        // build script on every target restore merely because dirs were copied.
+        assert_eq!(fixture.run(&cache, "build", true).output.unwrap().0, b"408\n");
+    }
+
+    #[test]
+    fn real_cargo_default_build_script_detects_a_removal_with_no_changed_remaining_rust_file() {
+        let fixture = CargoFixture::new();
+        fixture.edit("build.rs", DIRECTORY_BUILD.replace("    println!(\"cargo:rerun-if-changed=scan\");\n", ""));
+        write(&fixture.source, "scan/left.rs", b"2");
+        write(&fixture.source, "scan/right.rs", b"3");
+        let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+        assert_eq!(fixture.run(&cache, "build", false).output.unwrap().0, b"106\n");
+        fs::rename(fixture.source.join("scan/right.rs"), fixture.root.path().join("removed.rs")).unwrap();
+        let removed = fixture.run(&cache, "build", true);
+        removed.fresh("edit_dep", true);
+        assert_eq!(removed.output.unwrap().0, b"203\n");
+        assert_eq!(fixture.run(&cache, "build", true).output.unwrap().0, b"203\n");
     }
 }
