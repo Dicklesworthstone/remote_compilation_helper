@@ -280,3 +280,162 @@ fn allocation_unwind_releases_the_read_lease_without_poisoning_the_pool() {
     accounted(&cache);
     drop(capacity);
 }
+
+// Pause only after the real target copier has written a nonempty, incomplete
+// artifact. Initial source validation and destination allocation cannot satisfy
+// this observation. The callback uses the existing cooperative stop boundary.
+fn paused_restore(
+    cache: Arc<TargetCache>,
+    key: TargetKey,
+    inputs: WorkspaceInputs,
+    plan: ArtifactPlan,
+    length: u64,
+    progress: (mpsc::Sender<PathBuf>, mpsc::Receiver<bool>),
+) -> io::Result<Option<PreparedArtifacts>> {
+    let destination = std::cell::RefCell::new(None::<PathBuf>);
+    let paused = std::cell::Cell::new(false);
+    let cancelled = std::cell::Cell::new(false);
+    let (entered, release) = progress;
+    cache.acquire(
+        key,
+        inputs,
+        || {
+            let output = PreparedArtifacts::new(plan)?;
+            *destination.borrow_mut() = Some(output.backing().join("artifact"));
+            Ok(output)
+        },
+        41,
+        &|| {
+            if !paused.get() {
+                if let Some(path) = destination.borrow().as_ref() {
+                    let written = fs::metadata(path).map_or(0, |metadata| metadata.len());
+                    if written > 0 && written < length {
+                        paused.set(true);
+                        entered.send(path.clone()).unwrap();
+                        cancelled.set(release.recv_timeout(Duration::from_secs(10)).unwrap());
+                    }
+                }
+            }
+            cancelled.get()
+        },
+    ).map(|(_, restored)| restored)
+}
+
+#[test]
+fn pool_progress_and_quota_protection_continue_during_actual_target_copy() {
+    let bytes = vec![0xa5; 3 * 64 * 1024 + 7];
+    let fixture = Fixture::new(&bytes);
+    let length = bytes.len() as u64;
+    let cache = Arc::new(TargetCache::new(length * 2).unwrap());
+    let a = TargetKey([11; 32]);
+    let b = TargetKey([12; 32]);
+    fixture.pending(&cache, a).publish();
+    fixture.pending(&cache, b).publish();
+    let inputs = fixture.inputs();
+    let plan = fixture.plan.clone();
+    let reader_cache = Arc::clone(&cache);
+    let (entered, observed) = mpsc::channel();
+    let (release, resumed) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            paused_restore(reader_cache, a, inputs, plan, length, (entered, resumed))
+        });
+        let partial = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let written = fs::metadata(&partial).unwrap().len();
+        assert!(written > 0 && written < length);
+        // Even evicting B cannot make this request fit while A is being copied.
+        assert!(cache.reserve(length + 1).is_none());
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
+        let other = fixture.restore(&cache, b);
+        let other_path = other.backing().join("artifact");
+        assert_eq!(fs::read(&other_path).unwrap(), bytes);
+        assert_ne!(fs::metadata(&partial).unwrap().ino(), fs::metadata(&other_path).unwrap().ino());
+        accounted(&cache);
+        release.send(false).unwrap();
+        let first = reader.join().unwrap().unwrap().unwrap();
+        assert_eq!(fs::read(first.backing().join("artifact")).unwrap(), bytes);
+        fs::write(first.backing().join("artifact"), b"private replacement").unwrap();
+        assert_eq!(fs::read(&other_path).unwrap(), bytes);
+    });
+    accounted(&cache);
+}
+
+#[test]
+fn cancellation_after_partial_copy_returns_no_output_and_keeps_verified_seed_reusable() {
+    let bytes = vec![0x7b; 3 * 64 * 1024 + 7];
+    let fixture = Fixture::new(&bytes);
+    let length = bytes.len() as u64;
+    let cache = Arc::new(TargetCache::new(length).unwrap());
+    let key = TargetKey([13; 32]);
+    fixture.pending(&cache, key).publish();
+    let seed_path = lease(&cache, key).tree.directory.path().join("artifact");
+    let inputs = fixture.inputs();
+    let plan = fixture.plan.clone();
+    let reader_cache = Arc::clone(&cache);
+    let (entered, observed) = mpsc::channel();
+    let (release, resumed) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            paused_restore(reader_cache, key, inputs, plan, length, (entered, resumed))
+        });
+        let partial = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(fs::metadata(&partial).unwrap().len() < length);
+        release.send(true).unwrap();
+        let error = reader.join().unwrap().unwrap_err();
+        assert!(matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::TimedOut));
+        assert!(!partial.exists(), "cancelled private output must not escape its owner");
+    });
+    assert_eq!(fs::read(&seed_path).unwrap(), bytes);
+    assert_eq!(cache.state.lock().unwrap().retained_bytes, length);
+    assert_eq!(fs::read(fixture.restore(&cache, key).backing().join("artifact")).unwrap(), bytes);
+    accounted(&cache);
+}
+
+#[test]
+fn replacement_during_copy_survives_both_old_reader_success_and_corruption() {
+    for corrupt_old in [false, true] {
+        let old_bytes = vec![0x31; 3 * 64 * 1024 + 7];
+        let new_bytes = vec![0x92; old_bytes.len()];
+        let length = old_bytes.len() as u64;
+        let old = Fixture::new(&old_bytes);
+        let new = Fixture::new(&new_bytes);
+        let cache = Arc::new(TargetCache::new(length * 2).unwrap());
+        let key = TargetKey([14; 32]);
+        old.pending(&cache, key).publish();
+        let original = lease(&cache, key).tree.directory.path().to_path_buf();
+        let replacement = new.pending(&cache, key);
+        let inputs = old.inputs();
+        let plan = old.plan.clone();
+        let reader_cache = Arc::clone(&cache);
+        let (entered, observed) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                paused_restore(reader_cache, key, inputs, plan, length, (entered, resumed))
+            });
+            let partial = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+            replacement.publish();
+            assert!(original.exists());
+            assert_eq!(cache.state.lock().unwrap().retained_bytes, length * 2);
+            let current = new.restore(&cache, key);
+            assert_eq!(fs::read(current.backing().join("artifact")).unwrap(), new_bytes);
+            if corrupt_old {
+                fs::write(original.join("artifact"), vec![0xff; old_bytes.len()]).unwrap();
+            }
+            release.send(false).unwrap();
+            let restored = reader.join().unwrap().unwrap();
+            if corrupt_old {
+                assert!(restored.is_none(), "changed seed cannot return a partial target");
+                assert!(!partial.exists());
+            } else {
+                assert_eq!(fs::read(restored.unwrap().backing().join("artifact")).unwrap(), old_bytes);
+            }
+            assert_eq!(fs::read(current.backing().join("artifact")).unwrap(), new_bytes);
+        });
+        assert!(!original.exists(), "last old reader must release the retired generation");
+        assert_eq!(cache.state.lock().unwrap().retained_bytes, length);
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+        assert_eq!(fs::read(new.restore(&cache, key).backing().join("artifact")).unwrap(), new_bytes);
+        accounted(&cache);
+    }
+}

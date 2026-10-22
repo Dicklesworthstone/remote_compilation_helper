@@ -140,6 +140,8 @@ jobs:
           cargo test --release -p rabs-wkr --lib cargo_capture --locked
           cargo test --release -p rabs-wkr --lib cargo_dynamic_outputs --locked
           cargo test --release -p rabsd --lib coord::worker_delivery::tests --locked
+      - name: Private Cargo target reuse and concurrent seed lifetimes
+        run: cargo test --release -p rabs-wkr --lib target_cache --locked
       - name: Binary size budget (rabs-wrap < 2 MiB, A021)
         run: |
           size=$(stat -c%s target/release/rabs-wrap)
