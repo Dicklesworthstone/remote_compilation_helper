@@ -1,8 +1,9 @@
 //! Optional worker-local Cargo target state, never an action/result cache.
 //!
-//! Exact verified inputs may seed a NEW private target directory. Cargo still
+//! Verified inputs may seed a NEW private target directory. Cargo still
 //! executes and owns every freshness decision, including build-script tracking.
-//! Source timestamps come from the prior identical private workspace; output
+//! Unchanged sources retain prior timestamps; eligible edited Rust sources are
+//! made newer than every retained fingerprint before Cargo runs. Output
 //! timestamps are preserved, never advanced to manufacture freshness. No seed
 //! is mounted writable or linked into an execution. Verified internal aliases
 //! are reconstructed only between files of the SAME fresh private clone.
@@ -22,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+mod source_edits;
 
 /// Independent count and byte limits bound retained seeds and in-flight staging.
 pub const MAX_TARGET_CACHE_ENTRIES: usize = 8;
@@ -158,6 +161,13 @@ pub(crate) fn target_compatibility_key(
     value["version"] = serde_json::json!("rabs.private-cargo-commands.v1");
     value["args"] = serde_json::json!(args);
     value["cargo_mode"] = serde_json::json!("current-cargo-contract-required-v1");
+    if let Some(source) = source_edits::identity(inputs) {
+        // This is only a private Cargo seed family, never an action key.
+        // Actual changed bytes remain in the exact key and current manifest.
+        value["version"] = serde_json::json!("rabs.private-cargo-source-edits.v1");
+        value["source"] = serde_json::json!(source);
+        value["workspace"] = serde_json::json!(source);
+    }
     Ok(Some(TargetKey(
         Sha256::digest(serde_json::to_vec(&value)?).into(),
     )))
@@ -386,6 +396,10 @@ impl TargetCache {
         if let Some(seed) = seed {
             let mut restore_started = false;
             let reuse = (|| {
+                // Refuse incompatible edits or an unorderable clock BEFORE
+                // copying or invalidating an otherwise usable old generation.
+                let restored_times =
+                    source_edits::timestamps(&seed, &inputs, SystemTime::now(), stopped)?;
                 let output = new_output()?;
                 // The original SourceReceiver seal must never receive old
                 // Cargo timestamps. A miss needs no second source tree;
@@ -398,19 +412,21 @@ impl TargetCache {
                 };
                 restore_started = true;
                 seed.tree.restore(output.backing(), stopped)?;
-                seed.source.restore(&runtime, stopped)?;
+                restored_times.restore(&runtime, stopped)?;
                 if seed.invalidated.load(Ordering::Acquire) {
                     return Err(invalid("target seed invalidated during restoration"));
                 }
-                Ok::<_, io::Error>((output, runtime))
+                Ok::<_, io::Error>((output, runtime, restored_times))
             })();
             match reuse {
-                Ok((output, runtime)) => {
-                    times = seed.source.clone();
+                Ok((output, runtime, restored_times)) => {
+                    times = restored_times;
                     inputs = runtime;
                     restored = Some(output);
                     disposition = if seed.key == key {
                         "restored"
+                    } else if seed.source_manifest.digest() != inputs.manifest.digest() {
+                        "restored-edited"
                     } else {
                         "restored-compatible"
                     };
@@ -553,6 +569,8 @@ struct Seed {
     key: TargetKey,
     compatible: Option<TargetKey>,
     source: SourceTimes,
+    source_manifest: SourceManifest,
+    edit_family: Option<[u8; 32]>,
     tree: TreeSnapshot,
     invalidated: AtomicBool,
 }
@@ -681,6 +699,8 @@ impl TargetAttempt {
                 key: self.key,
                 compatible: self.compatible,
                 source: self.times,
+                edit_family: source_edits::identity(&self.inputs),
+                source_manifest: self.inputs.manifest,
                 tree,
                 invalidated: AtomicBool::new(false),
             }),
