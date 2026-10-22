@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -164,7 +165,9 @@ pub(crate) fn target_key(
 
 #[derive(Debug, Default)]
 struct PoolState {
-    entries: VecDeque<Seed>,
+    // Every generation stays charged while a restore holds its shared owner.
+    // A replacement may coexist with an in-use predecessor, within both caps.
+    entries: VecDeque<Arc<Seed>>,
     retained_bytes: u64,
     reserved_bytes: u64,
     reservations: usize,
@@ -198,8 +201,9 @@ impl TargetCache {
         })
     }
 
-    /// Every successful hit is copied while the bounded seed remains owned by
-    /// the pool. A contended pool is a cold execution, never a compiler wait.
+    /// Take an exact-generation read lease under the pool lock, then copy and
+    /// validate outside it. Independent restores never share writable inodes.
+    /// A contended lookup remains cold; a large copy no longer holds that lock.
     pub(crate) fn acquire(
         self: &Arc<Self>,
         key: TargetKey,
@@ -220,54 +224,60 @@ impl TargetCache {
         let mut times = SourceTimes::capture(&inputs, stopped)?;
         let mut restored = None;
         let mut disposition = "cold";
-        if let Ok(mut state) = self.state.try_lock() {
-            if let Some(index) = state.entries.iter().position(|seed| seed.key == key) {
-                let seed = &state.entries[index];
-                let mut restore_started = false;
-                let reuse = (|| {
-                    let output = new_output()?;
-                    restore_started = true;
-                    seed.tree.restore(output.backing(), stopped)?;
-                    seed.source.restore(&inputs, stopped)?;
-                    Ok::<_, io::Error>(output)
-                })();
-                match reuse {
-                    Ok(output) => {
-                        times = seed.source.clone();
-                        restored = Some(output);
-                        disposition = "restored";
-                        let seed = state.entries.remove(index).expect("located seed");
-                        state.entries.push_back(seed);
+        let seed = match self.state.try_lock() {
+            Ok(state) => state
+                .entries
+                .iter()
+                .rev()
+                .find(|seed| seed.key == key && !seed.invalidated.load(Ordering::Acquire))
+                .cloned(),
+            Err(_) => {
+                disposition = "cold-pool-busy";
+                None
+            }
+        };
+        if let Some(seed) = seed {
+            let mut restore_started = false;
+            let reuse = (|| {
+                let output = new_output()?;
+                restore_started = true;
+                seed.tree.restore(output.backing(), stopped)?;
+                seed.source.restore(&inputs, stopped)?;
+                if seed.invalidated.load(Ordering::Acquire) {
+                    return Err(invalid("target seed invalidated during restoration"));
+                }
+                Ok::<_, io::Error>(output)
+            })();
+            match reuse {
+                Ok(output) => {
+                    times = seed.source.clone();
+                    restored = Some(output);
+                    disposition = "restored";
+                    self.finish_seed_use(seed, true);
+                }
+                Err(error) => {
+                    // Keep the old error policy, but invalidate THIS generation
+                    // only. Other readers retain its backing and quota charge;
+                    // they cannot make a replacement generation disappear.
+                    if restore_started
+                        && !matches!(
+                            error.kind(),
+                            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+                        )
+                    {
+                        seed.invalidated.store(true, Ordering::Release);
                     }
-                    Err(error) => {
-                        // Failure to allocate this attempt's destination, or
-                        // cancellation while copying, is not seed corruption.
-                        // Keep its bytes and LRU position; a future hit still
-                        // performs the entire independent verification/copy.
-                        if restore_started
-                            && !matches!(
-                                error.kind(),
-                                io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
-                            )
-                        {
-                            let seed = state.entries.remove(index).expect("located seed");
-                            state.retained_bytes -= seed.tree.bytes;
-                            drop(seed);
-                        }
-                        eprintln!(
-                            "{}",
-                            serde_json::json!({"kind":"worker-target-state-refused", "request_id":request_id, "error":error.to_string()})
-                        );
-                        // A failed restore never exposes its partial output.
-                        // Re-read source timestamps if restoration had begun;
-                        // a cold target cannot trust any prior fingerprint.
-                        times = SourceTimes::capture(&inputs, stopped)?;
-                        disposition = "cold-after-refusal";
-                    }
+                    self.finish_seed_use(seed, false);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"kind":"worker-target-state-refused", "request_id":request_id, "error":error.to_string()})
+                    );
+                    // No partial target escapes. Cancellation/allocation failure
+                    // preserves a valid seed's position, not stale source facts.
+                    times = SourceTimes::capture(&inputs, stopped)?;
+                    disposition = "cold-after-refusal";
                 }
             }
-        } else {
-            disposition = "cold-pool-busy";
         }
         eprintln!(
             "{}",
@@ -285,22 +295,58 @@ impl TargetCache {
         ))
     }
 
+    fn finish_seed_use(&self, seed: Arc<Seed>, promote: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(index) = state.entries.iter().position(|entry| Arc::ptr_eq(entry, &seed)) else {
+            return;
+        };
+        let retired = seed.invalidated.load(Ordering::Acquire)
+            || state.entries.iter().skip(index + 1).any(|newer| {
+                newer.key == seed.key && !newer.invalidated.load(Ordering::Acquire)
+            });
+        // Drop this reader under the lock before the exclusive ownership test.
+        // Removing a leased entry would leave unaccounted live disk backing.
+        drop(seed);
+        if retired {
+            if Arc::get_mut(&mut state.entries[index]).is_some() {
+                let retired = state.entries.remove(index).expect("located generation");
+                state.retained_bytes -= retired.tree.bytes;
+                drop(retired);
+            }
+        } else if promote {
+            let seed = state.entries.remove(index).expect("located generation");
+            state.entries.push_back(seed);
+        }
+    }
+
     fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
         if bytes > self.max_bytes {
             return None;
         }
         let mut state = self.state.try_lock().ok()?;
-        // Pending copies cannot be evicted. Reject an impossible reservation
-        // before removing any warm seed: even emptying the entire LRU would
-        // not make it fit. The same lock covers this check and all eviction.
-        let available_bytes = self.max_bytes.checked_sub(state.reserved_bytes)?;
-        if bytes > available_bytes || state.reservations >= MAX_TARGET_CACHE_ENTRIES {
+        // Pending copies AND leased generations are non-evictable. Preflight
+        // both limits before changing the LRU, so an impossible request cannot
+        // destroy unrelated warm entries. Exclusivity checks include Weak refs.
+        let mut protected_bytes = state.reserved_bytes;
+        let mut protected_entries = state.reservations;
+        for seed in &mut state.entries {
+            if Arc::get_mut(seed).is_none() {
+                protected_bytes = protected_bytes.checked_add(seed.tree.bytes)?;
+                protected_entries += 1;
+            }
+        }
+        let available_bytes = self.max_bytes.checked_sub(protected_bytes)?;
+        if bytes > available_bytes || protected_entries >= MAX_TARGET_CACHE_ENTRIES {
             return None;
         }
         while state.retained_bytes + state.reserved_bytes + bytes > self.max_bytes
             || state.entries.len() + state.reservations >= MAX_TARGET_CACHE_ENTRIES
         {
-            let seed = state.entries.pop_front()?;
+            let index = state
+                .entries
+                .iter_mut()
+                .position(|seed| Arc::get_mut(seed).is_some())?;
+            let seed = state.entries.remove(index)?;
             state.retained_bytes -= seed.tree.bytes;
         }
         state.reserved_bytes += bytes;
@@ -339,6 +385,7 @@ struct Seed {
     key: TargetKey,
     source: SourceTimes,
     tree: TreeSnapshot,
+    invalidated: AtomicBool,
 }
 
 /// Staging is not publication. ExecutionControl owns this until its FINAL
@@ -363,7 +410,14 @@ impl PendingTargetSeed {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let seed = self.seed.take().expect("pending seed owns its snapshot");
-        if let Some(index) = state.entries.iter().position(|prior| prior.key == seed.key) {
+        // Keep in-use predecessor generations owned and charged. New lookups
+        // select the newest non-invalidated generation; its late predecessor
+        // is reclaimed only after that predecessor's final reader returns.
+        while let Some(index) = state
+            .entries
+            .iter_mut()
+            .position(|prior| prior.key == seed.key && Arc::get_mut(prior).is_some())
+        {
             let prior = state.entries.remove(index).expect("located seed");
             state.retained_bytes -= prior.tree.bytes;
         }
@@ -371,7 +425,7 @@ impl PendingTargetSeed {
         state.reservations -= 1;
         self.reservation.active = false;
         state.retained_bytes += seed.tree.bytes;
-        state.entries.push_back(seed);
+        state.entries.push_back(Arc::new(seed));
         eprintln!(
             "{}",
             serde_json::json!({"kind":"worker-target-state-published", "request_id":self.request_id, "seed_bytes":self.reservation.bytes, "retained_bytes":state.retained_bytes, "entries":state.entries.len()})
@@ -411,6 +465,7 @@ impl TargetAttempt {
                 key: self.key,
                 source: self.times,
                 tree,
+                invalidated: AtomicBool::new(false),
             }),
             request_id: self.request_id,
         }))
@@ -774,3 +829,7 @@ fn hash_copy(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "target_cache/concurrent_tests.rs"]
+mod concurrent_tests;
