@@ -12,7 +12,8 @@
 //! and only names in the newly validated result are considered for reuse.
 
 use super::{
-    CHUNK_BYTES, MAX_DELIVERY_BYTES, WorkerAuthentication, WorkerPeer, invalid, require, safe_name,
+    ArtifactByteCache, CHUNK_BYTES, MAX_DELIVERY_BYTES, WorkerAuthentication, WorkerPeer, invalid,
+    require, safe_name,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -257,6 +258,12 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for ResumePeer<'_, P> {
     }
     fn resume_source(&self) -> Option<&ResumeSource> {
         Some(self.source)
+    }
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        self.inner.artifact_byte_cache()
+    }
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.inner.checkpoint()
     }
 }
 

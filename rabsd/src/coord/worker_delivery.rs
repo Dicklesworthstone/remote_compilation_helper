@@ -9,8 +9,13 @@
 //! again. Failed directories are retained, never repaired in place or deleted.
 //! Explicit resume may copy local prefixes, but verifies the complete new files.
 
+mod byte_cache;
 mod ranges;
 mod reuse;
+pub use byte_cache::{
+    ArtifactByteCache, ArtifactCachePeer, DEFAULT_ARTIFACT_CACHE_BYTES,
+    DEFAULT_ARTIFACT_CACHE_ENTRIES, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
+};
 use ranges::download;
 pub use reuse::{ResumePeer, ResumeSource};
 
@@ -94,6 +99,18 @@ pub trait WorkerPeer {
     /// accepted only for result resume and still require complete-file hashing.
     fn resume_source(&self) -> Option<&ResumeSource> {
         None
+    }
+
+    /// Optional local byte reuse after the current authenticated result and
+    /// diagnostics pass validation. This never supplies an execution result.
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        None
+    }
+
+    /// Honor absolute transfer deadlines and operator cancellation during local
+    /// work too. Cache copies must not bypass a transport's send/receive checks.
+    fn checkpoint(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -671,7 +688,9 @@ fn receive_with_clock(
 }
 fn create_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    // Retain this original inode for optional artifact-byte cache seeding after
+    // verification; no pathname reopen or hardlink may substitute its contents.
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1097,6 +1116,7 @@ pub fn receive_operation(
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod byte_cache_tests;
     mod cross_file_range_tests;
     mod range_pipeline_tests;
     mod tree_tests;

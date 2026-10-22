@@ -463,6 +463,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPeer<'_, S, I> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        // Local artifact copies do not call send/receive. They must still
+        // obey this connection's deadlines, operator stop and execution lease.
+        // In particular, use interrupt() so a daemon stop after exec-result
+        // finishes verified delivery while an explicit signal still abandons.
+        let result = (|| {
+            self.inner.remaining()?;
+            if self.pending_interrupt()? {
+                self.interrupt()?;
+            }
+            self.lease_tick()?;
+            self.inner.remaining().map(|_| ())
+        })();
+        self.inner.failed |= result.is_err();
+        result
+    }
+
+    fn artifact_byte_cache(&self) -> Option<&super::ArtifactByteCache> {
+        self.inner.artifact_byte_cache()
+    }
+
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         let result = (|| {
             self.inner.remaining()?;
@@ -770,6 +791,143 @@ mod tests {
             }
             assert!(!peer.cancel_sent);
         }
+    }
+
+    #[test]
+    fn cache_copy_checkpoints_finish_daemon_delivery_but_honor_explicit_operator_stop() {
+        let runtime = runtime();
+        let trigger = Trigger::default();
+        let token = super::super::OperationCancellation::default();
+        let success =
+            json!({"kind":"exec-result", "request_id":7, "exit_code":0, "stop_reason":null});
+        let mut daemon = OperatorPeer::with_interrupts(
+            RecordPeer::new(
+                &runtime,
+                Wire::new(&trigger, std::slice::from_ref(&success)),
+                &request(),
+            ),
+            OperationInterrupts::new(token.clone()),
+        );
+        daemon.send(&request()).unwrap();
+        assert_eq!(daemon.receive().unwrap(), success);
+        let deadline = daemon.inner.until;
+        let sent = daemon.inner.stream.sent();
+        for _ in 0..2 {
+            token.cancel();
+            daemon.checkpoint().unwrap();
+            assert_eq!(daemon.inner.until, deadline);
+            assert_eq!(daemon.inner.stream.sent(), sent);
+            assert!(!daemon.inner.failed);
+            assert!(!daemon.cancel_sent);
+        }
+
+        let trigger = Trigger::default();
+        let mut operator = peer(&runtime, &trigger, std::slice::from_ref(&success));
+        operator.send(&request()).unwrap();
+        assert_eq!(operator.receive().unwrap(), success);
+        let sent = operator.inner.stream.sent();
+        trigger.fire();
+        let error = operator.checkpoint().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(!super::super::transport_interrupted(&error));
+        assert!(operator.inner.failed);
+        assert!(!operator.cancel_sent);
+        assert!(operator.checkpoint().is_err());
+        assert_eq!(operator.inner.stream.sent(), sent);
+    }
+
+    #[test]
+    fn cache_copy_checkpoints_enforce_absolute_deadlines_without_network_io() {
+        let runtime = runtime();
+        for phase in [Phase::Admission, Phase::Transfer, Phase::Acknowledgment] {
+            let trigger = Trigger::default();
+            let mut record = RecordPeer::new(&runtime, Wire::new(&trigger, &[]), &request());
+            record.phase = phase;
+            record.until = Instant::now() - Duration::from_secs(1);
+            let deadline = record.until;
+            let error = record.checkpoint().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(!super::super::transport_interrupted(&error));
+            assert!(record.failed);
+            assert!(record.stream.sent().is_empty());
+            assert_eq!(record.until, deadline);
+            assert!(record.checkpoint().is_err());
+
+            let mut operator = peer(&runtime, &trigger, &[]);
+            operator.inner.phase = phase;
+            operator.inner.until = deadline;
+            let error = operator.checkpoint().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(!super::super::transport_interrupted(&error));
+            assert!(operator.inner.failed);
+            assert!(operator.inner.stream.sent().is_empty());
+            assert_eq!(operator.inner.until, deadline);
+            assert!(operator.checkpoint().is_err());
+        }
+    }
+
+    #[test]
+    fn cache_copy_checkpoint_cancels_active_execution_and_keeps_terminal_drain() {
+        let runtime = runtime();
+        let trigger = Trigger::default();
+        let mut peer = peer(&runtime, &trigger, &[accepted(), result()]);
+        peer.send(&request()).unwrap();
+        trigger.fire();
+        peer.checkpoint().unwrap();
+        assert!(peer.cancel_sent);
+        assert!(peer.inner.phase == Phase::Execution);
+        assert!(!peer.inner.failed);
+        let sent = peer.inner.stream.sent();
+        assert_eq!(
+            sent,
+            vec![request(), json!({"kind":"cancel", "request_id":7})]
+        );
+        peer.checkpoint().unwrap();
+        assert_eq!(peer.inner.stream.sent(), sent);
+        assert_eq!(peer.receive().unwrap(), result());
+        assert!(peer.cancel_response_seen);
+        assert!(peer.inner.phase == Phase::Transfer);
+    }
+
+    #[test]
+    fn cache_copy_checkpoints_service_lease_renewal_and_expiry_without_a_read() {
+        let runtime = runtime();
+        let trigger = Trigger::default();
+        let mut peer = peer(&runtime, &trigger, &[]);
+        let hello = json!({
+            "execution_leases":[rabs_protocol::lease_semantics::REQUEST_EXECUTION_LEASE_VERSION],
+            "boot_generation":1, "incarnation":format!("{:032x}", 2),
+        });
+        let grant = super::super::lease::grant(&hello, &request(), 11, 12).unwrap();
+        let ttl = Duration::from_millis(grant["ttl_ms"].as_u64().unwrap());
+        peer.send(&json!({"kind":"session-ok", "execution_lease":grant}))
+            .unwrap();
+        peer.send(&request()).unwrap();
+        peer.lease.as_mut().unwrap().arm(Instant::now() - ttl / 2);
+        peer.checkpoint().unwrap();
+        let sent = peer.inner.stream.sent();
+        assert_eq!(sent.last().unwrap()["kind"], "execution-lease-renew");
+        assert_eq!(sent.last().unwrap()["request_id"], 7);
+        assert!(peer.lease.as_ref().unwrap().renewal_pending());
+        peer.checkpoint().unwrap();
+        assert_eq!(
+            peer.inner.stream.sent(),
+            sent,
+            "a pending renewal is not retried"
+        );
+
+        peer.lease.as_mut().unwrap().arm(Instant::now() - ttl);
+        peer.checkpoint().unwrap();
+        assert!(peer.lease.as_ref().unwrap().stopped());
+        assert!(peer.inner.until <= Instant::now() + CANCEL_DRAIN_BUDGET);
+        assert_eq!(peer.inner.stream.sent(), sent);
+        assert!(peer.inner.phase == Phase::Execution);
+        assert!(
+            !peer.inner.failed,
+            "expiry still drains the worker's terminal result"
+        );
+        peer.checkpoint().unwrap();
+        assert_eq!(peer.inner.stream.sent(), sent);
     }
 
     #[test]

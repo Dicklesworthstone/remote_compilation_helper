@@ -1430,6 +1430,93 @@ diagnostics and artifacts. This requires local storage with working file and
 directory fsync semantics. Private receiver directories must not be concurrently
 modified by another local process; this is not a race-proof shared-directory API.
 
+### Reuse artifact bytes across authenticated deliveries
+
+An optional coordinator-local artifact cache can satisfy complete artifact files
+from earlier deliveries from the same authenticated worker. A new execution still
+runs, and the receiver still validates the current terminal result, request,
+artifact manifest, Cargo report and diagnostics. The cache supplies file bytes;
+it does not supply a result, compilation outcome or permission to publish.
+
+Configure the process that owns the authenticated connection:
+
+| Variable | Default | Contract |
+|----------|---------|----------|
+| `RABS_ARTIFACT_CACHE_DIR` | Disabled | Existing absolute parent directory, owned by the current user, with no group/other permissions or symlink ancestors |
+| `RABS_ARTIFACT_CACHE_BYTES` | `1073741824` | Decimal integer from `1` through `17179869184`; aggregate logical object and pending-copy bytes |
+| `RABS_ARTIFACT_CACHE_ENTRIES` | `4096` | Decimal integer from `1` through `65536`; aggregate objects and pending-copy entry |
+
+Only the dedicated `artifact-bytes-v1` child is managed. Create the parent
+explicitly outside captured inputs, retained bundles, deliveries and installed
+outputs. The application never creates or chmods that parent. For example,
+after configuring the existing coordinator TLS credentials:
+
+```sh
+mkdir -m 700 /absolute/rabs-artifact-cache
+RABS_ARTIFACT_CACHE_DIR=/absolute/rabs-artifact-cache \
+  rabsd --worker-build-tls 0.0.0.0:7091 fleet-worker <worker-spki-sha256> \
+    /absolute/bundles/build-42 /absolute/deliveries/build-42 /absolute/outputs/build-42
+```
+
+The same environment settings apply to `--worker-exec-tls`, source-backed
+prepared TLS builds and explicit result resume. `--resume-from` takes precedence
+and disables the byte cache for that operation, preserving its existing refusal
+of corrupt local prefixes. For daemon prepared jobs and
+live dependency execution, configure the daemon before startup; setting the
+variables only on a submitting client cannot reconfigure that running process.
+Acknowledgment-only reconciliation does not open the cache. Plaintext loopback
+delivery cannot consume or seed it.
+
+All three variables absent disables the cache. An empty/relative/traversing
+directory, malformed or out-of-range limit, or a limit supplied without the
+directory produces a configuration error before session grant, source upload or
+execution dispatch. A syntactically valid configuration whose storage cannot be
+opened privately emits one `artifact-byte-cache-unavailable` JSON setup
+diagnostic on stderr and continues through ordinary verified transfer.
+
+Cache identity includes the authenticated SPKI and worker name, then the
+artifact's complete SHA-256 and byte length. A new request or session can reuse
+matching bytes; a changed worker name or key cannot. The current manifest owns
+the destination path and executable mode. Cached objects are ordinary private
+files, and delivery copies receive independent inodes. Writes to an installed
+artifact therefore cannot alter the retained cache object.
+
+Every hit is copied and completely rehashed before the file is accepted. A
+corrupt, missing or inaccessible object is a miss, and the receiver downloads
+that file through its normal bounded range pipeline. Current diagnostics are
+always received and verified. Newly verified artifact bytes can populate the
+cache under the aggregate byte and entry bounds; an optional cache-storage
+failure can skip population without turning a successful delivery
+into a failure. Cache objects may survive restarts, but their presence alone is
+never trusted.
+
+Warm readers share a nonblocking read lease that prevents their objects from
+being evicted; an active exclusive writer can force a cold read or skip optional
+population. The limits cover logical payload bytes and entries, including
+incoming copies and retained readers; filesystem blocks and metadata consume
+additional space. Before optional population, free-space and inode checks reserve
+room for the remaining current artifacts and delivery receipt, accounting for
+filesystem allocation rounding, but cannot guarantee capacity against unrelated
+concurrent disk writers.
+
+The local copy and population loops check the same operation deadline and
+interruption state at each 64 KiB boundary. A cancellation, expired phase budget,
+or failed write to the actual delivery is propagated instead of being retried as
+a cache miss. Daemon cancellation after an observed terminal result retains its
+existing verified-delivery drain; explicit operator signals retain their existing
+abandon behavior. All required file checks, directory syncs, the current
+`delivery.json`, and worker acknowledgments still occur.
+
+The byte-cache tests run the real receiver and filesystem with controlled
+protocol peers. They check warm range elision, scope separation, corrupt-cache
+fallback, independent copies, bounded storage and interrupted copying. They do
+not constitute a native TLS/compiler performance measurement:
+
+```sh
+cargo test -p rabsd --lib coord::worker_delivery --locked
+cargo test -p rabsd --lib coord::secure_worker_delivery --locked
+```
+
 ## Failure and acknowledgment semantics
 
 Compiler success and successful byte delivery are different facts. A failed or

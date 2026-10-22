@@ -16,8 +16,10 @@
 use super::delivery_ack::PendingAcknowledgment;
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
-    Delivery, DeliveryFailure, DeliveryMode, ResumePeer, ResumeSource, WorkerAuthentication,
-    WorkerPeer, receive_operation, transport_interrupted, validate_request, worker_transport_error,
+    ArtifactByteCache, DEFAULT_ARTIFACT_CACHE_BYTES, DEFAULT_ARTIFACT_CACHE_ENTRIES, Delivery,
+    DeliveryFailure, DeliveryMode, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
+    ResumePeer, ResumeSource, WorkerAuthentication, WorkerPeer, receive_operation,
+    transport_interrupted, validate_request, worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::Runtime;
@@ -30,9 +32,10 @@ use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_protocol::worker_session::{CoordinatorSession, SessionPolicy, WorkerHelloClaims};
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET;
 use serde_json::{Value, json};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,6 +64,109 @@ const TRANSFER_BUDGET: Duration = Duration::from_secs(5 * 60);
 const ACK_BUDGET: Duration = Duration::from_secs(10);
 const MAX_EXECUTION_MS: u64 = 30 * 60 * 1000;
 const RECORD_READ_BYTES: usize = 4096;
+
+#[derive(Debug)]
+struct ArtifactCacheConfiguration {
+    parent: PathBuf,
+    bytes: u64,
+    entries: usize,
+}
+
+/// Parse local policy without reading process state or touching storage. A
+/// supplied limit without a directory is a configuration error, not enablement.
+fn parse_artifact_cache_configuration(
+    directory: Option<&OsStr>,
+    bytes: Option<&OsStr>,
+    entries: Option<&OsStr>,
+) -> io::Result<Option<ArtifactCacheConfiguration>> {
+    let error = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let Some(directory) = directory else {
+        return if bytes.is_some() || entries.is_some() {
+            Err(error(
+                "RABS_ARTIFACT_CACHE_BYTES and RABS_ARTIFACT_CACHE_ENTRIES require RABS_ARTIFACT_CACHE_DIR",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let parent = Path::new(directory);
+    if directory.is_empty()
+        || directory.as_encoded_bytes().contains(&0)
+        || !parent.is_absolute()
+        || parent.file_name().is_none()
+        || !parent
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(error(
+            "RABS_ARTIFACT_CACHE_DIR must be a named absolute directory without parent traversal",
+        ));
+    }
+    let decimal = |name: &str, value: Option<&OsStr>, default: u64, maximum: u64| {
+        let Some(value) = value else {
+            return Ok(default);
+        };
+        value
+            .to_str()
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=maximum).contains(value))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a decimal integer between 1 and {maximum}"),
+                )
+            })
+    };
+    let bytes = decimal(
+        "RABS_ARTIFACT_CACHE_BYTES",
+        bytes,
+        DEFAULT_ARTIFACT_CACHE_BYTES,
+        MAX_ARTIFACT_CACHE_BYTES,
+    )?;
+    let entries = usize::try_from(decimal(
+        "RABS_ARTIFACT_CACHE_ENTRIES",
+        entries,
+        DEFAULT_ARTIFACT_CACHE_ENTRIES as u64,
+        MAX_ARTIFACT_CACHE_ENTRIES as u64,
+    )?)
+    .map_err(|_| error("RABS_ARTIFACT_CACHE_ENTRIES exceeds this platform's entry limit"))?;
+    Ok(Some(ArtifactCacheConfiguration {
+        parent: parent.to_path_buf(),
+        bytes,
+        entries,
+    }))
+}
+
+impl ArtifactCacheConfiguration {
+    fn open(&self) -> Option<Arc<ArtifactByteCache>> {
+        match ArtifactByteCache::open(&self.parent, self.bytes, self.entries) {
+            Ok(cache) => Some(Arc::new(cache)),
+            Err(error) => {
+                // One setup diagnostic per delivery. The existing parent is
+                // never created or chmodded; unavailable optional storage
+                // cannot prevent an otherwise valid verified transfer.
+                eprintln!(
+                    "{}",
+                    json!({"kind":"artifact-byte-cache-unavailable", "disposition":"cold", "detail":error.to_string()})
+                );
+                None
+            }
+        }
+    }
+}
+
+fn configured_artifact_byte_cache() -> io::Result<Option<Arc<ArtifactByteCache>>> {
+    let directory = std::env::var_os("RABS_ARTIFACT_CACHE_DIR");
+    let bytes = std::env::var_os("RABS_ARTIFACT_CACHE_BYTES");
+    let entries = std::env::var_os("RABS_ARTIFACT_CACHE_ENTRIES");
+    Ok(parse_artifact_cache_configuration(
+        directory.as_deref(),
+        bytes.as_deref(),
+        entries.as_deref(),
+    )?
+    .and_then(|configuration| configuration.open()))
+}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -233,6 +339,14 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
 }
 
 impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.inner.checkpoint()
+    }
+
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        self.inner.artifact_byte_cache()
+    }
+
     fn negotiate(&mut self, hello: &Value, grant: &Value) -> io::Result<()> {
         require(
             self.hello_read && !self.negotiation_started,
@@ -599,6 +713,7 @@ struct RecordPeer<'a, S> {
     execution_budget: Duration,
     phase: Phase,
     failed: bool,
+    artifact_byte_cache: Option<Arc<ArtifactByteCache>>,
 }
 
 impl<'a, S> RecordPeer<'a, S> {
@@ -616,7 +731,13 @@ impl<'a, S> RecordPeer<'a, S> {
             execution_budget: Duration::from_millis(millis) + Duration::from_secs(60),
             phase: Phase::Admission,
             failed: false,
+            artifact_byte_cache: None,
         }
+    }
+
+    fn with_artifact_byte_cache(mut self, cache: Option<Arc<ArtifactByteCache>>) -> Self {
+        self.artifact_byte_cache = cache;
+        self
     }
 
     fn remaining(&self) -> io::Result<Duration> {
@@ -707,6 +828,16 @@ impl<'a, S> RecordPeer<'a, S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        let result = self.remaining().map(|_| ());
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        self.artifact_byte_cache.as_deref()
+    }
+
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         let bytes = self.outbound(frame)?;
         let budget = self.remaining()?;
@@ -827,10 +958,13 @@ pub fn receive_authenticated_operation(
     }
     // Keep this private owner alive until the admitted peer and its transport
     // have both dropped. No caller can clone the consumed admission capability.
+    let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
-    let raw = interrupt::OperatorPeer::new(RecordPeer::new(runtime, peer.stream, request))
-        .map_err(&failure)?;
+    let raw = interrupt::OperatorPeer::new(
+        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache),
+    )
+    .map_err(&failure)?;
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
@@ -956,10 +1090,13 @@ pub fn receive_authenticated_source(
         )));
     }
     upload.validate_request(request).map_err(&failure)?;
+    let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
-    let raw = interrupt::OperatorPeer::new(RecordPeer::new(runtime, peer.stream, request))
-        .map_err(&failure)?;
+    let raw = interrupt::OperatorPeer::new(
+        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache),
+    )
+    .map_err(&failure)?;
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
@@ -1092,8 +1229,9 @@ pub fn receive_authenticated_with_admission(
     }
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
+    let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let raw = interrupt::OperatorPeer::with_interrupts(
-        RecordPeer::new(runtime, peer.stream, request),
+        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache),
         interrupt::OperationInterrupts::new(cancellation),
     )
     .with_preview_observer(if mode == DeliveryMode::Execute {
@@ -1131,6 +1269,160 @@ pub fn receive_authenticated_with_admission(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn artifact_cache_configuration_is_explicit_and_uses_shared_core_limits() {
+        assert!(
+            parse_artifact_cache_configuration(None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        for (bytes, entries) in [(Some("1"), None), (None, Some("1")), (Some("1"), Some("1"))] {
+            let error = parse_artifact_cache_configuration(
+                None,
+                bytes.map(OsStr::new),
+                entries.map(OsStr::new),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("require RABS_ARTIFACT_CACHE_DIR")
+            );
+        }
+        let directory = OsStr::new("/private/rabs-artifacts");
+        let defaults = parse_artifact_cache_configuration(Some(directory), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(defaults.parent, Path::new(directory));
+        assert_eq!(defaults.bytes, DEFAULT_ARTIFACT_CACHE_BYTES);
+        assert_eq!(defaults.entries, DEFAULT_ARTIFACT_CACHE_ENTRIES);
+        for (bytes, entries) in [
+            (1, 1),
+            (MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES),
+        ] {
+            let bytes_value = bytes.to_string();
+            let entries_value = entries.to_string();
+            let parsed = parse_artifact_cache_configuration(
+                Some(directory),
+                Some(OsStr::new(&bytes_value)),
+                Some(OsStr::new(&entries_value)),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed.bytes, bytes);
+            assert_eq!(parsed.entries, entries);
+        }
+    }
+
+    #[test]
+    fn artifact_cache_configuration_refuses_malformed_paths_and_numeric_policy() {
+        for directory in [
+            "",
+            "relative/cache",
+            "/",
+            "/tmp/../cache",
+            "/tmp/cache\0suffix",
+        ] {
+            let error = parse_artifact_cache_configuration(Some(OsStr::new(directory)), None, None)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("RABS_ARTIFACT_CACHE_DIR"));
+        }
+        let directory = Some(OsStr::new("/private/rabs-artifacts"));
+        for value in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1GiB",
+            "1.5",
+            "18446744073709551616",
+        ] {
+            for (bytes, entries, name) in [
+                (Some(OsStr::new(value)), None, "RABS_ARTIFACT_CACHE_BYTES"),
+                (None, Some(OsStr::new(value)), "RABS_ARTIFACT_CACHE_ENTRIES"),
+            ] {
+                let error =
+                    parse_artifact_cache_configuration(directory, bytes, entries).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains(name), "{value:?}: {error}");
+            }
+        }
+        let too_many_bytes = (MAX_ARTIFACT_CACHE_BYTES + 1).to_string();
+        let too_many_entries = (MAX_ARTIFACT_CACHE_ENTRIES + 1).to_string();
+        assert!(
+            parse_artifact_cache_configuration(directory, Some(OsStr::new(&too_many_bytes)), None)
+                .is_err()
+        );
+        assert!(
+            parse_artifact_cache_configuration(
+                directory,
+                None,
+                Some(OsStr::new(&too_many_entries))
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_cache_configuration_refuses_non_utf8_limits_without_mutating_environment() {
+        use std::os::unix::ffi::OsStringExt;
+        let value = std::ffi::OsString::from_vec(vec![b'1', 0xff]);
+        let directory = Some(OsStr::new("/private/rabs-artifacts"));
+        assert!(parse_artifact_cache_configuration(directory, Some(&value), None).is_err());
+        assert!(parse_artifact_cache_configuration(directory, None, Some(&value)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_cache_storage_failure_is_cold_and_never_creates_or_chmods_a_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = root.path().join("missing");
+        let missing_config =
+            parse_artifact_cache_configuration(Some(missing.as_os_str()), None, None)
+                .unwrap()
+                .unwrap();
+        assert!(missing_config.open().is_none());
+        assert!(!missing.exists());
+
+        let public = root.path().join("public");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let public_config =
+            parse_artifact_cache_configuration(Some(public.as_os_str()), None, None)
+                .unwrap()
+                .unwrap();
+        assert!(public_config.open().is_none());
+        assert_eq!(
+            std::fs::metadata(&public).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&public).unwrap().count(), 0);
+
+        let configured =
+            parse_artifact_cache_configuration(Some(root.path().as_os_str()), None, None)
+                .unwrap()
+                .unwrap();
+        let cache = configured
+            .open()
+            .expect("ordinary private parent enables cache");
+        assert_eq!(cache.root(), root.path().join("artifact-bytes-v1"));
+        assert_eq!(
+            std::fs::metadata(cache.root())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 
     #[derive(Default)]
     struct Script {

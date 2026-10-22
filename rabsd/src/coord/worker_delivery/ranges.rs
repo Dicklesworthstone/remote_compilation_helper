@@ -5,6 +5,7 @@
 //! descriptors and incremental hashes stay with that file until its complete
 //! digest, mode and sync succeed. Failure never drains, retries or acknowledges.
 
+use super::byte_cache::CacheSession;
 use super::{
     CHUNK_BYTES, Item, Manifest, ResumeSource, WorkerPeer, create_file, digest, hash, is_hex,
     number, receive, require, text,
@@ -27,6 +28,7 @@ struct Download<'a> {
     requested: u64,
     empty_requested: bool,
     outstanding: usize,
+    cached: bool,
 }
 
 impl<'a> Download<'a> {
@@ -35,18 +37,36 @@ impl<'a> Download<'a> {
         manifest_hash: Option<&'a str>,
         path: &Path,
         source: Option<&ResumeSource>,
+        cache: Option<&CacheSession>,
+        mut checkpoint: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Self> {
+        checkpoint()?;
         let mut file = create_file(path)?;
         let mut hasher = Sha256::new();
-        let offset = match source {
+        let mut offset = match source {
             Some(source) => source.copy_prefix(
-                if manifest_hash.is_some() { "artifacts" } else { "diagnostics" },
+                if manifest_hash.is_some() {
+                    "artifacts"
+                } else {
+                    "diagnostics"
+                },
                 &item.name,
                 item.len,
                 &mut file,
                 &mut hasher,
             )?,
             None => 0,
+        };
+        let cached = if let Some(cache) = cache {
+            if let Some(cached_hash) = cache.copy(item, &mut file, &mut checkpoint)? {
+                hasher = cached_hash;
+                offset = item.len;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         };
         Ok(Self {
             item,
@@ -57,6 +77,7 @@ impl<'a> Download<'a> {
             requested: offset,
             empty_requested: false,
             outstanding: 0,
+            cached,
         })
     }
 
@@ -82,7 +103,12 @@ impl<'a> Download<'a> {
         let artifact = self.manifest_hash.is_some();
         require(self.outstanding != 0, "unsolicited byte chunk")?;
         require(
-            text(chunk, "kind")? == if artifact { "artifact-chunk" } else { "output-chunk" },
+            text(chunk, "kind")?
+                == if artifact {
+                    "artifact-chunk"
+                } else {
+                    "output-chunk"
+                },
             "expected byte chunk",
         )?;
         require(
@@ -96,13 +122,17 @@ impl<'a> Download<'a> {
         if let Some(hash) = self.manifest_hash {
             require(
                 digest(chunk, "manifest_sha256")? == hash
-                    && chunk.get("executable").and_then(Value::as_bool) == Some(self.item.executable),
+                    && chunk.get("executable").and_then(Value::as_bool)
+                        == Some(self.item.executable),
                 "chunk manifest/mode mismatch",
             )?;
         }
         let count = (self.item.len - self.offset).min(CHUNK_BYTES as u64) as usize;
         let encoded = text(chunk, "data_hex")?;
-        require(is_hex(encoded, count * 2), "chunk encoding or length mismatch")?;
+        require(
+            is_hex(encoded, count * 2),
+            "chunk encoding or length mismatch",
+        )?;
         let mut bytes = Vec::with_capacity(count);
         for pair in encoded.as_bytes().as_chunks::<2>().0 {
             let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
@@ -122,23 +152,38 @@ impl<'a> Download<'a> {
         Ok(())
     }
 
-    fn finish(self) -> io::Result<()> {
+    fn finish(
+        mut self,
+        cache: Option<&mut CacheSession>,
+        peer: &mut impl WorkerPeer,
+    ) -> io::Result<()> {
+        peer.checkpoint()?;
         require(
             self.offset == self.item.len && self.outstanding == 0,
             "incomplete file has outstanding ranges",
         )?;
-        let actual: String = self.hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let actual: String = self
+            .hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         require(actual == self.item.sha256, "complete file digest mismatch")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            self.file.set_permissions(std::fs::Permissions::from_mode(if self.item.executable {
-                0o700
-            } else {
-                0o600
-            }))?;
+            self.file.set_permissions(std::fs::Permissions::from_mode(
+                if self.item.executable { 0o700 } else { 0o600 },
+            ))?;
         }
-        self.file.sync_all()
+        self.file.sync_all()?;
+        if let Some(cache) = cache {
+            cache.completed(self.item)?;
+            if !self.cached {
+                cache.remember(self.item, &mut self.file, || peer.checkpoint())?;
+            }
+        }
+        peer.checkpoint()
     }
 }
 
@@ -147,6 +192,7 @@ fn download_many<'a>(
     worker: &str,
     id: u64,
     targets: impl Iterator<Item = (&'a Item, Option<&'a str>, PathBuf)>,
+    mut cache: Option<CacheSession>,
 ) -> io::Result<()> {
     let mut targets = targets.fuse();
     let mut active: VecDeque<Download<'a>> = VecDeque::with_capacity(RANGE_WINDOW);
@@ -157,12 +203,22 @@ fn download_many<'a>(
                 let Some((item, manifest_hash, path)) = targets.next() else {
                     break;
                 };
-                let file = Download::open(item, manifest_hash, &path, peer.resume_source())?;
+                // The explicit resume source is borrowed only for its existing
+                // prefix semantics. Artifact cache copies get a separate mutable
+                // peer checkpoint, and are disabled whenever that source exists.
+                let source = peer.resume_source();
+                let file = if source.is_some() {
+                    Download::open(item, manifest_hash, &path, source, None, || Ok(()))?
+                } else {
+                    Download::open(item, manifest_hash, &path, None, cache.as_ref(), || {
+                        peer.checkpoint()
+                    })?
+                };
                 // A complete NONEMPTY local hint needs no range request, but
                 // is not trusted until its full hash, permissions and sync pass.
                 // Empty files still require their ordinary zero-length reply.
                 if item.len != 0 && file.offset == item.len {
-                    file.finish()?;
+                    file.finish(cache.as_mut(), peer)?;
                     continue;
                 }
                 active.push_back(file);
@@ -180,7 +236,10 @@ fn download_many<'a>(
             // Verify and sync the oldest file before consuming ANY response
             // for its successor. Later controls may be in flight, never credited
             // as verified output. Any failure leaves all private files retained.
-            active.pop_front().expect("completed range owner").finish()?;
+            active
+                .pop_front()
+                .expect("completed range owner")
+                .finish(cache.as_mut(), peer)?;
         }
     }
 }
@@ -194,7 +253,13 @@ pub(super) fn download(
     manifest_hash: Option<&str>,
     path: &Path,
 ) -> io::Result<()> {
-    download_many(peer, worker, id, std::iter::once((item, manifest_hash, path.to_path_buf())))
+    download_many(
+        peer,
+        worker,
+        id,
+        std::iter::once((item, manifest_hash, path.to_path_buf())),
+        None,
+    )
 }
 
 /// The complete artifact manifest and directory set were validated by the
@@ -207,10 +272,27 @@ pub(super) fn download_artifacts(
     manifest: &Manifest,
     root: &Path,
 ) -> io::Result<()> {
+    // A claimed JSON worker identity is insufficient. Local byte hints are
+    // scoped only after trusted session admission, and never override explicit
+    // ResumeSource behavior (including its intentional corruption refusal).
+    let cache = if peer.resume_source().is_none() {
+        peer.artifact_byte_cache()
+            .cloned()
+            .zip(peer.authentication())
+            .map(|(cache, authentication)| {
+                CacheSession::new(cache, worker, authentication, manifest)
+            })
+    } else {
+        None
+    };
     download_many(
         peer,
         worker,
         id,
-        manifest.files.iter().map(|item| (item, Some(manifest.sha256.as_str()), root.join(&item.name))),
+        manifest
+            .files
+            .iter()
+            .map(|item| (item, Some(manifest.sha256.as_str()), root.join(&item.name))),
+        cache,
     )
 }

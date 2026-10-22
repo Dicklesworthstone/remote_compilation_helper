@@ -1078,6 +1078,12 @@ impl<'a, P: WorkerPeer + ?Sized> SourcePeer<'a, P> {
 }
 
 impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.inner.checkpoint()
+    }
+    fn artifact_byte_cache(&self) -> Option<&super::worker_delivery::ArtifactByteCache> {
+        self.inner.artifact_byte_cache()
+    }
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         self.inner.send(frame)
     }

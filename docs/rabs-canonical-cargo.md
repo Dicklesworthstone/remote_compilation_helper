@@ -28,7 +28,8 @@ This is the canonical **Cargo driver**, not a wrapper-only path rewrite. The
 source remains `/__rabs/workspace`, the captured toolchain lives under
 `/__rabs/toolchain`, and Cargo writes to `/__rabs/out/cargo` before any rustc unit
 is planned. Existing worker output, cancellation, lease and recovery mechanisms
-are reused. There is no second scheduler, transport, artifact installer or cache.
+are reused. The existing scheduler, transport and artifact installer remain in
+control of every operation.
 
 **This profile is execution-only.** It does not publish an action-cache result,
 serve a compiler or test-result cache hit, distribute individual rustc units, enable the local dependency
@@ -170,15 +171,64 @@ cache or per-unit scheduling authority.
 
 A reconnecting worker can opt into bounded private target reuse with
 `--target-cache-bytes 1073741824` for a 1 GiB pool. Identical captured inputs and
-command context may seed the next execution's private target directory, allowing
-Cargo to skip compilation it considers fresh. Cargo still executes each request,
-including the requested tests. Source, build-script, environment, toolchain,
-feature, or effective job-grant changes start with a fresh target.
+compilation settings may seed the next execution's private target directory,
+allowing Cargo to skip compilation it considers fresh. An exact invocation is
+preferred; compatible `build`, `check`, `test --no-run` and `test` commands can
+share a target when their other compilation settings match. Cargo still executes
+each current request, including its selected tests and harness arguments.
+Source, build-script, environment, toolchain, feature, or effective job-grant
+changes start with a fresh target.
 
 This pool survives coordinator reconnects within one worker process; it is
 disabled by default and does not persist across worker restarts. See
 [worker-local Cargo target state](rabs-target-state.md) for ownership, limits,
 runtime assumptions, and the worker events that report actual reuse.
+
+### Reuse verified artifact bytes on the coordinator
+
+Enable an optional coordinator byte cache to avoid downloading identical artifact
+files from the same authenticated worker on later builds. This complements the
+worker's private target pool: Cargo still executes the current command, and the
+coordinator receives its current result, Cargo report and complete diagnostics.
+Every reused file is copied into the new delivery and hashed against that
+current result's manifest before the ordinary receipt and acknowledgment path.
+
+Create a private cache parent once, outside captured source/toolchain trees and
+operation directories, then enable it on the process that owns worker delivery:
+
+```sh
+mkdir -m 700 "$HOME/.cache/rabs-artifact-cache"
+RABS_ARTIFACT_CACHE_DIR="$HOME/.cache/rabs-artifact-cache" \
+RABS_ARTIFACT_CACHE_BYTES=1073741824 \
+RABS_ARTIFACT_CACHE_ENTRIES=4096 \
+  cargo rabs --rabs-canonical /absolute/profile.json -- build --workspace
+```
+
+The example applies to direct TLS builds. For a profile with `daemon_socket`,
+set these variables in the **daemon's environment before starting it**; the
+job-submitting client does not change the running daemon's environment. The same
+configuration also covers authenticated live dependency delivery and explicit
+result resume. It does not enable reuse for the plaintext loopback fixture.
+
+`RABS_ARTIFACT_CACHE_DIR` must name an existing absolute directory owned by the
+current user with no group/other permissions; symlink ancestors are refused.
+The receiver manages only its `artifact-bytes-v1` child. It does not create or
+chmod the configured parent. Byte and entry limits default to 1 GiB and 4096;
+their allowed ranges are 1–17,179,869,184 bytes and 1–65,536 entries. Both limits
+cover all worker scopes in that cache, including a pending object. Values must
+be decimal integers. Supplying either limit without the directory, or supplying
+malformed settings, refuses before execution dispatch. With all three variables
+absent, the cache is disabled.
+
+A missing or unsafe cache directory produces one
+`artifact-byte-cache-unavailable` setup diagnostic and uses ordinary verified
+transfer. Missing or corrupt objects also take the ordinary range path; local
+copy cancellation, deadline expiry and delivery-write errors remain failures.
+Objects may survive coordinator restarts, but every hit is independently checked
+and isolated by authenticated worker key and worker name. Diagnostics and test
+outcomes are never replayed from this cache. See
+[artifact byte reuse](rabs-worker-delivery.md#reuse-artifact-bytes-across-authenticated-deliveries)
+for ownership and recovery details.
 
 ### Use dependencies already cached by Cargo
 
