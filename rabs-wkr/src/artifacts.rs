@@ -234,6 +234,36 @@ impl PreparedArtifacts {
         stdout: impl Read,
         stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
+        self.capture_cargo_output_at(
+            dependency_inputs,
+            stdout,
+            stopped,
+            &self.plan.virtual_root(),
+        )
+    }
+
+    /// Host fixtures exercise actual Cargo reports at stable physical paths.
+    /// Production always resolves reports against the canonical mount above.
+    #[cfg(test)]
+    pub(crate) fn capture_fixture_cargo_output(
+        &self,
+        stdout: impl Read,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        let root = self
+            .backing()
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF-8 Cargo fixture target"))?;
+        self.capture_cargo_output_at(None, stdout, stopped, root)
+    }
+
+    fn capture_cargo_output_at(
+        &self,
+        dependency_inputs: Option<&DependencyOutputInputs>,
+        stdout: impl Read,
+        stopped: impl Fn() -> bool,
+        output_root: &str,
+    ) -> io::Result<CapturedArtifacts> {
         let Some(mode) = self.plan.cargo else {
             return self.capture_with_dependency_inputs(dependency_inputs, stopped);
         };
@@ -242,7 +272,7 @@ impl PreparedArtifacts {
                 "Cargo artifact capture interrupted or has dependency-only inputs",
             ));
         }
-        let report = CargoArtifactReport::read(stdout, &self.plan.virtual_root(), mode)?;
+        let report = CargoArtifactReport::read(stdout, output_root, mode)?;
         let mut resolved = self.plan.clone();
         resolved.files.extend(report.files().map(str::to_owned));
         rabs_sandbox::artifact_tree::validate_tree_names(resolved.files())?;

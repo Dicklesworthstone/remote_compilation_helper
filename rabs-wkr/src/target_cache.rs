@@ -132,6 +132,46 @@ pub(crate) fn target_key(
     plan: &ArtifactPlan,
     grant: u32,
 ) -> io::Result<TargetKey> {
+    let value = target_key_description(scope, request, inputs, spec, support, plan, grant)?;
+    Ok(TargetKey(
+        Sha256::digest(serde_json::to_vec(&value)?).into(),
+    ))
+}
+
+/// Ordinary Cargo can reuse one private target across build, check and test.
+/// This secondary key never changes action identity or permits result replay:
+/// the current command executes with its original argv and artifact contract.
+/// Unknown argument forms retain exact-key reuse only.
+pub(crate) fn target_compatibility_key(
+    scope: TargetCacheScope,
+    request: &CanonicalExecRequest,
+    inputs: &WorkspaceInputs,
+    spec: &CanonicalNamespaceSpec,
+    support: &HostIsolationSupport,
+    plan: &ArtifactPlan,
+    grant: u32,
+) -> io::Result<Option<TargetKey>> {
+    let Some(args) = compatible_cargo_arguments(request, plan) else {
+        return Ok(None);
+    };
+    let mut value = target_key_description(scope, request, inputs, spec, support, plan, grant)?;
+    value["version"] = serde_json::json!("rabs.private-cargo-commands.v1");
+    value["args"] = serde_json::json!(args);
+    value["cargo_mode"] = serde_json::json!("current-cargo-contract-required-v1");
+    Ok(Some(TargetKey(
+        Sha256::digest(serde_json::to_vec(&value)?).into(),
+    )))
+}
+
+fn target_key_description(
+    scope: TargetCacheScope,
+    request: &CanonicalExecRequest,
+    inputs: &WorkspaceInputs,
+    spec: &CanonicalNamespaceSpec,
+    support: &HostIsolationSupport,
+    plan: &ArtifactPlan,
+    grant: u32,
+) -> io::Result<serde_json::Value> {
     if spec.allows_network() {
         return Err(invalid(
             "target state requires the network-denied canonical namespace",
@@ -144,7 +184,7 @@ pub(crate) fn target_key(
     let mut rw: Vec<_> = spec.rw_binds.iter().map(|bind| &bind.visible).collect();
     ro.sort();
     rw.sort();
-    let bytes = serde_json::to_vec(&serde_json::json!({
+    Ok(serde_json::json!({
         "version":"rabs.private-cargo-target.v1",
         "scope":scope.0,
         "source":inputs.full_source_digest,
@@ -159,8 +199,103 @@ pub(crate) fn target_key(
         "required":plan.files().collect::<Vec<_>>(),
         "cargo_mode":format!("{:?}", plan.cargo_mode()),
         "runtime":"fresh-home+captured-or-empty-cargo-home+private-fifo-v1",
-    }))?;
-    Ok(TargetKey(Sha256::digest(bytes).into()))
+    }))
+}
+
+fn compatible_cargo_arguments(
+    request: &CanonicalExecRequest,
+    plan: &ArtifactPlan,
+) -> Option<Vec<String>> {
+    use rabs_sandbox::cargo_artifacts::CargoArtifactMode;
+    if request.program != "/__rabs/toolchain/bin/cargo" {
+        return None;
+    }
+    let mode = plan.cargo_mode()?;
+    let command = request.args.first()?.as_str();
+    if !matches!(command, "build" | "check" | "test") {
+        return None;
+    }
+    let mut normalized = vec!["cargo-build-check-test".to_owned()];
+    let mut no_run = false;
+    let mut filter = false;
+    let mut at = 1;
+    while at < request.args.len() {
+        let argument = &request.args[at];
+        if argument == "--" {
+            // These are test-process arguments. The current invocation still
+            // receives every original byte, including option-like spellings.
+            if command != "test" || no_run {
+                return None;
+            }
+            break;
+        }
+        let (option, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(option, value)| {
+                (option, Some(value))
+            });
+        match option {
+            "--no-run" if inline.is_none() && command == "test" && !no_run => {
+                no_run = true;
+            }
+            "--no-fail-fast" if inline.is_none() && command == "test" => {}
+            "--bin" | "--example" | "--test" | "--bench" | "--package" | "-p" | "--features"
+            | "-F" | "--target" | "--color" | "--exclude" | "--message-format"
+            | "--manifest-path" | "--target-dir" | "--profile" | "--jobs" | "-j" => {
+                normalized.push(argument.clone());
+                let value = if let Some(value) = inline {
+                    value
+                } else {
+                    at += 1;
+                    let value = request.args.get(at)?;
+                    normalized.push(value.clone());
+                    value
+                };
+                if value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+            }
+            "--release"
+            | "-r"
+            | "--workspace"
+            | "--locked"
+            | "--offline"
+            | "--frozen"
+            | "--all-features"
+            | "--no-default-features"
+            | "--verbose"
+            | "-v"
+            | "-vv"
+            | "--quiet"
+            | "-q"
+            | "--lib"
+            | "--bins"
+            | "--examples"
+            | "--tests"
+            | "--benches"
+            | "--all-targets"
+                if inline.is_none() =>
+            {
+                normalized.push(argument.clone());
+            }
+            "--doc" if inline.is_none() && command == "test" => {
+                normalized.push(argument.clone());
+            }
+            _ if command == "test" && !argument.starts_with('-') && !filter => {
+                filter = true;
+            }
+            _ => return None,
+        }
+        at += 1;
+    }
+    if no_run && filter {
+        return None;
+    }
+    match mode {
+        CargoArtifactMode::Compilation if command != "test" || no_run => Some(normalized),
+        CargoArtifactMode::TestExecution if command == "test" && !no_run => Some(normalized),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -210,6 +345,7 @@ impl TargetCache {
     pub(crate) fn acquire(
         self: &Arc<Self>,
         key: TargetKey,
+        compatible: Option<TargetKey>,
         mut inputs: WorkspaceInputs,
         new_output: impl FnOnce() -> io::Result<PreparedArtifacts>,
         request_id: u64,
@@ -233,6 +369,14 @@ impl TargetCache {
                 .iter()
                 .rev()
                 .find(|seed| seed.key == key && !seed.invalidated.load(Ordering::Acquire))
+                .or_else(|| {
+                    compatible.and_then(|compatible| {
+                        state.entries.iter().rev().find(|seed| {
+                            seed.compatible == Some(compatible)
+                                && !seed.invalidated.load(Ordering::Acquire)
+                        })
+                    })
+                })
                 .cloned(),
             Err(_) => {
                 disposition = "cold-pool-busy";
@@ -265,7 +409,11 @@ impl TargetCache {
                     times = seed.source.clone();
                     inputs = runtime;
                     restored = Some(output);
-                    disposition = "restored";
+                    disposition = if seed.key == key {
+                        "restored"
+                    } else {
+                        "restored-compatible"
+                    };
                     self.finish_seed_use(seed, true);
                 }
                 Err(error) => {
@@ -301,6 +449,7 @@ impl TargetCache {
             TargetAttempt {
                 cache: Arc::clone(self),
                 key,
+                compatible,
                 inputs,
                 times,
                 request_id,
@@ -311,13 +460,18 @@ impl TargetCache {
 
     fn finish_seed_use(&self, seed: Arc<Seed>, promote: bool) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(index) = state.entries.iter().position(|entry| Arc::ptr_eq(entry, &seed)) else {
+        let Some(index) = state
+            .entries
+            .iter()
+            .position(|entry| Arc::ptr_eq(entry, &seed))
+        else {
             return;
         };
-        let retired = seed.invalidated.load(Ordering::Acquire)
-            || state.entries.iter().skip(index + 1).any(|newer| {
-                newer.key == seed.key && !newer.invalidated.load(Ordering::Acquire)
-            });
+        let retired =
+            seed.invalidated.load(Ordering::Acquire)
+                || state.entries.iter().skip(index + 1).any(|newer| {
+                    newer.key == seed.key && !newer.invalidated.load(Ordering::Acquire)
+                });
         // Drop this reader under the lock before the exclusive ownership test.
         // Removing a leased entry would leave unaccounted live disk backing.
         drop(seed);
@@ -397,6 +551,7 @@ impl Drop for Reservation {
 #[derive(Debug)]
 struct Seed {
     key: TargetKey,
+    compatible: Option<TargetKey>,
     source: SourceTimes,
     tree: TreeSnapshot,
     invalidated: AtomicBool,
@@ -451,6 +606,7 @@ impl PendingTargetSeed {
 pub(crate) struct TargetAttempt {
     cache: Arc<TargetCache>,
     key: TargetKey,
+    compatible: Option<TargetKey>,
     inputs: WorkspaceInputs,
     times: SourceTimes,
     request_id: u64,
@@ -488,7 +644,8 @@ impl TargetAttempt {
             .iter()
             .position(|bind| bind.visible == visible && bind.backing == current.backing());
         let workspace_index = spec.ro_binds.iter().position(|bind| {
-            bind.visible == Path::new(rabs_sandbox::layout::WORKSPACE) && bind.backing == original.root
+            bind.visible == Path::new(rabs_sandbox::layout::WORKSPACE)
+                && bind.backing == original.root
         });
         let (Some(output_index), Some(workspace_index)) = (output_index, workspace_index) else {
             return Err(invalid(
@@ -522,6 +679,7 @@ impl TargetAttempt {
             reservation,
             seed: Some(Seed {
                 key: self.key,
+                compatible: self.compatible,
                 source: self.times,
                 tree,
                 invalidated: AtomicBool::new(false),

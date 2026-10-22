@@ -61,6 +61,39 @@ fn fixture_request() -> CanonicalExecRequest {
     }
 }
 
+fn cargo_request(command: &str, options: &[&str]) -> (CanonicalExecRequest, ArtifactPlan) {
+    use rabs_sandbox::cargo_artifacts::{CARGO_ARTIFACTS_VERSION, CARGO_TEST_ARTIFACTS_VERSION};
+    let mut request = fixture_request();
+    request.args = [
+        command,
+        "--frozen",
+        "--offline",
+        "--message-format=json",
+        "--target-dir=/__rabs/out/cargo",
+        "--jobs=1",
+    ]
+    .into_iter()
+    .chain(options.iter().copied())
+    .map(str::to_owned)
+    .collect();
+    let no_run = options
+        .iter()
+        .take_while(|option| **option != "--")
+        .any(|option| *option == "--no-run");
+    let contract = if command == "test" && !no_run {
+        CARGO_TEST_ARTIFACTS_VERSION
+    } else {
+        CARGO_ARTIFACTS_VERSION
+    };
+    let plan = crate::artifacts::parse_plan(&serde_json::json!({
+        "program":request.program, "args":request.args,
+        "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1", "cargo":contract},
+    }))
+    .unwrap()
+    .unwrap();
+    (request, plan)
+}
+
 fn fixture_spec(label: &str) -> CanonicalNamespaceSpec {
     let mut spec = CanonicalNamespaceSpec::new();
     spec.ro_binds
@@ -130,6 +163,7 @@ fn stage_small(
     let (attempt, restored) = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             1,
@@ -228,6 +262,170 @@ fn target_key_binds_inputs_scope_toolchain_command_environment_and_grant() {
 }
 
 #[test]
+fn compatible_commands_preserve_compilation_selection_and_runtime_identity() {
+    let (source, _, _, _) = small_fixture();
+    let input = inputs(source.path(), &["lib.rs"]);
+    let spec = fixture_spec("first");
+    let (build, plan) = cargo_request("build", &["--workspace"]);
+    let compatible = |request: &CanonicalExecRequest, plan: &ArtifactPlan| {
+        target_compatibility_key(scope(), request, &input, &spec, &support(), plan, 1).unwrap()
+    };
+    let expected = compatible(&build, &plan);
+    assert!(expected.is_some());
+    let exact = target_key(scope(), &build, &input, &spec, &support(), &plan, 1).unwrap();
+    for (command, options) in [
+        ("check", vec!["--workspace"]),
+        ("test", vec!["--workspace", "--no-run"]),
+        ("test", vec!["--workspace"]),
+        ("test", vec!["--workspace", "--no-fail-fast"]),
+        ("test", vec!["--workspace", "one_test", "--", "--exact"]),
+        (
+            "test",
+            vec!["--workspace", "other_test", "--", "--nocapture"],
+        ),
+    ] {
+        let (request, selected) = cargo_request(command, &options);
+        assert_eq!(compatible(&request, &selected), expected, "{options:?}");
+        assert_ne!(
+            target_key(scope(), &request, &input, &spec, &support(), &selected, 1).unwrap(),
+            exact,
+            "compatibility must not weaken the exact invocation key"
+        );
+    }
+    for options in [
+        vec!["--workspace", "--release"],
+        vec!["--workspace", "--features=test"],
+        vec!["--workspace", "--features", "build"],
+        vec!["--workspace", "--target", "x86_64-unknown-linux-gnu"],
+        vec!["--workspace", "--profile", "test"],
+        vec!["--workspace", "--manifest-path", "member/Cargo.toml"],
+        vec!["--workspace", "--package", "test"],
+        vec!["--workspace", "--lib"],
+    ] {
+        let (request, selected) = cargo_request("build", &options);
+        let changed = compatible(&request, &selected);
+        assert!(changed.is_some(), "known compiler selection: {options:?}");
+        assert_ne!(
+            changed, expected,
+            "compiler selection collapsed: {options:?}"
+        );
+    }
+    let (mut request, selected) = cargo_request("test", &["--workspace"]);
+    for unsupported in [
+        "--config",
+        "-Zchecksum-freshness",
+        "--unknown",
+        "--no-run=1",
+    ] {
+        request.args.push(unsupported.to_owned());
+        assert!(compatible(&request, &selected).is_none(), "{unsupported}");
+        request.args.pop();
+    }
+    for command in ["clippy", "doc", "run", "b", "+nightly"] {
+        request.args[0] = command.to_owned();
+        assert!(compatible(&request, &selected).is_none(), "{command}");
+    }
+    request.args[0] = "test".to_owned();
+    request.program = "/host/bin/cargo".to_owned();
+    assert!(compatible(&request, &selected).is_none());
+    assert!(compatible(&build, &small_fixture().1).is_none());
+    let changed_env = fixture_spec("second");
+    assert_ne!(
+        target_compatibility_key(scope(), &build, &input, &changed_env, &support(), &plan, 1)
+            .unwrap(),
+        expected
+    );
+    assert_ne!(
+        target_compatibility_key(scope(), &build, &input, &spec, &support(), &plan, 2).unwrap(),
+        expected
+    );
+    let mut changed = input.clone();
+    changed.full_source_digest[0] ^= 1;
+    assert_ne!(
+        target_compatibility_key(scope(), &build, &changed, &spec, &support(), &plan, 1).unwrap(),
+        expected,
+        "captured Cargo-home content remains exact"
+    );
+    changed = input.clone();
+    let mut files = changed.manifest.files().to_vec();
+    files[0].sha256[0] ^= 1;
+    changed.manifest = SourceManifest::new(files).unwrap();
+    assert_ne!(
+        target_compatibility_key(scope(), &build, &changed, &spec, &support(), &plan, 1).unwrap(),
+        expected,
+        "command compatibility cannot admit changed workspace bytes"
+    );
+    changed = input;
+    changed.projection = Some(("isolated-registry-cargo-home-v1".into(), "cache".into()));
+    assert_ne!(
+        target_compatibility_key(scope(), &build, &changed, &spec, &support(), &plan, 1).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn exact_target_precedes_a_more_recent_compatible_seed() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let compatible = Some(TargetKey([9; 32]));
+    let first = TargetKey([1; 32]);
+    let second = TargetKey([2; 32]);
+    for (key, bytes) in [(first, "first"), (second, "second")] {
+        let (source, plan, target, _) = small_fixture();
+        fs::write(target.backing().join("artifact"), bytes).unwrap();
+        let captured = target
+            .capture_with_dependency_inputs(None, || false)
+            .unwrap();
+        let (attempt, _) = cache
+            .acquire(
+                key,
+                compatible,
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                1,
+                &|| false,
+            )
+            .unwrap();
+        attempt
+            .stage(&target, &captured, &|| false)
+            .unwrap()
+            .unwrap()
+            .publish();
+    }
+    let (source, plan, _, _) = small_fixture();
+    for (key, expected) in [(TargetKey([3; 32]), "second"), (first, "first")] {
+        let (_, restored) = cache
+            .acquire(
+                key,
+                compatible,
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                2,
+                &|| false,
+            )
+            .unwrap();
+        let restored = restored.expect("matching seed");
+        assert_eq!(
+            fs::read_to_string(restored.backing().join("artifact")).unwrap(),
+            expected
+        );
+    }
+    let (_, restored) = cache
+        .acquire(
+            TargetKey([4; 32]),
+            None,
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || PreparedArtifacts::new(plan.clone()),
+            3,
+            &|| false,
+        )
+        .unwrap();
+    assert!(
+        restored.is_none(),
+        "unknown invocation must not pick a compatible seed"
+    );
+}
+
+#[test]
 fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_groups() {
     let cache = Arc::new(TargetCache::new(1024).unwrap());
     let (source, plan, target, _) = small_fixture();
@@ -244,6 +442,7 @@ fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_gro
     let (attempt, restored) = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             1,
@@ -259,6 +458,7 @@ fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_gro
     let (_, restored) = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             2,
@@ -296,6 +496,7 @@ fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_gro
     let (_, independent) = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             3,
@@ -332,6 +533,7 @@ fn external_hard_links_cannot_become_target_seeds() {
     let (attempt, _) = cache
         .acquire(
             TargetKey([1; 32]),
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             1,
@@ -357,6 +559,7 @@ fn unsafe_target_directory_modes_bypass_seeding_without_leaking_a_reservation() 
         let (attempt, _) = cache
             .acquire(
                 TargetKey([1; 32]),
+                None,
                 runtime_inputs(source.path(), &["lib.rs"]),
                 || PreparedArtifacts::new(plan.clone()),
                 1,
@@ -381,6 +584,7 @@ fn corruption_refuses_the_seed_and_falls_back_to_a_fresh_target() {
     let (attempt, _) = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             1,
@@ -401,6 +605,7 @@ fn corruption_refuses_the_seed_and_falls_back_to_a_fresh_target() {
     let (_, restored) = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             2,
@@ -464,7 +669,11 @@ fn impossible_reservations_preserve_warm_bytes_and_lru_until_pending_copy_finish
         assert_eq!(state.reserved_bytes, 4);
         assert_eq!(state.reservations, 1);
         assert_eq!(
-            state.entries.iter().map(|seed| seed.key).collect::<Vec<_>>(),
+            state
+                .entries
+                .iter()
+                .map(|seed| seed.key)
+                .collect::<Vec<_>>(),
             vec![TargetKey([1; 32]), TargetKey([2; 32])]
         );
         for path in &paths {
@@ -478,6 +687,7 @@ fn impossible_reservations_preserve_warm_bytes_and_lru_until_pending_copy_finish
         let (_, restored) = cache
             .acquire(
                 TargetKey([tag; 32]),
+                None,
                 runtime_inputs(source.path(), &["lib.rs"]),
                 || PreparedArtifacts::new(plan.clone()),
                 4,
@@ -506,6 +716,7 @@ fn staging_refusal_preserves_prior_seed_and_allows_later_publication() {
         cache
             .acquire(
                 TargetKey([2; 32]),
+                None,
                 runtime_inputs(source.path(), &["lib.rs"]),
                 || PreparedArtifacts::new(plan.clone()),
                 2,
@@ -555,7 +766,11 @@ fn feasible_reservations_keep_lru_eviction_exact_boundaries_and_entry_limits() {
         assert_eq!(state.reserved_bytes, 8);
         assert_eq!(state.reservations, 2);
         assert_eq!(
-            state.entries.iter().map(|seed| seed.key).collect::<Vec<_>>(),
+            state
+                .entries
+                .iter()
+                .map(|seed| seed.key)
+                .collect::<Vec<_>>(),
             vec![TargetKey([2; 32]), TargetKey([3; 32])]
         );
     }
@@ -590,6 +805,7 @@ fn failed_output_allocation_does_not_evict_or_promote_a_valid_seed() {
     let (_, restored) = cache
         .acquire(
             TargetKey([1; 32]),
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || {
                 Err(io::Error::new(
@@ -606,13 +822,18 @@ fn failed_output_allocation_does_not_evict_or_promote_a_valid_seed() {
         let state = cache.state.lock().unwrap();
         assert_eq!(state.retained_bytes, 8);
         assert_eq!(
-            state.entries.iter().map(|seed| seed.key).collect::<Vec<_>>(),
+            state
+                .entries
+                .iter()
+                .map(|seed| seed.key)
+                .collect::<Vec<_>>(),
             vec![TargetKey([1; 32]), TargetKey([2; 32])]
         );
     }
     let (_, restored) = cache
         .acquire(
             TargetKey([1; 32]),
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             4,
@@ -635,6 +856,7 @@ fn cancelled_restore_preserves_seed_but_never_bypasses_later_verification() {
     let error = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || {
                 let output = PreparedArtifacts::new(plan.clone())?;
@@ -662,6 +884,7 @@ fn cancelled_restore_preserves_seed_but_never_bypasses_later_verification() {
     let (_, restored) = cache
         .acquire(
             key,
+            None,
             runtime_inputs(source.path(), &["lib.rs"]),
             || PreparedArtifacts::new(plan.clone()),
             3,
@@ -771,6 +994,7 @@ struct CargoFixture {
     root: tempfile::TempDir,
     workspace: PathBuf,
     plan: ArtifactPlan,
+    names: Vec<&'static str>,
 }
 
 impl CargoFixture {
@@ -803,20 +1027,58 @@ impl CargoFixture {
             root,
             workspace,
             plan,
-        }
-    }
-
-    fn input(&self) -> WorkspaceInputs {
-        inputs(
-            &self.workspace,
-            &[
+            names: vec![
                 "Cargo.toml",
                 "Cargo.lock",
                 "build.rs",
                 "input.txt",
                 "src/main.rs",
             ],
+        }
+    }
+
+    fn input(&self) -> WorkspaceInputs {
+        inputs(&self.workspace, &self.names)
+    }
+
+    fn with_dependency() -> Self {
+        let mut fixture = Self::new();
+        fs::write(
+            fixture.workspace.join("Cargo.toml"),
+            "[package]\nname='hot_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\nmembers=['dep']\n[dependencies]\nhot_dep={path='dep'}\n",
+        ).unwrap();
+        fs::write(
+            fixture.workspace.join("Cargo.lock"),
+            "version=4\n[[package]]\nname='hot_fixture'\nversion='0.1.0'\ndependencies=['hot_dep']\n[[package]]\nname='hot_dep'\nversion='0.1.0'\n",
+        ).unwrap();
+        fs::create_dir_all(fixture.workspace.join("dep/src")).unwrap();
+        fs::write(
+            fixture.workspace.join("dep/Cargo.toml"),
+            "[package]\nname='hot_dep'\nversion='0.1.0'\nedition='2021'\n",
         )
+        .unwrap();
+        fs::write(
+            fixture.workspace.join("dep/src/lib.rs"),
+            "pub fn adjustment() -> u32 { 0 }\n",
+        )
+        .unwrap();
+        fs::write(fixture.workspace.join("src/main.rs"), r#"fn answer() -> u32 {
+    include!(concat!(env!("OUT_DIR"), "/answer.rs")) + hot_dep::adjustment()
+}
+fn main() { println!("{}:{}", env!("LABEL"), answer()); }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn actually_executes_each_time() {
+        assert_eq!(super::answer(), 40);
+        let counter = std::path::Path::new(env!("OUT_DIR")).join("test-runs");
+        let prior = std::fs::read_to_string(&counter).ok().map(|value| value.parse::<u32>().unwrap()).unwrap_or(0);
+        std::fs::write(counter, (prior + 1).to_string()).unwrap();
+    }
+}
+"#).unwrap();
+        fixture.names.extend(["dep/Cargo.toml", "dep/src/lib.rs"]);
+        fixture
     }
 
     fn fresh_upload_timestamps(&self) {
@@ -828,11 +1090,124 @@ impl CargoFixture {
                 .set_times(FileTimes::new().set_modified(SystemTime::now()))
                 .unwrap();
         }
-        for directory in [&self.workspace, &self.workspace.join("src")] {
-            File::open(directory)
+        let times = SourceTimes::capture(&self.input(), &|| false).unwrap();
+        for directory in times.directories.keys() {
+            File::open(self.workspace.join(directory))
                 .unwrap()
                 .set_times(FileTimes::new().set_modified(SystemTime::now()))
                 .unwrap();
+        }
+    }
+
+    fn command(
+        &self,
+        cache: &Arc<TargetCache>,
+        command: &str,
+        options: &[&str],
+        hit: bool,
+    ) -> CargoCommandResult {
+        let original = self.input();
+        let sealed_times = SourceTimes::capture(&original, &|| false).unwrap();
+        let runtime = tempfile::Builder::new()
+            .prefix("workspace")
+            .rand_bytes(0)
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(self.root.path())
+            .unwrap();
+        let input = original.clone_into(runtime, &|| false).unwrap();
+        let workspace = input.root.clone();
+        let (request, plan) = cargo_request(command, options);
+        let spec = fixture_spec("first");
+        let exact = target_key(scope(), &request, &input, &spec, &support(), &plan, 1).unwrap();
+        let compatible =
+            target_compatibility_key(scope(), &request, &input, &spec, &support(), &plan, 1)
+                .unwrap();
+        assert!(
+            compatible.is_some(),
+            "fixture uses an admitted Cargo command"
+        );
+        let (attempt, restored) = cache
+            .acquire(
+                exact,
+                compatible,
+                input,
+                || PreparedArtifacts::fixture(plan.clone(), self.root.path()),
+                1,
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(
+            restored.is_some(),
+            hit,
+            "{command} {options:?}: target reuse"
+        );
+        let target = restored
+            .unwrap_or_else(|| PreparedArtifacts::fixture(plan.clone(), self.root.path()).unwrap());
+        // Stable physical paths model canonical mounts on hosts without bwrap.
+        // Actual Cargo stdout passes unchanged through production report/capture.
+        let arguments = request.args.iter().map(|argument| {
+            if argument == "--target-dir=/__rabs/out/cargo" {
+                format!("--target-dir={}", target.backing().display())
+            } else {
+                argument.clone()
+            }
+        });
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = Command::new(cargo)
+            .args(arguments)
+            .current_dir(&workspace)
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", "-C debuginfo=0")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CACHE_LABEL", "first")
+            .output()
+            .expect("run the real installed Cargo and compiler");
+        assert!(
+            output.status.success(),
+            "{command} {options:?}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let artifacts = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        assert!(!artifacts.is_empty(), "actual compiler artifact report");
+        let captured = target
+            .capture_fixture_cargo_output(output.stdout.as_slice(), || false)
+            .unwrap();
+        let counts = captured
+            .file_names()
+            .filter(|name| name.ends_with("/out/test-runs"))
+            .map(|name| {
+                fs::read_to_string(target.backing().join(name))
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            counts.len() <= 1,
+            "one executed fixture test counter: {counts:?}"
+        );
+        let test_runs = counts.first().copied().unwrap_or(0);
+        attempt
+            .stage(&target, &captured, &|| false)
+            .unwrap()
+            .unwrap()
+            .publish();
+        assert_eq!(
+            SourceTimes::capture(&self.input(), &|| false).unwrap(),
+            sealed_times,
+            "command transition must not change the original sealed workspace"
+        );
+        CargoCommandResult {
+            artifacts,
+            test_runs,
         }
     }
 
@@ -862,6 +1237,7 @@ impl CargoFixture {
         let (attempt, restored) = cache
             .acquire(
                 key,
+                None,
                 input,
                 || PreparedArtifacts::fixture(self.plan.clone(), self.root.path()),
                 1,
@@ -957,6 +1333,94 @@ impl CargoFixture {
     }
 }
 
+struct CargoCommandResult {
+    artifacts: Vec<serde_json::Value>,
+    test_runs: u32,
+}
+
+impl CargoCommandResult {
+    fn assert_fresh(&self, name: &str, test: bool, expected: bool) {
+        let selected = self
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["target"]["name"] == name && artifact["profile"]["test"] == test
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !selected.is_empty(),
+            "missing compiler artifact for {name}, test={test}"
+        );
+        assert!(
+            selected
+                .iter()
+                .all(|artifact| artifact["fresh"] == expected),
+            "{name} test={test}, expected fresh={expected}: {selected:?}"
+        );
+    }
+
+    fn assert_all_fresh(&self) {
+        assert!(
+            self.artifacts
+                .iter()
+                .all(|artifact| artifact["fresh"] == true),
+            "unexpected recompilation: {:?}",
+            self.artifacts
+        );
+    }
+}
+
+#[test]
+fn real_cargo_build_test_and_check_reuse_targets_and_execute_tests_again() {
+    let fixture = CargoFixture::with_dependency();
+    let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+    let cold = fixture.command(&cache, "build", &["--workspace"], false);
+    cold.assert_fresh("hot_dep", false, false);
+    assert_eq!(cold.test_runs, 0);
+
+    fixture.fresh_upload_timestamps();
+    let compile_tests = fixture.command(&cache, "test", &["--workspace", "--no-run"], true);
+    compile_tests.assert_fresh("hot_dep", false, true);
+    compile_tests.assert_fresh("hot_fixture", true, false);
+    assert_eq!(
+        compile_tests.test_runs, 0,
+        "--no-run does not execute tests"
+    );
+
+    fixture.fresh_upload_timestamps();
+    let first = fixture.command(&cache, "test", &["--workspace"], true);
+    first.assert_all_fresh();
+    assert_eq!(first.test_runs, 1, "warm test artifacts still execute");
+
+    fixture.fresh_upload_timestamps();
+    let second = fixture.command(
+        &cache,
+        "test",
+        &[
+            "--workspace",
+            "tests::actually_executes_each_time",
+            "--",
+            "--exact",
+        ],
+        true,
+    );
+    second.assert_all_fresh();
+    assert_eq!(
+        second.test_runs, 2,
+        "a new harness invocation must execute again"
+    );
+
+    fixture.fresh_upload_timestamps();
+    let checking = fixture.command(&cache, "check", &["--workspace"], true);
+    checking.assert_fresh("hot_dep", false, false);
+    let checked_again = fixture.command(&cache, "check", &["--workspace"], true);
+    checked_again.assert_all_fresh();
+
+    // Prefer the exact build seed over newer compatible test/check targets.
+    let built_again = fixture.command(&cache, "build", &["--workspace"], true);
+    built_again.assert_all_fresh();
+}
+
 #[test]
 fn real_cargo_private_seed_is_fresh_and_source_build_script_environment_changes_miss() {
     let fixture = CargoFixture::new();
@@ -989,6 +1453,7 @@ fn cold_and_contended_attempts_do_not_copy_the_sealed_workspace() {
         let (attempt, restored) = cache
             .acquire(
                 TargetKey([31; 32]),
+                None,
                 original.clone(),
                 || {
                     calls.set(calls.get() + 1);
@@ -999,7 +1464,11 @@ fn cold_and_contended_attempts_do_not_copy_the_sealed_workspace() {
             )
             .unwrap();
         assert!(restored.is_none());
-        assert_eq!(calls.get(), 0, "cold acquisition must not allocate a target copy");
+        assert_eq!(
+            calls.get(),
+            0,
+            "cold acquisition must not allocate a target copy"
+        );
         assert_eq!(attempt.inputs.root, source.path());
         assert!(attempt.inputs.runtime_owner.is_none());
         assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
@@ -1028,11 +1497,21 @@ fn a_warm_hit_lazily_owns_its_source_and_preserves_the_original_seal() {
         .unwrap();
     let retained_times = SourceTimes::capture(&original, &|| false).unwrap();
     let (cold, restored) = cache
-        .acquire(key, original.clone(), || PreparedArtifacts::new(plan.clone()), 1, &|| false)
+        .acquire(
+            key,
+            None,
+            original.clone(),
+            || PreparedArtifacts::new(plan.clone()),
+            1,
+            &|| false,
+        )
         .unwrap();
     assert!(restored.is_none());
     assert!(cold.inputs.runtime_owner.is_none());
-    cold.stage(&target, &captured, &|| false).unwrap().unwrap().publish();
+    cold.stage(&target, &captured, &|| false)
+        .unwrap()
+        .unwrap()
+        .publish();
 
     // A later upload of the same bytes has different source timestamps. Only
     // the independently owned runtime tree may receive the retained times.
@@ -1043,12 +1522,25 @@ fn a_warm_hit_lazily_owns_its_source_and_preserves_the_original_seal() {
     let before = SourceTimes::capture(&original, &|| false).unwrap();
     assert_ne!(before, retained_times);
     let (warm, restored) = cache
-        .acquire(key, original.clone(), || PreparedArtifacts::new(plan.clone()), 2, &|| false)
+        .acquire(
+            key,
+            None,
+            original.clone(),
+            || PreparedArtifacts::new(plan.clone()),
+            2,
+            &|| false,
+        )
         .unwrap();
     let restored = restored.expect("the exact seed must remain reusable");
     assert_ne!(warm.inputs.root, original.root);
-    assert_eq!(warm.inputs.runtime_owner.as_ref().unwrap().path(), warm.inputs.root);
-    assert_eq!(SourceTimes::capture(&warm.inputs, &|| false).unwrap(), retained_times);
+    assert_eq!(
+        warm.inputs.runtime_owner.as_ref().unwrap().path(),
+        warm.inputs.root
+    );
+    assert_eq!(
+        SourceTimes::capture(&warm.inputs, &|| false).unwrap(),
+        retained_times
+    );
     assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
     let source_inode = fs::metadata(source.path().join("lib.rs")).unwrap();
     let runtime_inode = fs::metadata(warm.inputs.root.join("lib.rs")).unwrap();
@@ -1056,10 +1548,16 @@ fn a_warm_hit_lazily_owns_its_source_and_preserves_the_original_seal() {
         (source_inode.dev(), source_inode.ino()),
         (runtime_inode.dev(), runtime_inode.ino())
     );
-    assert_eq!(fs::read(restored.backing().join("artifact")).unwrap(), b"seed");
+    assert_eq!(
+        fs::read(restored.backing().join("artifact")).unwrap(),
+        b"seed"
+    );
     let runtime_path = warm.inputs.root.clone();
     drop(warm);
-    assert!(!runtime_path.exists(), "the attempt must own the complete copy lifetime");
+    assert!(
+        !runtime_path.exists(),
+        "the attempt must own the complete copy lifetime"
+    );
     assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
     // The timestamp-restoration guard itself remains unchanged.
     assert!(retained_times.restore(&original, &|| false).is_err());
@@ -1073,7 +1571,10 @@ fn refused_lazy_restore_keeps_the_original_workspace_and_fresh_target_path() {
         stage_small(&cache, key).0.publish();
         if corrupt {
             let path = cache.state.lock().unwrap().entries[0]
-                .tree.directory.path().join("artifact");
+                .tree
+                .directory
+                .path()
+                .join("artifact");
             fs::write(path, b"evil").unwrap();
         }
         let (source, plan, _, _) = small_fixture();
@@ -1082,6 +1583,7 @@ fn refused_lazy_restore_keeps_the_original_workspace_and_fresh_target_path() {
         let (attempt, restored) = cache
             .acquire(
                 key,
+                None,
                 original.clone(),
                 || {
                     if corrupt {
@@ -1101,7 +1603,10 @@ fn refused_lazy_restore_keeps_the_original_workspace_and_fresh_target_path() {
         assert_eq!(attempt.inputs.root, original.root);
         assert!(attempt.inputs.runtime_owner.is_none());
         assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
-        assert_eq!(cache.state.lock().unwrap().entries.len(), usize::from(!corrupt));
+        assert_eq!(
+            cache.state.lock().unwrap().entries.len(),
+            usize::from(!corrupt)
+        );
     }
 }
 
@@ -1118,6 +1623,7 @@ fn cancellation_before_lazy_source_copy_keeps_seed_and_drops_the_new_target() {
     let error = cache
         .acquire(
             key,
+            None,
             original.clone(),
             || {
                 let output = PreparedArtifacts::new(plan.clone())?;
@@ -1129,7 +1635,10 @@ fn cancellation_before_lazy_source_copy_keeps_seed_and_drops_the_new_target() {
             &|| stopped.get(),
         )
         .unwrap_err();
-    assert!(matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::TimedOut));
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+    ));
     assert!(!new_output_path.borrow().as_ref().unwrap().exists());
     assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
     assert_eq!(cache.state.lock().unwrap().reserved_bytes, 0);
@@ -1144,6 +1653,7 @@ fn a_cold_attempt_still_refuses_changed_sealed_source_before_seed_publication() 
     let (attempt, restored) = cache
         .acquire(
             TargetKey([35; 32]),
+            None,
             original,
             || PreparedArtifacts::new(plan.clone()),
             1,
@@ -1152,7 +1662,11 @@ fn a_cold_attempt_still_refuses_changed_sealed_source_before_seed_publication() 
         .unwrap();
     assert!(restored.is_none());
     assert!(attempt.inputs.runtime_owner.is_none());
-    fs::set_permissions(source.path().join("lib.rs"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(
+        source.path().join("lib.rs"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     fs::write(source.path().join("lib.rs"), b"changed source").unwrap();
     assert!(attempt.stage(&target, &captured, &|| false).is_err());
     let state = cache.state.lock().unwrap();
@@ -1169,7 +1683,14 @@ fn lazy_restoration_binds_both_owned_mounts_or_changes_neither() {
     let (source, plan, current, _) = small_fixture();
     let original = inputs(source.path(), &["lib.rs"]);
     let (attempt, restored) = cache
-        .acquire(key, original.clone(), || PreparedArtifacts::new(plan.clone()), 2, &|| false)
+        .acquire(
+            key,
+            None,
+            original.clone(),
+            || PreparedArtifacts::new(plan.clone()),
+            2,
+            &|| false,
+        )
         .unwrap();
     let restored = restored.unwrap();
     let make_spec = || {
@@ -1182,11 +1703,22 @@ fn lazy_restoration_binds_both_owned_mounts_or_changes_neither() {
     let mut spec = make_spec();
     let expected_key =
         target_key(scope(), &request, &original, &spec, &support(), &plan, 1).unwrap();
-    attempt.bind_restored(&mut spec, &original, &current, &restored, &plan).unwrap();
+    attempt
+        .bind_restored(&mut spec, &original, &current, &restored, &plan)
+        .unwrap();
     assert_eq!(spec.ro_binds[0].backing, attempt.inputs.root);
     assert_eq!(spec.rw_binds[0].backing, restored.backing());
     assert_eq!(
-        target_key(scope(), &request, &attempt.inputs, &spec, &support(), &plan, 1).unwrap(),
+        target_key(
+            scope(),
+            &request,
+            &attempt.inputs,
+            &spec,
+            &support(),
+            &plan,
+            1
+        )
+        .unwrap(),
         expected_key,
         "private backing selection must not change the exact semantic key"
     );
@@ -1199,19 +1731,28 @@ fn lazy_restoration_binds_both_owned_mounts_or_changes_neither() {
         }
         let before_source = spec.ro_binds[0].backing.clone();
         let before_output = spec.rw_binds[0].backing.clone();
-        assert!(attempt.bind_restored(&mut spec, &original, &current, &restored, &plan).is_err());
+        assert!(
+            attempt
+                .bind_restored(&mut spec, &original, &current, &restored, &plan)
+                .is_err()
+        );
         assert_eq!(spec.ro_binds[0].backing, before_source);
         assert_eq!(spec.rw_binds[0].backing, before_output);
     }
     let mut changed = original.clone();
     changed.full_source_digest[0] ^= 1;
     let mut spec = make_spec();
-    assert!(attempt.bind_restored(&mut spec, &changed, &current, &restored, &plan).is_err());
+    assert!(
+        attempt
+            .bind_restored(&mut spec, &changed, &current, &restored, &plan)
+            .is_err()
+    );
     assert_eq!(spec.ro_binds[0].backing, original.root);
     assert_eq!(spec.rw_binds[0].backing, current.backing());
     let (cold, _) = cache
         .acquire(
             TargetKey([37; 32]),
+            None,
             original.clone(),
             || PreparedArtifacts::new(plan.clone()),
             3,
@@ -1219,7 +1760,10 @@ fn lazy_restoration_binds_both_owned_mounts_or_changes_neither() {
         )
         .unwrap();
     let mut spec = make_spec();
-    assert!(cold.bind_restored(&mut spec, &original, &current, &restored, &plan).is_err());
+    assert!(
+        cold.bind_restored(&mut spec, &original, &current, &restored, &plan)
+            .is_err()
+    );
     assert_eq!(spec.ro_binds[0].backing, original.root);
     assert_eq!(spec.rw_binds[0].backing, current.backing());
 }
@@ -1235,6 +1779,7 @@ fn a_mismatched_runtime_owner_is_not_treated_as_a_sealed_source() {
     let error = cache
         .acquire(
             TargetKey([38; 32]),
+            None,
             original,
             || PreparedArtifacts::new(plan.clone()),
             1,
@@ -1257,6 +1802,7 @@ fn live_warm_attempts_own_independent_source_inodes_and_publication_checks() {
         let (attempt, restored) = cache
             .acquire(
                 key,
+                None,
                 original.clone(),
                 || PreparedArtifacts::new(plan.clone()),
                 2,
@@ -1276,8 +1822,14 @@ fn live_warm_attempts_own_independent_source_inodes_and_publication_checks() {
     let first_source = first.inputs.root.join("lib.rs");
     let second_source = second.inputs.root.join("lib.rs");
     assert_ne!(identity(&first_source), identity(&second_source));
-    assert_ne!(identity(&first_source), identity(&original.root.join("lib.rs")));
-    assert_ne!(identity(&second_source), identity(&original.root.join("lib.rs")));
+    assert_ne!(
+        identity(&first_source),
+        identity(&original.root.join("lib.rs"))
+    );
+    assert_ne!(
+        identity(&second_source),
+        identity(&original.root.join("lib.rs"))
+    );
     assert_ne!(
         identity(&first_target.backing().join("artifact")),
         identity(&second_target.backing().join("artifact"))
@@ -1286,12 +1838,19 @@ fn live_warm_attempts_own_independent_source_inodes_and_publication_checks() {
     fs::set_permissions(&first_source, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(&first_source, b"changed private workspace").unwrap();
     assert_eq!(fs::read(&second_source).unwrap(), original_bytes);
-    assert_eq!(fs::read(original.root.join("lib.rs")).unwrap(), original_bytes);
+    assert_eq!(
+        fs::read(original.root.join("lib.rs")).unwrap(),
+        original_bytes
+    );
     assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
     let first_capture = first_target
         .capture_with_dependency_inputs(None, || false)
         .unwrap();
-    assert!(first.stage(&first_target, &first_capture, &|| false).is_err());
+    assert!(
+        first
+            .stage(&first_target, &first_capture, &|| false)
+            .is_err()
+    );
     let second_capture = second_target
         .capture_with_dependency_inputs(None, || false)
         .unwrap();

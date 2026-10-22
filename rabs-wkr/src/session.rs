@@ -907,8 +907,12 @@ fn execute_canonical_inner(
         let prepared =
             crate::target_cache::target_key(scope, request, inputs, &spec, &support, plan, grant)
                 .and_then(|key| {
+                    let compatible = crate::target_cache::target_compatibility_key(
+                        scope, request, inputs, &spec, &support, plan, grant,
+                    )?;
                     cache.acquire(
                         key,
+                        compatible,
                         inputs.clone(),
                         || PreparedArtifacts::new(plan.clone()),
                         request.request_id,

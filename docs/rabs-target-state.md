@@ -3,7 +3,8 @@
 The canonical worker can retain successful Cargo target trees and seed later
 builds with independently owned copies. Cargo executes on every request and
 decides which compilation steps are fresh. This accelerates repeated commands
-with identical captured inputs without serving a stored compiler result.
+and ordinary build/check/test transitions with identical captured inputs
+without serving a stored compiler result.
 
 ## Enable it on a worker
 
@@ -34,16 +35,34 @@ requests keep their existing behavior.
 ## What can reuse a seed
 
 A match binds the complete captured source manifest, dependency projection,
-toolchain, command and arguments, final command environment, working directory,
-canonical namespace policy, output contract, and effective worker job grant.
+toolchain, compilation arguments, final command environment, working directory,
+canonical namespace policy, output location and required files, and effective
+worker job grant.
 The pool also separates worker identities, coordinator endpoints, and
 authenticated coordinator certificate keys.
 
 Changing a source file, build script, captured dependency, environment value,
-feature flag, toolchain, output contract, or effective job grant starts with a
-fresh target. This first implementation does not reuse incremental state across
+feature flag, toolchain, output location or required files, or effective job
+grant starts with a fresh target. This implementation does not reuse state across
 source edits. An identical invocation can reuse its prior target while Cargo
 still runs the requested command, including test executables for `cargo test`.
+
+An exact invocation match is preferred. Otherwise, ordinary `build`, `check`,
+`test --no-run`, and `test` commands may select the most recent compatible
+target. All captured input bytes and compilation settings remain exact. The
+command name, test execution switch, test filter, failure policy, and arguments
+after the test harness separator do not fragment this optional target pool;
+the current Cargo process still receives every original argument. Compiler and
+target-selection options retain their exact spelling and order. Unknown
+argument forms and Clippy keep exact-invocation reuse only.
+
+For example, `cargo build` followed by `cargo test --no-run` can reuse compiled
+dependencies while building the new test targets. A subsequent `cargo test`
+can reuse those compiled targets and still executes the tests. Check and build
+may require different compiler outputs, which Cargo creates as necessary. A
+restored target therefore does not imply that every compiler artifact is fresh.
+Every invocation produces and verifies its own artifact report, diagnostics,
+exit status, and cancellation outcome.
 
 The worker gives each eligible execution a fresh HOME and a captured or empty
 Cargo home. Its jobserver has a stable canonical FIFO name but a new private
@@ -90,14 +109,16 @@ cold execution without waiting for another build's copy.
 
 Worker stderr includes structured events:
 
-- `worker-target-state` reports `cold`, `restored`, `cold-after-refusal`, or
-  `cold-pool-busy`, together with the request ID and matching-key digest.
+- `worker-target-state` reports `cold`, `restored`, `restored-compatible`,
+  `cold-after-refusal`, or `cold-pool-busy`, together with the request ID and
+  matching-key digest.
 - `worker-target-state-refused` explains an optional capture or restore failure.
 - `worker-target-state-published` reports the accepted seed size, retained byte
   total, and entry count.
 
-`restored` means a verified private target was provided to Cargo. Cargo's own
-artifact JSON `fresh` fields show whether compilation was skipped. The build's
+`restored` or `restored-compatible` means a verified private target was provided
+to Cargo. Cargo's own artifact JSON `fresh` fields show whether compilation was
+skipped. The build's
 diagnostics, exit status, artifact verification, and delivery acknowledgments
 still come from the current execution.
 
