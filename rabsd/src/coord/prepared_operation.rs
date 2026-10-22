@@ -21,7 +21,7 @@ use super::worker_delivery::{DeliveryMode, MAX_FRAME_BYTES, toolchain_identity, 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -32,10 +32,12 @@ use std::time::{Duration, Instant};
 const MAX_OPERATIONS: usize = 1024;
 const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const RECORD_OVERHEAD: usize = 96 * 1024;
-const MAX_RECORD_BYTES: usize = MAX_FRAME_BYTES + RECORD_OVERHEAD;
+const MAX_WORKER_POOL_BYTES: usize = 16 * 1024;
+const MAX_RECORD_BYTES: usize = MAX_FRAME_BYTES + RECORD_OVERHEAD + MAX_WORKER_POOL_BYTES;
 const MAX_DETAIL_BYTES: usize = 2048;
 const MAX_RUNNING: usize = 4;
 const MAX_AUTOMATIC_RECOVERIES: u8 = 3;
+const MAX_PREPARED_WORKERS: usize = 32;
 
 fn recovery_delay(attempt: u8) -> Duration {
     Duration::from_secs(1_u64 << u32::from(attempt.saturating_sub(1).min(2)))
@@ -52,6 +54,48 @@ pub struct PreparedOperationSpec {
     pub bundle: PathBuf,
     pub delivery: PathBuf,
     pub output: PathBuf,
+}
+
+/// An operator-approved canonical worker and its fixed coordinator listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedWorker {
+    pub address: String,
+    pub worker: String,
+    pub worker_spki_sha256: String,
+}
+
+/// Placement is selected once when this immutable template enters the queue.
+/// The ordered candidate list remains part of admission identity on retries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedPoolOperationSpec {
+    pub id: String,
+    pub workers: Vec<PreparedWorker>,
+    pub bundle: PathBuf,
+    pub delivery: PathBuf,
+    pub output: PathBuf,
+}
+
+impl PreparedPoolOperationSpec {
+    /// Validate immutable admission shape without reading or creating inputs.
+    /// Native callers can reject a malformed pool before expensive capture.
+    pub fn validate(&self) -> io::Result<()> {
+        validate_worker_pool(&self.workers)?;
+        let first = self
+            .workers
+            .first()
+            .ok_or_else(|| invalid("canonical worker pool is empty"))?;
+        validate_spec_shape(&PreparedOperationSpec {
+            id: self.id.clone(),
+            address: first.address.clone(),
+            worker: first.worker.clone(),
+            worker_spki_sha256: first.worker_spki_sha256.clone(),
+            bundle: self.bundle.clone(),
+            delivery: self.delivery.clone(),
+            output: self.output.clone(),
+        })
+    }
 }
 
 /// These are operation/recovery states, not action publication states.
@@ -148,6 +192,10 @@ pub enum OperationOutcome {
 struct Record {
     version: u32,
     spec: PreparedOperationSpec,
+    /// Retain the exact ordered placement intent without changing execution or
+    /// recovery identity. Older singleton records intentionally omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_pool: Option<Vec<PreparedWorker>>,
     request: Value,
     request_sha256: String,
     /// Version 2 additionally binds the complete numeric execution request.
@@ -224,6 +272,12 @@ impl Record {
     fn weight(&self) -> io::Result<usize> {
         Ok(serde_json::to_vec(&self.request)?.len()
             + serde_json::to_vec(&self.spec)?.len()
+            + self
+                .worker_pool
+                .as_ref()
+                .map(serde_json::to_vec)
+                .transpose()?
+                .map_or(0, |bytes| bytes.len())
             + RECORD_OVERHEAD)
     }
 
@@ -312,6 +366,39 @@ fn valid_id(id: &str) -> bool {
 fn overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
+
+fn endpoints_overlap(left: SocketAddr, right: SocketAddr) -> bool {
+    let canonical_ip = |address: SocketAddr| match address.ip() {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(ip)),
+        ip => ip,
+    };
+    let left_ip = canonical_ip(left);
+    let right_ip = canonical_ip(right);
+    left.port() != 0
+        && left.port() == right.port()
+        && (left_ip == right_ip
+            // A wildcard listener may own every local interface, including a
+            // dual-stack IPv6 socket. Do not place simultaneous jobs there.
+            || left_ip.is_unspecified()
+            || right_ip.is_unspecified())
+}
+
+fn worker_owns_record(worker: &PreparedWorker, record: &Record) -> bool {
+    worker.worker == record.spec.worker
+        || worker.worker_spki_sha256 == record.spec.worker_spki_sha256
+        || worker.address.parse::<SocketAddr>().is_ok_and(|candidate| {
+            record
+                .bound_address
+                .as_deref()
+                .unwrap_or(&record.spec.address)
+                .parse::<SocketAddr>()
+                .is_ok_and(|other| endpoints_overlap(candidate, other))
+        })
+}
+
 fn shares_worker_or_endpoint(left: &Record, right: &Record) -> bool {
     let endpoint = |record: &Record| {
         record
@@ -324,7 +411,8 @@ fn shares_worker_or_endpoint(left: &Record, right: &Record) -> bool {
     };
     left.spec.worker == right.spec.worker
         || left.spec.worker_spki_sha256 == right.spec.worker_spki_sha256
-        || endpoint(left).is_some_and(|left| endpoint(right) == Some(left))
+        || endpoint(left)
+            .is_some_and(|left| endpoint(right).is_some_and(|right| endpoints_overlap(left, right)))
 }
 
 /// A captured bundle is read-only during dispatch, unlike delivery/output state.
@@ -413,6 +501,69 @@ fn validate_spec_shape(spec: &PreparedOperationSpec) -> io::Result<()> {
         require(
             !overlap(left, right),
             "operation bundle, delivery and output overlap",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_worker_pool(workers: &[PreparedWorker]) -> io::Result<()> {
+    require(
+        !workers.is_empty() && workers.len() <= MAX_PREPARED_WORKERS,
+        "canonical worker pool requires 1..=32 workers",
+    )?;
+    let mut names = BTreeSet::new();
+    let mut pins = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for worker in workers {
+        require(
+            worker.worker.len() <= 128
+                && worker
+                    .worker
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && worker
+                    .worker
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "canonical pool worker name must be a bounded ASCII identifier",
+        )?;
+        parse_worker_pin(&worker.worker_spki_sha256)?;
+        let endpoint = worker
+            .address
+            .parse::<SocketAddr>()
+            .map_err(|_| invalid("canonical pool listener must be a literal IP:port"))?;
+        require(
+            worker.address.len() <= 128 && endpoint.port() != 0,
+            "canonical pool listener requires a bounded address and nonzero port",
+        )?;
+        require(
+            names.insert(worker.worker.as_str())
+                && pins.insert(worker.worker_spki_sha256.as_str())
+                && endpoints
+                    .iter()
+                    .all(|other| !endpoints_overlap(endpoint, *other)),
+            "canonical worker pool repeats a worker, pin or overlapping listener",
+        )?;
+        endpoints.push(endpoint);
+    }
+    require(
+        serde_json::to_vec(workers)?.len() <= MAX_WORKER_POOL_BYTES,
+        "canonical worker pool exceeds its byte limit",
+    )
+}
+
+fn validate_record_pool(record: &Record) -> io::Result<()> {
+    if let Some(workers) = &record.worker_pool {
+        validate_worker_pool(workers)?;
+        require(
+            record.version == 2
+                && workers.iter().any(|worker| {
+                    worker.address == record.spec.address
+                        && worker.worker == record.spec.worker
+                        && worker.worker_spki_sha256 == record.spec.worker_spki_sha256
+                }),
+            "pooled operation does not bind an approved allocated worker",
         )?;
     }
     Ok(())
@@ -747,20 +898,45 @@ impl PreparedOperationStore {
     }
 
     pub fn submit(&self, spec: PreparedOperationSpec) -> io::Result<OperationStatus> {
-        self.submit_inner(spec, false)
+        self.submit_inner(spec, false, None)
     }
 
     /// Admit a fully captured template, leaving request allocation to its sole
     /// claimed execution owner. Queue order cannot be overtaken by allocating
     /// IDs in clients, and a client disconnect does not relinquish saved work.
     pub fn submit_allocated(&self, spec: PreparedOperationSpec) -> io::Result<OperationStatus> {
-        self.submit_inner(spec, true)
+        self.submit_inner(spec, true, None)
+    }
+
+    /// Select one approved worker under durable admission ownership. Busy
+    /// workers remain queue candidates; unresolved execution ownership does
+    /// not. Retries and restart retain the selected worker, never fail over.
+    pub fn submit_allocated_pool(
+        &self,
+        spec: PreparedPoolOperationSpec,
+    ) -> io::Result<OperationStatus> {
+        spec.validate()?;
+        let first = spec
+            .workers
+            .first()
+            .ok_or_else(|| invalid("canonical worker pool is empty"))?;
+        let operation = PreparedOperationSpec {
+            id: spec.id,
+            address: first.address.clone(),
+            worker: first.worker.clone(),
+            worker_spki_sha256: first.worker_spki_sha256.clone(),
+            bundle: spec.bundle,
+            delivery: spec.delivery,
+            output: spec.output,
+        };
+        self.submit_inner(operation, true, Some(spec.workers))
     }
 
     fn submit_inner(
         &self,
-        spec: PreparedOperationSpec,
+        mut spec: PreparedOperationSpec,
         allocate: bool,
+        worker_pool: Option<Vec<PreparedWorker>>,
     ) -> io::Result<OperationStatus> {
         self.validate_paths(&spec)?;
         let request: Value = serde_json::from_slice(&read_bounded(
@@ -780,9 +956,18 @@ impl PreparedOperationStore {
             if allocate {
                 accepted["request_id"] = serde_json::json!("allocate");
             }
+            let mut intended_spec = spec.clone();
+            if worker_pool.is_some() {
+                // Exact pool identity binds the previously selected placement.
+                // Do not rerun selection against a changed queue on retry.
+                intended_spec.address = record.spec.address.clone();
+                intended_spec.worker = record.spec.worker.clone();
+                intended_spec.worker_spki_sha256 = record.spec.worker_spki_sha256.clone();
+            }
             require(
                 record.version == version
-                    && record.spec == spec
+                    && record.spec == intended_spec
+                    && record.worker_pool == worker_pool
                     && accepted == request
                     && record.request_sha256 == fingerprint,
                 "operation id already belongs to another request or destination",
@@ -831,10 +1016,41 @@ impl PreparedOperationStore {
         for existing in state.records.values() {
             check_paths(existing)?;
         }
+        if let Some(workers) = &worker_pool {
+            let (_, selected) = workers
+                .iter()
+                .enumerate()
+                .filter(|(_, worker)| {
+                    state
+                        .records
+                        .values()
+                        .all(|record| !record.unresolved() || !worker_owns_record(worker, record))
+                })
+                .min_by_key(|(index, worker)| {
+                    let load = state
+                        .records
+                        .values()
+                        .filter(|record| {
+                            matches!(
+                                record.state,
+                                OperationState::Queued
+                                    | OperationState::Running
+                                    | OperationState::Cancelling
+                            ) && worker_owns_record(worker, record)
+                        })
+                        .count();
+                    (load, *index)
+                })
+                .ok_or_else(|| invalid("all canonical pool workers have unresolved ownership"))?;
+            spec.address = selected.address.clone();
+            spec.worker = selected.worker.clone();
+            spec.worker_spki_sha256 = selected.worker_spki_sha256.clone();
+        }
         let record = Record {
             version,
             delivery: spec.delivery.clone(),
             spec,
+            worker_pool,
             request,
             request_sha256: fingerprint,
             allocated_request_sha256: None,
@@ -1641,3 +1857,6 @@ mod tests;
 
 #[cfg(all(test, unix))]
 mod shared_bundle_tests;
+
+#[cfg(all(test, unix))]
+mod pool_tests;

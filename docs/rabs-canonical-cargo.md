@@ -6,7 +6,7 @@ supports `check`, `clippy`, `test`, and `test --no-run`, with Cargo selecting th
 requested libraries, binaries, examples and test executables. Ordinary `test` runs those
 tests on the selected worker and returns Cargo's final exit status:
 
-1. The launcher validates explicit source, toolchain, worker and destination
+1. The launcher validates explicit source, toolchain, worker or worker pool, and destination
    intent and creates a new private operation directory.
 2. It execs the installed native driver once: normally
    `rabsd --worker-build-tls --replay-diagnostics --prepare-from ...`, or
@@ -147,11 +147,13 @@ cargo rabs --rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID
 
 It uses the saved job ID and private daemon socket to invoke `--job-wait` once.
 The original profile, checkout, toolchain and captured bundle are not needed for
-this read-only wait/replay path. It does not resubmit the job. Direct-worker
-options such as `--resume-to`, `--delivery`, and `--prefix-from` do not apply to
-daemon-owned jobs. When an uncertain job needs explicit result-only recovery,
-use `rabsd --job-resume JOB_ID NEW_DELIVERY [PREFIX]` with the same
-`RABS_SOCKET_PATH`, then wait on that original job again.
+this read-only wait/replay path. It does not resubmit the job. For a daemon-owned
+operation, `--status` and `--cancel` also address that same job. Result controls
+`--resume-to NEW_DELIVERY [--prefix-from PREFIX]`, `--delivery DELIVERY`, and
+`--acknowledge DELIVERY` hand off to the daemon's existing result-resume, local
+recovery, and release commands. They preserve its selected worker and request
+identity. Wait on the original job afterward to replay a verified compiler
+result.
 
 Waiting again is a read-only operation and replays a verified completed result.
 If the initial submission response was lost, inspect the same job first. The
@@ -166,6 +168,71 @@ that same job with the existing job recovery commands. A second invocation of
 its existing bounded queue, per-worker ownership, cancellation, result-only
 reconnection and local-delivery recovery behavior. This mode adds no compiler
 cache or per-unit scheduling authority.
+
+### Place canonical Cargo jobs across a worker pool
+
+Replace the three singular `listen`, `worker`, and `worker_spki_sha256` fields
+with an ordered `workers` array to let the daemon select a worker for each
+whole Cargo job. Pool placement requires `daemon_socket`; it uses the same
+durable job service as single-worker daemon builds:
+
+```json
+{
+  "version": "canonical-cargo-v1",
+  "daemon_socket": "/home/builder/.cache/rch/rabsd.sock",
+  "workers": [
+    {
+      "listen": "192.0.2.10:45200",
+      "worker": "worker-a",
+      "worker_spki_sha256": "REPLACE_WITH_WORKER_A_64_LOWERCASE_HEX_DIGITS"
+    },
+    {
+      "listen": "192.0.2.10:45201",
+      "worker": "worker-b",
+      "worker_spki_sha256": "REPLACE_WITH_WORKER_B_64_LOWERCASE_HEX_DIGITS"
+    }
+  ],
+  "source_root": "/data/projects/approved-anchor",
+  "toolchain_root": "/opt/rust/native-linux-toolchain",
+  "operation_root": "/data/rabs-operations",
+  "manifest": "app/Cargo.toml"
+}
+```
+
+The array accepts 1–32 entries. Each entry names an already configured worker,
+its nonzero lowercase certificate pin, and its coordinator bind endpoint.
+Names, pins and normalized endpoints must be distinct. IPv6 endpoints use
+`[address]:port`. The singular fields and `workers` cannot be combined. Each
+worker must already reconnect to its own listed endpoint; this profile does
+not provision workers or discover a fleet.
+
+The daemon chooses an eligible worker using its durable job load, with the
+listed order breaking equal-load ties. It excludes workers whose previous
+execution remains unresolved. Selection and the original pool intent become
+part of the durable job before dispatch, so concurrent submissions can spread
+across available workers while retaining the existing queue and admission
+limits. A selected job keeps that worker for execution, cancellation and
+result-only recovery. An interrupted or uncertain attempt is never moved to
+another worker. The pool supplies whole-Cargo placement, not per-rustc-unit
+distribution or permission to reuse another worker's private target state.
+
+The operation directory retains private, exclusively created `pool.json` along
+with `spec.json` and `operation.json`. The pool file is a native JSON array of
+`address`, `worker`, and `worker_spki_sha256` entries in the original order;
+literal endpoints are normalized before saving. All three files are made
+durable before the launcher hands off. `operation.json` retains `worker_pool`
+as placement intent and the job's status command. The daemon's `--job-status`
+response identifies the actual selected worker and, after admission, its bound
+request ID; the launcher does not claim to know that choice in advance.
+
+The saved submission command is
+`rabsd --job-submit-pool JOB_ID POOL_FILE BUNDLE DELIVERY OUTPUTS`. Repeating
+that exact admission after an uncertain submission response returns the same
+durable job and selection. Changing its ordered pool, captured bundle or
+destinations is refused. The ordinary `cargo rabs --rabs-recover OPERATION`
+wait/status/cancel and result-recovery controls still address the original
+daemon job. They do not need the original profile, `pool.json`, checkout or
+toolchain and cannot submit or select a replacement worker.
 
 ### Reuse worker-local Cargo target state
 

@@ -471,6 +471,10 @@ impl Fixture {
     /// Exercise native source/toolchain capture and daemon admission without
     /// connecting a worker. These bytes are explicitly not a compiler fixture.
     fn start_allocated_build(&self, number: u64) -> (Job, Process) {
+        self.start_allocated_build_with_pool(number, None)
+    }
+
+    fn start_allocated_build_with_pool(&self, number: u64, pool: Option<&Path>) -> (Job, Process) {
         let source = self.owner.path().join(format!("allocated-source-{number}"));
         fs::create_dir(&source).unwrap();
         fs::write(source.join("input.txt"), b"retained allocation fixture\n").unwrap();
@@ -509,13 +513,15 @@ impl Fixture {
         cmd.args(["--job-build", "--prepare-from"])
             .arg(source)
             .arg(specification)
-            .arg(&job.id)
-            .arg("127.0.0.1:0")
-            .arg(&job.worker)
-            .arg(self.certificates.pin())
-            .arg(&job.bundle)
-            .arg(&job.delivery)
-            .arg(&job.output);
+            .arg(&job.id);
+        if let Some(pool) = pool {
+            cmd.arg("--worker-pool").arg(pool);
+        } else {
+            cmd.arg("127.0.0.1:0")
+                .arg(&job.worker)
+                .arg(self.certificates.pin());
+        }
+        cmd.arg(&job.bundle).arg(&job.delivery).arg(&job.output);
         let client = Process::spawn(self.owner.path(), &self.next_name("job-build"), &mut cmd);
         (job, client)
     }
@@ -543,6 +549,92 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+#[test]
+fn pooled_cli_builds_use_idle_workers_and_keep_placement_after_client_and_daemon_loss() {
+    // This exercises real capture, native clients, the daemon UDS API and TLS
+    // listener ownership. No worker is connected and no compiler is executed.
+    let fixture = Fixture::new();
+    let blocker = fixture.prepare(1, false);
+    let mut daemon = fixture.daemon();
+    fixture.operation(&fixture.submission(&blocker));
+    let busy = fixture.wait_for(&blocker, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = available.local_addr().unwrap().to_string();
+    let workers = json!([
+        {"address":busy["listen_address"], "worker":blocker.worker,
+         "worker_spki_sha256":fixture.certificates.pin()},
+        {"address":address, "worker":"pool-second", "worker_spki_sha256":"22".repeat(32)}
+    ]);
+    let pool = fixture.owner.path().join("pool.json");
+    fs::write(&pool, serde_json::to_vec(&workers).unwrap()).unwrap();
+    drop(available);
+
+    let (second, mut second_client) = fixture.start_allocated_build_with_pool(103, Some(&pool));
+    fixture.wait_for_submission(&second, &mut second_client);
+    let running = fixture.wait_for(&second, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert_eq!(running["worker"], "pool-second");
+    assert_eq!(running["address"], address);
+    assert_eq!(running["listen_address"], address);
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 0));
+    assert_eq!(fixture.status(&blocker)["state"], "running");
+
+    // Both candidates now have one running job. Stable input order queues the
+    // next build on the first worker without allocating another worker ID.
+    let (queued, mut queued_client) = fixture.start_allocated_build_with_pool(104, Some(&pool));
+    let before = fixture.wait_for_submission(&queued, &mut queued_client);
+    assert_eq!(before["state"], "queued");
+    assert_eq!(before["worker"], blocker.worker);
+    assert!(before["request_id"].is_null());
+    queued_client.crash();
+    let submit = vec![
+        "--job-submit-pool".into(),
+        queued.id.clone(),
+        pool.to_str().unwrap().into(),
+        queued.bundle.to_str().unwrap().into(),
+        queued.delivery.to_str().unwrap().into(),
+        queued.output.to_str().unwrap().into(),
+    ];
+    let retry = fixture.operation(&submit);
+    assert_eq!(retry["state"], "queued");
+    assert_eq!(retry["worker"], before["worker"]);
+    assert_eq!(retry["request_sha256"], before["request_sha256"]);
+    let reversed = json!([workers[1], workers[0]]);
+    fs::write(&pool, serde_json::to_vec(&reversed).unwrap()).unwrap();
+    let (status, reply) = fixture.cli(&submit);
+    assert!(!status.success());
+    assert_eq!(reply["kind"], "prepared-operation-error");
+    fs::write(&pool, serde_json::to_vec(&workers).unwrap()).unwrap();
+
+    daemon.crash();
+    assert!(!second_client.wait(Duration::from_secs(15)).success());
+    let mut restarted = fixture.daemon();
+    let uncertain = fixture.status(&second);
+    assert_eq!(uncertain["state"], "uncertain");
+    for field in [
+        "worker",
+        "worker_spki_sha256",
+        "address",
+        "request_id",
+        "request_sha256",
+        "attempt",
+    ] {
+        assert_eq!(uncertain[field], running[field], "{field}");
+    }
+    let retained = fixture.operation(&submit);
+    assert_eq!(retained["state"], "queued");
+    assert_eq!(retained["worker"], before["worker"]);
+    assert!(retained["request_id"].is_null());
+    let cancelled = fixture.operation(&["--job-cancel".into(), queued.id.clone()]);
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(cancelled["execution_may_have_run"], false);
+    assert!(!queued.delivery.exists() && !queued.output.exists());
+    restarted.terminate();
 }
 
 #[test]

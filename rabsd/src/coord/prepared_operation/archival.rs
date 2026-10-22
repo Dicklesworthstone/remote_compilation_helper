@@ -9,7 +9,8 @@ use super::{
     MAX_AUTOMATIC_RECOVERIES, MAX_DETAIL_BYTES, MAX_OPERATIONS, MAX_RECORD_BYTES,
     MAX_RETAINED_BYTES, OperationState, PreparedOperationStore, Record, State, StoredMode, invalid,
     ordinary_directory, overlap, path_shape, read_bounded, record_request_digest, require,
-    valid_id, validate_allocation_template, validate_bound_request, validate_spec_shape,
+    valid_id, validate_allocation_template, validate_bound_request, validate_record_pool,
+    validate_spec_shape,
 };
 use std::fs::{self, File};
 use std::io;
@@ -52,6 +53,7 @@ pub(super) fn load_record(root: &Path, path: &Path) -> io::Result<Record> {
     let bytes = read_bounded(path, MAX_RECORD_BYTES, true)?;
     let record: Record = serde_json::from_slice(&bytes)?;
     validate_spec_shape(&record.spec)?;
+    validate_record_pool(&record)?;
     if record.allocation_pending() {
         validate_allocation_template(&record.request)?;
         require(

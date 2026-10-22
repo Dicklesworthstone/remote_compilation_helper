@@ -29,9 +29,16 @@ DRIVER = r'''
 import json, os, pathlib, signal, sys
 args = sys.argv[1:]
 job_id = None
+pool, pool_file = None, None
 if args[0] == "--job-build":
     assert args[0:2] == ["--job-build", "--prepare-from"], args
-    source, specification, job_id, address, worker, pin, bundle, delivery, output = args[2:]
+    if args[5] == "--worker-pool":
+        source, specification, job_id, selector, pool_file, bundle, delivery, output = args[2:]
+        pool = json.loads(pathlib.Path(pool_file).read_bytes())
+        assert type(pool) is list and 1 <= len(pool) <= 32
+        assert all(worker.keys() == {"address", "worker", "worker_spki_sha256"} for worker in pool)
+    else:
+        source, specification, job_id, address, worker, pin, bundle, delivery, output = args[2:]
     assert len(job_id) == 32 and all(c in "0123456789abcdef" for c in job_id)
 else:
     assert args[0:3] == ["--worker-build-tls", "--replay-diagnostics", "--prepare-from"], args
@@ -56,6 +63,7 @@ assert request["toolchain_source"] + "/bin/rustc" == os.environ["RUSTC"]
 record = {"pid":os.getpid(), "argv":sys.argv, "request":request,
           "cwd":os.getcwd(), "tls":os.environ.get("RABS_COORD_TLS_KEY"),
           "job_id":job_id, "socket":os.environ.get("RABS_SOCKET_PATH"),
+          "worker_pool":pool, "pool_file":pool_file,
           "operation":str(operation), "input":sys.stdin.buffer.read().hex()}
 fd = os.environ.get("TEST_INHERITED_FD")
 if fd:
@@ -198,6 +206,18 @@ class CanonicalCargo(unittest.TestCase):
         listener.listen()
         endpoint.chmod(0o600)
         self.profile["daemon_socket"] = str(endpoint)
+        self.save()
+        return endpoint
+
+    def select_worker_pool(self, count=2):
+        endpoint = self.select_daemon()
+        for field in ("listen", "worker", "worker_spki_sha256"):
+            self.profile.pop(field)
+        self.profile["workers"] = [
+            {"listen": "127.0.0.1:" + str(45123 + index), "worker": "worker-" + str(index),
+             "worker_spki_sha256": format(index + 1, "064x")}
+            for index in range(count)
+        ]
         self.save()
         return endpoint
 
@@ -416,6 +436,147 @@ class CanonicalCargo(unittest.TestCase):
         self.assertEqual(len({record["job_id"] for record in records}), 4)
         self.assertTrue(all(record["request"]["request_id"] == "allocate" for record in records))
         self.assertTrue(all(record["argv"][1] == "--job-build" for record in records))
+
+    def test_worker_pool_handoff_retains_ordered_private_intent_and_native_ownership(self):
+        endpoint = self.select_worker_pool()
+        self.profile["workers"].reverse()
+        self.profile["workers"][0]["listen"] = "[0:0:0:0:0:0:0:1]:45124"
+        self.save()
+        env = dict(self.env, TEST_EXIT="101", RABS_SOCKET_PATH="/wrong/ambient.sock")
+        code, stdout, stderr, pid = self.invoke(["test", "--workspace"], env=env, input=b"pool-input")
+        self.assertEqual(code, 101, stderr)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["socket"], str(endpoint))
+        self.assertEqual(record["input"], b"pool-input".hex())
+        self.assertEqual(stdout, b"fixture Cargo stdout\x00\xff\n")
+        operation = Path(record["operation"])
+        pool_file = operation / "pool.json"
+        expected_pool = [
+            {"address": "[::1]:45124", "worker": "worker-1", "worker_spki_sha256": format(2, "064x")},
+            {"address": "127.0.0.1:45123", "worker": "worker-0", "worker_spki_sha256": format(1, "064x")},
+        ]
+        self.assertEqual(record["worker_pool"], expected_pool)
+        self.assertEqual(record["pool_file"], str(pool_file))
+        self.assertEqual(record["argv"], [str(self.driver), "--job-build", "--prepare-from",
+                         str(self.source), str(operation / "spec.json"), record["job_id"],
+                         "--worker-pool", str(pool_file), str(operation / "bundle"),
+                         str(operation / "delivery"), str(operation / "outputs")])
+        metadata = json.loads((operation / "operation.json").read_bytes())
+        self.assertEqual(metadata["worker_pool"], expected_pool)
+        self.assertEqual(metadata["request_id"], "allocate")
+        self.assertEqual(metadata["job_submit_argv"], [str(self.driver), "--job-submit-pool",
+                         record["job_id"], str(pool_file), str(operation / "bundle"),
+                         str(operation / "delivery"), str(operation / "outputs")])
+        self.assertNotIn("worker_pool", record["request"], "placement is not compiler input")
+        self.assertNotIn("worker", metadata, "the daemon alone owns actual placement")
+        self.assertEqual(sorted(path.name for path in operation.iterdir()),
+                         ["operation.json", "pool.json", "spec.json"])
+        for path in operation.iterdir():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(pool_file.read_bytes()), expected_pool)
+        self.assertFalse(metadata["automatic_retry"])
+        self.assertFalse(metadata["publication_authorized"])
+
+    def test_worker_pool_size_boundaries_pass_to_native_without_local_selection(self):
+        self.select_worker_pool(32)
+        workers = self.profile["workers"]
+        for count in (1, 32):
+            with self.subTest(count=count):
+                self.profile["workers"] = workers[:count]
+                self.save()
+                self.assertEqual(self.invoke(["check", "--workspace"])[0], 0)
+                record = self.records()[-1]
+                self.assertEqual(len(record["worker_pool"]), count)
+                self.assertEqual([item["worker"] for item in record["worker_pool"]],
+                                 [item["worker"] for item in workers[:count]])
+
+    def test_worker_pool_requires_daemon_and_cannot_mix_singular_placement(self):
+        endpoint = self.select_worker_pool()
+        valid = dict(self.profile)
+        self.profile.pop("daemon_socket")
+        self.save()
+        self.assert_refused()
+        self.profile["daemon_socket"] = str(endpoint)
+        for field, value in (("listen", "127.0.0.1:45600"), ("worker", "another-worker"),
+                             ("worker_spki_sha256", "ba" * 32)):
+            with self.subTest(field=field):
+                self.profile_path.write_text(json.dumps(dict(valid, **{field: value})))
+                self.assert_refused()
+
+    def test_worker_pool_malformed_or_unsafe_entries_refuse_before_creating_operation(self):
+        self.select_worker_pool()
+        first, second = self.profile["workers"]
+        invalid = (None, True, {}, [], "workers.json", [first] * 33, [None], [{}],
+                   [dict(first, address=first["listen"])],
+                   [{key: value for key, value in first.items() if key != "worker"}])
+        for workers in invalid:
+            with self.subTest(workers=workers):
+                self.profile_path.write_text(json.dumps(dict(self.profile, workers=workers)))
+                self.assert_refused()
+        for field, value in (
+            ("listen", None), ("listen", True), ("listen", "example.com:1"),
+            ("listen", "127.0.0.1:0"), ("listen", "::1:2"), ("listen", "[::1%lo]:2"),
+            ("listen", "127.0.0.1:65536"), ("listen", "../pool.json"),
+            ("worker", None), ("worker", "--arbitrary"), ("worker", "../other"),
+            ("worker", "worker/other"), ("worker", "x" * 129), ("worker", "雪"),
+            ("worker_spki_sha256", None), ("worker_spki_sha256", "AB" * 32),
+            ("worker_spki_sha256", "0" * 64),
+        ):
+            with self.subTest(field=field, value=value):
+                workers = [dict(first, **{field: value}), second]
+                self.profile_path.write_text(json.dumps(dict(self.profile, workers=workers)))
+                self.assert_refused()
+
+    def test_worker_pool_rejects_each_duplicate_identity_and_equivalent_endpoint(self):
+        self.select_worker_pool()
+        first, second = self.profile["workers"]
+        for field in ("listen", "worker", "worker_spki_sha256"):
+            with self.subTest(field=field):
+                workers = [first, dict(second, **{field: first[field]})]
+                self.profile_path.write_text(json.dumps(dict(self.profile, workers=workers)))
+                self.assert_refused()
+        for left, right in (("127.0.0.1:45123", "127.0.0.1:045123"),
+                            ("[::1]:45123", "[0:0:0:0:0:0:0:1]:45123"),
+                            ("127.0.0.1:45123", "[::ffff:127.0.0.1]:45123"),
+                            ("127.0.0.1:45123", "[::ffff:7f00:1]:45123"),
+                            ("0.0.0.0:45123", "127.0.0.1:45123"),
+                            ("[::]:45123", "127.0.0.1:45123"),
+                            ("[::1]:45123", "[::]:45123"),
+                            ("[::ffff:0.0.0.0]:45123", "127.0.0.1:45123")):
+            workers = [dict(first, listen=left), dict(second, listen=right)]
+            self.profile_path.write_text(json.dumps(dict(self.profile, workers=workers)))
+            self.assert_refused()
+        duplicate = json.dumps(self.profile).replace('"worker": "worker-0"',
+                         '"worker": "worker-0", "worker": "worker-0"')
+        self.profile_path.write_text(duplicate)
+        self.assert_refused()
+
+    def test_worker_pool_accepts_distinct_ports_and_nonoverlapping_literal_interfaces(self):
+        self.select_worker_pool()
+        first, second = self.profile["workers"]
+        for left, right in (("0.0.0.0:45123", "127.0.0.1:45124"),
+                            ("[::]:45123", "[::1]:45124"),
+                            ("127.0.0.1:45123", "127.0.0.2:45123"),
+                            ("127.0.0.1:45123", "[::1]:45123")):
+            with self.subTest(left=left, right=right):
+                workers = [dict(first, listen=left), dict(second, listen=right)]
+                self.profile_path.write_text(json.dumps(dict(self.profile, workers=workers)))
+                self.assertEqual(self.invoke()[0], 0)
+
+    def test_worker_pool_native_refusal_signal_and_exec_failure_never_choose_a_fallback(self):
+        self.select_worker_pool()
+        for code in (1, 2, 125):
+            self.assertEqual(self.invoke(env=dict(self.env, TEST_EXIT=str(code)))[0], code)
+        self.assertEqual(self.invoke(env=dict(self.env, TEST_SIGNAL="1"))[0], -signal.SIGTERM)
+        records = self.records()
+        self.assertEqual(len(records), 4)
+        self.assertTrue(all(record["worker_pool"] is not None for record in records))
+        self.assertEqual(len({record["job_id"] for record in records}), 4)
+        self.driver.write_bytes(b"not an executable image\n")
+        self.assertEqual(self.invoke()[0], 127)
+        self.assertEqual(len(self.records()), 4)
+        self.assertEqual(len(list(self.operations.iterdir())), 5)
 
     def test_daemon_socket_requires_explicit_private_existing_endpoint(self):
         endpoint = self.select_daemon()
@@ -1122,8 +1283,8 @@ sys.exit(2)
         self.assertEqual(len(self.records()), 1)
         self.assertFalse(new.exists())
 
-    def retained_daemon_operation(self):
-        endpoint = self.select_daemon()
+    def retained_daemon_operation(self, worker_pool=False):
+        endpoint = self.select_worker_pool() if worker_pool else self.select_daemon()
         _, command, _ = launcher.canonical_invocation(
             str(self.profile_path), ["check"], self.env)
         self.assertEqual(command[1:3], ["--job-build", "--prepare-from"])
@@ -1164,6 +1325,61 @@ sys.exit(2)
         self.assertEqual(metadata_path.read_bytes(), record_bytes)
         self.assertEqual((self.root / "retired-bundle/request.json").read_bytes(), template_bytes)
         self.assertEqual(list(self.operations.iterdir()), [operation])
+
+    def test_worker_pool_recovery_uses_same_daemon_job_after_pool_and_inputs_are_retired(self):
+        operation, endpoint = self.retained_daemon_operation(worker_pool=True)
+        metadata = json.loads((operation / "operation.json").read_bytes())
+        before = (operation / "operation.json").read_bytes()
+        for source, name in ((operation / "pool.json", "retired-pool.json"),
+                             (operation / "bundle", "retired-bundle"),
+                             (self.source, "retired-checkout"),
+                             (self.toolchain, "retired-toolchain"),
+                             (self.profile_path, "retired-profile")):
+            source.rename(self.root / name)
+        code, stdout, stderr, pid = self.recover(operation, env=dict(self.env, TEST_EXIT="101"))
+        self.assertEqual(code, 101, stderr)
+        self.assertEqual(stdout, b"verified job stdout\x00\xff\n")
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["argv"], [str(self.driver), "--job-wait", metadata["job_id"]])
+        self.assertEqual(record["socket"], str(endpoint))
+        self.assertEqual((operation / "operation.json").read_bytes(), before)
+        for action in ("status", "cancel"):
+            _, command, env = launcher.canonical_recovery_invocation(
+                [str(operation), "--" + action], self.env)
+            self.assertEqual(command, [str(self.driver), "--job-" + action, metadata["job_id"]])
+            self.assertEqual(env["RABS_SOCKET_PATH"], str(endpoint))
+        self.driver.write_text("#!" + sys.executable + " -S\n" + JOB_CONTROL_DRIVER)
+        new_delivery = operation / "recovered-delivery"
+        code, _, stderr, _ = self.recover(operation, "--resume-to", str(new_delivery))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.records()[-1]["argv"], [str(self.driver), "--job-resume",
+                         metadata["job_id"], str(new_delivery)])
+        self.assertFalse(new_delivery.exists(), "only the native daemon may create recovery state")
+        self.assertEqual(list(self.operations.iterdir()), [operation])
+
+    def test_worker_pool_recovery_refuses_changed_placement_contract_and_traversal(self):
+        operation, _ = self.retained_daemon_operation(worker_pool=True)
+        path = operation / "operation.json"
+        original = json.loads(path.read_bytes())
+        for index, value in ((1, "--job-submit-allocated"),
+                             (3, str(operation / "../pool.json")),
+                             (3, str(self.root / "pool.json")),
+                             (4, str(self.source))):
+            changed = json.loads(json.dumps(original))
+            changed["job_submit_argv"][index] = value
+            path.write_text(json.dumps(changed))
+            self.assert_recovery_refused(operation)
+        first = original["worker_pool"][0]
+        for pool in (None, [], [first, first], [dict(first, address="../other")],
+                     [dict(first, worker="../other")], [dict(first, listen=first["address"])]):
+            path.write_text(json.dumps(dict(original, worker_pool=pool)))
+            self.assert_recovery_refused(operation)
+        changed = dict(original)
+        changed.pop("worker_pool")
+        path.write_text(json.dumps(changed))
+        self.assert_recovery_refused(operation)
+        self.assertFalse(self.record.exists())
 
     def test_daemon_recovery_cannot_select_direct_receivers_or_submit_again(self):
         operation, _ = self.retained_daemon_operation()

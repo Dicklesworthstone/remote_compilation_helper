@@ -456,6 +456,7 @@ async fn handle_connection(
                     Some(
                         "prepared-submit"
                             | "prepared-submit-allocated"
+                            | "prepared-submit-pool"
                             | "prepared-status"
                             | "prepared-cancel"
                             | "prepared-resume"
@@ -470,9 +471,12 @@ async fn handle_connection(
                 // filesystem work. Neither may occupy the cancellation/status
                 // lane or the reactor while hashing a large delivered tree.
                 let lane = match value["kind"].as_str() {
-                    Some("prepared-submit" | "prepared-submit-allocated" | "prepared-resume") => {
-                        &limits.prepared_admission
-                    }
+                    Some(
+                        "prepared-submit"
+                        | "prepared-submit-allocated"
+                        | "prepared-submit-pool"
+                        | "prepared-resume",
+                    ) => &limits.prepared_admission,
                     Some("prepared-completion" | "prepared-recover-local") => {
                         &limits.materialization
                     }
@@ -824,7 +828,7 @@ fn prepared_reply(
     operations: Option<&std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
     request: &serde_json::Value,
 ) -> String {
-    use crate::coord::prepared_operation::PreparedOperationSpec;
+    use crate::coord::prepared_operation::{PreparedOperationSpec, PreparedPoolOperationSpec};
     use std::io;
     let operation_id = request.get("operation_id").or_else(|| {
         request
@@ -839,7 +843,9 @@ fn prepared_reply(
             .as_str()
             .ok_or_else(|| invalid("missing request kind"))?;
         let fields: &[&str] = match kind {
-            "prepared-submit" | "prepared-submit-allocated" => &["kind", "operation"],
+            "prepared-submit" | "prepared-submit-allocated" | "prepared-submit-pool" => {
+                &["kind", "operation"]
+            }
             "prepared-status" | "prepared-cancel" => &["kind", "operation_id"],
             "prepared-completion" => &["kind", "operation_id", "request_sha256"],
             "prepared-preview" => &[
@@ -896,7 +902,12 @@ fn prepared_reply(
                 "reexecute":false,
             }));
         }
-        let status = if matches!(kind, "prepared-submit" | "prepared-submit-allocated") {
+        let status = if kind == "prepared-submit-pool" {
+            let spec: PreparedPoolOperationSpec =
+                serde_json::from_value(request["operation"].clone())
+                    .map_err(|error| invalid(&format!("invalid prepared worker pool: {error}")))?;
+            operations.submit_allocated_pool(spec)?
+        } else if matches!(kind, "prepared-submit" | "prepared-submit-allocated") {
             let spec: PreparedOperationSpec = serde_json::from_value(request["operation"].clone())
                 .map_err(|error| invalid(&format!("invalid prepared operation: {error}")))?;
             if kind == "prepared-submit-allocated" {
@@ -1427,6 +1438,72 @@ mod edge_liveness_tests {
         assert_eq!(value["reason"], reason);
         // Field order is kept for people reading the raw stream.
         assert!(line.find("\"decision\"").unwrap() < line.find("\"reason\"").unwrap());
+    }
+
+    #[test]
+    fn prepared_pool_admission_returns_one_saved_placement_and_rejects_changed_intent() {
+        use crate::coord::prepared_operation::PreparedOperationStore;
+        use crate::coord::source_delivery::prepare_source_template;
+        use serde_json::{Value, json};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let bundle = root.join("bundle");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("lib.rs"), b"pub fn value() {}\n").unwrap();
+        prepare_source_template(
+            &source,
+            &json!({
+                "kind":"canonical-exec", "request_id":"allocate",
+                "program":"/__rabs/toolchain/bin/rustc",
+                "toolchain_backing":"/opt/pool-edge-fixture",
+                "toolchain_identity":{
+                    "version":"toolchain-dataset-v1", "sha256":"ab".repeat(32),
+                    "files":1, "bytes":4,
+                },
+                "source_files":["lib.rs"], "args":["lib.rs"],
+                "artifacts":{"unit":"compile", "files":["libfixture.rmeta"]},
+                "timeout_ms":10000,
+            }),
+            &bundle,
+        )
+        .unwrap();
+        let store = PreparedOperationStore::open(&root.join("operations")).unwrap();
+        let workers = json!([
+            {"address":"127.0.0.1:31001", "worker":"one", "worker_spki_sha256":"ab".repeat(32)},
+            {"address":"127.0.0.1:31002", "worker":"two", "worker_spki_sha256":"cd".repeat(32)},
+        ]);
+        let request = |sequence: u64| {
+            json!({
+                "kind":"prepared-submit-pool", "operation":{
+                    "id":format!("{sequence:032x}"), "workers":workers,
+                    "bundle":bundle, "delivery":root.join(format!("delivery-{sequence}")),
+                    "output":root.join(format!("output-{sequence}")),
+                },
+            })
+        };
+        let query = |request: &Value| -> Value {
+            serde_json::from_str(&prepared_reply(Some(&store), request)).unwrap()
+        };
+        let first = query(&request(1));
+        assert_eq!(first["kind"], "prepared-operation");
+        assert_eq!(first["operation"]["worker"], "one");
+        assert_eq!(first["operation"]["request_id"], Value::Null);
+        assert_eq!(first["publication_authorized"], false);
+        assert_eq!(first["reexecute"], false);
+        assert_eq!(query(&request(2))["operation"]["worker"], "two");
+        assert_eq!(query(&request(1)), first);
+        let mut changed = request(1);
+        changed["operation"]["workers"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert_eq!(query(&changed)["kind"], "prepared-operation-error");
+        let mut unknown = request(3);
+        unknown["operation"]["workers"][0]["unapproved"] = json!(true);
+        assert_eq!(query(&unknown)["kind"], "prepared-operation-error");
+        assert!(store.status(&format!("{:032x}", 3)).unwrap().is_none());
     }
 
     #[test]

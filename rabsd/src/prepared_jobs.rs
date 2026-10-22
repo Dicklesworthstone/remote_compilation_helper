@@ -379,13 +379,19 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
     if args.first().is_some_and(|arg| arg == "--job-follow") {
         return follow::run(args, socket);
     }
-    let request = match request(args) {
+    let parsed = if args.first().is_some_and(|arg| arg == "--job-submit-pool") {
+        build::pool_request(args)
+    } else {
+        request(args).map_err(invalid)
+    };
+    let request = match parsed {
         Ok(request) => request,
         Err(detail) => {
             eprintln!(
                 "rabsd: {detail}\n\
                 --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <output>\n\
                 --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <template-bundle> <delivery> <output>\n\
+                --job-submit-pool <id32hex> <pool.json> <template-bundle> <delivery> <output>\n\
                 --job-status <id32hex>\n\
                 --job-wait <id32hex> [timeout-seconds]\n\
                 --job-follow <id32hex> [timeout-seconds]\n\
