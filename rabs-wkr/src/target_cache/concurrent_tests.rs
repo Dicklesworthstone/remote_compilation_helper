@@ -465,14 +465,14 @@ fn paused_restore(
             },
             41,
             &|| {
-                if !paused.get() {
-                    if let Some(path) = destination.borrow().as_ref() {
-                        let written = fs::metadata(path).map_or(0, |metadata| metadata.len());
-                        if written > 0 && written < length {
-                            paused.set(true);
-                            entered.send(path.clone()).unwrap();
-                            cancelled.set(release.recv_timeout(Duration::from_secs(10)).unwrap());
-                        }
+                if !paused.get()
+                    && let Some(path) = destination.borrow().as_ref()
+                {
+                    let written = fs::metadata(path).map_or(0, |metadata| metadata.len());
+                    if written > 0 && written < length {
+                        paused.set(true);
+                        entered.send(path.clone()).unwrap();
+                        cancelled.set(release.recv_timeout(Duration::from_secs(10)).unwrap());
                     }
                 }
                 cancelled.get()

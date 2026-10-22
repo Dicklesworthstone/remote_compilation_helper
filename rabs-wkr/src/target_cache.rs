@@ -14,6 +14,7 @@ use crate::artifacts::{ArtifactPlan, CapturedArtifacts, MAX_ARTIFACT_BYTES, Prep
 use crate::result_spool::ResultRecipient;
 use crate::session::CanonicalExecRequest;
 use rabs_sandbox::canonical_namespace::{CanonicalNamespaceSpec, HostIsolationSupport};
+use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -69,7 +70,10 @@ pub(crate) struct WorkspaceInputs {
     pub root: PathBuf,
     pub manifest: SourceManifest,
     pub full_source_digest: [u8; 32],
-    pub projection: Option<(String, String)>,
+    // Retain the validated partition, not a caller-supplied cache digest hint.
+    // Its original transport and workspace identities are checked before any
+    // source-edit normalization; the cache partition always remains exact.
+    pub projection: Option<Arc<CargoHomeProjection>>,
     pub runtime_owner: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -199,7 +203,7 @@ fn target_key_description(
         "scope":scope.0,
         "source":inputs.full_source_digest,
         "workspace":inputs.manifest.digest(),
-        "projection":inputs.projection,
+        "projection":inputs.projection.as_ref().map(|home| (home.version(), home.prefix())),
         "toolchain":[crate::source_transfer::hex(&toolchain.sha256), toolchain.files.to_string(), toolchain.bytes.to_string()],
         "program":request.program, "args":request.args,
         "cwd":spec.cwd, "env":spec.env, "hostname":spec.hostname,
@@ -361,6 +365,7 @@ impl TargetCache {
         request_id: u64,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<(TargetAttempt, Option<PreparedArtifacts>)> {
+        checkpoint(stopped)?;
         if inputs
             .runtime_owner
             .as_ref()
@@ -401,6 +406,7 @@ impl TargetCache {
                 let restored_times =
                     source_edits::timestamps(&seed, &inputs, SystemTime::now(), stopped)?;
                 let output = new_output()?;
+                checkpoint(stopped)?;
                 // The original SourceReceiver seal must never receive old
                 // Cargo timestamps. A miss needs no second source tree;
                 // a hit copies and verifies it before changing any times.
@@ -449,9 +455,14 @@ impl TargetCache {
                         "{}",
                         serde_json::json!({"kind":"worker-target-state-refused", "request_id":request_id, "error":error.to_string()})
                     );
-                    // No partial target or newly cloned source escapes. Failed
-                    // private preparation/cancellation preserves a valid seed,
-                    // but original source facts must still be revalidated.
+                    // A stop is terminal, not a reason to prepare a cold
+                    // attempt. Release the seed lease above, then preserve the
+                    // target-state interruption before shared artifact scans
+                    // can replace it with their timeout classification.
+                    checkpoint(stopped)?;
+                    // No partial target or newly cloned source escapes. A
+                    // refused private preparation preserves a valid seed, but
+                    // cold execution must still revalidate the original source.
                     times = SourceTimes::capture(&inputs, stopped)?;
                     disposition = "cold-after-refusal";
                 }

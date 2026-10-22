@@ -144,6 +144,27 @@ impl CargoHomeProjection {
         &self.prefix
     }
 
+    /// Exact transport manifest to which both validated partitions belong.
+    /// This identity describes delivered inputs, not mutable Cargo runtime state.
+    #[must_use]
+    pub fn source_digest(&self) -> [u8; 32] {
+        self.source_digest
+    }
+
+    /// Selected cache members with paths relative to the private Cargo home.
+    /// Registry and Git contents retain their complete byte and mode identity.
+    #[must_use]
+    pub fn cache_manifest(&self) -> &SourceManifest {
+        &self.files
+    }
+
+    /// Compiler-visible members of an isolated projection. The legacy contract
+    /// leaves its transport prefix visible and has no separate workspace view.
+    #[must_use]
+    pub fn workspace_manifest(&self) -> Option<&SourceManifest> {
+        self.workspace.as_ref()
+    }
+
     /// Reuse coherent capture and SourceReceiver verification, rather than
     /// trusting chmod-only protection or copying unchecked mutable pathnames.
     /// The caller owns the private source/destination parent and excludes

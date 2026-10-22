@@ -398,3 +398,67 @@ fn warm_cache_bytes_do_not_skip_isolated_workspace_preparation() {
     );
     assert_eq!(fs::read(b.join("app/lib.rs")).unwrap(), b"source");
 }
+
+#[test]
+fn target_inputs_retain_the_exact_projection_only_after_admitted_source_handoff() {
+    for isolated in [false, true] {
+        let (manifest, start, request) = if isolated {
+            isolated_declarations(7)
+        } else {
+            declarations(7)
+        };
+        let mut state = SourceTransferState::default();
+        state.handle(&start, true, false).unwrap();
+        send_files(&mut state, &manifest, 7);
+        state.handle(&seal(&manifest, 7), true, false).unwrap();
+        assert!(
+            state
+                .pending
+                .as_ref()
+                .unwrap()
+                .target_cache_inputs(7)
+                .is_err()
+        );
+        let mut owner = state.take_prepared(&request).unwrap().unwrap();
+        assert!(owner.target_cache_inputs(8).is_err());
+        let input = owner.target_cache_inputs(7).unwrap();
+        assert_eq!(input.root, owner.workspace_root().unwrap());
+        assert_eq!(input.full_source_digest, owner.receiver.manifest().digest());
+        assert!(input.runtime_owner.is_none());
+        let projection = input.projection.as_ref().unwrap();
+        assert_eq!(projection.as_ref(), owner.cargo_home.as_ref().unwrap());
+        assert_eq!(projection.source_digest(), input.full_source_digest);
+        assert_eq!(projection.cache_manifest().files().len(), 1);
+        let cached = &projection.cache_manifest().files()[0];
+        assert_eq!(cached.path, "registry/cache/example/dep-1.crate");
+        assert_eq!(cached.sha256, <[u8; 32]>::from(Sha256::digest(ARCHIVE)));
+        if isolated {
+            assert_eq!(input.manifest.files().len(), 1);
+            assert_eq!(input.manifest.files()[0].path, "app/lib.rs");
+            assert_eq!(projection.workspace_manifest(), Some(&input.manifest));
+            assert!(!input.root.join("cache").exists());
+        } else {
+            assert_eq!(input.manifest, *owner.receiver.manifest());
+            assert!(projection.workspace_manifest().is_none());
+            assert!(input.root.join(CACHE_FILE).is_file());
+        }
+        // Even an internally substituted, well-formed partition cannot detach
+        // a cache identity from the source owner that completed the upload.
+        let mut different = owner.receiver.manifest().files().to_vec();
+        different
+            .iter_mut()
+            .find(|file| file.path == CACHE_FILE)
+            .unwrap()
+            .sha256[0] ^= 1;
+        owner.cargo_home = Some(
+            CargoHomeProjection::for_version(
+                projection.version(),
+                projection.prefix(),
+                &SourceManifest::new(different).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(owner.target_cache_inputs(7).is_err());
+        assert_eq!(input.full_source_digest, owner.receiver.manifest().digest());
+    }
+}

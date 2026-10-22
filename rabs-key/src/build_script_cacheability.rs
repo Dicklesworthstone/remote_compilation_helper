@@ -750,7 +750,8 @@ mod tests {
             fetch_timestamp_ns: 1_800_000_000_000_000_000,
         };
 
-        let plan_a = plan_captured_fetch_generator_split(true, true, &[fetch_a.clone()]);
+        let plan_a =
+            plan_captured_fetch_generator_split(true, true, std::slice::from_ref(&fetch_a));
         let plan_b = plan_captured_fetch_generator_split(true, true, &[fetch_b]);
         assert_eq!(
             plan_a, plan_b,

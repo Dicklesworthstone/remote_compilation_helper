@@ -39,6 +39,24 @@ fn runtime_inputs(root: &Path, names: &[&str]) -> WorkspaceInputs {
         .unwrap()
 }
 
+fn fixture_projection(inputs: &WorkspaceInputs, prefix: &str) -> Arc<CargoHomeProjection> {
+    let mut files = inputs.manifest.files().to_vec();
+    files.push(SourceFile {
+        path: format!("{prefix}/registry/cache/example/dep-1.crate"),
+        len: 7,
+        sha256: Sha256::digest(b"archive").into(),
+        executable: false,
+    });
+    Arc::new(
+        CargoHomeProjection::for_version(
+            rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION,
+            prefix,
+            &SourceManifest::new(files).unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
 fn fixture_request() -> CanonicalExecRequest {
     CanonicalExecRequest {
         request_id: 1,
@@ -218,10 +236,7 @@ fn target_key_binds_inputs_scope_toolchain_command_environment_and_grant() {
         target_key(scope(), &request, &input, &spec, &support(), &plan, 1).unwrap()
     );
     request.toolchain_identity.as_mut().unwrap().sha256[0] ^= 1;
-    input.projection = Some((
-        "isolated-registry-git-cargo-home-v1".into(),
-        ".captured".into(),
-    ));
+    input.projection = Some(fixture_projection(&input, ".captured"));
     assert_ne!(
         expected,
         target_key(scope(), &request, &input, &spec, &support(), &plan, 1).unwrap()
@@ -356,7 +371,7 @@ fn compatible_commands_preserve_compilation_selection_and_runtime_identity() {
         "command compatibility cannot admit changed workspace bytes"
     );
     changed = input;
-    changed.projection = Some(("isolated-registry-cargo-home-v1".into(), "cache".into()));
+    changed.projection = Some(fixture_projection(&changed, "cache"));
     assert_ne!(
         target_compatibility_key(scope(), &build, &changed, &spec, &support(), &plan, 1).unwrap(),
         expected

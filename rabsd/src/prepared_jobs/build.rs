@@ -81,7 +81,7 @@ fn pool_file(path: &Path) -> io::Result<Vec<rabsd::coord::prepared_operation::Pr
         let directories = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let mut directory = File::from(open("/", directories, Mode::empty())?);
         let mut parts = path.components().skip(1).peekable();
-        let file = loop {
+        loop {
             let name = parts
                 .next()
                 .ok_or_else(|| invalid("worker pool path lacks a file name"))?;
@@ -99,8 +99,7 @@ fn pool_file(path: &Path) -> io::Result<Vec<rabsd::coord::prepared_operation::Pr
                 directories,
                 Mode::empty(),
             )?);
-        };
-        file
+        }
     };
     #[cfg(not(unix))]
     let file = File::open(path)?;

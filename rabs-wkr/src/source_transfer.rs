@@ -18,6 +18,7 @@ use rabs_sandbox::source_transfer::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const UPLOAD_BUDGET: Duration = Duration::from_secs(5 * 60);
@@ -1032,27 +1033,27 @@ impl SourceOwner {
             ));
         }
         let root = self.workspace_root()?.to_path_buf();
-        let projection = self
+        let source = self.receiver.manifest();
+        if self
             .cargo_home
             .as_ref()
-            .map(|home| (home.version().to_owned(), home.prefix().to_owned()));
-        let source = self.receiver.manifest();
-        let files = source
-            .files()
-            .iter()
-            .filter(|file| {
-                !projection.as_ref().is_some_and(|(version, prefix)| {
-                    version != rabs_sandbox::cargo_home::CARGO_HOME_SOURCE_VERSION
-                        && file.path.starts_with(&format!("{prefix}/"))
-                })
-            })
-            .cloned()
-            .collect();
+            .is_some_and(|home| home.source_digest() != source.digest())
+        {
+            return Err(io::Error::other(
+                "target state Cargo home differs from the admitted source",
+            ));
+        }
+        let manifest = self
+            .cargo_home
+            .as_ref()
+            .and_then(CargoHomeProjection::workspace_manifest)
+            .unwrap_or(source)
+            .clone();
         Ok(crate::target_cache::WorkspaceInputs {
             root,
-            manifest: SourceManifest::new(files)?,
+            manifest,
             full_source_digest: source.digest(),
-            projection,
+            projection: self.cargo_home.clone().map(Arc::new),
             runtime_owner: None,
         })
     }

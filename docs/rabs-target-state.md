@@ -71,19 +71,28 @@ including that actual grant, participates in the match.
 
 ### Reuse after local Rust-source edits
 
-For an unprojected workspace, a compatible target can survive edits, additions,
-removals and renames of non-executable `.rs` files belonging to local/path
-packages, including `build.rs`. Non-Rust files (including manifests, lockfiles,
-Cargo configuration and data read by build scripts), executable inputs, and all
-files underneath a `.cargo-checksum.json` package root remain exact in content,
-membership and executable mode. Changing those inputs still selects a fresh
-target. Unknown commands and arguments retain exact-invocation reuse only.
+For a workspace with local/path packages, a compatible target can survive edits,
+additions, removals and renames of non-executable `.rs` files, including `build.rs`.
+Non-Rust files (including manifests, lockfiles, Cargo configuration and data read
+by build scripts), executable inputs, and all files underneath a
+`.cargo-checksum.json` package root remain exact in content, membership and
+executable mode. Changing those inputs still selects a fresh target. Unknown
+commands and arguments retain exact-invocation reuse only.
 
-This first edit family does not cover `cargo_home_source` projections: the
-workspace manifest alone cannot certify their separately captured registry/Git
-inputs. Those requests retain exact-source command compatibility. Vendored
-packages remain exact because Cargo does not track registry/Git source mtimes.
-The input capture/planning checks still validate the complete current source.
+This also applies to isolated `cargo_home_source` projections, including captured
+registry archives and locked Git databases. The worker retains the admitted
+projection's complete transport identity and its separate cache/workspace
+manifests. Source edits may change only the eligible workspace files: every
+cache member's path, bytes, size and executable bit, along with the projection
+version and transport prefix, must remain exact. Adding, removing, renaming or
+changing a cache file starts with a fresh target, even if that file ends in `.rs`.
+The worker verifies that both partitions belong to the current admitted source
+before selecting a compatible seed or replacing the workspace mount.
+
+The legacy `registry-cargo-home-v1` contract, which leaves the transport prefix
+visible in the workspace, retains exact-source compatibility only. Vendored
+packages also remain exact because Cargo does not track registry/Git source
+mtimes. Input capture and planning still validate the complete current source.
 
 The worker compares the previous and current manifests, never incoming mtimes,
 to identify edits and membership changes. It copies only the current source
