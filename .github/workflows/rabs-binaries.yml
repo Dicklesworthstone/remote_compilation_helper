@@ -129,6 +129,10 @@ jobs:
         run: cargo test --release -p rch-common --lib toolchain::worker_cache --locked
       - name: Coherent preparation to native worker-build handoff
         run: cargo test --release -p rabsd --bin rabsd worker_exec::prepared_build --locked
+      - name: Shared prepared inputs and durable job ownership
+        run: |
+          cargo test --release -p rabsd --lib coord::prepared_operation --locked
+          cargo test --release -p rabsd --test prepared_job_wait --test prepared_live_status --locked
       - name: Locked registry capture and isolated Cargo workspace
         run: |
           cargo test --release -p rabsd --lib coord::source_delivery::preparation::cargo --locked

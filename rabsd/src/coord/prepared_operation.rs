@@ -326,6 +326,29 @@ fn shares_worker_or_endpoint(left: &Record, right: &Record) -> bool {
         || left.spec.worker_spki_sha256 == right.spec.worker_spki_sha256
         || endpoint(left).is_some_and(|left| endpoint(right) == Some(left))
 }
+
+/// A captured bundle is read-only during dispatch, unlike delivery/output state.
+/// Permit only the exact same bundle and saved input identity to be shared.
+/// Allocated jobs retain that identity after binding different numeric IDs;
+/// neither claiming a job nor allocating its ID rewrites the bundle template.
+/// The adapter still revalidates each upload against its saved numeric request.
+fn conflicting_active_paths(left: &Record, right: &Record) -> bool {
+    let share_bundle = left.spec.bundle == right.spec.bundle
+        && left.version == right.version
+        && left.request_sha256 == right.request_sha256;
+    let left_paths = left.paths();
+    let right_paths = right.paths();
+    left_paths.iter().enumerate().any(|(left_index, left)| {
+        right_paths.iter().enumerate().any(|(right_index, right)| {
+            // paths() puts the input bundle first. All remaining roles stay
+            // exclusive, including prior deliveries and recovery prefixes.
+            // Compare roles, not path equality: a destination or prefix equal
+            // to a bundle must never inherit its read-sharing exception.
+            !(share_bundle && left_index == 0 && right_index == 0) && overlap(left, right)
+        })
+    })
+}
+
 fn bounded_detail(value: &str) -> String {
     let mut end = value.len().min(MAX_DETAIL_BYTES);
     while !value.is_char_boundary(end) {
@@ -1068,10 +1091,7 @@ impl PreparedOperationStore {
                         state.active.contains_key(&other.spec.id) || other.unresolved();
                     (!owns_worker || !shares_worker_or_endpoint(record, other))
                         && (!state.active.contains_key(&other.spec.id)
-                            || !record
-                                .paths()
-                                .iter()
-                                .any(|left| other.paths().iter().any(|right| overlap(left, right))))
+                            || !conflicting_active_paths(record, other))
                 })
             })
             .min_by_key(|record| record.order)
@@ -1618,3 +1638,6 @@ impl Drop for OperationClaim {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod shared_bundle_tests;
