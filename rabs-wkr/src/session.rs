@@ -874,37 +874,10 @@ fn execute_canonical_inner(
             return exec_error(request.request_id);
         }
     };
-    // Existing source protection validates the ORIGINAL sealed owner first.
-    // Only an independently verified copy may have its timestamps restored for
-    // Cargo freshness. Hold this owner even if optional target acquisition fails.
-    let hot_inputs = hot_inputs.and_then(|inputs| {
-        let original = inputs.root.clone();
-        match inputs.private_runtime_clone(&|| control.reason().is_some()) {
-            Ok(runtime) => {
-                let bind = spec.ro_binds.iter_mut().find(|bind| {
-                    bind.visible == std::path::Path::new(rabs_sandbox::layout::WORKSPACE)
-                        && bind.backing == original
-                });
-                if let Some(bind) = bind {
-                    bind.backing = runtime.root.clone();
-                    Some(runtime)
-                } else {
-                    eprintln!("{}", serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":"sealed source mount was not found for private runtime cloning"}));
-                    None
-                }
-            }
-            Err(error) => {
-                eprintln!("{}", serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":error.to_string()}));
-                None
-            }
-        }
-    });
-    if let Err(error) = toolchain.validate_namespace(&spec)
-        && request.dependency_context.is_none()
-    {
-        let _ = control.retain_outputs(Err(format!("runtime source clone isolation: {error}")));
-        return exec_error(request.request_id);
-    }
+    // Source protection above validates the ORIGINAL sealed owner. Keep that
+    // read-only mount for cold attempts: cache acquisition creates a private
+    // source copy only when it also restores a matching target. Both backings
+    // are installed together below, before the final namespace validation.
     // Worker-local jobserver authority runs on the FINAL env: extra_env
     // may carry smuggled coordination keys, so replacement must see them.
     // One real FIFO budget is held until the process group and drains resolve.
@@ -948,17 +921,13 @@ fn execute_canonical_inner(
                     let current = artifacts
                         .as_ref()
                         .expect("Cargo target has an artifact owner");
-                    let visible = std::path::PathBuf::from(plan.virtual_root());
-                    let bind = spec
-                        .rw_binds
-                        .iter_mut()
-                        .find(|bind| bind.visible == visible && bind.backing == current.backing());
-                    let Some(bind) = bind else {
+                    if let Err(error) =
+                        attempt.bind_restored(&mut spec, inputs, current, &restored, plan)
+                    {
                         let _ = control
-                            .retain_outputs(Err("Cargo target mount ownership changed".to_owned()));
+                            .retain_outputs(Err(format!("target state mount binding: {error}")));
                         return exec_error(request.request_id);
-                    };
-                    bind.backing = restored.backing().to_path_buf();
+                    }
                     artifacts = Some(restored);
                     if let Err(error) = toolchain.validate_namespace(&spec) {
                         let _ = control

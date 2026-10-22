@@ -52,10 +52,19 @@ including that actual grant, participates in the match.
 
 ## How ownership and freshness work
 
-The worker first validates the original sealed source and its namespace. It
-then creates and verifies a separate runtime workspace. Only this private copy
-may receive the timestamps from a prior identical workspace; the original
-captured source and its seal remain untouched.
+The worker first validates the original sealed source and its namespace. Cold
+and contended lookups keep that existing read-only workspace; they do not copy
+it just to discover that no target seed is available. Cold attempts still
+revalidate the complete source before staging a successful target seed.
+
+Only a matching target seed triggers creation and verification of a separate
+runtime workspace. Only that private copy may receive timestamps from the prior
+identical workspace; the original captured source and its seal remain untouched.
+The source and target mounts are replaced together after both original backing
+identities match, and the final namespace is validated again. The execution
+attempt retains its private source owner through process cleanup and capture.
+A failed optional restore exposes neither a partial target nor a partial source
+copy to the compiler.
 
 A seed is copied into a fresh execution target, preserving bytes, ordinary
 permissions, original modification times, empty directories, and verified

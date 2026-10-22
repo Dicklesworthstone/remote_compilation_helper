@@ -204,10 +204,13 @@ impl TargetCache {
     /// Take an exact-generation read lease under the pool lock, then copy and
     /// validate outside it. Independent restores never share writable inodes.
     /// A contended lookup remains cold; a large copy no longer holds that lock.
+    /// Cold attempts keep the caller-owned sealed workspace read-only. Only a
+    /// matching seed needs a private source copy for timestamp restoration;
+    /// the returned attempt owns that copy through execution and capture.
     pub(crate) fn acquire(
         self: &Arc<Self>,
         key: TargetKey,
-        inputs: WorkspaceInputs,
+        mut inputs: WorkspaceInputs,
         new_output: impl FnOnce() -> io::Result<PreparedArtifacts>,
         request_id: u64,
         stopped: &impl Fn() -> bool,
@@ -215,10 +218,10 @@ impl TargetCache {
         if inputs
             .runtime_owner
             .as_ref()
-            .is_none_or(|owner| owner.path() != inputs.root)
+            .is_some_and(|owner| owner.path() != inputs.root)
         {
             return Err(invalid(
-                "target state requires a private runtime workspace owner",
+                "target state runtime owner differs from its workspace",
             ));
         }
         let mut times = SourceTimes::capture(&inputs, stopped)?;
@@ -240,17 +243,27 @@ impl TargetCache {
             let mut restore_started = false;
             let reuse = (|| {
                 let output = new_output()?;
+                // The original SourceReceiver seal must never receive old
+                // Cargo timestamps. A miss needs no second source tree;
+                // a hit copies and verifies it before changing any times.
+                // The exact seed lease stays live throughout this copy.
+                let runtime = if inputs.runtime_owner.is_some() {
+                    inputs.clone()
+                } else {
+                    inputs.clone().private_runtime_clone(stopped)?
+                };
                 restore_started = true;
                 seed.tree.restore(output.backing(), stopped)?;
-                seed.source.restore(&inputs, stopped)?;
+                seed.source.restore(&runtime, stopped)?;
                 if seed.invalidated.load(Ordering::Acquire) {
                     return Err(invalid("target seed invalidated during restoration"));
                 }
-                Ok::<_, io::Error>(output)
+                Ok::<_, io::Error>((output, runtime))
             })();
             match reuse {
-                Ok(output) => {
+                Ok((output, runtime)) => {
                     times = seed.source.clone();
+                    inputs = runtime;
                     restored = Some(output);
                     disposition = "restored";
                     self.finish_seed_use(seed, true);
@@ -272,8 +285,9 @@ impl TargetCache {
                         "{}",
                         serde_json::json!({"kind":"worker-target-state-refused", "request_id":request_id, "error":error.to_string()})
                     );
-                    // No partial target escapes. Cancellation/allocation failure
-                    // preserves a valid seed's position, not stale source facts.
+                    // No partial target or newly cloned source escapes. Failed
+                    // private preparation/cancellation preserves a valid seed,
+                    // but original source facts must still be revalidated.
                     times = SourceTimes::capture(&inputs, stopped)?;
                     disposition = "cold-after-refusal";
                 }
@@ -443,6 +457,51 @@ pub(crate) struct TargetAttempt {
 }
 
 impl TargetAttempt {
+    /// Bind the verified private source and target together, never timestamps
+    /// from one source view with another target. The caller must retain this
+    /// attempt through process cleanup and revalidate the resulting namespace.
+    pub(crate) fn bind_restored(
+        &self,
+        spec: &mut CanonicalNamespaceSpec,
+        original: &WorkspaceInputs,
+        current: &PreparedArtifacts,
+        restored: &PreparedArtifacts,
+        plan: &ArtifactPlan,
+    ) -> io::Result<()> {
+        let owner = self
+            .inputs
+            .runtime_owner
+            .as_ref()
+            .filter(|owner| owner.path() == self.inputs.root)
+            .ok_or_else(|| invalid("restored Cargo target lacks a private workspace owner"))?;
+        if self.inputs.manifest.digest() != original.manifest.digest()
+            || self.inputs.full_source_digest != original.full_source_digest
+            || self.inputs.projection != original.projection
+        {
+            return Err(invalid(
+                "restored Cargo workspace differs from the admitted source",
+            ));
+        }
+        let visible = PathBuf::from(plan.virtual_root());
+        let output_index = spec
+            .rw_binds
+            .iter()
+            .position(|bind| bind.visible == visible && bind.backing == current.backing());
+        let workspace_index = spec.ro_binds.iter().position(|bind| {
+            bind.visible == Path::new(rabs_sandbox::layout::WORKSPACE) && bind.backing == original.root
+        });
+        let (Some(output_index), Some(workspace_index)) = (output_index, workspace_index) else {
+            return Err(invalid(
+                "Cargo target or sealed source mount ownership changed",
+            ));
+        };
+        // Both identities must match BEFORE changing either binding. A failed
+        // optional restore leaves the original sealed-source/fresh-target view.
+        spec.ro_binds[workspace_index].backing = owner.path().to_path_buf();
+        spec.rw_binds[output_index].backing = restored.backing().to_path_buf();
+        Ok(())
+    }
+
     pub(crate) fn stage(
         self,
         artifacts: &PreparedArtifacts,

@@ -976,3 +976,332 @@ fn real_cargo_private_seed_is_fresh_and_source_build_script_environment_changes_
     fixture.fresh_upload_timestamps();
     fixture.build(&cache, "second", true, "second:42");
 }
+
+#[test]
+fn cold_and_contended_attempts_do_not_copy_the_sealed_workspace() {
+    for contended in [false, true] {
+        let cache = Arc::new(TargetCache::new(1024).unwrap());
+        let (source, plan, target, captured) = small_fixture();
+        let original = inputs(source.path(), &["lib.rs"]);
+        let before = SourceTimes::capture(&original, &|| false).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let held = contended.then(|| cache.state.lock().unwrap());
+        let (attempt, restored) = cache
+            .acquire(
+                TargetKey([31; 32]),
+                original.clone(),
+                || {
+                    calls.set(calls.get() + 1);
+                    PreparedArtifacts::new(plan.clone())
+                },
+                1,
+                &|| false,
+            )
+            .unwrap();
+        assert!(restored.is_none());
+        assert_eq!(calls.get(), 0, "cold acquisition must not allocate a target copy");
+        assert_eq!(attempt.inputs.root, source.path());
+        assert!(attempt.inputs.runtime_owner.is_none());
+        assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
+        drop(held);
+        // Read-only input observation still supports successful cold capture.
+        attempt
+            .stage(&target, &captured, &|| false)
+            .unwrap()
+            .unwrap()
+            .publish();
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+        assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
+    }
+}
+
+#[test]
+fn a_warm_hit_lazily_owns_its_source_and_preserves_the_original_seal() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let (source, plan, target, captured) = small_fixture();
+    let original = inputs(source.path(), &["lib.rs"]);
+    let key = TargetKey([32; 32]);
+    let first_time = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    File::open(source.path().join("lib.rs"))
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(first_time))
+        .unwrap();
+    let retained_times = SourceTimes::capture(&original, &|| false).unwrap();
+    let (cold, restored) = cache
+        .acquire(key, original.clone(), || PreparedArtifacts::new(plan.clone()), 1, &|| false)
+        .unwrap();
+    assert!(restored.is_none());
+    assert!(cold.inputs.runtime_owner.is_none());
+    cold.stage(&target, &captured, &|| false).unwrap().unwrap().publish();
+
+    // A later upload of the same bytes has different source timestamps. Only
+    // the independently owned runtime tree may receive the retained times.
+    File::open(source.path().join("lib.rs"))
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(first_time + Duration::from_secs(10)))
+        .unwrap();
+    let before = SourceTimes::capture(&original, &|| false).unwrap();
+    assert_ne!(before, retained_times);
+    let (warm, restored) = cache
+        .acquire(key, original.clone(), || PreparedArtifacts::new(plan.clone()), 2, &|| false)
+        .unwrap();
+    let restored = restored.expect("the exact seed must remain reusable");
+    assert_ne!(warm.inputs.root, original.root);
+    assert_eq!(warm.inputs.runtime_owner.as_ref().unwrap().path(), warm.inputs.root);
+    assert_eq!(SourceTimes::capture(&warm.inputs, &|| false).unwrap(), retained_times);
+    assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
+    let source_inode = fs::metadata(source.path().join("lib.rs")).unwrap();
+    let runtime_inode = fs::metadata(warm.inputs.root.join("lib.rs")).unwrap();
+    assert_ne!(
+        (source_inode.dev(), source_inode.ino()),
+        (runtime_inode.dev(), runtime_inode.ino())
+    );
+    assert_eq!(fs::read(restored.backing().join("artifact")).unwrap(), b"seed");
+    let runtime_path = warm.inputs.root.clone();
+    drop(warm);
+    assert!(!runtime_path.exists(), "the attempt must own the complete copy lifetime");
+    assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
+    // The timestamp-restoration guard itself remains unchanged.
+    assert!(retained_times.restore(&original, &|| false).is_err());
+}
+
+#[test]
+fn refused_lazy_restore_keeps_the_original_workspace_and_fresh_target_path() {
+    for corrupt in [false, true] {
+        let cache = Arc::new(TargetCache::new(1024).unwrap());
+        let key = TargetKey([33; 32]);
+        stage_small(&cache, key).0.publish();
+        if corrupt {
+            let path = cache.state.lock().unwrap().entries[0]
+                .tree.directory.path().join("artifact");
+            fs::write(path, b"evil").unwrap();
+        }
+        let (source, plan, _, _) = small_fixture();
+        let original = inputs(source.path(), &["lib.rs"]);
+        let before = SourceTimes::capture(&original, &|| false).unwrap();
+        let (attempt, restored) = cache
+            .acquire(
+                key,
+                original.clone(),
+                || {
+                    if corrupt {
+                        PreparedArtifacts::new(plan.clone())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "injected allocation refusal",
+                        ))
+                    }
+                },
+                2,
+                &|| false,
+            )
+            .unwrap();
+        assert!(restored.is_none());
+        assert_eq!(attempt.inputs.root, original.root);
+        assert!(attempt.inputs.runtime_owner.is_none());
+        assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
+        assert_eq!(cache.state.lock().unwrap().entries.len(), usize::from(!corrupt));
+    }
+}
+
+#[test]
+fn cancellation_before_lazy_source_copy_keeps_seed_and_drops_the_new_target() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let key = TargetKey([34; 32]);
+    stage_small(&cache, key).0.publish();
+    let (source, plan, _, _) = small_fixture();
+    let original = inputs(source.path(), &["lib.rs"]);
+    let before = SourceTimes::capture(&original, &|| false).unwrap();
+    let stopped = std::cell::Cell::new(false);
+    let new_output_path = std::cell::RefCell::new(None);
+    let error = cache
+        .acquire(
+            key,
+            original.clone(),
+            || {
+                let output = PreparedArtifacts::new(plan.clone())?;
+                *new_output_path.borrow_mut() = Some(output.backing().to_path_buf());
+                stopped.set(true);
+                Ok(output)
+            },
+            2,
+            &|| stopped.get(),
+        )
+        .unwrap_err();
+    assert!(matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::TimedOut));
+    assert!(!new_output_path.borrow().as_ref().unwrap().exists());
+    assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+    assert_eq!(cache.state.lock().unwrap().reserved_bytes, 0);
+    assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
+}
+
+#[test]
+fn a_cold_attempt_still_refuses_changed_sealed_source_before_seed_publication() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let (source, plan, target, captured) = small_fixture();
+    let original = inputs(source.path(), &["lib.rs"]);
+    let (attempt, restored) = cache
+        .acquire(
+            TargetKey([35; 32]),
+            original,
+            || PreparedArtifacts::new(plan.clone()),
+            1,
+            &|| false,
+        )
+        .unwrap();
+    assert!(restored.is_none());
+    assert!(attempt.inputs.runtime_owner.is_none());
+    fs::set_permissions(source.path().join("lib.rs"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(source.path().join("lib.rs"), b"changed source").unwrap();
+    assert!(attempt.stage(&target, &captured, &|| false).is_err());
+    let state = cache.state.lock().unwrap();
+    assert!(state.entries.is_empty());
+    assert_eq!(state.reserved_bytes, 0);
+    assert_eq!(state.reservations, 0);
+}
+
+#[test]
+fn lazy_restoration_binds_both_owned_mounts_or_changes_neither() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let key = TargetKey([36; 32]);
+    stage_small(&cache, key).0.publish();
+    let (source, plan, current, _) = small_fixture();
+    let original = inputs(source.path(), &["lib.rs"]);
+    let (attempt, restored) = cache
+        .acquire(key, original.clone(), || PreparedArtifacts::new(plan.clone()), 2, &|| false)
+        .unwrap();
+    let restored = restored.unwrap();
+    let make_spec = || {
+        let mut spec = fixture_spec("unchanged");
+        spec.ro_binds[0].backing = original.root.clone();
+        spec.rw_binds[0].backing = current.backing().to_path_buf();
+        spec
+    };
+    let request = fixture_request();
+    let mut spec = make_spec();
+    let expected_key =
+        target_key(scope(), &request, &original, &spec, &support(), &plan, 1).unwrap();
+    attempt.bind_restored(&mut spec, &original, &current, &restored, &plan).unwrap();
+    assert_eq!(spec.ro_binds[0].backing, attempt.inputs.root);
+    assert_eq!(spec.rw_binds[0].backing, restored.backing());
+    assert_eq!(
+        target_key(scope(), &request, &attempt.inputs, &spec, &support(), &plan, 1).unwrap(),
+        expected_key,
+        "private backing selection must not change the exact semantic key"
+    );
+    for wrong_source in [false, true] {
+        let mut spec = make_spec();
+        if wrong_source {
+            spec.ro_binds[0].backing = "/unowned/source".into();
+        } else {
+            spec.rw_binds[0].backing = "/unowned/target".into();
+        }
+        let before_source = spec.ro_binds[0].backing.clone();
+        let before_output = spec.rw_binds[0].backing.clone();
+        assert!(attempt.bind_restored(&mut spec, &original, &current, &restored, &plan).is_err());
+        assert_eq!(spec.ro_binds[0].backing, before_source);
+        assert_eq!(spec.rw_binds[0].backing, before_output);
+    }
+    let mut changed = original.clone();
+    changed.full_source_digest[0] ^= 1;
+    let mut spec = make_spec();
+    assert!(attempt.bind_restored(&mut spec, &changed, &current, &restored, &plan).is_err());
+    assert_eq!(spec.ro_binds[0].backing, original.root);
+    assert_eq!(spec.rw_binds[0].backing, current.backing());
+    let (cold, _) = cache
+        .acquire(
+            TargetKey([37; 32]),
+            original.clone(),
+            || PreparedArtifacts::new(plan.clone()),
+            3,
+            &|| false,
+        )
+        .unwrap();
+    let mut spec = make_spec();
+    assert!(cold.bind_restored(&mut spec, &original, &current, &restored, &plan).is_err());
+    assert_eq!(spec.ro_binds[0].backing, original.root);
+    assert_eq!(spec.rw_binds[0].backing, current.backing());
+}
+
+#[test]
+fn a_mismatched_runtime_owner_is_not_treated_as_a_sealed_source() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let (source, plan, _, _) = small_fixture();
+    let mut original = inputs(source.path(), &["lib.rs"]);
+    original.runtime_owner = Some(Arc::new(
+        private_directory("rabs-wrong-runtime-owner-").unwrap(),
+    ));
+    let error = cache
+        .acquire(
+            TargetKey([38; 32]),
+            original,
+            || PreparedArtifacts::new(plan.clone()),
+            1,
+            &|| false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("runtime owner differs"));
+    assert!(cache.state.lock().unwrap().entries.is_empty());
+}
+
+#[test]
+fn live_warm_attempts_own_independent_source_inodes_and_publication_checks() {
+    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let key = TargetKey([39; 32]);
+    stage_small(&cache, key).0.publish();
+    let (source, plan, _, _) = small_fixture();
+    let original = inputs(source.path(), &["lib.rs"]);
+    let before = SourceTimes::capture(&original, &|| false).unwrap();
+    let acquire = || {
+        let (attempt, restored) = cache
+            .acquire(
+                key,
+                original.clone(),
+                || PreparedArtifacts::new(plan.clone()),
+                2,
+                &|| false,
+            )
+            .unwrap();
+        (attempt, restored.expect("matching seed must be restored"))
+    };
+    // Both attempts stay live together. Neither source nor target may alias
+    // the other attempt, the retained seed, or the original sealed workspace.
+    let (first, first_target) = acquire();
+    let (second, second_target) = acquire();
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    let first_source = first.inputs.root.join("lib.rs");
+    let second_source = second.inputs.root.join("lib.rs");
+    assert_ne!(identity(&first_source), identity(&second_source));
+    assert_ne!(identity(&first_source), identity(&original.root.join("lib.rs")));
+    assert_ne!(identity(&second_source), identity(&original.root.join("lib.rs")));
+    assert_ne!(
+        identity(&first_target.backing().join("artifact")),
+        identity(&second_target.backing().join("artifact"))
+    );
+    let original_bytes = fs::read(&second_source).unwrap();
+    fs::set_permissions(&first_source, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&first_source, b"changed private workspace").unwrap();
+    assert_eq!(fs::read(&second_source).unwrap(), original_bytes);
+    assert_eq!(fs::read(original.root.join("lib.rs")).unwrap(), original_bytes);
+    assert_eq!(SourceTimes::capture(&original, &|| false).unwrap(), before);
+    let first_capture = first_target
+        .capture_with_dependency_inputs(None, || false)
+        .unwrap();
+    assert!(first.stage(&first_target, &first_capture, &|| false).is_err());
+    let second_capture = second_target
+        .capture_with_dependency_inputs(None, || false)
+        .unwrap();
+    second
+        .stage(&second_target, &second_capture, &|| false)
+        .unwrap()
+        .unwrap()
+        .publish();
+    let state = cache.state.lock().unwrap();
+    assert_eq!(state.entries.len(), 1);
+    assert_eq!(state.reserved_bytes, 0);
+    assert_eq!(state.reservations, 0);
+}
