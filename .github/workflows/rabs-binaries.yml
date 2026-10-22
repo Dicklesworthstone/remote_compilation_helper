@@ -21,6 +21,7 @@ on:
       - 'scripts/cargo-rabs'
       - 'scripts/tests/test_cargo_rabs.py'
       - 'scripts/tests/test_cargo_rabs_canonical.py'
+      - 'scripts/tests/test_cargo_rabs_environment.py'
       - 'scripts/install-rabs'
       - 'scripts/rabs-recover'
       - 'scripts/tests/test_rabs_recover.py'
@@ -69,6 +70,8 @@ jobs:
           python3 tests/test_rabs_worker_cache_diagnostics.py -v
       - name: Canonical Cargo frontend (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_canonical.py -v
+      - name: Explicit canonical build inputs (native driver is an explicit fixture)
+        run: python3 -I -S scripts/tests/test_cargo_rabs_environment.py -v
       - name: Retained remote recovery (native driver, explicit daemon fixture)
         run: |
           python3 -I -S scripts/tests/test_rabs_recover.py -v

@@ -70,7 +70,7 @@ Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
 It runs the existing rabsd source/toolchain preparation and pinned-TLS worker
 build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
 explicit upload boundary, profile and worker connection setup. This Linux-only
-profile uses a captured toolchain, fixed worker environment and new output tree;
+profile uses a captured toolchain, explicit worker environment and new output tree;
 it is not transparent local-path replay, per-action scheduling or cache serving.
 Builds, checks, Clippy and tests accept ordinary workspace/target selection.
 Clippy accepts lint controls after -- and uses the captured cargo-clippy/driver.
@@ -79,6 +79,12 @@ Cargo's artifact reports identify the required real outputs in the captured tree
 Test execution success requires Cargo's final exit, never build-finished alone.
 Profiles may select an existing vendor tree or an explicit cargo_home_source
 for checksum-verified, locked crates.io dependencies from the offline cache.
+An optional env object supplies literal build-script, env!/option_env! and test
+inputs. Values are strings (including empty strings), not shell expressions or
+names to inherit from the dispatcher. They are retained in the private request
+and sent to the worker; do not use this as a secret-delivery channel. Toolchain,
+Cargo, loader, jobserver and RABS/RCH control variables remain reserved. These
+values do not reconfigure the local preparing driver or its TLS credentials.
 Cargo metadata may run locally; builds never do. No local/RCH fallback or
 automatic execution retry occurs. After complete verified delivery, the native
 driver replays Cargo/test stdout and stderr exactly and sends its result report
@@ -1163,6 +1169,49 @@ def canonical_daemon_endpoint(value):
     return endpoint
 
 
+def canonical_command_environment(values, clippy=False):
+    """Bind explicit build inputs without inheriting host variables or policy.
+
+    The native env-cwd-v1 validator remains authoritative. This frontend is
+    narrower: its fixed Cargo/toolchain/lint contract cannot be replaced through
+    an environment alternative to a refused command-line option. Only this
+    request receives the values, never the local preparation/control process.
+    """
+    import re
+    environment = {"CARGO_INCREMENTAL": "0"}
+    if clippy:
+        environment.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
+    if type(values) is not dict or len(values) + len(environment) > 256:
+        raise SetupError("canonical env must be an object within the native entry limit")
+    reserved = {
+        "PATH", "HOME", "CARGO_HOME", "TMPDIR", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN",
+        "LANG", "LC_ALL", "TZ", "MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS", "NUM_JOBS",
+        "CARGO", "RUSTC", "RUSTDOC", "RUSTFLAGS", "RUSTDOCFLAGS", "GLIBC_TUNABLES",
+    }
+    prefixes = ("CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_",
+                "RABS_", "RCH_", "LD_", "DYLD_")
+    total = sum(len(name) + len(value) + 2 for name, value in environment.items())
+    for name, value in values.items():
+        if type(name) is not str or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,255}", name) is None:
+            raise SetupError("canonical env names must be bounded POSIX identifiers")
+        if name in reserved or name.startswith(prefixes):
+            raise SetupError("canonical env cannot override worker or build-tool controls: " + name)
+        if type(value) is not str or "\0" in value:
+            raise SetupError("canonical env values must be literal strings without NUL")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError as error:
+            raise SetupError("canonical env values must be UTF-8") from error
+        if len(encoded) > 64 * 1024:
+            raise SetupError("canonical env value exceeds the native byte limit")
+        total += len(name) + len(encoded) + 2
+        if total > 128 * 1024:
+            raise SetupError("canonical env exceeds the native total byte limit")
+        environment[name] = value
+    # Request identity must not depend on the order of fields in the profile.
+    return dict(sorted(environment.items()))
+
+
 def canonical_profile(path, required_tools=("cargo", "rustc")):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(descriptor, "rb") as source:
@@ -1177,7 +1226,7 @@ def canonical_profile(path, required_tools=("cargo", "rustc")):
     profile = decode_object(data)
     required = {"version", "listen", "worker", "worker_spki_sha256",
                 "source_root", "toolchain_root", "operation_root"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket", "env"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-cargo-v1"):
         raise SetupError("invalid canonical-cargo-v1 profile fields")
@@ -1397,12 +1446,7 @@ def canonical_invocation(profile_path, args, env):
                 cargo_args.append(flag)
     cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
     cargo_args += trailing_args
-    command_env = {"CARGO_INCREMENTAL": "0"}
-    if clippy:
-        # Launch the captured subcommand directly. Neither Cargo's external
-        # subcommand search nor cargo-clippy's child Cargo may select a host
-        # tool when the explicitly selected dataset is incomplete.
-        command_env.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
+    command_env = canonical_command_environment(profile.get("env", {}), clippy)
     import secrets
     specification = {
         # This is LOCAL preparation intent. The combined TLS driver reserves a
