@@ -5,6 +5,8 @@
 //! that same owner through execution and installation. Only unleased images may
 //! be evicted. One background capture at a time preserves the original copy-I/O
 //! bound; ready images remain usable while a different toolchain is preparing.
+//! Invalidated generations remain owned and counted, but do not block a fresh
+//! capture under the same path when another retention slot is available.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -108,27 +110,32 @@ impl<K: Eq, V: Send + Sync + 'static> Cache<K, V> {
         prepare: impl FnOnce(&AtomicBool) -> Result<V, String> + Send + 'static,
     ) -> Result<Option<Arc<V>>, String> {
         self.harvest();
-        let matched = self.entries.iter().position(|entry| entry.key == key);
+        // An invalidated predecessor may still be leased by an earlier build.
+        // It retains its backing and slot, but is not a hit or a per-key lock.
+        // Select only the latest usable generation (or its one-shot error).
+        let matched = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.key == key && !entry.invalidated);
         if let Some(index) = matched {
-            let entry = &mut self.entries[index];
-            if !entry.invalidated {
-                let entry = self.entries.remove(index).expect("matched entry");
-                let value = entry.value.clone();
-                if value.is_ok() {
-                    self.entries.push_back(entry);
-                }
-                return value.map(Some);
+            let entry = self.entries.remove(index).expect("matched entry");
+            let value = entry.value.clone();
+            if value.is_ok() {
+                self.entries.push_back(entry);
             }
-            if !entry.idle() {
-                // The old generation remains counted until all users leave.
-                // Do not create an unbounded sequence of replaced generations.
-                return Ok(None);
-            }
+            return value.map(Some);
         }
         if self.pending.is_some() {
             return Ok(None);
         }
-        let victim = matched.or_else(|| {
+        // Reclaim an unleased invalidated generation before displacing a useful
+        // image. Every retained predecessor and the pending capture count toward
+        // the SAME global bound, even when they all have the same path key.
+        let retired = self
+            .entries
+            .iter_mut()
+            .position(|entry| entry.invalidated && entry.idle());
+        let victim = retired.or_else(|| {
             (self.entries.len() >= self.capacity)
                 .then(|| self.entries.iter_mut().position(Entry::idle))
                 .flatten()
@@ -264,7 +271,9 @@ mod tests {
 
     #[test]
     fn invalidated_generation_stays_counted_until_its_users_leave() {
-        let mut cache = Cache::new(2);
+        // Saturate retention: a replacement must not disown the old image.
+        // Spare-capacity replacement is covered separately below.
+        let mut cache = Cache::new(1);
         let first = ready(&mut cache, "a", 1);
         let lease = Arc::clone(&first);
         cache.invalidate(&"a", &first);
@@ -413,5 +422,193 @@ mod tests {
             Ok(Owner { dropped })
         }).unwrap().is_none());
         drop(finish(&mut cache, "new"));
+    }
+
+    #[test]
+    fn invalidated_lease_does_not_block_replacement_with_spare_capacity() {
+        let mut cache = Cache::new(2);
+        let original = ready(&mut cache, "compiler", 1);
+        cache.invalidate(&"compiler", &original);
+        let replacement = ready(&mut cache, "compiler", 2);
+        assert!(!Arc::ptr_eq(&original, &replacement));
+        assert_eq!(*original, 1, "a prior request retains its exact image");
+        assert_eq!(*replacement, 2);
+        assert_eq!(cache.entries.len(), 2, "both generations remain charged");
+        assert!(cache.entries.iter().any(|entry| {
+            entry.invalidated
+                && entry.value.as_ref().is_ok_and(|value| Arc::ptr_eq(value, &original))
+        }));
+        // A late validator names a generation, not whichever image now occupies
+        // the same compiler path. It cannot invalidate or shadow the new owner.
+        cache.invalidate(&"compiler", &original);
+        for _ in 0..16 {
+            assert!(Arc::ptr_eq(&replacement, &finish(&mut cache, "compiler")));
+        }
+        assert_eq!(*original, 1);
+    }
+
+    #[test]
+    fn repeated_replacements_and_weak_readers_stay_within_the_global_bound() {
+        let mut cache = Cache::new(CAPACITY);
+        let mut readers = VecDeque::new();
+        for generation in 0..CAPACITY {
+            let owner = ready(&mut cache, "compiler", generation);
+            cache.invalidate(&"compiler", &owner);
+            readers.push_back(owner);
+            assert_eq!(cache.entries.len(), generation + 1);
+            assert!(cache.pending.is_none());
+        }
+        for _ in 0..16 {
+            assert!(cache.poll("compiler", |_| panic!("all generations are leased")).unwrap().is_none());
+            assert!(cache.poll("another", |_| panic!("same bound applies across keys")).unwrap().is_none());
+            assert_eq!(cache.entries.len(), CAPACITY);
+            assert!(cache.pending.is_none());
+        }
+        let oldest = readers.pop_front().unwrap();
+        let weak = Arc::downgrade(&oldest);
+        drop(oldest);
+        assert!(cache.poll("compiler", |_| panic!("weak owner can still upgrade")).unwrap().is_none());
+        assert_eq!(*weak.upgrade().unwrap(), 0);
+        drop(weak);
+        assert!(cache.poll("compiler", |_| Ok(CAPACITY)).unwrap().is_none());
+        assert_eq!(cache.entries.len() + usize::from(cache.pending.is_some()), CAPACITY);
+        let latest = finish(&mut cache, "compiler");
+        assert_eq!(*latest, CAPACITY);
+        for (index, reader) in readers.iter().enumerate() {
+            assert_eq!(**reader, index + 1);
+        }
+        assert_eq!(cache.entries.len(), CAPACITY);
+        assert!(Arc::ptr_eq(&latest, &finish(&mut cache, "compiler")));
+    }
+
+    #[test]
+    fn an_idle_retired_generation_is_evicted_before_an_unrelated_warm_image() {
+        let mut cache = Cache::new(3);
+        drop(ready(&mut cache, "warm-oldest", 10));
+        let retired = ready(&mut cache, "retired", 20);
+        cache.invalidate(&"retired", &retired);
+        drop(ready(&mut cache, "warm-newest", 30));
+        drop(retired);
+        assert_eq!(*ready(&mut cache, "new", 40), 40);
+        assert_eq!(cache.entries.len(), 3);
+        assert!(!cache.entries.iter().any(|entry| entry.key == "retired"));
+        assert_eq!(*finish(&mut cache, "warm-oldest"), 10);
+        assert_eq!(*finish(&mut cache, "warm-newest"), 30);
+    }
+
+    #[test]
+    fn a_failed_replacement_reports_its_error_without_reviving_the_old_image() {
+        let mut cache = Cache::new(3);
+        let old = ready(&mut cache, "compiler", 1);
+        let independent = ready(&mut cache, "independent", 9);
+        cache.invalidate(&"compiler", &old);
+        assert!(cache.poll("compiler", |_| Err("new source capture refused".into())).unwrap().is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.pending.is_some() {
+            assert!(Arc::ptr_eq(&independent, &finish(&mut cache, "independent")));
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(cache.entries.len(), 3);
+        assert_eq!(
+            cache.poll("compiler", |_| panic!("error must be returned before retry")).unwrap_err(),
+            "new source capture refused",
+        );
+        assert_eq!(*old, 1);
+        assert_eq!(cache.entries.len(), 2);
+        let replacement = ready(&mut cache, "compiler", 2);
+        assert_eq!(*replacement, 2);
+        assert_eq!(cache.entries.len(), 3);
+        cache.invalidate(&"compiler", &old);
+        assert!(Arc::ptr_eq(&replacement, &finish(&mut cache, "compiler")));
+    }
+
+    #[test]
+    fn replacement_capture_remains_singleflight_with_live_predecessor_readers() {
+        let mut cache = Cache::new(3);
+        let old = ready(&mut cache, "compiler", 1);
+        let independent = ready(&mut cache, "independent", 9);
+        cache.invalidate(&"compiler", &old);
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        assert!(cache.poll("compiler", move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).map_err(|error| error.to_string())?;
+            wait.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?;
+            Ok(2)
+        }).unwrap().is_none());
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..128 {
+            assert!(cache.poll("compiler", |_| panic!("duplicate replacement")).unwrap().is_none());
+            assert!(cache.poll("another", |_| panic!("second capture lane")).unwrap().is_none());
+            assert!(Arc::ptr_eq(&independent, &finish(&mut cache, "independent")));
+            assert_eq!(cache.entries.len() + usize::from(cache.pending.is_some()), 3);
+            assert_eq!(*old, 1);
+        }
+        release.send(()).unwrap();
+        assert_eq!(*finish(&mut cache, "compiler"), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*old, 1);
+    }
+
+    #[test]
+    fn cache_shutdown_joins_replacement_but_does_not_disown_external_readers() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let joined = Arc::clone(&completed);
+        let mut cache = Cache::new(2);
+        let old = ready(&mut cache, "compiler", 1);
+        cache.invalidate(&"compiler", &old);
+        assert!(cache.poll("compiler", move |cancelled| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cancelled.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "replacement was not cancelled");
+                std::thread::yield_now();
+            }
+            joined.store(true, Ordering::Release);
+            Err("replacement cancelled".into())
+        }).unwrap().is_none());
+        drop(cache);
+        assert!(completed.load(Ordering::Acquire));
+        assert_eq!(*old, 1, "the old request still owns its image after shutdown");
+    }
+
+    #[test]
+    fn retired_backing_is_reclaimed_on_the_capture_lane_after_its_last_reader() {
+        #[derive(Debug)]
+        struct Image {
+            generation: usize,
+            dropped: mpsc::Sender<(usize, std::thread::ThreadId)>,
+        }
+        impl Drop for Image {
+            fn drop(&mut self) {
+                let _ = self.dropped.send((self.generation, std::thread::current().id()));
+            }
+        }
+        let mut cache = Cache::new(2);
+        let (dropped, observe) = mpsc::channel();
+        let first = dropped.clone();
+        assert!(cache.poll("compiler", move |_| Ok(Image { generation: 1, dropped: first })).unwrap().is_none());
+        let old = finish(&mut cache, "compiler");
+        cache.invalidate(&"compiler", &old);
+        let second = dropped.clone();
+        assert!(cache.poll("compiler", move |_| Ok(Image { generation: 2, dropped: second })).unwrap().is_none());
+        let current = finish(&mut cache, "compiler");
+        assert_eq!(current.generation, 2);
+        assert!(matches!(observe.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(old);
+        assert!(matches!(observe.try_recv(), Err(mpsc::TryRecvError::Empty)), "the cache still owns and charges retired backing");
+        let caller = std::thread::current().id();
+        assert!(cache.poll("another", move |_| {
+            let (generation, thread) = observe.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?;
+            assert_eq!(generation, 1);
+            assert_ne!(thread, caller);
+            assert_eq!(thread, std::thread::current().id());
+            Ok(Image { generation: 3, dropped })
+        }).unwrap().is_none());
+        assert_eq!(finish(&mut cache, "another").generation, 3);
+        assert!(Arc::ptr_eq(&current, &finish(&mut cache, "compiler")));
+        assert_eq!(cache.entries.len(), 2);
     }
 }
