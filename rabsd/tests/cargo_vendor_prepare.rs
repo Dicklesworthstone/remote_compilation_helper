@@ -334,6 +334,9 @@ impl Fixture {
         Self::git_with_history(false)
     }
     fn git_with_history(parented: bool) -> (Self, String) {
+        Self::git_with_reference(parented, "full-rev")
+    }
+    fn git_with_reference(parented: bool, selector: &str) -> (Self, String) {
         let owner = private_tempdir();
         let anchor = owner.path().join("approved source");
         fs::create_dir(&anchor).unwrap();
@@ -440,6 +443,31 @@ impl Fixture {
             .to_owned();
         assert_eq!(revision.len(), 40);
         let url = format!("file://{}", repository.display());
+        let reference = match selector {
+            "full-rev" => Some(("rev", revision.clone())),
+            "short-rev" => Some(("rev", revision[..7].to_owned())),
+            "branch" => Some(("branch", "main".to_owned())),
+            "tag" => {
+                git("git-tag", &["tag", "release+%2F#&name"]);
+                Some(("tag", "release+%2F#&name".to_owned()))
+            }
+            "default" => None,
+            _ => panic!("unknown Git fixture selector: {selector}"),
+        };
+        let manifest_reference = reference
+            .as_ref()
+            .map(|(kind, value)| format!(",{kind}='{value}'"))
+            .unwrap_or_default();
+        let locked_reference = reference
+            .as_ref()
+            .map(|(kind, value)| {
+                if *kind == "tag" {
+                    "?tag=release%2B%252F%23%26name".to_owned()
+                } else {
+                    format!("?{kind}={value}")
+                }
+            })
+            .unwrap_or_default();
         write(
             &anchor,
             "Cargo.toml",
@@ -449,7 +477,7 @@ impl Fixture {
             &anchor,
             "app/Cargo.toml",
             format!(
-                "[package]\nname='vendor_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nlocal_dep={{path='../local_dep'}}\ngit_dep={{git='{url}',rev='{revision}'}}\n"
+                "[package]\nname='vendor_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nlocal_dep={{path='../local_dep'}}\ngit_dep={{git='{url}'{manifest_reference}}}\n"
             ),
         );
         write(
@@ -493,7 +521,7 @@ impl Fixture {
         );
         write(&anchor, ".cargo/config.toml", config);
         let lock = fs::read_to_string(anchor.join("Cargo.lock")).unwrap();
-        assert!(lock.contains(&format!("git+{url}?rev={revision}#{revision}")));
+        assert!(lock.contains(&format!("git+{url}{locked_reference}#{revision}")));
         assert!(!lock.contains("checksum ="));
         for package in ["git_dep", "git_leaf"] {
             let checksums: Value = serde_json::from_slice(
@@ -508,6 +536,54 @@ impl Fixture {
         let dep_manifest =
             fs::read_to_string(anchor.join("vendor/git_dep-1.0.0/Cargo.toml")).unwrap();
         assert!(dep_manifest.contains("path = \"../leaf\""));
+        if selector != "full-rev" {
+            // Move both the origin and the approved object's ordinary refs to
+            // different code after Cargo generated the lock. Capture must use
+            // only the old locked object closure, never the selector's new tip.
+            write(&repository, "dep/payload.txt", "99\n");
+            write(
+                &repository,
+                "leaf/src/lib.rs",
+                "pub fn answer() -> u32 { 99 }\n",
+            );
+            git("git-advanced-add", &["add", "."]);
+            git(
+                "git-advanced-commit",
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-m",
+                    "moving references must not replace the locked commit",
+                ],
+            );
+            if selector == "tag" {
+                git("git-advanced-tag", &["tag", "--force", "release+%2F#&name"]);
+            }
+            let database = fs::read_dir(seed_home.join("git/db"))
+                .unwrap()
+                .map(Result::unwrap)
+                .next()
+                .unwrap()
+                .path();
+            git(
+                "git-advanced-cache",
+                &[
+                    "--git-dir",
+                    database.to_str().unwrap(),
+                    "fetch",
+                    "--force",
+                    &url,
+                    "+refs/heads/*:refs/remotes/origin/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+            );
+        }
         fs::rename(&repository, owner.path().join("retired-original-git")).unwrap();
         fs::rename(&seed_home, owner.path().join("retired-seed-cargo-home")).unwrap();
         let specification = json!({"kind":"canonical-exec","request_id":92,

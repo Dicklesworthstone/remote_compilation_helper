@@ -166,7 +166,7 @@ struct Package {
 /// the full revision in Cargo.lock. Neither package names nor directory names
 /// are a substitute for that source identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct GitSource {
+pub(super) struct GitSource {
     url: String,
     reference: Option<(String, String)>,
 }
@@ -184,7 +184,17 @@ fn git_url(url: &str) -> io::Result<()> {
 }
 
 impl GitSource {
-    fn parse(source: &str) -> io::Result<Self> {
+    pub(super) fn parse(source: &str) -> io::Result<Self> {
+        Self::parse_with_encoding(source, false)
+    }
+
+    /// Cargo.lock v4 encodes query values, whereas Cargo metadata serializes
+    /// literal references. Decode once, only at that explicit lock boundary.
+    pub(super) fn parse_encoded(source: &str) -> io::Result<Self> {
+        Self::parse_with_encoding(source, true)
+    }
+
+    fn parse_with_encoding(source: &str, encoded: bool) -> io::Result<Self> {
         require(
             source.len() <= 4096,
             "Git source identity exceeds its bound",
@@ -207,8 +217,14 @@ impl GitSource {
                 matches!(kind, "rev" | "branch" | "tag"),
                 "unsupported Git source selector",
             )?;
-            // Cargo source IDs display references literally, not as URL-form
-            // queries. Decoding '+' or '%xx' would conflate different refs.
+            // Metadata and older lock formats retain literal selectors. In
+            // particular, '+' and '%xx' there must never be decoded a second
+            // time after a v4 lock has already supplied its semantic identity.
+            let value = if encoded {
+                decode_git_reference(value)?
+            } else {
+                value.to_owned()
+            };
             require(
                 !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control),
                 "invalid Git reference",
@@ -220,7 +236,7 @@ impl GitSource {
                     || value.eq_ignore_ascii_case(revision),
                 "full Git revision selector disagrees with the locked commit",
             )?;
-            (url, Some((kind.to_owned(), value.to_owned())))
+            (url, Some((kind.to_owned(), value)))
         } else {
             (source, None)
         };
@@ -231,7 +247,7 @@ impl GitSource {
         })
     }
 
-    fn from_fields(fields: &toml::map::Map<String, toml::Value>) -> io::Result<Self> {
+    pub(super) fn from_fields(fields: &toml::map::Map<String, toml::Value>) -> io::Result<Self> {
         let url = fields
             .get("git")
             .and_then(toml::Value::as_str)
@@ -257,6 +273,37 @@ impl GitSource {
             reference,
         })
     }
+}
+
+fn decode_git_reference(value: &str) -> io::Result<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'%' => {
+                let mut digit = || {
+                    bytes
+                        .next()
+                        .and_then(|byte| match byte {
+                            b'0'..=b'9' => Some(byte - b'0'),
+                            b'a'..=b'f' => Some(byte - b'a' + 10),
+                            b'A'..=b'F' => Some(byte - b'A' + 10),
+                            _ => None,
+                        })
+                        .ok_or_else(|| invalid("invalid encoded Git reference"))
+                };
+                decoded.push(digit()? * 16 + digit()?);
+            }
+            b'+' => decoded.push(b' '),
+            b'&' | b'#' => {
+                return Err(invalid(
+                    "encoded Git source requires one unambiguous selector",
+                ));
+            }
+            _ => decoded.push(byte),
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| invalid("encoded Git reference must be UTF-8"))
 }
 
 #[derive(Debug)]

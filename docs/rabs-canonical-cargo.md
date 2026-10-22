@@ -315,9 +315,16 @@ the resolved graph against the retained inputs. The lockfile must remain
 unchanged. Missing cache entries, checksum mismatches and unsupported registry
 sources refuse preparation before remote execution.
 
-Git dependencies are supported when their manifest uses an explicit full
-40-character lowercase commit `rev`, and `Cargo.lock` selects that exact same
-commit. The approved Cargo home must already contain its complete object data
+Git dependencies may use a full or abbreviated `rev`, an explicit `branch` or
+`tag`, or Cargo's default branch, provided `Cargo.lock` records the full
+40-character lowercase resolved commit. The manifest selector remains part of
+the exact source identity; only that locked commit selects the captured object
+closure. Preparation and execution stay locked/offline, so moved remote or
+cached refs cannot update the selected source. Literal reference names retain
+their exact identity across Cargo's lockfile and metadata encodings, including
+names containing `+`, `%`, `#` or `&`.
+
+The approved Cargo home must already contain the complete locked object data
 under `git/db`; a checkout alone is insufficient. The Linux preparing host needs
 Git and `prlimit` available as local executables. This does not require those
 tools on the worker: captured Cargo reconstructs its own private checkouts.
@@ -333,9 +340,9 @@ existing source byte and file limits. The metadata probe checks each resolved
 Git package's full locked identity, contained manifest and target paths, and the
 bytes and executable modes of its checkout against the selected objects.
 
-Moving branches/tags, abbreviated revisions, credential-bearing URLs, object
-alternates, partial clones, Git submodules and symlinks are outside this cached
-Git profile. Missing or unsupported inputs refuse before remote execution.
+Credential-bearing URLs, object alternates, partial clones, Git submodules and
+symlinks are outside this cached Git profile. Missing or unsupported inputs
+refuse before remote execution.
 Manifests, lockfiles and captured project configuration retain their original
 bytes; no source replacement is synthesized for this mode.
 
@@ -368,7 +375,7 @@ bundles keep their existing version and behavior.
 must have ordinary directory ancestors and be disjoint from the source,
 toolchain and operation roots. The source anchor must not already contain the
 reserved `rabs-cargo-home` directory. Alternate registries and Git graphs outside
-the full-revision cache profile still require the supported approved vendor
+the locked-commit cache profile still require the supported approved vendor
 route. Cache capture does not authorize action
 cache publication or a compiler skip.
 

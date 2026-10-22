@@ -589,6 +589,205 @@ fn cached_git_and_registry_sources_rebuild_offline_without_original_history_or_c
     assert!(!hook_marker.exists());
 }
 
+fn cached_git_fixture(selector: &str) -> (Fixture, String) {
+    let (mut fixture, revision) = Fixture::git_with_reference(true, selector);
+    // Retire the alternate vendor route entirely. The production preparer must
+    // reconstruct this graph exclusively from the approved Git object store.
+    fs::rename(
+        fixture.anchor.join("vendor"),
+        fixture.owner.path().join("retired-vendor"),
+    )
+    .unwrap();
+    fs::rename(
+        fixture.anchor.join(".cargo"),
+        fixture.owner.path().join("retired-vendor-config"),
+    )
+    .unwrap();
+    fixture.specification["cargo_source"] = json!({
+        "manifest":"Cargo.toml",
+        "cargo_home_source":fixture.owner.path().join("retired-seed-cargo-home")
+    });
+    (fixture, revision)
+}
+
+#[test]
+fn cached_git_reference_selectors_build_locked_commits_after_origin_and_refs_move() {
+    use rabs_sandbox::cargo_home::ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION;
+    for selector in ["default", "branch", "tag", "short-rev"] {
+        let (fixture, revision) = cached_git_fixture(selector);
+        let home = fixture.owner.path().join("retired-seed-cargo-home");
+        let database = fs::read_dir(home.join("git/db"))
+            .unwrap()
+            .map(Result::unwrap)
+            .next()
+            .unwrap()
+            .path();
+        let namespace = database.file_name().unwrap().to_owned();
+        let mut latest = command("git");
+        latest
+            .arg("-C")
+            .arg(fixture.owner.path().join("retired-original-git"))
+            .args(["rev-parse", "HEAD"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let (status, stdout, stderr) =
+            Process::spawn(fixture.owner.path(), "advanced-git-tip", &mut latest)
+                .wait(Duration::from_secs(10));
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        let advanced = String::from_utf8(stdout).unwrap().trim().to_owned();
+        assert_ne!(advanced, revision, "{selector} must have a moving-ref trap");
+        let original_lock = fs::read(fixture.anchor.join("Cargo.lock")).unwrap();
+        let original_manifest = fs::read(fixture.anchor.join("app/Cargo.toml")).unwrap();
+        // These original files are never part of the approved object closure.
+        write(&home, "config.toml", PRIVATE_MARKER);
+        write(&database, "config", PRIVATE_MARKER);
+        write(&database, "HEAD", PRIVATE_MARKER);
+        write(&database, "refs/heads/private", PRIVATE_MARKER);
+        let (bundle, request) = fixture.prepared();
+        assert_eq!(
+            request["cargo_home"]["version"],
+            ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION
+        );
+        let manifest = rabsd::coord::source_delivery::request_manifest(&request)
+            .unwrap()
+            .unwrap();
+        let projection = CargoHomeProjection::for_version(
+            ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION,
+            "rabs-cargo-home",
+            &manifest,
+        )
+        .unwrap();
+        let mut received = SourceReceiver::create(
+            &fixture.owner.path().join("received-locked-git"),
+            manifest.clone(),
+        )
+        .unwrap();
+        for file in manifest.files() {
+            let bytes = fs::read(bundle.join("source").join(&file.path)).unwrap();
+            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                received
+                    .write_chunk(
+                        &file.path,
+                        (index * MAX_SOURCE_CHUNK) as u64,
+                        chunk,
+                        Sha256::digest(chunk).into(),
+                    )
+                    .unwrap();
+            }
+        }
+        received.seal().unwrap();
+        fs::rename(&home, fixture.owner.path().join("retired-approved-home")).unwrap();
+        fs::rename(
+            &fixture.anchor,
+            fixture.owner.path().join("retired-workspace"),
+        )
+        .unwrap();
+        let projected = projection
+            .prepare(
+                &received,
+                &fixture.owner.path().join("runtime-locked-git-home"),
+                || false,
+            )
+            .unwrap();
+        let workspace = projected.projected_workspace().unwrap();
+        assert!(!projected.root().join("git/checkouts").exists());
+        for (commit, expected) in [(&revision, true), (&advanced, false)] {
+            let mut check = command("git");
+            check
+                .arg("--git-dir")
+                .arg(projected.root().join("git/db").join(&namespace))
+                .args(["cat-file", "-e", commit])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null");
+            let (status, _, _) =
+                Process::spawn(fixture.owner.path(), "selected-git-object", &mut check)
+                    .wait(Duration::from_secs(10));
+            assert_eq!(status.success(), expected, "{selector}: {commit}");
+        }
+        let target = fixture.owner.path().join("locked-git-target");
+        let mut cargo = command(&fixture.cargo);
+        cargo
+            .current_dir(workspace)
+            .args(["build", "--frozen", "--jobs=1", "-p", "vendor_app"])
+            .arg("--target-dir")
+            .arg(&target)
+            .env("CARGO_HOME", projected.root())
+            .env("RUSTC", &fixture.rustc)
+            .env("CARGO_INCREMENTAL", "0")
+            .env("BUILD_LABEL", LABEL);
+        let (status, _, stderr) =
+            Process::spawn(fixture.owner.path(), "locked-git-build", &mut cargo)
+                .wait(Duration::from_secs(90));
+        assert!(
+            status.success(),
+            "{selector}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let (status, stdout, stderr) = Process::spawn(
+            fixture.owner.path(),
+            "locked-git-binary",
+            &mut command(target.join("debug/vendor_app")),
+        )
+        .wait(Duration::from_secs(5));
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, format!("42:{LABEL}\n").as_bytes(), "{selector}");
+        assert_eq!(
+            fs::read(workspace.join("Cargo.lock")).unwrap(),
+            original_lock
+        );
+        assert_eq!(
+            fs::read(workspace.join("app/Cargo.toml")).unwrap(),
+            original_manifest
+        );
+    }
+}
+
+#[test]
+fn cached_git_selector_drift_and_missing_locked_commit_refuse_without_lock_mutation() {
+    let (fixture, revision) = cached_git_fixture("branch");
+    let lock_path = fixture.anchor.join("Cargo.lock");
+    let manifest_path = fixture.anchor.join("app/Cargo.toml");
+    let lock = fs::read_to_string(&lock_path).unwrap();
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    for case in [
+        "missing-commit",
+        "short-lock",
+        "selector-drift",
+        "ambiguous-selector",
+    ] {
+        let selected_lock = match case {
+            "missing-commit" => lock.replace(&revision, &"f".repeat(40)),
+            "short-lock" => lock.replace(&revision, &revision[..7]),
+            _ => lock.clone(),
+        };
+        let selected_manifest = match case {
+            "selector-drift" => manifest.replace("branch='main'", "branch='unlocked-branch'"),
+            "ambiguous-selector" => {
+                manifest.replace("branch='main'", "branch='main',tag='release'")
+            }
+            _ => manifest.clone(),
+        };
+        fs::write(&lock_path, &selected_lock).unwrap();
+        fs::write(&manifest_path, &selected_manifest).unwrap();
+        let (bundle, status, stdout, stderr) = fixture.prepare(case);
+        assert!(!status.success(), "{case} must refuse");
+        assert!(stdout.is_empty(), "{case} must not publish a source bundle");
+        assert!(!bundle.exists(), "{case} published an input bundle");
+        let failure: Value = serde_json::from_slice(&stderr).unwrap();
+        assert_eq!(failure["kind"], "worker-prepare-failed", "{case}");
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            selected_lock,
+            "{case}"
+        );
+        assert_eq!(
+            fs::read_to_string(&manifest_path).unwrap(),
+            selected_manifest,
+            "{case}"
+        );
+    }
+}
+
 #[test]
 fn corrupt_missing_or_unapproved_registry_inputs_refuse_before_bundle_publication() {
     for case in 0..7 {

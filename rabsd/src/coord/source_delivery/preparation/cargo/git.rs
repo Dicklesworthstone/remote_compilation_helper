@@ -1,4 +1,4 @@
-//! Capture full-revision Cargo Git sources without importing user configuration,
+//! Capture locked Cargo Git commits without importing user configuration,
 //! checkouts, refs, hooks, alternates or unrelated repository history.
 //!
 //! Git reads a private object view backed by retained no-follow descriptors.
@@ -6,6 +6,7 @@
 //! resolves those inputs offline; no action-cache authority is created here.
 
 use super::registry::{MAX_ARCHIVE_MEMBERS, open_home, open_selected};
+use super::vendor::GitSource;
 use super::{
     MAX_PACKAGES, OUTPUT_LIMIT, bounded_command_with_input, contained_relative, invalid,
     local_tool, require,
@@ -26,7 +27,7 @@ const MAX_OBJECT_FILES: usize = 512;
 const MAX_OBJECT_STORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(180);
-type GitIdentity = (String, String, String);
+type GitIdentity = (String, String, GitSource, String);
 type CapturedFiles = BTreeMap<String, Vec<u8>>;
 
 fn object_id(value: &str) -> bool {
@@ -51,22 +52,30 @@ fn namespace(value: &str) -> bool {
         })
 }
 
-/// This cached-Git profile requires the same immutable full revision in the
-/// manifest selector and lock. Moving branches/tags need a fetch broker.
+/// Cargo's manifest selector remains part of the source identity, but the full
+/// locked commit alone selects captured objects. Frozen metadata resolution must
+/// reproduce that identity from the private cache without resolving moving refs.
+/// Selector validation belongs to the lock/metadata boundary, where its encoding
+/// is known; applying literal reference bounds here would reject encoded locks.
 pub(super) fn locked_revision(source: &str) -> io::Result<&str> {
+    require(
+        source.len() <= 4096,
+        "Git source identity exceeds its bound",
+    )?;
     let (selector, revision) = source
         .strip_prefix("git+")
-        .and_then(|source| source.split_once('#'))
-        .ok_or_else(|| {
-            invalid("cached Cargo sources support crates.io or full-revision Git sources")
-        })?;
-    let (url, selected) = selector
-        .split_once("?rev=")
-        .ok_or_else(|| invalid("cached Git dependencies require an explicit full rev selector"))?;
+        .and_then(|source| source.rsplit_once('#'))
+        .ok_or_else(|| invalid("cached Git source requires an exact locked commit"))?;
     require(
-        object_id(revision) && selected == revision,
-        "cached Git revision must be the exact full commit selected by Cargo.lock",
+        object_id(revision),
+        "cached Git source requires a canonical full locked commit",
     )?;
+    let url = selector.split_once('?').map_or(selector, |(url, _)| url);
+    validate_url(url)?;
+    Ok(revision)
+}
+
+fn validate_url(url: &str) -> io::Result<()> {
     require(
         url.len() <= 4096
             && ["https://", "http://", "ssh://", "git://", "file:///"]
@@ -79,28 +88,23 @@ pub(super) fn locked_revision(source: &str) -> io::Result<&str> {
                     .next()
                     .is_some_and(|host| host.contains('@'))
             }),
-        "cached Git source requires an ordinary URL without credentials or additional selectors",
-    )?;
-    Ok(revision)
+        "cached Git source requires an ordinary URL without credentials",
+    )
 }
 
 pub(super) fn validate_dependency(fields: &toml::map::Map<String, toml::Value>) -> io::Result<()> {
+    GitSource::from_fields(fields)?;
     let url = fields
         .get("git")
         .and_then(toml::Value::as_str)
         .ok_or_else(|| invalid("Git dependency URL must be a string"))?;
-    let revision = fields
-        .get("rev")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| invalid("cached Git dependencies require an explicit full rev selector"))?;
     require(
-        !["branch", "tag", "path", "registry", "registry-index"]
+        !["path", "registry", "registry-index"]
             .iter()
             .any(|field| fields.contains_key(*field)),
         "cached Git dependency combines incompatible source selectors",
     )?;
-    locked_revision(&format!("git+{url}?rev={revision}#{revision}"))?;
-    Ok(())
+    validate_url(url)
 }
 
 pub(super) fn has_locked_packages(lock: &toml::Value) -> bool {
@@ -122,6 +126,16 @@ fn locked_packages(lock: &toml::Value) -> io::Result<BTreeSet<GitIdentity>> {
         .and_then(toml::Value::as_array)
         .filter(|packages| packages.len() <= MAX_PACKAGES)
         .ok_or_else(|| invalid("cached Git capture requires a bounded Cargo.lock package list"))?;
+    let encoded = match lock.get("version") {
+        None => false,
+        Some(toml::Value::Integer(1..=3)) => false,
+        Some(toml::Value::Integer(4)) => true,
+        _ => {
+            return Err(invalid(
+                "unsupported Cargo.lock Git source encoding version",
+            ));
+        }
+    };
     let mut result = BTreeSet::new();
     for package in packages {
         let Some(source) = package
@@ -131,7 +145,12 @@ fn locked_packages(lock: &toml::Value) -> io::Result<BTreeSet<GitIdentity>> {
         else {
             continue;
         };
-        locked_revision(source)?;
+        let revision = locked_revision(source)?;
+        let identity = if encoded {
+            GitSource::parse_encoded(source)?
+        } else {
+            GitSource::parse(source)?
+        };
         let name = package
             .get("name")
             .and_then(toml::Value::as_str)
@@ -142,7 +161,7 @@ fn locked_packages(lock: &toml::Value) -> io::Result<BTreeSet<GitIdentity>> {
             .ok_or_else(|| invalid("locked Git package version missing"))?;
         require(
             package.get("checksum").is_none()
-                && result.insert((name.into(), version.into(), source.into())),
+                && result.insert((name.into(), version.into(), identity, revision.into())),
             "invalid or duplicate locked Git package",
         )?;
     }
@@ -598,8 +617,8 @@ impl GitCache {
         let packages = locked_packages(lock)?;
         let revisions = packages
             .iter()
-            .map(|(_, _, source)| locked_revision(source).map(str::to_owned))
-            .collect::<io::Result<BTreeSet<_>>>()?;
+            .map(|(_, _, _, revision)| revision.clone())
+            .collect::<BTreeSet<_>>();
         require(
             !revisions.is_empty() && revisions.len() <= MAX_DATABASES,
             "cached Git revision set exceeds its bound",
@@ -817,12 +836,16 @@ impl GitCache {
         let version = package["version"]
             .as_str()
             .ok_or_else(|| invalid("resolved Git package version missing"))?;
+        let revision = locked_revision(source)?;
         require(
-            self.packages
-                .contains(&(name.into(), version.into(), source.into())),
+            self.packages.contains(&(
+                name.into(),
+                version.into(),
+                GitSource::parse(source)?,
+                revision.into(),
+            )),
             "resolved Git package differs from its exact locked source identity",
         )?;
-        let revision = locked_revision(source)?;
         let manifest = Path::new(
             package["manifest_path"]
                 .as_str()
@@ -952,24 +975,117 @@ mod tests {
     use super::*;
 
     #[test]
-    fn immutable_git_selectors_bind_manifest_and_lock_without_moving_refs() {
+    fn git_selectors_keep_full_locked_commit_authority_without_resolving_refs() {
         let revision = "0123456789abcdef0123456789abcdef01234567";
-        let source = format!("git+https://example.invalid/repo.git?rev={revision}#{revision}");
-        assert_eq!(locked_revision(&source).unwrap(), revision);
+        for selector in [
+            String::new(),
+            format!("?rev={revision}"),
+            "?branch=main".to_owned(),
+            "?tag=release+%2F".to_owned(),
+            "?rev=0123456".to_owned(),
+        ] {
+            let source = format!("git+https://example.invalid/repo.git{selector}#{revision}");
+            assert_eq!(locked_revision(&source).unwrap(), revision, "{source}");
+            GitSource::parse(&source).unwrap();
+        }
         for source in [
-            format!("git+https://example.invalid/repo.git#{revision}"),
-            format!("git+https://example.invalid/repo.git?branch=main#{revision}"),
-            format!("git+https://example.invalid/repo.git?rev=0123456#{revision}"),
+            "git+https://example.invalid/repo.git".to_owned(),
+            "git+https://example.invalid/repo.git#0123456".to_owned(),
+            format!("git+https://example.invalid/repo.git?branch=#{revision}"),
+            format!("git+https://example.invalid/repo.git?unknown=main#{revision}"),
+            format!("git+https://example.invalid/repo.git?branch=bad\nref#{revision}"),
             format!("git+https://user:secret@example.invalid/repo.git?rev={revision}#{revision}"),
+            format!("git+https://user@example.invalid/repo.git?branch=main#{revision}"),
             format!(
                 "git+https://example.invalid/repo.git?rev={revision}#{}",
                 "a".repeat(40)
             ),
         ] {
-            assert!(locked_revision(&source).is_err(), "{source}");
+            assert!(
+                locked_revision(&source).is_err() || GitSource::parse(&source).is_err(),
+                "{source}"
+            );
         }
         assert!(namespace("repo-0123456789abcdef"));
         assert!(!namespace("../repo-0123456789abcdef"));
+    }
+
+    #[test]
+    fn cached_git_manifests_require_one_literal_selector_and_an_ordinary_url() {
+        let base = "git='https://example.invalid/repo.git'";
+        for reference in ["", ",rev='0123456'", ",branch='main'", ",tag='release+%2F'"] {
+            let value: toml::Value = toml::from_str(&format!("dep={{{base}{reference}}}")).unwrap();
+            validate_dependency(value["dep"].as_table().unwrap()).unwrap();
+        }
+        for reference in [
+            ",branch='main',rev='0123456'",
+            ",tag='release',branch='main'",
+            ",branch=123",
+            ",tag=''",
+            ",path='../outside'",
+            ",registry='private'",
+        ] {
+            let value: toml::Value = toml::from_str(&format!("dep={{{base}{reference}}}")).unwrap();
+            assert!(validate_dependency(value["dep"].as_table().unwrap()).is_err());
+        }
+        let value: toml::Value =
+            toml::from_str("dep={git='https://user:secret@example.invalid/repo',branch='main'}")
+                .unwrap();
+        assert!(validate_dependency(value["dep"].as_table().unwrap()).is_err());
+    }
+
+    #[test]
+    fn lock_encoding_preserves_literal_metadata_refs_and_distinct_package_identities() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let url = "https://example.invalid/repo.git";
+        let encoded = format!("git+{url}?tag=release%2B%252F%23%26name#{revision}");
+        let literal = format!("git+{url}?tag=release+%2F#&name#{revision}");
+        let lock = |version, source: &str| {
+            toml::from_str::<toml::Value>(&format!(
+                "version={version}\n[[package]]\nname='dep'\nversion='1.0.0'\nsource='{source}'\n"
+            ))
+            .unwrap()
+        };
+        let identity = locked_packages(&lock(4, &encoded)).unwrap();
+        assert!(identity.contains(&(
+            "dep".into(),
+            "1.0.0".into(),
+            GitSource::parse(&literal).unwrap(),
+            revision.into(),
+        )));
+        assert_eq!(identity, locked_packages(&lock(3, &literal)).unwrap());
+        let long_literal = format!("git+{url}?tag={}#{revision}", "%".repeat(400));
+        let long_encoded = format!("git+{url}?tag={}#{revision}", "%25".repeat(400));
+        assert_eq!(
+            locked_packages(&lock(4, &long_encoded)).unwrap(),
+            locked_packages(&lock(3, &long_literal)).unwrap(),
+            "reference bounds apply after decoding the versioned lock spelling"
+        );
+        assert_ne!(
+            identity,
+            locked_packages(&lock(
+                4,
+                &format!("git+{url}?tag=release%2B%2F%23%26name#{revision}")
+            ))
+            .unwrap(),
+            "a literal percent escape is not its decoded target"
+        );
+        for reference in ["bad%", "bad%GG", "bad%FF", "bad%00", "a&branch=b", "a#b"] {
+            let source = format!("git+{url}?tag={reference}#{revision}");
+            assert!(locked_packages(&lock(4, &source)).is_err(), "{source}");
+        }
+        let mut graph = lock(4, &encoded);
+        let packages = graph["package"].as_array_mut().unwrap();
+        let mut transitive = packages[0].clone();
+        transitive["name"] = "transitive".into();
+        packages.push(transitive);
+        let mut other_source = packages[0].clone();
+        other_source["source"] = format!("git+{url}?branch=main#{revision}").into();
+        packages.push(other_source);
+        assert_eq!(locked_packages(&graph).unwrap().len(), 3);
+        let duplicate = graph["package"][0].clone();
+        graph["package"].as_array_mut().unwrap().push(duplicate);
+        assert!(locked_packages(&graph).is_err());
     }
 
     #[test]
