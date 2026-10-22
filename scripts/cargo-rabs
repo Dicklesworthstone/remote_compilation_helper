@@ -112,6 +112,12 @@ without downloading again. These path options are recovery-only, not Cargo
 arguments. --delivery and --resume-to are exclusive.
 Daemon operations instead select native --job-wait for the saved job and socket.
 This waits for or replays its verified completion without submitting another job.
+Use --status alone to inspect that job without waiting for compiler completion,
+or --cancel alone to request cancellation of that same job. Both are daemon-only
+and cannot combine with recovery path options. They preserve native job-control
+status and exit codes, not the compiler's exit code. A cancellation response can
+still report cancelling or uncertain; it does not prove the worker has stopped.
+Inspect the same job again after a lost response; no automatic retry is made.
 For an uncertain daemon job, --resume-to requests native --job-resume, optionally
 with --prefix-from. --delivery requests native --job-recover-local for a complete
 delivery already owned by that job. --acknowledge /absolute/OWNED-DELIVERY requests
@@ -1631,7 +1637,13 @@ def canonical_job_recovery_invocation(operation, record, options, env):
     if saved[6:] != [str(operation / name) for name in ("bundle", "delivery", "outputs")]:
         raise SetupError("canonical daemon recovery record changed its fixed bundle/delivery/output paths")
     command = ["--job-wait", job_id]
-    if options:
+    if options.keys() == {"--status"}:
+        command = ["--job-status", job_id]
+    elif options.keys() == {"--cancel"}:
+        # Request cleanup from the durable owner, never signal a remembered PID
+        # or infer that worker resources are free from a control response.
+        command = ["--job-cancel", job_id]
+    elif options:
         # The record fixes ownership, not the contents of a result. In
         # particular, do not open/rewrite request.json: daemon submissions may
         # retain an allocation template rather than the numeric wire request.
@@ -1682,14 +1694,21 @@ def canonical_recovery_invocation(args, env):
     """
     if sys.platform != "linux":
         raise SetupError("canonical recovery currently requires Linux")
-    if not args or len(args) not in (1, 3, 5) or args[0].startswith("--"):
-        raise SetupError("--rabs-recover requires an absolute operation directory and recovery path options")
+    if not args or args[0].startswith("--"):
+        raise SetupError("--rabs-recover requires an absolute operation directory")
     options = {}
-    for index in range(1, len(args), 2):
-        flag, value = args[index:index + 2]
-        if flag not in ("--resume-to", "--delivery", "--prefix-from", "--acknowledge") or flag in options:
-            raise SetupError("unknown or duplicate canonical recovery option")
-        options[flag] = value
+    if len(args) == 2 and args[1] in ("--status", "--cancel"):
+        # Controls take no value and must stand alone. Preserve the existing
+        # path-pair grammar instead of treating flags as paths or vice versa.
+        options[args[1]] = True
+    else:
+        if len(args) not in (1, 3, 5):
+            raise SetupError("canonical recovery requires path options or one --status/--cancel control")
+        for index in range(1, len(args), 2):
+            flag, value = args[index:index + 2]
+            if flag not in ("--resume-to", "--delivery", "--prefix-from", "--acknowledge") or flag in options:
+                raise SetupError("unknown or duplicate canonical recovery option")
+            options[flag] = value
     if (len(options.keys() & {"--resume-to", "--delivery", "--acknowledge"}) > 1
             or "--prefix-from" in options and "--resume-to" not in options):
         raise SetupError("canonical recovery requires one destination; prefix reuse requires --resume-to")
@@ -1709,6 +1728,8 @@ def canonical_recovery_invocation(args, env):
         raise SetupError("invalid canonical recovery record identity or authority policy")
     if "job_id" in record:
         return canonical_job_recovery_invocation(operation, record, options, env)
+    if options.keys() & {"--status", "--cancel"}:
+        raise SetupError("canonical --status/--cancel requires a daemon-owned operation")
     if "--acknowledge" in options:
         raise SetupError("canonical --acknowledge requires a daemon-owned operation")
     saved = record["prepared_build_argv"]
