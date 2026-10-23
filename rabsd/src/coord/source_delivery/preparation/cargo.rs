@@ -337,7 +337,11 @@ fn validate_capture(
                         .map_err(|_| invalid("captured Cargo config is not UTF-8"))?;
                     let value = toml::from_str(text)
                         .map_err(|_| invalid("malformed captured Cargo config"))?;
-                    validate_cargo_config(&value, false)?;
+                    let base = Path::new(path)
+                        .parent()
+                        .and_then(Path::parent)
+                        .ok_or_else(|| invalid("invalid captured Cargo config path"))?;
+                    validate_cargo_config(&value, base, false)?;
                 }
             }
             if Path::new(path)
@@ -411,13 +415,14 @@ fn is_cargo_config(path: &Path) -> bool {
 /// output ownership to it. These bytes remain unchanged in both the planning
 /// copy and the worker upload; Cargo owns config layering and flag precedence.
 /// Source replacements need the vendor adapter's separate closure validation.
-fn validate_cargo_config(value: &toml::Value, vendor_sources: bool) -> io::Result<()> {
+fn validate_cargo_config(value: &toml::Value, base: &Path, vendor_sources: bool) -> io::Result<()> {
     let top = value
         .as_table()
         .ok_or_else(|| invalid("captured Cargo config must be a table"))?;
     for (section, value) in top {
         match section.as_str() {
             "source" | "registries" if vendor_sources => {}
+            "env" => validate_config_environment(value, base)?,
             "build" => {
                 let build = value
                     .as_table()
@@ -490,6 +495,91 @@ fn validate_cargo_config(value: &toml::Value, vendor_sources: bool) -> io::Resul
             _ => return Err(invalid("unsupported captured Cargo configuration section")),
         }
     }
+    Ok(())
+}
+
+/// Keep Cargo's environment table in the captured config, including its merge,
+/// force and config-relative semantics. This only validates the input boundary:
+/// neither the metadata probe nor the worker receives rewritten config bytes.
+/// In particular, resolving a relative value here must not bake the temporary
+/// planning directory into the request; Cargo resolves it again in its actual
+/// canonical workspace before launching the compiler or a build script.
+fn validate_config_environment(value: &toml::Value, base: &Path) -> io::Result<()> {
+    use rabs_sandbox::process_context::{CommandContext, MAX_COMMAND_ENV_ENTRIES};
+
+    let entries = value
+        .as_table()
+        .filter(|entries| entries.len() <= MAX_COMMAND_ENV_ENTRIES)
+        .ok_or_else(|| invalid("Cargo env config must be a bounded table"))?;
+    let mut environment = Vec::with_capacity(entries.len());
+    for (name, setting) in entries {
+        // Match the canonical frontend's application-environment boundary.
+        // The common CommandContext validator below also owns the pinned base
+        // environment and identifier/value/count/aggregate byte limits.
+        require(
+            !matches!(
+                name.as_str(),
+                "CARGO" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "GLIBC_TUNABLES"
+            ) && ![
+                "CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_", "RABS_", "RCH_", "LD_",
+                "DYLD_", "GIT_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)),
+            "Cargo env config cannot replace worker, compiler or preparation controls",
+        )?;
+        let (text, relative) = if let Some(text) = setting.as_str() {
+            (text, false)
+        } else {
+            let fields = setting
+                .as_table()
+                .ok_or_else(|| invalid("Cargo env entry requires a string or value table"))?;
+            require(
+                fields
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "value" | "force" | "relative")),
+                "Cargo env entry has an unsupported field",
+            )?;
+            for flag in ["force", "relative"] {
+                require(
+                    fields.get(flag).is_none_or(toml::Value::is_bool),
+                    "Cargo env force and relative flags must be booleans",
+                )?;
+            }
+            (
+                fields
+                    .get("value")
+                    .and_then(toml::Value::as_str)
+                    .ok_or_else(|| invalid("Cargo env entry requires a string value"))?,
+                fields
+                    .get("relative")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false),
+            )
+        };
+        let bounded = if relative {
+            // Empty relative values designate the config's base directory.
+            // All source members, including symlinks, are checked separately.
+            contained_relative(base, if text.is_empty() { "." } else { text })?;
+            let path = Path::new(rabs_sandbox::layout::WORKSPACE)
+                .join(base)
+                .join(text);
+            let path = path
+                .to_str()
+                .ok_or_else(|| invalid("Cargo env path must be UTF-8"))?;
+            require(
+                path.len() <= 4096,
+                "Cargo env relative path exceeds its bound",
+            )?;
+            path.to_owned()
+        } else {
+            text.to_owned()
+        };
+        environment.push((name.clone(), bounded));
+    }
+    CommandContext::new(rabs_sandbox::layout::WORKSPACE, environment).map_err(|_| {
+        invalid("Cargo env config has an invalid or reserved name or exceeds its limits")
+    })?;
     Ok(())
 }
 
@@ -1232,9 +1322,128 @@ mod tests {
         ] {
             let value: toml::Value = toml::from_str(text).unwrap();
             let original = value.clone();
-            validate_cargo_config(&value, false).unwrap();
+            validate_cargo_config(&value, Path::new(""), false).unwrap();
             assert_eq!(value, original, "validation must not rewrite Cargo intent");
         }
+    }
+
+    #[test]
+    fn captured_environment_preserves_cargo_defaults_force_and_relative_values() {
+        let value: toml::Value = toml::from_str(
+            r#"
+                [env]
+                APP_VERSION = "1.2.3"
+                EMPTY = ""
+                LABEL = { value = "two words\n雪", force = true }
+                DEFAULT = { value = "fallback", force = false, relative = false }
+                ASSET = { value = "../shared/data.txt", relative = true }
+                ROOT = { value = "", relative = true }
+            "#,
+        )
+        .unwrap();
+        let original = value.clone();
+        for vendor in [false, true] {
+            validate_cargo_config(&value, Path::new("app"), vendor).unwrap();
+        }
+        assert_eq!(
+            value, original,
+            "Cargo must receive the original config bytes"
+        );
+        assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+    }
+
+    #[test]
+    fn captured_environment_cannot_escape_its_config_origin_or_override_controls() {
+        for path in [
+            "../outside",
+            "a/../../outside",
+            "/outside",
+            "C:/outside",
+            "a\\b",
+            "a\n",
+        ] {
+            let value = toml::Value::try_from(json!({
+                "env": {"APP_PATH": {"value":path,"relative":true}}
+            }))
+            .unwrap();
+            assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "MAKEFLAGS",
+            "MFLAGS",
+            "NUM_JOBS",
+            "CARGO",
+            "RUSTC",
+            "RUSTDOC",
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "GLIBC_TUNABLES",
+            "CARGO_TARGET_DIR",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTUP_HOME",
+            "RUSTC_WRAPPER",
+            "RUSTDOCFLAGS",
+            "CLIPPY_ARGS",
+            "RABS_BUILD_DEPTH",
+            "RCH_BYPASS",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_SSH_COMMAND",
+        ] {
+            for setting in [
+                json!("private-value-must-not-appear"),
+                json!({"value":"private-value-must-not-appear","force":true}),
+            ] {
+                let value = toml::Value::try_from(json!({"env":{name:setting}})).unwrap();
+                let error = validate_cargo_config(&value, Path::new(""), false).unwrap_err();
+                assert!(!error.to_string().contains("private-value-must-not-appear"));
+            }
+        }
+    }
+
+    #[test]
+    fn captured_environment_rejects_malformed_or_unbounded_values() {
+        for text in [
+            "env='bad'",
+            "[env]\nAPP=3",
+            "[env]\nAPP={force=true}",
+            "[env]\nAPP={value=3}",
+            "[env]\nAPP={value='ok',force='true'}",
+            "[env]\nAPP={value='ok',relative=1}",
+            "[env]\nAPP={value='ok',unknown=true}",
+            "[env]\n'bad-name'='ok'",
+            "[env]\n'1APP'='ok'",
+            "[env]\n''='ok'",
+            "[env]\nAPP='\u{0}'",
+        ] {
+            // TOML itself rejects NUL; the native environment validator also
+            // rejects it when a typed value is constructed directly below.
+            if let Ok(value) = toml::from_str(text) {
+                assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+            }
+        }
+        for entries in [
+            json!({"APP":"\u{0}"}),
+            json!({"APP":"x".repeat(64 * 1024 + 1)}),
+            json!({"ONE":"x".repeat(64 * 1024),"TWO":"y".repeat(64 * 1024)}),
+            json!({"APP":{"value":"x".repeat(4096),"relative":true}}),
+            json!({"x".repeat(257):"value"}),
+        ] {
+            let value = toml::Value::try_from(json!({"env":entries})).unwrap();
+            assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+        }
+        let entries: std::collections::BTreeMap<_, _> = (0..257)
+            .map(|index| (format!("APP_{index}"), "value"))
+            .collect();
+        let value = toml::Value::try_from(json!({"env":entries})).unwrap();
+        assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
     }
 
     #[test]
@@ -1280,7 +1489,10 @@ mod tests {
             "[llvm-cov]\nunknown-command='outside'",
         ] {
             let value: toml::Value = toml::from_str(text).unwrap();
-            assert!(validate_cargo_config(&value, false).is_err(), "{text}");
+            assert!(
+                validate_cargo_config(&value, Path::new(""), false).is_err(),
+                "{text}"
+            );
         }
     }
 
@@ -1341,7 +1553,8 @@ mod tests {
             "[llvm-cov]\nexclude=[42]",
         ] {
             assert!(
-                validate_cargo_config(&toml::from_str(text).unwrap(), false).is_err(),
+                validate_cargo_config(&toml::from_str(text).unwrap(), Path::new(""), false)
+                    .is_err(),
                 "{text}"
             );
         }

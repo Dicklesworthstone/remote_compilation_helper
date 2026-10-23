@@ -280,6 +280,53 @@ impl Fixture {
             specification,
         }
     }
+    fn with_config_environment() -> Self {
+        let mut fixture = Self::new();
+        let config = fs::read_to_string(fixture.anchor.join(".cargo/config.toml")).unwrap();
+        write(
+            &fixture.anchor,
+            ".cargo/config.toml",
+            format!(
+                "{config}\n[env]\nBUILD_LABEL={{value={},force=true}}\nCONFIG_DEFAULT='from captured config'\nPROFILE_WINS={{value='config fallback',force=false}}\nCONFIG_EMPTY=''\nCONFIG_ASSET={{value='app/data/message.txt',relative=true}}\nCONFIG_ROOT={{value='',relative=true}}\n",
+                serde_json::to_string(LABEL).unwrap()
+            ),
+        );
+        fixture.specification["command_context"]["env"]["BUILD_LABEL"] =
+            json!("overridden by force");
+        fixture.specification["command_context"]["env"]["PROFILE_WINS"] = json!("explicit context");
+        write(&fixture.anchor, "app/data/message.txt", "captured asset\n");
+        write(
+            &fixture.anchor,
+            "app/build.rs",
+            r#"fn main() {
+    let root = std::path::PathBuf::from(std::env::var_os("CONFIG_ROOT").unwrap());
+    let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    assert_eq!(root, package.parent().unwrap());
+    assert_eq!(std::env::var("CONFIG_DEFAULT").unwrap(), "from captured config");
+    assert_eq!(std::env::var("PROFILE_WINS").unwrap(), "explicit context");
+    assert_eq!(std::env::var("CONFIG_EMPTY").unwrap(), "");
+    let asset = std::path::PathBuf::from(std::env::var_os("CONFIG_ASSET").unwrap());
+    assert_eq!(asset, package.join("data/message.txt"));
+    assert_eq!(std::fs::read_to_string(asset).unwrap(), "captured asset\n");
+    println!("cargo:rerun-if-env-changed=CONFIG_ASSET");
+    println!("cargo:rerun-if-changed=data/message.txt");
+}
+"#,
+        );
+        write(
+            &fixture.anchor,
+            "app/src/main.rs",
+            r#"fn main() {
+    assert_eq!(env!("CONFIG_DEFAULT"), "from captured config");
+    assert_eq!(env!("PROFILE_WINS"), "explicit context");
+    assert_eq!(env!("CONFIG_EMPTY"), "");
+    assert_eq!(include_str!(env!("CONFIG_ASSET")), "captured asset\n");
+    println!("{}:{}", registry_dep::answer() + local_dep::answer(), env!("BUILD_LABEL"));
+}
+"#,
+        );
+        fixture
+    }
     fn vendor(root: &Path, name: &str, files: BTreeMap<&str, &str>) -> String {
         let mut checksums = serde_json::Map::new();
         for (path, bytes) in files {
@@ -703,12 +750,20 @@ fn vendored_build_preserves_captured_compiler_flags_with_source_replacements() {
 }
 
 #[test]
+fn captured_cargo_environment_reaches_real_build_scripts_and_compilers() {
+    run_captured_vendor_build(Fixture::with_config_environment());
+}
+
+#[test]
 fn vendor_source_replacements_do_not_bypass_compiler_config_validation() {
     for extra in [
         "[build]\nrustc-wrapper='outside'\n",
         "[build]\nrustflags=['-Clinker=/outside']\n",
         "[target.'cfg(unix)']\nrunner='outside'\n",
         "[env]\nRUSTFLAGS='--sysroot=/outside'\n",
+        "[env]\nAPP_INPUT={value='../outside',relative=true}\n",
+        "[env]\nAPP_INPUT={value='/outside',relative=true}\n",
+        "[env]\nLD_PRELOAD={value='/outside',force=true}\n",
     ] {
         let fixture = Fixture::new();
         let config = fs::read_to_string(fixture.anchor.join(".cargo/config.toml")).unwrap();
@@ -768,6 +823,13 @@ fn run_captured_vendor_build(fixture: Fixture) {
         .env("RUSTC", &fixture.rustc)
         .env("CARGO_INCREMENTAL", "0")
         .env("BUILD_LABEL", LABEL);
+    // Exercise the same application inputs that the native worker will present.
+    // The target and compiler remain local to this filesystem-only fixture.
+    for (name, value) in request["command_context"]["env"].as_object().unwrap() {
+        if !matches!(name.as_str(), "CARGO_TARGET_DIR" | "RUSTC") {
+            cmd.env(name, value.as_str().unwrap());
+        }
+    }
     let (status, _, stderr) =
         Process::spawn(fixture.owner.path(), "cargo-build", &mut cmd).wait(Duration::from_secs(90));
     assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
@@ -1051,6 +1113,12 @@ fn automatic_vendored_bundle_builds_over_native_tls_and_replays_installed_output
 #[ignore = "requires canonical-capable Linux, a complete transferable toolchain, OpenSSL and matching RABS_TEST_WORKER_BIN; run explicitly"]
 fn uploaded_toolchain_builds_vendored_workspace_over_native_tls_and_recovers_offline() {
     run_vendored_native_tls_build(true);
+}
+
+#[test]
+#[ignore = "requires canonical-capable Linux, OpenSSL and matching RABS_TEST_WORKER_BIN; run explicitly"]
+fn captured_cargo_environment_resolves_inside_canonical_native_tls_builds() {
+    run_native_tls_build(Fixture::with_config_environment(), false);
 }
 
 fn run_vendored_native_tls_build(upload_toolchain: bool) {

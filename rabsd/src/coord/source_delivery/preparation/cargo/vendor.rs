@@ -742,7 +742,7 @@ fn validate_config(
     base: &Path,
     directory: &str,
 ) -> io::Result<SourceReplacements> {
-    super::validate_cargo_config(value, true)?;
+    super::validate_cargo_config(value, base, true)?;
     let top = value
         .as_table()
         .ok_or_else(|| invalid("vendor config must be a table"))?;

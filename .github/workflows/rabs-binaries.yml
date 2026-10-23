@@ -140,7 +140,7 @@ jobs:
       - name: Locked registry capture and isolated Cargo workspace
         run: |
           cargo test --release -p rabsd --lib coord::source_delivery::preparation::cargo --locked
-          cargo test --release -p rabsd --test cargo_vendor_prepare registry:: --locked
+          cargo test --release -p rabsd --test cargo_vendor_prepare --locked
           cargo test --release -p rabs-sandbox --lib cargo_home --locked
           cargo test --release -p rabs-wkr --lib cargo_home --locked
       - name: Cargo workspace outputs and independent delivery verification
