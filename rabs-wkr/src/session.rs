@@ -1160,7 +1160,7 @@ fn execute_canonical_inner(
                     }
                 }
             };
-            if let Some(artifacts) = artifacts
+            if let Some(artifacts) = artifacts.as_ref()
                 && exit_code == 0
                 && output.residual_group_members == 0
                 && control.reason().is_none()
@@ -1182,7 +1182,7 @@ fn execute_canonical_inner(
                         Ok(captured)
                     });
                 if let (Some(attempt), Ok(captured)) = (target_attempt, &capture) {
-                    match attempt.stage(&artifacts, captured, &|| control.reason().is_some()) {
+                    match attempt.stage(artifacts, captured, &|| control.reason().is_some()) {
                         Ok(Some(seed)) => {
                             let _ = control.retain_target_seed(seed);
                         }
@@ -1202,6 +1202,32 @@ fn execute_canonical_inner(
                     .is_err()
                 {
                     return exec_error(request.request_id);
+                }
+            } else if output
+                .status
+                .code()
+                .is_some_and(|code| (1..128).contains(&code))
+                && output.residual_group_members == 0
+                && control.reason().is_none()
+                && let (Some(artifacts), Some(attempt)) = (artifacts.as_ref(), target_attempt)
+            {
+                // An ordinary failed Cargo command may have compiled many
+                // useful dependencies. Retain only a private target seed;
+                // missing final outputs and the nonzero result stay failures.
+                // The final control frontier checks this exact native exit,
+                // diagnostics and cancellation again before publishing a seed.
+                match attempt.stage_failed(artifacts, output.status, &|| control.reason().is_some())
+                {
+                    Ok(Some(seed)) => {
+                        let _ = control.retain_target_seed(seed);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"kind":"worker-target-state-refused", "request_id":request.request_id, "error":error.to_string()})
+                        );
+                    }
                 }
             }
             ExecResult {

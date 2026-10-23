@@ -1,11 +1,12 @@
 # Worker-local Cargo target state
 
-The canonical worker can retain successful Cargo target trees and seed later
-builds with independently owned copies. Cargo executes on every request and
+The canonical worker can retain Cargo target trees after successful builds or
+ordinary completed compile, lint or test failures, then seed later builds with
+independently owned copies. Cargo or Clippy executes on every request and
 decides which compilation steps are fresh. This accelerates repeated commands,
 ordinary build/check/test transitions, changes to package or target selection,
-and Clippy runs across bounded local Rust-source edits. Every request still
-executes its current command and verifies its current result.
+and Clippy runs across local source and data edits. Every request still executes
+its current command and verifies its current result.
 
 ## Enable it on a worker
 
@@ -44,7 +45,7 @@ authenticated coordinator certificate keys.
 
 Changing a captured dependency, environment value, feature flag, toolchain,
 output location or required files, or effective job grant starts with a fresh
-target. The restricted local Rust-source edit family below is the only exception
+target. The restricted local input edit family below is the only exception
 to exact source bytes. An identical invocation can reuse its prior target while Cargo
 still runs the requested command, including test executables for `cargo test`.
 
@@ -65,8 +66,9 @@ dependencies while building the new test targets. A subsequent `cargo test`
 can reuse those compiled targets and still executes the tests. Check and build
 may require different compiler outputs, which Cargo creates as necessary. A
 restored target therefore does not imply that every compiler artifact is fresh.
-Every invocation produces and verifies its own artifact report, diagnostics,
-exit status, and cancellation outcome.
+Every invocation reports and verifies its own diagnostics, exit status and
+cancellation outcome. Successful invocations also require their current
+artifact report.
 
 Selecting one workspace library and later selecting a binary or example can
 therefore reuse their shared dependencies while compiling the newly requested
@@ -75,14 +77,14 @@ artifact report. A selected test still runs its harness and returns its current
 failure even when all compilation steps are fresh.
 
 Canonical Clippy has its own compatibility family. Repeated Clippy invocations
-and the eligible Rust edits below can reuse a previous Clippy target. The
+and the eligible source/data edits below can reuse a previous Clippy target. The
 captured `cargo-clippy`, Cargo and rustc bindings, all package/target selectors,
 `--no-deps`, and every argument after Clippy's lint separator remain exact,
 including their order. Clippy can otherwise consider a previously unlinted
 dependency fresh when that package becomes a selected lint target. Keeping its
 selectors exact ensures the newly selected package actually receives its lints.
 Changing an allow/deny level also starts with a fresh target; the current Clippy
-process must recheck edited source and return any lint failure. Cargo
+process must recheck affected units and report any current lint failure. Cargo
 build/check/test targets and Clippy targets use separate families.
 
 The worker gives each eligible execution a fresh HOME and a captured or empty
@@ -90,15 +92,23 @@ Cargo home. Its jobserver has a stable canonical FIFO name but a new private
 FIFO and independent token budget for each execution. The final environment,
 including that actual grant, participates in the match.
 
-### Reuse after local Rust-source edits
+### Reuse after local source and data edits
 
 For a workspace with local/path packages, a compatible target can survive edits,
-additions, removals and renames of non-executable `.rs` files, including `build.rs`.
-Non-Rust files (including manifests, lockfiles, Cargo configuration and data read
-by build scripts), executable inputs, and all files underneath a
-`.cargo-checksum.json` package root remain exact in content, membership and
-executable mode. Changing those inputs still selects a fresh target. Unknown
-commands and arguments retain exact-invocation reuse only.
+additions, removals and renames of ordinary non-executable source and data files.
+This includes `.rs` files and `build.rs`, text and binary assets consumed through
+`include_str!` or `include_bytes!`, and schemas, templates, headers or other
+inputs tracked by build scripts. Cargo applies its usual dep-info and
+`rerun-if-changed` rules to the current bytes and restored target. Build scripts
+remain responsible for declaring the inputs they read.
+
+`Cargo.toml`, `Cargo.lock`, `rust-toolchain`, `rust-toolchain.toml`, `clippy.toml`,
+`.clippy.toml`, all `.cargo` and `.git` descendants, `.gitignore`, `.gitattributes`,
+`.gitmodules`, executable inputs, and all files underneath a
+`.cargo-checksum.json` package root remain
+exact in content, membership and executable mode. Those controls and immutable
+dependencies still select a fresh target when changed. Unknown commands and
+arguments retain exact-invocation reuse only.
 
 This also applies to isolated `cargo_home_source` projections, including captured
 registry archives and locked Git databases. The worker retains the admitted
@@ -131,20 +141,38 @@ The worker reads back the complete timestamp plan and re-verifies current bytes.
 A regressed clock or inadequate filesystem timestamp precision refuses optional
 restoration and builds cold; output timestamps are never changed to force a hit.
 Directory mode changes and empty-directory changes unrelated to the admitted
-Rust membership changes also refuse optional restoration.
+source/data membership changes also refuse optional restoration.
 
 Cargo or Clippy still runs and decides which local units/dependents to rebuild
 or relint. Tests run again even when their compiled state can be reused. The
-exact invocation key,
-current source manifest, output checks and success-only seed publication remain
-unchanged. This is not a cross-source action-cache hit or cached test outcome.
+exact invocation key, current source manifest, output checks and final completion
+fence remain unchanged. This is not a cross-source action-cache hit or cached
+test outcome.
+
+### Reuse after a failed compile, lint or test
+
+A normally exited Cargo or Clippy command with status 1–127 can leave useful
+completed dependencies even when another crate does not compile, a lint is denied
+or a test fails. The worker can retain that complete private target tree and
+restore it for the next command. Cargo reads its own fingerprints, rebuilds
+unfinished or changed units, and executes the requested tests again. A repeated
+failing test command still returns its nonzero status and current diagnostics;
+fixing the source can reuse completed dependencies without treating the earlier
+failure as a successful result.
+
+Failure seeds have no successful artifact offer. Missing final outputs are
+never invented, and no failed target tree is delivered as a completed build.
+The snapshot must pass the same byte, file-count, path, internal-hard-link and
+mutation checks as other private target state. Its source bytes and timestamps
+are verified before and after capture. Empty or unsafe partial trees simply
+do not produce a seed.
 
 ## How ownership and freshness work
 
 The worker first validates the original sealed source and its namespace. Cold
 and contended lookups keep that existing read-only workspace; they do not copy
 it just to discover that no target seed is available. Cold attempts still
-revalidate the complete source before staging a successful target seed.
+revalidate the complete source before staging a target seed.
 
 Only a matching target seed triggers creation and verification of a separate
 runtime workspace. Only that private copy may receive retained timestamps or
@@ -162,11 +190,17 @@ the seed, other attempts, and shared storage. Output timestamps are preserved,
 not advanced to make Cargo consider an output fresh. The namespace mounts only
 the execution's private target writable.
 
-Successful execution, process cleanup, diagnostic verification, artifact
-capture, and the final cancellation check must all succeed before a pending
-seed enters the pool. Failed or interrupted commands cannot publish a seed.
-A later result-delivery or retention failure can leave valid local target state;
-that state does not authorize serving or replaying a compiler result.
+Normal process completion, zero residual descendants, verified diagnostics,
+source validation and the final cancellation check are required before a
+pending seed enters the pool. The seed must match the observed native exit
+status. A zero exit additionally requires the complete validated successful
+artifact offer; an ordinary nonzero Cargo exit may retain private state without
+such an offer. Signal termination of the native launcher and exit statuses
+128–255, which namespace launchers may use to report an inner signal, cannot
+publish seeds. Cancellation, deadlines, lost execution leases, uncertain cleanup
+and invalid captures also prevent publication. A later result-delivery or
+retention failure can leave valid local target state; that
+state does not authorize serving or replaying a compiler result.
 
 Corrupt, changed, oversized, or unavailable seeds are refused. Directories must
 retain owner read, write, and search permission so cancellation and eviction can

@@ -207,6 +207,12 @@ impl PreparedArtifacts {
         self.directory.path()
     }
 
+    /// The execution-owned output contract, including Cargo's dynamic mode.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn plan(&self) -> &ArtifactPlan {
+        &self.plan
+    }
+
     /// Reuse D005's canonical output-unit mount, rather than constructing argv.
     #[must_use]
     pub fn mount(&self) -> UnitMount {

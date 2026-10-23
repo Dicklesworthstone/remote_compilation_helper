@@ -95,6 +95,7 @@ fn projected_edits_keep_registry_and_git_cache_bytes_modes_and_membership_exact(
         let cache = Arc::new(TargetCache::new(4096).unwrap());
         stage_fixture(&cache, original);
         write(root.path(), "src/lib.rs", "pub fn answer() -> u32 { 9 }\n");
+        write(root.path(), "assets/message.txt", b"new workspace data");
         let edited = projected(observe(root.path()), &members, version, PREFIX);
         assert_ne!(
             edited.full_source_digest, old_digest,
@@ -124,6 +125,12 @@ fn projected_edits_keep_registry_and_git_cache_bytes_modes_and_membership_exact(
             b"pub fn injected() {}",
         ));
         variants.push(("injected Rust cache member".into(), changed));
+        let mut changed = members.clone();
+        changed.push(member(
+            "registry/src/injected/assets/data.bin",
+            &[1, 2, 255],
+        ));
+        variants.push(("injected data cache member".into(), changed));
         let mut changed = members.clone();
         changed[0].path.push_str(".renamed");
         variants.push(("renamed cache member".into(), changed));
@@ -519,4 +526,44 @@ fn real_offline_registry_cargo_keeps_dependencies_fresh_after_a_workspace_edit()
     let changed_cache = fixture.run(&target, false);
     changed_cache.fresh("registry_dep", false);
     assert_eq!(changed_cache.output.unwrap().0, b"56\n");
+}
+
+#[test]
+fn real_offline_registry_cargo_reuses_dependencies_after_embedded_data_edits() {
+    let fixture = RegistryFixture::new();
+    write(&fixture.cargo.source, "assets/number.txt", b"2");
+    let main = fs::read_to_string(fixture.cargo.source.join("src/main.rs")).unwrap();
+    fixture.cargo.edit(
+        "src/main.rs",
+        main.replace(
+            "+ 0 }",
+            "+ include_str!(\"../assets/number.txt\").trim().parse::<u32>().unwrap() }",
+        ),
+    );
+    let target = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+    let first = fixture.run(&target, false);
+    first.fresh("registry_dep", false);
+    assert_eq!(first.output.unwrap().0, b"53\n");
+    fixture.cargo.edit("assets/number.txt", b"7");
+    let edited = fixture.run(&target, true);
+    edited.fresh("registry_dep", true);
+    edited.fresh("edit_dep", true);
+    edited.fresh("edit_app", false);
+    let expected = edited.output.unwrap();
+    assert_eq!(expected.0, b"58\n");
+    let unchanged = fixture.run(&target, true);
+    unchanged.fresh("registry_dep", true);
+    unchanged.fresh("edit_dep", true);
+    unchanged.fresh("edit_app", true);
+    assert_eq!(unchanged.output.unwrap(), expected);
+    let cold = fixture.run(
+        &Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap()),
+        false,
+    );
+    cold.fresh("registry_dep", false);
+    assert_eq!(
+        cold.output.unwrap(),
+        expected,
+        "embedded workspace data must not contaminate captured dependency reuse"
+    );
 }

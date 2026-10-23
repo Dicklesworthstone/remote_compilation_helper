@@ -393,7 +393,8 @@ fn complete_result(
     stop_reason: Option<StopReason>,
 ) -> Result<ExecutionCompletion, String> {
     // Taking ownership immediately also releases the reservation on every
-    // error/early return. A failed result can never leave a publishable seed.
+    // error/early return. Only the seed's exact normal native exit can publish;
+    // interruptions and invalid completions cannot retain private hot state.
     let target_seed = control
         .target_seed
         .lock()
@@ -451,11 +452,10 @@ fn complete_result(
     };
     drop(capture);
     if result.executed
-        && result.exit_code == 0
         && stop_reason.is_none()
-        && artifacts.is_some()
         && control.state.load(Ordering::Acquire) == FINISHED
         && let Some(seed) = target_seed
+        && seed.matches_completion(result.request_id, result.exit_code, artifacts.is_some())
     {
         seed.publish();
     }

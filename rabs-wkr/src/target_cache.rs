@@ -2,7 +2,7 @@
 //!
 //! Verified inputs may seed a NEW private target directory. Cargo still
 //! executes and owns every freshness decision, including build-script tracking.
-//! Unchanged sources retain prior timestamps; eligible edited Rust sources are
+//! Unchanged inputs retain prior timestamps; eligible source and data edits are
 //! made newer than every retained fingerprint before Cargo runs. Output
 //! timestamps are preserved, never advanced to manufacture freshness. No seed
 //! is mounted writable or linked into an execution. Verified internal aliases
@@ -639,9 +639,11 @@ struct Seed {
 }
 
 /// Staging is not publication. ExecutionControl owns this until its FINAL
-/// successful execution frontier, after cancellation, drains and artifact
-/// checks. Subsequent result-spool/delivery failures do not invalidate normal
-/// Cargo state produced by that successfully completed native execution.
+/// completed execution frontier, after cancellation, drains and diagnostic
+/// checks. Successful commands also require their validated artifact offer.
+/// An ordinary Cargo failure may retain private target state, never a result
+/// cache hit or successful artifact offer. The observed native exit binds the
+/// candidate to that exact completion rather than an interruption or refusal.
 #[derive(Debug)]
 pub(crate) struct PendingTargetSeed {
     // Drop the owned tree BEFORE releasing its byte/entry reservation, so a
@@ -649,9 +651,21 @@ pub(crate) struct PendingTargetSeed {
     seed: Option<Seed>,
     reservation: Reservation,
     request_id: u64,
+    exit_code: i32,
 }
 
 impl PendingTargetSeed {
+    pub(crate) fn matches_completion(
+        &self,
+        request_id: u64,
+        exit_code: i32,
+        artifacts: bool,
+    ) -> bool {
+        self.request_id == request_id
+            && self.exit_code == exit_code
+            && (exit_code != 0 || artifacts)
+    }
+
     pub(crate) fn publish(mut self) {
         let mut state = self
             .reservation
@@ -768,7 +782,75 @@ impl TargetAttempt {
                 invalidated: AtomicBool::new(false),
             }),
             request_id: self.request_id,
+            exit_code: 0,
         }))
+    }
+
+    /// Preserve a normally exited Cargo command's complete private target even
+    /// when a compile or test failed. Cargo's own fingerprints decide reuse on
+    /// the next execution. Missing final outputs remain missing; no successful
+    /// artifact report or transport offer is constructed for this state.
+    /// Bubblewrap may report an inner signal as an ordinary 128+signal exit.
+    /// Exclude that entire range as well as direct signal statuses; Cargo's
+    /// ordinary compile/test failure (101) remains eligible.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stage_failed(
+        self,
+        artifacts: &PreparedArtifacts,
+        status: std::process::ExitStatus,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Option<PendingTargetSeed>> {
+        use rabs_sandbox::artifact_tree::TreeInventory;
+        let exit_code = status
+            .code()
+            .filter(|code| (1..128).contains(code))
+            .ok_or_else(|| invalid("target state requires a nonzero Cargo exit below 128"))?;
+        if artifacts.plan().cargo_mode().is_none() {
+            return Err(invalid(
+                "failed target state requires a Cargo output contract",
+            ));
+        }
+        if SourceTimes::capture(&self.inputs, stopped)? != self.times {
+            return Err(invalid("source changed while Cargo was executing"));
+        }
+        let inventory =
+            TreeInventory::scan_complete(artifacts.backing(), MAX_ARTIFACT_BYTES, stopped)?;
+        let Some(reservation) = self.cache.reserve(inventory.total_bytes()) else {
+            return Ok(None);
+        };
+        let tree = TreeSnapshot::capture_inventory(&inventory, stopped)?;
+        if SourceTimes::capture(&self.inputs, stopped)? != self.times {
+            return Err(invalid(
+                "source changed while capturing failed Cargo target state",
+            ));
+        }
+        Ok(Some(PendingTargetSeed {
+            reservation,
+            seed: Some(Seed {
+                key: self.key,
+                compatible: self.compatible,
+                source: self.times,
+                edit_family: source_edits::identity(&self.inputs),
+                source_manifest: self.inputs.manifest,
+                tree,
+                invalidated: AtomicBool::new(false),
+            }),
+            request_id: self.request_id,
+            exit_code,
+        }))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn stage_failed(
+        self,
+        _: &PreparedArtifacts,
+        _: std::process::ExitStatus,
+        _: &impl Fn() -> bool,
+    ) -> io::Result<Option<PendingTargetSeed>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "target state requires Linux",
+        ))
     }
 }
 
@@ -937,6 +1019,20 @@ fn directory_times(
 
 #[cfg(target_os = "linux")]
 impl TreeSnapshot {
+    fn capture_inventory(
+        tree: &rabs_sandbox::artifact_tree::TreeInventory,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        let directory = private_directory("rabs-target-seed-")?;
+        let (files, directories) = copy_tree(tree, directory.path(), stopped)?;
+        Ok(Self {
+            directory,
+            files,
+            directories,
+            bytes: tree.total_bytes(),
+        })
+    }
+
     fn capture(
         root: &Path,
         captured: &CapturedArtifacts,
@@ -945,12 +1041,16 @@ impl TreeSnapshot {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = captured.file_names().map(str::to_owned).collect();
         let tree = TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?;
-        let directory = private_directory("rabs-target-seed-")?;
-        let (files, directories) = copy_tree(&tree, directory.path(), stopped)?;
-        if files.keys().map(String::as_str).ne(captured.file_names()) {
+        let snapshot = Self::capture_inventory(&tree, stopped)?;
+        if snapshot
+            .files
+            .keys()
+            .map(String::as_str)
+            .ne(captured.file_names())
+        {
             return Err(invalid("target seed differs from validated artifact set"));
         }
-        for (name, file) in &files {
+        for (name, file) in &snapshot.files {
             if captured.file_identity(name)
                 != Some((
                     file.len,
@@ -961,12 +1061,7 @@ impl TreeSnapshot {
                 return Err(invalid("target seed differs from validated artifact bytes"));
             }
         }
-        Ok(Self {
-            directory,
-            files,
-            directories,
-            bytes: tree.total_bytes(),
-        })
+        Ok(snapshot)
     }
 
     fn restore(&self, destination: &Path, stopped: &impl Fn() -> bool) -> io::Result<()> {

@@ -155,6 +155,30 @@ mod linux {
         ) -> io::Result<Self> {
             checkpoint(stopped)?;
             validate_tree_names(required.iter().map(String::as_str))?;
+            Self::scan_with_required(root, required, max_bytes, stopped)
+        }
+
+        /// Inventory a private, quiescent tree without declaring successful
+        /// compiler outputs. Cargo may retain useful completed dependencies
+        /// after another unit fails; that state is only a seed for a later
+        /// private Cargo execution, never a successful artifact offer.
+        /// The complete nonempty tree still satisfies every ordinary path,
+        /// byte, entry, hard-link and mutation check.
+        pub fn scan_complete(
+            root: &Path,
+            max_bytes: u64,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<Self> {
+            Self::scan_with_required(root, &BTreeSet::new(), max_bytes, stopped)
+        }
+
+        fn scan_with_required(
+            root: &Path,
+            required: &BTreeSet<String>,
+            max_bytes: u64,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<Self> {
+            checkpoint(stopped)?;
             let directory = File::from(openat2(
                 CWD,
                 root,
@@ -435,6 +459,33 @@ mod tests {
         std::fs::hard_link(root.path().join("app"), outside.path().join("alias")).unwrap();
         assert!(inventory.verify(&|| false).is_err());
         assert!(TreeInventory::scan(root.path(), &required, 100, &|| false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_private_inventory_does_not_relax_successful_artifact_requirements() {
+        let root = private();
+        assert!(TreeInventory::scan_complete(root.path(), 100, &|| false).is_err());
+        std::fs::create_dir(root.path().join("deps")).unwrap();
+        std::fs::write(root.path().join("deps/finished.rlib"), b"dependency").unwrap();
+        let required = BTreeSet::from(["missing-final-binary".to_owned()]);
+        assert!(TreeInventory::scan(root.path(), &required, 100, &|| false).is_err());
+        assert!(TreeInventory::scan(root.path(), &BTreeSet::new(), 100, &|| false).is_err());
+        let inventory = TreeInventory::scan_complete(root.path(), 100, &|| false).unwrap();
+        assert_eq!(
+            inventory.names().collect::<Vec<_>>(),
+            ["deps/finished.rlib"]
+        );
+        assert!(TreeInventory::scan_complete(root.path(), 1, &|| false).is_err());
+        assert!(TreeInventory::scan_complete(root.path(), 100, &|| true).is_err());
+        let outside = private();
+        std::fs::hard_link(
+            root.path().join("deps/finished.rlib"),
+            outside.path().join("alias"),
+        )
+        .unwrap();
+        assert!(inventory.verify(&|| false).is_err());
+        assert!(TreeInventory::scan_complete(root.path(), 100, &|| false).is_err());
     }
 
     #[cfg(target_os = "linux")]

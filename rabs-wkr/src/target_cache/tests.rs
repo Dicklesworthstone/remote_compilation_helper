@@ -1,11 +1,12 @@
 use super::*;
-use crate::execution::{ExecutionTask, StopReason};
+use crate::execution::{ExecutionCompletion, ExecutionTask, StopReason};
 use crate::session::ExecResult;
 use rabs_sandbox::canonical_namespace::Bind;
 use rabs_sandbox::process_context::CommandContext;
 use rabs_sandbox::source_transfer::SourceFile;
 use rabs_sandbox::toolchain_dataset::ToolchainIdentity;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -1145,6 +1146,179 @@ impl Wake for ThreadWake {
     }
 }
 
+fn wait_completion(task: &mut ExecutionTask) -> Result<ExecutionCompletion, String> {
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match task.poll_completion(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => {
+                assert!(
+                    Instant::now() < deadline,
+                    "target-state completion timed out"
+                );
+                std::thread::park_timeout(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+#[test]
+fn normal_failure_seed_requires_exact_exit_clean_completion_and_diagnostics() {
+    for outcome in [
+        "failure",
+        "different-failure",
+        "foreign-request",
+        "success",
+        "cancel",
+        "deadline",
+        "session-lost",
+        "lease-expired",
+        "residual",
+        "bad-diagnostics",
+        "unexecuted",
+    ] {
+        let cache = Arc::new(TargetCache::new(1024).unwrap());
+        let (source, _, _, _) = small_fixture();
+        let (_, plan) = cargo_request("test", &[]);
+        let target = PreparedArtifacts::new(plan.clone()).unwrap();
+        fs::write(target.backing().join("dependency"), b"compiled dependency").unwrap();
+        let (attempt, _) = cache
+            .acquire(
+                TargetKey([3; 32]),
+                None,
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                if outcome == "foreign-request" { 4 } else { 3 },
+                &|| false,
+            )
+            .unwrap();
+        let pending = attempt
+            .stage_failed(
+                &target,
+                std::process::ExitStatus::from_raw(101 << 8),
+                &|| false,
+            )
+            .unwrap()
+            .unwrap();
+        let mut task =
+            ExecutionTask::spawn_with_artifacts(3, Duration::from_secs(10), plan, move |control| {
+                control.retain_target_seed(pending).unwrap();
+                if outcome == "bad-diagnostics" {
+                    control
+                        .retain_outputs(Err("lost diagnostic bytes".into()))
+                        .unwrap();
+                }
+                let stop = match outcome {
+                    "cancel" => Some(StopReason::Cancelled),
+                    "deadline" => Some(StopReason::DeadlineExceeded),
+                    "session-lost" => Some(StopReason::SessionLost),
+                    "lease-expired" => Some(StopReason::LeaseExpired),
+                    _ => None,
+                };
+                if let Some(stop) = stop {
+                    control.cancel(stop);
+                }
+                ExecResult {
+                    request_id: 3,
+                    exit_code: match outcome {
+                        "success" => 0,
+                        "different-failure" => 1,
+                        _ => 101,
+                    },
+                    stdout_sha256: crate::session::sha256_hex(b""),
+                    stderr_sha256: crate::session::sha256_hex(b""),
+                    executed: outcome != "unexecuted",
+                    residual_group_members: u32::from(outcome == "residual"),
+                    stdout_spill_bytes: 0,
+                    stderr_spill_bytes: 0,
+                    stdout_spill_path: None,
+                    stderr_spill_path: None,
+                }
+            })
+            .unwrap();
+        let completion = wait_completion(&mut task);
+        assert_eq!(
+            completion.is_err(),
+            matches!(outcome, "success" | "residual" | "bad-diagnostics"),
+            "{outcome}"
+        );
+        if let Ok(completion) = completion {
+            assert!(completion.artifacts.is_none(), "{outcome}");
+            assert_ne!(completion.result.exit_code, 0, "{outcome}");
+        }
+        drop(task);
+        let state = cache.state.lock().unwrap();
+        assert_eq!(
+            state.entries.len(),
+            usize::from(outcome == "failure"),
+            "{outcome}"
+        );
+        assert_eq!(state.reservations, 0, "{outcome}");
+        assert_eq!(state.reserved_bytes, 0, "{outcome}");
+    }
+}
+
+#[test]
+fn failed_seed_staging_refuses_signals_non_cargo_mutation_and_unsafe_targets() {
+    for case in [
+        "signal",
+        "wrapped-signal",
+        "high-status",
+        "zero",
+        "non-cargo",
+        "source-changed",
+        "symlink",
+        "interrupted",
+    ] {
+        let cache = Arc::new(TargetCache::new(1024).unwrap());
+        let (source, ordinary, _, _) = small_fixture();
+        let (_, cargo) = cargo_request("build", &[]);
+        let plan = if case == "non-cargo" { ordinary } else { cargo };
+        let target = PreparedArtifacts::new(plan.clone()).unwrap();
+        fs::write(target.backing().join("dependency"), b"compiled dependency").unwrap();
+        let (attempt, _) = cache
+            .acquire(
+                TargetKey([4; 32]),
+                None,
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                4,
+                &|| false,
+            )
+            .unwrap();
+        if case == "source-changed" {
+            fs::set_permissions(
+                attempt.inputs.root.join("lib.rs"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            fs::write(attempt.inputs.root.join("lib.rs"), b"changed source").unwrap();
+        }
+        if case == "symlink" {
+            std::os::unix::fs::symlink("dependency", target.backing().join("alias")).unwrap();
+        }
+        let status = std::process::ExitStatus::from_raw(match case {
+            "signal" => 9,
+            "wrapped-signal" => 137 << 8,
+            "high-status" => 255 << 8,
+            "zero" => 0,
+            _ => 101 << 8,
+        });
+        assert!(
+            attempt
+                .stage_failed(&target, status, &|| case == "interrupted")
+                .is_err(),
+            "{case}"
+        );
+        let state = cache.state.lock().unwrap();
+        assert!(state.entries.is_empty(), "{case}");
+        assert_eq!(state.reservations, 0, "{case}");
+        assert_eq!(state.reserved_bytes, 0, "{case}");
+    }
+}
+
 #[test]
 fn only_frozen_success_can_publish_a_pending_seed() {
     for outcome in [
@@ -1438,39 +1612,96 @@ mod tests {
             .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
             .filter(|message| message["reason"] == "compiler-artifact")
             .collect::<Vec<_>>();
-        let test_runs = if output.status.success() {
+        if output.status.success() {
             assert!(!artifacts.is_empty(), "actual compiler artifact report");
-            let captured = target
+        }
+        let inventory = rabs_sandbox::artifact_tree::TreeInventory::scan_complete(
+            target.backing(),
+            MAX_ARTIFACT_BYTES,
+            &|| false,
+        )
+        .unwrap();
+        let counts = inventory
+            .names()
+            .filter(|name| name.ends_with("/out/test-runs"))
+            .map(|name| {
+                fs::read_to_string(target.backing().join(name))
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            counts.len() <= 1,
+            "one executed fixture test counter: {counts:?}"
+        );
+        let test_runs = counts.first().copied().unwrap_or(0);
+        let captured = output.status.success().then(|| {
+            target
                 .capture_fixture_cargo_output(output.stdout.as_slice(), || false)
-                .unwrap();
-            let counts = captured
-                .file_names()
-                .filter(|name| name.ends_with("/out/test-runs"))
-                .map(|name| {
-                    fs::read_to_string(target.backing().join(name))
-                        .unwrap()
-                        .parse::<u32>()
-                        .unwrap()
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                counts.len() <= 1,
-                "one executed fixture test counter: {counts:?}"
-            );
-            let test_runs = counts.first().copied().unwrap_or(0);
-            attempt
-                .stage(&target, &captured, &|| false)
                 .unwrap()
-                .unwrap()
-                .publish();
-            test_runs
-        } else {
-            // Native process status remains authoritative, including test
-            // failure after a successful build-finished compilation report.
-            // ExecutionTask's separate lifecycle test covers this gate in the
-            // worker; this real-Cargo fixture must not seed a failed command.
-            0
+        });
+        let pending = match &captured {
+            Some(captured) => attempt.stage(&target, captured, &|| false),
+            None => attempt.stage_failed(&target, output.status, &|| false),
+        }
+        .unwrap()
+        .unwrap();
+        // Exercise the same final diagnostic, exit, cleanup and interruption
+        // fence as production. A failed Cargo run has no artifact offer at all.
+        let stdout = crate::output::CapturedStream::from_reader(
+            output.stdout.as_slice(),
+            output.stdout.len() as u64,
+        )
+        .unwrap();
+        let stderr = crate::output::CapturedStream::from_reader(
+            output.stderr.as_slice(),
+            output.stderr.len() as u64,
+        )
+        .unwrap();
+        let result = ExecResult {
+            request_id: 1,
+            exit_code: output.status.code().unwrap(),
+            stdout_sha256: stdout.sha256().to_owned(),
+            stderr_sha256: stderr.sha256().to_owned(),
+            executed: true,
+            residual_group_members: 0,
+            stdout_spill_bytes: 0,
+            stderr_spill_bytes: 0,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
         };
+        let mut task =
+            ExecutionTask::spawn_with_artifacts(1, Duration::from_secs(10), plan, move |control| {
+                control
+                    .retain_outputs(Ok(crate::output::CapturedOutputs { stdout, stderr }))
+                    .unwrap();
+                if let Some(captured) = captured {
+                    control.retain_artifacts(Ok(captured)).unwrap();
+                }
+                control.retain_target_seed(pending).unwrap();
+                result
+            })
+            .unwrap();
+        let mut completion = wait_completion(&mut task).unwrap();
+        assert_eq!(completion.result.exit_code, expected_status);
+        assert_eq!(completion.artifacts.is_some(), expected_status == 0);
+        assert_eq!(completion.stop_reason, None);
+        let diagnostics = completion.outputs.as_mut().unwrap();
+        assert_eq!(
+            diagnostics
+                .stdout
+                .read_chunk(0, output.stdout.len().max(1))
+                .unwrap(),
+            output.stdout
+        );
+        assert_eq!(
+            diagnostics
+                .stderr
+                .read_chunk(0, output.stderr.len().max(1))
+                .unwrap(),
+            output.stderr
+        );
         assert_eq!(
             SourceTimes::capture(&self.input(), &|| false).unwrap(),
             sealed_times,
@@ -1706,6 +1937,75 @@ fn real_cargo_build_test_and_check_reuse_targets_and_execute_tests_again() {
 }
 
 #[test]
+fn real_cargo_failed_compile_retains_completed_dependencies_for_the_fixed_source() {
+    let fixture = CargoFixture::with_dependency();
+    let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+    let source = fixture.workspace.join("src/main.rs");
+    let original = fs::read_to_string(&source).unwrap();
+    fs::write(
+        &source,
+        format!("{original}\nfn broken() {{ missing_function(); }}\n"),
+    )
+    .unwrap();
+    let failed = fixture.command_with_status(&cache, "build", &[], false, 101);
+    failed.assert_fresh("hot_dep", false, false);
+    assert!(
+        failed
+            .artifacts
+            .iter()
+            .all(|artifact| artifact["target"]["kind"] != serde_json::json!(["bin"]))
+    );
+
+    fixture.fresh_upload_timestamps();
+    let repeated = fixture.command_with_status(&cache, "build", &[], true, 101);
+    repeated.assert_fresh("hot_dep", false, true);
+
+    fs::write(&source, original).unwrap();
+    fixture.fresh_upload_timestamps();
+    let fixed = fixture.command(&cache, "build", &[], true);
+    fixed.assert_fresh("hot_dep", false, true);
+    fixed.assert_fresh("hot_fixture", false, false);
+    let warm = fixture.command(&cache, "build", &[], true);
+    warm.assert_all_fresh();
+}
+
+#[test]
+fn real_cargo_failed_tests_reuse_compilation_but_execute_and_fail_each_time() {
+    let fixture = CargoFixture::with_dependency();
+    let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+    let source = fixture.workspace.join("src/main.rs");
+    let original = fs::read_to_string(&source).unwrap();
+    fs::write(
+        &source,
+        format!(
+            "{original}\n#[test] fn still_fails() {{ assert_eq!(hot_dep::adjustment(), 1); }}\n"
+        ),
+    )
+    .unwrap();
+    let failed = fixture.command_with_status(&cache, "test", &[], false, 101);
+    failed.assert_fresh("hot_dep", false, false);
+    assert_eq!(failed.test_runs, 1);
+
+    fixture.fresh_upload_timestamps();
+    let repeated = fixture.command_with_status(&cache, "test", &[], true, 101);
+    repeated.assert_all_fresh();
+    assert_eq!(
+        repeated.test_runs, 2,
+        "a compiled failing test suite must run again"
+    );
+
+    fs::write(&source, original).unwrap();
+    fixture.fresh_upload_timestamps();
+    let fixed = fixture.command(&cache, "test", &[], true);
+    fixed.assert_fresh("hot_dep", false, true);
+    fixed.assert_fresh("hot_fixture", true, false);
+    assert_eq!(fixed.test_runs, 3);
+    let warm = fixture.command(&cache, "test", &[], true);
+    warm.assert_all_fresh();
+    assert_eq!(warm.test_runs, 4);
+}
+
+#[test]
 fn real_cargo_package_and_target_selections_reuse_dependencies_and_run_current_tests() {
     let mut fixture = CargoFixture::with_dependency();
     fs::create_dir(fixture.workspace.join("examples")).unwrap();
@@ -1792,7 +2092,18 @@ fn real_cargo_package_and_target_selections_reuse_dependencies_and_run_current_t
     failed.assert_fresh("hot_fixture", true, false);
     failed.assert_output_contains("current selected test actually ran");
     failed.assert_output_contains("FAILED");
-    assert_eq!(cache.state.lock().unwrap().entries.len(), retained);
+    assert_eq!(cache.state.lock().unwrap().entries.len(), retained + 1);
+    let repeated = fixture.command_with_status(
+        &cache,
+        "test",
+        &["--package", "hot_fixture", "--bin", "hot_fixture"],
+        true,
+        101,
+    );
+    repeated.assert_all_fresh();
+    repeated.assert_output_contains("current selected test actually ran");
+    repeated.assert_output_contains("FAILED");
+    assert_eq!(cache.state.lock().unwrap().entries.len(), retained + 1);
 }
 
 #[test]
@@ -1825,8 +2136,17 @@ fn real_clippy_source_edits_relint_without_rebuilding_dependencies_or_suppressin
     failed.assert_output_contains("needless_return");
     assert_eq!(
         cache.state.lock().unwrap().entries.len(),
-        retained,
-        "failing lints cannot publish a target seed"
+        retained + 1,
+        "an ordinary lint failure can retain private state without becoming a successful result"
+    );
+    fixture.fresh_upload_timestamps();
+    let repeated = fixture.command_with_status(&cache, "clippy", &deny, true, 101);
+    repeated.assert_fresh("hot_dep", false, true);
+    repeated.assert_output_contains("needless_return");
+    assert_eq!(
+        cache.state.lock().unwrap().entries.len(),
+        retained + 1,
+        "repeating the failed invocation replaces its seed and still rejects the current lint"
     );
 
     let allowed = fixture.command(
@@ -1846,6 +2166,19 @@ fn real_clippy_source_edits_relint_without_rebuilding_dependencies_or_suppressin
     let denied_again = fixture.command_with_status(&cache, "clippy", &deny, true, 101);
     denied_again.assert_fresh("hot_dep", false, true);
     denied_again.assert_output_contains("needless_return");
+
+    fs::write(
+        fixture.workspace.join("src/main.rs"),
+        "fn answer() -> u32 { hot_dep::adjustment() }\nfn main() { println!(\"{}\", answer()); }\n",
+    )
+    .unwrap();
+    fixture.fresh_upload_timestamps();
+    let fixed = fixture.command(&cache, "clippy", &deny, true);
+    fixed.assert_fresh("hot_dep", false, true);
+    fixed.assert_fresh("hot_fixture", false, false);
+    fixture
+        .command(&cache, "clippy", &deny, true)
+        .assert_all_fresh();
 
     // A dependency omitted from linting by --no-deps can become the next
     // primary package. Native Clippy may leave that unit fresh and skip its

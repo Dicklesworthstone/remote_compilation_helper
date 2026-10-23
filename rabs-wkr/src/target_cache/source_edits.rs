@@ -2,11 +2,14 @@
 //!
 //! Cargo tracks local/path-package source mtimes, but does not do so for registry
 //! and Git packages. Keep all directory-source packages (identified by their
-//! checksum document), non-Rust files and executable inputs exact. Local Rust
-//! files may be edited, added, removed or renamed. Isolated Cargo-home projections
-//! bind their validated cache partition byte-for-byte before normalizing workspace
-//! inputs. The legacy visible-prefix projection remains exact-source only.
+//! checksum document), Cargo/tool configuration and executable inputs exact.
+//! Local source and data files may be edited, added, removed or renamed. Isolated
+//! Cargo-home projections bind their validated cache partition byte-for-byte
+//! before normalizing workspace inputs. The legacy visible-prefix projection
+//! remains exact-source only.
 //! Unknown Cargo arguments/commands are excluded by the caller's existing gate.
+//! Cargo and Clippy use separate families; Clippy selection and lint controls
+//! remain exact in the caller's compatibility key.
 //!
 //! A matching family only selects a seed. Both trees are independently verified
 //! and copied; every changed input and its parent directories must become newer
@@ -14,8 +17,8 @@
 //! ancestor Cargo manifests for old-style build-script package scans. All other
 //! unchanged input times and every output timestamp are preserved. A regressed
 //! clock or a filesystem that cannot represent the requested timestamps yields
-//! a cold build, not a stale fingerprint. The current command and its artifact
-//! report still run.
+//! a cold build, not a stale fingerprint. The current command still runs, and
+//! successful commands validate their current artifact report.
 
 use super::{Seed, SourceTimes, WorkspaceInputs, checkpoint, invalid};
 use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
@@ -41,18 +44,47 @@ fn protected_roots(manifest: &SourceManifest) -> BTreeSet<&Path> {
 }
 
 fn editable(file: &SourceFile, protected: &BTreeSet<&Path>) -> bool {
-    if file.executable || !file.path.ends_with(".rs") {
+    let path = Path::new(&file.path);
+    // This is Cargo's mutable local input tracking, not a new action-input
+    // closure. Retain the resolution/configuration boundary exactly while
+    // allowing data consumed by include_str!/include_bytes! and build scripts
+    // to invalidate their ordinary Cargo fingerprints just like Rust sources.
+    // Git ignore/attribute rules can change Cargo's default package scan and
+    // must not silently change what that scan considers a tracked input.
+    // Keep Clippy configuration exact too: its lint settings must not rely on
+    // Cargo tracking arbitrary data files when selecting a prior Clippy target.
+    if file.executable
+        || path.file_name().is_some_and(|name| {
+            matches!(
+                name.to_str(),
+                Some(
+                    "Cargo.toml"
+                        | "Cargo.lock"
+                        | "rust-toolchain"
+                        | "rust-toolchain.toml"
+                        | "clippy.toml"
+                        | ".clippy.toml"
+                        | ".gitignore"
+                        | ".gitattributes"
+                        | ".gitmodules"
+                )
+            )
+        })
+        || path
+            .components()
+            .any(|part| part.as_os_str() == ".cargo" || part.as_os_str() == ".git")
+    {
         return false;
     }
-    !Path::new(&file.path)
+    !path
         .ancestors()
         .skip(1)
         .any(|parent| protected.contains(parent))
 }
 
 /// A length-framed family digest retains every non-editable input's name, mode
-/// and bytes. Editable Rust membership is checked by the timestamp planner, not
-/// collapsed into an action key: the exact source manifest remains unchanged.
+/// and bytes. Editable source/data membership is checked by the timestamp planner,
+/// not collapsed into an action key: the exact source manifest remains unchanged.
 pub(super) fn identity(inputs: &WorkspaceInputs) -> Option<[u8; 32]> {
     let mut hash = Sha256::new();
     if let Some(home) = &inputs.projection {
@@ -65,7 +97,7 @@ pub(super) fn identity(inputs: &WorkspaceInputs) -> Option<[u8; 32]> {
         {
             return None;
         }
-        hash.update(b"rabs.private-cargo-projected-source-edits.v2\0");
+        hash.update(b"rabs.private-cargo-projected-source-edits.v3\0");
         for value in [home.version(), home.prefix()] {
             hash.update((value.len() as u64).to_be_bytes());
             hash.update(value.as_bytes());
@@ -75,7 +107,7 @@ pub(super) fn identity(inputs: &WorkspaceInputs) -> Option<[u8; 32]> {
         if inputs.full_source_digest != inputs.manifest.digest() {
             return None;
         }
-        hash.update(b"rabs.private-cargo-source-edits.v2\0");
+        hash.update(b"rabs.private-cargo-source-edits.v3\0");
     }
     let protected = protected_roots(&inputs.manifest);
     let immutable = inputs
@@ -180,7 +212,7 @@ pub(super) fn timestamps(
     }
     if changed.is_empty() {
         return Err(invalid(
-            "changed manifest contains no supported Rust-source edit",
+            "changed manifest contains no supported local input edit",
         ));
     }
     let mut parents = BTreeSet::new();
@@ -378,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_family_keeps_non_rust_bytes_vendor_sources_and_modes_exact() {
+    fn edit_family_keeps_build_controls_vendor_sources_and_modes_exact() {
         let root = source();
         write(root.path(), "vendor/dep/.cargo-checksum.json", "{}");
         write(
@@ -386,6 +418,25 @@ mod tests {
             "vendor/dep/src/lib.rs",
             "pub fn dependency() {}\n",
         );
+        let controls = [
+            "Cargo.toml",
+            "Cargo.lock",
+            "dep/Cargo.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+            "clippy.toml",
+            "dep/.clippy.toml",
+            "dep/.cargo/config.toml",
+            ".cargo/config",
+            ".cargo/tool-input.txt",
+            ".gitignore",
+            "dep/.gitattributes",
+            ".gitmodules",
+            ".git/config",
+        ];
+        for name in controls {
+            write(root.path(), name, b"original control bytes");
+        }
         let original = observe(root.path());
         let expected = identity(&original).unwrap();
         write(
@@ -394,11 +445,10 @@ mod tests {
             "pub fn answer() -> u32 { 999 }\n",
         );
         assert_eq!(identity(&observe(root.path())), Some(expected));
-        for name in [
-            "Cargo.toml",
-            "vendor/dep/src/lib.rs",
-            "vendor/dep/.cargo-checksum.json",
-        ] {
+        for name in controls
+            .into_iter()
+            .chain(["vendor/dep/src/lib.rs", "vendor/dep/.cargo-checksum.json"])
+        {
             let before = fs::read(root.path().join(name)).unwrap();
             write(root.path(), name, b"different bytes");
             assert_ne!(identity(&observe(root.path())), Some(expected), "{name}");
@@ -417,8 +467,10 @@ mod tests {
         .unwrap();
         write(root.path(), "src/added.rs", b"new member");
         assert_eq!(identity(&observe(root.path())), Some(expected));
-        write(root.path(), "src/added.txt", b"new immutable member");
-        assert_ne!(identity(&observe(root.path())), Some(expected));
+        write(root.path(), "src/added.txt", b"new tracked data input");
+        assert_eq!(identity(&observe(root.path())), Some(expected));
+        write(root.path(), "assets/data.bin", [0, 255, 4, 128]);
+        assert_eq!(identity(&observe(root.path())), Some(expected));
     }
 
     #[test]
@@ -725,13 +777,26 @@ mod tests {
     #[test]
     fn immutable_membership_refuses_even_with_a_forged_compatible_hint() {
         for (name, operation) in [
-            ("data.txt", "add"),
-            ("data.txt", "remove"),
-            ("data.txt", "rename"),
+            (".cargo/config.toml", "add"),
+            (".cargo/config.toml", "remove"),
+            (".cargo/config.toml", "rename"),
+            ("dep/Cargo.toml", "add"),
+            ("dep/Cargo.toml", "remove"),
+            ("dep/Cargo.toml", "rename"),
+            ("clippy.toml", "add"),
+            ("clippy.toml", "remove"),
+            ("clippy.toml", "rename"),
+            ("dep/.clippy.toml", "add"),
+            ("dep/.clippy.toml", "remove"),
+            ("dep/.clippy.toml", "rename"),
             ("vendor/pkg/src/lib.rs", "add"),
             ("vendor/pkg/src/lib.rs", "remove"),
             ("vendor/pkg/src/lib.rs", "rename"),
+            ("vendor/pkg/assets/data.bin", "add"),
+            ("vendor/pkg/assets/data.bin", "remove"),
+            ("vendor/pkg/assets/data.bin", "rename"),
             ("script.rs", "executable"),
+            ("script.sh", "executable"),
         ] {
             let root = source();
             let parked = private_directory("rabs-immutable-inputs-").unwrap();
@@ -1185,7 +1250,57 @@ fn main() { println!("{}", answer()); }
     }
 
     #[test]
-    fn real_cargo_tests_execute_again_after_an_edit_and_non_rust_changes_start_cold() {
+    fn real_cargo_embedded_text_and_binary_edits_reuse_dependencies_and_match_cold_outputs() {
+        let fixture = CargoFixture::new();
+        write(&fixture.source, "assets/number.txt", b"2");
+        write(&fixture.source, "assets/number.bin", [3]);
+        fixture.edit(
+            "src/main.rs",
+            MAIN.replace(
+                "OFFSET",
+                "include_str!(\"../assets/number.txt\").trim().parse::<u32>().unwrap() + u32::from(include_bytes!(\"../assets/number.bin\")[0])",
+            ),
+        );
+        let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+        let first = fixture.run(&cache, "build", false);
+        first.fresh("edit_dep", false);
+        assert_eq!(first.output.unwrap().0, b"16\n");
+        // Same-length byte changes with the original mtime must invalidate the
+        // application through rustc's recorded include dependencies, while its
+        // unchanged local dependency and build-script compiler remain fresh.
+        fixture.edit("assets/number.txt", b"5");
+        let text = fixture.run(&cache, "build", true);
+        text.fresh("edit_dep", true);
+        text.fresh("build-script-build", true);
+        text.fresh("edit_app", false);
+        assert_eq!(text.output.unwrap().0, b"19\n");
+        fixture.edit("assets/number.bin", [7]);
+        let binary = fixture.run(&cache, "build", true);
+        binary.fresh("edit_dep", true);
+        binary.fresh("build-script-build", true);
+        binary.fresh("edit_app", false);
+        let expected = binary.output.unwrap();
+        assert_eq!(expected.0, b"23\n");
+        let unchanged = fixture.run(&cache, "build", true);
+        unchanged.fresh("edit_dep", true);
+        unchanged.fresh("build-script-build", true);
+        unchanged.fresh("edit_app", true);
+        assert_eq!(unchanged.output.unwrap(), expected);
+        let cold = fixture.run(
+            &Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap()),
+            "build",
+            false,
+        );
+        cold.fresh("edit_dep", false);
+        assert_eq!(
+            cold.output.unwrap(),
+            expected,
+            "embedded data must produce identical warm and cold compiler bytes/results"
+        );
+    }
+
+    #[test]
+    fn real_cargo_tests_execute_again_after_an_edit_and_manifest_changes_start_cold() {
         let fixture = CargoFixture::new();
         let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
         assert_eq!(fixture.run(&cache, "test", false).test_runs, 1);
@@ -1199,7 +1314,7 @@ fn main() { println!("{}", answer()); }
         let unchanged = fixture.run(&cache, "test", true);
         assert_eq!(unchanged.test_runs, 3);
         let mut manifest = fs::read(fixture.source.join("Cargo.toml")).unwrap();
-        manifest.extend_from_slice(b"\n# changed non-Rust input\n");
+        manifest.extend_from_slice(b"\n# changed Cargo manifest\n");
         fixture.edit("Cargo.toml", manifest);
         let cold = fixture.run(&cache, "test", false);
         cold.fresh("edit_dep", false);
@@ -1287,17 +1402,38 @@ fn main() {
 
     #[test]
     fn real_cargo_directory_build_scripts_observe_additions_removals_and_renames() {
+        directory_build_script_tracks_inputs("rs");
+    }
+
+    #[test]
+    fn real_cargo_directory_build_scripts_track_non_rust_edits_and_membership() {
+        directory_build_script_tracks_inputs("txt");
+    }
+
+    fn directory_build_script_tracks_inputs(extension: &str) {
         let fixture = CargoFixture::new();
         fixture.edit("build.rs", DIRECTORY_BUILD);
-        write(&fixture.source, "scan/left.rs", b"2");
-        write(&fixture.source, "scan/nested/right.rs", b"3");
+        let left = format!("scan/left.{extension}");
+        let added = format!("scan/new/deep.{extension}");
+        write(&fixture.source, &left, b"2");
+        write(
+            &fixture.source,
+            &format!("scan/nested/right.{extension}"),
+            b"3",
+        );
         let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
         assert_eq!(
             fixture.run(&cache, "build", false).output.unwrap().0,
             b"106\n"
         );
-        write(&fixture.source, "scan/new/deep.rs", b"5");
-        File::open(fixture.source.join("scan/new/deep.rs"))
+        fixture.edit(&left, b"7");
+        let edited = fixture.run(&cache, "build", true);
+        edited.fresh("edit_dep", true);
+        edited.fresh("build-script-build", true);
+        edited.fresh("edit_app", false);
+        assert_eq!(edited.output.unwrap().0, b"211\n");
+        write(&fixture.source, &added, b"5");
+        File::open(fixture.source.join(&added))
             .unwrap()
             .set_times(
                 FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
@@ -1305,7 +1441,7 @@ fn main() {
             .unwrap();
         let added = fixture.run(&cache, "build", true);
         added.fresh("edit_dep", true);
-        assert_eq!(added.output.unwrap().0, b"211\n");
+        assert_eq!(added.output.unwrap().0, b"316\n");
         fs::rename(
             fixture.source.join("scan/nested"),
             fixture.root.path().join("removed-scan"),
@@ -1313,7 +1449,7 @@ fn main() {
         .unwrap();
         let removed = fixture.run(&cache, "build", true);
         removed.fresh("edit_dep", true);
-        assert_eq!(removed.output.unwrap().0, b"308\n");
+        assert_eq!(removed.output.unwrap().0, b"413\n");
         fs::rename(
             fixture.source.join("scan/new"),
             fixture.source.join("scan/renamed"),
@@ -1323,34 +1459,45 @@ fn main() {
         renamed.fresh("edit_dep", true);
         assert_eq!(
             renamed.output.unwrap().0,
-            b"408\n",
+            b"513\n",
             "same-byte rename must rerun the scanner"
         );
         // An exact repeat must remain genuinely fresh, not invalidate the
         // build script on every target restore merely because dirs were copied.
-        assert_eq!(
-            fixture.run(&cache, "build", true).output.unwrap().0,
-            b"408\n"
-        );
+        let unchanged = fixture.run(&cache, "build", true);
+        unchanged.fresh("edit_dep", true);
+        unchanged.fresh("build-script-build", true);
+        unchanged.fresh("edit_app", true);
+        assert_eq!(unchanged.output.unwrap().0, b"513\n");
     }
 
     #[test]
     fn real_cargo_default_build_script_detects_a_removal_with_no_changed_remaining_rust_file() {
+        default_build_script_tracks_removal("rs");
+    }
+
+    #[test]
+    fn real_cargo_default_build_script_detects_data_removal_without_a_rust_edit() {
+        default_build_script_tracks_removal("txt");
+    }
+
+    fn default_build_script_tracks_removal(extension: &str) {
         let fixture = CargoFixture::new();
         fixture.edit(
             "build.rs",
             DIRECTORY_BUILD.replace("    println!(\"cargo:rerun-if-changed=scan\");\n", ""),
         );
-        write(&fixture.source, "scan/left.rs", b"2");
-        write(&fixture.source, "scan/right.rs", b"3");
+        let removed = format!("scan/right.{extension}");
+        write(&fixture.source, &format!("scan/left.{extension}"), b"2");
+        write(&fixture.source, &removed, b"3");
         let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
         assert_eq!(
             fixture.run(&cache, "build", false).output.unwrap().0,
             b"106\n"
         );
         fs::rename(
-            fixture.source.join("scan/right.rs"),
-            fixture.root.path().join("removed.rs"),
+            fixture.source.join(removed),
+            fixture.root.path().join("removed-input"),
         )
         .unwrap();
         let removed = fixture.run(&cache, "build", true);

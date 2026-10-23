@@ -243,8 +243,20 @@ allowing Cargo to skip compilation it considers fresh. An exact invocation is
 preferred; compatible `build`, `check`, `test --no-run` and `test` commands can
 share a target when their other compilation settings match. Cargo still executes
 each current request, including its selected tests and harness arguments.
-Source, build-script, environment, toolchain, feature, or effective job-grant
-changes start with a fresh target.
+Ordinary local source and data edits can retain compiled dependencies: changed
+inputs and their surviving ancestor directories receive timestamps newer than
+the retained target, and Cargo applies its own freshness checks. Embedded text
+or binary assets and declared build-script inputs follow the same path. Cargo
+manifests, lockfiles, configuration, executable inputs, immutable dependency
+sources, environment, toolchain, feature, or effective job-grant changes still
+start with a fresh target.
+
+A completed ordinary compiler or test failure can also retain its private
+target after verified process cleanup. The next request executes Cargo again
+and returns its own outcome; a failing test is never converted into a cache hit
+or a successful artifact delivery. Cancellation, uncertain cleanup, native
+launcher signal termination and unsafe partial trees cannot publish reusable
+target state.
 
 This pool survives coordinator reconnects within one worker process; it is
 disabled by default and does not persist across worker restarts. See
