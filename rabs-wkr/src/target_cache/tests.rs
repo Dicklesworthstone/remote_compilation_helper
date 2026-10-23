@@ -82,6 +82,17 @@ fn fixture_request() -> CanonicalExecRequest {
 fn cargo_request(command: &str, options: &[&str]) -> (CanonicalExecRequest, ArtifactPlan) {
     use rabs_sandbox::cargo_artifacts::{CARGO_ARTIFACTS_VERSION, CARGO_TEST_ARTIFACTS_VERSION};
     let mut request = fixture_request();
+    if command == "clippy" {
+        request.program = "/__rabs/toolchain/bin/cargo-clippy".to_owned();
+        request.command_context = CommandContext::new(
+            "/__rabs/workspace",
+            vec![
+                ("CARGO".to_owned(), "/__rabs/toolchain/bin/cargo".to_owned()),
+                ("RUSTC".to_owned(), "/__rabs/toolchain/bin/rustc".to_owned()),
+            ],
+        )
+        .unwrap();
+    }
     request.args = [
         command,
         "--frozen",
@@ -103,8 +114,15 @@ fn cargo_request(command: &str, options: &[&str]) -> (CanonicalExecRequest, Arti
     } else {
         CARGO_ARTIFACTS_VERSION
     };
+    let env: BTreeMap<_, _> = request
+        .command_context
+        .environment()
+        .iter()
+        .cloned()
+        .collect();
     let plan = crate::artifacts::parse_plan(&serde_json::json!({
         "program":request.program, "args":request.args,
+        "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace", "env":env},
         "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1", "cargo":contract},
     }))
     .unwrap()
@@ -277,7 +295,7 @@ fn target_key_binds_inputs_scope_toolchain_command_environment_and_grant() {
 }
 
 #[test]
-fn compatible_commands_preserve_compilation_selection_and_runtime_identity() {
+fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
     let (source, _, _, _) = small_fixture();
     let input = inputs(source.path(), &["lib.rs"]);
     let spec = fixture_spec("first");
@@ -298,6 +316,16 @@ fn compatible_commands_preserve_compilation_selection_and_runtime_identity() {
             "test",
             vec!["--workspace", "other_test", "--", "--nocapture"],
         ),
+        ("build", vec!["--workspace", "--package", "test"]),
+        ("build", vec!["--workspace", "--lib"]),
+        ("build", vec!["--package=other", "--bins"]),
+        ("build", vec!["-p", "other", "--example", "example"]),
+        (
+            "build",
+            vec!["--workspace", "--exclude=other", "--all-targets"],
+        ),
+        ("test", vec!["--package", "test", "--test=integration"]),
+        ("build", vec!["--all", "--benches"]),
     ] {
         let (request, selected) = cargo_request(command, &options);
         assert_eq!(compatible(&request, &selected), expected, "{options:?}");
@@ -314,8 +342,6 @@ fn compatible_commands_preserve_compilation_selection_and_runtime_identity() {
         vec!["--workspace", "--target", "x86_64-unknown-linux-gnu"],
         vec!["--workspace", "--profile", "test"],
         vec!["--workspace", "--manifest-path", "member/Cargo.toml"],
-        vec!["--workspace", "--package", "test"],
-        vec!["--workspace", "--lib"],
     ] {
         let (request, selected) = cargo_request("build", &options);
         let changed = compatible(&request, &selected);
@@ -376,6 +402,205 @@ fn compatible_commands_preserve_compilation_selection_and_runtime_identity() {
         target_compatibility_key(scope(), &build, &changed, &spec, &support(), &plan, 1).unwrap(),
         expected
     );
+}
+
+#[test]
+fn clippy_compatibility_keeps_selections_lints_companions_and_cargo_families_separate() {
+    let fixture = CargoFixture::with_dependency();
+    let input = fixture.input();
+    let (request, plan) = cargo_request(
+        "clippy",
+        &["--workspace", "--all-targets", "--", "-D", "warnings"],
+    );
+    let mut spec = fixture_spec("first");
+    request.command_context.apply_to(&mut spec).unwrap();
+    let key = |request: &CanonicalExecRequest, plan: &ArtifactPlan, input: &WorkspaceInputs| {
+        target_compatibility_key(scope(), request, input, &spec, &support(), plan, 1).unwrap()
+    };
+    let expected = key(&request, &plan, &input);
+    assert!(expected.is_some());
+    let exact = target_key(scope(), &request, &input, &spec, &support(), &plan, 1).unwrap();
+    let (selected, selection_plan) = cargo_request(
+        "clippy",
+        &[
+            "--package",
+            "hot_fixture",
+            "--bin",
+            "hot_fixture",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    );
+    assert_ne!(
+        key(&selected, &selection_plan, &input),
+        expected,
+        "Clippy selection must not reuse a previously unlinted dependency"
+    );
+    assert_ne!(
+        target_key(
+            scope(),
+            &selected,
+            &input,
+            &spec,
+            &support(),
+            &selection_plan,
+            1
+        )
+        .unwrap(),
+        exact,
+        "target selection remains in the exact request identity"
+    );
+    for options in [
+        vec!["--workspace", "--", "-D", "warnings"],
+        vec![
+            "--workspace",
+            "--all-targets",
+            "--no-deps",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        vec!["--workspace", "--all-targets", "--", "-A", "warnings"],
+        vec!["--workspace", "--all-targets", "--", "-D", "clippy::all"],
+        vec![
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-A",
+            "warnings",
+            "-D",
+            "clippy::all",
+        ],
+        vec![
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "clippy::all",
+            "-A",
+            "warnings",
+        ],
+        vec![
+            "--workspace",
+            "--all-targets",
+            "--features",
+            "other",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        vec![
+            "--workspace",
+            "--all-targets",
+            "--release",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    ] {
+        let (different, different_plan) = cargo_request("clippy", &options);
+        let changed = key(&different, &different_plan, &input);
+        assert!(changed.is_some(), "known Clippy configuration: {options:?}");
+        assert_ne!(changed, expected, "Clippy controls collapsed: {options:?}");
+    }
+    let (allow_then_deny, allow_then_deny_plan) = cargo_request(
+        "clippy",
+        &["--workspace", "--", "-A", "warnings", "-D", "clippy::all"],
+    );
+    let (deny_then_allow, deny_then_allow_plan) = cargo_request(
+        "clippy",
+        &["--workspace", "--", "-D", "clippy::all", "-A", "warnings"],
+    );
+    assert_ne!(
+        key(&allow_then_deny, &allow_then_deny_plan, &input),
+        key(&deny_then_allow, &deny_then_allow_plan, &input),
+        "lint order changes which diagnostic level wins"
+    );
+    let (check, check_plan) = cargo_request("check", &["--workspace", "--all-targets"]);
+    assert_ne!(key(&check, &check_plan, &input), expected);
+    let (test, test_plan) = cargo_request("test", &["--workspace"]);
+    assert_ne!(key(&test, &test_plan, &input), expected);
+    assert!(key(&request, &test_plan, &input).is_none());
+    let mut unbound = request.clone();
+    unbound.program = "/__rabs/toolchain/bin/cargo".into();
+    assert!(key(&unbound, &plan, &input).is_none());
+    let mut unknown = request.clone();
+    unknown.args.insert(1, "--fix".into());
+    assert!(key(&unknown, &plan, &input).is_none());
+    let mut changed_spec = spec.clone();
+    changed_spec
+        .env
+        .iter_mut()
+        .find(|(name, _)| name == "RUSTC")
+        .unwrap()
+        .1 = "/__rabs/toolchain/bin/other-rustc".into();
+    assert_ne!(
+        target_compatibility_key(
+            scope(),
+            &request,
+            &input,
+            &changed_spec,
+            &support(),
+            &plan,
+            1
+        )
+        .unwrap(),
+        expected,
+        "captured compiler binding remains exact"
+    );
+    fs::write(
+        fixture.workspace.join("src/main.rs"),
+        "fn main() { println!(\"edited\"); }\n",
+    )
+    .unwrap();
+    let edited = fixture.input();
+    assert_eq!(key(&request, &plan, &edited), expected);
+    assert_ne!(
+        target_key(scope(), &request, &edited, &spec, &support(), &plan, 1).unwrap(),
+        exact,
+        "source edits change exact identity while remaining eligible for a private Clippy seed"
+    );
+}
+
+#[test]
+fn selection_normalization_refuses_missing_empty_and_option_shaped_values() {
+    let (mut request, plan) = cargo_request("build", &["--workspace"]);
+    for selector in [
+        "--package",
+        "-p",
+        "--exclude",
+        "--bin",
+        "--example",
+        "--test",
+        "--bench",
+    ] {
+        request.args.push(selector.into());
+        assert!(
+            compatible_cargo_arguments(&request, &plan).is_none(),
+            "{selector}"
+        );
+        for value in ["", "--release"] {
+            request.args.push(value.into());
+            assert!(
+                compatible_cargo_arguments(&request, &plan).is_none(),
+                "{selector} {value}"
+            );
+            request.args.pop();
+        }
+        request.args.pop();
+        request.args.push(format!("{selector}="));
+        assert!(compatible_cargo_arguments(&request, &plan).is_none());
+        request.args.pop();
+    }
+    for selector in ["--workspace=all", "--lib=1", "--all-targets=yes"] {
+        request.args.push(selector.into());
+        assert!(
+            compatible_cargo_arguments(&request, &plan).is_none(),
+            "{selector}"
+        );
+        request.args.pop();
+    }
 }
 
 #[test]
@@ -1121,6 +1346,17 @@ mod tests {
         options: &[&str],
         hit: bool,
     ) -> CargoCommandResult {
+        self.command_with_status(cache, command, options, hit, 0)
+    }
+
+    fn command_with_status(
+        &self,
+        cache: &Arc<TargetCache>,
+        command: &str,
+        options: &[&str],
+        hit: bool,
+        expected_status: i32,
+    ) -> CargoCommandResult {
         let original = self.input();
         let sealed_times = SourceTimes::capture(&original, &|| false).unwrap();
         let runtime = tempfile::Builder::new()
@@ -1132,7 +1368,8 @@ mod tests {
         let input = original.clone_into(runtime, &|| false).unwrap();
         let workspace = input.root.clone();
         let (request, plan) = cargo_request(command, options);
-        let spec = fixture_spec("first");
+        let mut spec = fixture_spec("first");
+        request.command_context.apply_to(&mut spec).unwrap();
         let exact = target_key(scope(), &request, &input, &spec, &support(), &plan, 1).unwrap();
         let compatible =
             target_compatibility_key(scope(), &request, &input, &spec, &support(), &plan, 1)
@@ -1167,20 +1404,30 @@ mod tests {
                 argument.clone()
             }
         });
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = Command::new(cargo)
+        let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        let program = if command == "clippy" {
+            cargo.with_file_name("cargo-clippy")
+        } else {
+            cargo.clone()
+        };
+        let output = Command::new(program)
             .args(arguments)
             .current_dir(&workspace)
             .env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CLIPPY_ARGS")
+            .env_remove("CLIPPY_CONF_DIR")
+            .env("CARGO", &cargo)
+            .env("RUSTC", cargo.with_file_name("rustc"))
             .env("RUSTFLAGS", "-C debuginfo=0")
             .env("CARGO_INCREMENTAL", "0")
             .env("CACHE_LABEL", "first")
             .output()
             .expect("run the real installed Cargo and compiler");
-        assert!(
-            output.status.success(),
+        assert_eq!(
+            output.status.code(),
+            Some(expected_status),
             "{command} {options:?}: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -1191,30 +1438,39 @@ mod tests {
             .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
             .filter(|message| message["reason"] == "compiler-artifact")
             .collect::<Vec<_>>();
-        assert!(!artifacts.is_empty(), "actual compiler artifact report");
-        let captured = target
-            .capture_fixture_cargo_output(output.stdout.as_slice(), || false)
-            .unwrap();
-        let counts = captured
-            .file_names()
-            .filter(|name| name.ends_with("/out/test-runs"))
-            .map(|name| {
-                fs::read_to_string(target.backing().join(name))
-                    .unwrap()
-                    .parse::<u32>()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            counts.len() <= 1,
-            "one executed fixture test counter: {counts:?}"
-        );
-        let test_runs = counts.first().copied().unwrap_or(0);
-        attempt
-            .stage(&target, &captured, &|| false)
-            .unwrap()
-            .unwrap()
-            .publish();
+        let test_runs = if output.status.success() {
+            assert!(!artifacts.is_empty(), "actual compiler artifact report");
+            let captured = target
+                .capture_fixture_cargo_output(output.stdout.as_slice(), || false)
+                .unwrap();
+            let counts = captured
+                .file_names()
+                .filter(|name| name.ends_with("/out/test-runs"))
+                .map(|name| {
+                    fs::read_to_string(target.backing().join(name))
+                        .unwrap()
+                        .parse::<u32>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                counts.len() <= 1,
+                "one executed fixture test counter: {counts:?}"
+            );
+            let test_runs = counts.first().copied().unwrap_or(0);
+            attempt
+                .stage(&target, &captured, &|| false)
+                .unwrap()
+                .unwrap()
+                .publish();
+            test_runs
+        } else {
+            // Native process status remains authoritative, including test
+            // failure after a successful build-finished compilation report.
+            // ExecutionTask's separate lifecycle test covers this gate in the
+            // worker; this real-Cargo fixture must not seed a failed command.
+            0
+        };
         assert_eq!(
             SourceTimes::capture(&self.input(), &|| false).unwrap(),
             sealed_times,
@@ -1223,6 +1479,8 @@ mod tests {
         CargoCommandResult {
             artifacts,
             test_runs,
+            stdout: output.stdout,
+            stderr: output.stderr,
         }
     }
 
@@ -1351,6 +1609,8 @@ mod tests {
 struct CargoCommandResult {
     artifacts: Vec<serde_json::Value>,
     test_runs: u32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 impl CargoCommandResult {
@@ -1381,6 +1641,15 @@ impl CargoCommandResult {
                 .all(|artifact| artifact["fresh"] == true),
             "unexpected recompilation: {:?}",
             self.artifacts
+        );
+    }
+
+    fn assert_output_contains(&self, expected: &str) {
+        let stdout = String::from_utf8_lossy(&self.stdout);
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        assert!(
+            stdout.contains(expected) || stderr.contains(expected),
+            "missing {expected:?} in current process output: {stdout}\n{stderr}"
         );
     }
 }
@@ -1434,6 +1703,195 @@ fn real_cargo_build_test_and_check_reuse_targets_and_execute_tests_again() {
     // Prefer the exact build seed over newer compatible test/check targets.
     let built_again = fixture.command(&cache, "build", &["--workspace"], true);
     built_again.assert_all_fresh();
+}
+
+#[test]
+fn real_cargo_package_and_target_selections_reuse_dependencies_and_run_current_tests() {
+    let mut fixture = CargoFixture::with_dependency();
+    fs::create_dir(fixture.workspace.join("examples")).unwrap();
+    fs::write(
+        fixture.workspace.join("examples/selection_example.rs"),
+        "fn main() { println!(\"{}\", hot_dep::adjustment()); }\n",
+    )
+    .unwrap();
+    fixture.names.push("examples/selection_example.rs");
+    let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+
+    let dependency = fixture.command(&cache, "build", &["--package", "hot_dep", "--lib"], false);
+    dependency.assert_fresh("hot_dep", false, false);
+    assert!(
+        dependency
+            .artifacts
+            .iter()
+            .all(|artifact| artifact["target"]["name"] == "hot_dep"),
+        "the first selection must not build the later binary or example"
+    );
+
+    fixture.fresh_upload_timestamps();
+    let binary = fixture.command(
+        &cache,
+        "build",
+        &["--package", "hot_fixture", "--bin", "hot_fixture"],
+        true,
+    );
+    binary.assert_fresh("hot_dep", false, true);
+    binary.assert_fresh("hot_fixture", false, false);
+
+    fixture.fresh_upload_timestamps();
+    let example = fixture.command(
+        &cache,
+        "build",
+        &["--package=hot_fixture", "--example=selection_example"],
+        true,
+    );
+    example.assert_fresh("hot_dep", false, true);
+    example.assert_fresh("selection_example", false, false);
+
+    let tests = fixture.command(
+        &cache,
+        "test",
+        &["-p", "hot_fixture", "--bin", "hot_fixture"],
+        true,
+    );
+    tests.assert_fresh("hot_dep", false, true);
+    tests.assert_fresh("hot_fixture", true, false);
+    assert_eq!(tests.test_runs, 1);
+
+    let tested_again = fixture.command(
+        &cache,
+        "test",
+        &[
+            "--workspace",
+            "--exclude",
+            "hot_dep",
+            "--bin",
+            "hot_fixture",
+        ],
+        true,
+    );
+    tested_again.assert_all_fresh();
+    assert_eq!(
+        tested_again.test_runs, 2,
+        "new selections still run their test harness"
+    );
+
+    fs::write(
+        fixture.workspace.join("src/main.rs"),
+        "fn main() {}\n#[test]\nfn selected_failure() { panic!(\"current selected test actually ran\"); }\n",
+    )
+    .unwrap();
+    let retained = cache.state.lock().unwrap().entries.len();
+    let failed = fixture.command_with_status(
+        &cache,
+        "test",
+        &["--package", "hot_fixture", "--bin", "hot_fixture"],
+        true,
+        101,
+    );
+    failed.assert_fresh("hot_dep", false, true);
+    failed.assert_fresh("hot_fixture", true, false);
+    failed.assert_output_contains("current selected test actually ran");
+    failed.assert_output_contains("FAILED");
+    assert_eq!(cache.state.lock().unwrap().entries.len(), retained);
+}
+
+#[test]
+fn real_clippy_source_edits_relint_without_rebuilding_dependencies_or_suppressing_failures() {
+    let fixture = CargoFixture::with_dependency();
+    let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+    let deny = [
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "clippy::needless_return",
+    ];
+    let cold = fixture.command(&cache, "clippy", &deny, false);
+    cold.assert_fresh("hot_dep", false, false);
+    cold.assert_fresh("hot_fixture", false, false);
+
+    fixture.fresh_upload_timestamps();
+    fixture
+        .command(&cache, "clippy", &deny, true)
+        .assert_all_fresh();
+    fs::write(
+        fixture.workspace.join("src/main.rs"),
+        "fn answer() -> u32 { return hot_dep::adjustment(); }\nfn main() { println!(\"{}\", answer()); }\n",
+    )
+    .unwrap();
+    let retained = cache.state.lock().unwrap().entries.len();
+    let failed = fixture.command_with_status(&cache, "clippy", &deny, true, 101);
+    failed.assert_fresh("hot_dep", false, true);
+    failed.assert_output_contains("needless_return");
+    assert_eq!(
+        cache.state.lock().unwrap().entries.len(),
+        retained,
+        "failing lints cannot publish a target seed"
+    );
+
+    let allowed = fixture.command(
+        &cache,
+        "clippy",
+        &[
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-A",
+            "clippy::needless_return",
+        ],
+        false,
+    );
+    allowed.assert_fresh("hot_dep", false, false);
+    allowed.assert_fresh("hot_fixture", false, false);
+    let denied_again = fixture.command_with_status(&cache, "clippy", &deny, true, 101);
+    denied_again.assert_fresh("hot_dep", false, true);
+    denied_again.assert_output_contains("needless_return");
+
+    // A dependency omitted from linting by --no-deps can become the next
+    // primary package. Native Clippy may leave that unit fresh and skip its
+    // lints, so this selection change must start with a separate target.
+    fs::write(
+        fixture.workspace.join("src/main.rs"),
+        "fn main() { println!(\"{}\", hot_dep::adjustment()); }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.workspace.join("dep/src/lib.rs"),
+        "pub fn adjustment() -> u32 { return 0; }\n",
+    )
+    .unwrap();
+    fixture.command(
+        &cache,
+        "clippy",
+        &[
+            "--package",
+            "hot_fixture",
+            "--bin",
+            "hot_fixture",
+            "--no-deps",
+            "--",
+            "-D",
+            "clippy::needless_return",
+        ],
+        false,
+    );
+    let selected_dependency = fixture.command_with_status(
+        &cache,
+        "clippy",
+        &[
+            "--package",
+            "hot_dep",
+            "--lib",
+            "--no-deps",
+            "--",
+            "-D",
+            "clippy::needless_return",
+        ],
+        false,
+        101,
+    );
+    selected_dependency.assert_output_contains("needless_return");
+    selected_dependency.assert_output_contains("dep/src/lib.rs");
 }
 
 #[test]

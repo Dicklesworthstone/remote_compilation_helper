@@ -145,7 +145,10 @@ pub(crate) fn target_key(
     ))
 }
 
-/// Ordinary Cargo can reuse one private target across build, check and test.
+/// Ordinary Cargo can reuse one private target across build, check and test,
+/// including different package and target selections. Clippy uses a separate
+/// family and retains every selection and lint control while sharing its own
+/// prior targets across source edits.
 /// This secondary key never changes action identity or permits result replay:
 /// the current command executes with its original argv and artifact contract.
 /// Unknown argument forms retain exact-key reuse only.
@@ -162,13 +165,22 @@ pub(crate) fn target_compatibility_key(
         return Ok(None);
     };
     let mut value = target_key_description(scope, request, inputs, spec, support, plan, grant)?;
-    value["version"] = serde_json::json!("rabs.private-cargo-commands.v1");
+    let clippy = request.program == "/__rabs/toolchain/bin/cargo-clippy";
+    value["version"] = serde_json::json!(if clippy {
+        "rabs.private-clippy-commands.v1"
+    } else {
+        "rabs.private-cargo-selections.v1"
+    });
     value["args"] = serde_json::json!(args);
     value["cargo_mode"] = serde_json::json!("current-cargo-contract-required-v1");
     if let Some(source) = source_edits::identity(inputs) {
         // This is only a private Cargo seed family, never an action key.
         // Actual changed bytes remain in the exact key and current manifest.
-        value["version"] = serde_json::json!("rabs.private-cargo-source-edits.v1");
+        value["version"] = serde_json::json!(if clippy {
+            "rabs.private-clippy-source-edits.v1"
+        } else {
+            "rabs.private-cargo-selection-source-edits.v1"
+        });
         value["source"] = serde_json::json!(source);
         value["workspace"] = serde_json::json!(source);
     }
@@ -221,21 +233,34 @@ fn compatible_cargo_arguments(
     plan: &ArtifactPlan,
 ) -> Option<Vec<String>> {
     use rabs_sandbox::cargo_artifacts::CargoArtifactMode;
-    if request.program != "/__rabs/toolchain/bin/cargo" {
-        return None;
-    }
     let mode = plan.cargo_mode()?;
     let command = request.args.first()?.as_str();
-    if !matches!(command, "build" | "check" | "test") {
-        return None;
-    }
-    let mut normalized = vec!["cargo-build-check-test".to_owned()];
+    let clippy = match (request.program.as_str(), command, mode) {
+        ("/__rabs/toolchain/bin/cargo", "build" | "check" | "test", _) => false,
+        ("/__rabs/toolchain/bin/cargo-clippy", "clippy", CargoArtifactMode::Compilation) => true,
+        _ => return None,
+    };
+    let mut normalized = vec![
+        if clippy {
+            "cargo-clippy"
+        } else {
+            "cargo-build-check-test"
+        }
+        .to_owned(),
+    ];
     let mut no_run = false;
     let mut filter = false;
     let mut at = 1;
     while at < request.args.len() {
         let argument = &request.args[at];
         if argument == "--" {
+            if clippy {
+                // The admitted artifact contract already validates this as a
+                // lint-only tail. Keep every byte and its order: unlike a test
+                // harness argument, a lint can change the compiler's result.
+                normalized.extend(request.args[at..].iter().cloned());
+                break;
+            }
             // These are test-process arguments. The current invocation still
             // receives every original byte, including option-like spellings.
             if command != "test" || no_run {
@@ -253,8 +278,39 @@ fn compatible_cargo_arguments(
                 no_run = true;
             }
             "--no-fail-fast" if inline.is_none() && command == "test" => {}
-            "--bin" | "--example" | "--test" | "--bench" | "--package" | "-p" | "--features"
-            | "-F" | "--target" | "--color" | "--exclude" | "--message-format"
+            "--bin" | "--example" | "--test" | "--bench" | "--package" | "-p" | "--exclude" => {
+                // These select units within the same captured workspace. Cargo
+                // receives the original selection and checks each requested
+                // unit's own fingerprint, feature set and compiler identity.
+                // Clippy must retain the selection: a dependency compiled with
+                // --no-deps can otherwise remain fresh when selected as a
+                // primary package and silently escape its requested lints.
+                if clippy {
+                    normalized.push(argument.clone());
+                }
+                let value = if let Some(value) = inline {
+                    value
+                } else {
+                    at += 1;
+                    let value = request.args.get(at)?;
+                    if clippy {
+                        normalized.push(value.clone());
+                    }
+                    value
+                };
+                if value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+            }
+            "--workspace" | "--all" | "--lib" | "--bins" | "--examples" | "--tests"
+            | "--benches" | "--all-targets"
+                if inline.is_none() =>
+            {
+                if clippy {
+                    normalized.push(argument.clone());
+                }
+            }
+            "--features" | "-F" | "--target" | "--color" | "--message-format"
             | "--manifest-path" | "--target-dir" | "--profile" | "--jobs" | "-j" => {
                 normalized.push(argument.clone());
                 let value = if let Some(value) = inline {
@@ -271,7 +327,6 @@ fn compatible_cargo_arguments(
             }
             "--release"
             | "-r"
-            | "--workspace"
             | "--locked"
             | "--offline"
             | "--frozen"
@@ -282,17 +337,14 @@ fn compatible_cargo_arguments(
             | "-vv"
             | "--quiet"
             | "-q"
-            | "--lib"
-            | "--bins"
-            | "--examples"
-            | "--tests"
-            | "--benches"
-            | "--all-targets"
                 if inline.is_none() =>
             {
                 normalized.push(argument.clone());
             }
             "--doc" if inline.is_none() && command == "test" => {
+                normalized.push(argument.clone());
+            }
+            "--no-deps" if inline.is_none() && clippy => {
                 normalized.push(argument.clone());
             }
             _ if command == "test" && !argument.starts_with('-') && !filter => {

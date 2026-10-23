@@ -2,9 +2,10 @@
 
 The canonical worker can retain successful Cargo target trees and seed later
 builds with independently owned copies. Cargo executes on every request and
-decides which compilation steps are fresh. This accelerates repeated commands
-and ordinary build/check/test transitions, including bounded local Rust-source
-edits, without serving a stored compiler result.
+decides which compilation steps are fresh. This accelerates repeated commands,
+ordinary build/check/test transitions, changes to package or target selection,
+and Clippy runs across bounded local Rust-source edits. Every request still
+executes its current command and verifies its current result.
 
 ## Enable it on a worker
 
@@ -51,10 +52,13 @@ An exact invocation match is preferred. Otherwise, ordinary `build`, `check`,
 `test --no-run`, and `test` commands may select the most recent compatible
 target. Compilation settings and non-editable captured inputs remain exact. The
 command name, test execution switch, test filter, failure policy, and arguments
-after the test harness separator do not fragment this optional target pool;
-the current Cargo process still receives every original argument. Compiler and
-target-selection options retain their exact spelling and order. Unknown
-argument forms and Clippy keep exact-invocation reuse only.
+after the test harness separator do not fragment this optional target pool.
+Package selectors (`--package`/`-p`, `--workspace`/`--all`, `--exclude`) and target
+selectors (`--lib`, `--bin`, `--example`, `--test`, `--bench`, their plural forms,
+and `--all-targets`) may also change. Cargo still receives every original
+argument and checks the selected units' own fingerprints. Feature, profile,
+target triple, compiler, environment, and other compilation settings stay exact.
+Unknown argument forms keep exact-invocation reuse only.
 
 For example, `cargo build` followed by `cargo test --no-run` can reuse compiled
 dependencies while building the new test targets. A subsequent `cargo test`
@@ -63,6 +67,23 @@ may require different compiler outputs, which Cargo creates as necessary. A
 restored target therefore does not imply that every compiler artifact is fresh.
 Every invocation produces and verifies its own artifact report, diagnostics,
 exit status, and cancellation outcome.
+
+Selecting one workspace library and later selecting a binary or example can
+therefore reuse their shared dependencies while compiling the newly requested
+target. Switching to a different package never serves the earlier package's
+artifact report. A selected test still runs its harness and returns its current
+failure even when all compilation steps are fresh.
+
+Canonical Clippy has its own compatibility family. Repeated Clippy invocations
+and the eligible Rust edits below can reuse a previous Clippy target. The
+captured `cargo-clippy`, Cargo and rustc bindings, all package/target selectors,
+`--no-deps`, and every argument after Clippy's lint separator remain exact,
+including their order. Clippy can otherwise consider a previously unlinted
+dependency fresh when that package becomes a selected lint target. Keeping its
+selectors exact ensures the newly selected package actually receives its lints.
+Changing an allow/deny level also starts with a fresh target; the current Clippy
+process must recheck edited source and return any lint failure. Cargo
+build/check/test targets and Clippy targets use separate families.
 
 The worker gives each eligible execution a fresh HOME and a captured or empty
 Cargo home. Its jobserver has a stable canonical FIFO name but a new private
@@ -112,8 +133,9 @@ restoration and builds cold; output timestamps are never changed to force a hit.
 Directory mode changes and empty-directory changes unrelated to the admitted
 Rust membership changes also refuse optional restoration.
 
-Cargo still runs and decides which local units/dependents to rebuild. Tests run
-again even when their compiled state can be reused. The exact invocation key,
+Cargo or Clippy still runs and decides which local units/dependents to rebuild
+or relint. Tests run again even when their compiled state can be reused. The
+exact invocation key,
 current source manifest, output checks and success-only seed publication remain
 unchanged. This is not a cross-source action-cache hit or cached test outcome.
 
