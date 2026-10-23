@@ -655,7 +655,7 @@ class CanonicalCargo(unittest.TestCase):
                      ["build", "--exclude=member"], ["build", "--bin=hello", "--target-dir=/other"],
                      ["build", "--bin=hello", "--manifest-path=elsewhere"],
                      ["build", "--bin=hello", "--config", "x=y"],
-                     ["build", "--bin=hello", "--profile=custom"],
+                     ["build", "--bin=hello", "--profile=../custom"],
                      ["build", "--bin=hello", "--message-format=json"],
                      ["build", "--bin=hello", "--", "shell"],
                      ["build", "--bin=../escape"], ["build", "--bin=hello", "--bin=hello"],
@@ -688,6 +688,48 @@ class CanonicalCargo(unittest.TestCase):
                 self.assertEqual(request["args"].count("--message-format=json"), 1)
                 self.assertFalse((Path(self.records()[-1]["operation"]) / "outputs").exists(),
                                  "the launcher must not fabricate compiler outputs")
+
+    def test_custom_profiles_reach_each_native_cargo_mode_without_rewriting(self):
+        self.install_clippy()
+        cases = (
+            (["build", "--workspace", "--profile", "ci"], []),
+            (["check", "--profile=release-lto", "--all-targets"], []),
+            (["test", "--profile", "ci_2", "--no-run"], []),
+            (["test", "--profile=1stage", "selected::case"],
+             ["--", "--exact", "--profile=opaque-harness-value", "--release"]),
+            (["clippy", "--profile", "ci", "--no-deps"], ["--", "-D", "warnings"]),
+            (["build", "--profile=" + "p" * 64], []),
+        )
+        for before, after in cases:
+            with self.subTest(before=before, after=after):
+                self.assertEqual(self.invoke(before + after)[0], 0)
+                request = self.records()[-1]["request"]
+                self.assertEqual(request["args"][:len(before)], before)
+                controls = request["args"][:-len(after)] if after else request["args"]
+                self.assertEqual(controls[-2:], ["--target-dir", "/__rabs/out/cargo"])
+                self.assertEqual(request["command_context"]["env"]["CARGO_INCREMENTAL"], "0")
+                if after:
+                    self.assertEqual(request["args"][-len(after):], after)
+
+    def test_custom_profiles_reject_ambiguous_or_nonliteral_names_before_handoff(self):
+        cases = (
+            ["build", "--profile"], ["build", "--profile="],
+            ["build", "--profile", "-r"], ["build", "--profile=--release"],
+            ["build", "--profile=../ci"], ["build", "--profile=/ci"],
+            ["build", "--profile=ci/debug"], ["build", "--profile=ci\\debug"],
+            ["build", "--profile=ci debug"], ["build", "--profile=ci\n"],
+            ["build", "--profile=ci雪"], ["build", "--profile=_ci"],
+            ["build", "--profile=" + "p" * 65],
+            ["build", "--profile=ci", "--profile=ci"],
+            ["build", "--profile", "ci", "--profile=other"],
+            ["build", "--profile=ci", "--release"],
+            ["build", "--release", "--profile=ci"],
+            ["test", "-r", "--profile", "ci"],
+            ["test", "--profile=ci", "-r"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                self.assert_refused(args)
 
     def test_canonical_tests_keep_filters_harness_bytes_and_final_native_status(self):
         cases = (

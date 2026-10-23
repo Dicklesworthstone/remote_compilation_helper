@@ -423,6 +423,7 @@ fn validate_cargo_config(value: &toml::Value, base: &Path, vendor_sources: bool)
         match section.as_str() {
             "source" | "registries" if vendor_sources => {}
             "env" => validate_config_environment(value, base)?,
+            "profile" => validate_cargo_profiles(value)?,
             "build" => {
                 let build = value
                     .as_table()
@@ -494,6 +495,123 @@ fn validate_cargo_config(value: &toml::Value, base: &Path, vendor_sources: bool)
             }
             _ => return Err(invalid("unsupported captured Cargo configuration section")),
         }
+    }
+    Ok(())
+}
+
+fn cargo_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
+/// Profiles are compiler settings, not authority to select another compiler or
+/// read arbitrary paths. Keep the tables intact so Cargo merges workspace and
+/// config profiles, resolves inheritance, and applies package/build overrides.
+fn validate_cargo_profiles(value: &toml::Value) -> io::Result<()> {
+    let profiles = value
+        .as_table()
+        .filter(|profiles| profiles.len() <= 64)
+        .ok_or_else(|| invalid("Cargo profiles must be a bounded table"))?;
+    for (name, settings) in profiles {
+        require(
+            cargo_profile_name(name),
+            "captured Cargo profile names must be bounded literal names",
+        )?;
+        validate_profile_settings(settings, false)?;
+    }
+    Ok(())
+}
+
+fn validate_profile_settings(value: &toml::Value, overridden: bool) -> io::Result<()> {
+    let settings = value
+        .as_table()
+        .filter(|settings| settings.len() <= 16)
+        .ok_or_else(|| invalid("Cargo profile settings must be a bounded table"))?;
+    for (name, value) in settings {
+        let accepted = match name.as_str() {
+            "inherits" if !overridden => value.as_str().is_some_and(cargo_profile_name),
+            "build-override" if !overridden => {
+                validate_profile_settings(value, true)?;
+                true
+            }
+            "package" if !overridden => {
+                let packages = value
+                    .as_table()
+                    .filter(|packages| packages.len() <= 128)
+                    .ok_or_else(|| invalid("Cargo package profile overrides must be bounded"))?;
+                for (selector, settings) in packages {
+                    // These keys are Cargo package-ID selectors (including *),
+                    // never paths to be opened by the preparation layer.
+                    require(
+                        !selector.is_empty()
+                            && selector.len() <= 256
+                            && !selector.chars().any(char::is_control),
+                        "Cargo profile package selectors must be bounded literals",
+                    )?;
+                    validate_profile_settings(settings, true)?;
+                }
+                true
+            }
+            "opt-level" => {
+                value
+                    .as_integer()
+                    .is_some_and(|value| (0..=3).contains(&value))
+                    || value
+                        .as_str()
+                        .is_some_and(|value| matches!(value, "s" | "z"))
+            }
+            "debug" => {
+                value.is_bool()
+                    || value
+                        .as_integer()
+                        .is_some_and(|value| (0..=2).contains(&value))
+                    || value.as_str().is_some_and(|value| {
+                        matches!(
+                            value,
+                            "none"
+                                | "limited"
+                                | "full"
+                                | "line-tables-only"
+                                | "line-directives-only"
+                        )
+                    })
+            }
+            "split-debuginfo" => value
+                .as_str()
+                .is_some_and(|value| matches!(value, "off" | "packed" | "unpacked")),
+            "strip" => {
+                value.is_bool()
+                    || value
+                        .as_str()
+                        .is_some_and(|value| matches!(value, "none" | "debuginfo" | "symbols"))
+            }
+            "debug-assertions" | "overflow-checks" => value.is_bool(),
+            "lto" if !overridden => {
+                value.is_bool()
+                    || value
+                        .as_str()
+                        .is_some_and(|value| matches!(value, "thin" | "fat" | "off"))
+            }
+            "panic" if !overridden => value
+                .as_str()
+                .is_some_and(|value| matches!(value, "abort" | "unwind")),
+            // The frontend pins CARGO_INCREMENTAL=0. Config must not enable an
+            // unmodeled incremental input tree for direct prepared requests.
+            "incremental" => value.as_bool() == Some(false),
+            "codegen-units" => value
+                .as_integer()
+                .is_some_and(|value| (1..=4096).contains(&value)),
+            "rpath" if !overridden => value.is_bool(),
+            _ => false,
+        };
+        require(
+            accepted,
+            "unsupported or invalid captured Cargo profile setting",
+        )?;
     }
     Ok(())
 }
@@ -714,19 +832,45 @@ fn validate_scalar_codegen(value: &str) -> io::Result<()> {
                 | "line-tables-only"
                 | "line-directives-only"
         ),
-        "debug-assertions" | "overflow-checks" | "embed-bitcode" | "force-frame-pointers" => {
-            boolean()
-        }
+        "debug-assertions"
+        | "overflow-checks"
+        | "embed-bitcode"
+        | "force-frame-pointers"
+        | "force-unwind-tables" => boolean(),
         "codegen-units" => positive_count(value),
         "panic" => matches!(value, "abort" | "unwind"),
         "lto" => matches!(value, "thin" | "fat") || boolean(),
         "strip" => matches!(value, "none" | "debuginfo" | "symbols"),
+        "split-debuginfo" => matches!(value, "off" | "packed" | "unpacked"),
+        "code-model" => matches!(value, "tiny" | "small" | "kernel" | "medium" | "large"),
+        "relocation-model" => matches!(
+            value,
+            "static" | "pic" | "pie" | "dynamic-no-pic" | "ropi" | "rwpi" | "ropi-rwpi" | "default"
+        ),
+        "target-cpu" => codegen_target_name(value),
+        "target-feature" => {
+            value.split(',').count() <= 128
+                && value.split(',').all(|feature| {
+                    feature
+                        .strip_prefix(['+', '-'])
+                        .is_some_and(codegen_target_name)
+                })
+        }
         _ => false,
     };
     require(
         accepted,
         "unsupported or non-scalar captured Cargo codegen option",
     )
+}
+
+fn codegen_target_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
 // This is a containment preflight, not a second dependency resolver. Cargo owns
@@ -1324,6 +1468,185 @@ mod tests {
             let original = value.clone();
             validate_cargo_config(&value, Path::new(""), false).unwrap();
             assert_eq!(value, original, "validation must not rewrite Cargo intent");
+        }
+    }
+
+    #[test]
+    fn captured_profiles_preserve_inheritance_and_package_and_build_overrides() {
+        let value: toml::Value = toml::from_str(
+            r#"
+                [profile.dev]
+                debug = "line-tables-only"
+                incremental = false
+                [profile.ci]
+                inherits = "release"
+                opt-level = 2
+                debug = 1
+                split-debuginfo = "off"
+                strip = "debuginfo"
+                debug-assertions = true
+                overflow-checks = false
+                lto = "thin"
+                panic = "unwind"
+                incremental = false
+                codegen-units = 1
+                rpath = false
+                [profile.ci.build-override]
+                opt-level = 0
+                debug = false
+                debug-assertions = true
+                [profile.ci.package."*"]
+                opt-level = "s"
+                [profile.ci.package."some-crate:2.1.0"]
+                opt-level = "z"
+                debug = "full"
+                strip = true
+                [profile.release-lto]
+                inherits = "ci"
+                lto = true
+                [profile.1stage]
+                lto = "off"
+            "#,
+        )
+        .unwrap();
+        let original = value.clone();
+        for vendor in [false, true] {
+            validate_cargo_config(&value, Path::new("app"), vendor).unwrap();
+        }
+        assert_eq!(
+            value, original,
+            "Cargo must own profile merging and selection"
+        );
+        let profiles: std::collections::BTreeMap<_, _> = (0..64)
+            .map(|index| (format!("p{index}"), json!({"debug":false})))
+            .collect();
+        let value = toml::Value::try_from(json!({"profile":profiles})).unwrap();
+        validate_cargo_config(&value, Path::new(""), false).unwrap();
+        let value = toml::Value::try_from(json!({"profile":{"p".repeat(64):{}}})).unwrap();
+        validate_cargo_config(&value, Path::new(""), false).unwrap();
+    }
+
+    #[test]
+    fn captured_profiles_reject_unbounded_names_types_and_execution_controls() {
+        for text in [
+            "profile='bad'",
+            "[profile]\nci='bad'",
+            "[profile.ci]\ninherits='../release'",
+            "[profile.ci]\ninherits=1",
+            "[profile.ci]\nopt-level=4",
+            "[profile.ci]\nopt-level='3'",
+            "[profile.ci]\ndebug=3",
+            "[profile.ci]\ndebug='unknown'",
+            "[profile.ci]\nsplit-debuginfo=true",
+            "[profile.ci]\nstrip='outside'",
+            "[profile.ci]\ndebug-assertions='false'",
+            "[profile.ci]\noverflow-checks=0",
+            "[profile.ci]\nlto='plugin'",
+            "[profile.ci]\npanic='outside'",
+            "[profile.ci]\ncodegen-units=0",
+            "[profile.ci]\ncodegen-units=4097",
+            "[profile.ci]\ncodegen-units=1.0",
+            "[profile.ci]\nrpath='outside'",
+            "[profile.ci]\nincremental=true",
+            "[profile.ci]\ndir-name='../outside'",
+            "[profile.ci]\ncodegen-backend='/outside/backend.so'",
+            "[profile.ci]\nrustflags=['--sysroot=/outside']",
+            "[profile.ci]\ntrim-paths='all'",
+            "[profile.ci]\nbuild-override=false",
+            "[profile.ci]\npackage=['some-crate']",
+            "[profile.ci.package]\nsome-crate='bad'",
+            "[profile.ci.package.some-crate]\ninherits='release'",
+            "[profile.ci.package.some-crate]\npackage={nested={opt-level=1}}",
+            "[profile.ci.package.some-crate]\nbuild-override={opt-level=1}",
+            "[profile.ci.build-override]\nlto=true",
+            "[profile.ci.build-override]\npanic='abort'",
+            "[profile.ci.build-override]\nrpath=true",
+            "[profile.ci.build-override]\nincremental=true",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            assert!(
+                validate_cargo_config(&value, Path::new(""), false).is_err(),
+                "{text}"
+            );
+        }
+        for name in ["", "_ci", "../ci", "ci/x", "ci\\x", "ci x", "ci\n", "ci雪"] {
+            let value = toml::Value::try_from(json!({"profile":{name:{}}})).unwrap();
+            assert!(
+                validate_cargo_config(&value, Path::new(""), false).is_err(),
+                "{name:?}"
+            );
+        }
+        let profiles: std::collections::BTreeMap<_, _> = (0..65)
+            .map(|index| (format!("p{index}"), json!({})))
+            .collect();
+        let packages: std::collections::BTreeMap<_, _> = (0..129)
+            .map(|index| (format!("crate{index}"), json!({})))
+            .collect();
+        for value in [
+            json!({"profile":{"p".repeat(65):{}}}),
+            json!({"profile":profiles}),
+            json!({"profile":{"ci":{"package":packages}}}),
+            json!({"profile":{"ci":{"package":{"":{}}}}}),
+            json!({"profile":{"ci":{"package":{"x".repeat(257):{}}}}}),
+            json!({"profile":{"ci":{"package":{"a\nb":{}}}}}),
+        ] {
+            let value = toml::Value::try_from(value).unwrap();
+            assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+        }
+    }
+
+    #[test]
+    fn captured_codegen_accepts_bounded_cpu_features_and_scalar_platform_settings() {
+        for value in [
+            "target-cpu=generic",
+            "target-cpu=native",
+            "target-cpu=x86-64-v3",
+            "target-cpu=cortex-a76",
+            "target-feature=+sse4.2,-avx2,+crt-static",
+            "target-feature=+neon,-neon,+neon",
+            "code-model=small",
+            "code-model=large",
+            "relocation-model=pic",
+            "relocation-model=static",
+            "relocation-model=default",
+            "split-debuginfo=packed",
+            "split-debuginfo=unpacked",
+            "split-debuginfo=off",
+            "force-unwind-tables=yes",
+            "force-unwind-tables=false",
+        ] {
+            let flags = toml::Value::Array(vec!["-C".into(), value.into()]);
+            validate_compiler_flags(&flags).unwrap();
+        }
+        for value in [
+            "target-cpu=",
+            "target-cpu=/outside",
+            "target-cpu=../outside",
+            "target-cpu=@response",
+            "target-cpu=x86;command",
+            "target-cpu=x86 native",
+            "target-feature=",
+            "target-feature=sse4.2",
+            "target-feature=+",
+            "target-feature=+sse4.2,",
+            "target-feature=,+sse4.2",
+            "target-feature=++neon",
+            "target-feature=+avx2,-@outside",
+            "target-feature=+avx2,-feature/value",
+            "code-model=outside",
+            "relocation-model=/outside",
+            "split-debuginfo=yes",
+            "force-unwind-tables=1",
+        ] {
+            let flags = toml::Value::Array(vec!["-C".into(), value.into()]);
+            assert!(validate_compiler_flags(&flags).is_err(), "{value}");
+        }
+        for value in [
+            format!("target-cpu={}", "x".repeat(129)),
+            format!("target-feature=+{}", "x".repeat(129)),
+            format!("target-feature={}", vec!["+neon"; 129].join(",")),
+        ] {
+            assert!(validate_scalar_codegen(&value).is_err());
         }
     }
 

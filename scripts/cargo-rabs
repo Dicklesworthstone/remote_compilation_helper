@@ -1404,6 +1404,8 @@ def canonical_build_arguments(args):
     except UnicodeError as error:
         raise SetupError("canonical Cargo arguments must be UTF-8") from error
     target = None
+    profile = None
+    release = False
     no_run = False
     workspace = False
     excluded = False
@@ -1421,7 +1423,7 @@ def canonical_build_arguments(args):
             break
         option, separator, value = args[at].partition("=")
         if option in ("--bin", "--example", "--test", "--bench", "--package", "-p",
-                      "--features", "-F", "--target", "--color", "--exclude"):
+                      "--features", "-F", "--target", "--color", "--exclude", "--profile"):
             if not separator:
                 at += 1
                 if at == len(args):
@@ -1445,8 +1447,15 @@ def canonical_build_arguments(args):
                 raise SetupError("invalid Cargo color choice")
             elif option == "--exclude":
                 excluded = True
+            elif option == "--profile":
+                if (profile is not None or release
+                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value) is None):
+                    raise SetupError("canonical Cargo requires one literal profile without --release")
+                profile = value
         elif not separator and option in ("--release", "-r"):
-            pass
+            if profile is not None:
+                raise SetupError("canonical Cargo --release conflicts with --profile")
+            release = True
         elif not separator and option == "--no-run" and args[0] == "test" and not no_run:
             no_run = True
         elif not separator and option == "--workspace":

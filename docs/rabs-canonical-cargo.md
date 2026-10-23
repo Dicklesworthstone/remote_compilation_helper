@@ -424,17 +424,35 @@ bounded compiler settings:
 
 - `[build]` `rustflags` and `rustdocflags`;
 - `[target.<triple>]` and `[target.'cfg(...)']` `rustflags`;
+- `[profile.<name>]` scalar settings, inheritance, package overrides and build overrides;
 - `[llvm-cov]` `exclude`, retained as configuration metadata.
 
 String and array spellings retain Cargo's own tokenization and merge semantics;
 the captured configuration bytes are not rewritten. Supported compiler controls
 include `--cfg`, `--check-cfg`, lint levels, `-g`, `-O`, scalar codegen settings
 (`opt-level`, `debuginfo`, `debug-assertions`, `overflow-checks`, `embed-bitcode`,
-`force-frame-pointers`, `codegen-units`, `panic`, `lto`, `strip`) and explicit
-bounded `-Z threads` counts. Vendor source replacements can appear alongside
-these settings in the existing validated vendor configuration.
+`force-frame-pointers`, `force-unwind-tables`, `codegen-units`, `panic`, `lto`,
+`strip`, `split-debuginfo`, `code-model`, `relocation-model`, `target-cpu` and
+signed `target-feature` lists) and explicit bounded `-Z threads` counts.
+CPU and feature names are preserved literally; the worker's compiler decides
+whether they are supported. `target-cpu=native` selects the executing worker's
+CPU. This does not authorize a cross-machine action-cache hit. Vendor source
+replacements can appear alongside these settings in the existing validated
+vendor configuration.
 
-Compiler/wrapper overrides, `[env]`, linkers, runners, output-directory settings,
+Captured profiles support `inherits`, `opt-level`, `debug`, `split-debuginfo`,
+`strip`, `debug-assertions`, `overflow-checks`, `lto`, `panic`, `codegen-units`,
+`rpath`, and `incremental=false`. The launcher still pins `CARGO_INCREMENTAL=0`.
+Package and build overrides support the applicable scalar settings; nested
+overrides, inheritance within an override, and override `lto`, `panic` or `rpath`
+are refused. Configuration accepts up to 64 profiles and 128 package selectors
+per profile. Cargo owns inheritance, package matching, configuration precedence
+and its normal errors for invalid combinations; the source planner retains the
+exact project configuration bytes.
+
+Captured `[env]` settings also retain their existing default, `force` and bounded
+config-relative semantics; see [captured environment](rabs-canonical-environment.md).
+Compiler/wrapper overrides, linkers, runners, output-directory settings,
 response files and other compiler flags require additional input or execution
 contracts and remain unsupported in this profile. User Cargo-home configuration
 is still excluded. Preparation checks the retained configuration before invoking
@@ -453,7 +471,17 @@ cargo rabs --rabs-canonical PROFILE.json -- test --workspace --no-fail-fast
 cargo rabs --rabs-canonical PROFILE.json -- test --test integration selected::case -- --exact --nocapture
 cargo rabs --rabs-canonical PROFILE.json -- test --doc
 cargo rabs --rabs-canonical PROFILE.json -- build -p app --bin app --release
+cargo rabs --rabs-canonical PROFILE.json -- build --workspace --profile production
+cargo rabs --rabs-canonical PROFILE.json -- test --profile ci --no-run
 ```
+
+`--profile NAME` and `--profile=NAME` select a captured manifest or configuration
+profile for `build`, `check`, `clippy` and `test`. Supply one profile, without
+`--release` or `-r`. Names are 1–64 ASCII letters, digits, underscores or hyphens,
+starting with a letter or digit. The launcher preserves the exact arguments and
+lets Cargo resolve the profile. Warm target reuse retains the profile selection
+and captured configuration as compilation controls: a different profile or
+changed profile settings cannot reuse the same compatible target family.
 
 Cargo owns package and target selection, including its normal defaults when no
 selection option is supplied. Supported selectors are `--workspace`,
@@ -480,7 +508,7 @@ retains Clippy's nonzero exit and verified diagnostics and cannot produce a
 successful artifact result.
 
 Supported build options are `--features`/`-F`, `--all-features`,
-`--no-default-features`, `--release`/`-r`, `--locked`, `--offline`, `--frozen`,
+`--no-default-features`, `--release`/`-r`, `--profile`, `--locked`, `--offline`, `--frozen`,
 `--color`, `--verbose`/`-v`/`-vv`, `--quiet`/`-q`, and one optional `--target` from:
 `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`.
@@ -491,7 +519,7 @@ not install a cross-compiler. Cargo remains responsible for package/feature
 resolution and may reject an otherwise syntactically supported request.
 
 The profile owns `--manifest-path`, `--target-dir` and `--message-format=json`.
-Custom profiles, target JSON, `--config`, unstable Cargo flags, `+toolchain`, `run`,
+Target JSON, `--config`, unstable Cargo flags, `+toolchain`, `run`,
 test-harness arguments on compilation-only commands, arguments other than the
 supported lint controls after Clippy's delimiter, and unknown Cargo options
 refuse before preparation. The selected toolchain also supplies local Cargo metadata probes; a

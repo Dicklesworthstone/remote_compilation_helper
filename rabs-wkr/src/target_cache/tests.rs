@@ -409,6 +409,123 @@ fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
 }
 
 #[test]
+fn custom_profiles_reuse_only_the_same_captured_compilation_family() {
+    let source = private_directory("rabs-profile-family-").unwrap();
+    fs::create_dir(source.path().join(".cargo")).unwrap();
+    fs::write(
+        source.path().join("Cargo.toml"),
+        "[package]\nname='profile_fixture'\nversion='0.1.0'\n[lib]\npath='lib.rs'\n",
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("lib.rs"),
+        "pub fn answer() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let config = "[profile.ci]\ninherits='release'\nopt-level=1\nincremental=false\n";
+    fs::write(source.path().join(".cargo/config.toml"), config).unwrap();
+    let names = ["Cargo.toml", ".cargo/config.toml", "lib.rs"];
+    let input = inputs(source.path(), &names);
+    let spec = fixture_spec("first");
+    let (build, plan) = cargo_request("build", &["--workspace", "--profile", "ci"]);
+    let key = |request: &CanonicalExecRequest, plan: &ArtifactPlan, input: &WorkspaceInputs| {
+        target_compatibility_key(scope(), request, input, &spec, &support(), plan, 1).unwrap()
+    };
+    let expected = key(&build, &plan, &input);
+    assert!(expected.is_some());
+    let exact = target_key(scope(), &build, &input, &spec, &support(), &plan, 1).unwrap();
+    for (command, options) in [
+        ("check", vec!["--workspace", "--profile", "ci"]),
+        ("test", vec!["--workspace", "--profile", "ci", "--no-run"]),
+        (
+            "test",
+            vec!["--workspace", "--profile", "ci", "case", "--", "--exact"],
+        ),
+        (
+            "build",
+            vec!["--package=profile_fixture", "--profile", "ci"],
+        ),
+    ] {
+        let (request, selected) = cargo_request(command, &options);
+        assert_eq!(key(&request, &selected, &input), expected);
+        assert_ne!(
+            target_key(scope(), &request, &input, &spec, &support(), &selected, 1).unwrap(),
+            exact
+        );
+    }
+    for options in [
+        vec!["--workspace", "--profile", "other"],
+        vec!["--workspace", "--profile=ci"],
+        vec!["--workspace", "--release"],
+        vec!["--workspace"],
+    ] {
+        let (request, selected) = cargo_request("build", &options);
+        let changed = key(&request, &selected, &input);
+        assert!(changed.is_some());
+        assert_ne!(
+            changed, expected,
+            "profile spelling and selection remain exact: {options:?}"
+        );
+    }
+    fs::write(
+        source.path().join("lib.rs"),
+        "pub fn answer() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let edited = inputs(source.path(), &names);
+    assert_eq!(
+        key(&build, &plan, &edited),
+        expected,
+        "source edits can reuse the same custom profile"
+    );
+    assert_ne!(
+        target_key(scope(), &build, &edited, &spec, &support(), &plan, 1).unwrap(),
+        exact
+    );
+    fs::write(
+        source.path().join(".cargo/config.toml"),
+        config.replace("opt-level=1", "opt-level=2"),
+    )
+    .unwrap();
+    let configured = inputs(source.path(), &names);
+    assert_ne!(
+        key(&build, &plan, &configured),
+        expected,
+        "unchanged profile name cannot conceal changed compiler settings"
+    );
+
+    let (clippy, clippy_plan) = cargo_request("clippy", &["--profile=ci", "--", "-Dwarnings"]);
+    let mut clippy_spec = fixture_spec("first");
+    clippy.command_context.apply_to(&mut clippy_spec).unwrap();
+    let clippy_key = target_compatibility_key(
+        scope(),
+        &clippy,
+        &input,
+        &clippy_spec,
+        &support(),
+        &clippy_plan,
+        1,
+    )
+    .unwrap();
+    assert!(clippy_key.is_some());
+    assert_ne!(clippy_key, expected);
+    let (changed, changed_plan) = cargo_request("clippy", &["--profile=other", "--", "-Dwarnings"]);
+    assert_ne!(
+        target_compatibility_key(
+            scope(),
+            &changed,
+            &input,
+            &clippy_spec,
+            &support(),
+            &changed_plan,
+            1
+        )
+        .unwrap(),
+        clippy_key
+    );
+}
+
+#[test]
 fn clippy_compatibility_keeps_selections_lints_companions_and_cargo_families_separate() {
     let fixture = CargoFixture::with_dependency();
     let input = fixture.input();
