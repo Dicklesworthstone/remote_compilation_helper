@@ -206,9 +206,20 @@ Names, pins and normalized endpoints must be distinct. IPv6 endpoints use
 worker must already reconnect to its own listed endpoint; this profile does
 not provision workers or discover a fleet.
 
-The daemon chooses an eligible worker using its durable job load, with the
-listed order breaking equal-load ties. It excludes workers whose previous
-execution remains unresolved. Selection and the original pool intent become
+The daemon first chooses by durable job load. Among equally loaded workers it
+prefers the worker that most recently completed the same captured Cargo request,
+then uses the listed order. This locality hint binds the complete source,
+toolchain, command, environment and output contract, along with the worker's
+endpoint, identity and certificate pin. Only the assigned wire request ID is
+normalized. Resolved ordinary failures can also leave useful target state;
+cancelled, stopped, unresolved and never-dispatched jobs cannot supply a hint.
+History is limited to the last 128 queue admissions in the bounded live record
+set. It neither promises that a target is still retained nor authorizes a cache
+hit: the selected worker verifies its own state and executes the current Cargo
+command. Changed source bytes or command controls receive no locality preference.
+
+Workers whose previous execution remains unresolved are excluded. Selection
+and the original pool intent become
 part of the durable job before dispatch, so concurrent submissions can spread
 across available workers while retaining the existing queue and admission
 limits. A selected job keeps that worker for execution, cancellation and

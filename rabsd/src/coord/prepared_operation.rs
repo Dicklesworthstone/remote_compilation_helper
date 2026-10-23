@@ -38,6 +38,9 @@ const MAX_DETAIL_BYTES: usize = 2048;
 const MAX_RUNNING: usize = 4;
 const MAX_AUTOMATIC_RECOVERIES: u8 = 3;
 const MAX_PREPARED_WORKERS: usize = 32;
+/// Locality is a bounded admission hint, not an inventory of worker caches.
+/// Ignore cold archives and executions older than this many queue admissions.
+const CARGO_LOCALITY_WINDOW: u64 = 128;
 
 fn recovery_delay(attempt: u8) -> Duration {
     Duration::from_secs(1_u64 << u32::from(attempt.saturating_sub(1).min(2)))
@@ -397,6 +400,60 @@ fn worker_owns_record(worker: &PreparedWorker, record: &Record) -> bool {
                 .parse::<SocketAddr>()
                 .is_ok_and(|other| endpoints_overlap(candidate, other))
         })
+}
+
+/// Prefer a worker that recently finished this exact captured Cargo command
+/// when queue loads are equal. The existing allocated-intent fingerprint binds
+/// every captured source, toolchain, command and extension byte except the wire
+/// request ID. Do not infer source-edit compatibility here: the worker alone
+/// validates and chooses retained targets, and Cargo still executes normally.
+///
+/// Resolved ordinary failures can also leave useful targets. Cancellation,
+/// stopped processes, uncertain ownership and jobs never dispatched cannot.
+/// This uses only bounded live history and never changes durable request or
+/// recovery identity. Missing or evicted worker targets merely make it a miss.
+fn cargo_locality(
+    state: &State,
+    request: &Value,
+    workers: &[PreparedWorker],
+) -> io::Result<Vec<Option<u64>>> {
+    let mut recent = vec![None; workers.len()];
+    if rabs_sandbox::cargo_artifacts::requested(request)?.is_none() {
+        return Ok(recent);
+    }
+    let fingerprint = record_request_digest(2, request)?;
+    for record in state.records.values().filter(|record| {
+        record.state == OperationState::Completed
+            && !record.unresolved()
+            && record.execution_may_have_run
+            && !record.cancel_requested
+            && record
+                .exit_code
+                .is_some_and(|code| (0..128).contains(&code))
+            && record.stop_reason.is_none()
+            && state.next_order.saturating_sub(record.order) <= CARGO_LOCALITY_WINDOW
+    }) {
+        let matches = if record.version == 2 {
+            record.request_sha256 == fingerprint
+        } else {
+            record_request_digest(2, &record.request)? == fingerprint
+        };
+        if !matches {
+            continue;
+        }
+        for (index, worker) in workers.iter().enumerate() {
+            // Unlike overlapping-owner exclusion, a locality hint requires
+            // all three identities. Rotating an endpoint, worker or pin must
+            // not inherit another approved placement's execution history.
+            if worker.address == record.spec.address
+                && worker.worker == record.spec.worker
+                && worker.worker_spki_sha256 == record.spec.worker_spki_sha256
+            {
+                recent[index] = recent[index].max(Some(record.order));
+            }
+        }
+    }
+    Ok(recent)
 }
 
 fn shares_worker_or_endpoint(left: &Record, right: &Record) -> bool {
@@ -1017,6 +1074,7 @@ impl PreparedOperationStore {
             check_paths(existing)?;
         }
         if let Some(workers) = &worker_pool {
+            let locality = cargo_locality(&state, &request, workers)?;
             let (_, selected) = workers
                 .iter()
                 .enumerate()
@@ -1039,7 +1097,7 @@ impl PreparedOperationStore {
                             ) && worker_owns_record(worker, record)
                         })
                         .count();
-                    (load, *index)
+                    (load, std::cmp::Reverse(locality[*index]), *index)
                 })
                 .ok_or_else(|| invalid("all canonical pool workers have unresolved ownership"))?;
             spec.address = selected.address.clone();

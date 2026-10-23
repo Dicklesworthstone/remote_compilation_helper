@@ -15,13 +15,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let owner = tempfile::tempdir().unwrap();
-        let root = owner.path().canonicalize().unwrap();
-        let source = root.join("source");
-        let bundle = root.join("bundle");
-        fs::create_dir(&source).unwrap();
-        fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 42 }\n").unwrap();
-        let request = json!({
+        Self::capture(json!({
             "kind":"canonical-exec", "request_id":"allocate",
             "program":"/__rabs/toolchain/bin/rustc",
             "toolchain_backing":"/opt/pool-fixture",
@@ -34,7 +28,63 @@ impl Fixture {
                 "-o", "/__rabs/out/compile/libfixture.rmeta"],
             "artifacts":{"unit":"compile", "files":["libfixture.rmeta"]},
             "timeout_ms":10000,
-        });
+        }))
+    }
+
+    fn cargo(command: &str) -> Self {
+        Self::capture(Self::cargo_template(command))
+    }
+
+    fn cargo_template(command: &str) -> Value {
+        json!({
+            "kind":"canonical-exec", "request_id":"allocate",
+            "program":if command == "clippy" {
+                "/__rabs/toolchain/bin/cargo-clippy"
+            } else {
+                "/__rabs/toolchain/bin/cargo"
+            },
+            "toolchain_backing":"/opt/pool-fixture",
+            "toolchain_identity":{
+                "version":"toolchain-dataset-v1", "sha256":"ab".repeat(32),
+                "files":1, "bytes":4,
+            },
+            "source_files":["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "lib.rs"],
+            "args":[command, "--workspace", "--frozen", "--offline",
+                "--message-format=json", "--manifest-path=/__rabs/workspace/Cargo.toml",
+                "--target-dir=/__rabs/out/cargo"],
+            "command_context":{
+                "version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+                "env":{"CARGO":"/__rabs/toolchain/bin/cargo",
+                    "RUSTC":"/__rabs/toolchain/bin/rustc", "RUSTFLAGS":"-C debuginfo=0"},
+            },
+            "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1",
+                "cargo":if command == "test" { "cargo-test-json-v1" } else { "cargo-json-v1" }},
+            "timeout_ms":10000,
+        })
+    }
+
+    fn capture(request: Value) -> Self {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let bundle = root.join("bundle");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 42 }\n").unwrap();
+        if request["artifacts"].get("cargo").is_some() {
+            fs::write(source.join("Cargo.toml"),
+                b"[package]\nname=\"pool-fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[lib]\npath=\"lib.rs\"\n").unwrap();
+            fs::write(
+                source.join("Cargo.lock"),
+                b"version = 4\n[[package]]\nname=\"pool-fixture\"\nversion=\"0.1.0\"\n",
+            )
+            .unwrap();
+            fs::create_dir(source.join(".cargo")).unwrap();
+            fs::write(
+                source.join(".cargo/config.toml"),
+                b"[env]\nAPP_MODE=\"one\"\n",
+            )
+            .unwrap();
+        }
         prepare_source_template(&source, &request, &bundle).unwrap();
         Self {
             _owner: owner,
@@ -92,6 +142,408 @@ fn no_dispatch(claim: OperationClaim) {
 fn interrupted(mut claim: OperationClaim, request_id: u64) {
     claim.bind_request_id(request_id).unwrap();
     drop(claim);
+}
+
+/// Supply adapter-shaped terminal evidence to the real durable queue. This
+/// exercises placement and recovery bookkeeping, not TLS or target retention.
+fn completed(
+    mut claim: OperationClaim,
+    request_id: u64,
+    exit_code: i32,
+    stop: Value,
+    ack: bool,
+) -> OperationStatus {
+    if claim.needs_request_allocation() {
+        claim.bind_request_id(request_id).unwrap();
+    }
+    let installed = if exit_code == 0 && stop.is_null() {
+        json!({
+            "kind":"worker-output-install", "directory":claim.spec().output,
+            "publication_authorized":false, "reexecute":false,
+            "files":0, "total_bytes":0, "reused":false,
+        })
+    } else {
+        Value::Null
+    };
+    let digest = Sha256::digest(serde_json::to_vec(claim.request()).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let result = json!({
+        "delivery":{
+            "receipt":{
+                "request_id":claim.request()["request_id"], "request_sha256":digest,
+                "worker_id":claim.spec().worker,
+                "worker_spki_sha256":claim.spec().worker_spki_sha256,
+                "transport_authenticated":true, "publication_authorized":false,
+                "exit_code":exit_code, "stop_reason":stop,
+            },
+            "acknowledgments_confirmed":ack,
+        },
+        "installed_outputs":installed, "publication_authorized":false,
+    });
+    claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap()
+}
+
+#[test]
+fn cargo_locality_follows_resolved_success_and_ordinary_failure_across_fresh_captures() {
+    for command in ["build", "check", "clippy", "test"] {
+        for exit_code in [0, 101] {
+            let fixture = Fixture::cargo(command);
+            let store = fixture.open();
+            store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+            completed(
+                store.claim_next().unwrap().unwrap(),
+                9001,
+                exit_code,
+                Value::Null,
+                true,
+            );
+            let mut next = fixture.spec(2, 2);
+            next.bundle = fixture.root.join("fresh-capture");
+            prepare_source_template(
+                &fixture.root.join("source"),
+                &Fixture::cargo_template(command),
+                &next.bundle,
+            )
+            .unwrap();
+            let selected = store.submit_allocated_pool(next).unwrap();
+            assert_eq!(selected.worker, "worker-2", "{command}, exit {exit_code}");
+            assert_eq!(selected.request_id, None);
+            assert_eq!(selected.mode, "execute");
+            assert!(!selected.outputs_installed);
+            let claim = store.claim_next().unwrap().unwrap();
+            assert!(claim.needs_request_allocation());
+            no_dispatch(claim);
+        }
+    }
+}
+
+#[test]
+fn cargo_locality_preserves_load_priority_then_prefers_the_most_recent_match() {
+    let fixture = Fixture::cargo("build");
+    let store = fixture.open();
+    store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9001,
+        0,
+        Value::Null,
+        true,
+    );
+    store.submit_allocated(fixture.singleton(2, 2)).unwrap();
+    let active = store.claim_next().unwrap().unwrap();
+    let first = fixture.spec(3, 2);
+    assert_eq!(
+        store.submit_allocated_pool(first.clone()).unwrap().worker,
+        "worker-1"
+    );
+    // Equal pending loads now favor the worker with matching captured inputs.
+    let second = fixture.spec(4, 2);
+    assert_eq!(
+        store.submit_allocated_pool(second.clone()).unwrap().worker,
+        "worker-2"
+    );
+    store.cancel(&first.id).unwrap();
+    store.cancel(&second.id).unwrap();
+    no_dispatch(active);
+
+    store.submit_allocated(fixture.singleton(5, 1)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9005,
+        0,
+        Value::Null,
+        true,
+    );
+    let mut next = fixture.spec(6, 2);
+    next.workers.reverse();
+    assert_eq!(
+        store.submit_allocated_pool(next).unwrap().worker,
+        "worker-1"
+    );
+}
+
+#[test]
+fn cargo_locality_requires_exact_captured_inputs_and_command_controls() {
+    for change in 0..10 {
+        let fixture = Fixture::cargo("build");
+        let store = fixture.open();
+        store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+        completed(
+            store.claim_next().unwrap().unwrap(),
+            9001,
+            0,
+            Value::Null,
+            true,
+        );
+        let mut request = Fixture::cargo_template("build");
+        let source = fixture.root.join("source");
+        match change {
+            0 => fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap(),
+            1 => fs::write(
+                source.join("Cargo.toml"),
+                b"[package]\nname=\"pool-fixture\"\nversion=\"0.2.0\"\n[lib]\npath=\"lib.rs\"\n",
+            )
+            .unwrap(),
+            2 => fs::write(source.join("Cargo.lock"), b"version = 4\n# changed lock\n").unwrap(),
+            3 => fs::write(
+                source.join(".cargo/config.toml"),
+                b"[env]\nAPP_MODE=\"two\"\n",
+            )
+            .unwrap(),
+            4 => request["command_context"]["env"]["RUSTFLAGS"] = json!("-C debuginfo=2"),
+            5 => request["args"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("--release")),
+            6 => request["toolchain_identity"]["sha256"] = json!("cd".repeat(32)),
+            7 => request["artifacts"]["files"] = json!(["extra-output"]),
+            8 => request["jobserver_grant"] = json!(2),
+            9 => request["future_execution_control"] = json!({"value":true}),
+            _ => unreachable!(),
+        }
+        let mut next = fixture.spec(2, 2);
+        next.bundle = fixture.root.join("changed-capture");
+        prepare_source_template(&source, &request, &next.bundle).unwrap();
+        assert_eq!(
+            store.submit_allocated_pool(next).unwrap().worker,
+            "worker-1",
+            "changed control {change}",
+        );
+    }
+}
+
+#[test]
+fn cargo_locality_requires_the_exact_worker_endpoint_identity_and_pin() {
+    for change in 0..3 {
+        let fixture = Fixture::cargo("build");
+        let store = fixture.open();
+        store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+        completed(
+            store.claim_next().unwrap().unwrap(),
+            9001,
+            0,
+            Value::Null,
+            true,
+        );
+        let mut next = fixture.spec(2, 2);
+        match change {
+            0 => next.workers[1].address = "127.0.0.1:33002".into(),
+            1 => next.workers[1].worker = "replacement-worker".into(),
+            2 => next.workers[1].worker_spki_sha256 = "cd".repeat(32),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store.submit_allocated_pool(next).unwrap().worker,
+            "worker-1"
+        );
+    }
+}
+
+#[test]
+fn cargo_locality_ignores_nondispatched_unresolved_cancelled_and_stopped_attempts() {
+    for outcome in 0..7 {
+        let fixture = Fixture::cargo("build");
+        let store = fixture.open();
+        store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+        let claim = store.claim_next().unwrap().unwrap();
+        match outcome {
+            0 => no_dispatch(claim),
+            1 => interrupted(claim, 9001),
+            2 => {
+                completed(claim, 9001, 0, Value::Null, false);
+            }
+            3 => {
+                completed(claim, 9001, 130, json!("cancelled"), true);
+            }
+            4 => {
+                completed(claim, 9001, 124, json!("timeout"), true);
+            }
+            5 => {
+                completed(claim, 9001, 137, Value::Null, true);
+            }
+            6 => {
+                let mut claim = claim;
+                claim.bind_request_id(9001).unwrap();
+                store.cancel(&fixture.singleton(1, 2).id).unwrap();
+                completed(claim, 9001, 0, Value::Null, true);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store
+                .submit_allocated_pool(fixture.spec(2, 2))
+                .unwrap()
+                .worker,
+            "worker-1",
+            "ineligible outcome {outcome}",
+        );
+    }
+}
+
+#[test]
+fn cargo_locality_never_overrides_an_unresolved_workers_ownership() {
+    let fixture = Fixture::cargo("build");
+    let store = fixture.open();
+    store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9001,
+        0,
+        Value::Null,
+        true,
+    );
+    store.submit_allocated(fixture.singleton(2, 2)).unwrap();
+    interrupted(store.claim_next().unwrap().unwrap(), 9002);
+    store.submit_allocated(fixture.singleton(3, 1)).unwrap();
+    assert_eq!(
+        store
+            .submit_allocated_pool(fixture.spec(4, 2))
+            .unwrap()
+            .worker,
+        "worker-1"
+    );
+}
+
+#[test]
+fn cargo_locality_uses_numeric_history_without_reusing_its_request_id() {
+    let fixture = Fixture::cargo("build");
+    let store = fixture.open();
+    let mut request = Fixture::cargo_template("build");
+    request["request_id"] = json!(9001);
+    let mut first = fixture.singleton(1, 2);
+    first.bundle = fixture.root.join("numeric-capture");
+    crate::coord::source_delivery::prepare_source_bundle(
+        &fixture.root.join("source"),
+        &request,
+        &first.bundle,
+    )
+    .unwrap();
+    store.submit(first).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9001,
+        0,
+        Value::Null,
+        true,
+    );
+    let selected = store.submit_allocated_pool(fixture.spec(2, 2)).unwrap();
+    assert_eq!(selected.worker, "worker-2");
+    assert_eq!(selected.request_id, None);
+}
+
+#[test]
+fn cargo_locality_survives_restart_without_reassigning_admitted_or_recovering_jobs() {
+    let fixture = Fixture::cargo("build");
+    let store = fixture.open();
+    store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9001,
+        0,
+        Value::Null,
+        true,
+    );
+    drop(store);
+    let store = fixture.open();
+    let selected_spec = fixture.spec(2, 2);
+    let selected = store.submit_allocated_pool(selected_spec.clone()).unwrap();
+    assert_eq!(selected.worker, "worker-2");
+    let selected_claim = store.claim_next().unwrap().unwrap();
+    store.submit_allocated(fixture.singleton(3, 1)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9003,
+        0,
+        Value::Null,
+        true,
+    );
+    assert_eq!(
+        store
+            .submit_allocated_pool(selected_spec.clone())
+            .unwrap()
+            .worker,
+        "worker-2"
+    );
+    interrupted(selected_claim, 9002);
+    drop(store);
+    let store = fixture.open();
+    let retried = store.submit_allocated_pool(selected_spec.clone()).unwrap();
+    assert_eq!(retried.worker, "worker-2");
+    assert_eq!(retried.request_id, Some(9002));
+    assert_eq!(retried.request_sha256, selected.request_sha256);
+    store
+        .resume(
+            &selected_spec.id,
+            fixture.root.join("resumed-delivery"),
+            None,
+        )
+        .unwrap();
+    let recovery = store.claim_next().unwrap().unwrap();
+    assert_eq!(recovery.spec().worker, "worker-2");
+    assert_eq!(recovery.request()["request_id"], 9002);
+    assert!(!recovery.needs_request_allocation());
+    drop(recovery);
+}
+
+#[test]
+fn cargo_locality_expires_outside_the_bounded_recent_admission_window() {
+    let fixture = Fixture::cargo("build");
+    let store = fixture.open();
+    store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9001,
+        0,
+        Value::Null,
+        true,
+    );
+    let window = u16::try_from(CARGO_LOCALITY_WINDOW).unwrap();
+    for sequence in 2..=window {
+        let spec = fixture.singleton(sequence, 1);
+        store.submit_allocated(spec.clone()).unwrap();
+        store.cancel(&spec.id).unwrap();
+    }
+    let boundary = fixture.spec(window + 1, 2);
+    assert_eq!(
+        store
+            .submit_allocated_pool(boundary.clone())
+            .unwrap()
+            .worker,
+        "worker-2"
+    );
+    store.cancel(&boundary.id).unwrap();
+    assert_eq!(
+        store
+            .submit_allocated_pool(fixture.spec(window + 2, 2))
+            .unwrap()
+            .worker,
+        "worker-1"
+    );
+}
+
+#[test]
+fn non_cargo_commands_keep_configured_order_when_workers_are_idle() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9001,
+        0,
+        Value::Null,
+        true,
+    );
+    assert_eq!(
+        store
+            .submit_allocated_pool(fixture.spec(2, 2))
+            .unwrap()
+            .worker,
+        "worker-1"
+    );
 }
 
 #[test]
