@@ -651,12 +651,12 @@ fn reject_dependency_output_aliases(
 /// their conservative refusal in the walker. See rustc_metadata::locator's
 /// prefix AND suffix queries, not just its prefix prefilter.
 ///
-/// Dynamic candidates need one additional class-specific rule below:
-/// Cargo passes an actually consumed proc-macro/dylib as an explicit
-/// `--extern name=/.../libname.so` (or `.dylib`), and action planning
-/// refuses that invocation before filesystem observation. A dynamic artifact
-/// merely sharing `-L dependency` with an admitted metadata-only compile is
-/// consequently not selectable by that compile and must not poison its key.
+/// Dynamic candidates cannot be dismissed as unrelated merely because no
+/// explicit `--extern` names them. A regular metadata dependency can reexport
+/// a procedural macro, which rustc loads transitively from `-L dependency`.
+/// That macro can read files or environment values absent from dep-info. Until
+/// the complete transitive macro closure is proven, these directories must
+/// refuse live serving even for a metadata-only consumer.
 fn crate_locator_may_open(name: &std::ffi::OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
     bytes.starts_with(b"lib")
@@ -695,12 +695,13 @@ fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64)
             if excluded_outputs.contains(&name) {
                 continue;
             }
-            // Actual dynamic extern consumption is refused by the planner.
-            // Shared Cargo dependency directories still contain proc-macro
-            // outputs for unrelated units; those files cannot be selected by
-            // this admitted metadata-only invocation, so they are not inputs.
+            // An admitted regular --extern may reexport a proc macro. The
+            // dynamic artifact is executable input even when it is absent
+            // from argv, and hashing its bytes would not close its reads.
             if name.ends_with(".so") || name.ends_with(".dylib") {
-                continue;
+                return Err(format!(
+                    "dynamic dependency candidate {name} may provide an untracked transitive procedural macro"
+                ));
             }
             count += 1;
             if count > MAX_DEPENDENCY_FILES {
@@ -708,9 +709,8 @@ fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64)
             }
             let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
             // Interface (`.rs`), static-library and unknown lib-prefixed
-            // candidates remain refusals: unlike unrelated dynamic outputs,
-            // the admitted class has no earlier argument-level proof that
-            // rustc cannot select these names.
+            // candidates remain refusals: the admitted class has no proof
+            // that rustc cannot select these names.
             if !meta.is_file() || !(name.ends_with(".rlib") || name.ends_with(".rmeta")) {
                 return Err(format!("unsupported dependency directory member {name}"));
             }
@@ -2316,32 +2316,33 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_dynamic_outputs_do_not_poison_metadata_dependency_closure() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("libdep-0123.rmeta"), b"metadata").unwrap();
-        let roots = vec![(root.clone(), Vec::new(), Vec::new())];
-        let (members, _) = walk_dependencies(&roots).unwrap();
-        let captured = capture_dependencies(
-            &LiveFacts::new(),
-            roots.clone(),
-            members.clone(),
-            (dir.path().join("out"), Vec::new()),
-            None,
-        )
-        .unwrap();
-
-        // Cargo puts proc-macro artifacts for sibling units in the same
-        // target/deps directory. An admitted action cannot consume either:
-        // an explicit dynamic --extern is rejected during planning.
-        std::fs::write(root.join("libderive-1111.so"), b"proc macro").unwrap();
-        std::fs::write(root.join("libderive-2222.dylib"), b"proc macro").unwrap();
-        assert_eq!(walk_dependencies(&roots).unwrap().0, members);
-        captured.verify_unchanged().unwrap();
-
-        // Metadata remains part of the exact negative/positive closure.
-        std::fs::write(root.join("libother-4567.rmeta"), b"other metadata").unwrap();
-        assert!(captured.verify_unchanged().is_err());
+    fn dynamic_candidates_refuse_new_and_previously_observed_dependency_closures() {
+        for name in ["libderive-1111.so", "libderive-2222.dylib"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            std::fs::write(root.join("libdep-0123.rmeta"), b"metadata").unwrap();
+            let roots = vec![(root.clone(), Vec::new(), Vec::new())];
+            let (members, _) = walk_dependencies(&roots).unwrap();
+            let captured = capture_dependencies(
+                &LiveFacts::new(),
+                roots.clone(),
+                members,
+                (dir.path().join("out"), Vec::new()),
+                None,
+            )
+            .unwrap();
+            // No explicit dynamic extern is necessary: a normal metadata
+            // dependency may reexport this macro to the current consumer.
+            std::fs::write(root.join(name), b"proc macro").unwrap();
+            assert!(
+                walk_dependencies(&roots)
+                    .unwrap_err()
+                    .contains("untracked transitive procedural macro"),
+                "{name}"
+            );
+            assert!(captured.verify_unchanged().is_err(), "{name}");
+            assert!(captured.retained_artifacts().is_err(), "{name}");
+        }
     }
 
     #[test]

@@ -20,6 +20,18 @@ link, object, assembly and LLVM outputs. Re-enabling codegen reuse requires an
 enforced complete input view under a distinct policy identity; a source-text scan
 or a switch that ignores the missing reads cannot supply that authority.
 
+Metadata-only reuse also refuses a dependency search directory containing a
+dynamic Rust library (`lib*.so` or `lib*.dylib`). A regular `.rmeta` dependency can
+reexport a procedural macro that rustc loads transitively, without a dynamic
+`--extern` in the consumer's arguments. That macro can read files or environment
+values absent from dep-info. Hashing the macro binary alone cannot close those
+reads. The compiler still executes normally, but the live lane cannot publish or
+serve that invocation. This conservative rule also affects unrelated dynamic
+libraries sharing the directory until their lack of transitive use can be proven.
+Ordinary dep-info and codegen scratch files remain excluded from crate inputs.
+Live dependency key epoch 4 prevents older dynamic-omitting publications from
+regaining serving authority through their previous verification samples.
+
 ## Enable reuse through the launcher or daemon
 
 `cargo rabs check` enables the complete layout profile when it starts a new

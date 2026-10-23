@@ -109,9 +109,16 @@ impl NativeInventory {
             .output()
             .unwrap();
         success(&produced, "compile real upstream artifacts");
-        for name in ["libupstream.d", "liblibupstream.rlib", "liblibupstream.rmeta"] {
+        for name in [
+            "libupstream.d",
+            "liblibupstream.rlib",
+            "liblibupstream.rmeta",
+        ] {
             let metadata = std::fs::symlink_metadata(dependencies.join(name)).unwrap();
-            assert!(metadata.is_file() && metadata.len() > 0, "missing real {name}");
+            assert!(
+                metadata.is_file() && metadata.len() > 0,
+                "missing real {name}"
+            );
         }
         let mut env = vec![
             ("CARGO_HOME".into(), cargo_home.to_str().unwrap().into()),
@@ -139,7 +146,9 @@ impl NativeInventory {
         };
         let cas = Arc::new(mount_and_reconcile(&root.join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
-        coord.acquire_boot_authority("native-inventory-test").unwrap();
+        coord
+            .acquire_boot_authority("native-inventory-test")
+            .unwrap();
         coord.mark_up();
         Self {
             root: root.to_path_buf(),
@@ -184,7 +193,10 @@ impl NativeInventory {
             self.toolchain.host_triple().unwrap(),
         )
         .unwrap();
-        let package = self.facts.package(&self.source, plan.source_kind, None).unwrap();
+        let package = self
+            .facts
+            .package(&self.source, plan.source_kind, None)
+            .unwrap();
         let dependencies = self.facts.dependencies(&plan).unwrap();
         let inputs = ActionInputManifest {
             schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
@@ -214,8 +226,15 @@ impl NativeInventory {
             .collect();
         assert_eq!(externs.len(), 1);
         let candidates = &dependencies.directories[0].artifacts;
-        assert_eq!(candidates.len(), 2, "only the real archive and metadata are inputs");
-        assert!(candidates.contains(&externs[0]), "exact archive disappeared from closure");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "only the real archive and metadata are inputs"
+        );
+        assert!(
+            candidates.contains(&externs[0]),
+            "exact archive disappeared from closure"
+        );
         let key = live_dependency_key(
             &plan,
             &self.toolchain,
@@ -225,7 +244,10 @@ impl NativeInventory {
             &inputs,
         )
         .unwrap();
-        let toolchain = self.facts.toolchain_guard(&self.compiler, &self.toolchain).unwrap();
+        let toolchain = self
+            .facts
+            .toolchain_guard(&self.compiler, &self.toolchain)
+            .unwrap();
         (
             LiveDependencyRequest {
                 key,
@@ -248,7 +270,12 @@ impl NativeInventory {
     }
 
     fn published(&self, key: &TypedDigest) -> Option<String> {
-        self.cas.store().lock().unwrap().published_manifest_key(key).unwrap()
+        self.cas
+            .store()
+            .lock()
+            .unwrap()
+            .published_manifest_key(key)
+            .unwrap()
     }
 }
 
@@ -327,7 +354,12 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
             .args(&argv[1..])
             .current_dir(&fixture.source)
             .env_clear()
-            .envs(attempt.execution_env().iter().map(|(name, value)| (name, value)))
+            .envs(
+                attempt
+                    .execution_env()
+                    .iter()
+                    .map(|(name, value)| (name, value)),
+            )
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -348,7 +380,9 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
             expected_outputs = Some(bytes);
             expected_transcript = Some(transcript);
         }
-        let captured = attempt.capture(&report).expect("capture actual compiler output");
+        let captured = attempt
+            .capture(&report)
+            .expect("capture actual compiler output");
         assert_eq!(
             fixture.published(&key),
             published_manifest,
@@ -356,7 +390,10 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
         );
         let manifest = captured.manifest_key().to_owned();
         if let Some(original) = &published_manifest {
-            assert_eq!(&manifest, original, "equivalent outputs forked the manifest");
+            assert_eq!(
+                &manifest, original,
+                "equivalent outputs forked the manifest"
+            );
         }
         assert_eq!(captured.publish().0, expected);
         published_manifest = Some(manifest);
@@ -371,7 +408,11 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
         panic!("three actual matching compiles did not qualify normal replay");
     };
     assert_eq!(std::fs::read_dir(&plan.out_dir).unwrap().count(), 0);
-    let InstallResult::Served { transcript, installed } = pending.install() else {
+    let InstallResult::Served {
+        transcript,
+        installed,
+    } = pending.install()
+    else {
         panic!("qualified result did not install through the real materializer");
     };
     assert_eq!(consumer_compiles, 3, "replay must not invoke the compiler");
@@ -407,7 +448,10 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
     assert_eq!(std::fs::read(metadata_path).unwrap(), metadata_bytes);
     let (changed, _) = fixture.request(5);
     let changed_key = changed.key.action_key.clone();
-    assert_ne!(changed_key, key, "exact archive bytes did not enter the key");
+    assert_ne!(
+        changed_key, key,
+        "exact archive bytes did not enter the key"
+    );
     assert_eq!(fixture.published(&changed_key), None);
     let LiveDecision::Execute(unexecuted) = fixture.lane.decide(changed) else {
         panic!("changed exact archive must not reuse the old result");
@@ -416,4 +460,194 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
     assert_eq!(fixture.published(&changed_key), None);
     assert_eq!(fixture.published(&key), published_manifest);
     assert_eq!(consumer_compiles, 3);
+}
+
+#[test]
+fn real_metadata_consumer_of_reexported_macro_refuses_live_dependency_reuse() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let compiler = compiler();
+    let cargo_home = root.join("cargo");
+    let source = cargo_home.join("registry/src/macro-index/consumer-1.0.0");
+    let dependencies = root.join("dependencies");
+    let output = root.join("output");
+    for directory in [&source, &dependencies, &output] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let external = root.join("untracked-input.txt");
+    std::fs::write(&external, "7\n").unwrap();
+    let macro_source = root.join("macro.rs");
+    std::fs::write(
+        &macro_source,
+        r#"extern crate proc_macro;
+use proc_macro::TokenStream;
+#[proc_macro]
+pub fn external_length(_: TokenStream) -> TokenStream {
+    let value = std::fs::read_to_string(env!("RABS_INVENTORY_TRANSITIVE_INPUT")).unwrap();
+    format!("[u8; {}]", value.trim()).parse().unwrap()
+}
+"#,
+    )
+    .unwrap();
+    let macro_build = Command::new(&compiler)
+        .args([
+            "--edition=2021",
+            "--crate-name=external_macro",
+            "--crate-type=proc-macro",
+        ])
+        .arg(&macro_source)
+        .arg("--out-dir")
+        .arg(&dependencies)
+        .env("RABS_INVENTORY_TRANSITIVE_INPUT", &external)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    success(
+        &macro_build,
+        "compile real external-reading procedural macro",
+    );
+    let reexport_source = root.join("reexport.rs");
+    std::fs::write(
+        &reexport_source,
+        "pub use external_macro::external_length;\n",
+    )
+    .unwrap();
+    let reexport_build = Command::new(&compiler)
+        .args([
+            "--edition=2021",
+            "--crate-name=reexport",
+            "--crate-type=lib",
+            "--emit=metadata,dep-info",
+        ])
+        .arg(&reexport_source)
+        .arg("--out-dir")
+        .arg(&dependencies)
+        .arg("--extern")
+        .arg(format!(
+            "external_macro={}",
+            dependencies.join("libexternal_macro.so").display()
+        ))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    success(
+        &reexport_build,
+        "compile normal metadata reexporting the macro",
+    );
+    std::fs::write(
+        source.join("lib.rs"),
+        "pub type Value = reexport::external_length!();\n",
+    )
+    .unwrap();
+    let mut env = vec![
+        ("CARGO_HOME".into(), cargo_home.to_str().unwrap().into()),
+        ("CARGO_MANIFEST_DIR".into(), source.to_str().unwrap().into()),
+        ("CARGO_PKG_NAME".into(), "consumer".into()),
+    ];
+    for name in ["PATH", "LD_LIBRARY_PATH"] {
+        if let Ok(value) = std::env::var(name) {
+            env.push((name.into(), value));
+        }
+    }
+    let argv = vec![
+        compiler.to_str().unwrap().into(),
+        source.join("lib.rs").to_str().unwrap().into(),
+        "--crate-name=consumer".into(),
+        "--crate-type=lib".into(),
+        "--edition=2021".into(),
+        "--emit=metadata,dep-info".into(),
+        "--error-format=json".into(),
+        "--cap-lints=allow".into(),
+        "--out-dir".into(),
+        output.to_str().unwrap().into(),
+        "-L".into(),
+        format!("dependency={}", dependencies.display()),
+        "--extern".into(),
+        format!(
+            "reexport={}",
+            dependencies.join("libreexport.rmeta").display()
+        ),
+    ];
+    let version = Command::new(&compiler).arg("-vV").output().unwrap();
+    success(&version, "identify native compiler host");
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let plan = plan_dependency_action(
+        LiveRustcRequest {
+            argv: &argv,
+            cwd: source.to_str().unwrap(),
+            env: &env,
+        },
+        host,
+    )
+    .expect("only a normal .rmeta appears in the consumer's explicit externs");
+    rabs_key::live_dependency::check_dependency_cache_read_closure(&plan.invocation).unwrap();
+    assert_eq!(plan.externs.len(), 1);
+    assert!(
+        matches!(&plan.externs[0], PlannedExtern::File { path, .. } if path.ends_with(".rmeta"))
+    );
+    let facts = LiveFacts::new();
+    let package = facts.package(&source, plan.source_kind, None).unwrap();
+    let compile = || {
+        let result = Command::new(&compiler)
+            .args(&argv[1..])
+            .current_dir(&source)
+            .env_clear()
+            .envs(plan.execution_env.iter().map(|(name, value)| (name, value)))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        success(
+            &result,
+            "compile metadata consumer through the transitive macro",
+        );
+        (
+            std::fs::read(output.join("libconsumer.rmeta")).unwrap(),
+            std::fs::read(output.join("consumer.d")).unwrap(),
+        )
+    };
+    let before = compile();
+    assert_eq!(
+        compile(),
+        before,
+        "unchanged input must reproduce the same bytes"
+    );
+    let extern_before = std::fs::read(dependencies.join("libreexport.rmeta")).unwrap();
+    let macro_before = std::fs::read(dependencies.join("libexternal_macro.so")).unwrap();
+    assert!(
+        matches!(facts.dependencies(&plan), Err(FactsMiss::Refused(reason))
+        if reason.contains("untracked transitive procedural macro"))
+    );
+
+    std::fs::write(&external, "19\n").unwrap();
+    let after = compile();
+    assert_ne!(
+        after.0, before.0,
+        "an untracked macro read changed the compiler result"
+    );
+    assert_eq!(
+        after.1, before.1,
+        "rustc dep-info did not report the changed input"
+    );
+    assert!(
+        !String::from_utf8(after.1)
+            .unwrap()
+            .contains("untracked-input.txt")
+    );
+    package.verify_unchanged(&source).unwrap();
+    assert_eq!(
+        std::fs::read(dependencies.join("libreexport.rmeta")).unwrap(),
+        extern_before
+    );
+    assert_eq!(
+        std::fs::read(dependencies.join("libexternal_macro.so")).unwrap(),
+        macro_before
+    );
+    assert!(
+        matches!(facts.dependencies(&plan), Err(FactsMiss::Refused(reason))
+        if reason.contains("untracked transitive procedural macro"))
+    );
 }

@@ -37,8 +37,9 @@
 //!   metadata mode is modeled; other unstable output controls, incremental
 //!   state and explicit emit paths are refused; Linux targets);
 //! - every dependency artifact is a `.rmeta`/`.rlib` inside a completely
-//!   enumerated dependency directory; proc-macro consumption is refused because
-//!   untracked proc-macro reads cannot be proven closed (plan §33.10);
+//!   enumerated dependency directory; proc-macro consumption and dynamic
+//!   candidates are refused because even a regular metadata dependency can
+//!   reexport a macro with untracked reads (plan §33.10);
 //! - no native link inputs (`-l`) and no search path other than
 //!   explicit `-L dependency=<directory>`;
 //! - JSON diagnostics (`--error-format=json`), so the transcript is
@@ -107,10 +108,11 @@ use crate::typed_digest::compute;
 
 pub mod remote;
 
-/// Key epoch of the live dependency class. Epoch 3 preserves and keys the
-/// complete compiler environment. It retains epoch 2's acknowledged immutable
-/// output capture requirement; entries from either earlier epoch are not reused.
-pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 3;
+/// Key epoch of the live dependency class. Epoch 4 refuses dynamic search-path
+/// candidates that may supply transitive procedural macros. Earlier entries
+/// could omit those macros and their untracked reads, so none may be reused.
+/// Complete environment keying and acknowledged immutable capture remain required.
+pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 4;
 /// Projection epoch: exact (unprojected) dependency artifacts.
 pub const LIVE_DEPENDENCY_PROJECTION_EPOCH: u32 = 1;
 /// Canonical spelling of the invocation's out-dir in keys, committed
@@ -137,7 +139,7 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// The registry isolation profile. Deliberately plain: it is NOT a
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
-pub const ISOLATION_PROFILE: &str = "live-dependency-v6: unsandboxed local edge process; \
+pub const ISOLATION_PROFILE: &str = "live-dependency-v7: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete registry package \
@@ -147,11 +149,12 @@ pub const ISOLATION_PROFILE: &str = "live-dependency-v6: unsandboxed local edge 
      regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
      build-script execution is not cached; exact crate-locator candidates of every \
      dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
+     dynamic candidates refused because regular dependencies can reexport procedural macros; \
      other lib-prefixed kinds refused) revalidated before serving and after execution";
 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
-pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v5: unsandboxed local edge process; \
+pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v6: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete Cargo Git checkout \
@@ -162,12 +165,13 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v5: unsandboxed loc
      regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
      build-script execution is not cached; exact crate-locator candidates of every \
      dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
+     dynamic candidates refused because regular dependencies can reexport procedural macros; \
      other lib-prefixed kinds refused) revalidated before serving and after execution";
 
 /// Directory sources retain their real paths and complete package contents.
 /// The checksum document identifies the source class, never the file closure:
 /// even files absent from its `files` map are captured, hashed and revalidated.
-pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v2: unsandboxed local edge process; \
+pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v3: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete Cargo directory-source \
@@ -176,6 +180,7 @@ pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v2: uns
      real directory root and complete tree revalidated before serving and after execution; \
      symlinks and source-policy exclusions refuse capture; dep-info reads bounded to the \
      source and generated trees; proc-macro consumption and native link inputs refused; \
+     dynamic dependency candidates refused because regular dependencies can reexport procedural macros; \
      generated inputs captured as a complete disjoint regular-file OUT_DIR tree with exact \
      OUT_DIR spelling keyed and generation revalidated; build-script execution is not cached; \
      exact dependency-directory crate candidates revalidated before serving and after execution";
@@ -2202,13 +2207,9 @@ mod tests {
         for value in variants {
             let extra = value.map(|value| ("DEPENDENCY_FLAVOR", value));
             let plan = plan_for(OUT_A, &[], extra.as_slice()).unwrap();
-            let keyed = live_dependency_key(
-                &plan,
-                &toolchain(),
-                &externs(&plan, 20),
-                &inputs(&plan, 11),
-            )
-            .unwrap();
+            let keyed =
+                live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &inputs(&plan, 11))
+                    .unwrap();
             assert!(!keys.contains(&keyed.action_key));
             keys.push(keyed.action_key);
         }
@@ -2355,8 +2356,7 @@ mod tests {
         }
 
         let sysroot = successful(Command::new("rustc").args(["--print", "sysroot"]));
-        let rustc =
-            Path::new(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
+        let rustc = Path::new(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
         let version = successful(Command::new(&rustc).arg("-vV"));
         let version = String::from_utf8(version.stdout).unwrap();
         let host = version
@@ -2365,8 +2365,8 @@ mod tests {
             .unwrap();
         let temporary = tempfile::tempdir().unwrap();
         let cargo_home = temporary.path().join("cargo-home");
-        let package = cargo_home
-            .join("registry/src/index.example-0123456789abcdef/env_fixture-1.0.0");
+        let package =
+            cargo_home.join("registry/src/index.example-0123456789abcdef/env_fixture-1.0.0");
         std::fs::create_dir_all(package.join("src")).unwrap();
         std::fs::write(
             package.join("Cargo.toml"),
@@ -2486,7 +2486,10 @@ mod tests {
                     .arg("-o")
                     .arg(&driver),
             );
-            assert_eq!(successful(&mut Command::new(driver)).stdout, expected.as_bytes());
+            assert_eq!(
+                successful(&mut Command::new(driver)).stdout,
+                expected.as_bytes()
+            );
         }
     }
 
@@ -2937,16 +2940,21 @@ mod tests {
     }
 
     #[test]
-    fn preserved_environment_and_acknowledged_capture_have_a_separate_live_key_namespace() {
+    fn complete_dependency_inputs_require_new_evidence_for_every_source_kind() {
         for plan in [
             plan_for(OUT_A, &[], &[]).unwrap(),
             plan_in_package(GIT_ROOT, OUT_A, &[]).unwrap(),
+            directory_plan(DIRECTORY_PACKAGE, OUT_A, &[], &[]).unwrap(),
         ] {
+            let manifest = if plan.source_kind == DependencySourceKind::DirectoryPackage {
+                directory_inputs(&plan)
+            } else {
+                inputs(&plan, 11)
+            };
             let current =
-                live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &inputs(&plan, 11))
-                    .unwrap();
-            assert_eq!(current.descriptor.key_epoch, 3);
-            for previous_epoch in [1, 2] {
+                live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &manifest).unwrap();
+            assert_eq!(current.descriptor.key_epoch, 4);
+            for previous_epoch in [1, 2, 3] {
                 let mut previous = current.descriptor.clone();
                 previous.key_epoch = previous_epoch;
                 assert_ne!(current.action_key, compute_action_key(&previous).final_key);

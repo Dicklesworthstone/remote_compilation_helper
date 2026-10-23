@@ -15,6 +15,7 @@ on:
       - 'rabs-wkr/**'
       - 'rabs-asupersync/**'
       - 'rabs-cas/**'
+      - 'rabs-key/**'
       - 'rabs-sandbox/**'
       - 'rch-common/src/toolchain.rs'
       - 'rch-common/src/toolchain/**'
@@ -191,7 +192,10 @@ jobs:
           cargo test --release -p rabsd --lib coord::remote_dependency_transport::tests --locked
           cargo test --release -p rabsd --lib edge::live_facts::package_capture --locked
       - name: Toolchain ownership and complete live input observations
-        run: cargo test --release -p rabsd --lib edge::live_facts --locked
+        run: |
+          cargo test --release -p rabs-key --lib live_dependency --locked
+          cargo test --release -p rabsd --lib edge::live_facts --locked
+          cargo test --release -p rabsd --test live_dependency_inventory --locked
       - name: Cargo layout projection keys and real split-directory builds
         run: |
           cargo test --release -p rabsd cargo_placement_reuse --locked
