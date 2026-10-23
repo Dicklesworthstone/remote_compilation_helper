@@ -352,7 +352,7 @@ fn vendor_config_refuses_ambient_layers_aliases_and_escaping_directories() {
             "replace-with = 'vendored-sources'",
             "replace-with = 'crates-io'",
         ),
-        format!("{CONFIG}\n[env]\nSECRET='private-marker'\n"),
+        format!("{CONFIG}\n[env]\nRUSTC='private-marker'\n"),
         format!("{CONFIG}\n[build]\nrustc-wrapper='malicious-helper'\n"),
         format!("{CONFIG}\n[source.other]\ngit='file:///outside'\n"),
     ] {

@@ -1,11 +1,13 @@
-//! Offline crates.io archive capture from an explicitly approved Cargo home.
+//! Offline sparse registry capture from an explicitly approved Cargo home.
 //!
 //! A lockfile selects package identities; its SHA-256 checksums select archive
 //! bytes. Cargo remains the resolver and consumes only a fresh private home.
 //! Expanded user sources, credentials, Cargo configuration and unrelated
 //! index entries are never opened. This supplies inputs, not cache authority.
 
-use super::{MAX_PACKAGES, OUTPUT_LIMIT, git, invalid, require, validate_manifest_paths};
+use super::{
+    MAX_PACKAGES, OUTPUT_LIMIT, git, invalid, require, validate_manifest_paths_with_cache, vendor,
+};
 use flate2::read::MultiGzDecoder;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, MAX_SOURCE_FILES};
@@ -19,10 +21,120 @@ use std::path::{Component, Path, PathBuf};
 pub(super) const CACHE_PREFIX: &str = "rabs-cargo-home";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const MAX_NAMESPACES: usize = 8;
+// Candidate discovery can encounter archives belonging to other sparse indexes
+// on the same host. Bound all bytes read, including checksum mismatches, rather
+// than charging only the archives selected for delivery.
+const MAX_CANDIDATE_BYTES: u64 = MAX_SOURCE_BYTES;
 pub(super) const MAX_ARCHIVE_MEMBERS: usize = 100_000;
 
-type PackageIdentity = (String, String);
+// Sources are part of package identity: two registries may publish the same
+// name and version with different archives. Never collapse them into one hit.
+type PackageIdentity = (String, String, String);
 type LockedPackages = BTreeMap<PackageIdentity, [u8; 32]>;
+type CandidateIdentities<'a> = Vec<(&'a PackageIdentity, &'a [u8; 32])>;
+
+#[derive(Debug)]
+struct MatchedArchive<'a> {
+    bytes: Vec<u8>,
+    identities: Vec<&'a PackageIdentity>,
+}
+
+fn registry_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
+/// Cargo names sparse cache directories with the URL host and a Cargo-owned
+/// hash. The host only bounds candidate discovery; offline Cargo subsequently
+/// chooses the exact URL-derived namespace and we bind its result to the locked
+/// source identity, checksum, manifest and target bytes.
+fn registry_host(source: &str) -> io::Result<&str> {
+    if source == CRATES_IO {
+        return Ok("index.crates.io");
+    }
+    require(
+        source.starts_with("sparse+") && vendor::registry_source(source)? == source,
+        "cached alternate registries require a canonical sparse HTTP(S) index",
+    )?;
+    let authority = source
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .ok_or_else(|| invalid("cached sparse registry host missing"))?;
+    let host = if let Some((host, port)) = authority.split_once(':') {
+        require(
+            port.parse::<u16>().is_ok_and(|port| port != 0),
+            "cached sparse registry has an invalid port",
+        )?;
+        host
+    } else {
+        authority
+    };
+    require(
+        !host.is_empty()
+            && host.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte)
+            }),
+        "cached sparse registry requires a canonical DNS or IPv4 host",
+    )?;
+    Ok(host)
+}
+
+pub(super) fn validate_cargo_config(value: &toml::Value, base: &Path) -> io::Result<()> {
+    // The shared validator permits source tables only for its caller to check.
+    // This adapter admits named sparse indexes, never source replacement chains.
+    super::validate_cargo_config(value, base, true)?;
+    require(
+        value.get("source").is_none(),
+        "cached registry preparation does not import source replacements",
+    )?;
+    if let Some(registries) = value.get("registries") {
+        let registries = registries
+            .as_table()
+            .filter(|registries| registries.len() <= MAX_NAMESPACES)
+            .ok_or_else(|| invalid("captured sparse registry declarations exceed their bound"))?;
+        for (name, registry) in registries {
+            require(
+                registry_name(name) && name != "crates-io",
+                "invalid or reserved alternate registry name",
+            )?;
+            let fields = registry
+                .as_table()
+                .filter(|fields| fields.len() == 1)
+                .ok_or_else(|| {
+                    invalid("captured registry accepts only its index, not credentials or helpers")
+                })?;
+            let index = fields
+                .get("index")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| invalid("captured registry index missing"))?;
+            registry_host(index)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_dependency(fields: &toml::map::Map<String, toml::Value>) -> io::Result<()> {
+    require(
+        !fields.contains_key("git")
+            && !(fields.contains_key("registry") && fields.contains_key("registry-index")),
+        "dependency contains conflicting registry/Git selectors",
+    )?;
+    if let Some(name) = fields.get("registry") {
+        require(
+            name.as_str().is_some_and(registry_name),
+            "dependency registry name must be a bounded literal name",
+        )
+    } else {
+        let index = fields
+            .get("registry-index")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| invalid("dependency registry index must be a string"))?;
+        registry_host(&vendor::registry_source(index)?).map(|_| ())
+    }
+}
 
 fn archive_checksum(value: &str) -> io::Result<[u8; 32]> {
     require(
@@ -117,9 +229,7 @@ fn locked_packages(lock: &toml::Value) -> io::Result<LockedPackages> {
                     .ok_or_else(|| invalid("invalid locked package source"))
             })
             .transpose()?;
-        if let Some(source) = source
-            && source != CRATES_IO
-        {
+        if let Some(source) = source.filter(|source| source.starts_with("git+")) {
             git::locked_revision(source)?;
             require(
                 package.get("checksum").is_none(),
@@ -130,17 +240,21 @@ fn locked_packages(lock: &toml::Value) -> io::Result<LockedPackages> {
             identities.insert((name, version, source)),
             "duplicate locked package identity",
         )?;
-        if source == Some(CRATES_IO) {
+        if let Some(source) = source.filter(|source| !source.starts_with("git+")) {
+            registry_host(source)?;
             let checksum = package
                 .get("checksum")
                 .and_then(toml::Value::as_str)
-                .ok_or_else(|| invalid("locked crates.io package requires a SHA-256 checksum"))?;
+                .ok_or_else(|| invalid("locked registry package requires a SHA-256 checksum"))?;
             let digest = archive_checksum(checksum)?;
             require(
                 selected
-                    .insert((name.to_owned(), version.to_owned()), digest)
+                    .insert(
+                        (source.to_owned(), name.to_owned(), version.to_owned()),
+                        digest,
+                    )
                     .is_none(),
-                "ambiguous locked crates.io package identity",
+                "ambiguous locked registry package identity",
             )?;
         }
     }
@@ -201,7 +315,10 @@ pub(super) fn open_selected(_root: &File, _path: &str, _directory: bool) -> io::
 }
 
 fn read_selected(root: &File, path: &str, limit: u64) -> io::Result<Vec<u8>> {
-    let mut file = open_selected(root, path, false)?;
+    read_selected_file(open_selected(root, path, false)?, limit)
+}
+
+fn read_selected_file(mut file: File, limit: u64) -> io::Result<Vec<u8>> {
     let before = file.metadata()?;
     require(
         before.is_file() && before.len() <= limit,
@@ -209,7 +326,7 @@ fn read_selected(root: &File, path: &str, limit: u64) -> io::Result<Vec<u8>> {
     )?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
-        .take(limit.saturating_add(1))
+        .take(before.len())
         .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
     require(
@@ -232,10 +349,79 @@ fn read_selected(root: &File, path: &str, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn index_namespaces(root: &File) -> io::Result<Vec<String>> {
+fn archive_candidates<'a>(
+    namespace: &str,
+    locked: &'a LockedPackages,
+) -> io::Result<BTreeMap<String, CandidateIdentities<'a>>> {
+    let host = namespace
+        .rsplit_once('-')
+        .map(|(host, _)| host)
+        .unwrap_or_default();
+    let mut candidates: BTreeMap<String, CandidateIdentities<'a>> = BTreeMap::new();
+    for (identity @ (source, name, version), expected) in locked {
+        if registry_host(source)? != host {
+            continue;
+        }
+        let path = format!("registry/cache/{namespace}/{name}-{version}.crate");
+        let identities = candidates.entry(path).or_default();
+        if let Some(((.., previous_name, previous_version), _)) = identities.first() {
+            require(
+                previous_name == name && previous_version == version,
+                "locked package identities alias the same registry archive path",
+            )?;
+        }
+        identities.push((identity, expected));
+    }
+    Ok(candidates)
+}
+
+fn read_archive_candidate<'a>(
+    root: &File,
+    path: &str,
+    identities: &CandidateIdentities<'a>,
+    candidate_remaining: &mut u64,
+    retained_limit: u64,
+) -> io::Result<Option<MatchedArchive<'a>>> {
+    let file = match open_selected(root, path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let size = file.metadata()?.len();
+    *candidate_remaining = candidate_remaining.checked_sub(size).ok_or_else(|| {
+        invalid("registry archive candidates exceed their aggregate candidate-read byte budget")
+    })?;
+    // Reserve before reading or comparing checksums. The same descriptor and
+    // size limit prevent a replacement/growth from exceeding that reservation.
+    let bytes = read_selected_file(file, size.min(retained_limit))?;
+    let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+    let mut matches = Vec::new();
+    for (identity @ (source, _, _), expected) in identities {
+        if digest == **expected {
+            matches.push(*identity);
+        } else {
+            // Same-host indexes may legitimately hold a different archive, but
+            // preserve the existing crates.io checksum-mismatch refusal.
+            require(
+                source != CRATES_IO,
+                "cached crate archive checksum does not match the retained Cargo.lock",
+            )?;
+        }
+    }
+    Ok((!matches.is_empty()).then_some(MatchedArchive {
+        bytes,
+        identities: matches,
+    }))
+}
+
+fn index_namespaces(root: &File, locked: &LockedPackages) -> io::Result<Vec<String>> {
     #[cfg(unix)]
     {
         let directory = open_selected(root, "registry/index", true)?;
+        let hosts = locked
+            .keys()
+            .map(|(source, _, _)| registry_host(source))
+            .collect::<io::Result<BTreeSet<_>>>()?;
         let mut names = BTreeSet::new();
         for (index, entry) in rustix::fs::Dir::read_from(&directory)?.enumerate() {
             require(
@@ -246,8 +432,9 @@ fn index_namespaces(root: &File) -> io::Result<Vec<String>> {
             let Ok(name) = entry.file_name().to_str() else {
                 continue;
             };
-            if name.strip_prefix("index.crates.io-").is_some_and(|suffix| {
-                suffix.len() == 16
+            if name.rsplit_once('-').is_some_and(|(host, suffix)| {
+                hosts.contains(host)
+                    && suffix.len() == 16
                     && suffix
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -255,19 +442,19 @@ fn index_namespaces(root: &File) -> io::Result<Vec<String>> {
                 names.insert(name.to_owned());
                 require(
                     names.len() <= MAX_NAMESPACES,
-                    "too many cached crates.io sparse index namespaces",
+                    "too many selected sparse registry cache namespaces",
                 )?;
             }
         }
         require(
             !names.is_empty(),
-            "approved Cargo home has no crates.io sparse index cache",
+            "approved Cargo home has no selected sparse registry index cache",
         )?;
         Ok(names.into_iter().collect())
     }
     #[cfg(not(unix))]
     {
-        let _ = root;
+        let _ = (root, locked);
         Err(invalid("cached registry capture requires Unix"))
     }
 }
@@ -282,24 +469,66 @@ fn index_record(name: &str) -> String {
     }
 }
 
-fn validate_index_config(bytes: &[u8]) -> io::Result<()> {
+fn public_endpoint(value: &Value, template: bool) -> bool {
+    let Some(url) = value.as_str().filter(|url| url.len() <= 4096) else {
+        return false;
+    };
+    let Some(tail) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = tail.split('/').next().unwrap_or_default();
+    if authority.is_empty()
+        || !authority
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-:[]".contains(&byte))
+        || url.contains(['?', '#', '@', '\\', '%'])
+        || url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        || tail.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return false;
+    }
+    let mut literal = url.to_owned();
+    if template {
+        for marker in [
+            "{crate}",
+            "{version}",
+            "{prefix}",
+            "{lowerprefix}",
+            "{sha256-checksum}",
+        ] {
+            literal = literal.replace(marker, "");
+        }
+    }
+    !literal.contains(['{', '}'])
+}
+
+fn validate_index_config(bytes: &[u8], crates_io: bool) -> io::Result<()> {
     let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| invalid("cached crates.io index config is not JSON"))?;
+        .map_err(|_| invalid("cached sparse index config is not JSON"))?;
     require(
         value.as_object().is_some_and(|fields| {
             fields
                 .keys()
                 .all(|key| matches!(key.as_str(), "dl" | "api" | "auth-required"))
-        }) && value["dl"].as_str().is_some_and(|url| {
-            matches!(
-                url,
-                "https://static.crates.io/crates" | "https://static.crates.io/crates/"
-            )
-        }) && value
-            .get("api")
-            .is_none_or(|api| api == "https://crates.io")
-            && value.get("auth-required").is_none_or(|auth| auth == false),
-        "cached registry capture requires the public crates.io index configuration",
+        }) && if crates_io {
+            value["dl"].as_str().is_some_and(|url| {
+                matches!(
+                    url,
+                    "https://static.crates.io/crates" | "https://static.crates.io/crates/"
+                )
+            }) && value
+                .get("api")
+                .is_none_or(|api| api == "https://crates.io")
+        } else {
+            public_endpoint(&value["dl"], true)
+                && value
+                    .get("api")
+                    .is_none_or(|api| public_endpoint(api, false))
+        } && value.get("auth-required").is_none_or(|auth| auth == false),
+        "cached registry capture requires a public index without credentials or unknown endpoints",
     )
 }
 
@@ -479,7 +708,7 @@ fn inspect_archive(
                 == Some(version),
         "registry package manifest differs from its locked name or version",
     )?;
-    validate_manifest_paths(Path::new(""), &manifest, None, false)?;
+    validate_manifest_paths_with_cache(Path::new(""), &manifest, None, false, true)?;
     Ok(CapturedPackage { members })
 }
 
@@ -488,6 +717,7 @@ pub(super) struct RegistryCache {
     lock: PathBuf,
     files: BTreeMap<String, Vec<u8>>,
     packages: BTreeMap<(String, String, String), CapturedPackage>,
+    package_sources: BTreeSet<(String, String, String, String)>,
     git: Option<git::GitCache>,
 }
 
@@ -514,7 +744,7 @@ impl RegistryCache {
         let locked = locked_packages(&lock_value)?;
         require(
             !locked.is_empty() || git::has_locked_packages(&lock_value),
-            "cargo_home_source requires at least one locked crates.io or full-revision Git package",
+            "cargo_home_source requires at least one locked sparse-registry or full-revision Git package",
         )?;
         let workspace = image
             .manifest("workspace")
@@ -533,39 +763,48 @@ impl RegistryCache {
         let namespaces = if locked.is_empty() {
             Vec::new()
         } else {
-            index_namespaces(&root)?
+            index_namespaces(&root, &locked)?
         };
         let mut captured = Self {
             lock: lock.to_path_buf(),
             files: BTreeMap::new(),
             packages: BTreeMap::new(),
+            package_sources: BTreeSet::new(),
             git: None,
         };
         let mut found = BTreeSet::new();
+        let mut candidate_remaining = MAX_CANDIDATE_BYTES;
         let mut expanded_remaining = MAX_SOURCE_BYTES;
         let mut expanded_members = 0_usize;
         for namespace in namespaces {
             let config_path = format!("registry/index/{namespace}/config.json");
-            let mut namespace_used = false;
-            for ((name, version), expected) in &locked {
-                let path = format!("registry/cache/{namespace}/{name}-{version}.crate");
-                let bytes = match read_selected(&root, &path, remaining) {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
+            let mut namespace_sources = BTreeSet::new();
+            // Group by the physical cache path before acquisition: many locked
+            // source identities can share a host, package name and version.
+            // Each candidate is read and hashed once, not once per identity.
+            for (path, identities) in archive_candidates(&namespace, &locked)? {
+                let Some(candidate) = read_archive_candidate(
+                    &root,
+                    &path,
+                    &identities,
+                    &mut candidate_remaining,
+                    remaining,
+                )?
+                else {
+                    continue;
                 };
-                require(
-                    <[u8; 32]>::from(Sha256::digest(&bytes)) == *expected,
-                    "cached crate archive checksum does not match the retained Cargo.lock",
-                )?;
+                let (_, name, version) = candidate.identities[0];
                 let package = inspect_archive(
-                    &bytes,
+                    &candidate.bytes,
                     name,
                     version,
                     &mut expanded_remaining,
                     &mut expanded_members,
                 )?;
-                captured.insert(path, bytes, &mut remaining, &mut file_count)?;
+                captured.insert(path, candidate.bytes, &mut remaining, &mut file_count)?;
+                captured
+                    .packages
+                    .insert((namespace.clone(), name.clone(), version.clone()), package);
                 let record = format!("registry/index/{namespace}/.cache/{}", index_record(name));
                 if !captured.files.contains_key(&record) {
                     let bytes = read_selected(&root, &record, OUTPUT_LIMIT.min(remaining))?;
@@ -575,25 +814,32 @@ impl RegistryCache {
                     )?;
                     captured.insert(record, bytes, &mut remaining, &mut file_count)?;
                 }
-                captured
-                    .packages
-                    .insert((namespace.clone(), name.clone(), version.clone()), package);
-                found.insert((name.clone(), version.clone()));
-                namespace_used = true;
+                for (source, name, version) in candidate.identities {
+                    captured.package_sources.insert((
+                        source.clone(),
+                        namespace.clone(),
+                        name.clone(),
+                        version.clone(),
+                    ));
+                    found.insert((source.clone(), name.clone(), version.clone()));
+                    namespace_sources.insert(source.as_str());
+                }
             }
-            if namespace_used {
+            if !namespace_sources.is_empty() {
                 let config = read_selected(&root, &config_path, OUTPUT_LIMIT.min(remaining))?;
-                validate_index_config(&config)?;
+                validate_index_config(&config, namespace_sources.contains(CRATES_IO))?;
                 captured.insert(config_path, config, &mut remaining, &mut file_count)?;
             }
         }
         require(
             found.len() == locked.len(),
-            "approved Cargo home is missing a locked crates.io archive; fetch the complete locked graph before preparing",
+            "approved Cargo home is missing a checksum-matching locked registry archive; fetch the complete locked graph before preparing",
         )?;
         // Re-read the complete selected set. An index/cache replacement during
         // acquisition refuses; a later user-home mutation cannot change the
         // retained map. Archives are independently content-bound to the lock.
+        // This pass is bounded by the selected delivery bytes; rejected archive
+        // candidates were charged separately during the single acquisition pass.
         for (path, bytes) in &captured.files {
             require(
                 read_selected(&root, path, bytes.len() as u64)? == *bytes,
@@ -685,10 +931,10 @@ impl RegistryCache {
                 })?
                 .check_package(home, package);
         }
-        require(
-            package["source"] == CRATES_IO,
-            "resolved package is not from the captured crates.io source",
-        )?;
+        let source = package["source"]
+            .as_str()
+            .ok_or_else(|| invalid("resolved registry source missing"))?;
+        registry_host(source)?;
         let name = package["name"]
             .as_str()
             .ok_or_else(|| invalid("resolved registry package name missing"))?;
@@ -719,6 +965,15 @@ impl RegistryCache {
             components[1].as_os_str() == std::ffi::OsStr::new(&format!("{name}-{version}"))
                 && components[2].as_os_str() == "Cargo.toml",
             "resolved registry manifest differs from its locked package path",
+        )?;
+        require(
+            self.package_sources.contains(&(
+                source.to_owned(),
+                namespace.to_owned(),
+                name.to_owned(),
+                version.to_owned(),
+            )),
+            "resolved registry source and archive were not selected by the retained lockfile",
         )?;
         let captured = self
             .packages
@@ -939,6 +1194,7 @@ mod tests {
     fn public_index_configuration_cannot_enable_credentials_or_redirect_downloads() {
         validate_index_config(
             br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#,
+            true,
         )
         .unwrap();
         for value in [
@@ -947,8 +1203,470 @@ mod tests {
             json!({"dl":"https://static.crates.io/crates","token":"must-not-be-read"}),
             json!({"dl":"https://static.crates.io/crates","api":"https://other.invalid"}),
         ] {
-            assert!(validate_index_config(&serde_json::to_vec(&value).unwrap()).is_err());
+            assert!(validate_index_config(&serde_json::to_vec(&value).unwrap(), true).is_err());
         }
+    }
+
+    #[test]
+    fn sparse_registry_config_admits_only_captured_index_declarations() {
+        let valid = "[registries.company]\nindex='sparse+https://registry.example/team/'\n[build]\nrustflags=['-Dwarnings']\n";
+        validate_cargo_config(&toml::from_str(valid).unwrap(), Path::new("")).unwrap();
+        for text in [
+            valid.replace("sparse+https://registry.example/team/", "https://registry.example/team/"),
+            valid.replace("registry.example", "user:secret@registry.example"),
+            valid.replace("registry.example", "registry.example:0"),
+            valid.replace("team/", "team/?token=secret"),
+            valid.replace("company", "crates-io"),
+            format!("{valid}\n[registries.company.credential-provider]\nname='external'\n"),
+            "[registries.company]\nindex='sparse+https://registry.example/'\ntoken='must-not-read'\n".into(),
+            "[source.crates-io]\nreplace-with='company'\n".into(),
+        ] {
+            assert!(validate_cargo_config(&toml::from_str(&text).unwrap(), Path::new("")).is_err(), "{text}");
+        }
+        for text in [
+            "registry='company'",
+            "registry-index='sparse+https://registry.example/team/'",
+            "registry-index='https://github.com/rust-lang/crates.io-index'",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            validate_dependency(value.as_table().unwrap()).unwrap();
+        }
+        for text in [
+            "registry='company'\ngit='https://registry.example/repo'",
+            "registry='company'\nregistry-index='sparse+https://registry.example/'",
+            "registry='../../secret'",
+            "registry-index='https://registry.example/git-index'",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            assert!(
+                validate_dependency(value.as_table().unwrap()).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_name_and_version_remain_distinct_across_sparse_sources() {
+        let lock: toml::Value = toml::from_str(&format!(
+            "version=4\n[[package]]\nname='fixture'\nversion='1.0.0'\nsource='sparse+https://registry.example/first/'\nchecksum='{}'\n[[package]]\nname='fixture'\nversion='1.0.0'\nsource='sparse+https://registry.example/second/'\nchecksum='{}'\n",
+            "ab".repeat(32), "cd".repeat(32),
+        )).unwrap();
+        let locked = locked_packages(&lock).unwrap();
+        assert_eq!(locked.len(), 2);
+        assert_ne!(locked.values().next(), locked.values().next_back());
+        for source in [
+            "sparse+https://registry.example/index",
+            "sparse+https://token@registry.example/index/",
+            "sparse+file:///tmp/registry/",
+            "registry+https://registry.example/index",
+        ] {
+            assert!(registry_host(source).is_err(), "{source}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_path_registry_identities_read_and_hash_one_archive_candidate() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = open_home(owner.path()).unwrap();
+        let namespace = "registry.example-0123456789abcdef";
+        let bytes = archive(&[("fixture-1.0.0/Cargo.toml", MANIFEST)]);
+        let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+        let mut locked = LockedPackages::new();
+        for index in 0..MAX_PACKAGES {
+            locked.insert(
+                (
+                    format!("sparse+https://registry.example/{index}/"),
+                    "fixture".into(),
+                    "1.0.0".into(),
+                ),
+                if index % 2 == 0 { digest } else { [0; 32] },
+            );
+        }
+        let candidates = archive_candidates(namespace, &locked).unwrap();
+        assert_eq!(candidates.len(), 1, "group by physical archive path");
+        let (path, identities) = candidates.first_key_value().unwrap();
+        fs::create_dir_all(owner.path().join(path).parent().unwrap()).unwrap();
+        fs::write(owner.path().join(path), &bytes).unwrap();
+        // A budget of precisely one archive must cover every logical source,
+        // including the half whose checksum does not match this namespace.
+        let mut remaining = bytes.len() as u64;
+        let matched =
+            read_archive_candidate(&root, path, identities, &mut remaining, MAX_SOURCE_BYTES)
+                .unwrap()
+                .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(matched.bytes, bytes);
+        assert_eq!(matched.identities.len(), MAX_PACKAGES.div_ceil(2));
+        assert!(
+            matched
+                .identities
+                .iter()
+                .all(|identity| locked[*identity] == digest)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatched_archive_candidates_consume_one_shared_read_budget() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = open_home(owner.path()).unwrap();
+        let bytes = archive(&[("fixture-1.0.0/Cargo.toml", MANIFEST)]);
+        let locked = LockedPackages::from([(
+            (
+                "sparse+https://registry.example/required/".into(),
+                "fixture".into(),
+                "1.0.0".into(),
+            ),
+            [0; 32],
+        )]);
+        let first = archive_candidates("registry.example-0123456789abcdef", &locked).unwrap();
+        let second = archive_candidates("registry.example-fedcba9876543210", &locked).unwrap();
+        for path in first.keys().chain(second.keys()) {
+            fs::create_dir_all(owner.path().join(path).parent().unwrap()).unwrap();
+            fs::write(owner.path().join(path), &bytes).unwrap();
+        }
+        let mut remaining = bytes.len() as u64 * 2 - 1;
+        let (path, identities) = first.first_key_value().unwrap();
+        assert!(
+            read_archive_candidate(&root, path, identities, &mut remaining, MAX_SOURCE_BYTES)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(remaining, bytes.len() as u64 - 1);
+        let (path, identities) = second.first_key_value().unwrap();
+        let error =
+            read_archive_candidate(&root, path, identities, &mut remaining, MAX_SOURCE_BYTES)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate candidate-read byte budget"),
+            "{error}"
+        );
+        assert_eq!(remaining, bytes.len() as u64 - 1);
+        assert!(
+            read_archive_candidate(
+                &root,
+                "registry/cache/absent/fixture-1.0.0.crate",
+                identities,
+                &mut remaining,
+                MAX_SOURCE_BYTES,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(remaining, bytes.len() as u64 - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crates_io_mismatch_refuses_even_when_another_same_host_source_matches() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = open_home(owner.path()).unwrap();
+        let bytes = archive(&[("fixture-1.0.0/Cargo.toml", MANIFEST)]);
+        let locked = LockedPackages::from([
+            (
+                (CRATES_IO.into(), "fixture".into(), "1.0.0".into()),
+                [0; 32],
+            ),
+            (
+                (
+                    "sparse+https://index.crates.io/alternate/".into(),
+                    "fixture".into(),
+                    "1.0.0".into(),
+                ),
+                <[u8; 32]>::from(Sha256::digest(&bytes)),
+            ),
+        ]);
+        let candidates = archive_candidates("index.crates.io-0123456789abcdef", &locked).unwrap();
+        let (path, identities) = candidates.first_key_value().unwrap();
+        fs::create_dir_all(owner.path().join(path).parent().unwrap()).unwrap();
+        fs::write(owner.path().join(path), &bytes).unwrap();
+        let mut remaining = bytes.len() as u64;
+        let error =
+            read_archive_candidate(&root, path, identities, &mut remaining, MAX_SOURCE_BYTES)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("checksum does not match"),
+            "{error}"
+        );
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn public_sparse_index_templates_do_not_import_authentication_or_local_paths() {
+        for value in [
+            json!({"dl":"https://registry.example/crates/{crate}/{version}/{sha256-checksum}","api":"https://registry.example/api","auth-required":false}),
+            json!({"dl":"http://127.0.0.1:12345/crates/{lowerprefix}/{crate}-{version}.crate"}),
+        ] {
+            validate_index_config(&serde_json::to_vec(&value).unwrap(), false).unwrap();
+        }
+        for value in [
+            json!({"dl":"file:///etc/secret"}),
+            json!({"dl":"https://user:secret@registry.example/crates"}),
+            json!({"dl":"https://registry.example/crates?token=secret"}),
+            json!({"dl":"https://registry.example/crates","auth-required":true}),
+            json!({"dl":"https://registry.example/crates","credential-provider":"external"}),
+            json!({"dl":"https://registry.example/{unknown}"}),
+            json!({"dl":"https://registry.example/crates","api":"file:///etc/secret"}),
+        ] {
+            assert!(
+                validate_index_config(&serde_json::to_vec(&value).unwrap(), false).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_same_host_sparse_registries_replay_offline_from_archives_without_user_home_state() {
+        use rabs_sandbox::cargo_home::{CargoHomeProjection, ISOLATED_CARGO_HOME_SOURCE_VERSION};
+        use rabs_sandbox::snapshot_capture::capture_sealed_source;
+        use rabs_sandbox::source_transfer::{
+            MAX_SOURCE_CHUNK, SourceFile, SourceManifest, SourceReceiver,
+        };
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace = root.join("workspace");
+        let seed = root.join("seed");
+        for path in [
+            workspace.join("src"),
+            workspace.join(".cargo"),
+            seed.join("home"),
+            seed.join("cargo-home"),
+            seed.join("tools"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let cargo = super::super::local_tool("cargo", &seed.join("tools")).unwrap();
+        let rustc = super::super::local_tool("rustc", &seed.join("tools")).unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let address = server.local_addr().unwrap();
+        let mut responses = BTreeMap::new();
+        for (registry, answer) in [("first", 17), ("second", 25)] {
+            let code = format!("pub fn answer() -> u32 {{ {answer} }}\n");
+            let bytes = archive(&[
+                (
+                    "fixture-1.0.0/Cargo.toml",
+                    b"[package]\nname='fixture'\nversion='1.0.0'\nedition='2021'\n",
+                ),
+                ("fixture-1.0.0/src/lib.rs", code.as_bytes()),
+            ]);
+            let checksum: String = Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            responses.insert(
+                format!("/{registry}/config.json"),
+                serde_json::to_vec(&json!({
+                    "dl":format!("http://{address}/{registry}/crates"), "auth-required":false,
+                }))
+                .unwrap(),
+            );
+            responses.insert(
+                format!("/{registry}/fi/xt/fixture"),
+                serde_json::to_vec(&json!({
+                    "name":"fixture", "vers":"1.0.0", "deps":[], "cksum":checksum,
+                    "features":{}, "yanked":false,
+                }))
+                .unwrap(),
+            );
+            responses.insert(format!("/{registry}/crates/fixture/1.0.0/download"), bytes);
+        }
+        fs::write(workspace.join("Cargo.toml"), "[package]\nname='registry-replay'\nversion='0.1.0'\nedition='2021'\n[dependencies]\none={package='fixture',version='=1.0.0',registry='first'}\ntwo={package='fixture',version='=1.0.0',registry='second'}\n").unwrap();
+        fs::write(workspace.join("src/lib.rs"), "#[test]\nfn distinct_registry_archives() { assert_eq!(one::answer(),17); assert_eq!(two::answer(),25); }\n").unwrap();
+        fs::write(workspace.join(".cargo/config.toml"), format!(
+            "[registries.first]\nindex='sparse+http://{address}/first/'\n[registries.second]\nindex='sparse+http://{address}/second/'\n",
+        )).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+                let (mut stream, _) = match server.accept() {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("fixture server: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n")
+                    && request.len() < 16 * 1024
+                {
+                    let count = stream.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default();
+                let (status, body) = match responses.get(path) {
+                    Some(bytes) => ("200 OK", bytes.as_slice()),
+                    None => ("404 Not Found", &b"missing"[..]),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let mut fetch =
+            super::super::planning_command(&cargo, &rustc, &workspace, "Cargo.toml", &seed)
+                .unwrap();
+        fetch.args(["fetch", "--manifest-path"]).arg(workspace.join("Cargo.toml"))
+            .env("CARGO_HTTP_USER_AGENT", "remote_compilation_helper-agent (+https://github.com/Dicklesworthstone/remote_compilation_helper)");
+        let fetched =
+            super::super::bounded_command(fetch, &seed, Duration::from_secs(25), OUTPUT_LIMIT);
+        // All subsequent preparation and worker-side replay run with the only
+        // registry server shut down; a missing captured object cannot be fetched.
+        stop.store(true, Ordering::Release);
+        thread.join().unwrap();
+        fetched.unwrap();
+        let approved = seed.join("cargo-home");
+        fs::write(
+            approved.join("config.toml"),
+            "must not parse ambient Cargo configuration",
+        )
+        .unwrap();
+        fs::write(
+            approved.join("credentials.toml"),
+            "token = 'must-not-import'",
+        )
+        .unwrap();
+        for namespace in fs::read_dir(approved.join("registry/src")).unwrap() {
+            fs::write(
+                namespace.unwrap().path().join("fixture-1.0.0/src/lib.rs"),
+                "compile_error!(\"mutable expanded sources must not be read\");\n",
+            )
+            .unwrap();
+        }
+        let image = Arc::new(
+            capture_sealed_source(
+                &[("workspace".into(), workspace.clone())],
+                false,
+                2,
+                MAX_SOURCE_BYTES,
+            )
+            .unwrap(),
+        );
+        let source = super::super::CargoSource::parse(
+            &json!({"manifest":"Cargo.toml","cargo_home_source":approved}),
+        )
+        .unwrap();
+        let (retained, selected) = source.prepare(Arc::clone(&image)).unwrap();
+        assert!(
+            selected
+                .iter()
+                .all(|path| !path.ends_with("credentials.toml") && !path.contains("registry/src/"))
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|path| path.ends_with(".crate"))
+                .count(),
+            2
+        );
+        let manifest = SourceManifest::new(
+            selected
+                .iter()
+                .map(|path| {
+                    let bytes = retained.file_bytes("workspace", path).unwrap();
+                    SourceFile {
+                        path: path.clone(),
+                        len: bytes.len() as u64,
+                        sha256: Sha256::digest(bytes).into(),
+                        executable: false,
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        let projection = CargoHomeProjection::for_version(
+            ISOLATED_CARGO_HOME_SOURCE_VERSION,
+            CACHE_PREFIX,
+            &manifest,
+        )
+        .unwrap();
+        let mut receiver = SourceReceiver::create(&root.join("transferred"), manifest).unwrap();
+        for path in &selected {
+            for (chunk, bytes) in retained
+                .file_bytes("workspace", path)
+                .unwrap()
+                .chunks(MAX_SOURCE_CHUNK)
+                .enumerate()
+            {
+                receiver
+                    .write_chunk(
+                        path,
+                        (chunk * MAX_SOURCE_CHUNK) as u64,
+                        bytes,
+                        Sha256::digest(bytes).into(),
+                    )
+                    .unwrap();
+            }
+        }
+        receiver.seal().unwrap();
+        let prepared = projection
+            .prepare(&receiver, &root.join("worker-inputs"), || false)
+            .unwrap();
+        let worker = prepared.projected_workspace().unwrap();
+        assert!(!worker.join(CACHE_PREFIX).exists());
+        assert!(!prepared.root().join("credentials.toml").exists());
+        assert!(!prepared.root().join("config.toml").exists());
+        let mut replay =
+            super::super::planning_command(&cargo, &rustc, worker, "Cargo.toml", &seed).unwrap();
+        replay
+            .args(["test", "--locked", "--offline", "--lib"])
+            .env("CARGO_HOME", prepared.root())
+            .env("CARGO_TARGET_DIR", root.join("worker-target"));
+        let output =
+            super::super::bounded_command(replay, &seed, Duration::from_secs(30), OUTPUT_LIMIT)
+                .unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("1 passed; 0 failed"));
+        // The first retained view still works after user-home mutation; a fresh
+        // capture must instead refuse the now-mismatched locked archive.
+        let namespace = fs::read_dir(approved.join("registry/cache"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(namespace.join("fixture-1.0.0.crate"), b"checksum mismatch").unwrap();
+        let error = source.prepare(image).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checksum-matching locked registry archive"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]

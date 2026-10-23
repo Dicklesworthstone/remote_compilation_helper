@@ -341,7 +341,11 @@ fn validate_capture(
                         .parent()
                         .and_then(Path::parent)
                         .ok_or_else(|| invalid("invalid captured Cargo config path"))?;
-                    validate_cargo_config(&value, base, false)?;
+                    if cached_registry {
+                        registry::validate_cargo_config(&value, base)?;
+                    } else {
+                        validate_cargo_config(&value, base, false)?;
+                    }
                 }
             }
             if Path::new(path)
@@ -1017,9 +1021,15 @@ fn validate_dependencies(
         for dependency in dependencies.values() {
             if let Some(fields) = dependency.as_table() {
                 if fields.contains_key("registry") || fields.contains_key("registry-index") {
-                    sources
-                        .ok_or_else(|| invalid("alternate registry dependencies require an explicitly verified vendor source"))?
-                        .check_registry_dependency(fields)?;
+                    if let Some(sources) = sources {
+                        sources.check_registry_dependency(fields)?;
+                    } else {
+                        require(
+                            cached_git,
+                            "alternate registry dependencies require a verified vendor source or approved Cargo home",
+                        )?;
+                        registry::validate_dependency(fields)?;
+                    }
                 }
                 if fields.contains_key("git") {
                     if let Some(sources) = sources {

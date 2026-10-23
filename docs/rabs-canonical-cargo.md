@@ -337,8 +337,9 @@ for ownership and recovery details.
 
 ### Use dependencies already cached by Cargo
 
-For a locked crates.io or supported pinned-Git graph, replace `vendor` with an explicit absolute
-`cargo_home_source` in the profile:
+For a locked crates.io, public sparse alternate-registry or supported pinned-Git
+graph, replace `vendor` with an explicit absolute `cargo_home_source` in the
+profile:
 
 ```json
 "cargo_home_source": "/home/builder/.cargo"
@@ -352,6 +353,41 @@ It runs offline Cargo metadata against a fresh private Cargo home and verifies
 the resolved graph against the retained inputs. The lockfile must remain
 unchanged. Missing cache entries, checksum mismatches and unsupported registry
 sources refuse preparation before remote execution.
+
+Public alternate registries use the same archive and sparse-index capture path.
+Keep each named registry declaration in the captured project configuration:
+
+```toml
+# .cargo/config.toml
+[registries.company]
+index = "sparse+https://registry.example/team/"
+```
+
+```toml
+# Cargo.toml
+[dependencies]
+company-library = { version = "1.2", registry = "company" }
+```
+
+The index must use `sparse+http://` or `sparse+https://`, an ordinary lowercase
+DNS or IPv4 host, an optional nonzero port and a trailing slash. Registry URLs
+cannot contain credentials, queries, fragments, escapes or traversal. Each
+`[registries.<name>]` table accepts only `index`; source replacement tables,
+credential providers and tokens are not admitted by this cache mode. Index
+`config.json` must describe public HTTP(S) download/API endpoints and cannot set
+`auth-required = true`. Standard Cargo download URL templates are preserved.
+At most eight matching sparse cache namespaces are captured per preparation.
+Archive candidates are read and hashed once per cache path and share a 512 MiB
+acquisition limit, including archives rejected by checksum comparison. Exceeding
+that limit refuses preparation even if the selected archives would fit. The
+retained source/cache bytes and decompressed archives keep their separate limits.
+
+Registry source, package name, version and lockfile checksum remain separate
+parts of the selection. Two registries on the same host may publish distinct
+archives for the same name and version; preparation keeps both and offline
+Cargo selects the exact URL-derived namespace. The resolved source, manifest
+and target bytes must match their captured locked archive. A named registry is
+never silently redirected to crates.io or a different alternate registry.
 
 Git dependencies may use a full or abbreviated `rev`, an explicit `branch` or
 `tag`, or Cargo's default branch, provided `Cargo.lock` records the full
@@ -412,9 +448,10 @@ bundles keep their existing version and behavior.
 `cargo_home_source` and `vendor` are mutually exclusive. The selected Cargo home
 must have ordinary directory ancestors and be disjoint from the source,
 toolchain and operation roots. The source anchor must not already contain the
-reserved `rabs-cargo-home` directory. Alternate registries and Git graphs outside
-the locked-commit cache profile still require the supported approved vendor
-route. Cache capture does not authorize action
+reserved `rabs-cargo-home` directory. Git-index alternate registries,
+authentication-dependent indexes, source replacement configurations and Git
+graphs outside the locked-commit cache profile still require the supported
+approved vendor route. Cache capture does not authorize action
 cache publication or a compiler skip.
 
 ### Captured compiler configuration

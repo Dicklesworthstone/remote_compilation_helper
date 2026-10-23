@@ -53,7 +53,7 @@ fn git_revision(value: &str) -> bool {
 /// Preserve Cargo's registry source identity exactly, including the sparse
 /// protocol prefix. Accept only unambiguous, credential-free HTTP(S) indexes;
 /// this declaration selects already-captured bytes and never grants a fetch.
-fn registry_source(index: &str) -> io::Result<String> {
+pub(super) fn registry_source(index: &str) -> io::Result<String> {
     let (sparse, url) = match index.strip_prefix("sparse+") {
         Some(url) => (true, url),
         None => (false, index),
