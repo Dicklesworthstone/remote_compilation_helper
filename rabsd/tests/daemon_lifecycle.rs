@@ -8,7 +8,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn rabsd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rabsd"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
+    command.env_remove("RABS_PREPARED_CONCURRENCY");
+    command
 }
 
 fn run_capture(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32, Duration) {
@@ -66,6 +68,47 @@ fn unknown_config_keys_refuse_loudly() {
     assert_eq!(code, 1);
     assert!(stderr.contains("typo_key"), "{stderr}");
     assert!(stderr.contains("known keys"), "{stderr}");
+}
+
+#[test]
+fn prepared_concurrency_configuration_and_environment_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let path = config.to_str().unwrap();
+    for (contents, expected) in [
+        ("[rabs]\n", 4),
+        ("[rabs]\nprepared_concurrency = 1\n", 1),
+        ("[rabs]\nprepared_concurrency = 8\n", 8),
+        ("[rabs]\nprepared_concurrency = 32\n", 32),
+    ] {
+        std::fs::write(&config, contents).unwrap();
+        let (stdout, stderr, code, _) = run_capture(&["--check-config"], &[("RABS_CONFIG", path)]);
+        assert_eq!(code, 0, "{stderr}");
+        let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["prepared_concurrency"], expected);
+    }
+    std::fs::write(&config, "[rabs]\nprepared_concurrency = 1\n").unwrap();
+    let (stdout, stderr, code, _) = run_capture(
+        &["--check-config"],
+        &[("RABS_CONFIG", path), ("RABS_PREPARED_CONCURRENCY", "8")],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["prepared_concurrency"], 8);
+    for raw in ["0", "33", "-1", "", "1.5", "many", "18446744073709551616"] {
+        let (stdout, stderr, code, _) = run_capture(
+            &["--check-config"],
+            &[("RABS_CONFIG", path), ("RABS_PREPARED_CONCURRENCY", raw)],
+        );
+        assert_eq!(code, 1, "{raw}: {stdout}");
+        assert!(stderr.contains("RABS_PREPARED_CONCURRENCY"), "{stderr}");
+    }
+    for raw in ["0", "33", "-1", "1.5", "\"8\"", "true"] {
+        std::fs::write(&config, format!("[rabs]\nprepared_concurrency = {raw}\n")).unwrap();
+        let (stdout, stderr, code, _) = run_capture(&["--check-config"], &[("RABS_CONFIG", path)]);
+        assert_eq!(code, 1, "{raw}: {stdout}");
+        assert!(stderr.contains("rabs.prepared_concurrency"), "{stderr}");
+    }
 }
 
 #[test]

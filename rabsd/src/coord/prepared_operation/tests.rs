@@ -87,6 +87,48 @@ fn allocation_template(fixture: &Fixture, sequence: u64, worker: u16) -> Prepare
 }
 
 #[test]
+fn configured_concurrency_refuses_zero_and_unbounded_executor_counts() {
+    assert_eq!(PreparedConcurrency::default().get(), 4);
+    for value in [1, 4, 8, 32] {
+        assert_eq!(PreparedConcurrency::new(value).unwrap().get(), value);
+    }
+    for value in [0, 33, usize::MAX] {
+        assert_eq!(
+            PreparedConcurrency::new(value).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+}
+
+#[test]
+fn capacity_status_never_waits_for_persistence_and_reports_stopped_owners() {
+    let fixture = Fixture::new();
+    let store = PreparedOperationStore::open_with_concurrency(
+        &fixture.store_root,
+        PreparedConcurrency::new(1).unwrap(),
+    )
+    .unwrap();
+    let guard = store.lock_state().unwrap();
+    assert_eq!(
+        store.capacity_status().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(guard);
+    let spec = fixture.spec(800, 80);
+    store.submit(spec).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    store.stop().unwrap();
+    let status = store.capacity_status().unwrap();
+    assert_eq!(status.concurrency, 1);
+    assert_eq!(status.active, 1);
+    assert!(!status.accepting);
+    assert!(!status.persistence_uncertain);
+    assert!(claim.cancellation().is_cancelled());
+    drop(claim);
+    assert_eq!(store.capacity_status().unwrap().active, 0);
+}
+
+#[test]
 fn allocated_jobs_bind_once_in_claim_order_without_changing_submission_identity() {
     let fixture = Fixture::new();
     let first = allocation_template(&fixture, 701, 71);

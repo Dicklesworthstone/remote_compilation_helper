@@ -552,6 +552,79 @@ impl Fixture {
 }
 
 #[test]
+fn configured_daemon_runs_eight_owned_tls_listeners_and_reuses_released_capacity() {
+    // Real daemon, public CLI and TLS listener owners; no worker connects and
+    // these fixtures do not claim compiler execution or cache publication.
+    let fixture = Fixture::new();
+    let mut daemon =
+        fixture.daemon_with_environment(&[("RABS_PREPARED_CONCURRENCY".into(), "8".into())]);
+    let mut jobs = Vec::new();
+    for number in 1..=9 {
+        let mut job = fixture.prepare_with_allocation(number, false, true);
+        job.worker = format!("capacity-worker-{number}");
+        let mut submission = fixture.submission(&job);
+        submission[0] = "--job-submit-allocated".into();
+        submission[4] = format!("{number:064x}");
+        fixture.operation(&submission);
+        jobs.push(job);
+    }
+    let mut listeners = std::collections::BTreeSet::new();
+    for job in &jobs[..8] {
+        let running = fixture.wait_for(job, Duration::from_secs(15), |status| {
+            status["state"] == "running" && status["listen_address"].is_string()
+        });
+        listeners.insert(running["listen_address"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(
+        listeners.len(),
+        8,
+        "every owned slot has a distinct real listener"
+    );
+    let queued = fixture.status(&jobs[8]);
+    assert_eq!(queued["state"], "queued");
+    assert_eq!(queued["attempt"], 0);
+    assert!(queued["request_id"].is_null());
+    let capacity = || {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            // This client uses its ordinary default configuration. The reply
+            // must describe the daemon's actual eight-slot store.
+            let (status, value) = fixture.cli(&["--coord-status".into()]);
+            assert!(status.success(), "{value}");
+            assert_eq!(value["kind"], "coord-status");
+            if value["prepared_jobs"]["available"] == true {
+                return value["prepared_jobs"].clone();
+            }
+            assert!(
+                Instant::now() < until,
+                "capacity status stayed unavailable: {value}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert_eq!(
+        capacity(),
+        json!({
+            "available":true, "concurrency":8, "active":8, "queued":1,
+            "accepting":true, "persistence_uncertain":false,
+        })
+    );
+    fixture.operation(&["--job-cancel".into(), jobs[0].id.clone()]);
+    fixture.wait_for(&jobs[0], Duration::from_secs(15), |status| {
+        status["state"] == "cancelled"
+    });
+    let running = fixture.wait_for(&jobs[8], Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert_eq!(running["request_sha256"], queued["request_sha256"]);
+    assert_eq!(running["worker"], queued["worker"]);
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 0));
+    assert_eq!(capacity()["active"], 8);
+    assert_eq!(capacity()["queued"], 0);
+    daemon.terminate();
+}
+
+#[test]
 fn pooled_cli_builds_use_idle_workers_and_keep_placement_after_client_and_daemon_loss() {
     // This exercises real capture, native clients, the daemon UDS API and TLS
     // listener ownership. No worker is connected and no compiler is executed.

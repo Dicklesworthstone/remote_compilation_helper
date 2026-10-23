@@ -17,10 +17,11 @@
 //!
 //! Config: `[rabs]` table in the RCH config file (`$RABS_CONFIG` file
 //! override first, else `~/.config/rch/config.toml`), env overrides
-//! `RABS_SOCKET_PATH`/`RABS_LOG_LEVEL`. UNKNOWN `[rabs]` keys are a
+//! `RABS_SOCKET_PATH`/`RABS_LOG_LEVEL`/`RABS_PREPARED_CONCURRENCY`. UNKNOWN `[rabs]` keys are a
 //! typed refusal, not a silent ignore (config drift must be loud).
 
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, run_daemon};
+use rabsd::coord::prepared_operation::PreparedConcurrency;
 use std::time::{Duration, Instant};
 
 mod prepared_jobs;
@@ -32,6 +33,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct RabsConfig {
     socket_path: String,
     log_level: String,
+    /// Bounded, daemon-owned execution and recovery slots for prepared jobs.
+    prepared_concurrency: PreparedConcurrency,
     /// Opt-in live registry/Git dependency lane (bd-k52xe): exact keys,
     /// admitted local executions, evidence-gated serving. Off keeps every
     /// wrapper request in shadow mode (plan §154 rollout: observation →
@@ -49,6 +52,7 @@ impl Default for RabsConfig {
         Self {
             socket_path: default_under_home(".cache/rch/rabsd.sock"),
             log_level: "info".to_string(),
+            prepared_concurrency: PreparedConcurrency::default(),
             live_dependency: false,
             build_identity: rabs_protocol::release_authorization::default_build_identity(),
             release_authorization:
@@ -74,6 +78,16 @@ fn parse_release_authorization_mode(
     }
 }
 
+fn parse_prepared_concurrency(raw: &str, source: &str) -> Result<PreparedConcurrency, String> {
+    let value = raw.parse::<usize>().map_err(|_| {
+        format!(
+            "{source} must be an integer between 1 and {}",
+            PreparedConcurrency::MAX
+        )
+    })?;
+    PreparedConcurrency::new(value).map_err(|error| format!("{source}: {error}"))
+}
+
 /// Parse the `[rabs]` table. Unknown keys refuse loudly.
 fn parse_config(text: &str) -> Result<RabsConfig, String> {
     let value: toml::Table = text.parse().map_err(|e| format!("config parse: {e}"))?;
@@ -95,6 +109,15 @@ fn parse_config(text: &str) -> Result<RabsConfig, String> {
                         .as_str()
                         .ok_or_else(|| "rabs.log_level must be a string".to_string())?
                         .to_string();
+                }
+                "prepared_concurrency" => {
+                    let value = entry.as_integer().ok_or_else(|| {
+                        "rabs.prepared_concurrency must be an integer".to_string()
+                    })?;
+                    config.prepared_concurrency = parse_prepared_concurrency(
+                        &value.to_string(),
+                        "rabs.prepared_concurrency",
+                    )?;
                 }
                 "live_dependency" => {
                     config.live_dependency = entry
@@ -121,7 +144,7 @@ fn parse_config(text: &str) -> Result<RabsConfig, String> {
                 unknown => {
                     return Err(format!(
                         "unknown [rabs] config key {unknown:?} — refusing (config drift \
-                         must be loud); known keys: socket_path, log_level, live_dependency, \
+                         must be loud); known keys: socket_path, log_level, prepared_concurrency, live_dependency, \
                          build_identity, release_authorization"
                     ));
                 }
@@ -143,6 +166,16 @@ fn load_config() -> Result<RabsConfig, String> {
     }
     if let Ok(level) = std::env::var("RABS_LOG_LEVEL") {
         config.log_level = level;
+    }
+    match std::env::var("RABS_PREPARED_CONCURRENCY") {
+        Ok(value) => {
+            config.prepared_concurrency =
+                parse_prepared_concurrency(&value, "RABS_PREPARED_CONCURRENCY")?;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("RABS_PREPARED_CONCURRENCY must be valid UTF-8".to_string());
+        }
     }
     match std::env::var("RABS_LIVE_DEPENDENCY").as_deref() {
         Ok("1" | "true" | "on") => config.live_dependency = true,
@@ -432,7 +465,8 @@ fn main() {
                  Runs until SIGTERM/SIGINT; prints the obligation-accounted\n\
                  shutdown receipt (JSON) as its final stdout line.\n\
                  Config: [rabs] table ($RABS_CONFIG or ~/.config/rch/config.toml);\n\
-                 env: RABS_SOCKET_PATH, RABS_LOG_LEVEL."
+                 prepared_concurrency = 4 controls 1..32 owned execution/recovery slots.\n\
+                 env: RABS_SOCKET_PATH, RABS_LOG_LEVEL, RABS_PREPARED_CONCURRENCY."
             );
             return;
         }
@@ -529,9 +563,10 @@ fn main() {
                     }
                 };
                 println!(
-                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\",\"live_dependency\":{},\"build_identity\":\"{}\",\"release_authorization\":\"{}\"}}",
+                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\",\"prepared_concurrency\":{},\"live_dependency\":{},\"build_identity\":\"{}\",\"release_authorization\":\"{}\"}}",
                     config.socket_path,
                     config.log_level,
+                    config.prepared_concurrency.get(),
                     config.live_dependency,
                     config.build_identity.replace('"', "'"),
                     release_mode
@@ -576,6 +611,10 @@ fn main() {
             ("socket_path", &config.socket_path),
             ("log_level", &config.log_level),
             (
+                "prepared_concurrency",
+                &config.prepared_concurrency.get().to_string(),
+            ),
+            (
                 "live_dependency",
                 if config.live_dependency { "on" } else { "off" },
             ),
@@ -608,8 +647,9 @@ fn main() {
         .with_release_authorization(&config.build_identity, config.release_authorization),
     );
     let prepared_operations = if mounted.is_ok() {
-        match rabsd::coord::prepared_operation::PreparedOperationStore::open(
+        match rabsd::coord::prepared_operation::PreparedOperationStore::open_with_concurrency(
             &state_dir.join("prepared-operations"),
+            config.prepared_concurrency,
         ) {
             Ok(operations) => Some(operations),
             Err(error) => {

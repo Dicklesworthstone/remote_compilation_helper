@@ -104,7 +104,7 @@ fn one_captured_template_fills_four_independent_slots_without_rewriting_inputs()
         fingerprints.insert(fixture.submit(&store, fixture.spec(id, id)).request_sha256);
     }
     assert_eq!(fingerprints.len(), 1);
-    assert_eq!(MAX_RUNNING, 4);
+    assert_eq!(store.concurrency().get(), 4);
     let mut claims = Vec::new();
     for id in 1..=4 {
         let mut claim = store
@@ -115,10 +115,7 @@ fn one_captured_template_fills_four_independent_slots_without_rewriting_inputs()
         assert!(claim.needs_request_allocation());
         claim.bind_request_id(500 + u64::from(id)).unwrap();
         assert_eq!(claim.request()["request_id"], 500 + u64::from(id));
-        assert_eq!(
-            store.status(&claim.spec().id).unwrap().unwrap().attempt,
-            1
-        );
+        assert_eq!(store.status(&claim.spec().id).unwrap().unwrap().attempt, 1);
         claims.push(claim);
     }
     assert!(
@@ -129,7 +126,10 @@ fn one_captured_template_fills_four_independent_slots_without_rewriting_inputs()
     assert_eq!(fifth.state, OperationState::Queued);
     assert_eq!(fifth.request_id, None);
     assert_eq!(fifth.attempt, 0);
-    assert_eq!(fs::read(fixture.bundle.join("request.json")).unwrap(), saved);
+    assert_eq!(
+        fs::read(fixture.bundle.join("request.json")).unwrap(),
+        saved
+    );
     assert_eq!(
         fs::read(fixture.bundle.join("source/lib.rs")).unwrap(),
         source
@@ -287,6 +287,188 @@ fn concurrent_claimers_never_exceed_capacity_or_claim_one_job_twice() {
 }
 
 #[test]
+fn configured_capacity_runs_the_full_pool_and_keeps_every_live_preview() {
+    for width in [1, 8, PreparedConcurrency::MAX] {
+        let fixture = Fixture::new(true);
+        let store = PreparedOperationStore::open_with_concurrency(
+            &fixture.root().join("operations"),
+            PreparedConcurrency::new(width).unwrap(),
+        )
+        .unwrap();
+        let saved = fs::read(fixture.bundle.join("request.json")).unwrap();
+        let jobs = u16::try_from(width + 1).unwrap();
+        for id in 1..=jobs {
+            fixture.submit(&store, fixture.spec(id, id));
+        }
+        assert_eq!(store.capacity_status().unwrap().queued, width + 1);
+        let mut claims = Vec::new();
+        for _ in 0..width {
+            let claim = store.claim_next().unwrap().expect("configured fleet slot");
+            let status = store.status(&claim.spec().id).unwrap().unwrap();
+            assert!(claim.preview_observer().unwrap().observe(true, &[]));
+            assert_eq!(
+                store
+                    .preview(&status.id, &status.request_sha256, status.attempt, 0, 0)
+                    .unwrap()["available"],
+                true,
+                "jobs beyond the old four-job limit retain live diagnostics"
+            );
+            claims.push(claim);
+        }
+        assert_eq!(
+            store.capacity_status().unwrap(),
+            PreparedCapacityStatus {
+                concurrency: width,
+                active: width,
+                queued: 1,
+                accepting: true,
+                persistence_uncertain: false,
+            }
+        );
+        assert!(store.claim_next().unwrap().is_none());
+        store.cancel(&claims[0].spec().id).unwrap();
+        assert!(
+            store.claim_next().unwrap().is_none(),
+            "cancel still owns its slot"
+        );
+        assert_eq!(store.capacity_status().unwrap().active, width);
+        assert_eq!(
+            no_dispatch(claims.remove(0)).state,
+            OperationState::Cancelled
+        );
+        let next = store.claim_next().unwrap().unwrap();
+        assert_eq!(next.spec().id, fixture.spec(jobs, jobs).id);
+        assert!(next.preview_observer().unwrap().observe(true, &[]));
+        no_dispatch(next);
+        for claim in claims {
+            no_dispatch(claim);
+        }
+        assert_eq!(store.capacity_status().unwrap().active, 0);
+        assert_eq!(
+            fs::read(fixture.bundle.join("request.json")).unwrap(),
+            saved
+        );
+    }
+}
+
+#[test]
+fn configured_capacity_is_atomic_under_concurrent_claimers() {
+    let fixture = Fixture::new(true);
+    let store = PreparedOperationStore::open_with_concurrency(
+        &fixture.root().join("operations"),
+        PreparedConcurrency::new(8).unwrap(),
+    )
+    .unwrap();
+    for id in 1..=16 {
+        fixture.submit(&store, fixture.spec(id, id));
+    }
+    let barrier = Arc::new(Barrier::new(16));
+    let claims = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.claim_next().unwrap()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(claims.len(), 8);
+    assert_eq!(store.capacity_status().unwrap().active, 8);
+    assert_eq!(store.capacity_status().unwrap().queued, 8);
+    let unique: BTreeSet<_> = claims.iter().map(|claim| claim.spec().id.clone()).collect();
+    assert_eq!(unique.len(), 8);
+    for claim in claims {
+        no_dispatch(claim);
+    }
+}
+
+#[test]
+fn local_recovery_and_execution_share_the_configured_owner_bound() {
+    for width in [1, 8] {
+        let fixture = Fixture::new(false);
+        let store = PreparedOperationStore::open_with_concurrency(
+            &fixture.root().join("operations"),
+            PreparedConcurrency::new(width).unwrap(),
+        )
+        .unwrap();
+        for id in 1..=u16::try_from(width + 2).unwrap() {
+            fixture.submit(&store, fixture.spec(id, id));
+        }
+        let stranded = fixture.spec(1, 1);
+        drop(store.claim_next().unwrap().unwrap());
+        assert_eq!(
+            store.status(&stranded.id).unwrap().unwrap().state,
+            OperationState::Uncertain
+        );
+        let mut claims = (0..width)
+            .map(|_| store.claim_next().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            store
+                .claim_local(&stranded.id, stranded.delivery.clone())
+                .is_err()
+        );
+        assert!(store.recover_next_local().unwrap().is_none());
+        no_dispatch(claims.pop().unwrap());
+        // No delivery was created: this is admission/ownership coverage only.
+        // The real recovery verifier fails normally after taking the free slot.
+        let attempted = store.recover_next_local().unwrap().unwrap();
+        assert_eq!(attempted.state, OperationState::Uncertain);
+        assert_eq!(attempted.attempt, 2);
+        let (local, _) = store
+            .claim_local(&stranded.id, stranded.delivery.clone())
+            .unwrap();
+        assert_eq!(store.capacity_status().unwrap().active, width);
+        assert!(store.claim_next().unwrap().is_none());
+        assert!(store.recover_next_local().unwrap().is_none());
+        drop(local);
+        let next = store.claim_next().unwrap().unwrap();
+        no_dispatch(next);
+        for claim in claims {
+            no_dispatch(claim);
+        }
+    }
+}
+
+#[test]
+fn restart_can_lower_capacity_without_rebinding_queued_jobs() {
+    let fixture = Fixture::new(true);
+    let store = PreparedOperationStore::open_with_concurrency(
+        &fixture.root().join("operations"),
+        PreparedConcurrency::new(8).unwrap(),
+    )
+    .unwrap();
+    let admitted: Vec<_> = (1..=3)
+        .map(|id| fixture.submit(&store, fixture.spec(id, id)))
+        .collect();
+    drop(store);
+    let reopened = PreparedOperationStore::open_with_concurrency(
+        &fixture.root().join("operations"),
+        PreparedConcurrency::new(1).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reopened.capacity_status().unwrap().queued, 3);
+    for before in admitted {
+        let after = reopened.status(&before.id).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+    let first = reopened.claim_next().unwrap().unwrap();
+    assert!(reopened.claim_next().unwrap().is_none());
+    no_dispatch(first);
+    no_dispatch(reopened.claim_next().unwrap().unwrap());
+}
+
+#[test]
 fn restart_keeps_each_uncertain_execution_and_recovery_bound_to_its_worker() {
     let fixture = Fixture::new(true);
     let store = fixture.open();
@@ -309,7 +491,11 @@ fn restart_keeps_each_uncertain_execution_and_recovery_bound_to_its_worker() {
     let independent = reopened.claim_next().unwrap().unwrap();
     assert_eq!(independent.spec().id, fixture.spec(4, 3).id);
     reopened
-        .resume(&fixture.spec(1, 1).id, fixture.root().join("resume-1"), None)
+        .resume(
+            &fixture.spec(1, 1).id,
+            fixture.root().join("resume-1"),
+            None,
+        )
         .unwrap();
     let resumed = reopened
         .claim_next()

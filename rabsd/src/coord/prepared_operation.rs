@@ -35,12 +35,54 @@ const RECORD_OVERHEAD: usize = 96 * 1024;
 const MAX_WORKER_POOL_BYTES: usize = 16 * 1024;
 const MAX_RECORD_BYTES: usize = MAX_FRAME_BYTES + RECORD_OVERHEAD + MAX_WORKER_POOL_BYTES;
 const MAX_DETAIL_BYTES: usize = 2048;
-const MAX_RUNNING: usize = 4;
 const MAX_AUTOMATIC_RECOVERIES: u8 = 3;
 const MAX_PREPARED_WORKERS: usize = 32;
 /// Locality is a bounded admission hint, not an inventory of worker caches.
 /// Ignore cold archives and executions older than this many queue admissions.
 const CARGO_LOCALITY_WINDOW: u64 = 128;
+
+/// One process-wide bound shared by execution, local recovery and previews.
+/// The upper bound permits a full configured worker pool without allowing
+/// unbounded executor threads, TLS sessions or retained diagnostic tails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedConcurrency(usize);
+
+impl PreparedConcurrency {
+    pub const DEFAULT: usize = 4;
+    pub const MAX: usize = 32;
+
+    pub fn new(value: usize) -> io::Result<Self> {
+        if (1..=Self::MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("prepared concurrency must be between 1 and {}", Self::MAX),
+            ))
+        }
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for PreparedConcurrency {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
+    }
+}
+
+/// Observed queue ownership, not a promise that a particular worker is free.
+/// Active includes cancellation and local recovery until their owner finishes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreparedCapacityStatus {
+    pub concurrency: usize,
+    pub active: usize,
+    pub queued: usize,
+    pub accepting: bool,
+    pub persistence_uncertain: bool,
+}
 
 fn recovery_delay(attempt: u8) -> Duration {
     Duration::from_secs(1_u64 << u32::from(attempt.saturating_sub(1).min(2)))
@@ -341,6 +383,7 @@ impl Drop for StoreLock {
 pub struct PreparedOperationStore {
     root: PathBuf,
     _lock: StoreLock,
+    concurrency: PreparedConcurrency,
     state: Mutex<State>,
     previews: preview::PreviewRegistry,
     changed: Condvar,
@@ -725,6 +768,15 @@ fn read_bounded(path: &Path, limit: usize, private: bool) -> io::Result<Vec<u8>>
 
 impl PreparedOperationStore {
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
+        Self::open_with_concurrency(root, PreparedConcurrency::default())
+    }
+
+    /// Capacity belongs to this daemon incarnation, not to durable job identity.
+    /// Reopening with a different bound preserves every request and placement.
+    pub fn open_with_concurrency(
+        root: &Path,
+        concurrency: PreparedConcurrency,
+    ) -> io::Result<Arc<Self>> {
         ordinary_directory(root, true)?;
         if !root.exists() {
             let mut builder = fs::DirBuilder::new();
@@ -826,6 +878,7 @@ impl PreparedOperationStore {
         let store = Arc::new(Self {
             root,
             _lock: lock,
+            concurrency,
             state: Mutex::new(State {
                 records,
                 active: BTreeMap::new(),
@@ -837,7 +890,7 @@ impl PreparedOperationStore {
                 poisoned: false,
             }),
             changed: Condvar::new(),
-            previews: preview::PreviewRegistry::default(),
+            previews: preview::PreviewRegistry::new(concurrency),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -890,6 +943,34 @@ impl PreparedOperationStore {
             }
         }
         Ok(store)
+    }
+
+    pub const fn concurrency(&self) -> PreparedConcurrency {
+        self.concurrency
+    }
+
+    /// Status must not wait for a queued filesystem transaction. A busy result
+    /// is explicitly unavailable rather than silently reporting stale counts.
+    pub fn capacity_status(&self) -> io::Result<PreparedCapacityStatus> {
+        let state = self.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, "prepared operation state busy")
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                io::Error::other("prepared operation lock poisoned")
+            }
+        })?;
+        Ok(PreparedCapacityStatus {
+            concurrency: self.concurrency.get(),
+            active: state.active.len(),
+            queued: state
+                .records
+                .values()
+                .filter(|record| record.state == OperationState::Queued)
+                .count(),
+            accepting: state.accepting && !state.poisoned,
+            persistence_uncertain: state.poisoned,
+        })
     }
 
     fn lock_state(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
@@ -1340,7 +1421,7 @@ impl PreparedOperationStore {
 
     fn claim_next_at(self: &Arc<Self>, now: Instant) -> io::Result<Option<OperationClaim>> {
         let mut state = self.lock_state()?;
-        if !state.accepting || state.active.len() >= MAX_RUNNING {
+        if !state.accepting || state.active.len() >= self.concurrency.get() {
             return Ok(None);
         }
         let next = state

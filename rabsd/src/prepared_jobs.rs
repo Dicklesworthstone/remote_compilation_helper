@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const EXECUTORS: usize = 4;
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 const CLIENT_BUDGET: Duration = Duration::from_secs(20);
 
@@ -37,7 +36,7 @@ impl Drivers {
             stopped: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
         };
-        for index in 0..EXECUTORS {
+        for index in 0..drivers.store.concurrency().get() {
             let store = Arc::clone(&drivers.store);
             let coord = Arc::clone(&coord);
             let stopped = Arc::clone(&drivers.stopped);
@@ -488,6 +487,28 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn configured_driver_pool_owns_and_joins_every_executor() {
+        use rabsd::coord::prepared_operation::PreparedConcurrency;
+        for width in [1, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let store = PreparedOperationStore::open_with_concurrency(
+                &root.path().join("operations"),
+                PreparedConcurrency::new(width).unwrap(),
+            )
+            .unwrap();
+            // An unavailable coordinator cannot dispatch; the real drivers
+            // still exist and must all be stopped and joined by their owner.
+            let mut drivers =
+                Drivers::start(Arc::clone(&store), Arc::new(CoordLive::new())).unwrap();
+            assert_eq!(drivers.threads.len(), width);
+            let failure = drivers.stop();
+            drivers.join(failure).unwrap();
+            assert!(drivers.threads.is_empty());
+            assert!(!store.capacity_status().unwrap().accepting);
+        }
     }
 
     #[test]

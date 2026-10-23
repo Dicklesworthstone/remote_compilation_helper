@@ -206,6 +206,15 @@ Names, pins and normalized endpoints must be distinct. IPv6 endpoints use
 worker must already reconnect to its own listed endpoint; this profile does
 not provision workers or discover a fleet.
 
+The daemon runs up to four prepared jobs at once by default. Set
+`[rabs] prepared_concurrency = 16` in its configuration, or start it with
+`RABS_PREPARED_CONCURRENCY=16`, to use more independent workers concurrently.
+The limit accepts 1–32 and takes effect on daemon restart. It governs executor
+threads, job admission and local result recovery together. Per-worker ownership
+and the bounded queue still apply; listing 32 workers does not itself allocate
+32 executors. See [prepared builds in the running daemon](rabs-worker-delivery.md#prepared-builds-in-the-running-daemon)
+for configuration and status details.
+
 The daemon first chooses by durable job load. Among equally loaded workers it
 prefers the worker that most recently completed the same captured Cargo request,
 then uses the listed order. This locality hint binds the complete source,

@@ -448,7 +448,14 @@ async fn handle_connection(
                     .as_ref()
                     .and_then(|edge| edge.remote_configuration())
                     .cloned();
-                status_on_lane(&limits.control, coord.clone(), live.is_some(), remote).await
+                status_on_lane(
+                    &limits.control,
+                    coord.clone(),
+                    live.is_some(),
+                    remote,
+                    prepared_operations.clone(),
+                )
+                .await
             }
             Ok(value)
                 if matches!(
@@ -768,6 +775,9 @@ async fn status_on_lane(
     coord: crate::coord::live::EdgeSubscriber,
     live_dependency: bool,
     remote_dependency: Option<serde_json::Value>,
+    prepared_operations: Option<
+        std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>,
+    >,
 ) -> String {
     // Status can consult release-policy storage and coordinator locks too.
     // Its own lane prevents both inline I/O and bulk-work admission starvation.
@@ -781,6 +791,26 @@ async fn status_on_lane(
                 status.insert(
                     "remote_dependency".to_owned(),
                     remote_dependency.unwrap_or(serde_json::Value::Null),
+                );
+                status.insert(
+                    "prepared_jobs".to_owned(),
+                    prepared_operations.map_or(serde_json::Value::Null, |store| {
+                        match store.capacity_status() {
+                            Ok(capacity) => serde_json::json!({
+                                "available":true,
+                                "concurrency":capacity.concurrency,
+                                "active":capacity.active,
+                                "queued":capacity.queued,
+                                "accepting":capacity.accepting,
+                                "persistence_uncertain":capacity.persistence_uncertain,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "available":false,
+                                "concurrency":store.concurrency().get(),
+                                "detail":error.to_string(),
+                            }),
+                        }
+                    }),
                 );
                 serde_json::Value::Object(status).to_string()
             }

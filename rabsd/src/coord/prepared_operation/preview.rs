@@ -265,20 +265,26 @@ fn reply(
 /// state lock. Closed entries are pruned on admission; none survive a restart.
 #[derive(Debug)]
 pub(super) struct PreviewRegistry {
+    concurrency: super::PreparedConcurrency,
     enabled: Arc<AtomicBool>,
     entries: Mutex<BTreeMap<String, PreviewObserver>>,
 }
 
 impl Default for PreviewRegistry {
     fn default() -> Self {
-        Self {
-            enabled: Arc::new(AtomicBool::new(true)),
-            entries: Mutex::default(),
-        }
+        Self::new(super::PreparedConcurrency::default())
     }
 }
 
 impl PreviewRegistry {
+    pub(super) fn new(concurrency: super::PreparedConcurrency) -> Self {
+        Self {
+            concurrency,
+            enabled: Arc::new(AtomicBool::new(true)),
+            entries: Mutex::default(),
+        }
+    }
+
     pub(super) fn register(
         &self,
         id: &str,
@@ -288,7 +294,7 @@ impl PreviewRegistry {
         let mut entries = self.entries.try_lock().ok()?;
         entries.retain(|_, observer| observer.is_open());
         if !self.enabled.load(Ordering::Acquire)
-            || entries.len() >= super::MAX_RUNNING
+            || entries.len() >= self.concurrency.get()
             || entries.contains_key(id)
         {
             return None;
@@ -538,7 +544,7 @@ mod tests {
         assert!(registry.read(ID, &"cd".repeat(32), 1, 0, 0).is_err());
         assert!(registry.read(ID, HASH, 2, 0, 0).is_err());
         assert!(registry.read("bad", HASH, 1, 0, 0).is_err());
-        for index in 2..=super::super::MAX_RUNNING {
+        for index in 2..=super::super::PreparedConcurrency::DEFAULT {
             registry
                 .register(&format!("{index:032x}"), HASH, 1)
                 .unwrap();
@@ -560,7 +566,7 @@ mod tests {
         let next = registry.register(ID, HASH, 2).unwrap();
         assert_eq!(
             registry.entries.lock().unwrap().len(),
-            super::super::MAX_RUNNING
+            super::super::PreparedConcurrency::DEFAULT
         );
         assert!(!observer.observe(true, &[]));
         assert!(registry.read(ID, HASH, 1, 0, 0).is_err());

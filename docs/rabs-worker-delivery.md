@@ -910,9 +910,36 @@ described above.
 
 ### Prepared builds in the running daemon
 
-The running `rabsd` can durably queue prepared builds, execute up to four jobs on
-independent workers, install verified outputs, and retain their status across
-client disconnects and daemon restarts. Set `RABS_COORD_TLS_CA`,
+The running `rabsd` can durably queue prepared builds, execute jobs on independent
+workers, install verified outputs, and retain their status across client
+disconnects and daemon restarts. Four jobs may run at once by default. Configure
+`prepared_concurrency` in the daemon's `[rabs]` table to use a larger worker pool:
+
+```toml
+[rabs]
+prepared_concurrency = 16
+```
+
+The supported range is 1–32. `RABS_PREPARED_CONCURRENCY=16` overrides the file
+setting for the daemon process. Restart the daemon to apply a change;
+`rabsd --check-config` reports the resolved setting. One validated limit controls
+the owned executor threads, active-job admission, local result recovery and
+retained live previews. Raising it allows independent workers to run more jobs
+at once; jobs that share a worker, key pin, listener or conflicting paths still
+serialize. The existing queue and retained-byte limits also apply. Choose a
+value that fits the coordinator's memory, transfer bandwidth and available
+workers.
+
+`rabsd --coord-status` reports the running service's `prepared_jobs` object:
+`available`, `concurrency`, `active`, `queued`, `accepting`, and
+`persistence_uncertain`. Active ownership includes cancellation and local result
+recovery until that owner finishes. Queued counts include jobs waiting for a
+result-recovery retry, so neither count promises that a specific worker is free.
+A busy or poisoned queue lock returns `available:false` with the configured
+limit and a detail instead of blocking status behind a filesystem transaction.
+An unavailable prepared-job service is reported as `null`.
+
+Set `RABS_COORD_TLS_CA`,
 `RABS_COORD_TLS_CERT`, and `RABS_COORD_TLS_KEY` on the daemon process before
 starting it. These are the same authenticated transport credentials described
 below. The job commands connect to that daemon through `RABS_SOCKET_PATH` (or
