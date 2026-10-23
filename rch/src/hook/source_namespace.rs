@@ -189,14 +189,34 @@ pub(super) async fn initialize_worker_namespace(
         Duration::from_secs(20),
     )
     .await?;
-    anyhow::ensure!(
-        output.status.success() && output.stdout.as_slice() == b"RCH_TOPOLOGY_OK\n",
+    if output.status.success() && output.stdout.as_slice() == b"RCH_TOPOLOGY_OK\n" {
+        return Ok(());
+    }
+    Err(namespace_refusal(
+        worker,
+        output.status.code(),
+        &output.stderr,
+    ))
+}
+
+/// The initializer's refusal as an error. Its admission loop already retried
+/// a briefly overlapping owner (`rch_admission_attempts`), so an overlap
+/// verdict means another owner still holds this worker's source. Typed busy,
+/// the release fences the (project, worker) pair (bd-p3kuz). Untyped, rchd
+/// kept placing the project on the same worker: vmi1153651 refused it four
+/// times in 30 minutes on 2026-10-23 while one long build held the source.
+fn namespace_refusal(worker: &WorkerConfig, status: Option<i32>, stderr: &[u8]) -> anyhow::Error {
+    let error = anyhow::anyhow!(
         "worker source namespace initialization refused on {} (status {:?}): {}",
         worker.id,
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).trim(),
+        status,
+        String::from_utf8_lossy(stderr).trim(),
     );
-    Ok(())
+    if retryable_source_admission_error(&error) {
+        overlapping_owner_outlived_wait(error, worker)
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]
@@ -344,5 +364,37 @@ mod tests {
         assert!(namespace_command(&policy, "not-a-token", REGISTRY).is_err());
         let bad = PathTopologyPolicy::new("/projects\n/injected".into(), "/dp".into());
         assert!(namespace_command(&bad, "0123", REGISTRY).is_err());
+    }
+
+    /// An overlap verdict from the initializer must reach the release as
+    /// source-busy, or rchd never fences the pair and re-places the project on
+    /// the same held worker (2026-10-23). Every other refusal stays untyped.
+    #[test]
+    fn namespace_overlap_refusal_is_typed_source_busy() {
+        let worker = WorkerConfig {
+            id: rch_common::WorkerId::new("w1"),
+            host: "localhost".to_string(),
+            user: "test".to_string(),
+            identity_file: "/tmp/test_key".to_string(),
+            total_slots: 4,
+            priority: 1,
+            tags: vec![],
+            tools: Vec::new(),
+        };
+        for overlap in [
+            "RCH: durable source ownership: unfinished overlapping physical source owner\n",
+            "RCH: durable source ownership: unfinished overlapping source owner\n",
+        ] {
+            let error = namespace_refusal(&worker, Some(75), overlap.as_bytes());
+            assert!(crate::transfer::source_authority_busy(&error), "{error:#}");
+            assert!(format!("{error:#}").contains("initialization refused on w1"));
+        }
+        for terminal in [
+            "RCH: durable source ownership: invalid claim record\n",
+            "RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY\n",
+        ] {
+            let error = namespace_refusal(&worker, Some(73), terminal.as_bytes());
+            assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+        }
     }
 }
