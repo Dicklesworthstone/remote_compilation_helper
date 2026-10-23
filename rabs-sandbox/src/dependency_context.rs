@@ -3,21 +3,23 @@
 //! A Cargo wrapper has already exposed the subscriber's paths to rustc. This
 //! separate, negotiated context keeps those paths unchanged while binding only
 //! retained input bytes and private output. It does not widen the canonical
-//! Cargo namespace or grant action-cache publication authority. The host /usr
-//! runtime remains explicit and must match the measured runtime cohort before
-//! the worker launches this mode.
+//! Cargo namespace or grant action-cache publication authority. The selected
+//! ELF runtime is copied into a retained private tree before launch and must
+//! exactly match the measured runtime cohort. Private /proc and /dev remain
+//! explicit execution surfaces; this is not arbitrary plugin/read discovery.
 
 use crate::canonical_namespace::{
     Bind, CanonicalNamespaceSpec, HostIsolationSupport, IsolationError, NamespaceBoundary,
-    NamespaceLaunch, push_binds, push_common_prelude, push_env, push_host_usr, require_support,
+    NamespaceLaunch, push_binds, push_common_prelude, push_env, require_support,
 };
 use crate::layout;
+use crate::runtime_cohort::RetainedRuntime;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
-pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v5";
+pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v6";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -544,9 +546,12 @@ impl DependencyExecContext {
 
 /// Compile the separately validated original-path namespace. Ordinary
 /// build_canonical_argv remains restricted to canonical /__rabs roots.
+/// The runtime owner must outlive the child, its process cleanup, and output
+/// capture. Its private retained bytes replace the broad host runtime mounts.
 pub fn build_dependency_argv(
     context: &DependencyExecContext,
     spec: &CanonicalNamespaceSpec,
+    runtime: &RetainedRuntime,
     support: &HostIsolationSupport,
     program: &str,
     args: &[String],
@@ -658,12 +663,26 @@ pub fn build_dependency_argv(
     {
         return Err(refuse());
     }
+    if runtime.cohort().bytes != context.runtime_cohort_sha256 {
+        return Err(IsolationError::InvalidSpec {
+            reason: "retained dependency runtime differs from the negotiated cohort".to_owned(),
+        });
+    }
     let mut argv = vec!["bwrap".into()];
     push_common_prelude(&mut argv);
     argv.extend(["--unshare-net", "--hostname", "rabs"].map(OsString::from));
     push_env(&mut argv, &spec.env);
     argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
-    push_host_usr(&mut argv);
+    let writable_backings: Vec<_> = spec
+        .rw_binds
+        .iter()
+        .map(|bind| bind.backing.clone())
+        .collect();
+    runtime
+        .append_mounts(&mut argv, &writable_backings)
+        .map_err(|error| IsolationError::InvalidSpec {
+            reason: format!("retained dependency runtime cannot be mounted: {error}"),
+        })?;
     argv.extend(["--tmpfs", "/tmp", "--tmpfs", layout::TMP].map(OsString::from));
     let mut ro: Vec<_> = spec
         .ro_binds
@@ -689,7 +708,7 @@ pub fn build_dependency_argv(
             net_isolated: true,
             mounts_closed_view: true,
             clearenv: true,
-            host_usr_ro: true,
+            host_usr_ro: false,
             tmpfs_tmp: true,
             proc_private: true,
             die_with_parent: true,
@@ -700,6 +719,52 @@ pub fn build_dependency_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    struct RuntimeFixture {
+        runtime: RetainedRuntime,
+        root: tempfile::TempDir,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl RuntimeFixture {
+        fn prepare(context: &mut DependencyExecContext, spec: &mut CanonicalNamespaceSpec) -> Self {
+            Self::prepare_with_program(context, spec, Path::new("/usr/bin/true"))
+        }
+
+        fn prepare_with_program(
+            context: &mut DependencyExecContext,
+            spec: &mut CanonicalNamespaceSpec,
+            executable: &Path,
+        ) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let toolchain = root.path().join("toolchain");
+            std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+            std::fs::create_dir(toolchain.join("lib")).unwrap();
+            let compiler = toolchain.join("bin/rustc");
+            std::fs::copy(executable, &compiler).unwrap();
+            spec.ro_binds
+                .iter_mut()
+                .find(|bind| bind.visible == Path::new(context.toolchain_root()))
+                .unwrap()
+                .backing = toolchain.clone();
+            for (index, bind) in spec.rw_binds.iter_mut().enumerate() {
+                bind.backing = root.path().join(format!("writable-{index}"));
+                std::fs::create_dir(&bind.backing).unwrap();
+            }
+            let runtime = crate::runtime_cohort::retain_runtime_cohort(
+                &compiler,
+                &toolchain,
+                &[],
+                root.path(),
+                root.path(),
+                || false,
+            )
+            .unwrap();
+            context.runtime_cohort_sha256 = runtime.cohort().bytes;
+            Self { runtime, root }
+        }
+    }
 
     fn context(env: Vec<(String, String)>) -> DependencyExecContext {
         DependencyExecContext::new(
@@ -789,10 +854,11 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn generated_tree_is_read_only_below_its_prepared_loader_parent() {
         let root = "/work/build/generated/unit/out";
-        let context = generated_context(
+        let mut context = generated_context(
             Some(root),
             vec![
                 ("OUT_DIR".to_owned(), root.to_owned()),
@@ -803,7 +869,7 @@ mod tests {
         .unwrap();
         let empty = tempfile::tempdir().unwrap();
         context.prepare_empty_backings(empty.path()).unwrap();
-        let spec = context
+        let mut spec = context
             .namespace(
                 Path::new("/private/bundle/package"),
                 Path::new("/private/toolchain"),
@@ -812,6 +878,7 @@ mod tests {
                 Path::new("/private/home"),
             )
             .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
         let parent = spec
             .ro_binds
             .iter()
@@ -841,8 +908,15 @@ mod tests {
             cgroup_v2: false,
             landlock: false,
         };
-        let launch =
-            build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).unwrap();
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &[],
+        )
+        .unwrap();
         let argv: Vec<_> = launch
             .argv
             .iter()
@@ -862,24 +936,41 @@ mod tests {
             .ro_binds
             .retain(|bind| bind.visible != Path::new(root));
         assert!(
-            build_dependency_argv(&context, &missing, &support, context.compiler(), &[]).is_err()
+            build_dependency_argv(
+                &context,
+                &missing,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err()
         );
         let mut extra = spec;
         extra
             .ro_binds
             .push(Bind::new("/private/foreign", format!("{root}/injected")));
         assert!(
-            build_dependency_argv(&context, &extra, &support, context.compiler(), &[]).is_err()
+            build_dependency_argv(
+                &context,
+                &extra,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err()
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn original_paths_environment_and_empty_search_mounts_survive() {
-        let context = context(vec![(
+        let mut context = context(vec![(
             "DEPENDENCY_FLAVOR".into(),
             "hello /home/user/registry/package".into(),
         )]);
-        let spec = context
+        let mut spec = context
             .namespace(
                 Path::new("/private/source"),
                 Path::new("/private/toolchain"),
@@ -888,6 +979,7 @@ mod tests {
                 Path::new("/private/home"),
             )
             .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
         let support = HostIsolationSupport {
             bubblewrap: Some("test".into()),
             unprivileged_userns: true,
@@ -896,8 +988,15 @@ mod tests {
             landlock: false,
         };
         let args = vec!["src/lib.rs".into(), "--emit=dep-info,metadata".into()];
-        let launch =
-            build_dependency_argv(&context, &spec, &support, context.compiler(), &args).unwrap();
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &args,
+        )
+        .unwrap();
         let args: Vec<_> = launch
             .argv
             .iter()
@@ -913,10 +1012,12 @@ mod tests {
                 "/private/empty/search-0000",
                 "/work/build/empty"
             ]));
-        assert!(
-            args.windows(3)
-                .any(|values| values == ["--bind", "/private/output", context.out_dir()])
-        );
+        assert!(args.windows(3).any(|values| values
+            == [
+                "--bind",
+                runtime.root.path().join("writable-0").to_str().unwrap(),
+                context.out_dir()
+            ]));
         assert!(args.windows(3).any(|values| values
             == [
                 "--setenv",
@@ -934,8 +1035,265 @@ mod tests {
             .is_err()
         );
         assert!(launch.boundary.net_isolated);
+        assert!(!launch.boundary.host_usr_ro);
+        let retained_usr = args
+            .windows(3)
+            .find(|values| values[0] == "--ro-bind" && values[2] == "/usr")
+            .unwrap();
+        assert!(Path::new(retained_usr[1]).starts_with(runtime.root.path()));
+        assert!(
+            !args
+                .windows(3)
+                .any(|values| values[0].starts_with("--ro-bind")
+                    && matches!(values[1], "/usr" | "/etc/ld.so.cache"))
+        );
+        assert!(!args.contains(&"/etc/alternatives"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_runtime_requires_the_exact_cohort_and_disjoint_writable_backings() {
+        let mut context = context(Vec::new());
+        let mut spec = context
+            .namespace(
+                Path::new("/private/source"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let fixture = RuntimeFixture::prepare(&mut context, &mut spec);
+        let support = HostIsolationSupport {
+            bubblewrap: Some("test".into()),
+            unprivileged_userns: true,
+            overlayfs: false,
+            cgroup_v2: false,
+            landlock: false,
+        };
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &fixture.runtime,
+            &support,
+            context.compiler(),
+            &[],
+        )
+        .unwrap();
+        let retained_usr = launch
+            .argv
+            .windows(3)
+            .find(|values| values[0] == "--ro-bind" && values[2] == "/usr")
+            .map(|values| PathBuf::from(&values[1]))
+            .unwrap();
+        let mut mismatched = context.clone();
+        mismatched.runtime_cohort_sha256[31] ^= 1;
+        assert!(
+            build_dependency_argv(
+                &mismatched,
+                &spec,
+                &fixture.runtime,
+                &support,
+                mismatched.compiler(),
+                &[]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("differs from the negotiated cohort")
+        );
+        let alias = fixture.root.path().join("runtime-alias");
+        std::os::unix::fs::symlink(&retained_usr, &alias).unwrap();
+        for backing in [
+            retained_usr.clone(),
+            retained_usr.parent().unwrap().to_path_buf(),
+            fixture.root.path().to_path_buf(),
+            alias,
+        ] {
+            let mut invalid = spec.clone();
+            invalid.rw_binds[0].backing = backing;
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &invalid,
+                    &fixture.runtime,
+                    &support,
+                    context.compiler(),
+                    &[]
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("retained dependency runtime cannot be mounted")
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux host permitting the full bubblewrap namespace"]
+    fn selected_elf_runtime_executes_with_private_outputs_and_without_broad_host_usr() {
+        let support = HostIsolationSupport::probe();
+        assert!(
+            support.missing_for_canonical().is_empty(),
+            "full namespace unavailable: {:?}",
+            support.missing_for_canonical()
+        );
+        let mut context = context(Vec::new());
+        let empty = tempfile::tempdir().unwrap();
+        context.prepare_empty_backings(empty.path()).unwrap();
+        let mut spec = context
+            .namespace(
+                Path::new("/private/source"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                empty.path(),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let fixture =
+            RuntimeFixture::prepare_with_program(&mut context, &mut spec, Path::new("/bin/sh"));
+        let source = fixture.root.path().join("source");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        spec.ro_binds
+            .iter_mut()
+            .find(|bind| bind.visible == Path::new(context.source_root()))
+            .unwrap()
+            .backing = source;
+        // Shell builtins inspect the view; no second host executable is added
+        // to the retained runtime. Successful launch itself loads its real ELF
+        // interpreter and selected libc through the captured topology.
+        let script = concat!(
+            "set -eu; ",
+            "test ! -e /usr/bin/env; ",
+            "test ! -e /usr/share; ",
+            "test ! -e /etc/alternatives; ",
+            "test ! -e /etc/ld.so.preload; ",
+            "test -d /proc/self; test -e /dev/null; ",
+            "if (printf forbidden > /usr/rabs-write-probe) 2>/dev/null; ",
+            "then exit 41; fi; ",
+            "printf retained-runtime-ok > /work/build/deps/proof"
+        );
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &fixture.runtime,
+            &support,
+            context.compiler(),
+            &["-c".to_owned(), script.to_owned()],
+        )
+        .unwrap();
+        let output = crate::canonical_namespace::command_for(&launch)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "selected ELF namespace failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("writable-0/proof")).unwrap(),
+            b"retained-runtime-ok"
+        );
+        fixture.runtime.verify(|| false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_rustc_emits_metadata_with_only_the_selected_retained_elf_runtime() {
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("source");
+        let output = owner.path().join("output");
+        for directory in [&source, &output] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(
+            source.join("lib.rs"),
+            b"pub fn retained_runtime_value() -> String { format!(\"{}\", 42) }\n",
+        )
+        .unwrap();
+        let runtime = crate::runtime_cohort::retain_runtime_cohort(
+            &toolchain.join("bin/rustc"),
+            &toolchain,
+            &[toolchain.join("lib")],
+            output.as_path(),
+            owner.path(),
+            || false,
+        )
+        .unwrap();
+        // This checks real compiler/backend ELF loading and metadata output in
+        // a sparse filesystem. It deliberately does not assert the full worker
+        // PID/proc/network boundary, authenticated delivery, or cache serving.
+        let mut argv: Vec<OsString> = [
+            "bwrap",
+            "--die-with-parent",
+            "--unshare-user",
+            "--clearenv",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        runtime
+            .append_mounts(&mut argv, std::slice::from_ref(&output))
+            .unwrap();
+        for (option, backing, visible) in [
+            ("--ro-bind", source.as_path(), "/source/package"),
+            ("--ro-bind", toolchain.as_path(), "/toolchains/pinned"),
+            ("--bind", output.as_path(), "/target/output"),
+        ] {
+            argv.extend([
+                OsString::from(option),
+                backing.as_os_str().to_owned(),
+                OsString::from(visible),
+            ]);
+        }
+        argv.extend(
+            [
+                "--setenv",
+                "LD_LIBRARY_PATH",
+                "/toolchains/pinned/lib",
+                "--chdir",
+                "/source/package",
+                "--",
+                "/toolchains/pinned/bin/rustc",
+                "lib.rs",
+                "--crate-name=retained_runtime_smoke",
+                "--crate-type=lib",
+                "--emit=metadata,dep-info",
+                "--out-dir=/target/output",
+            ]
+            .map(OsString::from),
+        );
+        let result = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "real rustc selected ELF runtime failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            std::fs::metadata(output.join("libretained_runtime_smoke.rmeta"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        let dep_info = std::fs::read_to_string(output.join("retained_runtime_smoke.d")).unwrap();
+        assert!(dep_info.contains("lib.rs"));
+        runtime.verify(|| false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn retained_candidate_roots_bind_first_use_prefixes_without_reordering_inputs() {
         let directories = vec!["/target/z-first".to_owned(), "/target/a-second".to_owned()];
@@ -963,7 +1321,7 @@ mod tests {
                 [7; 32],
             )
         };
-        let context = make(roots.clone()).unwrap();
+        let mut context = make(roots.clone()).unwrap();
         assert_eq!(context.dependency_dirs(), directories.as_slice());
         assert_eq!(context.artifact_roots()[0], roots[1]);
         assert_eq!(context.artifact_roots()[1], roots[0]);
@@ -972,7 +1330,7 @@ mod tests {
         for child in ["z-first", "a-second", "output"] {
             assert!(empty.path().join("search-0000").join(child).is_dir());
         }
-        let spec = context
+        let mut spec = context
             .namespace(
                 Path::new("/private/bundle/package"),
                 Path::new("/private/toolchain"),
@@ -981,6 +1339,7 @@ mod tests {
                 Path::new("/private/home"),
             )
             .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
         for root in &roots {
             assert!(spec.ro_binds.iter().any(|bind| {
                 bind.visible == Path::new(&root.path)
@@ -1000,7 +1359,15 @@ mod tests {
             cgroup_v2: false,
             landlock: false,
         };
-        build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).unwrap();
+        build_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &[],
+        )
+        .unwrap();
         for invalid in [
             vec![DependencyArtifactRoot {
                 path: directories[0].clone(),
@@ -1037,10 +1404,11 @@ mod tests {
         assert_eq!(shared.artifact_roots()[0].path, shared.out_dir());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn shared_output_file_binds_follow_the_writable_root_and_refuse_other_shapes() {
         let base = context(Vec::new());
-        let context = DependencyExecContext::new_with_artifacts(
+        let mut context = DependencyExecContext::new_with_artifacts(
             base.source_root,
             base.cwd,
             base.toolchain_root,
@@ -1065,6 +1433,7 @@ mod tests {
                 Path::new("/private/home"),
             )
             .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
         assert!(
             spec.ro_binds
                 .iter()
@@ -1077,15 +1446,32 @@ mod tests {
             cgroup_v2: false,
             landlock: false,
         };
-        assert!(build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).is_err());
+        assert!(
+            build_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err()
+        );
         for name in ["libz.rmeta", "liba.rlib"] {
             spec.ro_binds.push(Bind::new(
                 Path::new("/private/bundle/dependencies/0000").join(name),
                 Path::new(context.out_dir()).join(name),
             ));
         }
-        let launch =
-            build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).unwrap();
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &[],
+        )
+        .unwrap();
         let argv: Vec<_> = launch
             .argv
             .iter()
@@ -1136,8 +1522,15 @@ mod tests {
             let mut invalid = spec.clone();
             invalid.ro_binds.push(bind);
             assert!(
-                build_dependency_argv(&context, &invalid, &support, context.compiler(), &[])
-                    .is_err()
+                build_dependency_argv(
+                    &context,
+                    &invalid,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &[]
+                )
+                .is_err()
             );
         }
         let mut invalid = spec;
@@ -1145,7 +1538,15 @@ mod tests {
             .rw_binds
             .push(Bind::new("/private/alias", "/work/build/deps/liba.rlib"));
         assert!(
-            build_dependency_argv(&context, &invalid, &support, context.compiler(), &[]).is_err()
+            build_dependency_argv(
+                &context,
+                &invalid,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err()
         );
     }
 
@@ -1232,6 +1633,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cargo_loader_parent_has_private_child_mountpoints_before_read_only_bind() {
         let base = context(Vec::new());
@@ -1254,7 +1656,7 @@ mod tests {
             .is_err(),
             "the parent must be explicitly declared"
         );
-        let context = DependencyExecContext::new_with_loader_dirs(
+        let mut context = DependencyExecContext::new_with_loader_dirs(
             base.source_root,
             base.cwd,
             base.toolchain_root,
@@ -1274,7 +1676,7 @@ mod tests {
         );
         let empty = tempfile::tempdir().unwrap();
         context.prepare_empty_backings(empty.path()).unwrap();
-        let spec = context
+        let mut spec = context
             .namespace(
                 Path::new("/private/source"),
                 Path::new("/private/toolchain"),
@@ -1283,6 +1685,7 @@ mod tests {
                 Path::new("/private/home"),
             )
             .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
         let parent = spec
             .ro_binds
             .iter()
@@ -1322,8 +1725,15 @@ mod tests {
             cgroup_v2: false,
             landlock: false,
         };
-        let launch =
-            build_dependency_argv(&context, &spec, &support, context.compiler(), &[]).unwrap();
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &[],
+        )
+        .unwrap();
         let argv: Vec<_> = launch
             .argv
             .iter()
@@ -1390,10 +1800,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn post_validation_environment_or_mount_injection_is_refused() {
-        let context = context(vec![("NUM_JOBS".into(), "2".into())]);
-        let spec = context
+        let mut context = context(vec![("NUM_JOBS".into(), "2".into())]);
+        let mut spec = context
             .namespace(
                 Path::new("/private/source"),
                 Path::new("/private/toolchain"),
@@ -1402,6 +1813,7 @@ mod tests {
                 Path::new("/private/home"),
             )
             .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
         let support = HostIsolationSupport {
             bubblewrap: Some("test".into()),
             unprivileged_userns: true,
@@ -1412,14 +1824,30 @@ mod tests {
         let mut changed = spec.clone();
         changed.env[0].1 = "8".into();
         assert!(
-            build_dependency_argv(&context, &changed, &support, context.compiler(), &[]).is_err()
+            build_dependency_argv(
+                &context,
+                &changed,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err()
         );
         let mut changed = spec;
         changed
             .rw_binds
             .push(Bind::new("/private/other", context.source_root()));
         assert!(
-            build_dependency_argv(&context, &changed, &support, context.compiler(), &[]).is_err()
+            build_dependency_argv(
+                &context,
+                &changed,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err()
         );
     }
 }

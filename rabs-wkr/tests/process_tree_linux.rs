@@ -474,7 +474,7 @@ fn wait_dependency_execution(
 }
 
 /// A real rustc invocation, retained source owner, pinned toolchain lease,
-/// private output capture and the dependency-exec-v5 alias namespace. The sealed
+/// private output capture and the dependency-exec-v6 alias namespace. The sealed
 /// source bundle uses package/ while rustc retains its original source paths.
 /// This exercises the worker executor; authenticated transport is covered by
 /// its session tests.

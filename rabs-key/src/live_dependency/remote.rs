@@ -9,7 +9,8 @@
 //! A remote result cannot be offered as an edge-local execution.
 //!
 //! The runtime digest is observed by rabs_sandbox::runtime_cohort on both hosts
-//! and checked again by the worker before execution. A configured cohort label
+//! and retained in a sparse read-only view checked before and after execution.
+//! A configured cohort label
 //! or target triple cannot replace that observation. This pure module checks
 //! its domain and binds its bytes; authenticated delivery, observation and
 //! attempt authority remain the callers' responsibilities.
@@ -30,13 +31,13 @@ use crate::output_platform::{CpuBaseline, OutputPlatformContract};
 use crate::typed_digest::compute;
 
 /// Required observer domain; kept in sync with the sandbox runtime observer.
-pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v1";
+pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v2";
 /// Isolation policy domain for the remote metadata dependency class.
 pub const REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str = "rabs.remote-leaf.isolation.v1";
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
-pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v5: \
+pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v6: \
     Linux worker namespace; subscriber paths preserved; complete regular-file \
     dependency source, exact toolchain and complete crate-candidate inventories \
     mounted read-only; explicit rmeta and complete rlib extern bytes retained; \
@@ -50,9 +51,14 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
     receive private empty backings; outputs private until complete authenticated \
     delivery; network denied; compiler environment preserved by dependency-env-v2 \
     except process-local jobserver descriptors; all loader paths within the exact \
-    toolchain or independently observed dependency-exec-v5 directories without \
-    dynamic libraries, including Cargo output parents; host ELF runtime, CPU and \
-    filesystem cohort observed and independently matched before execution; \
+    toolchain or independently observed dependency-exec-v6 directories without \
+    dynamic libraries, including Cargo output parents; selected host ELF runtime \
+    bytes, exact loader symlink topology and loader cache captured and mounted \
+    read-only in a sparse /usr view without other host /usr or /etc/alternatives \
+    contents; runtime, CPU and filesystem cohort observed and independently \
+    matched before execution; retained runtime checked again after cleanup; \
+    private proc and device views remain available and later dynamic loading \
+    and nondeterministic runtime inputs are not a general workspace closure; \
     dep-info closure and tracked-environment checks required before coordinator-only \
     publication; full-result readiness";
 
@@ -131,7 +137,7 @@ pub fn remote_loader_search_paths(
 
 /// Exact private-empty loader aliases required by the original environment.
 ///
-/// Sorted and deduplicated for the dependency-exec-v5 worker context. This
+/// Sorted and deduplicated for the dependency-exec-v6 worker context. This
 /// includes output/dependency entries and Cargo's output parent. No directory
 /// is silently assumed empty: rabs_sandbox::loader_directories must observe
 /// every returned root, even if its Rust .rlib/.rmeta inventory was empty.
@@ -1255,6 +1261,13 @@ mod tests {
             call(
                 &plan(OUTPUT),
                 &compute("rabs.operator-cohort-label.v1", b"same-machine")
+            ),
+            Err(RemoteDependencyRefusal::RuntimeIdentity)
+        );
+        assert_eq!(
+            call(
+                &plan(OUTPUT),
+                &compute("rabs.rustc-host-runtime.v1", b"runtime")
             ),
             Err(RemoteDependencyRefusal::RuntimeIdentity)
         );

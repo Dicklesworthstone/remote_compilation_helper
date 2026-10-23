@@ -18,6 +18,7 @@ use rabs_sandbox::dependency_context::{
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
+use rabs_sandbox::runtime_cohort::RetainedRuntime;
 use rabs_sandbox::toolchain_dataset::{TOOLCHAIN_DATASET_VERSION, ToolchainIdentity};
 
 pub(crate) mod toolchain_pool;
@@ -579,14 +580,49 @@ pub fn execute_uploaded_canonical_controlled(
     result
 }
 
-/// The host loader/runtime is visible read-only but is not retained with the
-/// toolchain. Measure before spawn and after cleanup, so a changed host cohort
-/// never becomes an accepted result for the caller's keyed execution profile.
+/// Capture the selected host ELF runtime into independently owned storage.
+/// The caller retains this owner through process cleanup and diagnostic drains;
+/// dependency namespaces never expose the live host /usr tree.
+fn prepare_dependency_runtime(
+    context: &DependencyExecContext,
+    toolchain: &toolchain_pool::ToolchainLease,
+    artifacts: Option<&PreparedArtifacts>,
+    retention_parent: &std::path::Path,
+    control: &ExecutionControl,
+) -> Result<RetainedRuntime, String> {
+    let artifacts = artifacts.ok_or("dependency runtime capture lacks private output storage")?;
+    let loader_paths = context
+        .loader_search_paths(toolchain.root())
+        .map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(retention_parent).map_err(|error| error.to_string())?;
+    let runtime = rabs_sandbox::runtime_cohort::retain_runtime_cohort(
+        &toolchain.root().join("bin/rustc"),
+        toolchain.root(),
+        &loader_paths,
+        artifacts.backing(),
+        retention_parent,
+        || control.reason().is_some(),
+    )
+    .map_err(|error| error.to_string())?;
+    if runtime.cohort().bytes != *context.runtime_cohort_sha256() {
+        return Err("captured host runtime differs from the dependency context".to_owned());
+    }
+    Ok(runtime)
+}
+
+/// Verify the retained bytes and reobserve the host before spawn and after
+/// cleanup. A changed host cohort or retained backing cannot authorize output
+/// under the caller's original keyed execution profile.
 fn verify_dependency_runtime(
     context: &DependencyExecContext,
     toolchain: &toolchain_pool::ToolchainLease,
     artifacts: Option<&PreparedArtifacts>,
+    runtime: &RetainedRuntime,
+    control: &ExecutionControl,
 ) -> Result<(), String> {
+    runtime
+        .verify(|| control.reason().is_some())
+        .map_err(|error| error.to_string())?;
     let artifacts = artifacts.ok_or("dependency runtime check lacks private output storage")?;
     let loader_paths = context
         .loader_search_paths(toolchain.root())
@@ -951,10 +987,27 @@ fn execute_canonical_inner(
             }
         }
     }
+    let dependency_runtime = match request
+        .dependency_context
+        .as_ref()
+        .map(|context| {
+            prepare_dependency_runtime(context, &toolchain, artifacts.as_ref(), spill_root, control)
+        })
+        .transpose()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("dependency runtime capture: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
     let launch = if let Some(context) = &request.dependency_context {
         rabs_sandbox::dependency_context::build_dependency_argv(
             context,
             &spec,
+            dependency_runtime
+                .as_ref()
+                .expect("dependency execution has a retained runtime"),
             &support,
             &request.program,
             &request.args,
@@ -990,7 +1043,15 @@ fn execute_canonical_inner(
         return exec_error(request.request_id);
     }
     if let Some(context) = &request.dependency_context
-        && let Err(error) = verify_dependency_runtime(context, &toolchain, artifacts.as_ref())
+        && let Err(error) = verify_dependency_runtime(
+            context,
+            &toolchain,
+            artifacts.as_ref(),
+            dependency_runtime
+                .as_ref()
+                .expect("dependency execution has a retained runtime"),
+            control,
+        )
     {
         let _ = control.retain_outputs(Err(format!(
             "dependency runtime pre-execution verification: {error}"
@@ -1114,8 +1175,15 @@ fn execute_canonical_inner(
             }
             if control.reason().is_none()
                 && let Some(context) = &request.dependency_context
-                && let Err(error) =
-                    verify_dependency_runtime(context, &toolchain, artifacts.as_ref())
+                && let Err(error) = verify_dependency_runtime(
+                    context,
+                    &toolchain,
+                    artifacts.as_ref(),
+                    dependency_runtime
+                        .as_ref()
+                        .expect("dependency execution has a retained runtime"),
+                    control,
+                )
                 && control.reason().is_none()
             {
                 let _ = control.retain_outputs(Err(format!(

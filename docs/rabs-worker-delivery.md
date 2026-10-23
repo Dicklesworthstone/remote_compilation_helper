@@ -143,10 +143,26 @@ installation authority. Callers that disable waiting, exhaust their wait
 budget or encounter a capture failure retain the existing local path before
 remote acceptance. Later requests use the retained compiler and sysroot only
 while their complete source witness still matches. Worker execution also
-requires the measured kernel, CPU,
-external loader libraries and filesystem profile to match the coordinator.
+requires the measured kernel, CPU, external loader libraries, loader cache,
+loader symlink topology and filesystem profile to match the coordinator.
 Both hosts need the supported Linux isolation environment; the worker needs
 working bubblewrap and user namespaces.
+
+The worker captures the selected external ELF libraries into an independently
+owned runtime snapshot before launching a dependency compiler. The namespace
+mounts a sparse read-only `/usr`, the captured `/etc/ld.so.cache` when present,
+and the exact observed loader aliases. Other host `/usr` contents and
+`/etc/alternatives` are absent. Snapshot ownership lasts through process-group
+cleanup and diagnostic drains, and the retained bytes are verified before
+execution and after cleanup. Writable output and HOME mounts cannot alias
+the runtime backing. The complete loader-cache bytes participate in the v2
+runtime identity, so even an unrelated host package change can conservatively
+require matching worker images or a new runtime observation.
+
+This narrows the metadata dependency execution environment; it does not admit
+arbitrary workspace code generation or build-script replay. Private proc and
+device views still exist, and arbitrary later dynamic loading, locale/NSS
+data, time and randomness are not a complete discovered input closure.
 
 The remote class accepts metadata-only dependency actions
 (`--emit=dep-info,metadata`), including explicit `--extern name=/path/lib*.rmeta`
@@ -181,7 +197,7 @@ the build script's execution.
 
 The worker keeps the original source, generated-input, output and toolchain
 path spellings and full compiler environment inside private mounts. The
-`dependency-exec-v5` context binds an explicit list of populated dependency
+`dependency-exec-v6` context binds an explicit list of populated dependency
 roots to their first-use directory indices. A single sealed source transfer contains
 `package/<source-path>`, optional `generated/<generated-path>` and
 `dependencies/NNNN/<artifact-basename>`; only the declared package, generated
@@ -207,7 +223,7 @@ subdirectories. A loader directory cannot be the generated root or lie inside
 it. Unsupported loader paths or changing source, generated input, build-script
 record, artifact, toolchain or runtime observations refuse remote admission
 or installation.
-The launcher requires a daemon advertising `dependency-exec-v5`; old execution
+The launcher requires a daemon advertising `dependency-exec-v6`; old execution
 contexts cannot admit new work. Already sealed results from older contexts can
 still resume against their exact saved request fingerprint.
 
@@ -299,7 +315,7 @@ CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
 This starts a live daemon if needed. Subsequent invocations retain the exported
 pool selection so the launcher checks the attached daemon's exact normalized
 configuration, including worker order, remote protocol 1 and
-`dependency-exec-v5`. The advertised `remote_dependency` object contains these
+`dependency-exec-v6`. The advertised `remote_dependency` object contains these
 protocol fields and a `workers` array in configured order. A singleton daemon
 does not satisfy a pool request, even when the pool contains that one worker.
 An existing daemon is never reconfigured or restarted to fit a new request;
@@ -412,7 +428,7 @@ receipt. Terminal events are associated with the crate that admitted their
 action key; one crate's successful execution cannot stand in for another's.
 Toolchain warmup may let different nodes start qualification on different runs.
 
-With `dependency-exec-v5`, this DAG oracle can use shared or disjoint dependency
+With `dependency-exec-v6`, this DAG oracle can use shared or disjoint dependency
 and output directories. It performs no compiler-argument rewriting and never
 treats local fallback as evidence of remote admission. It selects the installed
 Cargo and its matching compiler explicitly; ordinary rustup-based Cargo use

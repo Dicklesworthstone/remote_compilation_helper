@@ -1036,7 +1036,7 @@ impl LiveFixture {
 /// Actual Cargo chooses argv, cwd, jobserver and loader environment. The graph
 /// is leaf -> middle -> top -> consumer; top has no direct leaf dependency but
 /// must resolve leaf's RemoteToken through middle's metadata. This fixture
-/// supports shared or disjoint input/output directories under dependency-exec-v5,
+/// supports shared or disjoint input/output directories under dependency-exec-v6,
 /// never treats local fallback as evidence of a working remote DAG, and performs
 /// no argv rewriting.
 #[test]

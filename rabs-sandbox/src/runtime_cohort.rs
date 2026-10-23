@@ -7,19 +7,21 @@
 //! Internal paths are relative to the retained toolchain: physical placement
 //! does not participate in identity.
 //!
-//! This is a compatibility observation, not a sandbox or immutable mount.
-//! Callers retain the toolchain, compare edge and worker digests before spawn,
-//! and reobserve after execution before offering a result. The namespace must
-//! separately preserve subscriber paths, exact environment and input closure.
+//! Observation and retention share the same byte and topology measurement.
+//! A worker can retain a private sparse runtime and expose only those selected
+//! libraries and its captured loader cache in the dependency namespace. This
+//! is not discovery of arbitrary dlopen, locale, NSS, /proc or /dev reads; the
+//! metadata-only eligibility gate and separate input-closure checks still apply.
 //! No hostname, PID, core count, frequency, load or configured label is keyed.
 
 use rabs_protocol::result_identity::TypedDigest;
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// Fixed identity domain shared with the remote dependency key builder.
-pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v1";
+pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v2";
 
 /// An observation that cannot support remote result publication.
 #[derive(Debug)]
@@ -62,7 +64,7 @@ impl From<io::Error> for RuntimeCohortError {
 /// private-empty namespace aliases may be omitted from the physical probe.
 ///
 /// Any library actually resolved outside the toolchain must still be in the
-/// read-only /usr runtime view. The adapter must separately refuse empty loader
+/// supported /usr runtime roots. The adapter must separately refuse empty loader
 /// components, other LD_* controls and GLIBC_TUNABLES, and must retain and
 /// revalidate every non-toolchain loader-directory witness through execution.
 ///
@@ -107,15 +109,125 @@ pub fn observe_runtime_cohort(
     }
 }
 
+/// Owned, bounded runtime bytes for one dependency execution lifetime.
+///
+/// The private backing directory must outlive every child and output drain.
+/// Its path is intentionally not exposed as a writable workspace capability.
+/// Call `verify` after execution and before accepting a result.
+pub struct RetainedRuntime {
+    // Keep construction private even where the Linux implementation is absent.
+    _private: (),
+    #[cfg(target_os = "linux")]
+    inner: linux::RuntimeSnapshot,
+}
+
+impl RetainedRuntime {
+    /// Compatibility identity measured from the bytes actually retained.
+    pub fn cohort(&self) -> &TypedDigest {
+        #[cfg(target_os = "linux")]
+        {
+            &self.inner.cohort
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unreachable!("retained runtimes can only be constructed on Linux")
+        }
+    }
+
+    /// Revalidate every owned entry and its bytes without trusting host libraries.
+    ///
+    /// # Errors
+    /// Refuses cancellation, missing/extra/changed entries and replaced owners.
+    pub fn verify(&self, cancelled: impl Fn() -> bool) -> Result<(), RuntimeCohortError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.verify(&cancelled)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cancelled;
+            Err(RuntimeCohortError::Unsupported(
+                "Linux ELF runtime required",
+            ))
+        }
+    }
+
+    pub(crate) fn append_mounts(
+        &self,
+        args: &mut Vec<OsString>,
+        writable_backings: &[PathBuf],
+    ) -> Result<(), RuntimeCohortError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.append_mounts(args, writable_backings)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (args, writable_backings);
+            Err(RuntimeCohortError::Unsupported(
+                "Linux ELF runtime required",
+            ))
+        }
+    }
+}
+
+/// Measure and retain the selected ELF runtime in a new private child.
+///
+/// `retention_parent` must be an existing directory owned by this worker and
+/// not writable by other users. It must be separate from action-writable
+/// backings; the namespace builder checks physical inode ancestry again.
+///
+/// # Errors
+/// Has the observer's refusals, plus cancellation, unsafe retention ownership,
+/// unavailable capacity and any failure to preserve the exact selected bytes.
+pub fn retain_runtime_cohort(
+    compiler: &Path,
+    toolchain_root: &Path,
+    loader_search_paths: &[PathBuf],
+    filesystem_root: &Path,
+    retention_parent: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<RetainedRuntime, RuntimeCohortError> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(RetainedRuntime {
+            _private: (),
+            inner: linux::retain(
+                compiler,
+                toolchain_root,
+                loader_search_paths,
+                filesystem_root,
+                retention_parent,
+                &cancelled,
+            )?,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            compiler,
+            toolchain_root,
+            loader_search_paths,
+            filesystem_root,
+            retention_parent,
+            cancelled,
+        );
+        Err(RuntimeCohortError::Unsupported(
+            "Linux ELF runtime required",
+        ))
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use rabs_protocol::result_identity::DigestAlgorithm;
     use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::fs::{self, FileTimes, OpenOptions};
-    use std::io::Read;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::fs::{self, File, FileTimes, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Component;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, UNIX_EPOCH};
@@ -125,10 +237,398 @@ mod linux {
     const MAX_LIBRARIES: usize = 128;
     const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_EXTERNAL_BYTES: u64 = 256 * 1024 * 1024;
+    const MAX_LOADER_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_RUNTIME_ENTRIES: usize = 4096;
     static NEXT_PROBE: AtomicU64 = AtomicU64::new(1);
 
     fn invalid(detail: &'static str) -> RuntimeCohortError {
         RuntimeCohortError::Invalid(detail)
+    }
+
+    fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), RuntimeCohortError> {
+        if cancelled() {
+            return Err(invalid("runtime retention cancelled"));
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct FileIdentity(u64, u64);
+
+    impl FileIdentity {
+        fn of(metadata: &fs::Metadata) -> Self {
+            Self(metadata.dev(), metadata.ino())
+        }
+    }
+
+    /// A create-new private child; the held root and parent descriptors prevent
+    /// a replaced pathname from acquiring this owner's cleanup authority.
+    struct RuntimeDirectory {
+        path: PathBuf,
+        handle: File,
+        parent_path: PathBuf,
+        parent_handle: File,
+    }
+
+    impl RuntimeDirectory {
+        fn new(parent: &Path) -> Result<Self, RuntimeCohortError> {
+            if !parent.is_absolute() {
+                return Err(invalid("runtime retention parent is not absolute"));
+            }
+            let parent_path = fs::canonicalize(parent)?;
+            let parent_metadata = fs::symlink_metadata(&parent_path)?;
+            if !parent_metadata.is_dir()
+                || parent_metadata.uid() != rustix::process::geteuid().as_raw()
+                || parent_metadata.mode() & 0o022 != 0
+            {
+                return Err(invalid(
+                    "runtime retention parent is not worker-owned and private",
+                ));
+            }
+            let open_directory = |path: &Path| -> io::Result<File> {
+                rustix::fs::open(
+                    path,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(Into::into)
+            };
+            let parent_handle = open_directory(&parent_path)?;
+            if FileIdentity::of(&parent_handle.metadata()?) != FileIdentity::of(&parent_metadata) {
+                return Err(invalid(
+                    "runtime retention parent changed during acquisition",
+                ));
+            }
+            for _ in 0..64 {
+                let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+                let path =
+                    parent_path.join(format!(".rabs-runtime-{}-{sequence}", std::process::id()));
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => {
+                        let handle = open_directory(&path)?;
+                        let result = Self {
+                            path,
+                            handle,
+                            parent_path,
+                            parent_handle,
+                        };
+                        result.verify_owner()?;
+                        return Ok(result);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(invalid("runtime retention child name budget exhausted"))
+        }
+
+        fn verify_owner(&self) -> Result<(), RuntimeCohortError> {
+            let held = self.handle.metadata()?;
+            let named = fs::symlink_metadata(&self.path)?;
+            let parent = fs::symlink_metadata(&self.parent_path)?;
+            if !held.is_dir()
+                || !named.is_dir()
+                || !parent.is_dir()
+                || held.uid() != rustix::process::geteuid().as_raw()
+                || held.mode() & 0o777 != 0o700
+                || parent.uid() != held.uid()
+                || parent.mode() & 0o022 != 0
+                || FileIdentity::of(&held) != FileIdentity::of(&named)
+                || FileIdentity::of(&parent) != FileIdentity::of(&self.parent_handle.metadata()?)
+            {
+                return Err(invalid("retained runtime owner or parent was replaced"));
+            }
+            Ok(())
+        }
+
+        fn destination(&self, absolute: &Path) -> Result<PathBuf, RuntimeCohortError> {
+            let relative = absolute
+                .strip_prefix("/")
+                .map_err(|_| invalid("runtime entry is not absolute"))?;
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_)))
+            {
+                return Err(invalid("runtime entry is not normalized"));
+            }
+            Ok(self.path.join(relative))
+        }
+
+        fn ensure_directory(&self, absolute: &Path) -> Result<(), RuntimeCohortError> {
+            self.verify_owner()?;
+            let mut path = self.path.clone();
+            for component in absolute
+                .strip_prefix("/")
+                .map_err(|_| invalid("runtime directory is not absolute"))?
+                .components()
+            {
+                let Component::Normal(name) = component else {
+                    return Err(invalid("runtime directory is not normalized"));
+                };
+                path.push(name);
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&path)?;
+                        if !metadata.is_dir()
+                            || metadata.uid() != rustix::process::geteuid().as_raw()
+                            || metadata.mode() & 0o777 != 0o700
+                        {
+                            return Err(invalid(
+                                "runtime capture parent is not a private directory",
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for RuntimeDirectory {
+        fn drop(&mut self) {
+            // Only the create-new child is reclaimed, never the supplied spill
+            // parent. A replaced child or parent is left untouched.
+            if self.verify_owner().is_ok() {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum RuntimeEntry {
+        Directory,
+        Symlink(PathBuf),
+        File {
+            bytes: u64,
+            mode: u32,
+            digest: [u8; 32],
+        },
+    }
+
+    #[derive(Default)]
+    struct RuntimeTree {
+        entries: BTreeMap<PathBuf, RuntimeEntry>,
+    }
+
+    impl RuntimeTree {
+        fn insert(&mut self, path: PathBuf, entry: RuntimeEntry) -> Result<(), RuntimeCohortError> {
+            if let Some(previous) = self.entries.get(&path) {
+                if previous != &entry {
+                    return Err(invalid("runtime topology changed during capture"));
+                }
+            } else {
+                if self.entries.len() >= MAX_RUNTIME_ENTRIES {
+                    return Err(invalid("runtime entry budget exhausted"));
+                }
+                self.entries.insert(path, entry);
+            }
+            Ok(())
+        }
+
+        fn finish(&self, owner: &RuntimeDirectory) -> Result<(), RuntimeCohortError> {
+            // No symlink is installed until every ordinary file has been
+            // written. Absolute source links can never redirect capture I/O.
+            for (path, entry) in &self.entries {
+                if matches!(entry, RuntimeEntry::Directory) {
+                    owner.ensure_directory(path)?;
+                }
+            }
+            for (path, entry) in &self.entries {
+                if let RuntimeEntry::Symlink(target) = entry {
+                    owner.verify_owner()?;
+                    std::os::unix::fs::symlink(target, owner.destination(path)?)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn verify(
+            &self,
+            owner: &RuntimeDirectory,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<BTreeSet<FileIdentity>, RuntimeCohortError> {
+            check_cancelled(cancelled)?;
+            owner.verify_owner()?;
+            let mut pending = vec![owner.path.clone()];
+            let mut seen = BTreeSet::new();
+            let mut identities = BTreeSet::from([FileIdentity::of(&owner.handle.metadata()?)]);
+            let mut budget = MAX_EXTERNAL_BYTES;
+            let mut checked = BTreeMap::new();
+            while let Some(directory) = pending.pop() {
+                check_cancelled(cancelled)?;
+                checked.insert(
+                    directory.clone(),
+                    Stamp::of(&fs::symlink_metadata(&directory)?),
+                );
+                for item in fs::read_dir(&directory)? {
+                    check_cancelled(cancelled)?;
+                    let item = item?;
+                    let physical = item.path();
+                    let relative = physical
+                        .strip_prefix(&owner.path)
+                        .map_err(|_| invalid("runtime verification escaped owner"))?;
+                    let path = Path::new("/").join(relative);
+                    if !seen.insert(path.clone()) || seen.len() > MAX_RUNTIME_ENTRIES {
+                        return Err(invalid("runtime verification entry budget exhausted"));
+                    }
+                    let expected = self
+                        .entries
+                        .get(&path)
+                        .ok_or_else(|| invalid("unexpected retained runtime entry"))?;
+                    let metadata = fs::symlink_metadata(&physical)?;
+                    checked.insert(physical.clone(), Stamp::of(&metadata));
+                    identities.insert(FileIdentity::of(&metadata));
+                    if metadata.uid() != rustix::process::geteuid().as_raw() {
+                        return Err(invalid("retained runtime entry ownership changed"));
+                    }
+                    match expected {
+                        RuntimeEntry::Directory
+                            if metadata.is_dir() && metadata.mode() & 0o777 == 0o700 =>
+                        {
+                            pending.push(physical)
+                        }
+                        RuntimeEntry::Symlink(target)
+                            if metadata.is_symlink() && fs::read_link(&physical)? == *target => {}
+                        RuntimeEntry::File {
+                            bytes,
+                            mode,
+                            digest,
+                        } if metadata.is_file()
+                            && metadata.nlink() == 1
+                            && metadata.len() == *bytes
+                            && metadata.mode() & 0o777 == *mode =>
+                        {
+                            if stable_file(&physical, &mut budget, None, cancelled)?.digest
+                                != *digest
+                            {
+                                return Err(invalid("retained runtime file bytes changed"));
+                            }
+                        }
+                        _ => return Err(invalid("retained runtime entry changed")),
+                    }
+                }
+            }
+            if seen.len() != self.entries.len() {
+                return Err(invalid("retained runtime entry is missing"));
+            }
+            for (path, before) in checked {
+                check_cancelled(cancelled)?;
+                if Stamp::of(&fs::symlink_metadata(path)?) != before {
+                    return Err(invalid("retained runtime changed during verification"));
+                }
+            }
+            owner.verify_owner()?;
+            Ok(identities)
+        }
+    }
+
+    pub(super) struct RuntimeSnapshot {
+        pub(super) cohort: TypedDigest,
+        owner: RuntimeDirectory,
+        tree: RuntimeTree,
+        filesystem_root: PathBuf,
+        ambient: Vec<u8>,
+    }
+
+    impl RuntimeSnapshot {
+        pub(super) fn verify(
+            &self,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<(), RuntimeCohortError> {
+            self.tree.verify(&self.owner, cancelled)?;
+            if ambient_profile(&self.filesystem_root)? != self.ambient {
+                return Err(invalid(
+                    "runtime CPU, kernel or filesystem identity changed",
+                ));
+            }
+            check_cancelled(cancelled)
+        }
+
+        pub(super) fn append_mounts(
+            &self,
+            args: &mut Vec<OsString>,
+            writable_backings: &[PathBuf],
+        ) -> Result<(), RuntimeCohortError> {
+            let identities = self.tree.verify(&self.owner, &|| false)?;
+            let root_ancestors = physical_ancestors(&self.owner.path)?;
+            for backing in writable_backings {
+                // Callers supply worker-owned output/home trees, without
+                // preexisting nested mounts. Root ancestry checks also catch
+                // bind aliases, which canonical path strings alone miss.
+                if !backing.is_absolute() {
+                    return Err(invalid("writable runtime neighbor is not absolute"));
+                }
+                let ancestors = physical_ancestors(backing)?;
+                let backing_identity = *ancestors
+                    .first()
+                    .ok_or_else(|| invalid("missing writable backing identity"))?;
+                if root_ancestors.contains(&backing_identity)
+                    || ancestors
+                        .iter()
+                        .any(|identity| identities.contains(identity))
+                {
+                    return Err(invalid(
+                        "writable backing physically overlaps retained runtime",
+                    ));
+                }
+            }
+            let mut mounts = Vec::new();
+            for top in ["/usr", "/lib", "/lib64"] {
+                match self.tree.entries.get(Path::new(top)) {
+                    Some(RuntimeEntry::Directory) => mounts.extend([
+                        OsString::from("--ro-bind"),
+                        self.owner.destination(Path::new(top))?.into_os_string(),
+                        OsString::from(top),
+                    ]),
+                    Some(RuntimeEntry::Symlink(target)) => mounts.extend([
+                        OsString::from("--symlink"),
+                        target.as_os_str().to_owned(),
+                        OsString::from(top),
+                    ]),
+                    Some(RuntimeEntry::File { .. }) => {
+                        return Err(invalid("runtime root is not a directory or alias"));
+                    }
+                    None => {}
+                }
+            }
+            if self
+                .tree
+                .entries
+                .contains_key(Path::new("/etc/ld.so.cache"))
+            {
+                mounts.extend([
+                    OsString::from("--ro-bind"),
+                    self.owner
+                        .destination(Path::new("/etc/ld.so.cache"))?
+                        .into_os_string(),
+                    OsString::from("/etc/ld.so.cache"),
+                ]);
+            }
+            self.owner.verify_owner()?;
+            args.extend(mounts);
+            Ok(())
+        }
+    }
+
+    fn physical_ancestors(path: &Path) -> Result<Vec<FileIdentity>, RuntimeCohortError> {
+        // Canonical strings alone miss bind aliases of a runtime directory or
+        // its parent. Compare filesystem identity at each physical ancestor.
+        let canonical = fs::canonicalize(path)?;
+        canonical
+            .ancestors()
+            .map(|ancestor| {
+                fs::metadata(ancestor)
+                    .map(|metadata| FileIdentity::of(&metadata))
+                    .map_err(Into::into)
+            })
+            .collect()
     }
 
     fn append(bytes: &mut Vec<u8>, field: &[u8]) {
@@ -259,13 +759,74 @@ mod linux {
                 if !path.starts_with(root) || !fs::metadata(&path)?.is_file() {
                     return Err(invalid("runtime DSO leaves the retained toolchain"));
                 }
-                targets.insert(path);
+                targets.insert(retained_probe_target(&path, root)?);
                 if targets.len() > 32 {
                     return Err(invalid("too many retained runtime DSOs"));
                 }
             }
         }
         Ok(targets.into_iter().collect())
+    }
+
+    fn retained_probe_target(path: &Path, root: &Path) -> Result<PathBuf, RuntimeCohortError> {
+        let mut file = crate::regular_input::open(path)?;
+        let before = Stamp::of(&file.metadata()?);
+        let mut magic = [0_u8; 4];
+        file.read_exact(&mut magic)?;
+        let target = if magic == *b"\x7fELF" {
+            path.to_path_buf()
+        } else {
+            // Official Rust distributions include a short libLLVM*.so GNU
+            // linker-script alias alongside the real versioned ELF library.
+            // ldd rejects the script itself. Accept only one direct sibling
+            // INPUT member and probe that actual ELF; never interpret linker
+            // commands, searches, groups or arbitrary non-ELF DSO contents.
+            if before.size > 4096 {
+                return Err(invalid("non-ELF runtime DSO is not a bounded linker alias"));
+            }
+            let mut script = magic.to_vec();
+            script.extend_from_slice(&bounded_read(&mut file, 4096 - 4)?);
+            let script = std::str::from_utf8(&script)
+                .map_err(|_| invalid("non-ELF runtime DSO is not a UTF-8 linker alias"))?
+                .trim();
+            let name = script
+                .strip_prefix("INPUT(")
+                .and_then(|script| script.strip_suffix(')'))
+                .filter(|name| {
+                    name.starts_with("lib")
+                        && name.contains(".so")
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                        })
+                })
+                .ok_or_else(|| invalid("unsupported runtime linker alias"))?;
+            let target = fs::canonicalize(
+                path.parent()
+                    .ok_or_else(|| invalid("runtime linker alias has no parent"))?
+                    .join(name),
+            )?;
+            if !target.starts_with(root) || target == path {
+                return Err(invalid(
+                    "runtime linker alias leaves its retained toolchain",
+                ));
+            }
+            let mut elf = crate::regular_input::open(&target)?;
+            let target_before = Stamp::of(&elf.metadata()?);
+            elf.read_exact(&mut magic)?;
+            if magic != *b"\x7fELF"
+                || Stamp::of(&elf.metadata()?) != target_before
+                || Stamp::of(&fs::metadata(&target)?) != target_before
+            {
+                return Err(invalid(
+                    "runtime linker alias target is not a stable ELF file",
+                ));
+            }
+            target
+        };
+        if Stamp::of(&file.metadata()?) != before || Stamp::of(&fs::metadata(path)?) != before {
+            return Err(invalid("runtime probe target changed during acquisition"));
+        }
+        Ok(target)
     }
 
     fn without_probe_headers(
@@ -366,8 +927,12 @@ mod linux {
             let (name, path) = entry.split_once(" => ").unwrap_or((entry, entry));
             if name.is_empty()
                 || name.bytes().any(|byte| byte.is_ascii_whitespace())
+                || (name.starts_with('/') && name != path)
                 || !path.starts_with('/')
                 || path.len() > 4096
+                || path[1..]
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
                 || path
                     .bytes()
                     .any(|byte| byte.is_ascii_whitespace() || byte == 0)
@@ -393,7 +958,7 @@ mod linux {
             .collect())
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct Stamp {
         device: u64,
         inode: u64,
@@ -416,17 +981,38 @@ mod linux {
         }
     }
 
-    fn external_bytes(path: &Path, budget: &mut u64) -> Result<[u8; 32], RuntimeCohortError> {
+    struct StableFile {
+        digest: [u8; 32],
+        stamp: Stamp,
+    }
+
+    fn stable_file(
+        path: &Path,
+        budget: &mut u64,
+        destination: Option<&Path>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StableFile, RuntimeCohortError> {
+        check_cancelled(cancelled)?;
         let mut held = crate::regular_input::open(path)?;
         let before = Stamp::of(&held.metadata()?);
         if before.size > MAX_LIBRARY_BYTES || before.size > *budget {
             return Err(invalid("external runtime exceeds its byte budget"));
         }
         *budget -= before.size;
+        let mut output = destination
+            .map(|destination| {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(destination)
+            })
+            .transpose()?;
         let mut copied = 0_u64;
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
+            check_cancelled(cancelled)?;
             let count = held.read(&mut buffer)?;
             if count == 0 {
                 break;
@@ -436,6 +1022,11 @@ mod linux {
                 .filter(|count| *count <= before.size)
                 .ok_or_else(|| invalid("runtime library grew during observation"))?;
             hasher.update(&buffer[..count]);
+            if let Some(output) = &mut output {
+                // Copy and identity consume the same held-file read. A second
+                // pathname read can never silently substitute captured bytes.
+                output.write_all(&buffer[..count])?;
+            }
         }
         if copied != before.size
             || Stamp::of(&held.metadata()?) != before
@@ -443,13 +1034,297 @@ mod linux {
         {
             return Err(invalid("runtime library changed during observation"));
         }
-        Ok(hasher.finalize().into())
+        if let Some(output) = output {
+            output.set_permissions(fs::Permissions::from_mode(before.mode & 0o777))?;
+        }
+        Ok(StableFile {
+            digest: hasher.finalize().into(),
+            stamp: before,
+        })
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct SourceWitness {
+        stamp: Stamp,
+        symlink: Option<PathBuf>,
+    }
+
+    struct Measurement<'a> {
+        owner: Option<&'a RuntimeDirectory>,
+        tree: RuntimeTree,
+        witnesses: BTreeMap<PathBuf, SourceWitness>,
+        budget: u64,
+    }
+
+    impl<'a> Measurement<'a> {
+        fn new(owner: Option<&'a RuntimeDirectory>) -> Self {
+            Self {
+                owner,
+                tree: RuntimeTree::default(),
+                witnesses: BTreeMap::new(),
+                budget: MAX_EXTERNAL_BYTES,
+            }
+        }
+
+        fn witness(
+            &mut self,
+            path: &Path,
+            metadata: &fs::Metadata,
+            symlink: Option<PathBuf>,
+        ) -> Result<(), RuntimeCohortError> {
+            let witness = SourceWitness {
+                stamp: Stamp::of(metadata),
+                symlink,
+            };
+            if let Some(previous) = self.witnesses.get(path) {
+                if previous != &witness {
+                    return Err(invalid(
+                        "runtime source topology changed during observation",
+                    ));
+                }
+            } else {
+                if self.witnesses.len() >= MAX_RUNTIME_ENTRIES {
+                    return Err(invalid("runtime source entry budget exhausted"));
+                }
+                self.witnesses.insert(path.to_path_buf(), witness);
+            }
+            Ok(())
+        }
+
+        fn verify_sources(&self, cancelled: &dyn Fn() -> bool) -> Result<(), RuntimeCohortError> {
+            for (path, expected) in &self.witnesses {
+                check_cancelled(cancelled)?;
+                let metadata = fs::symlink_metadata(path)?;
+                if Stamp::of(&metadata) != expected.stamp {
+                    return Err(invalid("runtime source changed during observation"));
+                }
+                if let Some(target) = &expected.symlink
+                    && fs::read_link(path)? != *target
+                {
+                    return Err(invalid("runtime source alias changed during observation"));
+                }
+            }
+            Ok(())
+        }
+
+        fn trace(
+            &mut self,
+            path: &Path,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<PathBuf, RuntimeCohortError> {
+            if !path.is_absolute() {
+                return Err(invalid("runtime topology path is not absolute"));
+            }
+            let mut pending: VecDeque<_> = path
+                .components()
+                .filter_map(|component| match component {
+                    Component::RootDir => None,
+                    _ => Some(component.as_os_str().to_owned()),
+                })
+                .collect();
+            let mut current = PathBuf::from("/");
+            let mut links = 0_u32;
+            while let Some(part) = pending.pop_front() {
+                check_cancelled(cancelled)?;
+                if part == "." {
+                    continue;
+                }
+                if part == ".." {
+                    if !current.pop() {
+                        return Err(invalid("runtime alias escapes the filesystem root"));
+                    }
+                    continue;
+                }
+                current.push(part);
+                if current.as_os_str().len() > 4096 {
+                    return Err(invalid("runtime alias path budget exhausted"));
+                }
+                let metadata = fs::symlink_metadata(&current)?;
+                if metadata.is_symlink() {
+                    links += 1;
+                    if links > 40 {
+                        return Err(invalid("runtime alias traversal budget exhausted"));
+                    }
+                    let target = fs::read_link(&current)?;
+                    if target.as_os_str().is_empty()
+                        || target.as_os_str().len() > 4096
+                        || target.to_str().is_none()
+                    {
+                        return Err(invalid("runtime alias target is unrepresentable"));
+                    }
+                    self.witness(&current, &metadata, Some(target.clone()))?;
+                    self.tree
+                        .insert(current.clone(), RuntimeEntry::Symlink(target.clone()))?;
+                    if target.is_absolute() {
+                        current = PathBuf::from("/");
+                    } else {
+                        current.pop();
+                    }
+                    for component in target.components().rev() {
+                        if !matches!(component, Component::RootDir) {
+                            pending.push_front(component.as_os_str().to_owned());
+                        }
+                    }
+                } else {
+                    self.witness(&current, &metadata, None)?;
+                    if metadata.is_dir() {
+                        self.tree.insert(current.clone(), RuntimeEntry::Directory)?;
+                    } else if !metadata.is_file() || !pending.is_empty() {
+                        return Err(invalid(
+                            "runtime topology contains a special or non-directory parent",
+                        ));
+                    }
+                }
+            }
+            if !fs::symlink_metadata(&current)?.is_file() {
+                return Err(invalid("runtime alias does not resolve to a regular file"));
+            }
+            Ok(current)
+        }
+
+        fn file(
+            &mut self,
+            path: &Path,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<[u8; 32], RuntimeCohortError> {
+            if let Some(RuntimeEntry::File { digest, .. }) = self.tree.entries.get(path) {
+                return Ok(*digest);
+            }
+            let destination = self
+                .owner
+                .map(|owner| {
+                    owner.ensure_directory(
+                        path.parent()
+                            .ok_or_else(|| invalid("runtime file has no parent"))?,
+                    )?;
+                    owner.destination(path)
+                })
+                .transpose()?;
+            let measured = stable_file(path, &mut self.budget, destination.as_deref(), cancelled)?;
+            let witness = self
+                .witnesses
+                .get(path)
+                .ok_or_else(|| invalid("runtime file was not traced"))?;
+            if witness.stamp != measured.stamp {
+                return Err(invalid(
+                    "runtime file changed between topology and byte observation",
+                ));
+            }
+            self.tree.insert(
+                path.to_path_buf(),
+                RuntimeEntry::File {
+                    bytes: measured.stamp.size,
+                    mode: measured.stamp.mode & 0o777,
+                    digest: measured.digest,
+                },
+            )?;
+            Ok(measured.digest)
+        }
+
+        fn loader_cache(&mut self, cache: &OptionalFile) -> Result<(), RuntimeCohortError> {
+            let Some((_, stamp)) = &cache.file else {
+                return Ok(());
+            };
+            self.budget = self
+                .budget
+                .checked_sub(stamp.size)
+                .ok_or_else(|| invalid("runtime cache exceeds the byte budget"))?;
+            let path = Path::new("/etc/ld.so.cache");
+            self.tree
+                .insert(PathBuf::from("/etc"), RuntimeEntry::Directory)?;
+            let digest = Sha256::digest(&cache.bytes).into();
+            self.tree.insert(
+                path.to_path_buf(),
+                RuntimeEntry::File {
+                    bytes: stamp.size,
+                    mode: stamp.mode & 0o777,
+                    digest,
+                },
+            )?;
+            if let Some(owner) = self.owner {
+                owner.ensure_directory(Path::new("/etc"))?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(owner.destination(path)?)?;
+                output.write_all(&cache.bytes)?;
+                output.set_permissions(fs::Permissions::from_mode(stamp.mode & 0o777))?;
+            }
+            Ok(())
+        }
+    }
+
+    struct OptionalFile {
+        path: PathBuf,
+        file: Option<(File, Stamp)>,
+        bytes: Vec<u8>,
+    }
+
+    impl OptionalFile {
+        fn read(
+            path: &Path,
+            maximum: u64,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<Self, RuntimeCohortError> {
+            check_cancelled(cancelled)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Err(invalid("loader configuration is not an ordinary file")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        file: None,
+                        bytes: Vec::new(),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let mut file = crate::regular_input::open(path)?;
+            let stamp = Stamp::of(&file.metadata()?);
+            if stamp.size > maximum {
+                return Err(invalid("loader configuration byte limit exceeded"));
+            }
+            let bytes = bounded_read(&mut file, maximum)?;
+            check_cancelled(cancelled)?;
+            let result = Self {
+                path: path.to_path_buf(),
+                file: Some((file, stamp)),
+                bytes,
+            };
+            result.verify()?;
+            if result
+                .file
+                .as_ref()
+                .is_some_and(|(_, stamp)| stamp.size != result.bytes.len() as u64)
+            {
+                return Err(invalid("loader configuration changed during its read"));
+            }
+            Ok(result)
+        }
+
+        fn verify(&self) -> Result<(), RuntimeCohortError> {
+            match (&self.file, fs::symlink_metadata(&self.path)) {
+                (Some((file, before)), Ok(named))
+                    if named.is_file()
+                        && Stamp::of(&named) == *before
+                        && Stamp::of(&file.metadata()?) == *before =>
+                {
+                    Ok(())
+                }
+                (None, Err(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                _ => Err(invalid(
+                    "loader configuration changed during the loader probe",
+                )),
+            }
+        }
     }
 
     fn library_record(
         library: &Library,
         root: &Path,
-        budget: &mut u64,
+        measurement: &mut Measurement<'_>,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<u8>, RuntimeCohortError> {
         let resolved = fs::canonicalize(&library.path)?;
         let mut record = Vec::new();
@@ -458,6 +1333,11 @@ mod linux {
             // rehashing hundreds of megabytes of LLVM on every observation.
             if !fs::metadata(&resolved)?.is_file() {
                 return Err(invalid("toolchain runtime member is not regular"));
+            }
+            if !library.path.starts_with(root) {
+                return Err(RuntimeCohortError::Unsupported(
+                    "toolchain runtime alias lies outside its retained root",
+                ));
             }
             append(&mut record, b"retained-toolchain");
             append(
@@ -471,6 +1351,10 @@ mod linux {
                 append(&mut record, library.name.as_bytes());
             }
         } else {
+            let traced = measurement.trace(&library.path, cancelled)?;
+            if traced != resolved {
+                return Err(invalid("runtime alias changed during topology observation"));
+            }
             append(&mut record, b"host-runtime");
             append(&mut record, library.name.as_bytes());
             append(
@@ -488,7 +1372,7 @@ mod linux {
                     .ok_or_else(|| invalid("non-UTF-8 resolved runtime path"))?
                     .as_bytes(),
             );
-            append(&mut record, &external_bytes(&resolved, budget)?);
+            append(&mut record, &measurement.file(&resolved, cancelled)?);
         }
         if fs::canonicalize(&library.path)? != resolved {
             return Err(invalid("runtime library path changed during observation"));
@@ -652,6 +1536,57 @@ mod linux {
         loader_search_paths: &[PathBuf],
         filesystem_root: &Path,
     ) -> Result<TypedDigest, RuntimeCohortError> {
+        let (cohort, _, _) = measure(
+            compiler,
+            toolchain_root,
+            loader_search_paths,
+            filesystem_root,
+            None,
+            &|| false,
+        )?;
+        Ok(cohort)
+    }
+
+    pub(super) fn retain(
+        compiler: &Path,
+        toolchain_root: &Path,
+        loader_search_paths: &[PathBuf],
+        filesystem_root: &Path,
+        retention_parent: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<RuntimeSnapshot, RuntimeCohortError> {
+        check_cancelled(cancelled)?;
+        let owner = RuntimeDirectory::new(retention_parent)?;
+        let (cohort, tree, ambient) = measure(
+            compiler,
+            toolchain_root,
+            loader_search_paths,
+            filesystem_root,
+            Some(&owner),
+            cancelled,
+        )?;
+        check_cancelled(cancelled)?;
+        tree.finish(&owner)?;
+        let result = RuntimeSnapshot {
+            cohort,
+            owner,
+            tree,
+            filesystem_root: filesystem_root.to_path_buf(),
+            ambient,
+        };
+        result.verify(cancelled)?;
+        Ok(result)
+    }
+
+    fn measure(
+        compiler: &Path,
+        toolchain_root: &Path,
+        loader_search_paths: &[PathBuf],
+        filesystem_root: &Path,
+        owner: Option<&RuntimeDirectory>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(TypedDigest, RuntimeTree, Vec<u8>), RuntimeCohortError> {
+        check_cancelled(cancelled)?;
         if !compiler.is_absolute()
             || !toolchain_root.is_absolute()
             || loader_search_paths.len() > 128
@@ -672,36 +1607,115 @@ mod linux {
                 "compiler is not an ELF binary",
             ));
         }
-        match read_system("/etc/ld.so.preload", MAX_PROBE_BYTES) {
-            Ok(bytes) if bytes.iter().any(|byte| !byte.is_ascii_whitespace()) => {
-                return Err(RuntimeCohortError::Unsupported(
-                    "global loader preloads are not exposed in the action namespace",
-                ));
-            }
-            Ok(_) => {}
-            Err(RuntimeCohortError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        let preload =
+            OptionalFile::read(Path::new("/etc/ld.so.preload"), MAX_PROBE_BYTES, cancelled)?;
+        if preload.bytes.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            return Err(RuntimeCohortError::Unsupported(
+                "global loader preloads are not exposed in the action namespace",
+            ));
         }
+        // Capture before ldd: later host cache bytes must never be paired with
+        // an earlier loader selection. Absence is also witnessed and keyed.
+        let cache = OptionalFile::read(
+            Path::new("/etc/ld.so.cache"),
+            MAX_LOADER_CACHE_BYTES,
+            cancelled,
+        )?;
+        let mut measurement = Measurement::new(owner);
+        measurement.loader_cache(&cache)?;
         let search = validated_search_paths(loader_search_paths)?;
         let targets = probe_targets(&compiler, &root)?;
         let libraries = libraries(&probe(&targets, &search)?)?;
+        check_cancelled(cancelled)?;
+        preload.verify()?;
+        cache.verify()?;
         let mut records = Vec::new();
-        let mut budget = MAX_EXTERNAL_BYTES;
         for library in libraries {
+            check_cancelled(cancelled)?;
             let resolved = fs::canonicalize(&library.path)?;
             if !resolved.starts_with(&root) && !resolved.starts_with("/usr") {
                 return Err(RuntimeCohortError::Unsupported(
-                    "external library is not in the worker's read-only /usr view",
+                    "external library is outside the supported selected /usr runtime",
                 ));
             }
-            records.push(library_record(&library, &root, &mut budget)?);
+            records.push(library_record(
+                &library,
+                &root,
+                &mut measurement,
+                cancelled,
+            )?);
         }
+        measurement.verify_sources(cancelled)?;
+        preload.verify()?;
+        cache.verify()?;
         records.sort();
         let mut observed = Vec::new();
-        append(&mut observed, b"elf-host-cohort-v1");
+        append(&mut observed, b"elf-host-cohort-v2");
         for record in records {
             append(&mut observed, &record);
         }
+        append(
+            &mut observed,
+            if cache.file.is_some() {
+                b"loader-cache-present"
+            } else {
+                b"loader-cache-absent"
+            },
+        );
+        for (path, entry) in &measurement.tree.entries {
+            if !(path.starts_with("/usr")
+                || path.starts_with("/lib")
+                || path.starts_with("/lib64")
+                || path == Path::new("/etc")
+                || path == Path::new("/etc/ld.so.cache"))
+            {
+                return Err(RuntimeCohortError::Unsupported(
+                    "selected runtime alias leaves supported namespace roots",
+                ));
+            }
+            append(
+                &mut observed,
+                path.to_str()
+                    .ok_or_else(|| invalid("runtime entry is not UTF-8"))?
+                    .as_bytes(),
+            );
+            match entry {
+                RuntimeEntry::Directory => append(&mut observed, b"private-directory-mode-0700"),
+                RuntimeEntry::Symlink(target) => {
+                    append(&mut observed, b"symlink");
+                    append(
+                        &mut observed,
+                        target
+                            .to_str()
+                            .ok_or_else(|| invalid("runtime alias target is not UTF-8"))?
+                            .as_bytes(),
+                    );
+                }
+                RuntimeEntry::File {
+                    bytes,
+                    mode,
+                    digest,
+                } => {
+                    append(&mut observed, b"regular-file");
+                    append(&mut observed, &bytes.to_le_bytes());
+                    append(&mut observed, &mode.to_le_bytes());
+                    append(&mut observed, digest);
+                }
+            }
+        }
+        let ambient = ambient_profile(filesystem_root)?;
+        append(&mut observed, &ambient);
+        check_cancelled(cancelled)?;
+        if Stamp::of(&executable.metadata()?) != compiler_stamp
+            || Stamp::of(&fs::metadata(&compiler)?) != compiler_stamp
+        {
+            return Err(invalid("compiler changed during runtime observation"));
+        }
+        Ok((digest(&observed), measurement.tree, ambient))
+    }
+
+    fn ambient_profile(filesystem_root: &Path) -> Result<Vec<u8>, RuntimeCohortError> {
+        let mut observed = Vec::new();
         for path in ["/proc/sys/kernel/ostype", "/proc/sys/kernel/osrelease"] {
             let raw = read_system(path, 4096)?;
             let value = std::str::from_utf8(&raw)
@@ -717,12 +1731,7 @@ mod linux {
             &cpu_profile(&read_system("/proc/cpuinfo", MAX_CPUINFO_BYTES)?)?,
         );
         append(&mut observed, &filesystem_profile(filesystem_root)?);
-        if Stamp::of(&executable.metadata()?) != compiler_stamp
-            || Stamp::of(&fs::metadata(&compiler)?) != compiler_stamp
-        {
-            return Err(invalid("compiler changed during runtime observation"));
-        }
-        Ok(digest(&observed))
+        Ok(observed)
     }
 
     #[cfg(test)]
@@ -740,6 +1749,8 @@ mod linux {
                 b"statically linked\n",
                 b"libc.so => /lib/libc.so (invalid)\n",
                 b"linux-vdso.so.1 (0x1234)\n",
+                b"/lib64/ld-linux.so.2 => /lib/other-loader.so (0x1234)\n",
+                b"libc.so => /usr/lib/../lib/libc.so (0x1234)\n",
             ] {
                 assert!(libraries(bad).is_err(), "{bad:?}");
             }
@@ -756,7 +1767,7 @@ mod linux {
             let driver = root.join("lib/librustc_driver.so");
             let codegen = backend.join("librustc_codegen_llvm.so");
             for path in [&compiler, &driver, &codegen] {
-                fs::write(path, b"fixture").unwrap();
+                fs::write(path, b"\x7fELFfixture").unwrap();
             }
             let targets = probe_targets(&compiler, &root).unwrap();
             assert_eq!(targets.len(), 3);
@@ -774,6 +1785,41 @@ mod linux {
         }
 
         #[test]
+        fn official_llvm_linker_alias_probes_its_retained_elf_and_refuses_other_scripts() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("toolchain");
+            fs::create_dir_all(root.join("lib")).unwrap();
+            fs::create_dir(root.join("bin")).unwrap();
+            let compiler = root.join("bin/rustc");
+            fs::write(&compiler, b"\x7fELFcompiler").unwrap();
+            let actual = root.join("lib/libLLVM.so.23.1-rust-1.100.0-nightly");
+            fs::write(&actual, b"\x7fELFselected LLVM").unwrap();
+            let alias = root.join("lib/libLLVM-23-rust-1.100.0-nightly.so");
+            fs::write(&alias, b"INPUT(libLLVM.so.23.1-rust-1.100.0-nightly)\n").unwrap();
+            let targets = probe_targets(&compiler, &root).unwrap();
+            assert_eq!(targets.len(), 2);
+            assert!(targets.contains(&compiler));
+            assert!(targets.contains(&actual));
+            assert!(!targets.contains(&alias));
+            for script in [
+                "GROUP(libLLVM.so.23.1-rust-1.100.0-nightly)",
+                "INPUT(/usr/lib/libLLVM.so)",
+                "INPUT(../libLLVM.so)",
+                "INPUT(libLLVM.so extra.so)",
+                "INPUT(libLLVM-23-rust-1.100.0-nightly.so)",
+                "arbitrary non-ELF DSO",
+            ] {
+                fs::write(&alias, script).unwrap();
+                assert!(probe_targets(&compiler, &root).is_err(), "{script}");
+            }
+            let foreign = directory.path().join("libforeign.so");
+            fs::write(&foreign, b"\x7fELFoutside toolchain").unwrap();
+            std::os::unix::fs::symlink(&foreign, root.join("lib/libforeign.so")).unwrap();
+            fs::write(&alias, b"INPUT(libforeign.so)\n").unwrap();
+            assert!(retained_probe_target(&alias, &root).is_err());
+        }
+
+        #[test]
         fn external_library_byte_changes_change_the_runtime_record() {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().join("toolchain");
@@ -784,11 +1830,11 @@ mod linux {
                 name: "libexternal.so".into(),
                 path: path.clone(),
             };
-            let mut budget = MAX_EXTERNAL_BYTES;
-            let first = library_record(&library, &root, &mut budget).unwrap();
+            let first =
+                library_record(&library, &root, &mut Measurement::new(None), &|| false).unwrap();
             fs::write(path, b"different runtime bytes").unwrap();
-            let mut budget = MAX_EXTERNAL_BYTES;
-            let changed = library_record(&library, &root, &mut budget).unwrap();
+            let changed =
+                library_record(&library, &root, &mut Measurement::new(None), &|| false).unwrap();
             assert_ne!(first, changed);
             assert_ne!(digest(&first), digest(&changed));
         }
@@ -802,7 +1848,6 @@ mod linux {
                 fs::create_dir_all(root.join("lib")).unwrap();
                 let path = root.join("lib/libinternal.so");
                 fs::write(&path, b"same retained bytes").unwrap();
-                let mut budget = MAX_EXTERNAL_BYTES;
                 records.push(
                     library_record(
                         &Library {
@@ -810,7 +1855,8 @@ mod linux {
                             path,
                         },
                         &root,
-                        &mut budget,
+                        &mut Measurement::new(None),
+                        &|| false,
                     )
                     .unwrap(),
                 );
@@ -901,6 +1947,258 @@ mod linux {
             let second = observe(&compiler, root, &[], scratch.path()).unwrap();
             assert_eq!(first, second);
             assert_eq!(first.domain, RUNTIME_COHORT_DOMAIN);
+        }
+
+        #[test]
+        fn retained_selected_runtime_matches_observer_and_uses_only_owned_mounts() {
+            let directory = tempfile::tempdir().unwrap();
+            let toolchain = directory.path().join("toolchain");
+            fs::create_dir_all(toolchain.join("bin")).unwrap();
+            fs::create_dir(toolchain.join("lib")).unwrap();
+            let compiler = toolchain.join("bin/rustc");
+            fs::copy("/usr/bin/true", &compiler).unwrap();
+            let observed = observe(&compiler, &toolchain, &[], directory.path()).unwrap();
+            let retained = retain_runtime_cohort(
+                &compiler,
+                &toolchain,
+                &[],
+                directory.path(),
+                directory.path(),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(retained.cohort(), &observed);
+            retained.verify(|| false).unwrap();
+            let writable = directory.path().join("output");
+            fs::create_dir(&writable).unwrap();
+            let mut args = Vec::new();
+            retained.append_mounts(&mut args, &[writable]).unwrap();
+            assert!(!args.is_empty());
+            assert!(args.len().is_multiple_of(3));
+            for mount in args.as_chunks::<3>().0 {
+                if mount[0] == "--ro-bind" {
+                    assert!(Path::new(&mount[1]).starts_with(&retained.inner.owner.path));
+                    assert_ne!(mount[1], mount[2]);
+                } else {
+                    assert_eq!(mount[0], "--symlink");
+                    assert!(matches!(
+                        mount[2].to_str(),
+                        Some("/lib" | "/lib64" | "/usr")
+                    ));
+                }
+            }
+            assert!(
+                args.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .any(|mount| mount[2] == "/usr")
+            );
+            let snapshot_path = retained.inner.owner.path.clone();
+            drop(retained);
+            assert!(!snapshot_path.try_exists().unwrap());
+            assert!(directory.path().is_dir());
+            assert!(compiler.is_file());
+        }
+
+        #[test]
+        fn same_read_capture_keeps_bytes_and_aliases_after_source_changes() {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let library = source.join("libfixture.so.1");
+            fs::write(&library, b"captured library bytes").unwrap();
+            let relative = source.join("libfixture.so");
+            std::os::unix::fs::symlink("libfixture.so.1", &relative).unwrap();
+            let absolute = source.join("libabsolute.so");
+            std::os::unix::fs::symlink(&relative, &absolute).unwrap();
+            let owner = RuntimeDirectory::new(directory.path()).unwrap();
+            let mut measurement = Measurement::new(Some(&owner));
+            let resolved = measurement.trace(&absolute, &|| false).unwrap();
+            assert_eq!(resolved, library);
+            let measured = measurement.file(&resolved, &|| false).unwrap();
+            measurement.verify_sources(&|| false).unwrap();
+            measurement.tree.finish(&owner).unwrap();
+            assert_eq!(
+                fs::read_link(owner.destination(&absolute).unwrap()).unwrap(),
+                relative
+            );
+            assert_eq!(
+                fs::read_link(owner.destination(&relative).unwrap()).unwrap(),
+                Path::new("libfixture.so.1")
+            );
+            let copied = owner.destination(&library).unwrap();
+            assert_eq!(fs::read(&copied).unwrap(), b"captured library bytes");
+            let expected: [u8; 32] = Sha256::digest(b"captured library bytes").into();
+            assert_eq!(measured, expected);
+            fs::write(&library, b"replacement host bytes").unwrap();
+            assert!(measurement.verify_sources(&|| false).is_err());
+            measurement.tree.verify(&owner, &|| false).unwrap();
+            assert_eq!(fs::read(&copied).unwrap(), b"captured library bytes");
+            fs::write(&copied, b"modified retained bytes").unwrap();
+            assert!(measurement.tree.verify(&owner, &|| false).is_err());
+        }
+
+        #[test]
+        fn loader_cache_capture_witnesses_presence_bytes_and_generation() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cache");
+            let missing = OptionalFile::read(&path, MAX_LOADER_CACHE_BYTES, &|| false).unwrap();
+            missing.verify().unwrap();
+            fs::write(&path, b"selected loader cache").unwrap();
+            assert!(missing.verify().is_err());
+            let captured = OptionalFile::read(&path, MAX_LOADER_CACHE_BYTES, &|| false).unwrap();
+            let owner = RuntimeDirectory::new(directory.path()).unwrap();
+            let mut measurement = Measurement::new(Some(&owner));
+            measurement.loader_cache(&captured).unwrap();
+            measurement.tree.finish(&owner).unwrap();
+            let copied = owner.destination(Path::new("/etc/ld.so.cache")).unwrap();
+            assert_eq!(fs::read(copied).unwrap(), b"selected loader cache");
+            fs::write(&path, b"new loader cache").unwrap();
+            assert!(captured.verify().is_err());
+            measurement.tree.verify(&owner, &|| false).unwrap();
+            let current = OptionalFile::read(&path, MAX_LOADER_CACHE_BYTES, &|| false).unwrap();
+            let mut changed = Measurement::new(None);
+            changed.loader_cache(&current).unwrap();
+            assert_ne!(measurement.tree.entries, changed.tree.entries);
+            let too_large = directory.path().join("large-cache");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&too_large)
+                .unwrap()
+                .set_len(MAX_LOADER_CACHE_BYTES + 1)
+                .unwrap();
+            assert!(OptionalFile::read(&too_large, MAX_LOADER_CACHE_BYTES, &|| false).is_err());
+            let alias = directory.path().join("cache-alias");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            assert!(OptionalFile::read(&alias, MAX_LOADER_CACHE_BYTES, &|| false).is_err());
+        }
+
+        #[test]
+        fn retained_tree_refuses_extra_entries_hardlinks_and_replaced_owner() {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            fs::write(&source, b"runtime bytes").unwrap();
+            let owner = RuntimeDirectory::new(directory.path()).unwrap();
+            let mut measurement = Measurement::new(Some(&owner));
+            let resolved = measurement.trace(&source, &|| false).unwrap();
+            measurement.file(&resolved, &|| false).unwrap();
+            measurement.tree.finish(&owner).unwrap();
+            measurement.tree.verify(&owner, &|| false).unwrap();
+            let copied = owner.destination(&source).unwrap();
+            fs::hard_link(&copied, directory.path().join("writable-alias")).unwrap();
+            assert!(measurement.tree.verify(&owner, &|| false).is_err());
+
+            let empty_owner = RuntimeDirectory::new(directory.path()).unwrap();
+            let empty_tree = RuntimeTree::default();
+            empty_tree.verify(&empty_owner, &|| false).unwrap();
+            fs::write(empty_owner.path.join("unexpected"), b"not selected").unwrap();
+            assert!(empty_tree.verify(&empty_owner, &|| false).is_err());
+
+            let replace_owner = RuntimeDirectory::new(directory.path()).unwrap();
+            let original_path = replace_owner.path.clone();
+            let moved = directory.path().join("moved-owned-runtime");
+            fs::rename(&original_path, &moved).unwrap();
+            fs::create_dir(&original_path).unwrap();
+            fs::write(
+                original_path.join("replacement"),
+                b"must survive guarded cleanup",
+            )
+            .unwrap();
+            assert!(replace_owner.verify_owner().is_err());
+            drop(replace_owner);
+            assert_eq!(
+                fs::read(original_path.join("replacement")).unwrap(),
+                b"must survive guarded cleanup"
+            );
+            assert!(moved.is_dir());
+        }
+
+        #[test]
+        fn capture_bounds_and_cancellation_are_fail_closed() {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(
+                retain_runtime_cohort(
+                    Path::new("/not-probed"),
+                    Path::new("/not-probed"),
+                    &[],
+                    directory.path(),
+                    directory.path(),
+                    || true,
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+            let owner = RuntimeDirectory::new(directory.path()).unwrap();
+            assert!(RuntimeTree::default().verify(&owner, &|| true).is_err());
+            let source = directory.path().join("source");
+            fs::write(&source, b"one byte budget is not enough").unwrap();
+            assert!(stable_file(&source, &mut 1, None, &|| false).is_err());
+            let mut budget = MAX_EXTERNAL_BYTES;
+            assert!(stable_file(&source, &mut budget, None, &|| true).is_err());
+            let mut tree = RuntimeTree::default();
+            for index in 0..MAX_RUNTIME_ENTRIES {
+                tree.insert(
+                    PathBuf::from(format!("/usr/entry-{index}")),
+                    RuntimeEntry::Directory,
+                )
+                .unwrap();
+            }
+            assert!(
+                tree.insert(PathBuf::from("/usr/one-too-many"), RuntimeEntry::Directory)
+                    .is_err()
+            );
+            let mut output = String::new();
+            for index in 0..=MAX_LIBRARIES {
+                output.push_str(&format!(
+                    "lib{index}.so => /usr/lib/lib{index}.so (0x1234)\n"
+                ));
+            }
+            assert!(libraries(output.as_bytes()).is_err());
+            let large = directory.path().join("large-library");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&large)
+                .unwrap()
+                .set_len(MAX_LIBRARY_BYTES + 1)
+                .unwrap();
+            let mut budget = MAX_EXTERNAL_BYTES;
+            assert!(stable_file(&large, &mut budget, None, &|| false).is_err());
+        }
+
+        #[test]
+        fn writable_aliases_and_ancestors_cannot_expose_retained_runtime() {
+            let directory = tempfile::tempdir().unwrap();
+            let toolchain = directory.path().join("toolchain");
+            fs::create_dir_all(toolchain.join("bin")).unwrap();
+            let compiler = toolchain.join("bin/rustc");
+            fs::copy("/usr/bin/true", &compiler).unwrap();
+            let retained = retain_runtime_cohort(
+                &compiler,
+                &toolchain,
+                &[],
+                directory.path(),
+                directory.path(),
+                || false,
+            )
+            .unwrap();
+            let alias = directory.path().join("runtime-alias");
+            std::os::unix::fs::symlink(&retained.inner.owner.path, &alias).unwrap();
+            for backing in [
+                retained.inner.owner.path.clone(),
+                retained.inner.owner.path.join("usr"),
+                directory.path().to_path_buf(),
+                alias,
+                PathBuf::from("/"),
+            ] {
+                let mut args = vec![OsString::from("unchanged")];
+                assert!(retained.append_mounts(&mut args, &[backing]).is_err());
+                assert_eq!(args, [OsString::from("unchanged")]);
+            }
+            let sibling = directory.path().join("private-output");
+            fs::create_dir(&sibling).unwrap();
+            retained.append_mounts(&mut Vec::new(), &[sibling]).unwrap();
         }
     }
 }

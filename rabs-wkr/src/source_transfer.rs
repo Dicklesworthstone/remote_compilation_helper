@@ -1845,12 +1845,37 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn shared_output_retains_exact_input_bytes_over_exclusive_empty_mountpoints() {
-        use rabs_sandbox::dependency_context::build_dependency_argv;
+        use rabs_sandbox::dependency_context::{DependencyExecContext, build_dependency_argv};
         use std::path::Path;
 
         let mut fixture = SharedDependencyFixture::new();
+        let retention_parent = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let runtime = rabs_sandbox::runtime_cohort::retain_runtime_cohort(
+            &executable,
+            executable.parent().unwrap(),
+            &[],
+            fixture.output.path(),
+            retention_parent.path(),
+            || false,
+        )
+        .unwrap();
+        fixture.context = DependencyExecContext::new_with_artifacts(
+            fixture.context.source_root().to_owned(),
+            fixture.context.cwd().to_owned(),
+            fixture.context.toolchain_root().to_owned(),
+            fixture.context.compiler().to_owned(),
+            fixture.context.out_dir().to_owned(),
+            fixture.context.dependency_dirs().to_vec(),
+            fixture.context.loader_dirs().to_vec(),
+            fixture.context.artifact_roots().to_vec(),
+            fixture.context.env().to_vec(),
+            runtime.cohort().bytes,
+        )
+        .unwrap();
         let guard = fixture.prepare().unwrap();
         assert_eq!(
             guard.relative_paths().collect::<Vec<_>>(),
@@ -1899,6 +1924,7 @@ mod tests {
         let launch = build_dependency_argv(
             &fixture.context,
             &fixture.spec,
+            &runtime,
             &support,
             fixture.context.compiler(),
             &[],
