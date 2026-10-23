@@ -67,6 +67,8 @@ WORKER_BIN="rch-wkr"
 USE_COLOR=true
 USE_GUM=false
 TEMP_DIR=""
+# Expand arrays that may be empty as ${a[@]+"${a[@]}"}: under `set -u`, macOS's
+# /bin/bash 3.2 treats an empty "${a[@]}" as an unbound variable and exits.
 PROXY_ARGS=()
 
 # Default color values (set properly by setup_ui)
@@ -883,7 +885,7 @@ download_binaries() {
         tag_name=$(installer_release_tag "$VERSION") || return 1
     else
         local release_url="${GITHUB_API}/releases/latest"
-        release_info=$(curl -sL --connect-timeout 10 "${PROXY_ARGS[@]}" "$release_url" 2>/dev/null || echo "")
+        release_info=$(curl -sL --connect-timeout 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$release_url" 2>/dev/null || echo "")
         if [[ -n "$release_info" ]] && echo "$release_info" | grep -q '"tag_name"'; then
             tag_name=$(echo "$release_info" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
         fi
@@ -896,12 +898,12 @@ download_binaries() {
         # asset that actually exists in this release (rch#23: linux-x86_64 falls
         # back from -musl to -gnu when only -gnu was published).
         local candidate_target
-        for candidate_target in "${RELEASE_TARGETS[@]}"; do
+        for candidate_target in ${RELEASE_TARGETS[@]+"${RELEASE_TARGETS[@]}"}; do
             local versioned_asset="rch-${tag_name}-${candidate_target}.${asset_ext}"
             local versioned_url
             versioned_url=$(release_download_url "$tag_name" "$versioned_asset") || return 1
             info "Downloading $versioned_asset from $tag_name..."
-            if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
                 downloaded=true
                 asset_name="$versioned_asset"
                 checksum_url=$(release_download_url "$tag_name" "${versioned_asset}.sha256") || return 1
@@ -913,11 +915,11 @@ download_binaries() {
 
     if [[ "$downloaded" != "true" ]]; then
         local candidate_target unversioned_asset version_url
-        for candidate_target in "${RELEASE_TARGETS[@]}" "$TARGET"; do
+        for candidate_target in ${RELEASE_TARGETS[@]+"${RELEASE_TARGETS[@]}"} "$TARGET"; do
             unversioned_asset="rch-${candidate_target}.${asset_ext}"
             version_url=$(release_download_url "$tag_name" "$unversioned_asset") || return 1
             info "Downloading $unversioned_asset from $tag_name..."
-            if curl -fsSL "${PROXY_ARGS[@]}" "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
                 downloaded=true
                 asset_name="$unversioned_asset"
                 checksum_tag="$tag_name"
@@ -937,7 +939,7 @@ download_binaries() {
 
     local checksum_file="$TEMP_DIR/SHA256SUMS"
     local sidecar_file="$TEMP_DIR/${asset_name}.sha256"
-    if curl -fsSL "${PROXY_ARGS[@]}" "$checksum_url" -o "$sidecar_file"; then
+    if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$checksum_url" -o "$sidecar_file"; then
         local expected
         if ! expected=$(extract_checksum_from_manifest "$(cat "$sidecar_file")" "$asset_name" true); then
             error "Invalid or ambiguous checksum sidecar for $asset_name"
@@ -947,7 +949,7 @@ download_binaries() {
     else
         local manifest_url
         manifest_url=$(release_download_url "$checksum_tag" SHA256SUMS) || return 1
-        if ! curl -fsSL "${PROXY_ARGS[@]}" "$manifest_url" -o "$checksum_file"; then
+        if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$manifest_url" -o "$checksum_file"; then
             error "No checksum available for $asset_name from $checksum_tag; installation refused"
             return 1
         fi
@@ -1093,7 +1095,7 @@ install_rust_toolchain() {
 
     info "Installing Rust via rustup..."
     # Note: rustup respects HTTPS_PROXY/HTTP_PROXY environment variables automatically
-    if curl --proto '=https' --tlsv1.2 -sSf "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly; then
+    if curl --proto '=https' --tlsv1.2 -sSf ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly; then
         # Source cargo env for current session
         if [[ -f "$HOME/.cargo/env" ]]; then
             # shellcheck source=/dev/null
@@ -1356,7 +1358,7 @@ verify_sigstore_bundle() {
     local bundle_file="${file}.sigstore.json"
 
     info "Downloading Sigstore bundle..."
-    if ! curl -fsSL "${PROXY_ARGS[@]}" "$bundle_url" -o "$bundle_file" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$bundle_url" -o "$bundle_file" 2>/dev/null; then
         warn "Could not download Sigstore bundle; skipping signature verification"
         return 0
     fi
@@ -1505,7 +1507,7 @@ install_skill() {
 
     mkdir -p "$skill_stage/assets" "$skill_stage/references" "$skill_stage/scripts"
     # SKILL.md is mandatory; without it the raw tree cannot yield a usable skill.
-    if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/SKILL.md" -o "${skill_stage}/SKILL.md" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "${skill_raw_base}/SKILL.md" -o "${skill_stage}/SKILL.md" 2>/dev/null; then
         raw_skill_ok=false
     fi
     # Companion files are best-effort: a single missing/renamed file must not
@@ -1514,7 +1516,7 @@ install_skill() {
     if $raw_skill_ok; then
         for rel_path in "${skill_files[@]}"; do
             mkdir -p "${skill_stage}/$(dirname "$rel_path")"
-            if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/${rel_path}" -o "${skill_stage}/${rel_path}" 2>/dev/null; then
+            if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "${skill_raw_base}/${rel_path}" -o "${skill_stage}/${rel_path}" 2>/dev/null; then
                 warn "Skill companion file not found (skipping): ${rel_path}"
                 rm -f "${skill_stage}/${rel_path}" 2>/dev/null || true
             fi
@@ -1528,7 +1530,7 @@ install_skill() {
     fi
 
     # Try release-packaged skill only after repo-local and raw repo sources.
-    if curl -fsSL "${PROXY_ARGS[@]}" "$skill_url" -o "$skill_temp" 2>/dev/null; then
+    if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$skill_url" -o "$skill_temp" 2>/dev/null; then
         if tar -xzf "$skill_temp" -C "$HOME/.claude/skills" 2>/dev/null; then
             installed_claude=true
         fi
@@ -1704,7 +1706,7 @@ show_skill_info() {
             "It provides setup guidance, troubleshooting, and quick fixes." \
             "" \
             "Installed to:" \
-            "${loc_lines[@]}" \
+            ${loc_lines[@]+"${loc_lines[@]}"} \
             "" \
             "How Skills Work:" \
             "  When you describe an RCH problem to your AI agent," \
@@ -1735,7 +1737,7 @@ show_skill_info() {
         echo "  It provides setup guidance, troubleshooting, and quick fixes."
         echo ""
         echo "  Installed to:"
-        for line in "${loc_lines[@]}"; do
+        for line in ${loc_lines[@]+"${loc_lines[@]}"}; do
             echo "$line"
         done
         echo ""
@@ -2359,7 +2361,7 @@ configure_dispatcher_shim() {
     fi
     # Reassert at the end: an updater may have appended its own PATH prepend
     # after an older RCH line. Consecutive installs remain idempotent.
-    for shell_rc in "${shell_files[@]}"; do
+    for shell_rc in ${shell_files[@]+"${shell_files[@]}"}; do
         mkdir -p "$(dirname "$shell_rc")"
         if [[ ! -f "$shell_rc" ]] || [[ "$(tail -n 1 "$shell_rc")" != "$path_line" ]]; then
             printf '\n# RCH dispatcher: keep Cargo offload ahead of toolchain binaries\n%s\n' "$path_line" >> "$shell_rc"

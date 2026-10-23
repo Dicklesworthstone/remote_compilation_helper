@@ -281,6 +281,24 @@ else
     fail "installer_has_no_errexit_unsafe_increments: ${unsafe_increments//$'\n'/; }"
 fi
 
+# Case 15: under `set -u`, macOS /bin/bash 3.2 aborts on an empty "${a[@]}"
+# ("PROXY_ARGS[@]: unbound variable"), so every download died on a stock Mac
+# shell with no proxy configured. An array the installer initializes empty
+# must be expanded as ${a[@]+"${a[@]}"}.
+start_test "installer_guards_possibly_empty_array_expansions"
+unguarded_arrays=""
+while IFS= read -r array_name; do
+    [[ -n "$array_name" ]] || continue
+    hits=$(grep -nE "(^|[^+])\"\\\$\{${array_name}\[@\]\}\"" "$PROJECT_ROOT/install.sh" || true)
+    [[ -z "$hits" ]] || unguarded_arrays+="${array_name}: ${hits//$'\n'/; } "
+done < <(grep -oE '(^|[[:space:]])[A-Za-z_][A-Za-z_0-9]*=\(\)' "$PROJECT_ROOT/install.sh" \
+    | sed -E 's/^[[:space:]]*//; s/=\(\)$//' | sort -u)
+if [[ -z "$unguarded_arrays" ]]; then
+    pass "installer_guards_possibly_empty_array_expansions"
+else
+    fail "installer_guards_possibly_empty_array_expansions: $unguarded_arrays"
+fi
+
 log "=== Summary ==="
 log "Tests run: $TESTS_RUN"
 log "Passed:    $TESTS_PASSED"
