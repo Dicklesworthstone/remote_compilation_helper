@@ -11,6 +11,9 @@ use std::process::Command;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
+#[path = "persistence_tests.rs"]
+mod persistence_tests;
+
 fn inputs(root: &Path, names: &[&str]) -> WorkspaceInputs {
     let files = names
         .iter()

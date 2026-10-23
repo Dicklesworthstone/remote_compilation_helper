@@ -107,6 +107,17 @@ abandons the history that prevents a completed or uncertain request from
 executing twice. Missing prior settings refuse an upgrade before replacing
 the binary or restarting the service.
 
+For canonical whole-Cargo jobs, managed deployments also accept
+`RABS_WORKER_TARGET_CACHE_BYTES` (0–8589934592) and
+`RABS_WORKER_TARGET_CACHE_EPOCH`. A positive byte limit enables private target
+reuse. A nonempty epoch additionally retains completed seeds across worker
+restarts on an unchanged host runtime. The epoch is an operator-managed label:
+stop the worker and change the label before updating host tools, libraries or
+other runtime inputs. An omitted setting preserves its active managed value
+during upgrades; explicit `0` bytes disables reuse, and an explicitly empty
+epoch selects process-only retention. See [Cargo target state](rabs-target-state.md)
+for limits, ownership, and the runtime stability requirement.
+
 In another coordinator-side terminal, run ordinary Cargo through the live
 wrapper. Repeat the same worker selection here so launcher readiness verifies
 that the attached daemon has the requested remote capability:

@@ -22,11 +22,52 @@ is `0`, which disables target retention. The maximum configured limit is 8 GiB.
 The pool admits at most eight retained or pending seeds, and each target tree
 must also fit the existing 1 GiB artifact transport limit. Pending captures count
 against the pool before copying begins; old unused seeds are evicted when needed.
+The byte limit counts target file payload. Durable metadata has a separate
+16 MiB cap per generation; directory and filesystem allocation overhead also
+remain subject to the existing file and directory count limits.
 
-The worker process owns this pool across coordinator reconnects. It does not
-persist seeds across worker restarts or share them with another worker process.
-Run a reconnecting worker to benefit across separate canonical builds; a worker
-started with `--once` exits after its one session and drops the pool.
+`RABS_WORKER_TARGET_CACHE_BYTES` also sets this limit; an explicit CLI value
+takes precedence. Without a runtime epoch the pool belongs to the worker process
+and survives coordinator reconnects, but a worker restart drops its seeds.
+
+For a worker whose host runtime is kept stable, also select an operator-managed
+epoch to retain completed seeds across restarts:
+
+```sh
+RABS_WORKER_TARGET_CACHE_BYTES=1073741824 \
+RABS_WORKER_TARGET_CACHE_EPOCH=worker-image-2026-01 \
+  rabs-wkr --coordinator 10.0.0.1:7091 --worker-id builder
+```
+
+The equivalent CLI option is `--target-cache-epoch worker-image-2026-01`.
+The epoch is a version label supplied by the operator, not an automatically
+measured host identity. It must contain 1–128 ASCII letters, digits, dots,
+underscores or hyphens and start with a letter or digit. An absent or explicitly
+empty epoch selects process-only retention. CLI values override the environment.
+
+Keep the epoch unchanged only while all host tools, system libraries, headers,
+configuration and other runtime inputs visible to builds remain unchanged.
+Before updating those inputs, stop the worker and its builds, change to a new
+epoch, then restart the worker on the updated runtime. An epoch change starts
+with cold target state. Do not reuse an earlier epoch label for a later runtime
+change. Captured toolchains and source still have their own exact identities;
+the epoch does not replace those checks.
+
+Durable seeds live beneath `target-cache` in the worker's existing private
+journal directory. The store has an independent lifetime lock and admits one
+local owner. Only the final completion fence can publish a durable seed;
+staged, cancelled or interrupted captures cannot become hits after restart.
+Startup verifies persisted metadata and target bytes before admitting a seed,
+and each execution receives an independently verified private copy. Epoch
+changes and byte-limit reductions use the same bounded store instead of leaving
+an unbounded directory per epoch. Neither durable nor process-only mode shares
+writable target files between workers or executions.
+
+Managed deployments accept the same two environment settings through
+`scripts/rabs_fleet_deploy.sh`. Omitted values retain the active managed settings
+during an upgrade. An explicit zero byte limit disables retention; an explicit
+empty epoch restores process-only retention. A disabled store is dormant until
+enabled again, when the supplied epoch and quota are checked.
 
 No new Cargo profile field is needed. Both the direct and durable daemon modes
 of [canonical Cargo](rabs-canonical-cargo.md) can use an enabled worker. Requests
@@ -219,6 +260,10 @@ Worker stderr includes structured events:
 - `worker-target-state-refused` explains an optional capture or restore failure.
 - `worker-target-state-published` reports the accepted seed size, retained byte
   total, and entry count.
+- `worker-target-state-recovered` reports the seeds and payload bytes admitted
+  after reopening a durable store. Recovery or persistence refusal events explain
+  rejected generations; `worker-target-state-storage-disabled` means uncertain
+  reclamation has stopped further durable writes until successful recovery.
 
 `restored`, `restored-compatible`, or `restored-edited` means a verified private target was provided
 to Cargo. Cargo's own artifact JSON `fresh` fields show whether compilation was
@@ -228,7 +273,8 @@ still come from the current execution.
 
 This is ordinary Cargo hot state, not RABS action-cache publication or proof of
 a complete action input closure. Build scripts retain Cargo's normal input
-tracking obligations. Restart the worker after changing host tools or system
-libraries visible in its canonical runtime, since those are not all captured by
-the toolchain identity. The separate gates for observation, recipes, closed
+tracking obligations. Host tools and system libraries visible in its canonical
+runtime are not all captured by the toolchain identity. After changing those
+inputs, process-only mode requires a worker restart and durable mode requires
+the new runtime epoch described above. The separate gates for observation, recipes, closed
 views, and verified action serving remain in force.

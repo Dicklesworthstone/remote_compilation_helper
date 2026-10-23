@@ -7,8 +7,9 @@
 //! timestamps are preserved, never advanced to manufacture freshness. No seed
 //! is mounted writable or linked into an execution. Verified internal aliases
 //! are reconstructed only between files of the SAME fresh private clone.
-//! The process owns the pool
-//! across reconnects, and clean shutdown drops all its temporary directories.
+//! The process owns the pool across reconnects. Explicit persistent mode also
+//! retains completed generations across restarts under an exclusive disk owner;
+//! its operator-supplied runtime epoch must change when host tools/libraries do.
 
 use crate::artifacts::{ArtifactPlan, CapturedArtifacts, MAX_ARTIFACT_BYTES, PreparedArtifacts};
 use crate::result_spool::ResultRecipient;
@@ -25,6 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+#[cfg(target_os = "linux")]
+mod persistence;
 mod source_edits;
 
 /// Independent count and byte limits bound retained seeds and in-flight staging.
@@ -379,6 +382,8 @@ struct PoolState {
 pub struct TargetCache {
     max_bytes: u64,
     state: Mutex<PoolState>,
+    #[cfg(target_os = "linux")]
+    storage: Option<Arc<persistence::Storage>>,
 }
 
 impl TargetCache {
@@ -399,7 +404,40 @@ impl TargetCache {
         Ok(Self {
             max_bytes,
             state: Mutex::new(PoolState::default()),
+            #[cfg(target_os = "linux")]
+            storage: None,
         })
+    }
+
+    /// Retain completed private targets across worker restarts. The epoch is an
+    /// explicit operator assertion that the host runtime remains unchanged;
+    /// rotate it before changing tools, libraries, headers or other host inputs.
+    /// A changed epoch retires old generations within this SAME bounded root.
+    /// This never enables action-result reuse or skips the current Cargo command.
+    pub fn open_persistent(max_bytes: u64, root: &Path, runtime_epoch: &str) -> io::Result<Self> {
+        let cache = Self::new(max_bytes)?;
+        #[cfg(target_os = "linux")]
+        {
+            let (storage, entries) = persistence::Storage::open(root, max_bytes, runtime_epoch)?;
+            let retained_bytes = entries.iter().map(|seed| seed.tree.bytes).sum();
+            Ok(Self {
+                storage: Some(storage),
+                state: Mutex::new(PoolState {
+                    entries,
+                    retained_bytes,
+                    ..PoolState::default()
+                }),
+                ..cache
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (cache, root, runtime_epoch);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "target state requires Linux",
+            ))
+        }
     }
 
     /// Take an exact-generation read lease under the pool lock, then copy and
@@ -556,6 +594,14 @@ impl TargetCache {
         drop(seed);
         if retired {
             if Arc::get_mut(&mut state.entries[index]).is_some() {
+                if state.entries[index].tree.directory.retire().is_err() {
+                    // Failed reclamation stays charged; durable storage refuses
+                    // further reservations until a successful recovery/reopen.
+                    state.entries[index]
+                        .invalidated
+                        .store(true, Ordering::Release);
+                    return;
+                }
                 let retired = state.entries.remove(index).expect("located generation");
                 state.retained_bytes -= retired.tree.bytes;
                 drop(retired);
@@ -568,6 +614,14 @@ impl TargetCache {
 
     fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
         if bytes > self.max_bytes {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        if self
+            .storage
+            .as_ref()
+            .is_some_and(|storage| !storage.healthy())
+        {
             return None;
         }
         let mut state = self.state.try_lock().ok()?;
@@ -593,6 +647,12 @@ impl TargetCache {
                 .entries
                 .iter_mut()
                 .position(|seed| Arc::get_mut(seed).is_some())?;
+            if state.entries[index].tree.directory.retire().is_err() {
+                state.entries[index]
+                    .invalidated
+                    .store(true, Ordering::Release);
+                return None;
+            }
             let seed = state.entries.remove(index)?;
             state.retained_bytes -= seed.tree.bytes;
         }
@@ -667,6 +727,27 @@ impl PendingTargetSeed {
     }
 
     pub(crate) fn publish(mut self) {
+        // The execution's final completion frontier is the ONLY operation that
+        // makes a staged disk generation discoverable after restart. Do this
+        // before taking the pool mutex: a failed commit drops the reservation,
+        // whose destructor takes that same mutex to release its charge.
+        if let Err(error) = self
+            .seed
+            .as_mut()
+            .expect("pending snapshot")
+            .tree
+            .directory
+            .publish()
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "kind":"worker-target-state-persistence-refused",
+                    "request_id":self.request_id, "error":error.to_string(),
+                })
+            );
+            return;
+        }
         let mut state = self
             .reservation
             .cache
@@ -682,6 +763,12 @@ impl PendingTargetSeed {
             .iter_mut()
             .position(|prior| prior.key == seed.key && Arc::get_mut(prior).is_some())
         {
+            if state.entries[index].tree.directory.retire().is_err() {
+                state.entries[index]
+                    .invalidated
+                    .store(true, Ordering::Release);
+                break;
+            }
             let prior = state.entries.remove(index).expect("located seed");
             state.retained_bytes -= prior.tree.bytes;
         }
@@ -766,21 +853,23 @@ impl TargetAttempt {
         let Some(reservation) = self.cache.reserve(captured.total_bytes()) else {
             return Ok(None);
         };
-        let tree = TreeSnapshot::capture(artifacts.backing(), captured, stopped)?;
+        let tree = TreeSnapshot::capture(&self.cache, artifacts.backing(), captured, stopped)?;
         if tree.bytes != reservation.bytes {
             return Err(invalid("target state differs from captured artifacts"));
         }
+        let seed = Seed {
+            key: self.key,
+            compatible: self.compatible,
+            source: self.times,
+            edit_family: source_edits::identity(&self.inputs),
+            source_manifest: self.inputs.manifest,
+            tree,
+            invalidated: AtomicBool::new(false),
+        };
+        seed.tree.directory.prepare(&seed, stopped)?;
         Ok(Some(PendingTargetSeed {
             reservation,
-            seed: Some(Seed {
-                key: self.key,
-                compatible: self.compatible,
-                source: self.times,
-                edit_family: source_edits::identity(&self.inputs),
-                source_manifest: self.inputs.manifest,
-                tree,
-                invalidated: AtomicBool::new(false),
-            }),
+            seed: Some(seed),
             request_id: self.request_id,
             exit_code: 0,
         }))
@@ -818,23 +907,25 @@ impl TargetAttempt {
         let Some(reservation) = self.cache.reserve(inventory.total_bytes()) else {
             return Ok(None);
         };
-        let tree = TreeSnapshot::capture_inventory(&inventory, stopped)?;
+        let tree = TreeSnapshot::capture_inventory(&self.cache, &inventory, stopped)?;
         if SourceTimes::capture(&self.inputs, stopped)? != self.times {
             return Err(invalid(
                 "source changed while capturing failed Cargo target state",
             ));
         }
+        let seed = Seed {
+            key: self.key,
+            compatible: self.compatible,
+            source: self.times,
+            edit_family: source_edits::identity(&self.inputs),
+            source_manifest: self.inputs.manifest,
+            tree,
+            invalidated: AtomicBool::new(false),
+        };
+        seed.tree.directory.prepare(&seed, stopped)?;
         Ok(Some(PendingTargetSeed {
             reservation,
-            seed: Some(Seed {
-                key: self.key,
-                compatible: self.compatible,
-                source: self.times,
-                edit_family: source_edits::identity(&self.inputs),
-                source_manifest: self.inputs.manifest,
-                tree,
-                invalidated: AtomicBool::new(false),
-            }),
+            seed: Some(seed),
             request_id: self.request_id,
             exit_code,
         }))
@@ -979,10 +1070,52 @@ struct StoredDirectory {
 
 #[derive(Debug)]
 struct TreeSnapshot {
-    directory: tempfile::TempDir,
+    directory: SnapshotDirectory,
     files: BTreeMap<String, StoredFile>,
     directories: BTreeMap<String, StoredDirectory>,
     bytes: u64,
+}
+
+#[derive(Debug)]
+enum SnapshotDirectory {
+    Temporary(tempfile::TempDir),
+    #[cfg(target_os = "linux")]
+    Durable(persistence::Generation),
+}
+
+impl SnapshotDirectory {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(directory) => directory.path(),
+            #[cfg(target_os = "linux")]
+            Self::Durable(generation) => generation.path(),
+        }
+    }
+
+    fn prepare(&self, seed: &Seed, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Self::Durable(generation) = self {
+            return generation.prepare(seed, stopped);
+        }
+        let _ = seed;
+        checkpoint(stopped)
+    }
+
+    fn publish(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Self::Durable(generation) = self {
+            return generation.publish();
+        }
+        Ok(())
+    }
+
+    fn retire(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Self::Durable(generation) = self {
+            return generation.retire();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1020,10 +1153,14 @@ fn directory_times(
 #[cfg(target_os = "linux")]
 impl TreeSnapshot {
     fn capture_inventory(
+        cache: &TargetCache,
         tree: &rabs_sandbox::artifact_tree::TreeInventory,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Self> {
-        let directory = private_directory("rabs-target-seed-")?;
+        let directory = match &cache.storage {
+            Some(storage) => SnapshotDirectory::Durable(storage.allocate()?),
+            None => SnapshotDirectory::Temporary(private_directory("rabs-target-seed-")?),
+        };
         let (files, directories) = copy_tree(tree, directory.path(), stopped)?;
         Ok(Self {
             directory,
@@ -1034,6 +1171,7 @@ impl TreeSnapshot {
     }
 
     fn capture(
+        cache: &TargetCache,
         root: &Path,
         captured: &CapturedArtifacts,
         stopped: &impl Fn() -> bool,
@@ -1041,7 +1179,7 @@ impl TreeSnapshot {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = captured.file_names().map(str::to_owned).collect();
         let tree = TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?;
-        let snapshot = Self::capture_inventory(&tree, stopped)?;
+        let snapshot = Self::capture_inventory(cache, &tree, stopped)?;
         if snapshot
             .files
             .keys()
@@ -1081,7 +1219,12 @@ impl TreeSnapshot {
 
 #[cfg(not(target_os = "linux"))]
 impl TreeSnapshot {
-    fn capture(_: &Path, _: &CapturedArtifacts, _: &impl Fn() -> bool) -> io::Result<Self> {
+    fn capture(
+        _: &TargetCache,
+        _: &Path,
+        _: &CapturedArtifacts,
+        _: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "target state requires Linux",

@@ -14,15 +14,20 @@
 #   RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
 #   RABS_WORKER_ID=leaf-worker \
 #   RABS_WORKER_STATE_DIR=/var/lib/rabs/leaf-worker \
+#   RABS_WORKER_TARGET_CACHE_BYTES=1073741824 \
+#   RABS_WORKER_TARGET_CACHE_EPOCH=worker-image-2026-01 \
 #   rabs_fleet_deploy.sh <worker-ssh-host> <coordinator-host:port> \
 #       [path-to-release-rabs-wkr]
 #
 # TLS paths above are LOCAL files. All four settings are required, including
 # for loopback. The CA authenticates the coordinator; the worker certificate
 # may be issued by a different CA. This script never creates or learns trust.
-# RABS_WORKER_ID and RABS_WORKER_STATE_DIR are optional service settings. Omit
-# them to retain the previous managed settings, or the worker's hostname/state
-# defaults on a fresh install. The state path is on the REMOTE worker. Never
+# Identity, state directory and target-cache settings are optional. Omit them
+# to retain previous managed settings, or worker defaults on a fresh install.
+# A nonempty target-cache epoch enables retention across restarts; change it
+# before updating host tools, libraries or any other runtime input. An empty
+# epoch selects process-only retention; zero bytes disables all target reuse.
+# The state path is on the REMOTE worker. Never
 # change it to retry an uncertain execution: that would abandon its journal.
 # Credential generations are private and retained across deployment attempts.
 # Re-running replaces the binary + unit and explicitly restarts the service.
@@ -35,6 +40,7 @@ usage() {
   echo 'Usage: rabs_fleet_deploy.sh <worker-ssh-host> <coordinator-host:port> [local-rabs-wkr]' >&2
   echo 'Required: RABS_WORKER_TLS_CA/CERT/KEY (local PEM files), RABS_WORKER_TLS_SERVER_NAME' >&2
   echo 'Optional: RABS_WORKER_ID, RABS_WORKER_STATE_DIR (absolute remote journal directory)' >&2
+  echo 'Optional: RABS_WORKER_TARGET_CACHE_BYTES (0..8589934592), RABS_WORKER_TARGET_CACHE_EPOCH (stable host runtime identity)' >&2
   exit 2
 }
 
@@ -104,6 +110,8 @@ dns_name "$TLS_SERVER_NAME" || ipv6_address "$TLS_SERVER_NAME" ||
   input_error 'RABS_WORKER_TLS_SERVER_NAME must be a DNS name or literal IP address'
 WORKER_ID_SET=0
 WORKER_STATE_SET=0
+TARGET_CACHE_BYTES_SET=0
+TARGET_CACHE_EPOCH_SET=0
 if [[ ${RABS_WORKER_ID+x} == x ]]; then
   [[ ${#RABS_WORKER_ID} -le 128 && $RABS_WORKER_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
     input_error 'RABS_WORKER_ID must be 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit'
@@ -117,6 +125,18 @@ if [[ ${RABS_WORKER_STATE_DIR+x} == x ]]; then
     (export LC_ALL=C; [[ $RABS_WORKER_STATE_DIR =~ ^[[:print:]]+$ ]]) ||
     input_error 'RABS_WORKER_STATE_DIR must be an absolute printable ASCII remote directory, up to 4096 characters'
   WORKER_STATE_SET=1
+fi
+if [[ ${RABS_WORKER_TARGET_CACHE_BYTES+x} == x ]]; then
+  [[ $RABS_WORKER_TARGET_CACHE_BYTES =~ ^[0-9]{1,10}$ ]] &&
+    ((10#$RABS_WORKER_TARGET_CACHE_BYTES <= 8589934592)) ||
+    input_error 'RABS_WORKER_TARGET_CACHE_BYTES must be 1..10 decimal digits representing 0 to 8589934592 bytes'
+  TARGET_CACHE_BYTES_SET=1
+fi
+if [[ ${RABS_WORKER_TARGET_CACHE_EPOCH+x} == x ]]; then
+  [[ -z $RABS_WORKER_TARGET_CACHE_EPOCH ]] ||
+    [[ ${#RABS_WORKER_TARGET_CACHE_EPOCH} -le 128 && $RABS_WORKER_TARGET_CACHE_EPOCH =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    input_error 'RABS_WORKER_TARGET_CACHE_EPOCH must be empty or 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit'
+  TARGET_CACHE_EPOCH_SET=1
 fi
 [[ -f $LOCAL_BIN && -x $LOCAL_BIN ]] || input_error "no executable release binary at $LOCAL_BIN"
 command -v openssl >/dev/null 2>&1 || input_error 'openssl is required to validate TLS credentials'
@@ -288,6 +308,12 @@ ENV
   if [[ $WORKER_STATE_SET == 1 ]]; then
     environment_setting RABS_WORKER_STATE_DIR "$RABS_WORKER_STATE_DIR"
   fi
+  if [[ $TARGET_CACHE_BYTES_SET == 1 ]]; then
+    environment_setting RABS_WORKER_TARGET_CACHE_BYTES "$RABS_WORKER_TARGET_CACHE_BYTES"
+  fi
+  if [[ $TARGET_CACHE_EPOCH_SET == 1 ]]; then
+    environment_setting RABS_WORKER_TARGET_CACHE_EPOCH "$RABS_WORKER_TARGET_CACHE_EPOCH"
+  fi
 }
 worker_environment | ssh "${SSH_OPTS[@]}" "root@$WORKER" \
   "set -eu; umask 077; set -C; cat > '$STAGE/worker.env'; chmod 0600 '$STAGE/worker.env'" ||
@@ -366,6 +392,12 @@ ssh "${SSH_OPTS[@]}" "root@$WORKER" "
           ;;
         RABS_WORKER_STATE_DIR=*)
           if [ '$WORKER_STATE_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
+          ;;
+        RABS_WORKER_TARGET_CACHE_BYTES=*)
+          if [ '$TARGET_CACHE_BYTES_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
+          ;;
+        RABS_WORKER_TARGET_CACHE_EPOCH=*)
+          if [ '$TARGET_CACHE_EPOCH_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
           ;;
       esac
     done < \"\$previous_environment\"

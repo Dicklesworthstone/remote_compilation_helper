@@ -248,7 +248,8 @@ toolchain and cannot submit or select a replacement worker.
 ### Reuse worker-local Cargo target state
 
 A reconnecting worker can opt into bounded private target reuse with
-`--target-cache-bytes 1073741824` for a 1 GiB pool. Identical captured inputs and
+`--target-cache-bytes 1073741824` or `RABS_WORKER_TARGET_CACHE_BYTES=1073741824`
+for a 1 GiB pool. Identical captured inputs and
 compilation settings may seed the next execution's private target directory,
 allowing Cargo to skip compilation it considers fresh. An exact invocation is
 preferred; compatible `build`, `check`, `test --no-run` and `test` commands can
@@ -269,8 +270,13 @@ or a successful artifact delivery. Cancellation, uncertain cleanup, native
 launcher signal termination and unsafe partial trees cannot publish reusable
 target state.
 
-This pool survives coordinator reconnects within one worker process; it is
-disabled by default and does not persist across worker restarts. See
+The pool is disabled by default. With only a byte limit it survives coordinator
+reconnects within one worker process. To preserve completed seeds across worker
+restarts on a stable host runtime, also set `RABS_WORKER_TARGET_CACHE_EPOCH` or
+`--target-cache-epoch` to an operator-managed version label. Stop the worker and
+change this epoch before updating host tools, system libraries or other runtime
+inputs; a restart alone does not invalidate durable seeds. Managed fleet
+deployment accepts and preserves these settings. See
 [worker-local Cargo target state](rabs-target-state.md) for ownership, limits,
 runtime assumptions, and the worker events that report actual reuse.
 

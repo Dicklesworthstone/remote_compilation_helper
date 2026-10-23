@@ -461,6 +461,69 @@ fn worker_state_path(worker: &str, coordinator: &str) -> io::Result<PathBuf> {
         .join(rabs_wkr::session::sha256_hex(binding.as_bytes())))
 }
 
+fn target_cache_limit(
+    argument: Option<&str>,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<u64, String> {
+    let (name, value) = match argument {
+        Some(value) => ("--target-cache-bytes", value),
+        None => match environment {
+            Some(value) => (
+                "RABS_WORKER_TARGET_CACHE_BYTES",
+                value
+                    .to_str()
+                    .ok_or("RABS_WORKER_TARGET_CACHE_BYTES must be ASCII decimal digits")?,
+            ),
+            None => return Ok(0),
+        },
+    };
+    if !value.is_empty()
+        && value.len() <= 10
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(bytes) = value.parse::<u64>()
+        && bytes <= rabs_wkr::target_cache::MAX_TARGET_CACHE_BYTES
+    {
+        return Ok(bytes);
+    }
+    Err(format!(
+        "{name} requires 1..10 decimal digits representing 0 to 8589934592 bytes"
+    ))
+}
+
+fn target_cache_epoch(
+    argument: Option<&str>,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<Option<String>, String> {
+    let (name, value) = match argument {
+        Some(value) => ("--target-cache-epoch", value),
+        None => match environment {
+            Some(value) => (
+                "RABS_WORKER_TARGET_CACHE_EPOCH",
+                value
+                    .to_str()
+                    .ok_or("RABS_WORKER_TARGET_CACHE_EPOCH must be ASCII")?,
+            ),
+            None => return Ok(None),
+        },
+    };
+    // An explicit empty value restores process-only retention, including when
+    // overriding a previously managed durable-cache setting during deployment.
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Ok(Some(value.to_owned()));
+    }
+    Err(format!(
+        "{name} must be empty or 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
+    ))
+}
+
 /// Drive one top-level future on the worker's owned current-thread runtime.
 ///
 /// # Panics
@@ -486,12 +549,15 @@ fn main() {
         Some("--help") => {
             println!(
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
-                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--target-cache-bytes N]\n\
+                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Reconnects with bounded backoff after session loss; execution is never replayed.\n\
                  --once performs one session only, without reconnecting.\n\
-                 --target-cache-bytes opts into bounded private Cargo target seeds (default 0/off).\n\
-                 Exact inputs may reuse local target state; Cargo still executes every time.\n\
+                 --target-cache-bytes or RABS_WORKER_TARGET_CACHE_BYTES enables bounded private Cargo seeds (default 0/off).\n\
+                 --target-cache-epoch or RABS_WORKER_TARGET_CACHE_EPOCH also retains seeds across restarts.\n\
+                 Change the epoch before updating host tools, libraries or other runtime inputs.\n\
+                 Without an epoch, seeds are process-only. CLI values override environment settings.\n\
+                 Compatible inputs may reuse local target state; Cargo still executes every time.\n\
                  Select output_transfer=ranges-v1 and artifact_transfer=files-v1 in session-ok\n\
                  to retrieve diagnostics and declared compiled artifacts.\n\
                  Select source_transfer=source-files-v1 to upload verified source before execution.\n\
@@ -520,7 +586,8 @@ fn main() {
             .unwrap_or_else(|| "worker".to_string())
     });
     let mut once = false;
-    let mut target_cache_bytes = 0_u64;
+    let mut target_cache_argument = None;
+    let mut target_epoch_argument = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -531,16 +598,16 @@ fn main() {
                 }
             }
             "--once" => once = true,
-            "--target-cache-bytes" => {
-                target_cache_bytes = match iter.next().and_then(|value| value.parse::<u64>().ok()) {
-                    Some(bytes) if bytes <= rabs_wkr::target_cache::MAX_TARGET_CACHE_BYTES => bytes,
-                    _ => {
-                        eprintln!(
-                            "rabs-wkr: --target-cache-bytes requires an integer from 0 to 8589934592"
-                        );
-                        std::process::exit(2);
-                    }
+            "--target-cache-bytes" | "--target-cache-epoch" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("rabs-wkr: {arg} requires a value");
+                    std::process::exit(2);
                 };
+                if arg == "--target-cache-bytes" {
+                    target_cache_argument = Some(value.as_str());
+                } else {
+                    target_epoch_argument = Some(value.as_str());
+                }
             }
             other => {
                 eprintln!("rabs-wkr: unknown argument {other:?} (see --help)");
@@ -552,22 +619,31 @@ fn main() {
         eprintln!("rabs-wkr: --coordinator <host:port> is required");
         std::process::exit(2);
     };
+    let target_cache_bytes = match target_cache_limit(
+        target_cache_argument,
+        std::env::var_os("RABS_WORKER_TARGET_CACHE_BYTES").as_deref(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("rabs-wkr: {error}");
+            std::process::exit(2);
+        }
+    };
+    let target_epoch = match target_cache_epoch(
+        target_epoch_argument,
+        std::env::var_os("RABS_WORKER_TARGET_CACHE_EPOCH").as_deref(),
+    ) {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            eprintln!("rabs-wkr: {error}");
+            std::process::exit(2);
+        }
+    };
     let host_budget = match HostBudget::from_environment() {
         Ok(budget) => budget,
         Err(error) => {
             eprintln!("rabs-wkr: shared host budget configuration: {error}");
             std::process::exit(1);
-        }
-    };
-    let target_cache = if target_cache_bytes == 0 {
-        None
-    } else {
-        match rabs_wkr::target_cache::TargetCache::new(target_cache_bytes) {
-            Ok(cache) => Some(std::sync::Arc::new(cache)),
-            Err(error) => {
-                eprintln!("rabs-wkr: target state configuration: {error}");
-                std::process::exit(1);
-            }
         }
     };
     // Persist ownership before any runtime task or network advertisement. An IO
@@ -579,6 +655,25 @@ fn main() {
         Err(error) => {
             eprintln!("rabs-wkr: durable ownership unavailable: {error}");
             std::process::exit(1);
+        }
+    };
+    let target_cache = if target_cache_bytes == 0 {
+        None
+    } else {
+        let cache = match target_epoch.as_deref() {
+            Some(epoch) => rabs_wkr::target_cache::TargetCache::open_persistent(
+                target_cache_bytes,
+                &journal.storage_root().join("target-cache"),
+                epoch,
+            ),
+            None => rabs_wkr::target_cache::TargetCache::new(target_cache_bytes),
+        };
+        match cache {
+            Ok(cache) => Some(std::sync::Arc::new(cache)),
+            Err(error) => {
+                eprintln!("rabs-wkr: target state configuration: {error}");
+                std::process::exit(1);
+            }
         }
     };
     let report = probe_capability(&worker_id);
@@ -2019,6 +2114,95 @@ mod tests {
     mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;
+
+    #[test]
+    fn target_cache_settings_default_to_off_and_cli_overrides_environment() {
+        use std::ffi::OsStr;
+
+        assert_eq!(target_cache_limit(None, None).unwrap(), 0);
+        assert_eq!(target_cache_epoch(None, None).unwrap(), None);
+        assert_eq!(
+            target_cache_limit(None, Some(OsStr::new("1073741824"))).unwrap(),
+            1 << 30
+        );
+        assert_eq!(
+            target_cache_limit(Some("0"), Some(OsStr::new("invalid"))).unwrap(),
+            0
+        );
+        assert_eq!(
+            target_cache_limit(Some("8589934592"), None).unwrap(),
+            rabs_wkr::target_cache::MAX_TARGET_CACHE_BYTES
+        );
+        assert_eq!(
+            target_cache_epoch(None, Some(OsStr::new("image-2026.01_v2"))).unwrap(),
+            Some("image-2026.01_v2".to_owned())
+        );
+        assert_eq!(
+            target_cache_epoch(Some("image-v3"), Some(OsStr::new("old/image"))).unwrap(),
+            Some("image-v3".to_owned())
+        );
+        assert_eq!(
+            target_cache_epoch(Some(""), Some(OsStr::new("image-v3"))).unwrap(),
+            None
+        );
+        assert_eq!(
+            target_cache_epoch(None, Some(OsStr::new(""))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn target_cache_settings_refuse_unbounded_or_ambiguous_values() {
+        use std::ffi::OsStr;
+
+        for value in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1\n",
+            "1.5",
+            "0x100",
+            "8589934593",
+            "00000000000",
+        ] {
+            assert!(target_cache_limit(Some(value), None).is_err(), "{value:?}");
+            assert!(
+                target_cache_limit(None, Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "../image",
+            ".image",
+            "image/path",
+            "a b",
+            "v\n2",
+            "v$HOST",
+            "é",
+        ] {
+            assert!(target_cache_epoch(Some(value), None).is_err(), "{value:?}");
+            assert!(
+                target_cache_epoch(None, Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+        assert!(target_cache_epoch(Some(&"a".repeat(128)), None).is_ok());
+        assert!(target_cache_epoch(Some(&"a".repeat(129)), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_cache_settings_refuse_non_utf8_unless_overridden() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = std::ffi::OsStr::from_bytes(&[0xff]);
+        assert!(target_cache_limit(None, Some(invalid)).is_err());
+        assert!(target_cache_epoch(None, Some(invalid)).is_err());
+        assert_eq!(target_cache_limit(Some("0"), Some(invalid)).unwrap(), 0);
+        assert_eq!(target_cache_epoch(Some(""), Some(invalid)).unwrap(), None);
+    }
 
     #[derive(Default)]
     struct WireState {
