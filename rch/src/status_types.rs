@@ -233,6 +233,10 @@ pub struct IssueFromApi {
     pub severity: String,
     pub summary: String,
     pub remediation: Option<String>,
+    /// Set when the issue concerns one worker rather than the daemon. Older
+    /// daemons omit it, so `serde(default)` keeps them parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
 }
 
 /// Alert information from API.
@@ -1506,6 +1510,8 @@ mod tests {
             issue.remediation,
             Some("Check network connection".to_string())
         );
+        // Daemons older than the worker_id field still parse.
+        assert_eq!(issue.worker_id, None);
     }
 
     #[test]

@@ -872,6 +872,7 @@ mod tests {
                 severity: "info".to_string(),
                 summary: "all good".to_string(),
                 remediation: None,
+                worker_id: None,
             }],
             alerts: vec![],
             stats: BuildStatsFromApi {

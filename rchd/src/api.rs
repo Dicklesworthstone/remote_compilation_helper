@@ -427,6 +427,11 @@ pub struct Issue {
     pub summary: String,
     /// Suggested remediation command.
     pub remediation: Option<String>,
+    /// The worker this issue is about, when it concerns one worker rather than
+    /// the daemon. `rch check` rates such an issue as a degraded fleet, not a
+    /// daemon that is not ready. Omitted for daemon-level issues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
 }
 
 // ============================================================================
@@ -4557,6 +4562,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
             remediation: Some(
                 "Run `rch workers probe --all`, then inspect daemon logs for `cancellation_failed` events before retrying affected builds.".to_string(),
             ),
+            worker_id: None,
         });
     }
 
@@ -4570,6 +4576,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
             remediation: Some(
                 "Check for stuck toolchain phases with `rch status --jobs` and investigate long-running remote processes.".to_string(),
             ),
+            worker_id: None,
         });
     }
 
@@ -4583,6 +4590,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
             remediation: Some(
                 "Validate worker reachability with `rch workers probe --all` and confirm SSH connectivity before resuming remote builds.".to_string(),
             ),
+            worker_id: None,
         });
     }
 
@@ -4596,6 +4604,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
             remediation: Some(
                 "No action required. Use `rch status --json` to inspect cancellation metadata if debugging build interruptions.".to_string(),
             ),
+            worker_id: None,
         });
     }
 
@@ -4641,6 +4650,7 @@ fn active_build_issues_from_active_builds(
             "No action needed while the hook stays alive. Inspect with `rch queue --json`; cancel build {} only if it is past its build/test timeout budget. Do not drain {} for this: the worker is healthy.",
             representative.id, representative.worker_id
         )),
+        worker_id: None,
     }]
 }
 
@@ -4794,6 +4804,7 @@ fn worker_issue(
             remediation: Some(format!(
                 "only once the recorded reason no longer applies (an operator decision): rch workers enable {worker_id}"
             )),
+            worker_id: Some(worker_id.to_string()),
         });
     }
     if status == WorkerStatus::Drained {
@@ -4803,6 +4814,7 @@ fn worker_issue(
                 "Worker '{worker_id}' is drained; its slots are withheld and it is not polled for telemetry"
             ),
             remediation: Some(format!("rch workers enable {worker_id}")),
+            worker_id: Some(worker_id.to_string()),
         });
     }
 
@@ -4812,6 +4824,7 @@ fn worker_issue(
             severity: "error".to_string(),
             summary: format!("Circuit open for worker '{worker_id}'"),
             remediation: Some(format!("rch workers probe {worker_id} --force")),
+            worker_id: Some(worker_id.to_string()),
         });
     }
     if pressure_state == crate::disk_pressure::PressureState::Critical {
@@ -4824,6 +4837,7 @@ fn worker_issue(
                 "rch workers capabilities --refresh (inspect pressure metrics and ballast policy)"
                     .to_string(),
             ),
+            worker_id: Some(worker_id.to_string()),
         });
     }
     if pressure_state == crate::disk_pressure::PressureState::TelemetryGap {
@@ -4843,6 +4857,7 @@ fn worker_issue(
                 "telemetry ingest is daemon-driven; wait for next poll (~poll-interval) or run `rch daemon restart` to force a fresh poll cycle"
                     .to_string(),
             ),
+            worker_id: Some(worker_id.to_string()),
         });
     }
     if status == WorkerStatus::Unreachable {
@@ -4850,6 +4865,7 @@ fn worker_issue(
             severity: "error".to_string(),
             summary: format!("Worker '{worker_id}' is unreachable"),
             remediation: Some(format!("rch workers probe {worker_id}")),
+            worker_id: Some(worker_id.to_string()),
         });
     }
     if status == WorkerStatus::Degraded {
@@ -4857,6 +4873,7 @@ fn worker_issue(
             severity: "warning".to_string(),
             summary: format!("Worker '{worker_id}' is degraded (slow response)"),
             remediation: None,
+            worker_id: Some(worker_id.to_string()),
         });
     }
 
@@ -8901,10 +8918,20 @@ mod tests {
             severity: "warning".to_string(),
             summary: "Worker w1 is unreachable".to_string(),
             remediation: Some("rch doctor".to_string()),
+            worker_id: None,
         };
         let json = serde_json::to_string(&issue).unwrap();
         assert!(json.contains("\"severity\":\"warning\""));
         assert!(json.contains("\"remediation\":\"rch doctor\""));
+        // Daemon-level issues keep their pre-existing wire shape.
+        assert!(!json.contains("worker_id"));
+
+        let worker_scoped = Issue {
+            worker_id: Some("w1".to_string()),
+            ..issue
+        };
+        let json = serde_json::to_string(&worker_scoped).unwrap();
+        assert!(json.contains("\"worker_id\":\"w1\""));
     }
 
     #[test]
@@ -12727,6 +12754,8 @@ mod tests {
         .expect("issue expected");
         assert_eq!(circuit.severity, "error");
         assert!(circuit.summary.contains("Circuit open"));
+        // Worker-scoped, so `rch check` rates it degraded rather than not ready.
+        assert_eq!(circuit.worker_id.as_deref(), Some("w1"));
 
         let critical = worker_issue(
             "w2",
@@ -12739,6 +12768,7 @@ mod tests {
         .expect("issue expected");
         assert_eq!(critical.severity, "error");
         assert!(critical.summary.contains("critical pressure state"));
+        assert_eq!(critical.worker_id.as_deref(), Some("w2"));
 
         let unreachable = worker_issue(
             "w3",

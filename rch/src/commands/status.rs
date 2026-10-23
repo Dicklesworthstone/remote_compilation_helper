@@ -2742,6 +2742,7 @@ fn local_fallback_issue_from(
         remediation: Some(
             "Reasons are recorded as RCH-I011 in the incident ledger (~/.local/state/rch/incidents.jsonl); `rch diagnose -- <cmd>` explains a single decision".to_string(),
         ),
+        worker_id: None,
     })
 }
 
@@ -3342,9 +3343,28 @@ fn derive_check_outcome(
         ("not_ready".to_string(), 2)
     };
 
+    // An error about one worker (an open circuit, critical disk pressure) takes
+    // that worker out of rotation, not the daemon: while another healthy worker
+    // can still take builds, it degrades the fleet rather than making it not
+    // ready. Daemon-level errors, and worker errors that leave no usable
+    // worker, still mean not ready.
+    let impaired: std::collections::HashSet<&str> = daemon_issues
+        .iter()
+        .filter(|issue| check_issue_severity(&issue.severity) == CheckIssueSeverity::Error)
+        .filter_map(|issue| issue.worker_id.as_deref())
+        .collect();
+    let usable_workers = workers
+        .iter()
+        .filter(|worker| worker.status == "healthy" && !impaired.contains(worker.id.as_str()))
+        .count();
     match daemon_issues
         .iter()
-        .map(|issue| check_issue_severity(&issue.severity))
+        .map(|issue| match check_issue_severity(&issue.severity) {
+            CheckIssueSeverity::Error if issue.worker_id.is_some() && usable_workers > 0 => {
+                CheckIssueSeverity::Warning
+            }
+            severity => severity,
+        })
         .max()
     {
         Some(CheckIssueSeverity::Error) => {
@@ -4089,6 +4109,7 @@ mod tests {
             severity: severity.to_string(),
             summary: summary.to_string(),
             remediation: None,
+            worker_id: None,
         }
     }
 
@@ -4366,6 +4387,50 @@ mod tests {
         assert_eq!(status, "not_ready");
         assert_eq!(exit_code, 2);
         assert_eq!(issues, vec!["daemon failed to clean up a build"]);
+    }
+
+    fn worker_check_issue(severity: &str, summary: &str, worker_id: &str) -> IssueFromApi {
+        IssueFromApi {
+            worker_id: Some(worker_id.to_string()),
+            ..check_issue(severity, summary)
+        }
+    }
+
+    /// One worker's open circuit made `rch check` report the whole fleet not
+    /// ready (16 of 17 workers healthy, 2026-10-23). An open circuit can sit
+    /// on a worker whose status still reads healthy, so the counts alone say
+    /// ready; the worker-scoped error must degrade, not fail.
+    #[test]
+    fn test_check_outcome_one_worker_error_with_healthy_peers_is_degraded() {
+        let workers = vec![
+            mk_worker_status("w1", "healthy", "closed", 4, 1.0),
+            mk_worker_status("w2", "healthy", "open", 4, 1.0),
+        ];
+        let daemon_issues = vec![worker_check_issue(
+            "error",
+            "Circuit open for worker 'w2'",
+            "w2",
+        )];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &workers, &daemon_issues, true);
+
+        assert_eq!(status, "degraded");
+        assert_eq!(exit_code, 1);
+        assert_eq!(issues, vec!["Circuit open for worker 'w2'"]);
+    }
+
+    #[test]
+    fn test_check_outcome_worker_errors_leaving_no_usable_worker_is_not_ready() {
+        let workers = vec![mk_worker_status("w1", "healthy", "open", 4, 1.0)];
+        let daemon_issues = vec![worker_check_issue(
+            "error",
+            "Circuit open for worker 'w1'",
+            "w1",
+        )];
+        let (status, exit_code, _) = derive_check_outcome(1, 1, &workers, &daemon_issues, true);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
     }
 
     #[test]

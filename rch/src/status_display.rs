@@ -1489,6 +1489,7 @@ mod tests {
                 severity: "warning".to_string(),
                 summary: "worker-b unreachable".to_string(),
                 remediation: Some("Check SSH connectivity".to_string()),
+                worker_id: None,
             }],
             alerts: vec![],
             stats: BuildStatsFromApi {
