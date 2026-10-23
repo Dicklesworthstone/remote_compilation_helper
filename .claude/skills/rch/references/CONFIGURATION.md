@@ -268,7 +268,7 @@ Loader-consumed (`rch config export` emits these names):
 | `RCH_ENABLED` | `general.enabled` | `0/false/no/off` disables. Must be in the **process env** of the hook/`rch exec`; an inline prefix inside an agent's Bash command does not bypass the hook |
 | `RCH_LOG_LEVEL` | `general.log_level` | `trace..off`; `RUST_LOG` (if set) overrides the whole filter |
 | `RCH_FORCE_REMOTE` / `RCH_REQUIRE_REMOTE` | `general.force_remote` | REQUIRE also fails closed; wins over FORCE |
-| `RCH_SOCKET_PATH` | `general.socket_path` | (`RCH_DAEMON_SOCKET` is **not** read by any code) |
+| `RCH_SOCKET_PATH` | `general.socket_path` | (`RCH_DAEMON_SOCKET` is **not** read on 1.0.58; on 2.0.0 it is an alias, and `RCH_SOCKET_PATH` wins) |
 | `RCH_CONFIDENCE_THRESHOLD`, `RCH_MIN_LOCAL_TIME_MS`, `RCH_REMOTE_SPEEDUP_THRESHOLD`, `RCH_BUILD_SLOTS`, `RCH_TEST_SLOTS`, `RCH_CHECK_SLOTS`, `RCH_BUILD_TIMEOUT_SEC`, `RCH_TEST_TIMEOUT_SEC`, `RCH_BUN_TIMEOUT_SEC`, `RCH_EXTERNAL_TIMEOUT_ENABLED` | `[compilation]` | |
 | `RCH_COMPRESSION_LEVEL` (legacy alias `RCH_COMPRESSION`) | `transfer.compression_level` | `RCH_TRANSFER_ZSTD_LEVEL` only triggers a validator warning — it does nothing |
 | `RCH_SYNC_TIMEOUT_MS` | `transfer.sync_timeout_ms` | per-attempt; 1000..=3600000 |
@@ -311,8 +311,16 @@ Worker-side: `RCH_WORKER_ID` (falls back to `HOSTNAME`), `RCH_WKR_CANONICAL_ROOT
 
 Validation-only names (appear in `rch --help`/validators but are **not read as
 overrides**): `RCH_DAEMON_TIMEOUT_MS`, `RCH_SSH_KEY`, `RCH_TRANSFER_ZSTD_LEVEL`.
-Non-existent: `RCH_DISABLED`, `RCH_BYPASS`, `RCH_FORCE_LOCAL`, `RCH_DAEMON_SOCKET`,
-`RCH_LOG`, `RCH_DRY_RUN`, `RCH_NO_COLOR`.
+
+### Things That Do NOT Exist
+
+These env vars are not read (never set them expecting an effect): `RCH_DISABLED`, `RCH_BYPASS`,
+`RCH_FORCE_LOCAL`, `RCH_DAEMON_SOCKET`, `RCH_LOG`, `RCH_DRY_RUN`, `RCH_NO_COLOR`.
+
+2.0.0 changes two of these (issue #57): `RCH_DAEMON_TIMEOUT_MS` is read as the
+hook's daemon-socket connect/read timeout (100..=600000 ms, default 5000), and
+`RCH_DAEMON_SOCKET` is read as an alias of `RCH_SOCKET_PATH` (the canonical
+name wins when both are set).
 
 Boolean parsing: loader accepts `1|true|yes|on` / `0|false|no|off|""`; the
 placement resolver additionally accepts `enabled|disabled`.

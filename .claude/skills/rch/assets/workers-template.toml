@@ -46,7 +46,7 @@ tags = ["rust", "bun", "fast"]           # Descriptive labels only (see Tips)
 # treats the worker as unfenced. Upgrade the fleet before adding the worker.
 # [[workers]]
 # id = "windows-builder"
-# host = "100.68.2.11"
+# host = "100.64.0.10"
 # user = "builder"
 # identity_file = "~/.ssh/windows_key"
 # total_slots = 4

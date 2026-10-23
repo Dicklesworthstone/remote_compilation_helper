@@ -3,6 +3,8 @@
 Every flag below is quoted from the clap definitions in
 `rch/src/main.rs` (and `rch/src/commands/{rabs_gc,why}.rs`). Prefer
 `rch --help-json <path>` at runtime; this table is the offline copy.
+Re-checked against `rch --help` of the released `rch 2.0.0`; lines marked
+"2.0.0" differ from 1.0.58.
 
 ## Contents
 
@@ -52,7 +54,8 @@ rch cancel [<build_id>] [-a|--all] [-f|--force] [-y|--yes] [-n|--dry-run]
 ## Execution: `exec`, `diagnose`, `admit`, `why`
 
 ```bash
-rch exec [--base <COMMIT> --clean-overlay (--overlay-path <P>... | --no-overlay)]
+rch exec [-b|--base <COMMIT> --clean-overlay (-o|--overlay-path <P>... | --no-overlay)]
+         [--dependency-base <PATH=REV>...]   # 2.0.0: bind a sibling Git repo to a commit
          [--source-content-receipt] [--job [--result-dir <DIR>...]] -- <command...>
 rch diagnose [-n|--dry-run] <command...>    # full offload pipeline explanation; --json → .data.placement etc.
 rch admit <command...>                       # read-only admission preflight: recommendation, family, required caps
@@ -66,14 +69,20 @@ Full semantics of every `exec` mode: `EXEC_MODES.md`.
 
 ```bash
 rch daemon start | stop [-y] | restart [-y] | status | logs [-n <LINES>=50] | reload
+rch daemon stop|restart [-y] [--drain [--drain-timeout 300]] [--force]   # 2.0.0
 ```
+
+On 2.0.0, `stop`/`restart` **refuse** while builds are in flight unless
+`--drain` (close admission, wait) or `--force` (interrupt); `-y` only skips the
+prompt and never authorises interrupting builds. On 1.0.58 they interrupt.
 
 `rch --json daemon status` returns only `{running, socket_path, uptime_seconds}`.
 The daemon's **version** is at `rch --json status` → `.data.daemon.daemon.version`.
 
 `rchd` itself: `-s/--socket`, `-w/--workers-config`, `--history-file`,
 `--history-capacity` (100), `-f/--foreground`, `--metrics-port` (9100),
-`--metrics-reset-interval` (300), `--debug-routing`, `--no-hot-reload`, `-v`.
+`--metrics-reset-interval` (300), `--debug-routing`, `--no-hot-reload`, `-v`;
+2.0.0 adds `--api-bind` and `--api-token-file` (TCP status API).
 
 ## Workers
 
@@ -115,32 +124,33 @@ rch config export [--format shell|env]
 rch completions generate <shell> | install [<shell>] [--dry-run] | uninstall <shell> [--dry-run] | status
 ```
 
-There is no `rch config check`; it is `validate` (syntax) / `lint` / `doctor`
-(semantic, incl. missing `identity_file` keys).
+The config checks are `validate` (syntax), `lint` and `doctor` (semantic, incl. missing
+`identity_file` keys); there is no `check` subcommand (see "Things That Do NOT Exist").
 
 ## Doctor, Self-Test, Error Catalog
 
 ```bash
 rch doctor [--fix] [--dry-run]
-rch doctor --reliability [--check-schemas] [--strict|--lenient] [--scope all|topology,convergence,pressure,triage,helpers,rollout,schema]   # main adds `ownership` (mirror-ownership probe); 1.0.58 rejects it and has no such probe
+rch doctor --reliability [--check-schemas] [--strict|--lenient] [--scope all|topology,convergence,pressure,triage,helpers,rollout,schema]   # 2.0.0 adds `ownership` (mirror-ownership probe); 1.0.58 rejects it and has no such probe
 rch doctor --reliability --watch [--watch-interval <S>=5] [--transitions-only] [--watch-snapshot <PATH>]
 rch doctor --runbook <RCH-Rnnn>          # render an authored runbook as Markdown, no probes
-rch doctor --runbook-list                # 10 authored runbooks on 1.0.58 (11 on main)
+rch doctor --runbook-list                # 10 authored runbooks on 1.0.58 (11 on 2.0.0)
 rch self-test [status | history [--limit N]] [--worker <W>] [--all] [--project <P>] [--timeout <S>=300] [--debug]
               [--scheduled] [--smoke] [--soak] [--load] [--dry-run]
-rch error explain <RCH-Ennn|RCH-Innn> [--json]
-rch error list [--category <snake_case>] [--json]     # 166 known codes on 1.0.58 (E + I + R namespaces)
+rch error explain <RCH-Ennn|RCH-Innn|RCH-Rnnn> [--json]
+rch error list [--category <snake_case>] [--json]     # 166 known codes on 1.0.58; 177 on 2.0.0 (102 E + 18 I + 57 R)
 ```
 
-Note: `rch doctor --help` currently prints no description (the doc comment is
-attached to `rch error` in source) — the flags above are correct regardless.
+Note: on 1.0.58 `rch doctor --help` prints no description (the doc comment is
+attached to `rch error` in source); 2.0.0 prints it. The flags are the same.
 
 ## Storage: `gc`, `cache`, `sync`, `rabs`
 
 Three distinct surfaces — do not conflate:
 
 ```bash
-rch gc [-n|--dry-run] [--workers <ID>...]        # reap stale remote target dirs NOW (same sweep as the daemon's periodic one)
+rch gc [-n|--dry-run] [--workers <ID>...]        # 1.0.58: reap stale remote target dirs NOW (same sweep as the daemon's periodic one)
+rch gc [--apply] [--workers <ID>...] [--root <ABS_PATH>...] [--worker-timeout 900]   # 2.0.0: PREVIEWS by default; only --apply removes
 rch cache status [--workers <ID>...]              # read-only: per-dir path/size/idle/verdict incl. pooled dirs
 rch cache clean [--older 24h] [--project <NAME>] [--execute] [--base <PATH>...]   # local staging trees; dry-run unless --execute
 rch cache warm [--workers <ID>...] [--project <PATH>]
@@ -176,7 +186,8 @@ There is **no** `rch fleet enable`; re-enable workers with `rch workers enable <
 
 ```bash
 rch dashboard|tui [--refresh 1000] [--no-mouse] [--test-mode] [--mock-data] [--dump-state] [--high-contrast] [--color-blind <mode>]
-rch web [--port 3000] [--no-open] [--prod]
+rch web [--port 3000] [--no-open] [--prod]   # 1.0.58
+rch web [--url <URL>] [--no-open]           # 2.0.0: opens the configured fleet dashboard URL; --port/--prod are gone
 rch init|setup [-y] [--skip-test]
 rch capabilities                  # with --json: commands, env_vars, exit_codes, policies, reason_code_families, ...
 rch robot-docs guide
@@ -192,8 +203,9 @@ rch schema export [-o DIR] | list
 `config edit --workers`) · `rch config check` · `rch hook install --force` ·
 `rch fleet enable` · `rch status --stats` · `rch bypass`, `rch reconcile`,
 `rch inventory`, `rch toolchain`, `rch wrapper` at top level · env vars
-`RCH_DISABLED`, `RCH_BYPASS`, `RCH_FORCE_LOCAL`, `RCH_DAEMON_SOCKET`, `RCH_LOG`,
-`RCH_DRY_RUN`, `RCH_NO_COLOR` · config file `daemon.toml` **does** exist
+`RCH_DISABLED`, `RCH_BYPASS`, `RCH_FORCE_LOCAL`, `RCH_LOG`,
+`RCH_DRY_RUN`, `RCH_NO_COLOR` (`RCH_DAEMON_SOCKET` is missing on 1.0.58 but is
+an alias of `RCH_SOCKET_PATH` on 2.0.0) · config file `daemon.toml` **does** exist
 (`rchd` reads `~/.config/rch/daemon.toml`) but `.rch.toml` does not (project
 override is `.rch/config.toml`).
 
