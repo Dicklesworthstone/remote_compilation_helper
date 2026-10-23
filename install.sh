@@ -41,7 +41,7 @@ set -euo pipefail
 # Last-resort floor used only when every release-discovery path fails. Keep it in
 # step with the newest published release; enforce_no_downgrade() stops a stale
 # value here from clobbering a newer install.
-INSTALLER_VERSION="2.1.17"
+INSTALLER_VERSION="2.1.34"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
 # Records whether the caller pinned a version (VERSION=... or --version), which
 # suppresses the no-downgrade guard so deliberate rollbacks still work.
