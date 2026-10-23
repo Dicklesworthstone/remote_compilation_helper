@@ -502,7 +502,7 @@ check_prerequisites() {
             success "cargo: $(cargo --version)"
         else
             error "cargo not found (required for source build)"
-            ((errors++))
+            errors=$((errors + 1))
         fi
 
         if command_exists rustc; then
@@ -515,7 +515,7 @@ check_prerequisites() {
             fi
         else
             error "rustc not found (required for source build)"
-            ((errors++))
+            errors=$((errors + 1))
         fi
     fi
 
@@ -525,14 +525,14 @@ check_prerequisites() {
     else
         error "rsync not found"
         echo "  Install with: apt install rsync / brew install rsync"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     if command_exists ssh; then
         success "ssh: available"
     else
         error "ssh not found"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Optional but recommended
@@ -566,7 +566,7 @@ verify_worker_toolchain() {
     else
         error "rustup: not found"
         echo "  Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check for Rust nightly
@@ -586,7 +586,7 @@ verify_worker_toolchain() {
         success "clang: $(clang --version | head -1)"
     else
         error "No C compiler found (gcc or clang required)"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check rsync
@@ -595,7 +595,7 @@ verify_worker_toolchain() {
     else
         error "rsync: not found"
         echo "  Install with: apt install rsync / brew install rsync"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check zstd
@@ -604,7 +604,7 @@ verify_worker_toolchain() {
     else
         error "zstd: not found"
         echo "  Install with: apt install zstd / brew install zstd"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check SSH server (for incoming connections)
@@ -2736,7 +2736,7 @@ verify_installation() {
             success "$WORKER_BIN: $version"
         else
             error "Worker binary not found or not executable"
-            ((failed++))
+            failed=$((failed + 1))
         fi
     else
         for binary in "$HOOK_BIN" "$DAEMON_BIN"; do
@@ -2747,7 +2747,7 @@ verify_installation() {
                 success "$binary: $version"
             else
                 error "$binary: not found or not executable"
-                ((failed++))
+                failed=$((failed + 1))
             fi
         done
 
@@ -2760,13 +2760,13 @@ verify_installation() {
                 warn "$WORKER_BIN: not installed (fleet sync disabled)"
             else
                 error "$WORKER_BIN: not found or not executable"
-                ((failed++))
+                failed=$((failed + 1))
             fi
         fi
 
         if [[ ! -f "$CONFIG_DIR/daemon.toml" ]]; then
             error "Daemon config not found"
-            ((failed++))
+            failed=$((failed + 1))
         fi
     fi
 

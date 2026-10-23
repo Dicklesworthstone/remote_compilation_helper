@@ -255,6 +255,32 @@ else
     fail "runtime_dir_collision_uses_private_directory (RUNTIME_DIR='$RUNTIME_DIR', output='$runtime_output')"
 fi
 
+# Case 14: a failed check is counted, not fatal. Under `set -e` on bash >= 4.1,
+# `((errors++))` with errors=0 evaluates to 0 and exits the installer after the
+# first error, before the remaining checks and the summary. A separate bash
+# process keeps errexit live (an `|| true` context here would suspend it).
+start_test "prerequisite_errors_are_all_reported"
+# shellcheck disable=SC2016  # the child shell expands $1, not this one
+prereq_output=$(FROM_SOURCE=true "$BASH" -c '
+    export RCH_INSTALLER_LIB=1
+    source "$1"
+    command_exists() { [[ "$1" != cargo && "$1" != rustc ]] && command -v "$1" >/dev/null 2>&1; }
+    check_prerequisites
+' prereq-test "$PROJECT_ROOT/install.sh" 2>&1) || true
+if [[ "$prereq_output" == *"rustc not found"* && "$prereq_output" == *"failed with 2 errors"* ]]; then
+    pass "prerequisite_errors_are_all_reported"
+else
+    fail "prerequisite_errors_are_all_reported (bash $BASH_VERSION, output='$prereq_output')"
+fi
+# The same trap is invisible on bash 3.2, so also reject the pattern itself.
+start_test "installer_has_no_errexit_unsafe_increments"
+unsafe_increments=$(grep -nE '^[[:space:]]*\(\([A-Za-z_]+(\+\+|--)\)\)[[:space:]]*$' "$PROJECT_ROOT/install.sh" || true)
+if [[ -z "$unsafe_increments" ]]; then
+    pass "installer_has_no_errexit_unsafe_increments"
+else
+    fail "installer_has_no_errexit_unsafe_increments: ${unsafe_increments//$'\n'/; }"
+fi
+
 log "=== Summary ==="
 log "Tests run: $TESTS_RUN"
 log "Passed:    $TESTS_PASSED"
