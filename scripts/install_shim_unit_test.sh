@@ -77,10 +77,13 @@ export NO_SERVICE=true
 install_dispatcher_shim_watchdog
 [[ -x "$HOME/.rch/shim-watchdog" ]]
 [[ ! -e "$XDG_CONFIG_HOME/systemd/user/rch-shim-watchdog.timer" ]]
-before_inode=$(stat -c '%i' "$HOME/.rch/shims/cargo")
+# `ls -id` reports the inode on GNU, uutils and BSD alike; `stat -c` is GNU-only.
+# shellcheck disable=SC2012  # one known path; only the inode column is read
+inode_of() { ls -id -- "$1" | awk '{print $1}'; }
+before_inode=$(inode_of "$HOME/.rch/shims/cargo")
 PATH="$original_path" "$HOME/.rch/shim-watchdog"
 PATH="$original_path" "$HOME/.rch/shim-watchdog"
-[[ "$(stat -c '%i' "$HOME/.rch/shims/cargo")" == "$before_inode" ]]
+[[ "$(inode_of "$HOME/.rch/shims/cargo")" == "$before_inode" ]]
 [[ "$(cat "$HOME/.bashrc")" == "$before_rc" ]]
 printf 'PASS: healthy watchdog cycles preserve the shim inode and shell rc\n'
 printf '\nexport PATH="%s:$PATH"\n' "$fixture/local-tools" >> "$HOME/.bashrc"
