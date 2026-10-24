@@ -8696,12 +8696,18 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         .find(|entry| entry.phase == mock::Phase::Execute)
         .and_then(|entry| entry.command.as_deref())
         .expect("execute command should be recorded");
+    // The disk-budget supervisor nests the build in one more shell-quoting
+    // layer, so compare the assignments with the quoting removed.
+    let unquoted: String = execute_command
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '\\'))
+        .collect();
     for assignment in [
-        "CARGO_PROFILE_DEV_DEBUG='line-tables-only'",
-        "CARGO_PROFILE_TEST_DEBUG='line-tables-only'",
+        "CARGO_PROFILE_DEV_DEBUG=line-tables-only",
+        "CARGO_PROFILE_TEST_DEBUG=line-tables-only",
     ] {
         assert!(
-            execute_command.contains(assignment),
+            unquoted.contains(assignment),
             "expected {assignment} on the executed command, got {execute_command}"
         );
     }
