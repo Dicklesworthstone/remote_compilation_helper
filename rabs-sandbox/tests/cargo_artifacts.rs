@@ -7,7 +7,10 @@
 use rabs_sandbox::artifact_tree::TreeInventory;
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
-use rabs_sandbox::cargo_artifacts::{CargoArtifactMode, CargoArtifactReport};
+use rabs_sandbox::cargo_artifacts::{
+    CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION, CargoArtifactMode, CargoArtifactReport,
+    is_private_incremental_file, private_incremental_roots,
+};
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
 use std::collections::BTreeSet;
 use std::fs;
@@ -208,6 +211,178 @@ fn real_workspace_build_check_and_test_compilation_capture_actual_outputs() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn real_private_incremental_projection_preserves_outputs_and_reuses_edited_compilation() {
+    let (owner, root, home, tools) = workspace_fixture();
+    let manifest = root.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\n[profile.incremental]\ninherits='dev'\nincremental=false\n",
+            fs::read_to_string(&manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    let version = Command::new(tools.join("bin/rustc"))
+        .arg("-vV")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("real rustc must identify its host triple");
+
+    // This is the shared production JSON/tree boundary with native Cargo.
+    // It does not exercise worker transport or persistent target-cache restore.
+    for custom in [false, true] {
+        let label = if custom { "custom-host" } else { "default" };
+        let output_root = owner.path().join(label);
+        fs::create_dir(&output_root).unwrap();
+        fs::set_permissions(&output_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut args = [
+            "build",
+            "--workspace",
+            "--locked",
+            "--offline",
+            "--message-format=json",
+            "--target-dir=/__rabs/out/cargo",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let executable = if custom {
+            args.extend(["--profile=incremental".into(), format!("--target={host}")]);
+            format!("{host}/incremental/artifact_app")
+        } else {
+            "debug/artifact_app".to_owned()
+        };
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo", "args":args,
+            "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+                "env":{"CARGO_INCREMENTAL":"1"}},
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[],
+                "cargo":CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION}
+        });
+        let roots = private_incremental_roots(&request).unwrap().unwrap();
+        let mut expected_roots = if custom {
+            vec![
+                "incremental/incremental".to_owned(),
+                format!("{host}/incremental/incremental"),
+            ]
+        } else {
+            vec!["debug/incremental".to_owned()]
+        };
+        expected_roots.sort();
+        assert_eq!(roots, expected_roots);
+
+        for offset in [0, 1] {
+            fs::write(
+                root.join("app/src/main.rs"),
+                format!(
+                    "fn main() {{ println!(\"{{}}\", artifact_library::VALUE + {offset}); }}\n"
+                ),
+            )
+            .unwrap();
+            let output = cargo(&tools, &root, &home)
+                .env("CARGO_INCREMENTAL", "1")
+                // Diagnostic instrumentation only; this flag is not admitted
+                // as a production command-context override.
+                .env("RUSTFLAGS", "-Zincremental-info")
+                .args(args.iter().map(|argument| {
+                    if argument == "--target-dir=/__rabs/out/cargo" {
+                        format!("--target-dir={}", output_root.display())
+                    } else {
+                        argument.clone()
+                    }
+                }))
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{label} edit={offset}: {stderr}");
+            let reused_files: usize = stderr
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("[incremental] session directory: ")?
+                        .strip_suffix(" files hard-linked")?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .sum();
+            if offset == 0 {
+                assert_eq!(reused_files, 0, "a cold build has no prior session");
+            } else {
+                assert!(
+                    reused_files > 0,
+                    "{label}: edited rustc did not reuse its prior session: {stderr}"
+                );
+            }
+            let report = CargoArtifactReport::read(
+                output.stdout.as_slice(),
+                output_root.to_str().unwrap(),
+                CargoArtifactMode::Compilation,
+            )
+            .unwrap();
+            let required = report.files().map(str::to_owned).collect::<BTreeSet<_>>();
+            assert!(required.contains(&executable));
+            assert!(
+                required
+                    .iter()
+                    .all(|name| !is_private_incremental_file(&roots, name)),
+                "no Cargo-reported output may disappear into private state"
+            );
+            let inventory =
+                TreeInventory::scan(&output_root, &required, 128 * 1024 * 1024, &|| false).unwrap();
+            let private = inventory
+                .names()
+                .filter(|name| is_private_incremental_file(&roots, name))
+                .collect::<Vec<_>>();
+            for suffix in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+                assert!(
+                    private.iter().any(|name| name.ends_with(suffix)),
+                    "{label}: real rustc did not retain {suffix} under {roots:?}"
+                );
+                assert!(
+                    inventory
+                        .names()
+                        .filter(|name| name.ends_with(suffix))
+                        .all(|name| is_private_incremental_file(&roots, name)),
+                    "{label}: compiler state escaped the derived roots"
+                );
+            }
+            let mut public = Vec::new();
+            let mut public_bytes = 0_u64;
+            let mut private_bytes = 0_u64;
+            for name in inventory.names() {
+                let mut file = inventory.open_file(name).unwrap();
+                let metadata = file.metadata().unwrap();
+                if is_private_incremental_file(&roots, name) {
+                    private_bytes += metadata.len();
+                } else {
+                    public_bytes += std::io::copy(&mut file, &mut std::io::sink()).unwrap();
+                    public.push((name, metadata.permissions().mode() & 0o111 != 0));
+                }
+                inventory.verify_file(name, &file).unwrap();
+            }
+            report.validate_outputs(public).unwrap();
+            assert!(private_bytes > 0);
+            assert!(public_bytes > 0 && public_bytes < inventory.total_bytes());
+            assert_eq!(public_bytes + private_bytes, inventory.total_bytes());
+            inventory.verify(&|| false).unwrap();
+            let ran = Command::new(output_root.join(&executable))
+                .output()
+                .unwrap();
+            assert!(ran.status.success());
+            assert_eq!(ran.stdout, format!("{}\n", 42 + offset).as_bytes());
+            eprintln!(
+                "{label} edit={offset}: {} private files, {private_bytes} private bytes, \
+                 {public_bytes} public bytes, {reused_files} prior-session files reused",
+                private.len()
+            );
+        }
+    }
 }
 
 #[test]
