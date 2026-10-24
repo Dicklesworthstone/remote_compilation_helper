@@ -196,15 +196,10 @@ rch_group_state() {
         '
         return $?
     fi
-    # Process observation is evidence, never an unbounded control dependency.
-    # Bound the COMPLETE census exchange, including an exited ps whose descendant
-    # still holds stdout open. rch_group_timeout prefers the fleet's GNU timeout,
-    # which kills the helper process group at the deadline. Timeout/failure stays
-    # unknown (2); it never becomes evidence that the workload is absent.
-    # Enumerate every process first, then only the group's LWPs plus the
-    # observer. Enumerating every unrelated LWP exceeded the same 1s bound on
-    # busy workers. A zombie leader remains in the first census, so its live
-    # sibling threads are still inspected. Both exchanges share ONE deadline.
+    # One deadline covers both exchanges and descendants holding stdout open;
+    # timeout kills the helper group and means unknown, never absence. Inspect
+    # all leaders, then group/observer LWPs (including zombie-leader siblings).
+    # Unrelated LWPs previously exhausted this same 1s bound on busy workers.
     rch_task_snapshot=$(LC_ALL=C rch_control_capture 1s \
         /bin/sh -c '
             leaders=$(ps -e -o pid= -o lwp= -o pgid= -o s= -o nlwp=) || exit 2
@@ -280,11 +275,8 @@ rch_capture_group_witnesses() {
     rch_member_pids=$(printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" '
         $2 == group && $3 !~ /^[ZXx]/ { print $1 }
     ') || return 44
-    # A per-process deadline still grows without bound with the job's size.
-    # Collect in one timed control exchange using the SAME literal protocol.
-    # No signal is sent here, and partial/failed output grants no authority.
-    # 46 means collection unavailable: the caller may use a freshly verified
-    # leader for immediate KILL, never send TERM with incomplete witnesses.
+    # One timed exchange bounds ALL witnesses using the same protocol. Partial
+    # output grants no authority: 46 permits freshly authenticated KILL, not TERM.
     [ -n "${rch_launch_source:-}" ] || return 46
     rch_collected=$(rch_control_capture 5s /bin/sh -c '
         command eval "$1" || exit 44
@@ -492,12 +484,20 @@ rch_remote_cancel_loaded() {
     [ "${rch_scope_bound:-0}" != 1 ] || rch_attempt_limit=8
     while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
         rch_group_state
+        rch_last_state=$?
         # Without stop authority, an unavailable census keeps the refusal.
-        case $? in 0) return 0;; 1) ;; *) [ "$rch_kill_status" = 0 ] || return 43; return 44;; esac
+        # A between-pass exit needs another complete census, within this cap.
+        case $rch_last_state in
+            0) return 0;;
+            1) ;;
+            2) [ "$rch_kill_status" = 0 ] || return 43;;
+            *) return 44;;
+        esac
         rch_attempt=$((rch_attempt + 1))
         sleep 0.1 || return 44
     done
     [ "$rch_kill_status" = 0 ] || return "$rch_kill_status"
+    [ $rch_last_state != 2 ] || return 44
     return 45
 }
 
@@ -686,10 +686,8 @@ rch_control_capture() {
     case "$1" in 1s|5s) ;; *) return 125;; esac
     rch_control_timeout=$1
     shift
-    # Never place untrusted control bytes in a shell variable before validating
-    # them: command substitution can discard NUL and turn malformed evidence
-    # into a valid-looking systemd property. Capture raw bytes in a private,
-    # bounded file owned by this still-live observer, outside the timed group.
+    # Validate raw bytes before shell substitution can discard NUL. The private
+    # bounded output file belongs to this observer, outside the timed group.
     rch_control_base=${TMPDIR:-/tmp}
     case "$rch_control_base" in /*) ;; *) return 125;; esac
     rch_control_dir=$(umask 077; mktemp -d "$rch_control_base/rch-control-output.XXXXXXXXXX") || return 125

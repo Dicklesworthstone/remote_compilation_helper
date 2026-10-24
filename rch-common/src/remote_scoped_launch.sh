@@ -1,9 +1,6 @@
-# Owned rch-build lifecycle. The supervisor stays OUTSIDE the workload group.
-# The leader reports the command's status but remains alive until the supervisor
-# has stopped the group (and configured scope). Only then may the outer durable
-# execution wrapper publish completion and release source/output ownership.
-# This is the existing rch-build argv ABI, not a new worker installation.
-# V1 owns a process group; only configured V2 scopes cover setsid descendants.
+# Owned rch-build lifecycle: supervisor outside, leader alive until scoped stop.
+# Only then publish durable completion/release ownership. V1 covers the process
+# group; configured V2 also covers setsid descendants. The argv ABI is unchanged.
 
 # Dash redirects an asynchronous command's stdin to /dev/null BEFORE applying
 # that command's redirections: <&0 alone cannot preserve the original input.
@@ -191,13 +188,9 @@ rch_scope_launch_deadline_marker() {
         >&3 2>/dev/null </dev/null
 }
 
-# A terminal refusal must not retain the supervisor's inherited source/activity
-# descriptors indefinitely because its diagnostic consumer stopped reading.
-# Only this literal printf writer is timed out, in the helper's private group,
-# never the workload group or the caller. It creates no descendants.
-# Suppress timeout's own diagnostics too; otherwise the failure path can block
-# on the same pipe again. Callers keep their original terminal status even if
-# delivery fails. No receipt, claim, or cleanup verdict is changed here.
+# Bound diagnostics in a private helper group so a blocked consumer cannot hold
+# source/activity FDs forever. Silence timeout diagnostics too. Delivery failure
+# changes no terminal status, receipt, claim, or cleanup verdict.
 rch_scope_launch_message() (
     rch_group_timeout --signal=KILL 1s /bin/sh -c '
         case "$2" in
@@ -484,8 +477,12 @@ rch_scope_launch_finish() {
                 if ! rch_scope_launch_read_owned_record; then
                     __sl_reason=unknown; break
                 fi
-                rch_group_state
-                [ "$?" = 1 ] || { __sl_reason=unknown; break; }
+                # Live birth proves presence; only cleanup needs a full census.
+                rch_remote_leader_matches || { __sl_reason=unknown; break; }
+                if [ $rch_scope_bound = 1 ]; then
+                    rch_scope_operation state
+                    [ $? = 1 ] || { __sl_reason=unknown; break; }
+                fi
                 rch_scope_launch_clock || { __sl_reason=unknown; break; }
                 __sl_started=$rch_launch_now
                 # Mark admitted before publication: an uncertain gate write
