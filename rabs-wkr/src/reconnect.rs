@@ -366,6 +366,7 @@ mod tests {
         let report = CapabilityReport {
             worker_id: "shutdown-test".to_owned(),
             canonical_namespace: false,
+            dependency_modes: vec![],
             missing: Vec::new(),
             slots: 1,
         };
@@ -470,7 +471,7 @@ mod tests {
                 let mut stream = WorkerConnection::LoopbackFixture(socket);
                 let report = CapabilityReport {
                     worker_id:"shutdown-test".to_owned(), canonical_namespace:true,
-                    missing:Vec::new(), slots:1,
+                    dependency_modes:Vec::new(), missing:Vec::new(), slots:1,
                 };
                 let driver = crate::drive_session(
                     &mut stream, &report, false, Some(&mut journal), false,

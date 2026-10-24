@@ -19,7 +19,7 @@ use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
-use rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION;
+use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
 use rabs_wkr::artifacts::{
@@ -678,10 +678,17 @@ fn main() {
     };
     let report = probe_capability(&worker_id);
     eprintln!(
-        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{}}}",
+        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"dependency_execution_modes\":{}}}",
         json_string(&report.worker_id),
         report.canonical_namespace,
-        report.slots
+        report.slots,
+        serde_json::json!(
+            report
+                .dependency_modes
+                .iter()
+                .map(|mode| mode.as_str())
+                .collect::<Vec<_>>()
+        ),
     );
     std::process::exit(reconnect::run(
         coordinator,
@@ -1174,7 +1181,7 @@ where
         output_preview_enabled,
         execution_lease,
         false,
-        false,
+        None,
         |request, timeout, artifacts, source, toolchain, lease| {
             assert!(
                 toolchain.is_none(),
@@ -1202,7 +1209,7 @@ async fn drive_session_with_inputs<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
-    dependency_context_enabled: bool,
+    dependency_mode: Option<DependencyExecutionMode>,
     launch: L,
     heartbeat: H,
 ) -> Result<(), String>
@@ -1229,7 +1236,7 @@ where
         output_preview_enabled,
         execution_lease,
         toolchain_reuse_enabled,
-        dependency_context_enabled,
+        dependency_mode,
         InputBudgets::default(),
         launch,
         heartbeat,
@@ -1249,7 +1256,7 @@ async fn drive_session_with_input_budgets<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
-    dependency_context_enabled: bool,
+    dependency_mode: Option<DependencyExecutionMode>,
     input_budgets: InputBudgets,
     mut launch: L,
     mut heartbeat: H,
@@ -1269,13 +1276,16 @@ where
     if toolchain_reuse_enabled && !toolchain_transfer_enabled {
         return Err("toolchain reuse requires toolchain transfer".to_owned());
     }
-    if dependency_context_enabled
+    if dependency_mode.is_some()
         && !(source_transfer_enabled && toolchain_transfer_enabled && artifact_transfer_enabled)
     {
         return Err(
             "dependency execution requires negotiated source, toolchain and artifact transfer"
                 .to_owned(),
         );
+    }
+    if dependency_mode.is_some_and(|mode| !report.dependency_modes.contains(&mode)) {
+        return Err("dependency execution mode unavailable".to_owned());
     }
     let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
@@ -1522,10 +1532,9 @@ where
                         }
                         Some("canonical-exec") => {
                             let parsed = (|| {
-                                if value.get("dependency_context").is_some() && !dependency_context_enabled {
-                                    return Err("dependency context not negotiated".to_owned());
-                                }
-                                parse_exec_request(&value)
+                                let request = parse_exec_request(&value)?;
+                                validate_execution_selection(&request, report, dependency_mode)?;
+                                Ok(request)
                             })().and_then(|mut request| {
                                 // A different request or a worker-local execute
                                 // cannot orphan the staged owner and its clock.
@@ -1663,6 +1672,8 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION],
+        "dependency_execution_modes": report.dependency_modes.iter()
+            .map(|mode| mode.as_str()).collect::<Vec<_>>(),
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
         "recovery_protocols": [RECOVERY_PROTOCOL],
         "result_retentions": [RESULT_RETENTION],
@@ -1808,6 +1819,7 @@ async fn session_loop(
             let preview = output_preview_requested(&ack)?;
             let dependency_context = dependency_context_selection(
                 &ack,
+                &report.dependency_modes,
                 local_identity.is_some(),
                 output,
                 artifacts,
@@ -1978,26 +1990,65 @@ fn result_retention_requested(frame: &str) -> Result<bool, String> {
 /// ignored and an old peer cannot silently execute different path semantics.
 fn dependency_context_selection(
     frame: &str,
+    supported: &[DependencyExecutionMode],
     authenticated: bool,
     output: bool,
     artifacts: bool,
     source: bool,
     toolchain: bool,
-) -> Result<bool, String> {
+) -> Result<Option<DependencyExecutionMode>, String> {
     let value: serde_json::Value =
         serde_json::from_str(frame).map_err(|error| error.to_string())?;
     match value.get("dependency_context") {
-        None => Ok(false),
+        None if value.get("dependency_execution_mode").is_none() => Ok(None),
+        None => Err("dependency execution mode requires a versioned context".to_owned()),
         Some(selected) if selected.as_str() == Some(DEPENDENCY_CONTEXT_VERSION) => {
+            let mode = match value
+                .get("dependency_execution_mode")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("metadata") => DependencyExecutionMode::Metadata,
+                Some("rlib") => DependencyExecutionMode::Rlib,
+                _ => return Err("unsupported dependency_execution_mode selection".to_owned()),
+            };
+            if !supported.contains(&mode) {
+                return Err("dependency execution mode unavailable".to_owned());
+            }
             if !(authenticated && output && artifacts && source && toolchain) {
                 return Err(
                     "dependency context requires authenticated input and complete result transfer"
                         .to_owned(),
                 );
             }
-            Ok(true)
+            Ok(Some(mode))
         }
         Some(_) => Err("unsupported dependency_context selection".to_owned()),
+    }
+}
+
+/// Bind every new execution to its selected and measured namespace before
+/// durable admission. A recovery session may retrieve sealed results without
+/// selecting any execution profile; it cannot use that to launch a command.
+fn validate_execution_selection(
+    request: &CanonicalExecRequest,
+    report: &rabs_wkr::session::CapabilityReport,
+    selected: Option<DependencyExecutionMode>,
+) -> Result<(), String> {
+    match (request.dependency_context.as_ref(), selected) {
+        (Some(context), Some(mode))
+            if context.execution_mode() == mode && report.dependency_modes.contains(&mode) =>
+        {
+            Ok(())
+        }
+        (Some(_), None) => Err("dependency context not negotiated".to_owned()),
+        (Some(_), Some(_)) => {
+            Err("dependency execution mode does not match negotiation".to_owned())
+        }
+        (None, Some(_)) => {
+            Err("dependency session requires its negotiated execution context".to_owned())
+        }
+        (None, None) if report.canonical_namespace => Ok(()),
+        (None, None) => Err("canonical namespace unavailable".to_owned()),
     }
 }
 
@@ -2326,6 +2377,7 @@ mod tests {
         rabs_wkr::session::CapabilityReport {
             worker_id: "session-test".to_owned(),
             canonical_namespace: true,
+            dependency_modes: vec![],
             missing: vec![],
             slots: 4,
         }

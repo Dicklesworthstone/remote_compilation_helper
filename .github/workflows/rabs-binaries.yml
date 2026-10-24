@@ -196,6 +196,28 @@ jobs:
           cargo test --release -p rabs-key --lib live_dependency --locked
           cargo test --release -p rabsd --lib edge::live_facts --locked
           cargo test --release -p rabsd --test live_dependency_inventory --locked
+      - name: Closed archive isolation and authenticated mode selection
+        run: |
+          cargo test --release -p rabs-sandbox --lib dependency_context --locked
+          RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+            cargo test --release -p rabs-sandbox --lib \
+              real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
+              --locked -- --ignored --nocapture
+          cargo test --release -p rabs-wkr --bin rabs-wkr dependency --locked
+          cargo test --release -p rabs-wkr --bin rabs-wkr archive --locked
+          cargo test --release -p rabsd --lib coord::secure_worker_delivery::tests --locked
+          cargo test --release -p rabs-wkr --test process_tree_linux \
+            real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
+            --locked -- --nocapture
+      - name: Actual offline Cargo builds, links and replays remote archives
+        timeout-minutes: 30
+        env:
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+          RABS_TEST_WRAP_BIN: ${{ github.workspace }}/target/release/rabs-wrap
+        run: |
+          cargo test --release -p rabsd --test prepared_operation_live \
+            actual_offline_cargo_build_uses_remote_archives_then_links_and_replays \
+            --locked -- --ignored --nocapture
       - name: Cargo layout projection keys and real split-directory builds
         run: |
           cargo test --release -p rabsd cargo_placement_reuse --locked

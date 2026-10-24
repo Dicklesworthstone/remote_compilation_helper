@@ -165,6 +165,7 @@ fn report() -> rabs_wkr::session::CapabilityReport {
     rabs_wkr::session::CapabilityReport {
         worker_id: "preview-session-test".into(),
         canonical_namespace: true,
+        dependency_modes: vec![],
         missing: vec![],
         slots: 1,
     }

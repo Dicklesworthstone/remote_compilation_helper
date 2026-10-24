@@ -13,7 +13,8 @@ use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
     DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
-    DependencyExecutionMode, MAX_DEPENDENCY_DIRS, MAX_DEPENDENCY_ENV_ENTRIES,
+    DependencyExecutionMode, DependencyIsolationSupport, MAX_DEPENDENCY_DIRS,
+    MAX_DEPENDENCY_ENV_ENTRIES,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -24,9 +25,8 @@ use rabs_sandbox::toolchain_dataset::{TOOLCHAIN_DATASET_VERSION, ToolchainIdenti
 pub(crate) mod toolchain_pool;
 pub use toolchain_pool::ToolchainReuseScope;
 
-/// What this worker can do (advertised at handshake; the scheduler
-/// gates placement on it). Derived from a real HostIsolationSupport
-/// probe on the worker.
+/// What this worker can do (advertised at handshake; the scheduler gates
+/// placement on it). Each execution profile is measured on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityReport {
     /// Worker id (stable per host).
@@ -35,6 +35,9 @@ pub struct CapabilityReport {
     /// the rest — `HostIsolationSupport::missing_for_canonical`
     /// empty).
     pub canonical_namespace: bool,
+    /// Independently measured leaf rustc profiles. Supporting the closed rlib
+    /// namespace does not imply support for canonical commands or metadata.
+    pub dependency_modes: Vec<DependencyExecutionMode>,
     /// Missing isolation facets (empty when `canonical_namespace`).
     pub missing: Vec<String>,
     /// Advertised execution slots (CPU-derived).
@@ -550,9 +553,17 @@ pub fn probe_capability(worker_id: &str) -> CapabilityReport {
     let slots = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
+    let dependency_modes = [
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+    ]
+    .into_iter()
+    .filter(|mode| DependencyIsolationSupport::probe(*mode).is_supported())
+    .collect();
     CapabilityReport {
         worker_id: worker_id.to_string(),
         canonical_namespace: missing.is_empty(),
+        dependency_modes,
         missing,
         slots,
     }
@@ -805,8 +816,22 @@ fn execute_canonical_inner(
         )));
         return exec_error(request.request_id);
     }
-    let support = HostIsolationSupport::probe();
-    if !support.missing_for_canonical().is_empty() {
+    let dependency_support = request
+        .dependency_context
+        .as_ref()
+        .map(|context| DependencyIsolationSupport::probe(context.execution_mode()));
+    let canonical_support = request
+        .dependency_context
+        .is_none()
+        .then(HostIsolationSupport::probe);
+    if dependency_support
+        .as_ref()
+        .is_some_and(|support| !support.is_supported())
+        || canonical_support
+            .as_ref()
+            .is_some_and(|support| !support.missing_for_canonical().is_empty())
+    {
+        let _ = control.retain_outputs(Err("requested isolation profile unavailable".to_owned()));
         return exec_error(request.request_id);
     }
 
@@ -1144,12 +1169,21 @@ fn execute_canonical_inner(
             dependency_runtime
                 .as_ref()
                 .expect("dependency execution has a retained runtime"),
-            &support,
+            dependency_support
+                .as_ref()
+                .expect("dependency execution has its own isolation proof"),
             &request.program,
             &request.args,
         )
     } else {
-        build_canonical_argv(&spec, &support, &request.program, &request.args)
+        build_canonical_argv(
+            &spec,
+            canonical_support
+                .as_ref()
+                .expect("canonical execution has its own isolation proof"),
+            &request.program,
+            &request.args,
+        )
     };
     let launch = match launch {
         Ok(launch) => launch,
@@ -1508,6 +1542,7 @@ mod tests {
         let report = CapabilityReport {
             worker_id: "hz2".into(),
             canonical_namespace: true,
+            dependency_modes: vec![],
             missing: vec![],
             slots: 8,
         };

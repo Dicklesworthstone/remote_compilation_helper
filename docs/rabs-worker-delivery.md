@@ -234,6 +234,20 @@ instead of inheriting metadata-only layout projections. Native inputs,
 proc macros and unmodeled codegen outputs cannot enter this archive class.
 This profile does not establish arbitrary workspace or plugin hermeticity.
 
+Workers measure these profiles separately. Their hello advertises
+`dependency_execution_modes` containing only the supported `metadata` and/or
+`rlib` modes; the authenticated session grant selects the exact
+`dependency_execution_mode` in the request. Missing, unknown or mismatched
+modes refuse before admission, input upload or execution. The archive probe
+uses the same namespace setup as archive execution, including user, PID, IPC,
+UTS and network isolation, private temporary filesystems and `/dev/null`.
+The null device must be the Linux character device 1:3; a symlink, regular
+file or different device refuses both probing and namespace construction.
+A host that cannot mount procfs can still execute the measured archive profile.
+Metadata and whole-Cargo execution retain their full canonical isolation checks.
+Sealed-result recovery requires the original request fingerprint and retained
+bytes, without requiring the restarted host to support new execution.
+
 The launcher requires a daemon advertising `dependency-exec-v7`; old execution
 contexts cannot admit new work. Already sealed results from older contexts can
 still resume against their exact saved request fingerprint.
@@ -331,6 +345,10 @@ protocol fields and a `workers` array in configured order. A singleton daemon
 does not satisfy a pool request, even when the pool contains that one worker.
 An existing daemon is never reconfigured or restarted to fit a new request;
 use a separate socket and state directory when changing the selection.
+
+Use `build --locked` in the same launcher command to accelerate eligible
+dependency archives during an ordinary Cargo build. Cargo continues to run
+the final executable link and unsupported compiler actions locally.
 
 Independent eligible metadata or archive actions can execute concurrently, with at most
 one admitted action per worker. Selection rotates across available slots, and
@@ -447,6 +465,24 @@ can select that compiler itself. Both integration fixtures are ignored by
 default and must be run on the supported host to establish execution evidence.
 Their presence alone does not assert a successful RABS remote run.
 
+The corresponding `cargo build` fixture exercises code generation and final
+linking with the same offline graph:
+
+```sh
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test prepared_operation_live \
+    actual_offline_cargo_build_uses_remote_archives_then_links_and_replays \
+    -- --ignored --nocapture
+```
+
+It compares ten Cargo-selected archive, metadata and dep-info outputs with the
+stock build, links and executes the consumer (which must print `146`), requires
+three actual remote archive productions for each dependency, and verifies a
+later build uses all three cached dependencies without another worker receipt.
+It requires the measured archive profile, matching binaries and OpenSSL. Local
+fallback or the stock baseline alone cannot satisfy the remote assertions.
+
 A worker-level native fixture explicitly exercises a populated shared directory
 with both metadata and archive direct externs, transitive metadata resolution,
 and exact output capture:
@@ -475,6 +511,32 @@ It compares stock rustc and worker metadata, dep-info and JSON diagnostics at
 the same paths, and checks that generated input files are not returned as
 outputs. This fixture has not yet been run on the supported isolation host;
 the new test alone does not establish execution evidence.
+
+The archive variant runs the same shared dependency and generated-input shape
+through the worker's closed archive profile and compares all three outputs with
+stock rustc:
+
+```sh
+cargo test -p rabs-wkr --test process_tree_linux \
+  real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
+  -- --nocapture
+```
+
+The sandbox-level native regression separately exercises assembler inputs that
+do not appear in dep-info. It requires successful archive isolation rather than
+silently skipping on an unsupported host:
+
+```sh
+RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+  cargo test -p rabs-sandbox --lib \
+    real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
+    -- --ignored --nocapture
+```
+
+It compiles an archive containing captured `.incbin` bytes and refuses attempts
+to read host-only files, procfs or `/dev/urandom`. This proves the production
+sandbox boundary; the worker and live Cargo fixtures establish the broader
+remote execution and replay behavior when run successfully.
 
 ## Run one delivery
 

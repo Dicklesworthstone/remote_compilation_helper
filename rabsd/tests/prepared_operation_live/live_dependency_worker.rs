@@ -188,12 +188,22 @@ impl LiveFixture {
     }
 
     fn with_worker_count(worker_count: usize) -> Self {
+        Self::with_execution_mode(
+            worker_count,
+            rabs_sandbox::dependency_context::DependencyExecutionMode::Metadata,
+        )
+    }
+
+    fn with_execution_mode(
+        worker_count: usize,
+        mode: rabs_sandbox::dependency_context::DependencyExecutionMode,
+    ) -> Self {
         assert!((1..=2).contains(&worker_count));
-        let missing = rabs_sandbox::canonical_namespace::HostIsolationSupport::probe()
-            .missing_for_canonical();
+        let support = rabs_sandbox::dependency_context::DependencyIsolationSupport::probe(mode);
+        let missing = support.missing();
         assert!(
             missing.is_empty(),
-            "real dependency isolation is required: {missing:?}"
+            "real {mode:?} dependency isolation is required: {missing:?}"
         );
         let binary = |name: &str| {
             let path =
@@ -854,6 +864,11 @@ impl LiveFixture {
     }
 
     fn cargo_check(&self, wrapped: bool) -> CargoRun {
+        self.cargo_compile(wrapped, "check")
+    }
+
+    fn cargo_compile(&self, wrapped: bool, subcommand: &str) -> CargoRun {
+        assert!(matches!(subcommand, "check" | "build"));
         let number = self.sequence.get();
         self.sequence.set(number + 1);
         let root = self.fixture.owner.path();
@@ -867,7 +882,7 @@ impl LiveFixture {
         let mut cargo = Command::new(toolchain.join("bin/cargo"));
         cargo
             .current_dir(root.join("consumer"))
-            .args(["check", "--offline", "--jobs=1", "--message-format=json"])
+            .args([subcommand, "--offline", "--jobs=1", "--message-format=json"])
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("HOME", root.join("home"))
@@ -918,7 +933,9 @@ impl LiveFixture {
             let artifacts: Vec<_> = messages
                 .iter()
                 .filter(|message| {
-                    message["reason"] == "compiler-artifact" && message["target"]["name"] == name
+                    message["reason"] == "compiler-artifact"
+                        && message["target"]["name"] == name
+                        && message["target"]["kind"] == json!(["lib"])
                 })
                 .collect();
             assert_eq!(
@@ -930,30 +947,42 @@ impl LiveFixture {
                 artifacts[0]["fresh"], false,
                 "the clean target must schedule {name}, not Cargo's own fresh reuse"
             );
-            let metadata: Vec<_> = artifacts[0]["filenames"]
+            let extension = if subcommand == "build" {
+                "rlib"
+            } else {
+                "rmeta"
+            };
+            let primary: Vec<_> = artifacts[0]["filenames"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter_map(Value::as_str)
                 .map(PathBuf::from)
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|extension| extension == "rmeta")
-                })
+                .filter(|path| path.extension().is_some_and(|actual| actual == extension))
                 .collect();
-            assert_eq!(metadata.len(), 1);
-            let metadata = &metadata[0];
-            let stem = metadata
+            assert_eq!(primary.len(), 1, "missing {extension} for {name}");
+            let primary = &primary[0];
+            let stem = primary
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
                 .and_then(|name| name.strip_prefix("lib"))
-                .and_then(|name| name.strip_suffix(".rmeta"))
-                .expect("Cargo's real library metadata filename");
-            let dep_info = metadata.with_file_name(format!("{stem}.d"));
-            for path in [metadata, &dep_info] {
-                let bytes = fs::read(path).unwrap();
+                .and_then(|name| name.strip_suffix(&format!(".{extension}")))
+                .expect("Cargo's real library artifact filename");
+            let mut outputs = vec![primary.clone()];
+            if subcommand == "check" || CARGO_DEPENDENCIES.contains(&name) {
+                outputs.push(primary.with_file_name(format!("{stem}.d")));
+            }
+            if subcommand == "build" && CARGO_DEPENDENCIES.contains(&name) {
+                outputs.push(primary.with_extension("rmeta"));
+            }
+            for path in &outputs {
+                let bytes = fs::read(path).unwrap_or_else(|error| panic!("{path:?}: {error}"));
                 assert!(!bytes.is_empty(), "empty actual compiler output: {path:?}");
-                if CARGO_DEPENDENCIES.contains(&name) && path == metadata {
+                if CARGO_DEPENDENCIES.contains(&name)
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "rmeta")
+                {
                     assert!(
                         metadata_by_crate
                             .insert(name.to_owned(), bytes.clone())
@@ -967,8 +996,17 @@ impl LiveFixture {
                 assert!(files.insert(relative, bytes).is_none());
             }
         }
-        assert_eq!(files.len(), 8);
+        assert_eq!(files.len(), if subcommand == "build" { 10 } else { 8 });
         assert_eq!(metadata_by_crate.len(), CARGO_DEPENDENCIES.len());
+        if subcommand == "build" {
+            // The final link runs under stock Cargo. It must consume real
+            // object code from the remotely produced/replayed transitive rlibs.
+            let result = Command::new(target.join("debug").join(CARGO_CONSUMER))
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "consumer did not execute");
+            assert_eq!(result.stdout, b"146\n");
+        }
         let diagnostics = messages
             .into_iter()
             .filter(|message| message["reason"] == "compiler-message")
@@ -1036,15 +1074,37 @@ impl LiveFixture {
 /// Actual Cargo chooses argv, cwd, jobserver and loader environment. The graph
 /// is leaf -> middle -> top -> consumer; top has no direct leaf dependency but
 /// must resolve leaf's RemoteToken through middle's metadata. This fixture
-/// supports shared or disjoint input/output directories under dependency-exec-v6,
+/// supports shared or disjoint input/output directories under dependency-exec-v7,
 /// never treats local fallback as evidence of a working remote DAG, and performs
 /// no argv rewriting.
 #[test]
 #[ignore = "requires Linux isolation and matching RABS_TEST_WORKER_BIN/RABS_TEST_WRAP_BIN; actual offline Cargo dependency DAG plus daemon/worker"]
 fn actual_offline_cargo_check_uses_remote_dependency_dag_then_replays() {
-    let mut live = LiveFixture::new();
+    actual_offline_cargo_dependency_dag_then_replays("check");
+}
+
+#[test]
+#[ignore = "requires Linux isolation and matching RABS_TEST_WORKER_BIN/RABS_TEST_WRAP_BIN; actual Cargo builds, links, runs and replays a remote rlib DAG"]
+fn actual_offline_cargo_build_uses_remote_archives_then_links_and_replays() {
+    actual_offline_cargo_dependency_dag_then_replays("build");
+}
+
+fn actual_offline_cargo_dependency_dag_then_replays(subcommand: &str) {
+    let mode = if subcommand == "build" {
+        rabs_sandbox::dependency_context::DependencyExecutionMode::Rlib
+    } else {
+        rabs_sandbox::dependency_context::DependencyExecutionMode::Metadata
+    };
+    let mut live = LiveFixture::with_execution_mode(1, mode);
     live.prepare_cargo_consumer();
-    let stock = live.cargo_check(false);
+    if subcommand == "build" {
+        fs::write(
+            live.fixture.owner.path().join("consumer/src/main.rs"),
+            format!("fn main() {{ println!(\"{{}}\", {CARGO_CONSUMER}::transitive_value()); }}\n"),
+        )
+        .unwrap();
+    }
+    let stock = live.cargo_compile(false, subcommand);
     assert!(stock.dependencies.values().all(|run| run.events.is_empty()));
 
     let until = Instant::now() + Duration::from_secs(1200);
@@ -1052,7 +1112,7 @@ fn actual_offline_cargo_check_uses_remote_dependency_dag_then_replays() {
         std::collections::BTreeMap::new();
     let mut receipt: Option<Value> = None;
     loop {
-        let run = live.cargo_check(true);
+        let run = live.cargo_compile(true, subcommand);
         run.matches_stock(&stock);
         let mut remote_count = 0;
         let mut all_hit = true;

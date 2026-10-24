@@ -12,7 +12,7 @@
 
 use crate::canonical_namespace::{
     Bind, CanonicalNamespaceSpec, HostIsolationSupport, IsolationError, NamespaceBoundary,
-    NamespaceLaunch, push_binds, push_common_prelude, push_env, require_support,
+    NamespaceLaunch, push_binds, push_common_prelude, push_env, push_host_usr,
 };
 use crate::layout;
 use crate::runtime_cohort::RetainedRuntime;
@@ -45,6 +45,192 @@ impl DependencyExecutionMode {
             Self::Rlib => "rlib",
         }
     }
+}
+
+/// Measured permission to construct one dependency execution mode's base view.
+///
+/// Canonical and metadata execution need a private proc mount. Archive execution
+/// deliberately omits procfs and general devices, and can work on hosts whose
+/// enclosing container forbids mounting procfs. Its separate no-op probe must
+/// succeed before that mode is advertised or executed. Neither result is input
+/// closure, runtime identity, or cache-publication authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyIsolationSupport {
+    mode: DependencyExecutionMode,
+    bubblewrap: Option<String>,
+    base_namespace: bool,
+    null_device: bool,
+}
+
+impl DependencyIsolationSupport {
+    /// Execute a no-op in the required base namespace. Metadata retains the
+    /// existing canonical capability requirement; archives measure their own
+    /// null-only device view without borrowing that canonical result.
+    #[must_use]
+    pub fn probe(mode: DependencyExecutionMode) -> Self {
+        Self::probe_with_bubblewrap(mode, Path::new("bwrap"))
+    }
+
+    fn probe_with_bubblewrap(mode: DependencyExecutionMode, executable: &Path) -> Self {
+        if mode == DependencyExecutionMode::Metadata {
+            let canonical = HostIsolationSupport::probe_with_bubblewrap(executable);
+            return Self {
+                mode,
+                bubblewrap: canonical.bubblewrap,
+                base_namespace: canonical.unprivileged_userns,
+                null_device: false,
+            };
+        }
+        if !cfg!(target_os = "linux") {
+            return Self {
+                mode,
+                bubblewrap: None,
+                base_namespace: false,
+                null_device: false,
+            };
+        }
+        let bubblewrap = std::process::Command::new(executable)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        let null_device = linux_null_device(Path::new("/dev/null"));
+        let base_namespace = bubblewrap.is_some() && null_device && {
+            let mut argv = dependency_base_argv(mode, &[]);
+            // These host bytes only let the trusted no-op run while measuring
+            // mount/namespace availability. They never enter a compiler view:
+            // production requires a separately retained, keyed runtime below.
+            push_host_usr(&mut argv);
+            push_dependency_temporary_mounts(&mut argv);
+            argv.extend(["--chdir", layout::TMP, "--", "/usr/bin/true"].map(OsString::from));
+            let mut command = std::process::Command::new(executable);
+            command.args(&argv[1..]).env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let null_device = null_device && linux_null_device(Path::new("/dev/null"));
+        Self {
+            mode,
+            bubblewrap,
+            base_namespace,
+            null_device,
+        }
+    }
+
+    /// The single execution mode whose base namespace was measured.
+    #[must_use]
+    pub const fn mode(&self) -> DependencyExecutionMode {
+        self.mode
+    }
+
+    /// Whether the no-op completed successfully inside this mode's base view.
+    #[must_use]
+    pub fn is_supported(&self) -> bool {
+        self.bubblewrap.is_some()
+            && self.base_namespace
+            && (self.mode == DependencyExecutionMode::Metadata || self.null_device)
+    }
+
+    /// Missing capabilities for this exact mode, never for another namespace.
+    #[must_use]
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.bubblewrap.is_none() {
+            missing.push("bubblewrap");
+        }
+        if !self.base_namespace {
+            missing.push(match self.mode {
+                DependencyExecutionMode::Metadata => "dependency-metadata-base-namespace",
+                DependencyExecutionMode::Rlib => "dependency-rlib-base-namespace",
+            });
+        }
+        if self.mode == DependencyExecutionMode::Rlib && !self.null_device {
+            missing.push("linux-null-device");
+        }
+        missing
+    }
+
+    fn require_mode(&self, mode: DependencyExecutionMode) -> Result<(), IsolationError> {
+        self.require_mode_with_null_device(mode, Path::new("/dev/null"))
+    }
+
+    fn require_mode_with_null_device(
+        &self,
+        mode: DependencyExecutionMode,
+        null_device: &Path,
+    ) -> Result<(), IsolationError> {
+        if self.mode != mode {
+            return Err(IsolationError::InvalidSpec {
+                reason: "dependency isolation was measured for another execution mode".into(),
+            });
+        }
+        let mut missing = self.missing();
+        // The source of --dev-bind may have changed since capability probing.
+        // Never mount arbitrary regular bytes or another device at /dev/null.
+        if mode == DependencyExecutionMode::Rlib
+            && !linux_null_device(null_device)
+            && !missing.contains(&"linux-null-device")
+        {
+            missing.push("linux-null-device");
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(IsolationError::UnsupportedHost {
+                missing: missing.into_iter().map(str::to_owned).collect(),
+            })
+        }
+    }
+}
+
+fn linux_null_device(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.file_type().is_char_device()
+                && rustix::fs::major(metadata.rdev()) == 1
+                && rustix::fs::minor(metadata.rdev()) == 3
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn dependency_base_argv(mode: DependencyExecutionMode, env: &[(String, String)]) -> Vec<OsString> {
+    let mut argv = vec!["bwrap".into()];
+    push_common_prelude(&mut argv);
+    argv.extend(["--unshare-net", "--hostname", "rabs"].map(OsString::from));
+    push_env(&mut argv, env);
+    match mode {
+        DependencyExecutionMode::Metadata => {
+            argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
+        }
+        DependencyExecutionMode::Rlib => {
+            // LLVM's integrated assembler can read files absent from rustc's
+            // dep-info. Process state and entropy do not belong to this view.
+            // The null sink is deterministic and needed by ordinary I/O.
+            argv.extend(
+                ["--dir", "/dev", "--dev-bind", "/dev/null", "/dev/null"].map(OsString::from),
+            );
+        }
+    }
+    argv
+}
+
+fn push_dependency_temporary_mounts(argv: &mut Vec<OsString>) {
+    argv.extend(["--tmpfs", "/tmp", "--tmpfs", layout::TMP].map(OsString::from));
 }
 
 /// One retained candidate directory, mapped by its first-use dependency index.
@@ -589,11 +775,11 @@ pub fn build_dependency_argv(
     context: &DependencyExecContext,
     spec: &CanonicalNamespaceSpec,
     runtime: &RetainedRuntime,
-    support: &HostIsolationSupport,
+    support: &DependencyIsolationSupport,
     program: &str,
     args: &[String],
 ) -> Result<NamespaceLaunch, IsolationError> {
-    require_support(support)?;
+    support.require_mode(context.execution_mode())?;
     let refuse = || IsolationError::InvalidSpec {
         reason: "dependency namespace differs from its validated context".to_owned(),
     };
@@ -705,25 +891,7 @@ pub fn build_dependency_argv(
             reason: "retained dependency runtime differs from the negotiated cohort".to_owned(),
         });
     }
-    let mut argv = vec!["bwrap".into()];
-    push_common_prelude(&mut argv);
-    argv.extend(["--unshare-net", "--hostname", "rabs"].map(OsString::from));
-    push_env(&mut argv, &spec.env);
-    match context.execution_mode() {
-        DependencyExecutionMode::Metadata => {
-            argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
-        }
-        DependencyExecutionMode::Rlib => {
-            // LLVM's integrated assembler can read files absent from rustc's
-            // dep-info. A private procfs still contains clocks, process memory
-            // and kernel entropy; a private /dev still supplies random bytes.
-            // Neither belongs to this closed input view. The only device is
-            // the deterministic null sink, needed by ordinary compiler I/O.
-            argv.extend(
-                ["--dir", "/dev", "--dev-bind", "/dev/null", "/dev/null"].map(OsString::from),
-            );
-        }
-    }
+    let mut argv = dependency_base_argv(context.execution_mode(), &spec.env);
     let writable_backings: Vec<_> = spec
         .rw_binds
         .iter()
@@ -734,7 +902,7 @@ pub fn build_dependency_argv(
         .map_err(|error| IsolationError::InvalidSpec {
             reason: format!("retained dependency runtime cannot be mounted: {error}"),
         })?;
-    argv.extend(["--tmpfs", "/tmp", "--tmpfs", layout::TMP].map(OsString::from));
+    push_dependency_temporary_mounts(&mut argv);
     let mut ro: Vec<_> = spec
         .ro_binds
         .iter()
@@ -770,6 +938,212 @@ pub fn build_dependency_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pure namespace-construction fixtures, never kernel capability evidence.
+    fn fixture_support(mode: DependencyExecutionMode) -> DependencyIsolationSupport {
+        DependencyIsolationSupport {
+            mode,
+            bubblewrap: Some("test".into()),
+            base_namespace: true,
+            null_device: mode == DependencyExecutionMode::Rlib,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_null_device_cannot_be_replaced_by_regular_bytes_or_another_device() {
+        let owner = tempfile::tempdir().unwrap();
+        let regular = owner.path().join("null");
+        std::fs::write(&regular, b"unkeyed bytes must never enter the archive view").unwrap();
+        let link = owner.path().join("null-link");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let support = fixture_support(DependencyExecutionMode::Rlib);
+        for path in [
+            regular,
+            link,
+            owner.path().join("missing"),
+            PathBuf::from("/dev/zero"),
+        ] {
+            assert!(!linux_null_device(&path), "{}", path.display());
+            assert!(matches!(
+                support.require_mode_with_null_device(DependencyExecutionMode::Rlib, &path),
+                Err(IsolationError::UnsupportedHost { missing })
+                    if missing == ["linux-null-device"]
+            ));
+        }
+        // Metadata never gains a new device rule or consumes an archive proof.
+        let metadata = fixture_support(DependencyExecutionMode::Metadata);
+        assert!(
+            metadata
+                .require_mode_with_null_device(
+                    DependencyExecutionMode::Metadata,
+                    &owner.path().join("missing")
+                )
+                .is_ok()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_fixture(body: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::tempdir().unwrap();
+        let executable = owner.path().join("bwrap");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then\n\
+                 printf 'bubblewrap fixture\\n'; exit 0\n\
+                 fi\n\
+                 printf '%s\\000' \"$@\" > \"$0.argv\"\n\
+                 {body}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (owner, executable)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_probe_executes_the_complete_production_base() {
+        // The fixture checks the exact command and exit handling; only the
+        // real ignored rustc test below supplies kernel execution evidence.
+        let (owner, executable) = probe_fixture("exit 0");
+        let support = DependencyIsolationSupport::probe_with_bubblewrap(
+            DependencyExecutionMode::Rlib,
+            &executable,
+        );
+        assert!(support.is_supported());
+        assert!(support.missing().is_empty());
+        assert_eq!(support.mode(), DependencyExecutionMode::Rlib);
+        let recorded = std::fs::read_to_string(owner.path().join("bwrap.argv")).unwrap();
+        let argv = recorded.split_terminator('\0').collect::<Vec<_>>();
+        let production = dependency_base_argv(DependencyExecutionMode::Rlib, &[]);
+        let expected = production[1..]
+            .iter()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(argv.starts_with(&expected));
+        for flag in [
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-net",
+            "--clearenv",
+            "--die-with-parent",
+        ] {
+            assert!(argv.contains(&flag), "missing production axis {flag}");
+        }
+        for pair in [
+            ["--hostname", "rabs"],
+            ["--dir", "/dev"],
+            ["--tmpfs", "/tmp"],
+            ["--tmpfs", layout::TMP],
+            ["--chdir", layout::TMP],
+            ["--", "/usr/bin/true"],
+        ] {
+            assert!(argv.windows(2).any(|window| window == pair), "{pair:?}");
+        }
+        assert!(
+            argv.windows(3)
+                .any(|window| window == ["--dev-bind", "/dev/null", "/dev/null"])
+        );
+        assert!(!argv.contains(&"--proc") && !argv.contains(&"--dev"));
+        assert!(
+            !argv
+                .windows(3)
+                .any(|window| window == ["--ro-bind", "/", "/"])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_support_does_not_fabricate_proc_or_canonical_support() {
+        let (_owner, executable) = probe_fixture(
+            "for arg do\n\
+             if [ \"$arg\" = --proc ]; then exit 1; fi\n\
+             done\n\
+             exit 0",
+        );
+        let canonical = HostIsolationSupport::probe_with_bubblewrap(&executable);
+        assert!(!canonical.unprivileged_userns);
+        assert_eq!(
+            canonical.missing_for_canonical(),
+            ["unprivileged-user-namespaces"]
+        );
+        let metadata = DependencyIsolationSupport::probe_with_bubblewrap(
+            DependencyExecutionMode::Metadata,
+            &executable,
+        );
+        assert!(!metadata.is_supported());
+        assert_eq!(metadata.missing(), ["dependency-metadata-base-namespace"]);
+        let archive = DependencyIsolationSupport::probe_with_bubblewrap(
+            DependencyExecutionMode::Rlib,
+            &executable,
+        );
+        assert!(archive.is_supported());
+        assert!(archive.require_mode(DependencyExecutionMode::Rlib).is_ok());
+        assert!(matches!(
+            archive.require_mode(DependencyExecutionMode::Metadata),
+            Err(IsolationError::InvalidSpec { .. })
+        ));
+        assert!(matches!(
+            metadata.require_mode(DependencyExecutionMode::Metadata),
+            Err(IsolationError::UnsupportedHost { .. })
+        ));
+        assert!(matches!(
+            crate::canonical_namespace::build_canonical_argv(
+                &CanonicalNamespaceSpec::new(),
+                &canonical,
+                "cargo",
+                &[],
+            ),
+            Err(IsolationError::UnsupportedHost { .. })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_probe_requires_successful_execution_of_every_base_axis() {
+        for refused in [
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-net",
+            "--clearenv",
+            "--tmpfs",
+            "--dev-bind",
+            "/usr/bin/true",
+        ] {
+            let (_owner, executable) = probe_fixture(&format!(
+                "for arg do\nif [ \"$arg\" = '{refused}' ]; then exit 1; fi\ndone\nexit 0"
+            ));
+            let support = DependencyIsolationSupport::probe_with_bubblewrap(
+                DependencyExecutionMode::Rlib,
+                &executable,
+            );
+            assert!(!support.is_supported(), "{refused}");
+            assert_eq!(support.missing(), ["dependency-rlib-base-namespace"]);
+            assert!(matches!(
+                support.require_mode(DependencyExecutionMode::Rlib),
+                Err(IsolationError::UnsupportedHost { .. })
+            ));
+        }
+        let owner = tempfile::tempdir().unwrap();
+        let missing = DependencyIsolationSupport::probe_with_bubblewrap(
+            DependencyExecutionMode::Rlib,
+            &owner.path().join("missing-bwrap"),
+        );
+        assert!(!missing.is_supported());
+        assert_eq!(
+            missing.missing(),
+            ["bubblewrap", "dependency-rlib-base-namespace"]
+        );
+    }
 
     #[cfg(target_os = "linux")]
     struct RuntimeFixture {
@@ -952,13 +1326,7 @@ mod tests {
                 .iter()
                 .all(|bind| !overlaps(&bind.visible, Path::new(root)))
         );
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         let launch = build_dependency_argv(
             &context,
             &spec,
@@ -1031,13 +1399,7 @@ mod tests {
             )
             .unwrap();
         let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         let args = vec!["src/lib.rs".into(), "--emit=dep-info,metadata".into()];
         let launch = build_dependency_argv(
             &context,
@@ -1076,10 +1438,17 @@ mod tests {
                 "hello /home/user/registry/package"
             ]));
         assert!(args.ends_with(&[context.compiler(), "src/lib.rs", "--emit=dep-info,metadata"]));
+        let canonical_support = HostIsolationSupport {
+            bubblewrap: Some("test".into()),
+            unprivileged_userns: true,
+            overlayfs: false,
+            cgroup_v2: false,
+            landlock: false,
+        };
         assert!(
             crate::canonical_namespace::build_canonical_argv(
                 &spec,
-                &support,
+                &canonical_support,
                 context.compiler(),
                 &[]
             )
@@ -1115,13 +1484,7 @@ mod tests {
             )
             .unwrap();
         let fixture = RuntimeFixture::prepare(&mut context, &mut spec);
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         let launch = build_dependency_argv(
             &context,
             &spec,
@@ -1154,6 +1517,18 @@ mod tests {
         // The separately negotiated metadata mode preserves its established
         // execution semantics; the archive policy must not quietly replace it.
         let metadata = context.with_execution_mode(DependencyExecutionMode::Metadata);
+        assert!(matches!(
+            build_dependency_argv(
+                &metadata,
+                &spec,
+                &fixture.runtime,
+                &support,
+                metadata.compiler(),
+                &[],
+            ),
+            Err(IsolationError::InvalidSpec { .. })
+        ));
+        let support = fixture_support(DependencyExecutionMode::Metadata);
         let launch = build_dependency_argv(
             &metadata,
             &spec,
@@ -1192,13 +1567,7 @@ mod tests {
             )
             .unwrap();
         let fixture = RuntimeFixture::prepare(&mut context, &mut spec);
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         let launch = build_dependency_argv(
             &context,
             &spec,
@@ -1259,11 +1628,11 @@ mod tests {
     #[test]
     #[ignore = "requires a Linux host permitting the full bubblewrap namespace"]
     fn selected_elf_runtime_executes_with_private_outputs_and_without_broad_host_usr() {
-        let support = HostIsolationSupport::probe();
+        let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Metadata);
         assert!(
-            support.missing_for_canonical().is_empty(),
+            support.is_supported(),
             "full namespace unavailable: {:?}",
-            support.missing_for_canonical()
+            support.missing()
         );
         let mut context = context(Vec::new());
         let empty = tempfile::tempdir().unwrap();
@@ -1430,8 +1799,8 @@ mod tests {
                 .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
         );
         assert!(toolchain.is_absolute());
-        let support = HostIsolationSupport::probe();
-        assert!(support.missing_for_canonical().is_empty(), "{support:?}");
+        let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Rlib);
+        assert!(support.is_supported(), "{support:?}");
         let owner = tempfile::tempdir().unwrap();
         let source = owner.path().join("source");
         let output = owner.path().join("output");
@@ -1601,13 +1970,7 @@ mod tests {
                     .any(|bind| { overlaps(&bind.visible, Path::new(&root.path)) })
             );
         }
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         build_dependency_argv(
             &context,
             &spec,
@@ -1688,13 +2051,7 @@ mod tests {
                 .iter()
                 .all(|bind| { bind.visible != Path::new(context.out_dir()) })
         );
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         assert!(
             build_dependency_argv(
                 &context,
@@ -1967,13 +2324,7 @@ mod tests {
             "each alias has its own owner subtree"
         );
         assert_eq!(std::fs::read_dir(&search.backing).unwrap().count(), 0);
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         let launch = build_dependency_argv(
             &context,
             &spec,
@@ -2063,13 +2414,7 @@ mod tests {
             )
             .unwrap();
         let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
-        let support = HostIsolationSupport {
-            bubblewrap: Some("test".into()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = fixture_support(context.execution_mode());
         let mut changed = spec.clone();
         changed.env[0].1 = "8".into();
         assert!(
