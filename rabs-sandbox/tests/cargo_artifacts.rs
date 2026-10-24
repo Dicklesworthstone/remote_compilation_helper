@@ -11,7 +11,9 @@ use rabs_sandbox::cargo_artifacts::{
     CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION, CargoArtifactMode, CargoArtifactReport,
     is_private_incremental_file, private_incremental_roots,
 };
-use rabs_sandbox::snapshot_capture::capture_sealed_source;
+use rabs_sandbox::cargo_target::{compatible_arguments, source_edit_identity};
+use rabs_sandbox::snapshot_capture::{MemberKind, capture_sealed_source};
+use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -383,6 +385,251 @@ fn real_private_incremental_projection_preserves_outputs_and_reuses_edited_compi
             );
         }
     }
+}
+
+/// Exercise the shared private-target selection policy against actual Cargo
+/// fingerprints and captured source bytes. This is not daemon placement, worker
+/// target restoration or a result-cache test: every command below executes.
+#[test]
+fn real_cargo_source_edit_family_reuses_dependencies_across_commands_and_membership() {
+    let (owner, root, home, tools) = workspace_fixture();
+    let output_root = owner.path().join("compatible-target");
+    let capture = || {
+        let image = capture_sealed_source(
+            &[("workspace".to_owned(), root.clone())],
+            false,
+            3,
+            1024 * 1024,
+        )
+        .unwrap();
+        let files = image
+            .manifest("workspace")
+            .unwrap()
+            .members
+            .iter()
+            .filter_map(|(path, member)| match member {
+                MemberKind::Regular {
+                    size,
+                    content_sha256,
+                    mode,
+                    ..
+                } => Some(SourceFile {
+                    path: path.clone(),
+                    len: *size,
+                    sha256: *content_sha256,
+                    executable: mode & 0o111 != 0,
+                }),
+                MemberKind::Directory => None,
+                MemberKind::Symlink { .. } => panic!("fixture contains no symlink"),
+            })
+            .collect();
+        SourceManifest::new(files).unwrap()
+    };
+    let arguments = |command: &str, selection: &[&str]| {
+        let mut args = [
+            command,
+            "--locked",
+            "--offline",
+            "--message-format=json",
+            "--manifest-path=/__rabs/workspace/Cargo.toml",
+            "--target-dir=/__rabs/out/cargo",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        args.extend(selection.iter().map(|argument| (*argument).to_owned()));
+        args
+    };
+    let run = |args: &[String], mode| {
+        let output = cargo(&tools, &root, &home)
+            .args(args.iter().map(|argument| match argument.as_str() {
+                "--manifest-path=/__rabs/workspace/Cargo.toml" => {
+                    format!("--manifest-path={}", root.join("Cargo.toml").display())
+                }
+                "--target-dir=/__rabs/out/cargo" => {
+                    format!("--target-dir={}", output_root.display())
+                }
+                _ => argument.clone(),
+            }))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            mode,
+        )
+        .unwrap();
+        assert!(report.files().next().is_some());
+        output
+    };
+    let base = capture();
+    let family = source_edit_identity(&base, base.digest(), None).unwrap();
+    let build_shape = compatible_arguments(
+        "/__rabs/toolchain/bin/cargo",
+        &arguments("build", &["--workspace"]),
+        CargoArtifactMode::Compilation,
+    )
+    .unwrap();
+    let mut previous = base.digest();
+
+    for (step, expected, selection) in [
+        ("cold", 42, vec!["--workspace"]),
+        ("source-edit", 43, vec!["-p", "artifact_app"]),
+        ("module-added", 44, vec!["--bin", "artifact_app"]),
+        ("module-removed", 49, vec!["--workspace"]),
+        ("data-added", 45, vec!["-p", "artifact_app"]),
+        ("data-edited", 46, vec!["--bin", "artifact_app"]),
+    ] {
+        match step {
+            "source-edit" => fs::write(
+                root.join("app/src/main.rs"),
+                "fn main() { println!(\"{}\", artifact_library::VALUE + 1); }\n",
+            )
+            .unwrap(),
+            "module-added" => {
+                fs::write(root.join("app/src/bonus.rs"), "pub const BONUS: u32 = 2;\n").unwrap();
+                fs::write(
+                    root.join("app/src/main.rs"),
+                    "mod bonus; fn main() { println!(\"{}\", artifact_library::VALUE + bonus::BONUS); }\n",
+                )
+                .unwrap();
+            }
+            "module-removed" => {
+                // Move outside the captured workspace so the old module is
+                // absent while preserving its bytes for inspection.
+                fs::rename(root.join("app/src/bonus.rs"), owner.path().join("bonus.rs")).unwrap();
+                fs::write(
+                    root.join("app/src/main.rs"),
+                    "fn main() { println!(\"{}\", artifact_library::VALUE + 7); }\n",
+                )
+                .unwrap();
+            }
+            "data-added" => {
+                fs::write(root.join("app/src/offset.txt"), "3\n").unwrap();
+                fs::write(
+                    root.join("app/src/main.rs"),
+                    "fn main() { println!(\"{}\", artifact_library::VALUE + include_str!(\"offset.txt\").trim().parse::<u32>().unwrap()); }\n",
+                )
+                .unwrap();
+            }
+            "data-edited" => fs::write(root.join("app/src/offset.txt"), "4\n").unwrap(),
+            "cold" => {}
+            _ => unreachable!(),
+        }
+        let captured = capture();
+        assert_eq!(
+            source_edit_identity(&captured, captured.digest(), None),
+            Some(family),
+            "{step} must retain the private Cargo seed family",
+        );
+        if step != "cold" {
+            assert_ne!(
+                captured.digest(),
+                previous,
+                "{step} must still have a different exact source identity",
+            );
+        }
+        previous = captured.digest();
+        let args = arguments("build", &selection);
+        assert_eq!(
+            compatible_arguments(
+                "/__rabs/toolchain/bin/cargo",
+                &args,
+                CargoArtifactMode::Compilation,
+            ),
+            Some(build_shape.clone()),
+        );
+        let output = run(&args, CargoArtifactMode::Compilation);
+        let artifacts = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        for (name, expected_fresh) in [
+            ("artifact_library", step != "cold"),
+            ("artifact_app", false),
+        ] {
+            let artifact = artifacts
+                .iter()
+                .find(|message| message["target"]["name"] == name)
+                .unwrap_or_else(|| panic!("{step}: missing real Cargo artifact for {name}"));
+            assert_eq!(artifact["fresh"], expected_fresh, "{step}: {name}");
+        }
+        let executed = Command::new(output_root.join("debug/artifact_app"))
+            .output()
+            .unwrap();
+        assert!(executed.status.success());
+        assert_eq!(executed.stdout, format!("{expected}\n").as_bytes());
+        eprintln!(
+            "{step}: output={expected}, dependency fresh={}",
+            step != "cold"
+        );
+    }
+
+    for (command, selection, mode) in [
+        ("check", vec!["--workspace"], CargoArtifactMode::Compilation),
+        (
+            "test",
+            vec!["--workspace", "--no-run"],
+            CargoArtifactMode::Compilation,
+        ),
+        (
+            "test",
+            vec!["-p", "artifact_library", "--lib", "value", "--", "--exact"],
+            CargoArtifactMode::TestExecution,
+        ),
+    ] {
+        let args = arguments(command, &selection);
+        assert_eq!(
+            compatible_arguments("/__rabs/toolchain/bin/cargo", &args, mode),
+            Some(build_shape.clone()),
+        );
+        let output = run(&args, mode);
+        if mode == CargoArtifactMode::TestExecution {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "test selection must execute the real test after compilation",
+            );
+        }
+    }
+    let clippy = compatible_arguments(
+        "/__rabs/toolchain/bin/cargo-clippy",
+        &arguments("clippy", &["--workspace", "--", "-Dwarnings"]),
+        CargoArtifactMode::Compilation,
+    )
+    .unwrap();
+    assert_ne!(clippy, build_shape, "Clippy retains a separate seed family");
+    assert_ne!(
+        Some(clippy),
+        compatible_arguments(
+            "/__rabs/toolchain/bin/cargo-clippy",
+            &arguments("clippy", &["-p", "artifact_library", "--", "-Dwarnings"]),
+            CargoArtifactMode::Compilation,
+        ),
+        "Clippy package selection must not erase lint execution",
+    );
+
+    let manifest = root.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\n# resolution/configuration boundary changed\n",
+            fs::read_to_string(&manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    let changed = capture();
+    assert_ne!(
+        source_edit_identity(&changed, changed.digest(), None),
+        Some(family),
+        "Cargo manifests remain exact even when the edited comment changes no output",
+    );
 }
 
 #[test]
