@@ -9,8 +9,11 @@ fn source_claim_inventory_preserves_complete_ownership_checks() {
     let fixture = tempfile::tempdir().expect("inventory fixture").keep();
     let script = fixture.join("transaction.sh");
     let helpers = fixture.join("helpers.sh");
-    std::fs::write(&script, include_str!("../src/hook/source_claim_registry.sh"))
-        .expect("write compiled transaction");
+    std::fs::write(
+        &script,
+        include_str!("../src/hook/source_claim_registry.sh"),
+    )
+    .expect("write compiled transaction");
     std::fs::write(
         &helpers,
         rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,

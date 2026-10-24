@@ -8,7 +8,10 @@ fn prepared_tools_keep_their_directory_binding() {
     std::fs::write(&script, include_str!("../src/transfer/node_prepare.sh"))
         .expect("write compiled preparation script");
     let output = std::process::Command::new("python3")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/node_prepare_paths.py"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/node_prepare_paths.py"
+        ))
         .env("RCH_NODE_PREPARE_SCRIPT", &script)
         .output()
         .expect("run native prepared-tool tests");

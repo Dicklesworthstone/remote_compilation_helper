@@ -1394,9 +1394,25 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
     #[test]
     fn packaging_option_values_never_enable_a_dry_run() {
         for flag in [
-            "--index", "--registry", "--token", "--color", "--config", "-Z", "-C",
-            "-p", "--package", "--exclude", "-F", "--features", "-j", "--jobs",
-            "--target", "--target-dir", "-m", "--manifest-path", "--lockfile-path",
+            "--index",
+            "--registry",
+            "--token",
+            "--color",
+            "--config",
+            "-Z",
+            "-C",
+            "-p",
+            "--package",
+            "--exclude",
+            "-F",
+            "--features",
+            "-j",
+            "--jobs",
+            "--target",
+            "--target-dir",
+            "-m",
+            "--manifest-path",
+            "--lockfile-path",
             "--message-format",
         ] {
             let inline = format!("{flag}=--dry-run");

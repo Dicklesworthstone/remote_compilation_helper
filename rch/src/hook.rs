@@ -5517,8 +5517,8 @@ use rabs_recorder::record_invocation;
 mod daemon_ipc;
 pub(crate) use daemon_ipc::{
     RestartAdmissionWait, query_admission_preview, query_daemon, query_daemon_dry_run,
-    release_worker,
-    restart_admission_is_closed, restart_admission_wait_bound, wait_for_restart_admission,
+    release_worker, restart_admission_is_closed, restart_admission_wait_bound,
+    wait_for_restart_admission,
 };
 use daemon_ipc::{
     disable_worker_for_fault, queue_when_busy_enabled, record_build, release_worker_with_fault,

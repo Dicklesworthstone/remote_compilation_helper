@@ -1314,7 +1314,10 @@ mod bounded_ipc_tests {
             let (reader, mut writer) = stream.into_split();
             let mut line = String::new();
             BufReader::new(reader).read_line(&mut line).await.unwrap();
-            assert!(line.starts_with("GET /admission-preview?request="), "{line}");
+            assert!(
+                line.starts_with("GET /admission-preview?request="),
+                "{line}"
+            );
             assert!(!line.contains("/select-worker"), "{line}");
             writer
                 .write_all(
@@ -1337,7 +1340,10 @@ mod bounded_ipc_tests {
         .unwrap();
         let response = response.unwrap();
         assert!(response.selection.build_id.is_none());
-        assert!(matches!(response.selection.reason, SelectionReason::AllWorkersBusy));
+        assert!(matches!(
+            response.selection.reason,
+            SelectionReason::AllWorkersBusy
+        ));
     }
 
     async fn caller_fixture(
