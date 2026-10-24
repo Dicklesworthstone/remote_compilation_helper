@@ -636,6 +636,16 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
         nonlocal cancelled
         cancelled = True
 
+    def stop(reason, **detail):
+        # Diagnostics must not delay the existing kill fence. This separate
+        # marker never attests disk usage or successful command completion.
+        try:
+            emit_receipts([(marker[:-len(DISK_MARKER_SUFFIX)] + "_DISK_GUARDIAN:", {
+                "reason": reason, "started": started, **detail,
+            })])
+        finally:
+            kill_owned_group(group)
+
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
     last_heartbeat = time.monotonic()
@@ -656,12 +666,15 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
                 completed = completed or b"C" in os.read(read_fd, 4096)
             if os.WIFEXITED(status) and completed:
                 return os.WEXITSTATUS(status)
-            kill_owned_group(group)
+            stop("supervisor_exit_unconfirmed", wait_status=status)
         deadline = HEARTBEAT_DEADLINE if started else SCAN_DEADLINE + 10
-        if cancelled or os.getppid() != parent or time.monotonic() - last_heartbeat > deadline:
+        age = time.monotonic() - last_heartbeat
+        if cancelled or os.getppid() != parent or age > deadline:
             # Also fences a wedged fsync/receipt or process-identity probe. A
             # missing receipt is unconfirmed execution, never safe local replay.
-            kill_owned_group(group)
+            reason = "cancelled" if cancelled else (
+                "parent_lost" if os.getppid() != parent else "heartbeat_timeout")
+            stop(reason, heartbeat_age_seconds=age)
         time.sleep(0.1)
 
 

@@ -532,9 +532,12 @@ else:
     def test_guardian_kills_writers_when_supervisor_is_killed(self):
         ready = self.target / "writer"
         process, receipt = self.spawn(f"from pathlib import Path; import os,signal,time; Path({str(ready)!r}).write_text(str(os.getpid())); os.kill(os.getppid(),signal.SIGKILL); time.sleep(20)")
-        status, _, _ = self.complete(process)
+        status, _, stderr = self.complete(process)
         self.assertNotEqual(status, 0)
         self.assertEqual(receipt.read_text(), "")
+        diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
+        self.assertEqual(diagnostic["reason"], "supervisor_exit_unconfirmed")
+        self.assertEqual(diagnostic["wait_status"], signal.SIGKILL)
         record = monitor.process_snapshot().get(int(ready.read_text()))
         self.assertTrue(record is None or record["state"] in ("Z", "X"))
 
@@ -664,6 +667,9 @@ m.finish_descendants=finish"""
         self.assertNotEqual(status, 0, stderr)
         self.assertIn("foreground-finished", stdout)
         self.assertEqual(receipt.read_text(), "")
+        diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
+        self.assertEqual(diagnostic["reason"], "heartbeat_timeout")
+        self.assertTrue(diagnostic["started"])
 
 
 if __name__ == "__main__":
