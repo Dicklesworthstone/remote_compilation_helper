@@ -2358,7 +2358,11 @@ async fn execute_remote_compilation_inner(
     }
 
     let mut captured_disk_failure = disk_failure.borrow_mut().take();
-    if captured_disk_failure.is_none() && disk_peak_output_bytes.get().is_none() {
+    // Mock transport never runs the remote disk supervisor, so it has neither
+    // a receipt to read nor usage to certify (as in `execute_remote`).
+    let disk_supervised = !crate::transfer::use_mock_transport(&worker_config);
+    if disk_supervised && captured_disk_failure.is_none() && disk_peak_output_bytes.get().is_none()
+    {
         // A full stderr pipe may drop control output. The immutable receipt
         // remains available after confirmed completion and is attempt-bound.
         if let Some(receipt) = pipeline
@@ -2417,7 +2421,8 @@ async fn execute_remote_compilation_inner(
         }
         return Err(failure.into());
     }
-    if disk_peak_output_bytes.get().is_none()
+    if disk_supervised
+        && disk_peak_output_bytes.get().is_none()
         && !(result.exit_code == 137 && deadline_triggered.get())
     {
         pipeline.ensure_remote_disk_budget(&result)?;

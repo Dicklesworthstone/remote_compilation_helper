@@ -885,7 +885,7 @@ fn test_doctor_reliability_json_outputs_real_binary_response() {
         parsed
             .pointer("/data/schema_version")
             .and_then(|value| value.as_str()),
-        Some("1.0.0")
+        Some("1.1.0")
     );
     assert_eq!(
         parsed

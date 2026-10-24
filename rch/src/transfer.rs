@@ -2621,7 +2621,7 @@ async fn execute_source_rsync_attempt(cmd: Command) -> Result<std::process::Outp
     .into())
 }
 
-fn use_mock_transport(worker: &WorkerConfig) -> bool {
+pub(crate) fn use_mock_transport(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
 }
 
@@ -12351,10 +12351,12 @@ Number of files transferred: 42
                 false,
                 15,
             ),
-            (Some(2), "exit 101", 101, false, 15),
-            (None, "exit 137", 137, false, 15),
-            (Some(3), "exec sleep 20", 137, true, 1),
-            (None, "exec sleep 20", 137, true, 1),
+            // The color wrapper runs the first word through env(1), so each
+            // workload starts with a program, as a real build command does.
+            (Some(2), "sh -c 'exit 101'", 101, false, 15),
+            (None, "sh -c 'exit 137'", 137, false, 15),
+            (Some(3), "sleep 20", 137, true, 1),
+            (None, "sleep 20", 137, true, 1),
         ]
         .into_iter()
         .enumerate()
