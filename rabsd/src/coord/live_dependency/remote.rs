@@ -268,6 +268,19 @@ struct RetainedToolchain {
     _directory: tempfile::TempDir,
 }
 
+fn toolchain_staging_directory(state: &Path) -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("compiler-");
+    // TempDir otherwise inherits 0777 masked by the caller's umask. The
+    // retained dataset requires an owner-private parent before its first write.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(state)
+}
+
 /// The edge has checked the actual key and the same typed execution context
 /// accepted by the worker. Unsupported path/loader shapes cannot fail late
 /// after the transport crossed its execution frontier.
@@ -568,10 +581,8 @@ impl RemoteDependencies {
                         return Err("toolchain capture cancelled".into());
                     }
                     capture_guard.verify_unchanged(&capture_compiler)?;
-                    let directory = tempfile::Builder::new()
-                        .prefix("compiler-")
-                        .tempdir_in(state)
-                        .map_err(|error| error.to_string())?;
+                    let directory =
+                        toolchain_staging_directory(&state).map_err(|error| error.to_string())?;
                     let image = capture_toolchain(
                         capture_guard.sysroot(),
                         &directory.path().join("tree"),
@@ -1255,6 +1266,69 @@ mod worker_pool_tests {
     use super::*;
     use rabs_asupersync::worker_transport::TlsFiles;
     use rabs_key::typed_digest::compute;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn toolchain_staging_is_private_and_accepted_by_dataset_capture() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = crate::test_util::private_tempdir();
+        let source = crate::test_util::private_tempdir();
+        fs::create_dir(source.path().join("bin")).unwrap();
+        let bytes = b"fixture compiler bytes; never executed";
+        fs::write(source.path().join("bin/rustc"), bytes).unwrap();
+        fs::set_permissions(
+            source.path().join("bin/rustc"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let directory = toolchain_staging_directory(state.path()).unwrap();
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let limits = ToolchainLimits::default();
+        let expected =
+            rabs_sandbox::toolchain_dataset::fingerprint_toolchain(source.path(), &limits, || {
+                false
+            })
+            .unwrap();
+        let image = capture_toolchain(
+            source.path(),
+            &directory.path().join("tree"),
+            Some(&expected),
+            &limits,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(image.identity(), &expected);
+        assert_eq!(fs::read(image.root().join("bin/rustc")).unwrap(), bytes);
+        image
+            .verify_source_unchanged(source.path(), || false)
+            .unwrap();
+
+        // Keep the strict capture boundary: a public parent is still refused
+        // before any output directory or compiler bytes can be created.
+        let public = state.path().join("public");
+        fs::create_dir(&public).unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+        let destination = public.join("refused");
+        let failure = capture_toolchain(
+            source.path(),
+            &destination,
+            Some(&expected),
+            &limits,
+            || false,
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("toolchain destination parent must be private")
+        );
+        assert!(!destination.exists());
+    }
 
     fn endpoint(index: u16) -> Value {
         json!({

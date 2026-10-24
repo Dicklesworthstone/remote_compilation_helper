@@ -1686,6 +1686,47 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
     .to_string()
 }
 
+/// Preserve the worker's process-lifetime runtime roots across reconnects.
+/// Diagnostic retention may still own files beneath them after a session ends;
+/// creating a session-scoped TempDir here would discard those files too early.
+/// New Unix roots are private from creation, independent of a permissive umask.
+/// Existing roots are checked without changing permissions or adopting aliases.
+fn prepare_runtime_directory(path: &std::path::Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker runtime root must be a real directory, not a symlink or file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker runtime root must not be writable by group or other users",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker runtime root must be owned by the worker",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn session_loop(
     cx: &Cx,
     coordinator: &str,
@@ -1854,7 +1895,7 @@ async fn session_loop(
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
     let spills = std::env::temp_dir().join(format!("rabs-wkr-spill-{}", std::process::id()));
     for path in [&cargo_home, &home, &spills] {
-        std::fs::create_dir_all(path).map_err(|e| format!("prepare {}: {e}", path.display()))?;
+        prepare_runtime_directory(path).map_err(|e| format!("prepare {}: {e}", path.display()))?;
     }
     let journal_root = journal.storage_root().to_path_buf();
     journal.clear_result_recipient();
@@ -2740,6 +2781,156 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    mod runtime_directory_tests {
+        use super::{prepare_runtime_directory, private_root};
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        #[test]
+        fn runtime_directory_creation_is_private_and_reconnect_preserves_existing_bytes() {
+            let parent = private_root();
+            for name in ["cargo-home", "home", "spills"] {
+                let path = parent.path().join(name);
+                prepare_runtime_directory(&path).unwrap();
+                let created = fs::symlink_metadata(&path).unwrap();
+                assert_eq!(created.permissions().mode() & 0o777, 0o700);
+                assert_eq!(created.uid(), rustix::process::geteuid().as_raw());
+                let retained = path.join("retained-output");
+                fs::write(&retained, b"output still awaiting acknowledgement\0\xff").unwrap();
+                for mode in [0o700, 0o750, 0o755] {
+                    // Older workers created 0755 roots with a normal umask.
+                    // They remain usable without chmod or new inode ownership.
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                    prepare_runtime_directory(&path).unwrap();
+                    let after = fs::symlink_metadata(&path).unwrap();
+                    assert_eq!((after.dev(), after.ino()), (created.dev(), created.ino()));
+                    assert_eq!(after.permissions().mode() & 0o777, mode);
+                    assert_eq!(
+                        fs::read(&retained).unwrap(),
+                        b"output still awaiting acknowledgement\0\xff"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn runtime_directory_refuses_writable_or_redirected_roots_without_mutation() {
+            let parent = private_root();
+            for mode in [0o770, 0o707, 0o777] {
+                let path = parent.path().join(format!("writable-{mode:o}"));
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("retained"), b"existing output").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                let before = fs::symlink_metadata(&path).unwrap();
+                assert!(prepare_runtime_directory(&path).is_err());
+                let after = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+                assert_eq!(after.permissions().mode() & 0o777, mode);
+                assert_eq!(fs::read(path.join("retained")).unwrap(), b"existing output");
+            }
+            let real = parent.path().join("real");
+            prepare_runtime_directory(&real).unwrap();
+            fs::write(real.join("retained"), b"do not adopt this directory").unwrap();
+            let alias = parent.path().join("alias");
+            symlink(&real, &alias).unwrap();
+            assert!(prepare_runtime_directory(&alias).is_err());
+            assert!(
+                fs::symlink_metadata(&alias)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                fs::read(real.join("retained")).unwrap(),
+                b"do not adopt this directory"
+            );
+            let missing = parent.path().join("missing");
+            let dangling = parent.path().join("dangling");
+            symlink(&missing, &dangling).unwrap();
+            assert!(prepare_runtime_directory(&dangling).is_err());
+            assert!(!missing.exists());
+            assert!(
+                fs::symlink_metadata(&dangling)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let file = parent.path().join("file");
+            fs::write(&file, b"keep ordinary file bytes").unwrap();
+            assert!(prepare_runtime_directory(&file).is_err());
+            assert_eq!(fs::read(file).unwrap(), b"keep ordinary file bytes");
+        }
+
+        #[test]
+        fn runtime_directory_refuses_foreign_ownership_when_chown_is_available() {
+            let parent = private_root();
+            let path = parent.path().join("foreign");
+            prepare_runtime_directory(&path).unwrap();
+            fs::write(path.join("retained"), b"foreign owner output").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let held = fs::File::open(&path).unwrap();
+            let own = rustix::process::geteuid();
+            let foreign = rustix::process::Uid::from_raw(if own.is_root() { 1 } else { 0 });
+            match rustix::fs::fchown(&held, Some(foreign), None) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::PERM | rustix::io::Errno::INVAL) => {
+                    eprintln!(
+                        "foreign-owner runtime fixture needs chown permission and a mapped UID"
+                    );
+                    return;
+                }
+                Err(error) => panic!("create foreign-owned runtime fixture: {error}"),
+            }
+            let refused = prepare_runtime_directory(&path);
+            let observed = fs::symlink_metadata(&path).unwrap();
+            // Restore only our fixture's ownership after observing the result,
+            // so its test owner can reclaim it on hosts with limited UID maps.
+            rustix::fs::fchown(&held, Some(own), None).unwrap();
+            assert!(refused.is_err());
+            assert_eq!(observed.uid(), foreign.as_raw());
+            assert_eq!(observed.permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                fs::read(path.join("retained")).unwrap(),
+                b"foreign owner output"
+            );
+        }
+
+        #[test]
+        fn runtime_directory_supports_real_runtime_capture_without_losing_retained_output() {
+            let parent = private_root();
+            let toolchain = parent.path().join("toolchain");
+            fs::create_dir_all(toolchain.join("bin")).unwrap();
+            // A real ELF no-op measures the actual host loader/runtime. It is
+            // not a compiler fixture or evidence of a remote compilation.
+            let executable = toolchain.join("bin/rustc");
+            fs::copy("/usr/bin/true", &executable).unwrap();
+            let output = parent.path().join("output");
+            let spills = parent.path().join("spills");
+            prepare_runtime_directory(&output).unwrap();
+            prepare_runtime_directory(&spills).unwrap();
+            let transcript = spills.join("completed-stdout");
+            fs::write(&transcript, b"completed stream awaiting its recipient").unwrap();
+            let retained = rabs_sandbox::runtime_cohort::retain_runtime_cohort(
+                &executable,
+                &toolchain,
+                &[],
+                &output,
+                &spills,
+                || false,
+            )
+            .unwrap();
+            retained.verify(|| false).unwrap();
+            drop(retained);
+            prepare_runtime_directory(&spills).unwrap();
+            assert_eq!(
+                fs::read(&transcript).unwrap(),
+                b"completed stream awaiting its recipient"
+            );
+            assert_eq!(fs::read_dir(&spills).unwrap().count(), 1);
+        }
     }
 
     #[cfg(unix)]
