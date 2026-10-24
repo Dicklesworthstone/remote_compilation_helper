@@ -80,11 +80,15 @@ def linux_process(path):
     }
 
 
-def process_snapshot():
+def process_snapshot(heartbeat=lambda: None):
     result = {}
     if sys.platform.startswith("linux"):
         with os.scandir("/proc") as entries:
             for entry in entries:
+                # A large, progressing census is not a wedged kernel read.
+                # Keep the guardian armed between records; any individual
+                # scandir/read stall still receives no heartbeat and is fenced.
+                heartbeat()
                 if not entry.name.isdecimal():
                     continue
                 try:
@@ -95,6 +99,7 @@ def process_snapshot():
                     if record["state"] in ("Z", "X"):
                         with os.scandir(entry.path + "/task") as tasks:
                             for task in tasks:
+                                heartbeat()
                                 try:
                                     thread = linux_process(task.path + "/stat")
                                     result[thread["pid"]] = thread
@@ -107,6 +112,7 @@ def process_snapshot():
             ["ps", "-axo", "pid=,ppid=,pgid=,stat="], timeout=1, text=True
         )
         for line in output.splitlines():
+            heartbeat()
             pid, parent, group, state = line.split()
             result[int(pid)] = {
                 "pid": int(pid), "parent": int(parent), "group": int(group),
@@ -460,7 +466,7 @@ def finish_descendants(monitor, heartbeat):
     while True:
         heartbeat()
         monitor.check_owner()
-        snapshot = process_snapshot()
+        snapshot = process_snapshot(heartbeat)
         descendants = [record for record in snapshot.values()
                        if record["group"] == monitor.group and record["pid"] not in monitor.controls
                        and record["state"] not in ("Z", "X")]
@@ -579,11 +585,15 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
                     receipts.append(usage_receipt(marker, monitor, False))
             else:
                 receipts = receipts_for_failure(marker, failure, budget, floor, started, monitor)
+            # A failing filesystem can also wedge receipt fsync. Publish the
+            # bounded, nonblocking failure diagnostic first so the guardian's
+            # subsequent kill does not erase the reason. This is never a
+            # completion acknowledgement; durable success still comes first.
+            with contextlib.suppress(OSError):
+                emit_receipts(receipts)
             if receipt_owned:
                 with contextlib.suppress(OSError):
                     persist_receipts(receipt_path, receipts)
-            with contextlib.suppress(OSError):
-                emit_receipts(receipts)
         finally:
             # A broken serializer, receipt writer, or diagnostic must never
             # bypass the only cleanup boundary for a possibly started child.

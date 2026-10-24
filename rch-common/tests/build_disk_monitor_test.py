@@ -578,7 +578,13 @@ else:
         ready = self.target / "writer"
         output = self.target / "large"
         process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); Path({str(output)!r}).write_bytes(b'x'*{4*MIB}); time.sleep(20)", budget=2 * MIB, inject=inject)
-        self.complete(process)
+        status, _, stderr = self.complete(process)
+        self.assertNotEqual(status, 0)
+        failures = [json.loads(line[len(MARKER):]) for line in stderr.splitlines()
+                    if line.startswith(MARKER)]
+        self.assertEqual(len(failures), 1, stderr)
+        self.assertEqual(failures[0]["reason"], "growth")
+        self.assertTrue(failures[0]["started"])
         self.assertEqual(receipt.read_text(), "")
         record = monitor.process_snapshot().get(int(ready.read_text()))
         self.assertTrue(record is None or record["state"] in ("Z", "X"))
@@ -610,6 +616,54 @@ m.receipts_for_failure=broken_receipt"""
         opened.assert_called_once_with(123)
         sent.assert_called_once_with(789, signal.SIGKILL)
         numeric_kill.assert_not_called()
+
+    def test_terminal_census_progress_keeps_guardian_live(self):
+        # Delay real procfs records only during finalization. The whole census
+        # takes longer than the heartbeat deadline, but each read progresses.
+        # Keep the real namespace, membership, writer cleanup and receipts.
+        inject = """original_finish=m.finish_descendants
+original_process=m.linux_process
+remaining=0
+def process(path):
+    global remaining
+    result=original_process(path)
+    if remaining:
+        remaining-=1
+        time.sleep(0.6)
+    return result
+def finish(value, heartbeat):
+    global remaining
+    remaining=7
+    return original_finish(value, heartbeat)
+m.linux_process=process
+m.finish_descendants=finish"""
+        if not sys.platform.startswith("linux"):
+            self.skipTest("procfs record scheduling probe")
+        process, receipt = self.spawn("print('foreground-finished')", inject=inject)
+        status, stdout, stderr = self.complete(process, timeout=15)
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("foreground-finished", stdout)
+        usage = json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])
+        self.assertTrue(usage["complete"])
+        self.assertEqual(usage["exit_code"], 0)
+
+    def test_terminal_census_stalled_read_still_stops_group(self):
+        inject = """original_finish=m.finish_descendants
+original_process=m.linux_process
+def finish(value, heartbeat):
+    def stalled(path):
+        time.sleep(20)
+        return original_process(path)
+    m.linux_process=stalled
+    return original_finish(value, heartbeat)
+m.finish_descendants=finish"""
+        if not sys.platform.startswith("linux"):
+            self.skipTest("procfs record scheduling probe")
+        process, receipt = self.spawn("print('foreground-finished')", inject=inject)
+        status, stdout, stderr = self.complete(process, timeout=8)
+        self.assertNotEqual(status, 0, stderr)
+        self.assertIn("foreground-finished", stdout)
+        self.assertEqual(receipt.read_text(), "")
 
 
 if __name__ == "__main__":
