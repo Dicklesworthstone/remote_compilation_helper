@@ -733,7 +733,7 @@ pub const INCLUDED: &str = include_str!("message.txt");
 /// receive identical rustc arguments; only private backing paths differ.
 #[test]
 fn real_dependency_rustc_reads_shared_output_metadata_dag() {
-    dependency_metadata_dag(false);
+    dependency_metadata_dag(false, false);
 }
 
 /// Captured Cargo OUT_DIR files must remain readable beside shared dependency
@@ -741,11 +741,22 @@ fn real_dependency_rustc_reads_shared_output_metadata_dag() {
 /// the same generated paths and environment, and their actual outputs agree.
 #[test]
 fn real_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag() {
-    dependency_metadata_dag(true);
+    dependency_metadata_dag(true, false);
 }
 
-fn dependency_metadata_dag(with_generated: bool) {
-    use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
+/// A real archive consumer runs through source transfer, retained toolchain,
+/// the closed worker view and exact artifact capture. Its complete bytes and
+/// diagnostics must agree with stock rustc despite changed original OUT_DIR.
+#[test]
+fn real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag() {
+    dependency_metadata_dag(true, true);
+}
+
+fn dependency_metadata_dag(with_generated: bool, archive: bool) {
+    use rabs_sandbox::dependency_context::{
+        DependencyArtifactRoot, DependencyExecContext, DependencyExecutionMode,
+        DependencyIsolationSupport,
+    };
     use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
     use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceFile, SourceManifest};
     use rabs_sandbox::toolchain_dataset::{ToolchainLimits, fingerprint_toolchain};
@@ -760,7 +771,18 @@ fn dependency_metadata_dag(with_generated: bool) {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    if !namespace_supported() {
+    let mode = if archive {
+        DependencyExecutionMode::Rlib
+    } else {
+        DependencyExecutionMode::Metadata
+    };
+    let support = DependencyIsolationSupport::probe(mode);
+    if !support.is_supported() {
+        eprintln!(
+            "SKIP: dependency {} isolation unavailable: {:?}",
+            mode.as_str(),
+            support.missing()
+        );
         return;
     }
     let cargo =
@@ -842,12 +864,22 @@ pub const SOURCE: &str = file!();
     )
     .unwrap();
 
-    for (iteration, direct_kind) in ["rmeta", "rlib"].into_iter().enumerate() {
+    let direct_kinds: &[&str] = if archive {
+        &["rlib"]
+    } else {
+        &["rmeta", "rlib"]
+    };
+    for (iteration, direct_kind) in direct_kinds.iter().enumerate() {
         let args = vec![
             "--crate-name=dag_top".to_owned(),
             "--crate-type=lib".to_owned(),
             "--edition=2024".to_owned(),
-            "--emit=dep-info,metadata".to_owned(),
+            if archive {
+                "--emit=dep-info,metadata,link"
+            } else {
+                "--emit=dep-info,metadata"
+            }
+            .to_owned(),
             "--error-format=json".to_owned(),
             "--json=artifacts".to_owned(),
             "--cap-lints=allow".to_owned(),
@@ -909,8 +941,14 @@ pub const SOURCE: &str = file!();
             !stock.stderr.is_empty(),
             "real rustc must emit artifact notifications"
         );
-        let expected: BTreeMap<_, _> = ["dag_top.d", "libdag_top.rmeta"]
-            .into_iter()
+        let names: &[&str] = if archive {
+            &["dag_top.d", "libdag_top.rlib", "libdag_top.rmeta"]
+        } else {
+            &["dag_top.d", "libdag_top.rmeta"]
+        };
+        let expected: BTreeMap<_, _> = names
+            .iter()
+            .copied()
             .map(|name| (name.to_owned(), std::fs::read(out.join(name)).unwrap()))
             .collect();
         let mut retained = BTreeMap::from([
@@ -970,7 +1008,10 @@ pub const SOURCE: &str = file!();
                 "executable":false,
             })).collect::<Vec<_>>(),
         });
-        let request_id = 426_000 + if with_generated { 1_000 } else { 0 } + iteration as u64;
+        let request_id = 426_000
+            + if with_generated { 1_000 } else { 0 }
+            + if archive { 2_000 } else { 0 }
+            + iteration as u64;
         let wire = json!({"kind":"canonical-exec", "request_id":request_id,
             "source_manifest":manifest_json});
         let mut transfer = SourceTransferState::default();
@@ -1024,7 +1065,8 @@ pub const SOURCE: &str = file!();
             env,
             cohort.bytes,
         )
-        .unwrap();
+        .unwrap()
+        .with_execution_mode(mode);
         let request = CanonicalExecRequest {
             request_id,
             program: compiler.to_str().unwrap().to_owned(),
@@ -1101,7 +1143,7 @@ pub const SOURCE: &str = file!();
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["dag_top.d", "libdag_top.rmeta"],
+            expected.keys().map(String::as_str).collect::<Vec<_>>(),
             "retained inputs and their mount placeholders must not be returned as outputs"
         );
         for (name, bytes) in &expected {

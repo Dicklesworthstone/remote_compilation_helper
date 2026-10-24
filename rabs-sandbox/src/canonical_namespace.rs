@@ -70,7 +70,7 @@ impl HostIsolationSupport {
 
     // An explicit executable keeps fixture subprocesses independent of global
     // PATH mutations. Production always selects the same bwrap as command_for.
-    fn probe_with_bubblewrap(executable: &Path) -> Self {
+    pub(crate) fn probe_with_bubblewrap(executable: &Path) -> Self {
         if !cfg!(target_os = "linux") {
             return Self {
                 bubblewrap: None,

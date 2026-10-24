@@ -164,8 +164,9 @@ arbitrary workspace code generation or build-script replay. Private proc and
 device views still exist, and arbitrary later dynamic loading, locale/NSS
 data, time and randomness are not a complete discovered input closure.
 
-The remote class accepts metadata-only dependency actions
-(`--emit=dep-info,metadata`), including explicit `--extern name=/path/lib*.rmeta`
+The remote classes accept metadata-only dependency actions
+(`--emit=dep-info,metadata`) and pure Rust `lib`/`rlib` archive actions
+(`--emit=dep-info,link` with optional `metadata`), including explicit `--extern name=/path/lib*.rmeta`
 and `--extern name=/path/lib*.rlib` inputs. The key covers each direct extern
 and the complete candidate inventories of every dependency search directory,
 including metadata or archives rustc can discover through transitive
@@ -178,12 +179,12 @@ A populated dependency search directory may be disjoint from the action's
 output directory or may be that same directory. In the shared case, the worker
 places each retained dependency file above its private writable output mount
 as a separate read-only bind. Bare toolchain externs, proc macros,
-native libraries and linker output remain local. Build scripts themselves
+native libraries and executable/shared-library linker output remain local. Build scripts themselves
 also continue to run locally.
 These limits apply to each compiler action; they do not prevent Cargo from
 continuing with other units.
 
-Metadata dependency actions may consume a previously completed Cargo build
+Both dependency classes may consume a previously completed Cargo build
 script's generated `OUT_DIR` tree. Admission binds the exact captured Cargo
 build-script output record, the original `OUT_DIR` path and every generated
 file, including an explicitly captured empty tree. A tree containing empty
@@ -197,7 +198,7 @@ the build script's execution.
 
 The worker keeps the original source, generated-input, output and toolchain
 path spellings and full compiler environment inside private mounts. The
-`dependency-exec-v6` context binds an explicit list of populated dependency
+`dependency-exec-v7` context binds an explicit list of populated dependency
 roots to their first-use directory indices. A single sealed source transfer contains
 `package/<source-path>`, optional `generated/<generated-path>` and
 `dependencies/NNNN/<artifact-basename>`; only the declared package, generated
@@ -223,7 +224,31 @@ subdirectories. A loader directory cannot be the generated root or lie inside
 it. Unsupported loader paths or changing source, generated input, build-script
 record, artifact, toolchain or runtime observations refuse remote admission
 or installation.
-The launcher requires a daemon advertising `dependency-exec-v6`; old execution
+The context also requires an explicit `execution_mode`: `metadata` retains the
+existing proc/device view, while `rlib` removes procfs and general devices and
+exposes only `/dev/null`. This closes assembler file reads that rustc dep-info
+does not record, including `.incbin`. Source, generated, dependency, toolchain
+and selected runtime files remain captured and read-only; output and temporary
+trees remain private. Archive keys bind exact original paths and environment
+instead of inheriting metadata-only layout projections. Native inputs,
+proc macros and unmodeled codegen outputs cannot enter this archive class.
+This profile does not establish arbitrary workspace or plugin hermeticity.
+
+Workers measure these profiles separately. Their hello advertises
+`dependency_execution_modes` containing only the supported `metadata` and/or
+`rlib` modes; the authenticated session grant selects the exact
+`dependency_execution_mode` in the request. Missing, unknown or mismatched
+modes refuse before admission, input upload or execution. The archive probe
+uses the same namespace setup as archive execution, including user, PID, IPC,
+UTS and network isolation, private temporary filesystems and `/dev/null`.
+The null device must be the Linux character device 1:3; a symlink, regular
+file or different device refuses both probing and namespace construction.
+A host that cannot mount procfs can still execute the measured archive profile.
+Metadata and whole-Cargo execution retain their full canonical isolation checks.
+Sealed-result recovery requires the original request fingerprint and retained
+bytes, without requiring the restarted host to support new execution.
+
+The launcher requires a daemon advertising `dependency-exec-v7`; old execution
 contexts cannot admit new work. Already sealed results from older contexts can
 still resume against their exact saved request fingerprint.
 
@@ -315,13 +340,17 @@ CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
 This starts a live daemon if needed. Subsequent invocations retain the exported
 pool selection so the launcher checks the attached daemon's exact normalized
 configuration, including worker order, remote protocol 1 and
-`dependency-exec-v6`. The advertised `remote_dependency` object contains these
+`dependency-exec-v7`. The advertised `remote_dependency` object contains these
 protocol fields and a `workers` array in configured order. A singleton daemon
 does not satisfy a pool request, even when the pool contains that one worker.
 An existing daemon is never reconfigured or restarted to fit a new request;
 use a separate socket and state directory when changing the selection.
 
-Independent eligible metadata actions can execute concurrently, with at most
+Use `build --locked` in the same launcher command to accelerate eligible
+dependency archives during an ordinary Cargo build. Cargo continues to run
+the final executable link and unsupported compiler actions locally.
+
+Independent eligible metadata or archive actions can execute concurrently, with at most
 one admitted action per worker. Selection rotates across available slots, and
 each reservation remains held through execution, result capture and publication.
 Two requests for the same action cannot consume separate workers while the
@@ -331,8 +360,8 @@ failure or uncertain result after dispatch never causes an automatic retry on
 another worker. Durable recovery remains bound to the selected worker's identity.
 
 The pool retains all source, toolchain, isolation and output checks described
-above. It expands concurrency for the supported metadata dependency class;
-ordinary archive/codegen actions, native linking, proc macros and build-script
+above. It expands concurrency for the supported metadata and closed archive classes;
+other codegen actions, native linking, proc macros and build-script
 execution retain their existing local path. `--rabs-require-daemon` guarantees
 matching daemon setup, not remote execution of every Cargo action. The original
 three-variable singleton configuration and its status fields remain supported.
@@ -428,13 +457,31 @@ receipt. Terminal events are associated with the crate that admitted their
 action key; one crate's successful execution cannot stand in for another's.
 Toolchain warmup may let different nodes start qualification on different runs.
 
-With `dependency-exec-v6`, this DAG oracle can use shared or disjoint dependency
+With `dependency-exec-v7`, this DAG oracle can use shared or disjoint dependency
 and output directories. It performs no compiler-argument rewriting and never
 treats local fallback as evidence of remote admission. It selects the installed
 Cargo and its matching compiler explicitly; ordinary rustup-based Cargo use
 can select that compiler itself. Both integration fixtures are ignored by
 default and must be run on the supported host to establish execution evidence.
 Their presence alone does not assert a successful RABS remote run.
+
+The corresponding `cargo build` fixture exercises code generation and final
+linking with the same offline graph:
+
+```sh
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test prepared_operation_live \
+    actual_offline_cargo_build_uses_remote_archives_then_links_and_replays \
+    -- --ignored --nocapture
+```
+
+It compares ten Cargo-selected archive, metadata and dep-info outputs with the
+stock build, links and executes the consumer (which must print `146`), requires
+three actual remote archive productions for each dependency, and verifies a
+later build uses all three cached dependencies without another worker receipt.
+It requires the measured archive profile, matching binaries and OpenSSL. Local
+fallback or the stock baseline alone cannot satisfy the remote assertions.
 
 A worker-level native fixture explicitly exercises a populated shared directory
 with both metadata and archive direct externs, transitive metadata resolution,
@@ -464,6 +511,32 @@ It compares stock rustc and worker metadata, dep-info and JSON diagnostics at
 the same paths, and checks that generated input files are not returned as
 outputs. This fixture has not yet been run on the supported isolation host;
 the new test alone does not establish execution evidence.
+
+The archive variant runs the same shared dependency and generated-input shape
+through the worker's closed archive profile and compares all three outputs with
+stock rustc:
+
+```sh
+cargo test -p rabs-wkr --test process_tree_linux \
+  real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
+  -- --nocapture
+```
+
+The sandbox-level native regression separately exercises assembler inputs that
+do not appear in dep-info. It requires successful archive isolation rather than
+silently skipping on an unsupported host:
+
+```sh
+RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+  cargo test -p rabs-sandbox --lib \
+    real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
+    -- --ignored --nocapture
+```
+
+It compiles an archive containing captured `.incbin` bytes and refuses attempts
+to read host-only files, procfs or `/dev/urandom`. This proves the production
+sandbox boundary; the worker and live Cargo fixtures establish the broader
+remote execution and replay behavior when run successfully.
 
 ## Run one delivery
 

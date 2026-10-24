@@ -148,6 +148,26 @@ fn fixture_spec(label: &str) -> CanonicalNamespaceSpec {
     spec
 }
 
+fn incremental_request(options: &[&str]) -> (CanonicalExecRequest, ArtifactPlan) {
+    use rabs_sandbox::cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION;
+    let (mut request, _) = cargo_request("build", options);
+    request.command_context = CommandContext::new(
+        "/__rabs/workspace",
+        vec![("CARGO_INCREMENTAL".into(), "1".into())],
+    )
+    .unwrap();
+    let plan = crate::artifacts::parse_plan(&serde_json::json!({
+        "program":request.program, "args":request.args,
+        "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+            "env":{"CARGO_INCREMENTAL":"1"}},
+        "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1",
+            "cargo":CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION},
+    }))
+    .unwrap()
+    .unwrap();
+    (request, plan)
+}
+
 fn support() -> HostIsolationSupport {
     // A pure key-construction fixture, not evidence of native namespace support.
     HostIsolationSupport {
@@ -406,6 +426,181 @@ fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
         target_compatibility_key(scope(), &build, &changed, &spec, &support(), &plan, 1).unwrap(),
         expected
     );
+}
+
+#[test]
+fn incremental_mode_projection_profile_and_toolchain_partition_target_keys() {
+    let (source, _, _, _) = small_fixture();
+    let input = inputs(source.path(), &["lib.rs"]);
+    let mut spec = fixture_spec("private-incremental");
+    let (request, plan) = incremental_request(&["--workspace"]);
+    for (name, value) in &mut spec.env {
+        if name == "CARGO_INCREMENTAL" {
+            *value = "1".into();
+        }
+    }
+    let keys =
+        |request: &CanonicalExecRequest, plan: &ArtifactPlan, spec: &CanonicalNamespaceSpec| {
+            (
+                target_key(scope(), request, &input, spec, &support(), plan, 1).unwrap(),
+                target_compatibility_key(scope(), request, &input, spec, &support(), plan, 1)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+    let expected = keys(&request, &plan, &spec);
+    let mut disabled = spec.clone();
+    for (name, value) in &mut disabled.env {
+        if name == "CARGO_INCREMENTAL" {
+            *value = "0".into();
+        }
+    }
+    let mut changed_toolchain = request.clone();
+    changed_toolchain
+        .toolchain_identity
+        .as_mut()
+        .unwrap()
+        .sha256[0] ^= 1;
+    let (release, release_plan) = incremental_request(&["--workspace", "--release"]);
+    let (_, full_tree_plan) = cargo_request("build", &["--workspace"]);
+    for changed in [
+        keys(&request, &plan, &disabled),
+        keys(&changed_toolchain, &plan, &spec),
+        keys(&release, &release_plan, &spec),
+        keys(&request, &full_tree_plan, &spec),
+    ] {
+        assert_ne!(expected.0, changed.0, "exact target identity collapsed");
+        assert_ne!(
+            expected.1, changed.1,
+            "compatible target identity collapsed"
+        );
+    }
+}
+
+#[test]
+fn private_incremental_seed_retains_and_charges_the_complete_target() {
+    let source = private_directory("rabs-incremental-source-").unwrap();
+    fs::write(source.path().join("lib.rs"), b"pub fn value() {}\n").unwrap();
+    let (_, plan) = incremental_request(&[]);
+    let target = PreparedArtifacts::new(plan.clone()).unwrap();
+    fs::create_dir_all(target.backing().join("debug/deps")).unwrap();
+    fs::create_dir_all(target.backing().join("debug/incremental/unit/session")).unwrap();
+    fs::write(
+        target.backing().join("debug/deps/libapp.rmeta"),
+        b"metadata",
+    )
+    .unwrap();
+    let private = "debug/incremental/unit/session/query-cache.bin";
+    fs::write(target.backing().join(private), b"private compiler state").unwrap();
+    let report = concat!(
+        "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+        "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp.rmeta\"],\"executable\":null}\n",
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+    );
+    let captured = target
+        .capture_with_cargo_output(None, report.as_bytes(), || false)
+        .unwrap();
+    assert_eq!(captured.total_bytes(), 8);
+    assert_eq!(
+        captured.file_names().collect::<Vec<_>>(),
+        ["debug/deps/libapp.rmeta"]
+    );
+    let total =
+        captured.total_bytes() + fs::metadata(target.backing().join(private)).unwrap().len();
+    let too_small = Arc::new(TargetCache::new(total - 1).unwrap());
+    let attempt = too_small
+        .acquire(
+            TargetKey([1; 32]),
+            None,
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || PreparedArtifacts::new(plan.clone()),
+            1,
+            &|| false,
+        )
+        .unwrap()
+        .0;
+    assert!(
+        attempt
+            .stage(&target, &captured, &|| false)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(too_small.state.lock().unwrap().reserved_bytes, 0);
+
+    let cache = Arc::new(TargetCache::new(total).unwrap());
+    let attempt = cache
+        .acquire(
+            TargetKey([1; 32]),
+            None,
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || PreparedArtifacts::new(plan.clone()),
+            1,
+            &|| false,
+        )
+        .unwrap()
+        .0;
+    let pending = attempt
+        .stage(&target, &captured, &|| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cache.state.lock().unwrap().reserved_bytes, total);
+    pending.publish();
+    assert_eq!(cache.state.lock().unwrap().retained_bytes, total);
+    let seed_path = cache.state.lock().unwrap().entries[0]
+        .tree
+        .directory
+        .path()
+        .to_path_buf();
+    let restore = || {
+        cache
+            .acquire(
+                TargetKey([1; 32]),
+                None,
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                2,
+                &|| false,
+            )
+            .unwrap()
+            .1
+            .unwrap()
+    };
+    let first = restore();
+    let second = restore();
+    let identity = |root: &Path| {
+        let metadata = fs::metadata(root.join(private)).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    assert_ne!(identity(&seed_path), identity(first.backing()));
+    assert_ne!(identity(&seed_path), identity(second.backing()));
+    assert_ne!(identity(first.backing()), identity(second.backing()));
+    fs::write(first.backing().join(private), b"changed by one compiler").unwrap();
+    for root in [seed_path.as_path(), second.backing()] {
+        assert_eq!(
+            fs::read(root.join(private)).unwrap(),
+            b"private compiler state"
+        );
+    }
+    fs::write(
+        target.backing().join("debug/late-public-output"),
+        b"unexpected",
+    )
+    .unwrap();
+    let attempt = cache
+        .acquire(
+            TargetKey([2; 32]),
+            None,
+            runtime_inputs(source.path(), &["lib.rs"]),
+            || PreparedArtifacts::new(plan.clone()),
+            3,
+            &|| false,
+        )
+        .unwrap()
+        .0;
+    assert!(attempt.stage(&target, &captured, &|| false).is_err());
+    let state = cache.state.lock().unwrap();
+    assert_eq!(state.retained_bytes, total);
+    assert_eq!(state.reserved_bytes, 0);
 }
 
 #[test]

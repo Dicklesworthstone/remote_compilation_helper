@@ -211,6 +211,7 @@ fn report() -> rabs_wkr::session::CapabilityReport {
     rabs_wkr::session::CapabilityReport {
         worker_id: "toolchain-upload-session-test".to_owned(),
         canonical_namespace: true,
+        dependency_modes: vec![],
         missing: vec![],
         slots: 1,
     }
@@ -532,7 +533,7 @@ fn unnegotiated_and_partial_toolchains_never_reach_durable_admission() {
             false,
             &selected,
             false,
-            false,
+            None,
             |_, _, _, _, _, _| panic!("incomplete toolchain launched"),
             pressure,
         ));
@@ -593,7 +594,7 @@ fn pipelined_toolchain_chunks_preserve_order_while_ping_bypasses_filesystem_work
         false,
         &selected,
         false,
-        false,
+        None,
         |_, _, _, _, _, _| panic!("toolchain upload is not execution admission"),
         pressure,
     ));
@@ -677,7 +678,7 @@ fn uploaded_executable_runs_private_bytes_and_journals_the_exact_original_reques
             false,
             &selected,
             request_id == 0,
-            false,
+            None,
             |request, timeout, artifacts, source, toolchain, lease| {
                 assert!(lease.is_some());
                 launch(
@@ -795,7 +796,7 @@ fn sealed_toolchain_refuses_foreign_original_identity_without_consuming_the_owne
         false,
         &selected,
         false,
-        false,
+        None,
         |request, timeout, artifacts, source, toolchain, lease| {
             launch(
                 root.path(),
@@ -867,7 +868,7 @@ fn disconnect_retains_the_uploaded_toolchain_until_the_real_child_is_drained() {
         false,
         &selected,
         false,
-        false,
+        None,
         |request, timeout, artifacts, source, toolchain, lease| {
             launch(
                 root.path(),
@@ -927,7 +928,7 @@ fn cancel_before_seal_and_after_seal_blocks_later_execution_and_reupload() {
             false,
             &selected,
             false,
-            false,
+            None,
             |_, _, _, _, _, _| panic!("cancelled upload reached execution"),
             pressure,
         ));
@@ -1026,7 +1027,7 @@ fn a_blocked_seal_reply_does_not_admit_pipelined_execution_after_cancel() {
         false,
         &selected,
         false,
-        false,
+        None,
         |_, _, _, _, _, _| panic!("cancelled pipelined request launched"),
         pressure,
     ));

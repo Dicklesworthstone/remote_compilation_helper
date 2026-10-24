@@ -35,7 +35,7 @@ DEFAULT_STARTUP_MS = 5000
 MAX_STARTUP_MS = 30000
 OWNER_RECEIPT = "daemon-owner.json"
 MAX_OWNER_RECEIPT = 2048
-DEPENDENCY_CONTEXT = "dependency-exec-v6"
+DEPENDENCY_CONTEXT = "dependency-exec-v7"
 DEPENDENCY_WORKER_KEYS = (
     "RABS_DEPENDENCY_WORKER_LISTEN",
     "RABS_DEPENDENCY_WORKER_ID",
@@ -170,13 +170,15 @@ with exactly listen, worker_id and worker_spki_sha256 fields. Pool listeners,
 IDs and pins must each be unique; pool and singleton settings cannot be mixed.
 New daemons also require the existing RABS_COORD_TLS_* credentials. The connected
 daemon must advertise the exact normalized worker configuration, including pool
-order, and dependency-exec-v6 capability. A different, local-only or older daemon
+order, and dependency-exec-v7 capability. A different, local-only or older daemon
 produces a setup error and an explicit stock-Cargo fallback; use
 --rabs-require-daemon to refuse setup instead. Settings never reconfigure an
 attached daemon. A matching configuration does not promise a connected worker
 or a cache hit; eligible requests retain the worker's execution checks. The
-pool admits independent metadata dependency compilations on separate workers;
-native linking, proc macros and build-script execution retain the local path.
+pool admits independent metadata and pure Rust archive dependency compilations
+on separate workers. Archive compilation requires its closed codegen view and
+exact original paths; native linking, proc macros and build-script execution
+retain the local path.
 See docs/rabs-worker-delivery.md for worker connection and pool setup.
 
 RABS_CONFIG, RABS_SOCKET_PATH and RABS_STATE_DIR retain rabsd's meanings.
@@ -1175,7 +1177,7 @@ def canonical_daemon_endpoint(value):
     return endpoint
 
 
-def canonical_command_environment(values, clippy=False):
+def canonical_command_environment(values, clippy=False, incremental=False):
     """Bind explicit build inputs without inheriting host variables or policy.
 
     The native env-cwd-v1 validator remains authoritative. This frontend is
@@ -1184,7 +1186,7 @@ def canonical_command_environment(values, clippy=False):
     request receives the values, never the local preparation/control process.
     """
     import re
-    environment = {"CARGO_INCREMENTAL": "0"}
+    environment = {"CARGO_INCREMENTAL": "1" if incremental else "0"}
     if clippy:
         environment.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
     if type(values) is not dict or len(values) + len(environment) > 256:
@@ -1269,7 +1271,7 @@ def canonical_profile(path, required_tools=("cargo", "rustc")):
             raise SetupError("canonical profile changed during reading")
     profile = decode_object(data)
     required = {"version", "source_root", "toolchain_root", "operation_root"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket", "env"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket", "env", "incremental"}
     singular = {"listen", "worker", "worker_spki_sha256"}
     if "workers" in profile:
         required.add("workers")
@@ -1284,6 +1286,8 @@ def canonical_profile(path, required_tools=("cargo", "rustc")):
         raise SetupError("invalid canonical-cargo-v1 profile fields")
     if "vendor" in profile and "cargo_home_source" in profile:
         raise SetupError("canonical profile must select either vendor or cargo_home_source")
+    if "incremental" in profile and type(profile["incremental"]) is not bool:
+        raise SetupError("canonical incremental must be a boolean")
     if "jobserver_grant" in profile:
         grant = profile["jobserver_grant"]
         if type(grant) is not int or not 1 <= grant <= 4096:
@@ -1500,6 +1504,7 @@ def canonical_invocation(profile_path, args, env):
     clippy = cargo_args[0] == "clippy"
     required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
     profile = canonical_profile(profile_path, required_tools)
+    incremental = profile.get("incremental", False)
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     if os.path.samefile(daemon, __file__):
         raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
@@ -1510,7 +1515,14 @@ def canonical_invocation(profile_path, args, env):
                 cargo_args.append(flag)
     cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
     cargo_args += trailing_args
-    command_env = canonical_command_environment(profile.get("env", {}), clippy)
+    command_env = canonical_command_environment(profile.get("env", {}), clippy, incremental)
+    if incremental:
+        # The matching native contract retains compiler state privately and
+        # excludes only its verified incremental roots from artifact delivery.
+        # Older peers must refuse this distinct contract before execution.
+        artifact_contract = "cargo-private-incremental-test-json-v1" if test_execution else "cargo-private-incremental-json-v1"
+    else:
+        artifact_contract = "cargo-test-json-v1" if test_execution else "cargo-json-v1"
     import secrets
     specification = {
         # This is LOCAL preparation intent. The combined TLS driver reserves a
@@ -1524,7 +1536,7 @@ def canonical_invocation(profile_path, args, env):
         "toolchain_source": profile["toolchain_root"],
         "cargo_source": {"manifest": profile["manifest"]},
         "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs,
-                      "cargo": "cargo-test-json-v1" if test_execution else "cargo-json-v1"},
+                      "cargo": artifact_contract},
     }
     if "vendor" in profile:
         specification["cargo_source"]["vendor"] = profile["vendor"]

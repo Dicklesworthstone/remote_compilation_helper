@@ -1848,7 +1848,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shared_output_retains_exact_input_bytes_over_exclusive_empty_mountpoints() {
-        use rabs_sandbox::dependency_context::{DependencyExecContext, build_dependency_argv};
+        use rabs_sandbox::dependency_context::{
+            DependencyExecContext, DependencyExecutionMode, DependencyIsolationSupport,
+            build_dependency_argv,
+        };
         use std::path::Path;
 
         let mut fixture = SharedDependencyFixture::new();
@@ -1875,7 +1878,8 @@ mod tests {
             fixture.context.env().to_vec(),
             runtime.cohort().bytes,
         )
-        .unwrap();
+        .unwrap()
+        .with_execution_mode(DependencyExecutionMode::Rlib);
         let guard = fixture.prepare().unwrap();
         assert_eq!(
             guard.relative_paths().collect::<Vec<_>>(),
@@ -1914,13 +1918,14 @@ mod tests {
         let unrelated = tempfile::tempdir().unwrap();
         assert!(guard.verify(unrelated.path()).is_err());
 
-        let support = rabs_sandbox::canonical_namespace::HostIsolationSupport {
-            bubblewrap: Some("test".to_owned()),
-            unprivileged_userns: true,
-            overlayfs: false,
-            cgroup_v2: false,
-            landlock: false,
-        };
+        let support = DependencyIsolationSupport::probe(fixture.context.execution_mode());
+        if !support.is_supported() {
+            eprintln!(
+                "SKIP: namespace argv proof unavailable: {:?}",
+                support.missing()
+            );
+            return;
+        }
         let launch = build_dependency_argv(
             &fixture.context,
             &fixture.spec,

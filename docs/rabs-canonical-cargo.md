@@ -216,16 +216,36 @@ and the bounded queue still apply; listing 32 workers does not itself allocate
 for configuration and status details.
 
 The daemon first chooses by durable job load. Among equally loaded workers it
-prefers the worker that most recently completed the same captured Cargo request,
-then uses the listed order. This locality hint binds the complete source,
-toolchain, command, environment and output contract, along with the worker's
-endpoint, identity and certificate pin. Only the assigned wire request ID is
-normalized. Resolved ordinary failures can also leave useful target state;
-cancelled, stopped, unresolved and never-dispatched jobs cannot supply a hint.
-History is limited to the last 128 queue admissions in the bounded live record
-set. It neither promises that a target is still retained nor authorizes a cache
-hit: the selected worker verifies its own state and executes the current Cargo
-command. Changed source bytes or command controls receive no locality preference.
+prefers a worker that completed the exact captured Cargo request, then one that
+completed a compatible command or source generation. Within each match class,
+the most recently admitted matching job wins; the listed order breaks remaining
+ties. A source edit can therefore return to a worker holding the preceding build's
+private target and incremental state, while a less loaded worker still takes
+priority.
+
+Compatibility uses the same source and command planner as the worker's
+[private target cache](rabs-target-state.md). Ordinary non-executable local
+source and data edits, additions, removals and renames may retain affinity.
+Cargo `build`, `check`, `test --no-run` and `test` can share it across package
+and target selections. Clippy remains a separate family with exact selectors
+and lint controls. Cargo manifests, lockfiles, configuration, executable inputs,
+vendored packages and captured Cargo-home cache contents remain exact, as do
+the toolchain, environment, compilation profile, target, features, job grant,
+output location, required artifacts, private-state projection and other request
+controls. Unknown argument forms retain only
+exact-request preference. Legacy visible-prefix Cargo-home projections retain
+exact-source preference.
+
+A hint requires the same configured endpoint, worker identity and certificate
+pin. Resolved ordinary failures can also leave useful state; cancelled, stopped,
+unresolved and never-dispatched jobs cannot supply a hint. History is limited
+to the last 128 queue admissions in the bounded durable live record set; cold
+archives do not contribute. Reloading those records after a coordinator restart
+can preserve affinity. A worker restart, eviction, disabled target cache or
+changed runtime epoch may still leave that worker cold. The worker independently
+verifies its retained state and executes the original Cargo command, including
+tests; placement alone never authorizes reuse or a compiler skip. The captured
+request, source identity and recovery identity remain exact and unchanged.
 
 Workers whose previous execution remains unresolved are excluded. Selection
 and the original pool intent become
@@ -479,7 +499,9 @@ vendor configuration.
 
 Captured profiles support `inherits`, `opt-level`, `debug`, `split-debuginfo`,
 `strip`, `debug-assertions`, `overflow-checks`, `lto`, `panic`, `codegen-units`,
-`rpath`, and `incremental=false`. The launcher still pins `CARGO_INCREMENTAL=0`.
+`rpath`, and Boolean `incremental` settings. The launcher's explicit incremental
+policy supplies `CARGO_INCREMENTAL`, which takes precedence over these captured
+profile settings: the default is `0`, and the opt-in below selects `1`.
 Package and build overrides support the applicable scalar settings; nested
 overrides, inheritance within an override, and override `lto`, `panic` or `rpath`
 are refused. Configuration accepts up to 64 profiles and 128 package selectors
@@ -494,6 +516,41 @@ response files and other compiler flags require additional input or execution
 contracts and remain unsupported in this profile. User Cargo-home configuration
 is still excluded. Preparation checks the retained configuration before invoking
 Cargo; no broader source capture or hidden local execution is substituted.
+
+### Private incremental compilation
+
+To retain rustc's incremental work products between builds on the same worker,
+add this Boolean field to the canonical JSON profile:
+
+```json
+"incremental": true
+```
+
+The launcher supplies `CARGO_INCREMENTAL=1` for `build`, `check`, `clippy`, and
+`test`, including `test --no-run`. Omitting the field or setting it to `false`
+keeps `CARGO_INCREMENTAL=0`. This is an explicit operation policy: it overrides
+the incremental settings of captured Cargo profiles, including release and
+custom profiles. Ambient dispatcher values and arbitrary `env` overrides cannot
+change it. Cargo and rustc retain their normal handling of incompatible compiler
+options; the launcher does not change optimization settings to enable reuse.
+
+Enable [worker-local target retention](rabs-target-state.md) to keep useful state
+between operations. Every execution still runs its requested Cargo command in a
+private target tree. A compatible seed can contain the complete prior incremental
+state, and rustc decides which work products remain usable after source edits.
+Changing the explicit incremental policy, compiler, profile, features, target or
+other keyed compilation controls selects a different target family. Without
+target retention, the command uses fresh private incremental storage.
+
+Incremental compiler state remains on the worker and is excluded from delivered
+artifacts through the explicit contracts described below. It is never a shared
+writable directory or a compiler-result cache hit. The complete private target,
+including incremental state, still has the existing 1 GiB, 4,096-file and
+16,384-entry limits; enabling incremental compilation does not relax those
+limits or silently discard state to fit them. Persistent reuse follows the
+existing worker runtime-epoch and complete-state verification rules. This does
+not enable portable incremental snapshots, skip test execution, or authorize
+broader dependency or workspace action-cache serving.
 
 ## Supported command contract
 
@@ -564,7 +621,8 @@ refuse before preparation. The selected toolchain also supplies local Cargo meta
 Cargo is always locked/offline, without duplicating supplied flags.
 
 The worker receives its existing clear-environment canonical base, with
-`CARGO_INCREMENTAL=0`. **Ambient dispatcher RUSTFLAGS, Cargo configuration,
+`CARGO_INCREMENTAL=0` by default or `1` for the explicit incremental opt-in.
+**Ambient dispatcher RUSTFLAGS, Cargo configuration,
 custom wrappers and other environment values are not copied into the worker
 command.** The supported captured project configuration described above still
 applies. This is an explicitly selected canonical build profile, not transparent
@@ -589,7 +647,11 @@ jobserver token. The worker keeps that grant through process-group cleanup.
 The explicit `artifacts.cargo = "cargo-json-v1"` compilation contract and
 `artifacts.cargo = "cargo-test-json-v1"` test-execution contract augment
 `tree-files-v1`. Old endpoints reject the new test contract rather than treating
-tests as compilation-only work. The launcher's `files` minimum is empty because it does not guess
+tests as compilation-only work. With `incremental: true`, the launcher instead
+selects `cargo-private-incremental-json-v1` for compilation or
+`cargo-private-incremental-test-json-v1` for test execution. Both require matching
+native support; older endpoints refuse the unknown contract before execution.
+The launcher's `files` minimum is empty because it does not guess
 hashed library, metadata, executable or target-triple paths. After Cargo exits
 successfully and its writers have drained, the worker requires a complete
 `compiler-artifact` / `build-finished` report with at least one ordinary target.
@@ -602,8 +664,17 @@ test failure retains the failure and diagnostics without offering successful
 artifacts. There is no test-result cache or inferred test-pass count.
 
 Every reported output must exist beneath `/__rabs/out/cargo`, and each reported
-executable must retain executable mode. The worker captures the entire bounded
-regular-file tree, including Cargo intermediates that are absent from the report.
+executable must retain executable mode. The ordinary contracts capture the entire
+bounded regular-file tree, including Cargo intermediates absent from the report.
+The private-incremental contracts verify that same complete tree but omit only
+`<profile-output>/incremental/**` and, when an explicit target triple is selected,
+`<triple>/<profile-output>/incremental/**` from artifact delivery. `dev` and `test`
+profiles use `debug`; `release` and `bench` use `release`; custom profiles use
+their exact names. The host-profile root remains private during cross-compilation
+as well. Other directories merely named `incremental` are still delivered.
+Reported compiler outputs cannot be hidden by this projection. The worker's
+retained seed includes the complete state, and the full-tree integrity and size
+checks apply before projection, including to the files that remain private.
 Incidental files such as `.rustc_info.json`, or a success marker alone, cannot
 satisfy the contract.
 

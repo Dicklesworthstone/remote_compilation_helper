@@ -213,7 +213,7 @@ fn target_key_description(
     let mut rw: Vec<_> = spec.rw_binds.iter().map(|bind| &bind.visible).collect();
     ro.sort();
     rw.sort();
-    Ok(serde_json::json!({
+    let mut value = serde_json::json!({
         "version":"rabs.private-cargo-target.v1",
         "scope":scope.0,
         "source":inputs.full_source_digest,
@@ -228,143 +228,25 @@ fn target_key_description(
         "required":plan.files().collect::<Vec<_>>(),
         "cargo_mode":format!("{:?}", plan.cargo_mode()),
         "runtime":"fresh-home+captured-or-empty-cargo-home+private-fifo-v1",
-    }))
+    });
+    if let Some(roots) = plan.private_incremental_roots() {
+        // The private tree and the delivered tree have different contracts.
+        // Preserve exact identity for existing full-tree requests, and bind
+        // the explicitly selected projection for private incremental runs.
+        value["cargo_private_incremental_roots"] = serde_json::json!(roots);
+    }
+    Ok(value)
 }
 
 fn compatible_cargo_arguments(
     request: &CanonicalExecRequest,
     plan: &ArtifactPlan,
 ) -> Option<Vec<String>> {
-    use rabs_sandbox::cargo_artifacts::CargoArtifactMode;
-    let mode = plan.cargo_mode()?;
-    let command = request.args.first()?.as_str();
-    let clippy = match (request.program.as_str(), command, mode) {
-        ("/__rabs/toolchain/bin/cargo", "build" | "check" | "test", _) => false,
-        ("/__rabs/toolchain/bin/cargo-clippy", "clippy", CargoArtifactMode::Compilation) => true,
-        _ => return None,
-    };
-    let mut normalized = vec![
-        if clippy {
-            "cargo-clippy"
-        } else {
-            "cargo-build-check-test"
-        }
-        .to_owned(),
-    ];
-    let mut no_run = false;
-    let mut filter = false;
-    let mut at = 1;
-    while at < request.args.len() {
-        let argument = &request.args[at];
-        if argument == "--" {
-            if clippy {
-                // The admitted artifact contract already validates this as a
-                // lint-only tail. Keep every byte and its order: unlike a test
-                // harness argument, a lint can change the compiler's result.
-                normalized.extend(request.args[at..].iter().cloned());
-                break;
-            }
-            // These are test-process arguments. The current invocation still
-            // receives every original byte, including option-like spellings.
-            if command != "test" || no_run {
-                return None;
-            }
-            break;
-        }
-        let (option, inline) = argument
-            .split_once('=')
-            .map_or((argument.as_str(), None), |(option, value)| {
-                (option, Some(value))
-            });
-        match option {
-            "--no-run" if inline.is_none() && command == "test" && !no_run => {
-                no_run = true;
-            }
-            "--no-fail-fast" if inline.is_none() && command == "test" => {}
-            "--bin" | "--example" | "--test" | "--bench" | "--package" | "-p" | "--exclude" => {
-                // These select units within the same captured workspace. Cargo
-                // receives the original selection and checks each requested
-                // unit's own fingerprint, feature set and compiler identity.
-                // Clippy must retain the selection: a dependency compiled with
-                // --no-deps can otherwise remain fresh when selected as a
-                // primary package and silently escape its requested lints.
-                if clippy {
-                    normalized.push(argument.clone());
-                }
-                let value = if let Some(value) = inline {
-                    value
-                } else {
-                    at += 1;
-                    let value = request.args.get(at)?;
-                    if clippy {
-                        normalized.push(value.clone());
-                    }
-                    value
-                };
-                if value.is_empty() || value.starts_with('-') {
-                    return None;
-                }
-            }
-            "--workspace" | "--all" | "--lib" | "--bins" | "--examples" | "--tests"
-            | "--benches" | "--all-targets"
-                if inline.is_none() =>
-            {
-                if clippy {
-                    normalized.push(argument.clone());
-                }
-            }
-            "--features" | "-F" | "--target" | "--color" | "--message-format"
-            | "--manifest-path" | "--target-dir" | "--profile" | "--jobs" | "-j" => {
-                normalized.push(argument.clone());
-                let value = if let Some(value) = inline {
-                    value
-                } else {
-                    at += 1;
-                    let value = request.args.get(at)?;
-                    normalized.push(value.clone());
-                    value
-                };
-                if value.is_empty() || value.starts_with('-') {
-                    return None;
-                }
-            }
-            "--release"
-            | "-r"
-            | "--locked"
-            | "--offline"
-            | "--frozen"
-            | "--all-features"
-            | "--no-default-features"
-            | "--verbose"
-            | "-v"
-            | "-vv"
-            | "--quiet"
-            | "-q"
-                if inline.is_none() =>
-            {
-                normalized.push(argument.clone());
-            }
-            "--doc" if inline.is_none() && command == "test" => {
-                normalized.push(argument.clone());
-            }
-            "--no-deps" if inline.is_none() && clippy => {
-                normalized.push(argument.clone());
-            }
-            _ if command == "test" && !argument.starts_with('-') && !filter => {
-                filter = true;
-            }
-            _ => return None,
-        }
-        at += 1;
-    }
-    if no_run && filter {
-        return None;
-    }
-    match mode {
-        CargoArtifactMode::Compilation if command != "test" || no_run => Some(normalized),
-        CargoArtifactMode::TestExecution if command == "test" && !no_run => Some(normalized),
-        _ => None,
-    }
+    rabs_sandbox::cargo_target::compatible_arguments(
+        &request.program,
+        &request.args,
+        plan.cargo_mode()?,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -850,12 +732,18 @@ impl TargetAttempt {
         if SourceTimes::capture(&self.inputs, stopped)? != self.times {
             return Err(invalid("source changed while Cargo was executing"));
         }
-        let Some(reservation) = self.cache.reserve(captured.total_bytes()) else {
+        let Some((reservation, tree)) = TreeSnapshot::capture(
+            &self.cache,
+            artifacts.backing(),
+            artifacts.plan(),
+            captured,
+            stopped,
+        )?
+        else {
             return Ok(None);
         };
-        let tree = TreeSnapshot::capture(&self.cache, artifacts.backing(), captured, stopped)?;
-        if tree.bytes != reservation.bytes {
-            return Err(invalid("target state differs from captured artifacts"));
+        if SourceTimes::capture(&self.inputs, stopped)? != self.times {
+            return Err(invalid("source changed while capturing Cargo target state"));
         }
         let seed = Seed {
             key: self.key,
@@ -1171,24 +1059,37 @@ impl TreeSnapshot {
     }
 
     fn capture(
-        cache: &TargetCache,
+        cache: &Arc<TargetCache>,
         root: &Path,
+        plan: &ArtifactPlan,
         captured: &CapturedArtifacts,
         stopped: &impl Fn() -> bool,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Option<(Reservation, Self)>> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = captured.file_names().map(str::to_owned).collect();
         let tree = TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?;
-        let snapshot = Self::capture_inventory(cache, &tree, stopped)?;
-        if snapshot
-            .files
-            .keys()
-            .map(String::as_str)
+        // Every ordinary output still belongs to the validated offer. Only
+        // the explicit Cargo private-state projection may retain extra files;
+        // generic and older Cargo contracts continue to require exact equality.
+        if tree
+            .names()
+            .filter(|name| !plan.is_private_incremental_file(name))
             .ne(captured.file_names())
         {
             return Err(invalid("target seed differs from validated artifact set"));
         }
-        for (name, file) in &snapshot.files {
+        // Reserve the COMPLETE target before copying, including compiler state
+        // omitted from transport. An output-only reservation would undercount
+        // incremental generations and let them bypass the worker pool quota.
+        let Some(reservation) = cache.reserve(tree.total_bytes()) else {
+            return Ok(None);
+        };
+        let snapshot = Self::capture_inventory(cache, &tree, stopped)?;
+        for name in captured.file_names() {
+            let file = snapshot
+                .files
+                .get(name)
+                .ok_or_else(|| invalid("target seed is missing a validated artifact"))?;
             if captured.file_identity(name)
                 != Some((
                     file.len,
@@ -1199,7 +1100,12 @@ impl TreeSnapshot {
                 return Err(invalid("target seed differs from validated artifact bytes"));
             }
         }
-        Ok(snapshot)
+        if snapshot.bytes != reservation.bytes {
+            return Err(invalid(
+                "target state differs from its complete reservation",
+            ));
+        }
+        Ok(Some((reservation, snapshot)))
     }
 
     fn restore(&self, destination: &Path, stopped: &impl Fn() -> bool) -> io::Result<()> {
@@ -1220,11 +1126,12 @@ impl TreeSnapshot {
 #[cfg(not(target_os = "linux"))]
 impl TreeSnapshot {
     fn capture(
-        _: &TargetCache,
+        _: &Arc<TargetCache>,
         _: &Path,
+        _: &ArtifactPlan,
         _: &CapturedArtifacts,
         _: &impl Fn() -> bool,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Option<(Reservation, Self)>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "target state requires Linux",

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 fn context() -> Value {
     json!({
         "version":DEPENDENCY_CONTEXT_VERSION,
+        "execution_mode":"metadata",
         "source_root":"/home/user/registry/package",
         "cwd":"/home/user/registry/package",
         "toolchain_root":"/home/user/toolchains/pinned",
@@ -66,6 +67,137 @@ fn complete_dependency_decode_preserves_paths_values_and_input_owner_slots() {
         original,
         dependency_request(),
         "decoder does not project wire identity in place"
+    );
+}
+
+fn archive_request(separate_metadata: bool) -> Value {
+    let mut request = dependency_request();
+    request["dependency_context"]["execution_mode"] = json!("rlib");
+    let emit = if separate_metadata {
+        "--emit=dep-info,metadata,link"
+    } else {
+        "--emit=dep-info,link"
+    };
+    request["args"] = json!([
+        "--crate-name",
+        "leaf",
+        "--crate-type",
+        "rlib",
+        emit,
+        "--out-dir",
+        "/work/target/debug/deps",
+        "src/lib.rs",
+    ]);
+    request["artifacts"]["files"] = if separate_metadata {
+        json!(["leaf.d", "libleaf.rmeta", "libleaf.rlib"])
+    } else {
+        json!(["leaf.d", "libleaf.rlib"])
+    };
+    request
+}
+
+#[test]
+fn closed_archive_decode_requires_its_mode_and_complete_derived_artifacts() {
+    use rabs_sandbox::dependency_context::DependencyExecutionMode;
+    for separate_metadata in [false, true] {
+        let original = archive_request(separate_metadata);
+        let parsed = parse_exec_request(&original).unwrap();
+        assert_eq!(
+            parsed.dependency_context.unwrap().execution_mode(),
+            DependencyExecutionMode::Rlib
+        );
+        assert_eq!(original, archive_request(separate_metadata));
+        let mut missing_archive = original.clone();
+        missing_archive["artifacts"]["files"] = json!(["leaf.d", "libleaf.rmeta"]);
+        assert!(parse_exec_request(&missing_archive).is_err());
+        let mut extra_output = original.clone();
+        extra_output["artifacts"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("unclaimed.o"));
+        assert!(parse_exec_request(&extra_output).is_err());
+        let mut tree = original.clone();
+        tree["artifacts"]["tree"] = json!("tree-files-v1");
+        assert!(parse_exec_request(&tree).is_err());
+        let mut missing_contract = original.clone();
+        missing_contract
+            .as_object_mut()
+            .unwrap()
+            .remove("artifacts");
+        assert!(parse_exec_request(&missing_contract).is_err());
+    }
+}
+
+#[test]
+fn archive_mode_is_never_inferred_from_argv_or_silently_downgraded() {
+    let mut absent = archive_request(true);
+    absent["dependency_context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_mode");
+    assert!(parse_exec_request(&absent).is_err());
+    for mode in [
+        Value::Null,
+        json!(true),
+        json!("metadata"),
+        json!("archive"),
+        json!("rlib-v999"),
+    ] {
+        let mut wrong = archive_request(true);
+        wrong["dependency_context"]["execution_mode"] = mode;
+        assert!(parse_exec_request(&wrong).is_err());
+    }
+    let mut metadata = dependency_request();
+    metadata["dependency_context"]["execution_mode"] = json!("rlib");
+    assert!(parse_exec_request(&metadata).is_err());
+    let mut old = archive_request(true);
+    old["dependency_context"]["version"] = json!("dependency-exec-v6");
+    assert!(parse_exec_request(&old).is_err());
+}
+
+#[test]
+fn archive_worker_refuses_native_plugins_unretained_paths_and_output_overrides() {
+    for extra in [
+        vec!["-l", "static=unretained"],
+        vec!["-L", "native=/usr/lib"],
+        vec!["-L", "dependency=/unretained"],
+        vec!["--extern", "unbound"],
+        vec!["--extern", "derive=/work/target/debug/deps/libderive.so"],
+        vec!["--extern", "other=/unretained/libother.rlib"],
+        vec!["--sysroot", "/another/toolchain"],
+        vec!["-C", "linker=/usr/bin/cc"],
+        vec!["-C", "target-cpu=native"],
+        vec!["-C", "incremental=/private/incremental"],
+        vec!["-C", "save-temps=yes"],
+        vec!["-o", "/unretained/output"],
+        vec!["--crate-type", "dylib"],
+        vec!["--emit=dep-info,metadata,link,llvm-ir"],
+    ] {
+        let mut request = archive_request(true);
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|arg| json!(arg)));
+        assert!(parse_exec_request(&request).is_err(), "{extra:?}");
+    }
+    for source in ["../outside.rs", "/unretained/source.rs", "src/../lib.rs"] {
+        let mut request = archive_request(true);
+        *request["args"].as_array_mut().unwrap().last_mut().unwrap() = json!(source);
+        assert!(parse_exec_request(&request).is_err(), "{source}");
+    }
+    let mut output = archive_request(true);
+    output["dependency_context"]["out_dir"] = json!("/different/output");
+    assert!(parse_exec_request(&output).is_err());
+    let mut direct = archive_request(true);
+    direct["args"].as_array_mut().unwrap().extend([
+        json!("--extern"),
+        json!("leaf=/work/target/debug/deps/libinput.rlib"),
+        json!("-L"),
+        json!("dependency=/work/target/debug/deps"),
+    ]);
+    assert!(
+        parse_exec_request(&direct).is_ok(),
+        "retained Rust externs remain supported"
     );
 }
 
@@ -351,10 +483,23 @@ fn dependency_artifact_root_parser_requires_exact_bounded_mapping_records() {
 
 #[test]
 fn dependency_context_requires_exact_negotiation_and_complete_authenticated_transfer() {
-    let grant =
-        json!({"kind":"session-ok","dependency_context":DEPENDENCY_CONTEXT_VERSION}).to_string();
-    assert!(!dependency_context_selection("{}", true, true, true, true, true).unwrap());
-    assert!(dependency_context_selection(&grant, true, true, true, true, true).unwrap());
+    let supported = [
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+    ];
+    let grant = json!({
+        "kind":"session-ok", "dependency_context":DEPENDENCY_CONTEXT_VERSION,
+        "dependency_execution_mode":"metadata",
+    })
+    .to_string();
+    assert_eq!(
+        dependency_context_selection("{}", &supported, true, true, true, true, true).unwrap(),
+        None,
+    );
+    assert_eq!(
+        dependency_context_selection(&grant, &supported, true, true, true, true, true).unwrap(),
+        Some(DependencyExecutionMode::Metadata),
+    );
     for flags in [
         [false, true, true, true, true],
         [true, false, true, true, true],
@@ -363,8 +508,10 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
         [true, true, true, true, false],
     ] {
         assert!(
-            dependency_context_selection(&grant, flags[0], flags[1], flags[2], flags[3], flags[4])
-                .is_err()
+            dependency_context_selection(
+                &grant, &supported, flags[0], flags[1], flags[2], flags[3], flags[4],
+            )
+            .is_err()
         );
     }
     for bad in [
@@ -374,11 +521,14 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
         json!("dependency-exec-v2"),
         json!("dependency-exec-v3"),
         json!("dependency-exec-v4"),
+        json!("dependency-exec-v5"),
+        json!("dependency-exec-v6"),
         json!("dependency-exec-v999"),
     ] {
         assert!(
             dependency_context_selection(
                 &json!({"dependency_context":bad}).to_string(),
+                &supported,
                 true,
                 true,
                 true,
@@ -388,6 +538,150 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
             .is_err()
         );
     }
+}
+
+#[test]
+fn dependency_mode_selection_never_infers_support_or_downgrades() {
+    for mode in [
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+    ] {
+        let grant = json!({
+            "dependency_context":DEPENDENCY_CONTEXT_VERSION,
+            "dependency_execution_mode":mode.as_str(),
+        });
+        assert_eq!(
+            dependency_context_selection(
+                &grant.to_string(), &[mode], true, true, true, true, true,
+            ).unwrap(),
+            Some(mode),
+        );
+        for unsupported in [
+            vec![],
+            vec![if mode == DependencyExecutionMode::Metadata {
+                DependencyExecutionMode::Rlib
+            } else {
+                DependencyExecutionMode::Metadata
+            }],
+        ] {
+            assert!(
+                dependency_context_selection(
+                    &grant.to_string(),
+                    &unsupported,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+                .is_err()
+            );
+        }
+        let mut missing = grant.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("dependency_execution_mode");
+        let mut unversioned = grant.clone();
+        unversioned
+            .as_object_mut()
+            .unwrap()
+            .remove("dependency_context");
+        for bad in [missing, unversioned] {
+            assert!(
+                dependency_context_selection(
+                    &bad.to_string(),
+                    &[mode],
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+                .is_err()
+            );
+        }
+        for bad_mode in [
+            Value::Null,
+            json!(true),
+            json!([]),
+            json!("Rlib"),
+            json!("future"),
+        ] {
+            let mut bad = grant.clone();
+            bad["dependency_execution_mode"] = bad_mode;
+            assert!(
+                dependency_context_selection(
+                    &bad.to_string(),
+                    &[mode],
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn archive_only_capability_never_authorizes_metadata_or_canonical_commands() {
+    let mut archive_only = report();
+    archive_only.canonical_namespace = false;
+    archive_only.dependency_modes = vec![DependencyExecutionMode::Rlib];
+    let archive = parse_exec_request(&archive_request(true)).unwrap();
+    let metadata = parse_exec_request(&dependency_request()).unwrap();
+    let canonical = parse_exec_request(&request(19)).unwrap();
+    assert!(
+        validate_execution_selection(&archive, &archive_only, Some(DependencyExecutionMode::Rlib),)
+            .is_ok()
+    );
+    assert!(validate_execution_selection(&archive, &archive_only, None).is_err());
+    assert!(
+        validate_execution_selection(
+            &archive,
+            &archive_only,
+            Some(DependencyExecutionMode::Metadata),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_execution_selection(
+            &metadata,
+            &archive_only,
+            Some(DependencyExecutionMode::Rlib),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_execution_selection(
+            &metadata,
+            &archive_only,
+            Some(DependencyExecutionMode::Metadata),
+        )
+        .is_err()
+    );
+    assert!(validate_execution_selection(&canonical, &archive_only, None).is_err());
+    assert!(
+        validate_execution_selection(
+            &canonical,
+            &archive_only,
+            Some(DependencyExecutionMode::Rlib),
+        )
+        .is_err()
+    );
+    archive_only.canonical_namespace = true;
+    assert!(validate_execution_selection(&canonical, &archive_only, None).is_ok());
+    assert!(
+        validate_execution_selection(
+            &canonical,
+            &archive_only,
+            Some(DependencyExecutionMode::Rlib),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -469,6 +763,53 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
         hello["dependency_contexts"],
         json!([DEPENDENCY_CONTEXT_VERSION])
     );
+    assert_eq!(hello["dependency_execution_modes"], json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_mode_mismatch_refuses_before_input_or_durable_admission() {
+    let root = private_root();
+    let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let mut report = report();
+    report.canonical_namespace = false;
+    report.dependency_modes = vec![DependencyExecutionMode::Rlib];
+    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal)).unwrap();
+    assert_eq!(hello["canonical"], false);
+    assert_eq!(hello["dependency_execution_modes"], json!(["rlib"]));
+    let mut wire = Wire::default();
+    let peer = wire.clone();
+    peer.frame(dependency_request());
+    peer.frame(request(713));
+    peer.frame(json!({"kind":"request-status","request_id":712}));
+    peer.close();
+    wait(drive_session_with_inputs(
+        &mut wire,
+        &report,
+        false,
+        Some(&mut journal),
+        true,
+        true,
+        true,
+        false,
+        &ExecutionLeaseSelection::default(),
+        false,
+        Some(DependencyExecutionMode::Rlib),
+        |_, _, _, _, _, _| panic!("mismatched namespace reached executor"),
+        pressure,
+    ))
+    .unwrap();
+    let replies = peer.replies();
+    assert_eq!(
+        replies[0]["reason"],
+        "dependency execution mode does not match negotiation"
+    );
+    assert_eq!(
+        replies[1]["reason"],
+        "dependency session requires its negotiated execution context"
+    );
+    assert_eq!(replies[2]["status"], "unknown");
+    assert_eq!(journal.high_water(), None);
 }
 
 #[cfg(unix)]
@@ -555,7 +896,11 @@ fn assert_retained_dependency_resume(version: &str) {
     changed["dependency_context"]["cwd"] = json!("/home/user/registry/package/src");
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":changed}));
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":original}));
-    let report = report();
+    let mut report = report();
+    // Retained bytes remain recoverable even if the host can no longer create
+    // any execution namespace after a worker restart.
+    report.canonical_namespace = false;
+    report.dependency_modes.clear();
     // This production compatibility wrapper selects no source, toolchain,
     // dependency context or execution-lease grant. Recovery needs only the
     // exact original request and authorized retained-result recipient.

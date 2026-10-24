@@ -24,6 +24,7 @@ use rabs_sandbox::artifact_tree::{
     validate_tree_names,
 };
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
+use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode};
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -61,6 +62,46 @@ impl DeliveryMode {
             }
         }
     }
+}
+
+/// A dependency profile changes the worker's filesystem authority. Select it
+/// only from this exact request and an explicit worker advertisement, before
+/// disk creation, authentication grants or input upload. Recovery retrieves a
+/// sealed result and must not require the restarted worker to execute it again.
+pub(crate) fn negotiated_dependency_mode(
+    hello: &Value,
+    request: &Value,
+    mode: DeliveryMode,
+) -> io::Result<Option<DependencyExecutionMode>> {
+    if mode == DeliveryMode::Resume {
+        return Ok(None);
+    }
+    let Some(context) = request.get("dependency_context") else {
+        return Ok(None);
+    };
+    require(
+        context["version"] == DEPENDENCY_CONTEXT_VERSION
+            && hello["dependency_contexts"]
+                .as_array()
+                .is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|version| version == DEPENDENCY_CONTEXT_VERSION)
+                }),
+        "worker lacks the required dependency execution context",
+    )?;
+    let selected = match context.get("execution_mode").and_then(Value::as_str) {
+        Some("metadata") => DependencyExecutionMode::Metadata,
+        Some("rlib") => DependencyExecutionMode::Rlib,
+        _ => return Err(invalid("unsupported dependency execution mode")),
+    };
+    require(
+        hello["dependency_execution_modes"]
+            .as_array()
+            .is_some_and(|modes| modes.iter().any(|mode| mode == selected.as_str())),
+        "worker lacks the required measured dependency execution mode",
+    )?;
+    Ok(Some(selected))
 }
 
 const RESULT_RETENTION: &str = "durable-result-v1";
@@ -260,6 +301,7 @@ struct Declaration {
     unit: String,
     names: BTreeSet<String>,
     tree: bool,
+    private_incremental: Option<Vec<String>>,
 }
 
 fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
@@ -272,6 +314,7 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         Some(_) => return Err(invalid("unsupported artifact tree declaration")),
     };
     let cargo = cargo_artifacts::requested(request)?;
+    let private_incremental = cargo_artifacts::private_incremental_roots(request)?;
     require(
         value
             .as_object()
@@ -321,6 +364,7 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         unit: unit.to_owned(),
         names,
         tree,
+        private_incremental,
     }))
 }
 
@@ -528,6 +572,14 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
         require(rows.len() == expected.names.len(), "artifact set mismatch")?;
         expected.names.clone()
     };
+    if let Some(roots) = &expected.private_incremental {
+        require(
+            names
+                .iter()
+                .all(|name| !cargo_artifacts::is_private_incremental_file(roots, name)),
+            "worker offered private incremental state as a Cargo artifact",
+        )?;
+    }
     let mut files = Vec::new();
     let mut total = 0_u64;
     let mut hasher = Sha256::new();
@@ -605,6 +657,14 @@ pub(crate) fn verify_cargo_artifacts(
     };
     verified_artifact_names(request, artifacts)?;
     let report = CargoArtifactReport::read(stdout, "/__rabs/out/cargo", mode)?;
+    if let Some(roots) = cargo_artifacts::private_incremental_roots(request)? {
+        require(
+            report
+                .files()
+                .all(|name| !cargo_artifacts::is_private_incremental_file(&roots, name)),
+            "Cargo reported an output inside private incremental state",
+        )?;
+    }
     let files = artifacts["files"]
         .as_array()
         .ok_or_else(|| invalid("Cargo artifact manifest"))?
@@ -808,8 +868,11 @@ pub fn receive_operation(
                 .and_then(Value::as_array)
                 .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(value)))
         };
+        let dependency_mode = negotiated_dependency_mode(&hello, request, mode)?;
+        let require_canonical =
+            mode == DeliveryMode::Execute && dependency_mode != Some(DependencyExecutionMode::Rlib);
         require(
-            hello.get("canonical").and_then(Value::as_bool) == Some(true)
+            (!require_canonical || hello.get("canonical").and_then(Value::as_bool) == Some(true))
                 && number(&hello, "slots")? > 0
                 && number(&hello, "boot_generation")? > 0
                 && supports("recovery_protocols", "request-journal-v1")
@@ -879,6 +942,10 @@ pub fn receive_operation(
         create_directory(&destination.join("diagnostics"))?;
         create_directory(&destination.join("artifacts"))?;
         let mut ack = json!({"kind":"session-ok","output_transfer":"ranges-v1","recovery_protocol":"request-journal-v1"});
+        if let Some(mode) = dependency_mode {
+            ack["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
+            ack["dependency_execution_mode"] = json!(mode.as_str());
+        }
         if expected.is_some() {
             ack["artifact_transfer"] = json!("files-v1");
         }
@@ -1553,6 +1620,8 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let dest = parent.path().join("resumed");
         let mut peer = resumable(&dest);
+        peer.replies[0]["canonical"] = json!(false);
+        peer.replies[0]["dependency_execution_modes"] = json!([]);
         let delivery =
             receive_operation(&mut peer, &request(), "worker", &dest, DeliveryMode::Resume)
                 .unwrap();
@@ -1975,6 +2044,85 @@ mod tests {
     }
 
     #[test]
+    fn archive_delivery_negotiates_its_profile_without_requiring_proc_mounts() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        let mut request = request();
+        request["dependency_context"] = json!({
+            "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"rlib"
+        });
+        let mut peer = fixture(&destination);
+        peer.replies[0]["canonical"] = json!(false);
+        peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+        peer.replies[0]["dependency_execution_modes"] = json!(["rlib"]);
+        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(
+            peer.sent[0]["dependency_context"],
+            DEPENDENCY_CONTEXT_VERSION
+        );
+        assert_eq!(peer.sent[0]["dependency_execution_mode"], "rlib");
+        assert_eq!(peer.sent[1], request);
+    }
+
+    #[test]
+    fn missing_or_wrong_archive_capability_refuses_before_disk_or_dispatch() {
+        for advertised in [
+            None,
+            Some(Value::Null),
+            Some(json!("rlib")),
+            Some(json!([])),
+            Some(json!(["metadata"])),
+            Some(json!([{"mode":"rlib"}])),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut request = request();
+            request["dependency_context"] = json!({
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"rlib"
+            });
+            let mut peer = fixture(&destination);
+            peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            if let Some(value) = advertised {
+                peer.replies[0]["dependency_execution_modes"] = value;
+            }
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run);
+            assert!(
+                failure
+                    .detail
+                    .contains("measured dependency execution mode")
+            );
+            assert!(peer.sent.is_empty());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn archive_capability_cannot_authorize_metadata_or_whole_command_execution() {
+        for dependency in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut request = request();
+            if dependency {
+                request["dependency_context"] = json!({
+                    "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
+                });
+            }
+            let mut peer = fixture(&destination);
+            peer.replies[0]["canonical"] = json!(false);
+            peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run);
+            assert!(peer.sent.is_empty());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
     fn toolchain_binding_requires_worker_support_before_any_upload_or_dispatch() {
         use super::super::source_delivery::SourcePeer;
         let source = tempfile::tempdir().unwrap();
@@ -2173,6 +2321,7 @@ mod tests {
         let mut request = request();
         request["command_context"] = explicit_context();
         let mut peer = resumable(&destination);
+        peer.replies[0]["canonical"] = json!(false);
         assert!(peer.replies[0].get("command_contexts").is_none());
         let delivery = receive_operation(
             &mut peer,

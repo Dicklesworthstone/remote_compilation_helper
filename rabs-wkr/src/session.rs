@@ -6,13 +6,14 @@
 //! harvesting after successful cleanup. Results are offers, never publications;
 //! the prototype newline transport is not authenticated ATP.
 
-use crate::artifacts::PreparedArtifacts;
+use crate::artifacts::{ArtifactPlan, PreparedArtifacts};
 use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
 use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
-    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext, MAX_DEPENDENCY_DIRS,
+    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
+    DependencyExecutionMode, DependencyIsolationSupport, MAX_DEPENDENCY_DIRS,
     MAX_DEPENDENCY_ENV_ENTRIES,
 };
 use rabs_sandbox::process_context::{
@@ -24,9 +25,8 @@ use rabs_sandbox::toolchain_dataset::{TOOLCHAIN_DATASET_VERSION, ToolchainIdenti
 pub(crate) mod toolchain_pool;
 pub use toolchain_pool::ToolchainReuseScope;
 
-/// What this worker can do (advertised at handshake; the scheduler
-/// gates placement on it). Derived from a real HostIsolationSupport
-/// probe on the worker.
+/// What this worker can do (advertised at handshake; the scheduler gates
+/// placement on it). Each execution profile is measured on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityReport {
     /// Worker id (stable per host).
@@ -35,6 +35,9 @@ pub struct CapabilityReport {
     /// the rest — `HostIsolationSupport::missing_for_canonical`
     /// empty).
     pub canonical_namespace: bool,
+    /// Independently measured leaf rustc profiles. Supporting the closed rlib
+    /// namespace does not imply support for canonical commands or metadata.
+    pub dependency_modes: Vec<DependencyExecutionMode>,
     /// Missing isolation facets (empty when `canonical_namespace`).
     pub missing: Vec<String>,
     /// Advertised execution slots (CPU-derived).
@@ -168,8 +171,9 @@ pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandConte
 /// Decode the separately negotiated full dependency context. Unknown fields,
 /// duplicate environment names and absent versus malformed values never fall
 /// back to the canonical execution defaults. The artifact closure is always
-/// explicit, including an empty array for a dependency leaf. V5 optionally binds
-/// one captured generated tree to the exact OUT_DIR environment value.
+/// explicit, including an empty array for a dependency leaf. V7 requires the
+/// execution mode so archive codegen cannot silently inherit metadata's procfs
+/// and device view. A generated tree binds the exact OUT_DIR environment value.
 pub fn parse_dependency_context(
     request: &serde_json::Value,
 ) -> Result<Option<DependencyExecContext>, String> {
@@ -184,6 +188,7 @@ pub fn parse_dependency_context(
         .ok_or("dependency_context must be an object")?;
     const REQUIRED: &[&str] = &[
         "version",
+        "execution_mode",
         "source_root",
         "cwd",
         "toolchain_root",
@@ -211,6 +216,11 @@ pub fn parse_dependency_context(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| format!("dependency_context {field} must be a string"))
+    };
+    let execution_mode = match text("execution_mode")?.as_str() {
+        "metadata" => DependencyExecutionMode::Metadata,
+        "rlib" => DependencyExecutionMode::Rlib,
+        _ => return Err("unsupported dependency execution_mode".to_owned()),
     };
     let env = object
         .get("env")
@@ -317,8 +327,133 @@ pub fn parse_dependency_context(
         env,
         runtime_cohort,
     )
-    .map(Some)
+    .map(|context| Some(context.with_execution_mode(execution_mode)))
     .map_err(|error| error.to_string())
+}
+
+/// Independently validate the compiler/output contract before worker ownership
+/// or process launch. The coordinator's mode is intent, never proof that LLVM
+/// can safely run under that view. The stricter archive path must name only
+/// retained inputs and exactly the complete, derived library output set.
+pub fn validate_dependency_execution(
+    request: &CanonicalExecRequest,
+    artifacts: Option<&ArtifactPlan>,
+) -> Result<(), String> {
+    use rabs_key::invocation::SourceInput;
+    use rabs_key::live_dependency::remote::{
+        RemoteDependencyOutputClass, remote_dependency_output_class,
+    };
+    use std::collections::BTreeSet;
+    use std::path::{Component, Path};
+    let Some(context) = &request.dependency_context else {
+        return Ok(());
+    };
+    let argv = std::iter::once(request.program.clone())
+        .chain(request.args.iter().cloned())
+        .collect::<Vec<_>>();
+    let invocation = rabs_key::invocation::parse(&argv, None)
+        .map_err(|error| format!("dependency invocation: {error:?}"))?;
+    let class = remote_dependency_output_class(&invocation).map_err(|error| error.to_string())?;
+    match (context.execution_mode(), class) {
+        (DependencyExecutionMode::Metadata, RemoteDependencyOutputClass::Metadata) => return Ok(()),
+        (DependencyExecutionMode::Rlib, RemoteDependencyOutputClass::Rlib) => {}
+        _ => return Err("dependency execution mode differs from compiler outputs".into()),
+    }
+    let host = match (
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "musl"),
+    ) {
+        ("linux", "x86_64", false) => "x86_64-unknown-linux-gnu",
+        ("linux", "x86_64", true) => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64", false) => "aarch64-unknown-linux-gnu",
+        ("linux", "aarch64", true) => "aarch64-unknown-linux-musl",
+        _ => return Err("remote archive execution requires a supported Linux worker".into()),
+    };
+    let outputs =
+        rabs_key::output_derivation::derive_dependency_output_declarations(&invocation, host)
+            .map_err(|error| format!("dependency archive outputs: {error}"))?;
+    if request.program != context.compiler()
+        || invocation.out_dir.as_deref() != Some(context.out_dir())
+        || !invocation.native_libs.is_empty()
+        || invocation
+            .codegen
+            .iter()
+            .any(|(name, value)| name == "target-cpu" && value.as_deref() == Some("native"))
+    {
+        return Err(
+            "dependency archive compiler, output or native inputs differ from its context".into(),
+        );
+    }
+    let plain = |path: &Path| {
+        path.components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    };
+    let Some(SourceInput::Path(source)) = &invocation.source else {
+        return Err("dependency archive requires a retained source file".into());
+    };
+    let source = Path::new(source);
+    let source = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        Path::new(context.cwd()).join(source)
+    };
+    if !plain(&source) || !source.starts_with(context.source_root()) {
+        return Err("dependency archive source is outside the retained package".into());
+    }
+    for search in &invocation.lib_search {
+        if search
+            .strip_prefix("dependency=")
+            .is_none_or(|path| !context.dependency_dirs().iter().any(|root| root == path))
+        {
+            return Err("dependency archive has an undeclared or native search directory".into());
+        }
+    }
+    for (_, path) in &invocation.externs {
+        let Some(path) = path else {
+            return Err("dependency archive requires explicit retained Rust externs".into());
+        };
+        let path = Path::new(path);
+        if !plain(path)
+            || path.parent().is_none_or(|parent| {
+                !context
+                    .dependency_dirs()
+                    .iter()
+                    .any(|root| Path::new(root) == parent)
+            })
+            || !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("rmeta" | "rlib")
+            )
+        {
+            return Err("dependency archive has an undeclared or executable extern".into());
+        }
+    }
+    let mut passthrough = invocation.passthrough.iter();
+    while let Some(argument) = passthrough.next() {
+        let root = if argument == "--sysroot" {
+            passthrough.next().map(String::as_str)
+        } else {
+            argument.strip_prefix("--sysroot=")
+        };
+        if root.is_some_and(|root| root != context.toolchain_root()) {
+            return Err("dependency archive sysroot is outside the retained toolchain".into());
+        }
+    }
+    let artifacts = artifacts
+        .filter(|plan| plan.is_exact())
+        .ok_or("dependency archive requires an exact artifact declaration")?;
+    let expected = outputs
+        .declarations
+        .iter()
+        .map(|output| output.virtual_path.as_str())
+        .collect::<BTreeSet<_>>();
+    if artifacts.files().collect::<BTreeSet<_>>() != expected {
+        return Err(
+            "dependency archive artifacts differ from the compiler's complete output set".into(),
+        );
+    }
+    Ok(())
 }
 
 /// The result of one canonical execution — an OFFER, never a commit.
@@ -418,9 +553,17 @@ pub fn probe_capability(worker_id: &str) -> CapabilityReport {
     let slots = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
+    let dependency_modes = [
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+    ]
+    .into_iter()
+    .filter(|mode| DependencyIsolationSupport::probe(*mode).is_supported())
+    .collect();
     CapabilityReport {
         worker_id: worker_id.to_string(),
         canonical_namespace: missing.is_empty(),
+        dependency_modes,
         missing,
         slots,
     }
@@ -673,8 +816,22 @@ fn execute_canonical_inner(
         )));
         return exec_error(request.request_id);
     }
-    let support = HostIsolationSupport::probe();
-    if !support.missing_for_canonical().is_empty() {
+    let dependency_support = request
+        .dependency_context
+        .as_ref()
+        .map(|context| DependencyIsolationSupport::probe(context.execution_mode()));
+    let canonical_support = request
+        .dependency_context
+        .is_none()
+        .then(HostIsolationSupport::probe);
+    if dependency_support
+        .as_ref()
+        .is_some_and(|support| !support.is_supported())
+        || canonical_support
+            .as_ref()
+            .is_some_and(|support| !support.missing_for_canonical().is_empty())
+    {
+        let _ = control.retain_outputs(Err("requested isolation profile unavailable".to_owned()));
         return exec_error(request.request_id);
     }
 
@@ -714,6 +871,10 @@ fn execute_canonical_inner(
     // backing. Use D005's existing mount builder and keep the owner alive until
     // the process and drains have resolved and the exact output set is captured.
     let artifact_plan = control.artifact_plan();
+    if let Err(error) = validate_dependency_execution(request, artifact_plan.as_ref()) {
+        let _ = control.retain_outputs(Err(error));
+        return exec_error(request.request_id);
+    }
     let hot_inputs = if resources.target_cache.is_some()
         && request.dependency_context.is_none()
         && request.toolchain_identity.is_some()
@@ -940,11 +1101,20 @@ fn execute_canonical_inner(
         hot_inputs.as_ref(),
         artifact_plan.as_ref(),
     ) {
+        // Hot target state is only constructed for canonical execution, which
+        // already probed host isolation above. The key must bind that proof;
+        // a missing probe refuses instead of hashing an unbound or empty profile.
+        let Some(support) = canonical_support.as_ref() else {
+            let _ = control.retain_outputs(Err(
+                "hot Cargo target state lacks canonical isolation proof".to_owned(),
+            ));
+            return exec_error(request.request_id);
+        };
         let prepared =
-            crate::target_cache::target_key(scope, request, inputs, &spec, &support, plan, grant)
+            crate::target_cache::target_key(scope, request, inputs, &spec, support, plan, grant)
                 .and_then(|key| {
                     let compatible = crate::target_cache::target_compatibility_key(
-                        scope, request, inputs, &spec, &support, plan, grant,
+                        scope, request, inputs, &spec, support, plan, grant,
                     )?;
                     cache.acquire(
                         key,
@@ -1008,12 +1178,21 @@ fn execute_canonical_inner(
             dependency_runtime
                 .as_ref()
                 .expect("dependency execution has a retained runtime"),
-            &support,
+            dependency_support
+                .as_ref()
+                .expect("dependency execution has its own isolation proof"),
             &request.program,
             &request.args,
         )
     } else {
-        build_canonical_argv(&spec, &support, &request.program, &request.args)
+        build_canonical_argv(
+            &spec,
+            canonical_support
+                .as_ref()
+                .expect("canonical execution has its own isolation proof"),
+            &request.program,
+            &request.args,
+        )
     };
     let launch = match launch {
         Ok(launch) => launch,
@@ -1372,6 +1551,7 @@ mod tests {
         let report = CapabilityReport {
             worker_id: "hz2".into(),
             canonical_namespace: true,
+            dependency_modes: vec![],
             missing: vec![],
             slots: 8,
         };

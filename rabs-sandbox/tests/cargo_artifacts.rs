@@ -7,8 +7,13 @@
 use rabs_sandbox::artifact_tree::TreeInventory;
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
-use rabs_sandbox::cargo_artifacts::{CargoArtifactMode, CargoArtifactReport};
-use rabs_sandbox::snapshot_capture::capture_sealed_source;
+use rabs_sandbox::cargo_artifacts::{
+    CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION, CargoArtifactMode, CargoArtifactReport,
+    is_private_incremental_file, private_incremental_roots,
+};
+use rabs_sandbox::cargo_target::{compatible_arguments, source_edit_identity};
+use rabs_sandbox::snapshot_capture::{MemberKind, capture_sealed_source};
+use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -207,6 +212,423 @@ fn real_workspace_build_check_and_test_compilation_capture_actual_outputs() {
             CargoArtifactMode::Compilation,
         )
         .is_err()
+    );
+}
+
+#[test]
+fn real_private_incremental_projection_preserves_outputs_and_reuses_edited_compilation() {
+    let (owner, root, home, tools) = workspace_fixture();
+    let manifest = root.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\n[profile.incremental]\ninherits='dev'\nincremental=false\n",
+            fs::read_to_string(&manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    let version = Command::new(tools.join("bin/rustc"))
+        .arg("-vV")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("real rustc must identify its host triple");
+
+    // This is the shared production JSON/tree boundary with native Cargo.
+    // It does not exercise worker transport or persistent target-cache restore.
+    for custom in [false, true] {
+        let label = if custom { "custom-host" } else { "default" };
+        let output_root = owner.path().join(label);
+        fs::create_dir(&output_root).unwrap();
+        fs::set_permissions(&output_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut args = [
+            "build",
+            "--workspace",
+            "--locked",
+            "--offline",
+            "--message-format=json",
+            "--target-dir=/__rabs/out/cargo",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let executable = if custom {
+            args.extend(["--profile=incremental".into(), format!("--target={host}")]);
+            format!("{host}/incremental/artifact_app")
+        } else {
+            "debug/artifact_app".to_owned()
+        };
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo", "args":args,
+            "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+                "env":{"CARGO_INCREMENTAL":"1"}},
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[],
+                "cargo":CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION}
+        });
+        let roots = private_incremental_roots(&request).unwrap().unwrap();
+        let mut expected_roots = if custom {
+            vec![
+                "incremental/incremental".to_owned(),
+                format!("{host}/incremental/incremental"),
+            ]
+        } else {
+            vec!["debug/incremental".to_owned()]
+        };
+        expected_roots.sort();
+        assert_eq!(roots, expected_roots);
+
+        for offset in [0, 1] {
+            fs::write(
+                root.join("app/src/main.rs"),
+                format!(
+                    "fn main() {{ println!(\"{{}}\", artifact_library::VALUE + {offset}); }}\n"
+                ),
+            )
+            .unwrap();
+            let output = cargo(&tools, &root, &home)
+                .env("CARGO_INCREMENTAL", "1")
+                // Diagnostic instrumentation only; this flag is not admitted
+                // as a production command-context override.
+                .env("RUSTFLAGS", "-Zincremental-info")
+                .args(args.iter().map(|argument| {
+                    if argument == "--target-dir=/__rabs/out/cargo" {
+                        format!("--target-dir={}", output_root.display())
+                    } else {
+                        argument.clone()
+                    }
+                }))
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{label} edit={offset}: {stderr}");
+            let reused_files: usize = stderr
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("[incremental] session directory: ")?
+                        .strip_suffix(" files hard-linked")?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .sum();
+            if offset == 0 {
+                assert_eq!(reused_files, 0, "a cold build has no prior session");
+            } else {
+                assert!(
+                    reused_files > 0,
+                    "{label}: edited rustc did not reuse its prior session: {stderr}"
+                );
+            }
+            let report = CargoArtifactReport::read(
+                output.stdout.as_slice(),
+                output_root.to_str().unwrap(),
+                CargoArtifactMode::Compilation,
+            )
+            .unwrap();
+            let required = report.files().map(str::to_owned).collect::<BTreeSet<_>>();
+            assert!(required.contains(&executable));
+            assert!(
+                required
+                    .iter()
+                    .all(|name| !is_private_incremental_file(&roots, name)),
+                "no Cargo-reported output may disappear into private state"
+            );
+            let inventory =
+                TreeInventory::scan(&output_root, &required, 128 * 1024 * 1024, &|| false).unwrap();
+            let private = inventory
+                .names()
+                .filter(|name| is_private_incremental_file(&roots, name))
+                .collect::<Vec<_>>();
+            for suffix in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+                assert!(
+                    private.iter().any(|name| name.ends_with(suffix)),
+                    "{label}: real rustc did not retain {suffix} under {roots:?}"
+                );
+                assert!(
+                    inventory
+                        .names()
+                        .filter(|name| name.ends_with(suffix))
+                        .all(|name| is_private_incremental_file(&roots, name)),
+                    "{label}: compiler state escaped the derived roots"
+                );
+            }
+            let mut public = Vec::new();
+            let mut public_bytes = 0_u64;
+            let mut private_bytes = 0_u64;
+            for name in inventory.names() {
+                let mut file = inventory.open_file(name).unwrap();
+                let metadata = file.metadata().unwrap();
+                if is_private_incremental_file(&roots, name) {
+                    private_bytes += metadata.len();
+                } else {
+                    public_bytes += std::io::copy(&mut file, &mut std::io::sink()).unwrap();
+                    public.push((name, metadata.permissions().mode() & 0o111 != 0));
+                }
+                inventory.verify_file(name, &file).unwrap();
+            }
+            report.validate_outputs(public).unwrap();
+            assert!(private_bytes > 0);
+            assert!(public_bytes > 0 && public_bytes < inventory.total_bytes());
+            assert_eq!(public_bytes + private_bytes, inventory.total_bytes());
+            inventory.verify(&|| false).unwrap();
+            let ran = Command::new(output_root.join(&executable))
+                .output()
+                .unwrap();
+            assert!(ran.status.success());
+            assert_eq!(ran.stdout, format!("{}\n", 42 + offset).as_bytes());
+            eprintln!(
+                "{label} edit={offset}: {} private files, {private_bytes} private bytes, \
+                 {public_bytes} public bytes, {reused_files} prior-session files reused",
+                private.len()
+            );
+        }
+    }
+}
+
+/// Exercise the shared private-target selection policy against actual Cargo
+/// fingerprints and captured source bytes. This is not daemon placement, worker
+/// target restoration or a result-cache test: every command below executes.
+#[test]
+fn real_cargo_source_edit_family_reuses_dependencies_across_commands_and_membership() {
+    let (owner, root, home, tools) = workspace_fixture();
+    let output_root = owner.path().join("compatible-target");
+    let capture = || {
+        let image = capture_sealed_source(
+            &[("workspace".to_owned(), root.clone())],
+            false,
+            3,
+            1024 * 1024,
+        )
+        .unwrap();
+        let files = image
+            .manifest("workspace")
+            .unwrap()
+            .members
+            .iter()
+            .filter_map(|(path, member)| match member {
+                MemberKind::Regular {
+                    size,
+                    content_sha256,
+                    mode,
+                    ..
+                } => Some(SourceFile {
+                    path: path.clone(),
+                    len: *size,
+                    sha256: *content_sha256,
+                    executable: mode & 0o111 != 0,
+                }),
+                MemberKind::Directory => None,
+                MemberKind::Symlink { .. } => panic!("fixture contains no symlink"),
+            })
+            .collect();
+        SourceManifest::new(files).unwrap()
+    };
+    let arguments = |command: &str, selection: &[&str]| {
+        let mut args = [
+            command,
+            "--locked",
+            "--offline",
+            "--message-format=json",
+            "--manifest-path=/__rabs/workspace/Cargo.toml",
+            "--target-dir=/__rabs/out/cargo",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        args.extend(selection.iter().map(|argument| (*argument).to_owned()));
+        args
+    };
+    let run = |args: &[String], mode| {
+        let output = cargo(&tools, &root, &home)
+            .args(args.iter().map(|argument| match argument.as_str() {
+                "--manifest-path=/__rabs/workspace/Cargo.toml" => {
+                    format!("--manifest-path={}", root.join("Cargo.toml").display())
+                }
+                "--target-dir=/__rabs/out/cargo" => {
+                    format!("--target-dir={}", output_root.display())
+                }
+                _ => argument.clone(),
+            }))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            mode,
+        )
+        .unwrap();
+        assert!(report.files().next().is_some());
+        output
+    };
+    let base = capture();
+    let family = source_edit_identity(&base, base.digest(), None).unwrap();
+    let build_shape = compatible_arguments(
+        "/__rabs/toolchain/bin/cargo",
+        &arguments("build", &["--workspace"]),
+        CargoArtifactMode::Compilation,
+    )
+    .unwrap();
+    let mut previous = base.digest();
+
+    for (step, expected, selection) in [
+        ("cold", 42, vec!["--workspace"]),
+        ("source-edit", 43, vec!["-p", "artifact_app"]),
+        ("module-added", 44, vec!["--bin", "artifact_app"]),
+        ("module-removed", 49, vec!["--workspace"]),
+        ("data-added", 45, vec!["-p", "artifact_app"]),
+        ("data-edited", 46, vec!["--bin", "artifact_app"]),
+    ] {
+        match step {
+            "source-edit" => fs::write(
+                root.join("app/src/main.rs"),
+                "fn main() { println!(\"{}\", artifact_library::VALUE + 1); }\n",
+            )
+            .unwrap(),
+            "module-added" => {
+                fs::write(root.join("app/src/bonus.rs"), "pub const BONUS: u32 = 2;\n").unwrap();
+                fs::write(
+                    root.join("app/src/main.rs"),
+                    "mod bonus; fn main() { println!(\"{}\", artifact_library::VALUE + bonus::BONUS); }\n",
+                )
+                .unwrap();
+            }
+            "module-removed" => {
+                // Move outside the captured workspace so the old module is
+                // absent while preserving its bytes for inspection.
+                fs::rename(root.join("app/src/bonus.rs"), owner.path().join("bonus.rs")).unwrap();
+                fs::write(
+                    root.join("app/src/main.rs"),
+                    "fn main() { println!(\"{}\", artifact_library::VALUE + 7); }\n",
+                )
+                .unwrap();
+            }
+            "data-added" => {
+                fs::write(root.join("app/src/offset.txt"), "3\n").unwrap();
+                fs::write(
+                    root.join("app/src/main.rs"),
+                    "fn main() { println!(\"{}\", artifact_library::VALUE + include_str!(\"offset.txt\").trim().parse::<u32>().unwrap()); }\n",
+                )
+                .unwrap();
+            }
+            "data-edited" => fs::write(root.join("app/src/offset.txt"), "4\n").unwrap(),
+            "cold" => {}
+            _ => unreachable!(),
+        }
+        let captured = capture();
+        assert_eq!(
+            source_edit_identity(&captured, captured.digest(), None),
+            Some(family),
+            "{step} must retain the private Cargo seed family",
+        );
+        if step != "cold" {
+            assert_ne!(
+                captured.digest(),
+                previous,
+                "{step} must still have a different exact source identity",
+            );
+        }
+        previous = captured.digest();
+        let args = arguments("build", &selection);
+        assert_eq!(
+            compatible_arguments(
+                "/__rabs/toolchain/bin/cargo",
+                &args,
+                CargoArtifactMode::Compilation,
+            ),
+            Some(build_shape.clone()),
+        );
+        let output = run(&args, CargoArtifactMode::Compilation);
+        let artifacts = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        for (name, expected_fresh) in [
+            ("artifact_library", step != "cold"),
+            ("artifact_app", false),
+        ] {
+            let artifact = artifacts
+                .iter()
+                .find(|message| message["target"]["name"] == name)
+                .unwrap_or_else(|| panic!("{step}: missing real Cargo artifact for {name}"));
+            assert_eq!(artifact["fresh"], expected_fresh, "{step}: {name}");
+        }
+        let executed = Command::new(output_root.join("debug/artifact_app"))
+            .output()
+            .unwrap();
+        assert!(executed.status.success());
+        assert_eq!(executed.stdout, format!("{expected}\n").as_bytes());
+        eprintln!(
+            "{step}: output={expected}, dependency fresh={}",
+            step != "cold"
+        );
+    }
+
+    for (command, selection, mode) in [
+        ("check", vec!["--workspace"], CargoArtifactMode::Compilation),
+        (
+            "test",
+            vec!["--workspace", "--no-run"],
+            CargoArtifactMode::Compilation,
+        ),
+        (
+            "test",
+            vec!["-p", "artifact_library", "--lib", "value", "--", "--exact"],
+            CargoArtifactMode::TestExecution,
+        ),
+    ] {
+        let args = arguments(command, &selection);
+        assert_eq!(
+            compatible_arguments("/__rabs/toolchain/bin/cargo", &args, mode),
+            Some(build_shape.clone()),
+        );
+        let output = run(&args, mode);
+        if mode == CargoArtifactMode::TestExecution {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "test selection must execute the real test after compilation",
+            );
+        }
+    }
+    let clippy = compatible_arguments(
+        "/__rabs/toolchain/bin/cargo-clippy",
+        &arguments("clippy", &["--workspace", "--", "-Dwarnings"]),
+        CargoArtifactMode::Compilation,
+    )
+    .unwrap();
+    assert_ne!(clippy, build_shape, "Clippy retains a separate seed family");
+    assert_ne!(
+        Some(clippy),
+        compatible_arguments(
+            "/__rabs/toolchain/bin/cargo-clippy",
+            &arguments("clippy", &["-p", "artifact_library", "--", "-Dwarnings"]),
+            CargoArtifactMode::Compilation,
+        ),
+        "Clippy package selection must not erase lint execution",
+    );
+
+    let manifest = root.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\n# resolution/configuration boundary changed\n",
+            fs::read_to_string(&manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    let changed = capture();
+    assert_ne!(
+        source_edit_identity(&changed, changed.digest(), None),
+        Some(family),
+        "Cargo manifests remain exact even when the edited comment changes no output",
     );
 }
 

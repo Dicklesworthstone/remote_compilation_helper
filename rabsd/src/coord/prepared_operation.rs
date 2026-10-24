@@ -445,11 +445,86 @@ fn worker_owns_record(worker: &PreparedWorker, record: &Record) -> bool {
         })
 }
 
-/// Prefer a worker that recently finished this exact captured Cargo command
-/// when queue loads are equal. The existing allocated-intent fingerprint binds
-/// every captured source, toolchain, command and extension byte except the wire
-/// request ID. Do not infer source-edit compatibility here: the worker alone
-/// validates and chooses retained targets, and Cargo still executes normally.
+/// Derive a placement hint using the worker's private-target compatibility
+/// policy. The retained request and its durable execution fingerprint stay
+/// exact. The shared source policy permits only local source/data edits while
+/// keeping Cargo manifests, configuration, executables and dependency caches
+/// bound to their complete captured contents.
+///
+/// Every other request field, including unknown extensions, remains exact. A
+/// matching hint cannot authorize target restoration or compiler skipping: the
+/// selected worker independently verifies its actual retained state and Cargo
+/// still executes the original command.
+fn cargo_compatibility_fingerprint(request: &Value) -> io::Result<Option<[u8; 32]>> {
+    use rabs_sandbox::cargo_artifacts::{private_incremental_roots, requested};
+    use rabs_sandbox::cargo_home::CargoHomeProjection;
+    use rabs_sandbox::cargo_target::{compatible_arguments, source_edit_identity};
+
+    let Some(mode) = requested(request)? else {
+        return Ok(None);
+    };
+    let private_roots = private_incremental_roots(request)?;
+    let program = request["program"]
+        .as_str()
+        .ok_or_else(|| invalid("Cargo locality requires a literal program"))?;
+    let arguments = request["args"]
+        .as_array()
+        .ok_or_else(|| invalid("Cargo locality requires an argument array"))?
+        .iter()
+        .map(|argument| {
+            argument
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("Cargo locality requires literal arguments"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let Some(arguments) = compatible_arguments(program, &arguments, mode) else {
+        return Ok(None);
+    };
+    let Some(source) = request_manifest(request)? else {
+        return Ok(None);
+    };
+    let projection = request
+        .get("cargo_home")
+        .map(|home| {
+            CargoHomeProjection::for_version(
+                home["version"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo locality requires a projection version"))?,
+                home["prefix"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo locality requires a projection prefix"))?,
+                &source,
+            )
+        })
+        .transpose()?;
+    let workspace = projection
+        .as_ref()
+        .and_then(CargoHomeProjection::workspace_manifest)
+        .unwrap_or(&source);
+    let mut intent = request.clone();
+    intent["request_id"] = serde_json::json!("allocate");
+    intent["args"] = serde_json::json!(arguments);
+    intent["artifacts"]["cargo"] = serde_json::json!("current-cargo-contract-required-v1");
+    if let Some(source_family) =
+        source_edit_identity(workspace, source.digest(), projection.as_ref())
+    {
+        intent["source_manifest"] = serde_json::json!(source_family);
+    }
+    // Keep the independently validated output projection outside the request
+    // object so an unknown extension cannot collide with an internal hint field.
+    let encoded = serde_json::to_vec(&(intent, private_roots))?;
+    let mut hash = Sha256::new();
+    hash.update(b"rabs.prepared-operation.cargo-compatible-locality.v1\0");
+    hash.update((encoded.len() as u64).to_le_bytes());
+    hash.update(encoded);
+    Ok(Some(hash.finalize().into()))
+}
+
+/// Prefer an exact captured command, then a compatible private Cargo target,
+/// when queue loads are equal. Recency breaks ties within each class. The exact
+/// allocated-intent fingerprint still binds every source, toolchain, command
+/// and extension byte except the wire request ID.
 ///
 /// Resolved ordinary failures can also leave useful targets. Cancellation,
 /// stopped processes, uncertain ownership and jobs never dispatched cannot.
@@ -459,12 +534,13 @@ fn cargo_locality(
     state: &State,
     request: &Value,
     workers: &[PreparedWorker],
-) -> io::Result<Vec<Option<u64>>> {
+) -> io::Result<Vec<Option<(u8, u64)>>> {
     let mut recent = vec![None; workers.len()];
     if rabs_sandbox::cargo_artifacts::requested(request)?.is_none() {
         return Ok(recent);
     }
     let fingerprint = record_request_digest(2, request)?;
+    let compatible = cargo_compatibility_fingerprint(request)?;
     for record in state.records.values().filter(|record| {
         record.state == OperationState::Completed
             && !record.unresolved()
@@ -476,23 +552,34 @@ fn cargo_locality(
             && record.stop_reason.is_none()
             && state.next_order.saturating_sub(record.order) <= CARGO_LOCALITY_WINDOW
     }) {
-        let matches = if record.version == 2 {
+        // Avoid parsing large manifests for records belonging to another pool.
+        // Unlike overlapping-owner exclusion, locality requires all three
+        // identities: endpoint, worker name and certificate pin.
+        let matches_worker = |worker: &PreparedWorker| {
+            worker.address == record.spec.address
+                && worker.worker == record.spec.worker
+                && worker.worker_spki_sha256 == record.spec.worker_spki_sha256
+        };
+        if !workers.iter().any(matches_worker) {
+            continue;
+        }
+        let exact = if record.version == 2 {
             record.request_sha256 == fingerprint
         } else {
             record_request_digest(2, &record.request)? == fingerprint
         };
-        if !matches {
+        let rank = if exact {
+            2
+        } else if compatible.is_some()
+            && cargo_compatibility_fingerprint(&record.request)? == compatible
+        {
+            1
+        } else {
             continue;
-        }
+        };
         for (index, worker) in workers.iter().enumerate() {
-            // Unlike overlapping-owner exclusion, a locality hint requires
-            // all three identities. Rotating an endpoint, worker or pin must
-            // not inherit another approved placement's execution history.
-            if worker.address == record.spec.address
-                && worker.worker == record.spec.worker
-                && worker.worker_spki_sha256 == record.spec.worker_spki_sha256
-            {
-                recent[index] = recent[index].max(Some(record.order));
+            if matches_worker(worker) {
+                recent[index] = recent[index].max(Some((rank, record.order)));
             }
         }
     }

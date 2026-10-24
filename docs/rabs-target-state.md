@@ -19,8 +19,8 @@ rabs-wkr --coordinator 10.0.0.1:7091 --worker-id builder \
 
 Keep the worker's existing TLS and durable admission configuration. The default
 is `0`, which disables target retention. The maximum configured limit is 8 GiB.
-The pool admits at most eight retained or pending seeds, and each target tree
-must also fit the existing 1 GiB artifact transport limit. Pending captures count
+The pool admits at most eight retained or pending seeds, and each complete target
+tree must also fit the existing 1 GiB tree inventory limit. Pending captures count
 against the pool before copying begins; old unused seeds are evicted when needed.
 The byte limit counts target file payload. Durable metadata has a separate
 16 MiB cap per generation; directory and filesystem allocation overhead also
@@ -69,11 +69,83 @@ during an upgrade. An explicit zero byte limit disables retention; an explicit
 empty epoch restores process-only retention. A disabled store is dormant until
 enabled again, when the supplied epoch and quota are checked.
 
-No new Cargo profile field is needed. Both the direct and durable daemon modes
-of [canonical Cargo](rabs-canonical-cargo.md) can use an enabled worker. Requests
+No new Cargo profile field is needed for ordinary target retention. Both the
+direct and durable daemon modes of [canonical Cargo](rabs-canonical-cargo.md)
+can use an enabled worker. Requests
 must have a verified uploaded workspace, captured toolchain, and an explicit
 Cargo artifact-report contract. Dependency-only execution and generic artifact
 requests keep their existing behavior.
+
+### Retain private rustc incremental state
+
+Set `"incremental": true` in the canonical Cargo profile to run with
+`CARGO_INCREMENTAL=1`. This explicitly overrides Cargo's per-profile incremental
+setting. The default and `false` keep `CARGO_INCREMENTAL=0`. Both values enter
+the actual command environment and select different target families; changing
+the toolchain, compilation profile or other keyed controls still starts cold.
+
+The explicit `cargo-private-incremental-json-v1` and
+`cargo-private-incremental-test-json-v1` output contracts keep compiler state
+under the selected profile's `incremental` directory on the worker. An explicit
+target triple also selects that target's profile directory. The worker and
+coordinator derive these exact paths independently. A similarly named binary,
+custom profile, or generated output is not omitted. Every Cargo-reported output
+must still appear in the delivered artifact manifest. Older output contracts
+continue to return their complete regular-file trees.
+
+The retained seed contains the complete target, including rustc's dep-graph,
+query-cache and work products. A new execution receives its own writable copy;
+the retained seed and concurrent attempts share no writable inodes. Cargo and
+rustc validate that state during the current command. Normal edits can reuse
+it, and persistent mode can retain it across worker restarts under the same
+runtime epoch. Tests always execute again.
+
+Only delivered artifacts consume transport payload bytes. The complete tree,
+including omitted compiler state and internal hardlink aliases, still counts
+toward the existing 1 GiB, 4,096-file and 16,384-entry inventory limits and the
+configured target-pool quota. Its full namespace receives the same symlink,
+hardlink, special-file and mutation checks before any artifact is offered.
+Without worker target retention, an incremental build still runs with fresh
+private storage, but the next operation has no retained seed to reuse. This
+mode does not transfer incremental snapshots to other workers or authorize
+fine-grained action-cache serving.
+
+## Keep related builds on a warm worker
+
+A canonical Cargo profile with a `workers` array automatically uses recent build
+history to prefer a worker that may hold useful private state. No extra profile
+option is required. The daemon chooses by queued/running job load first. Among
+equally loaded workers, an exact captured request match takes precedence over a
+compatible command or source generation; more recently admitted matching jobs
+win within each class, then the configured worker order breaks ties.
+
+The coordinator and worker share the command normalization and source-edit
+family planner described below. An eligible edit or a build/check/test selection
+change can therefore keep the next build on the worker that ran its predecessor.
+Clippy's separate family preserves its exact selectors and lint controls.
+Non-editable inputs, captured dependency-cache contents, toolchain, environment,
+profile, features, target, job grant, required artifacts and other request
+controls still partition the placement hint. Unknown argument forms keep
+exact-request affinity. Legacy visible-prefix Cargo-home projections keep
+exact-source affinity.
+
+History must match all three configured identities: the coordinator endpoint,
+worker name and certificate pin. Only resolved, dispatched completions with
+normal exit status 0–127 and no cancellation or stop reason qualify. A completed
+compile, lint or test failure may therefore help place the next fixed build.
+Unresolved executions continue to exclude their worker from new placement.
+
+The hint uses the last 128 queue admissions in the daemon's bounded durable live
+records. A coordinator restart can reload those records; archived history does
+not contribute. This records where work ran, not whether a seed is still present.
+Worker eviction, disabled retention, a process-only worker restart or a changed
+runtime epoch can leave the preferred worker cold. Its own exact and compatible
+keys, input verification, timestamp checks and quota decide whether restoration
+is possible. Cargo always runs the current command. The original request and its
+source, allocation and recovery identities are never replaced by this hint.
+
+See [canonical Cargo worker pools](rabs-canonical-cargo.md#place-canonical-cargo-jobs-across-a-worker-pool)
+for configuration. Single-worker profiles continue to use their selected worker.
 
 ## What can reuse a seed
 

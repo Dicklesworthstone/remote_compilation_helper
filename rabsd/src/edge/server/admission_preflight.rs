@@ -8,6 +8,7 @@
 //! or classify a directory source without its captured checksum witness.
 
 use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
+use rabs_key::live_dependency::remote::remote_dependency_output_class;
 use rabs_key::live_dependency::{
     LiveRefusal, LiveRustcRequest, check_dependency_cache_read_closure,
 };
@@ -20,6 +21,19 @@ mod sysroot_preflight;
 /// Keep this deliberately small; differential tests below require supported
 /// requests to continue to the full planner, not become false cache misses.
 pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
+    rejection_for(request, false)
+}
+
+/// A configured remote worker can enforce the archive read-closure profile.
+/// This only avoids a premature local-only refusal: the complete remote key,
+/// retained validation owner and worker context must still agree before lookup,
+/// dispatch, publication or installation. An unavailable remote lane never
+/// turns this preliminary check into local codegen cache authority.
+pub(super) fn remote_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
+    rejection_for(request, true)
+}
+
+fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefusal> {
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
     if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -108,9 +122,12 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
         ));
     }
     // A .d file does not report assembler reads such as global_asm! .incbin.
-    // Refuse codegen before any expensive facts, persisted hit or sampling
-    // decision. The wrapper still executes the exact original command.
-    if let Err(refusal) = check_dependency_cache_read_closure(&invocation) {
+    // Only an explicitly configured remote execution path may proceed toward
+    // its separately enforced archive profile; the unsandboxed local lane
+    // still refuses all codegen before warming facts or consulting a cache.
+    if !(remote && remote_dependency_output_class(&invocation).is_ok())
+        && let Err(refusal) = check_dependency_cache_read_closure(&invocation)
+    {
         return Some(refusal);
     }
     if !invocation
@@ -249,6 +266,78 @@ mod tests {
     }
 
     #[test]
+    fn only_the_explicit_remote_preflight_can_consider_pure_rust_archives() {
+        for package in [
+            PACKAGE,
+            "/cargo/git/checkouts/leaf-123/abcdef123/member",
+            "/workspace/vendor/leaf",
+        ] {
+            for emit in ["dep-info,link", "dep-info,metadata,link"] {
+                let (mut argv, env) = fixture(package);
+                *argv
+                    .iter_mut()
+                    .find(|arg| arg.starts_with("--emit="))
+                    .unwrap() = format!("--emit={emit}");
+                let request = LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package,
+                    env: &env,
+                };
+                assert_eq!(rejection(request), Some(LiveRefusal::UnclosedCodegenInputs));
+                assert_eq!(remote_rejection(request), None);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_archive_preflight_still_rejects_native_proc_macro_and_unmodeled_inputs() {
+        for extra in [
+            vec!["--crate-type=proc-macro"],
+            vec!["--crate-type=cdylib"],
+            vec!["-l", "ssl"],
+            vec!["-L", "native=/usr/lib"],
+            vec!["--extern", "derive=/target/deps/libderive.so"],
+            vec!["-C", "target-cpu=native"],
+            vec!["-C", "incremental=/target/incremental"],
+        ] {
+            let (mut argv, env) = fixture(PACKAGE);
+            *argv
+                .iter_mut()
+                .find(|arg| arg.starts_with("--emit="))
+                .unwrap() = "--emit=dep-info,metadata,link".into();
+            argv.extend(extra.iter().map(|value| (*value).to_owned()));
+            let request = LiveRustcRequest {
+                argv: &argv,
+                cwd: PACKAGE,
+                env: &env,
+            };
+            assert!(remote_rejection(request).is_some(), "{extra:?}");
+        }
+        for emit in [
+            "dep-info,obj",
+            "dep-info,asm",
+            "dep-info,llvm-ir",
+            "dep-info,llvm-bc",
+            "link",
+        ] {
+            let (mut argv, env) = fixture(PACKAGE);
+            *argv
+                .iter_mut()
+                .find(|arg| arg.starts_with("--emit="))
+                .unwrap() = format!("--emit={emit}");
+            assert!(
+                remote_rejection(LiveRustcRequest {
+                    argv: &argv,
+                    cwd: PACKAGE,
+                    env: &env
+                })
+                .is_some(),
+                "{emit}"
+            );
+        }
+    }
+
+    #[test]
     fn early_environment_refusals_agree_with_the_full_planner() {
         for name in [
             "CARGO_PRIMARY_PACKAGE",
@@ -264,8 +353,14 @@ mod tests {
                 cwd: PACKAGE,
                 env: &env,
             };
-            assert_eq!(rejection(request), plan_dependency_action(request, HOST).err());
-            assert!(matches!(rejection(request), Some(LiveRefusal::RefusedEnv(_))));
+            assert_eq!(
+                rejection(request),
+                plan_dependency_action(request, HOST).err()
+            );
+            assert!(matches!(
+                rejection(request),
+                Some(LiveRefusal::RefusedEnv(_))
+            ));
         }
         for missing in ["CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "CARGO_HOME"] {
             let (argv, mut env) = fixture(PACKAGE);
@@ -275,8 +370,14 @@ mod tests {
                 cwd: PACKAGE,
                 env: &env,
             };
-            assert_eq!(rejection(request), plan_dependency_action(request, HOST).err());
-            assert!(matches!(rejection(request), Some(LiveRefusal::MissingEnv(_))));
+            assert_eq!(
+                rejection(request),
+                plan_dependency_action(request, HOST).err()
+            );
+            assert!(matches!(
+                rejection(request),
+                Some(LiveRefusal::MissingEnv(_))
+            ));
         }
         let (argv, mut env) = fixture(PACKAGE);
         env.push(env[0].clone());
@@ -285,8 +386,14 @@ mod tests {
             cwd: PACKAGE,
             env: &env,
         };
-        assert_eq!(rejection(request), plan_dependency_action(request, HOST).err());
-        assert!(matches!(rejection(request), Some(LiveRefusal::DuplicateEnv(_))));
+        assert_eq!(
+            rejection(request),
+            plan_dependency_action(request, HOST).err()
+        );
+        assert!(matches!(
+            rejection(request),
+            Some(LiveRefusal::DuplicateEnv(_))
+        ));
     }
 
     #[test]
@@ -463,6 +570,12 @@ mod tests {
                         panic!("codegen cannot warm, execute privately or serve: {emit}");
                     };
                     assert_eq!(observed.argv, argv, "fallback retains original outputs");
+                    let mut advertised = request.clone();
+                    advertised["remote_protocol"] = json!(1);
+                    assert!(
+                        matches!(decide(&live, &advertised), Decided::Shadow(_)),
+                        "a wrapper hint cannot replace a configured enforcing worker: {emit}"
+                    );
                 }
             }
         }
@@ -484,7 +597,10 @@ mod tests {
         let marker = root.join("probed");
         std::fs::write(
             &compiler,
-            format!("#!/bin/sh\nprintf invoked > '{}'\nexit 99\n", marker.display()),
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 99\n",
+                marker.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -511,7 +627,10 @@ mod tests {
                     panic!("out-of-class requests must not wait for cold toolchain facts");
                 };
                 assert_eq!(observed.argv[0], compiler.to_str().unwrap());
-                assert!(!marker.exists(), "preflight must not start an identity probe");
+                assert!(
+                    !marker.exists(),
+                    "preflight must not start an identity probe"
+                );
             }
         }
     }
@@ -524,7 +643,15 @@ mod tests {
             "aarch64-unknown-linux-gnu",
             "aarch64-unknown-linux-musl",
         ] {
-            for kind in ["", "bin", "proc-macro", "dylib", "cdylib", "staticlib", "lib,bin"] {
+            for kind in [
+                "",
+                "bin",
+                "proc-macro",
+                "dylib",
+                "cdylib",
+                "staticlib",
+                "lib,bin",
+            ] {
                 for split in [false, true] {
                     let (mut argv, env) = fixture(PACKAGE);
                     argv.retain(|arg| arg != "--crate-type=lib");
@@ -612,7 +739,10 @@ mod tests {
                 let plan = plan_dependency_action(request, host).unwrap();
                 assert_eq!(argv, original, "admission must not rewrite the command");
                 assert!(
-                    plan.invocation.unstable.iter().any(|(name, _)| name == "threads")
+                    plan.invocation
+                        .unstable
+                        .iter()
+                        .any(|(name, _)| name == "threads")
                 );
                 assert!(plan.output_names().iter().any(|name| name.ends_with(".d")));
             }
@@ -672,7 +802,10 @@ mod tests {
         std::fs::create_dir_all(compiler.parent().unwrap()).unwrap();
         std::fs::write(
             &compiler,
-            format!("#!/bin/sh\nprintf invoked > '{}'\nexit 99\n", marker.display()),
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 99\n",
+                marker.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -703,14 +836,23 @@ mod tests {
                     panic!("{option} must bypass, not warm facts for an impossible cache hit");
                 };
                 assert_eq!(observed.argv, argv);
-                assert!(!marker.exists(), "an unsupported output control started rustc");
+                assert!(
+                    !marker.exists(),
+                    "an unsupported output control started rustc"
+                );
             }
         }
     }
 
     #[test]
     fn unmodeled_compiler_source_and_output_shapes_do_not_warm() {
-        for case in ["compiler", "stdin", "missing-source", "missing-out-dir", "empty-out-dir"] {
+        for case in [
+            "compiler",
+            "stdin",
+            "missing-source",
+            "missing-out-dir",
+            "empty-out-dir",
+        ] {
             let (mut argv, env) = fixture(PACKAGE);
             match case {
                 "compiler" => argv[0] = "/toolchain/bin/clippy-driver".into(),
@@ -754,13 +896,18 @@ mod tests {
         let marker = root.join("probed");
         std::fs::write(
             &compiler,
-            format!("#!/bin/sh\nprintf invoked > '{}'\nexit 99\n", marker.display()),
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 99\n",
+                marker.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cas = Arc::new(crate::janitor::store::mount_and_reconcile(&root.join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(cas));
-        coord.acquire_boot_authority("producer-preflight-fixture").unwrap();
+        coord
+            .acquire_boot_authority("producer-preflight-fixture")
+            .unwrap();
         coord.mark_up();
         let live = LiveEdge::new(LiveDependencyLane::new(coord));
         for may_wait in [true, false] {
@@ -778,7 +925,10 @@ mod tests {
                     panic!("{kind} must immediately pass through, not enter preparation");
                 };
                 assert_eq!(observed.argv, argv);
-                assert!(!marker.exists(), "unsupported producers must not probe rustc");
+                assert!(
+                    !marker.exists(),
+                    "unsupported producers must not probe rustc"
+                );
             }
         }
     }

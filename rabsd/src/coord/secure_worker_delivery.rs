@@ -18,8 +18,8 @@ use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
     ArtifactByteCache, DEFAULT_ARTIFACT_CACHE_BYTES, DEFAULT_ARTIFACT_CACHE_ENTRIES, Delivery,
     DeliveryFailure, DeliveryMode, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
-    ResumePeer, ResumeSource, WorkerAuthentication, WorkerPeer, receive_operation,
-    transport_interrupted, validate_request, worker_transport_error,
+    ResumePeer, ResumeSource, WorkerAuthentication, WorkerPeer, negotiated_dependency_mode,
+    receive_operation, transport_interrupted, validate_request, worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::Runtime;
@@ -30,6 +30,7 @@ use rabs_protocol::identity_store::{IdentityStore, TransportIdentity, TrustScope
 use rabs_protocol::version_negotiation::{VersionHello, VersionRange};
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_protocol::worker_session::{CoordinatorSession, SessionPolicy, WorkerHelloClaims};
+use rabs_sandbox::dependency_context::DependencyExecutionMode;
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET;
 use serde_json::{Value, json};
 use std::ffi::OsStr;
@@ -387,26 +388,20 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         // A dependency context changes mounts, argv and environment, so sending
         // one without an explicit negotiated selection could execute different
         // code. Refuse before the challenge, input upload or live action hook.
-        let dependency_context = self.mode == DeliveryMode::Execute
-            && self.expected_operation.get("dependency_context").is_some();
-        if dependency_context {
-            require(
-                self.expected_operation["dependency_context"]["version"]
-                    == DEPENDENCY_CONTEXT_VERSION
-                    && hello["dependency_contexts"]
-                        .as_array()
-                        .is_some_and(|versions| {
-                            versions
-                                .iter()
-                                .any(|version| version == DEPENDENCY_CONTEXT_VERSION)
-                        }),
-                "worker lacks the required dependency execution context",
-            )?;
-        }
+        let dependency_mode =
+            negotiated_dependency_mode(hello, &self.expected_operation, self.mode)?;
         require(
-            grant.get("dependency_context").is_none_or(|selection| {
-                dependency_context && selection == DEPENDENCY_CONTEXT_VERSION
-            }),
+            match (
+                grant.get("dependency_context"),
+                grant.get("dependency_execution_mode"),
+            ) {
+                (None, None) => true,
+                (Some(context), Some(mode)) => {
+                    context == DEPENDENCY_CONTEXT_VERSION
+                        && dependency_mode.is_some_and(|selected| mode == selected.as_str())
+                }
+                _ => false,
+            },
             "dependency context was not authorized by this execution session",
         )?;
         // Refuse an old worker before challenge, source upload or dispatch.
@@ -483,7 +478,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 revoked_token_ids: &[],
                 current_seq: 1,
                 required_capability: CapabilityKind::ExecuteAction,
-                require_canonical: true,
+                require_canonical: self.mode == DeliveryMode::Execute
+                    && dependency_mode != Some(DependencyExecutionMode::Rlib),
                 limits: DEFAULT_LIMITS,
                 max_sequence_buffer: 1,
             },
@@ -526,8 +522,9 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         if let Some(lease) = execution_lease {
             grant["execution_lease"] = lease;
         }
-        if dependency_context {
+        if let Some(mode) = dependency_mode {
             grant["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
+            grant["dependency_execution_mode"] = json!(mode.as_str());
         }
         if self.mode == DeliveryMode::Execute
             && hello["output_previews"]
@@ -1800,12 +1797,20 @@ mod tests {
 
     #[test]
     fn resume_binds_complete_request_and_burns_dispatch_before_partial_write() {
-        let mut peer = peer_with_mode(recovery_hello(), response(), DeliveryMode::Resume);
+        let mut offered = recovery_hello();
+        offered["canonical"] = json!(false);
+        offered["dependency_execution_modes"] = json!([]);
+        let mut peer = peer_with_mode(offered, response(), DeliveryMode::Resume);
         let hello = peer.receive().unwrap();
         let mut grant = grant();
         grant["result_retention"] = json!("durable-result-v1");
         peer.negotiate(&hello, &grant).unwrap();
         assert!(peer.inner.sent[1].get("execution_lease").is_none());
+        assert!(
+            peer.inner.sent[1]
+                .get("dependency_execution_mode")
+                .is_none()
+        );
         assert!(peer.send(&request()).is_err());
         let dispatch = DeliveryMode::Resume.frame(&request());
         for field in [
@@ -2253,6 +2258,7 @@ mod tests {
             let (upload, mut request, mut script) = toolchain_fixture(root.path(), false);
             request["dependency_context"] = json!({
                 "version": DEPENDENCY_CONTEXT_VERSION,
+                "execution_mode":"metadata",
                 "source_root":"/ws", "cwd":"/ws", "toolchain_root":"/tc",
                 "compiler":"/tc/rustc", "out_dir":"/out", "env":[], "dependency_dirs":[],
                 "runtime_cohort_sha256":"ab".repeat(32)
@@ -2266,7 +2272,10 @@ mod tests {
                     script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
                     request["dependency_context"]["version"] = json!("dependency-exec-v999");
                 }
-                _ => script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]),
+                _ => {
+                    script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+                    script.replies[0]["dependency_execution_modes"] = json!(["metadata"]);
+                }
             }
             let calls = Arc::new(AtomicUsize::new(0));
             let callback_calls = Arc::clone(&calls);
@@ -2292,6 +2301,7 @@ mod tests {
                     peer.inner.sent[1]["dependency_context"],
                     DEPENDENCY_CONTEXT_VERSION
                 );
+                assert_eq!(peer.inner.sent[1]["dependency_execution_mode"], "metadata");
                 assert!(
                     peer.inner
                         .sent
@@ -2301,6 +2311,90 @@ mod tests {
                 peer.send(&request).unwrap();
                 assert_eq!(peer.inner.sent.last().unwrap(), &request);
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_only_worker_admission_requires_the_exact_measured_profile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (requested, advertised, canonical, accepted) in [
+            ("rlib", json!(["rlib"]), false, true),
+            ("metadata", json!(["metadata"]), false, false),
+            ("rlib", json!(["metadata"]), true, false),
+            ("metadata", json!(["rlib"]), true, false),
+            ("future", json!(["future"]), true, false),
+            ("rlib", Value::Null, false, false),
+            ("rlib", json!("rlib"), false, false),
+            ("rlib", json!(["metadata", "rlib"]), true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, mut request, mut script) = toolchain_fixture(root.path(), false);
+            request["dependency_context"] = json!({
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":requested,
+                "source_root":"/ws", "cwd":"/ws", "toolchain_root":"/tc",
+                "compiler":"/tc/rustc", "out_dir":"/out", "env":[], "dependency_dirs":[],
+                "runtime_cohort_sha256":"ab".repeat(32)
+            });
+            request["program"] = json!("/tc/rustc");
+            request["artifacts"] = json!({"unit":"dep", "files":["a"]});
+            script.replies[0]["canonical"] = json!(canonical);
+            script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            script.replies[0]["dependency_execution_modes"] = advertised.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap()
+                .with_admission_hook(Some(Box::new(move |_| {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })));
+            let offered = peer.receive().unwrap();
+            let outcome = peer.negotiate(&offered, &grant());
+            assert_eq!(
+                outcome.is_ok(),
+                accepted,
+                "requested={requested}, advertised={advertised}, canonical={canonical}: {outcome:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(accepted));
+            if accepted {
+                assert_eq!(peer.inner.sent[1]["dependency_execution_mode"], requested);
+                assert_eq!(
+                    peer.inner.sent[1]["dependency_context"],
+                    DEPENDENCY_CONTEXT_VERSION
+                );
+                peer.send(&request).unwrap();
+                assert_eq!(peer.inner.sent.last().unwrap(), &request);
+            } else {
+                assert!(
+                    peer.inner.sent.is_empty(),
+                    "refusal must precede challenge and upload"
+                );
+                assert!(peer.send(&request).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unsolicited_dependency_mode_grants_cannot_relax_canonical_admission() {
+        for selection in [
+            json!({"dependency_execution_mode":"rlib"}),
+            json!({"dependency_context":DEPENDENCY_CONTEXT_VERSION}),
+            json!({"dependency_context":DEPENDENCY_CONTEXT_VERSION,
+                   "dependency_execution_mode":"rlib"}),
+        ] {
+            let mut peer = peer(hello(), response());
+            let offered = peer.receive().unwrap();
+            let mut selected = grant();
+            selected
+                .as_object_mut()
+                .unwrap()
+                .extend(selection.as_object().unwrap().clone());
+            assert!(peer.negotiate(&offered, &selected).is_err());
+            assert!(peer.inner.sent.is_empty());
+            assert!(peer.send(&request()).is_err());
         }
     }
 

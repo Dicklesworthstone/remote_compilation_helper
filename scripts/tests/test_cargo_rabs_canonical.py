@@ -56,7 +56,10 @@ assert request["program"] == ("/__rabs/toolchain/bin/cargo-clippy" if clippy els
 if clippy:
     assert request["command_context"]["env"]["CARGO"] == "/__rabs/toolchain/bin/cargo"
     assert request["command_context"]["env"]["RUSTC"] == "/__rabs/toolchain/bin/rustc"
-assert request["artifacts"]["cargo"] == ("cargo-test-json-v1" if test_execution else "cargo-json-v1")
+if request["command_context"]["env"]["CARGO_INCREMENTAL"] == "1":
+    assert request["artifacts"]["cargo"] == ("cargo-private-incremental-test-json-v1" if test_execution else "cargo-private-incremental-json-v1")
+else:
+    assert request["artifacts"]["cargo"] == ("cargo-test-json-v1" if test_execution else "cargo-json-v1")
 assert cargo_args.count("--message-format=json") == 1
 assert request["toolchain_source"] + "/bin/cargo" == os.environ["CARGO"]
 assert request["toolchain_source"] + "/bin/rustc" == os.environ["RUSTC"]
@@ -275,6 +278,53 @@ class CanonicalCargo(unittest.TestCase):
             "/__rabs/workspace/Cargo.toml", "--target-dir", "/__rabs/out/cargo"])
         self.assertEqual(request["artifacts"]["files"], [])
         self.assertEqual(request["artifacts"]["cargo"], "cargo-json-v1")
+
+    def test_private_incremental_selects_its_contract_for_every_command_and_dispatch_mode(self):
+        self.install_clippy()
+        self.profile["incremental"] = True
+        self.save()
+        cases = (
+            (["build", "--workspace"], "cargo-private-incremental-json-v1"),
+            (["check", "--all-targets"], "cargo-private-incremental-json-v1"),
+            (["test", "--no-run"], "cargo-private-incremental-json-v1"),
+            (["test", "chosen", "--", "--exact"], "cargo-private-incremental-test-json-v1"),
+            (["clippy", "--workspace", "--", "-D", "warnings"], "cargo-private-incremental-json-v1"),
+        )
+        for daemon in (False, True):
+            if daemon:
+                self.select_daemon()
+            for args, contract in cases:
+                with self.subTest(daemon=daemon, args=args):
+                    status, _, stderr, _ = self.invoke(args, env=dict(self.env, CARGO_INCREMENTAL="0"))
+                    self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                    record = self.records()[-1]
+                    request = record["request"]
+                    self.assertEqual(request["command_context"]["env"]["CARGO_INCREMENTAL"], "1")
+                    self.assertEqual(request["artifacts"], {
+                        "unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":contract,
+                    })
+                    self.assertEqual(record["argv"][1], "--job-build" if daemon else "--worker-build-tls")
+                    self.assertEqual(request["request_id"], "allocate")
+                    if "--" in args:
+                        self.assertEqual(request["args"][request["args"].index("--"):], args[args.index("--"):])
+
+    def test_incremental_false_preserves_the_default_specification_and_test_contract(self):
+        self.assertEqual(self.invoke()[0], 0)
+        original = self.records()[-1]["request"]
+        self.profile["incremental"] = False
+        self.save()
+        self.assertEqual(self.invoke(env=dict(self.env, CARGO_INCREMENTAL="1"))[0], 0)
+        self.assertEqual(self.records()[-1]["request"], original)
+        self.assertEqual(self.invoke(["test"])[0], 0)
+        request = self.records()[-1]["request"]
+        self.assertEqual(request["command_context"]["env"]["CARGO_INCREMENTAL"], "0")
+        self.assertEqual(request["artifacts"]["cargo"], "cargo-test-json-v1")
+
+    def test_incremental_policy_requires_a_boolean_before_creating_an_operation(self):
+        for value in (None, 0, 1, -1, 1.0, "true", "false", "1", [], {}):
+            with self.subTest(value=value):
+                self.profile_path.write_text(json.dumps(dict(self.profile, incremental=value)))
+                self.assert_refused()
 
     def test_member_and_explicit_vendor_go_to_shared_source_planner(self):
         self.profile.update(manifest="members/app/Cargo.toml", vendor="third_party/vendor")

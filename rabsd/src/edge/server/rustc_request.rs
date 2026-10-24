@@ -295,11 +295,19 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     // the sysroot is warm. Do not delay Cargo (or occupy a warmer) for them.
     // Passing preflight grants no authority: the observed-host planner below
     // still checks the entire source/output class and all serving gates.
-    if let Some(refusal) = admission_preflight::rejection(LiveRustcRequest {
+    let candidate = LiveRustcRequest {
         argv: &parsed.argv,
         cwd: &parsed.cwd,
         env: &parsed.env,
-    }) {
+    };
+    let remote_requested =
+        live.remote.is_some() && request.get("remote_protocol").and_then(Value::as_u64) == Some(1);
+    let rejection = if remote_requested {
+        admission_preflight::remote_rejection(candidate)
+    } else {
+        admission_preflight::rejection(candidate)
+    };
+    if let Some(refusal) = rejection {
         log(
             "shadow",
             &[
