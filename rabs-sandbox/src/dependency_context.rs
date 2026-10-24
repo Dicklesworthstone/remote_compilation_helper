@@ -5,8 +5,10 @@
 //! retained input bytes and private output. It does not widen the canonical
 //! Cargo namespace or grant action-cache publication authority. The selected
 //! ELF runtime is copied into a retained private tree before launch and must
-//! exactly match the measured runtime cohort. Private /proc and /dev remain
-//! explicit execution surfaces; this is not arbitrary plugin/read discovery.
+//! exactly match the measured runtime cohort. Metadata execution retains private
+//! /proc and /dev. Archive code generation uses a distinct negotiated mode with
+//! no procfs or general device tree, so assembler file reads cannot consume
+//! unkeyed process state or entropy. Neither mode admits arbitrary plugins.
 
 use crate::canonical_namespace::{
     Bind, CanonicalNamespaceSpec, HostIsolationSupport, IsolationError, NamespaceBoundary,
@@ -19,11 +21,31 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
-pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v6";
+pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v7";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
 pub const MAX_DEPENDENCY_DIRS: usize = 64;
+
+/// The output class selects the filesystem contract independently of argv.
+/// The worker must also check that the actual invocation belongs to this class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyExecutionMode {
+    /// Metadata and dep-info only, with the established private proc/device view.
+    Metadata,
+    /// Pure Rust archive code generation, without procfs or entropy devices.
+    Rlib,
+}
+
+impl DependencyExecutionMode {
+    /// Exact negotiated wire spelling; unknown modes must never use a default.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Rlib => "rlib",
+        }
+    }
+}
 
 /// One retained candidate directory, mapped by its first-use dependency index.
 /// The prefix names only a subtree of the sealed source-transfer bundle.
@@ -37,6 +59,7 @@ pub struct DependencyArtifactRoot {
 /// Physical source, toolchain, output and jobserver backings never appear here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyExecContext {
+    execution_mode: DependencyExecutionMode,
     source_root: String,
     generated_root: Option<String>,
     cwd: String,
@@ -325,6 +348,7 @@ impl DependencyExecContext {
         }
         env.sort_by(|left, right| left.0.cmp(&right.0));
         let context = Self {
+            execution_mode: DependencyExecutionMode::Metadata,
             source_root,
             generated_root,
             cwd,
@@ -340,6 +364,19 @@ impl DependencyExecContext {
         // Validate even when runtime observation is deferred until acquisition.
         context.loader_search_paths(Path::new(&context.toolchain_root))?;
         Ok(context)
+    }
+
+    /// Select the independently negotiated output class after path validation.
+    /// Rlib narrows the namespace; it never grants execution or cache authority.
+    #[must_use]
+    pub fn with_execution_mode(mut self, mode: DependencyExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    /// Filesystem contract required for this invocation's output class.
+    pub const fn execution_mode(&self) -> DependencyExecutionMode {
+        self.execution_mode
     }
 
     /// Original immutable package/snapshot root.
@@ -672,7 +709,21 @@ pub fn build_dependency_argv(
     push_common_prelude(&mut argv);
     argv.extend(["--unshare-net", "--hostname", "rabs"].map(OsString::from));
     push_env(&mut argv, &spec.env);
-    argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
+    match context.execution_mode() {
+        DependencyExecutionMode::Metadata => {
+            argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
+        }
+        DependencyExecutionMode::Rlib => {
+            // LLVM's integrated assembler can read files absent from rustc's
+            // dep-info. A private procfs still contains clocks, process memory
+            // and kernel entropy; a private /dev still supplies random bytes.
+            // Neither belongs to this closed input view. The only device is
+            // the deterministic null sink, needed by ordinary compiler I/O.
+            argv.extend(
+                ["--dir", "/dev", "--dev-bind", "/dev/null", "/dev/null"].map(OsString::from),
+            );
+        }
+    }
     let writable_backings: Vec<_> = spec
         .rw_binds
         .iter()
@@ -710,7 +761,7 @@ pub fn build_dependency_argv(
             clearenv: true,
             host_usr_ro: false,
             tmpfs_tmp: true,
-            proc_private: true,
+            proc_private: context.execution_mode() == DependencyExecutionMode::Metadata,
             die_with_parent: true,
         },
     })
@@ -1052,6 +1103,83 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn archive_mode_removes_process_and_entropy_files_without_exposing_host_devices() {
+        let mut context = context(Vec::new()).with_execution_mode(DependencyExecutionMode::Rlib);
+        let mut spec = context
+            .namespace(
+                Path::new("/private/source"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let fixture = RuntimeFixture::prepare(&mut context, &mut spec);
+        let support = HostIsolationSupport {
+            bubblewrap: Some("test".into()),
+            unprivileged_userns: true,
+            overlayfs: false,
+            cgroup_v2: false,
+            landlock: false,
+        };
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &fixture.runtime,
+            &support,
+            context.compiler(),
+            &[],
+        )
+        .unwrap();
+        let argv: Vec<_> = launch
+            .argv
+            .iter()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(context.execution_mode().as_str(), "rlib");
+        assert!(!launch.boundary.proc_private);
+        assert!(launch.boundary.mounts_closed_view && launch.boundary.net_isolated);
+        assert!(!argv.contains(&"--proc") && !argv.contains(&"--dev"));
+        assert!(!argv.iter().any(|arg| arg.starts_with("/proc")));
+        assert!(
+            argv.windows(3)
+                .any(|row| row == ["--dev-bind", "/dev/null", "/dev/null"])
+        );
+        assert!(
+            !argv.windows(3).any(
+                |row| matches!(row[0], "--bind" | "--ro-bind" | "--dev-bind") && row[1] == "/dev"
+            )
+        );
+
+        // The separately negotiated metadata mode preserves its established
+        // execution semantics; the archive policy must not quietly replace it.
+        let metadata = context.with_execution_mode(DependencyExecutionMode::Metadata);
+        let launch = build_dependency_argv(
+            &metadata,
+            &spec,
+            &fixture.runtime,
+            &support,
+            metadata.compiler(),
+            &[],
+        )
+        .unwrap();
+        assert!(launch.boundary.proc_private);
+        assert!(
+            launch
+                .argv
+                .windows(2)
+                .any(|row| row[0] == "--proc" && row[1] == "/proc")
+        );
+        assert!(
+            launch
+                .argv
+                .windows(2)
+                .any(|row| row[0] == "--dev" && row[1] == "/dev")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn retained_runtime_requires_the_exact_cohort_and_disjoint_writable_backings() {
         let mut context = context(Vec::new());
         let mut spec = context
@@ -1290,6 +1418,127 @@ mod tests {
         );
         let dep_info = std::fs::read_to_string(output.join("retained_runtime_smoke.d")).unwrap();
         assert!(dep_info.contains("lib.rs"));
+        runtime.verify(|| false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let support = HostIsolationSupport::probe();
+        assert!(support.missing_for_canonical().is_empty(), "{support:?}");
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("source");
+        let output = owner.path().join("output");
+        let home = owner.path().join("home");
+        let empty = owner.path().join("empty");
+        for directory in [&source, &output, &home, &empty] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let marker = b"rabs-complete-keyed-assembler-input";
+        std::fs::write(source.join("payload.bin"), marker).unwrap();
+        let host_only = owner.path().join("host-only.bin");
+        std::fs::write(&host_only, b"unkeyed-host-input").unwrap();
+        let runtime = crate::runtime_cohort::retain_runtime_cohort(
+            &toolchain.join("bin/rustc"),
+            &toolchain,
+            &[toolchain.join("lib")],
+            &output,
+            owner.path(),
+            || false,
+        )
+        .unwrap();
+        let context = DependencyExecContext::new(
+            "/source/package".into(),
+            "/source/package".into(),
+            "/toolchains/pinned".into(),
+            "/toolchains/pinned/bin/rustc".into(),
+            "/target/output".into(),
+            Vec::new(),
+            vec![("LD_LIBRARY_PATH".into(), "/toolchains/pinned/lib".into())],
+            runtime.cohort().bytes,
+        )
+        .unwrap()
+        .with_execution_mode(DependencyExecutionMode::Rlib);
+        context.prepare_empty_backings(&empty).unwrap();
+        let spec = context
+            .namespace(&source, &toolchain, &output, &empty, &home)
+            .unwrap();
+        let compile = |path: &str, name: &str| {
+            // LLVM's assembler reads .incbin itself. Rustc's dep-info does not
+            // list this file, so success must depend on the enforced view.
+            std::fs::write(
+                source.join("lib.rs"),
+                format!(
+                    "core::arch::global_asm!(r#\".pushsection .rodata.rabs,\\\"a\\\"\n.incbin \\\"{path}\\\"\n.popsection\"#);\npub fn value() -> u64 {{ 42 }}\n"
+                ).replace("\\\"", "\""),
+            )
+            .unwrap();
+            let args = vec![
+                "lib.rs".into(),
+                format!("--crate-name={name}"),
+                "--edition=2024".into(),
+                "--crate-type=rlib".into(),
+                "--emit=dep-info,metadata,link".into(),
+                "--out-dir=/target/output".into(),
+                "-Cembed-bitcode=no".into(),
+            ];
+            let launch = build_dependency_argv(
+                &context,
+                &spec,
+                &runtime,
+                &support,
+                context.compiler(),
+                &args,
+            )
+            .unwrap();
+            crate::canonical_namespace::command_for(&launch)
+                .output()
+                .unwrap()
+        };
+        let result = compile("/source/package/payload.bin", "closed_archive");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let archive = std::fs::read(output.join("libclosed_archive.rlib")).unwrap();
+        assert!(archive.starts_with(b"!<arch>\n"));
+        assert!(archive.windows(marker.len()).any(|window| window == marker));
+        assert!(
+            !std::fs::read_to_string(output.join("closed_archive.d"))
+                .unwrap()
+                .contains("payload.bin")
+        );
+        assert!(
+            std::fs::metadata(output.join("libclosed_archive.rmeta"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        for (index, denied) in [
+            host_only.to_str().unwrap(),
+            "/proc/version",
+            "/proc/sys/kernel/random/uuid",
+            "/dev/urandom",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("unclosed_archive_{index}");
+            let result = compile(denied, &name);
+            assert!(
+                !result.status.success(),
+                "unkeyed assembler read succeeded: {denied}"
+            );
+            assert!(String::from_utf8_lossy(&result.stderr).contains("error"));
+            assert!(!output.join(format!("lib{name}.rlib")).exists());
+        }
         runtime.verify(|| false).unwrap();
     }
 

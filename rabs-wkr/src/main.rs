@@ -2082,7 +2082,7 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
     } else {
         text("toolchain_backing")?
     };
-    Ok(CanonicalExecRequest {
+    let request = CanonicalExecRequest {
         request_id: value
             .get("request_id")
             .and_then(serde_json::Value::as_u64)
@@ -2095,7 +2095,14 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
         jobserver_grant,
         command_context: parse_command_context(value)?,
         dependency_context,
-    })
+    };
+    if request.dependency_context.is_some() {
+        rabs_wkr::session::validate_dependency_execution(
+            &request,
+            artifacts::parse_plan(value)?.as_ref(),
+        )?;
+    }
+    Ok(request)
 }
 
 #[cfg(test)]

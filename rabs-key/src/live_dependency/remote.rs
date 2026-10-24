@@ -1,4 +1,4 @@
-//! Metadata-only dependency actions executed in a closed worker view.
+//! Dependency actions executed in a closed worker view.
 //!
 //! This class has distinct isolation and platform identity from unsandboxed
 //! local dependency execution. The worker retains subscriber source, cwd,
@@ -26,6 +26,7 @@ use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
 use crate::extern_resolution::DependencyArtifactKind;
 use crate::hit_verification::{descriptor_canonical_bytes, descriptor_digest};
+use crate::invocation::NormalizedRustcInvocation;
 use crate::output_derivation::derive_dependency_output_declarations;
 use crate::output_platform::{CpuBaseline, OutputPlatformContract};
 use crate::typed_digest::compute;
@@ -62,13 +63,82 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
     dep-info closure and tracked-environment checks required before coordinator-only \
     publication; full-result readiness";
 
+/// Archive emission has a separately enforced view. In particular, LLVM's
+/// integrated assembler may read `.incbin` files without listing them in
+/// dep-info; it must not see procfs, randomness devices, or the host filesystem.
+/// This policy is never evidence for an unsandboxed local archive compilation.
+pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
+    dependency-exec-v7 rlib execution mode; original subscriber paths preserved; \
+    complete regular-file package, generated OUT_DIR, exact toolchain, Rust \
+    dependency candidate inventories and observed selected ELF runtime retained \
+    read-only; exact compiler environment except process-local jobserver descriptors; \
+    network denied; no procfs or general device filesystem, only deterministic \
+    /dev/null; fresh private empty home, temporary and output storage; LLVM \
+    integrated archive codegen only with no proc macros, native link inputs, \
+    external linker, incremental state or unmodeled output options; every \
+    assembler include/incbin read resolves within retained keyed inputs or fails; \
+    required dep-info and optional detached metadata accompany the complete rlib; \
+    exact private output capture, runtime/input revalidation, authenticated delivery \
+    and coordinator-only publication; full-result readiness";
+
+/// Output and isolation class selected from a bounded compiler invocation.
+/// This is not execution or serving authority: the caller must enforce the
+/// matching worker context and retain every observed input through completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteDependencyOutputClass {
+    /// Existing metadata-only execution and cache policy.
+    Metadata,
+    /// Pure Rust archive codegen in the stricter, closed filesystem profile.
+    Rlib,
+}
+
+/// Classify exact supported remote output modes. Native linking, mixed crate
+/// types, implicit output defaults and additional LLVM/assembly outputs cannot
+/// borrow the archive profile. Full output naming/options are checked by the
+/// ordinary dependency output adapter before dispatch.
+pub fn remote_dependency_output_class(
+    invocation: &NormalizedRustcInvocation,
+) -> Result<RemoteDependencyOutputClass, RemoteDependencyRefusal> {
+    let has = |kind| invocation.emit.iter().any(|actual| actual == kind);
+    if invocation.emit.len() == 2 && has("metadata") && has("dep-info") {
+        return Ok(RemoteDependencyOutputClass::Metadata);
+    }
+    if invocation.crate_types.len() == 1
+        && matches!(invocation.crate_types[0].as_str(), "lib" | "rlib")
+        && has("dep-info")
+        && has("link")
+        && (invocation.emit.len() == 2 || (invocation.emit.len() == 3 && has("metadata")))
+    {
+        return Ok(RemoteDependencyOutputClass::Rlib);
+    }
+    Err(RemoteDependencyRefusal::OutputClass)
+}
+
+/// Exact isolation-policy component used by the remote key builder. Daemon
+/// publication and serving boundaries compare this against the descriptor,
+/// together with an opaque witness of the enforced worker execution mode.
+pub fn remote_dependency_isolation_policy(
+    plan: &DependencyActionPlan,
+) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    let profile = match remote_dependency_output_class(&plan.invocation)? {
+        RemoteDependencyOutputClass::Metadata => REMOTE_DEPENDENCY_ISOLATION_PROFILE,
+        RemoteDependencyOutputClass::Rlib => REMOTE_RLIB_ISOLATION_PROFILE,
+    };
+    let mut policy = CanonicalEncoder::new();
+    policy.str(profile).str(plan.source_kind.as_str());
+    Ok(compute(
+        REMOTE_DEPENDENCY_ISOLATION_DOMAIN,
+        &policy.finish(),
+    ))
+}
+
 /// Why an otherwise admitted dependency cannot use this remote class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteDependencyRefusal {
     /// Source, toolchain, output or other local-plan facts were inconsistent.
     Local(LiveRefusal),
-    /// Only --emit=dep-info,metadata is currently executed remotely.
-    MetadataOnly,
+    /// Neither metadata-only nor the explicitly closed archive output class.
+    OutputClass,
     /// Generated inputs do not have a coherent, disjoint original OUT_DIR binding.
     GeneratedInputs,
     /// An extern is unbound, executable, or lacks a complete candidate identity.
@@ -89,7 +159,7 @@ impl RemoteDependencyRefusal {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Local(_) => "REMOTE_DEP_LOCAL_FACTS",
-            Self::MetadataOnly => "REMOTE_DEP_METADATA_ONLY",
+            Self::OutputClass => "REMOTE_DEP_OUTPUT_CLASS",
             Self::GeneratedInputs => "REMOTE_DEP_GENERATED_INPUTS",
             Self::ExternInputs => "REMOTE_DEP_EXTERN_INPUTS",
             Self::NativeInputs => "REMOTE_DEP_NATIVE_INPUTS",
@@ -231,7 +301,7 @@ fn loader_paths(
     Ok((search_paths, empty.into_iter().collect()))
 }
 
-/// Check the remote metadata shape before expensive capture or runtime observation.
+/// Check the remote dependency shape before expensive capture or runtime observation.
 ///
 /// This has no filesystem access and needs neither a retained toolchain nor a
 /// runtime digest. It checks the same invocation, output, loader and complete
@@ -265,12 +335,7 @@ pub fn remote_dependency_shape(
     {
         return Err(RemoteDependencyRefusal::NativeInputs);
     }
-    if plan.invocation.emit.len() != 2
-        || !plan.invocation.emit.iter().any(|kind| kind == "metadata")
-        || !plan.invocation.emit.iter().any(|kind| kind == "dep-info")
-    {
-        return Err(RemoteDependencyRefusal::MetadataOnly);
-    }
+    remote_dependency_output_class(&plan.invocation)?;
     let derived = derive_dependency_output_declarations(&plan.invocation, &plan.host_triple)
         .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
     if derived != plan.outputs {
@@ -363,7 +428,9 @@ fn remote_extern_facts(
         .collect()
 }
 
-/// Key an admitted, fully observed metadata-only dependency for remote execution.
+/// Key an admitted, fully observed dependency for remote execution. The rlib
+/// class requires its separately enforced filesystem profile; this function
+/// does not grant codegen authority to local dependency execution.
 ///
 /// Ordinary semantic input components are retained, while worker isolation and
 /// the measured platform replace the unsandboxed local components. The existing
@@ -414,6 +481,48 @@ pub fn remote_dependency_key(
         build_script_output,
         inputs,
     )?;
+    let output_class = remote_dependency_output_class(&plan.invocation)?;
+    if output_class == RemoteDependencyOutputClass::Rlib {
+        // An assembler `.incbin` can mention the original dependency/output
+        // roots without appearing in dep-info. The metadata lane's placement
+        // equivalence therefore is not a proof for archive codegen. Preserve
+        // exact argv, cwd and semantic environment until an observed-read
+        // policy can establish a narrower equivalence. Process-local controls
+        // retain their existing tracked-read publication veto.
+        let mut invocation = CanonicalEncoder::new();
+        invocation
+            .bytes(&plan.invocation.canonical_bytes())
+            .str(&plan.cwd)
+            .str(&plan.compiler)
+            .str(toolchain_root)
+            .str(&plan.source_root)
+            .str(&plan.out_dir);
+        invocation.seq(&plan.dependency_dirs, |encoder, directory| {
+            encoder.str(directory);
+        });
+        invocation.seq(&plan.invocation.excluded_presentation, |encoder, flag| {
+            encoder.str(flag);
+        });
+        key.descriptor.normalized_invocation =
+            compute("rabs.remote-rlib.exact-invocation.v1", &invocation.finish());
+        // Use original semantic values, not keyed_env: that set may already
+        // have projected Cargo layout or empty OUT_DIR spellings. Preserve
+        // the shared exclusion for jobserver/wrapper controls, whose tracked
+        // reads (including absence) already veto publication.
+        let semantic_env = plan
+            .execution_env
+            .iter()
+            .filter(|(name, _)| matches!(super::env_role(name), super::EnvRole::Keyed))
+            .collect::<Vec<_>>();
+        let mut environment = CanonicalEncoder::new();
+        environment.seq(&semantic_env, |encoder, (name, value)| {
+            encoder.str(name).str(value);
+        });
+        key.descriptor.environment = compute(
+            "rabs.remote-rlib.exact-environment.v1",
+            &environment.finish(),
+        );
+    }
     let mut retained_toolchain = CanonicalEncoder::new();
     retained_toolchain
         .str(key.descriptor.toolchain.domain)
@@ -421,12 +530,7 @@ pub fn remote_dependency_key(
         .str("toolchain-dataset-v1")
         .bytes(retained_toolchain_sha256);
     key.descriptor.toolchain = compute(REMOTE_TOOLCHAIN_DOMAIN, &retained_toolchain.finish());
-    let mut policy = CanonicalEncoder::new();
-    policy
-        .str(REMOTE_DEPENDENCY_ISOLATION_PROFILE)
-        .str(plan.source_kind.as_str());
-    key.descriptor.sandbox_semantic_policy =
-        compute(REMOTE_DEPENDENCY_ISOLATION_DOMAIN, &policy.finish());
+    key.descriptor.sandbox_semantic_policy = remote_dependency_isolation_policy(plan)?;
     let codegen = |name: &str| {
         plan.invocation
             .codegen
@@ -450,7 +554,11 @@ pub fn remote_dependency_key(
             feature_adjustments: codegen("target-feature"),
         },
         libc_runtime: format!("{}:{runtime_hex}", runtime.domain),
-        linker_format: "metadata-only-no-linker-v1".to_owned(),
+        linker_format: match output_class {
+            RemoteDependencyOutputClass::Metadata => "metadata-only-no-linker-v1",
+            RemoteDependencyOutputClass::Rlib => "rust-rlib-no-native-linker-v1",
+        }
+        .to_owned(),
         sdk_identity: None,
         deployment_target: None,
         signing_policy: None,
@@ -561,6 +669,241 @@ mod tests {
             &compute(RUNTIME_COHORT_DOMAIN, runtime_bytes),
         )
         .unwrap()
+    }
+
+    fn archive_plan(out_dir: &str, separate_metadata: bool) -> DependencyActionPlan {
+        let mut plan = plan(out_dir);
+        plan.invocation.emit = vec!["dep-info".into(), "link".into()];
+        if separate_metadata {
+            plan.invocation.emit.push("metadata".into());
+        }
+        plan.outputs =
+            derive_dependency_output_declarations(&plan.invocation, &plan.host_triple).unwrap();
+        plan
+    }
+
+    #[test]
+    fn archives_require_a_distinct_enforced_policy_and_exact_output_set() {
+        for separate_metadata in [false, true] {
+            let archive = archive_plan(OUTPUT, separate_metadata);
+            assert_eq!(
+                remote_dependency_output_class(&archive.invocation),
+                Ok(RemoteDependencyOutputClass::Rlib)
+            );
+            let mut outputs = archive.output_names();
+            outputs.sort();
+            let mut expected = vec!["leaf.d".to_owned(), "libleaf.rlib".to_owned()];
+            if separate_metadata {
+                expected.push("libleaf.rmeta".to_owned());
+            }
+            assert_eq!(outputs, expected);
+            let remote = key(&archive, b"runtime");
+            let metadata = key(&plan(OUTPUT), b"runtime");
+            let local = live_dependency_key(
+                &archive,
+                &toolchain(),
+                &[],
+                &directories(&archive),
+                None,
+                &inputs(&archive),
+            )
+            .unwrap();
+            assert_ne!(remote.action_key, local.action_key);
+            assert_ne!(remote.action_key, metadata.action_key);
+            assert_ne!(
+                remote.descriptor.sandbox_semantic_policy,
+                local.descriptor.sandbox_semantic_policy
+            );
+            assert_ne!(
+                remote.descriptor.sandbox_semantic_policy,
+                metadata.descriptor.sandbox_semantic_policy
+            );
+            assert_eq!(
+                super::super::check_dependency_cache_read_closure(&archive.invocation),
+                Err(LiveRefusal::UnclosedCodegenInputs),
+                "a remote archive policy must never authorize local codegen capture"
+            );
+            assert_eq!(
+                remote.action_key,
+                compute_action_key(&remote.descriptor).final_key
+            );
+        }
+    }
+
+    #[test]
+    fn archive_keys_retain_paths_environment_and_complete_source_bytes() {
+        let archive = archive_plan(OUTPUT, true);
+        let original = key(&archive, b"runtime");
+        assert_ne!(
+            original.action_key,
+            key(&archive_plan("/other/target/debug/deps", true), b"runtime").action_key,
+            "unobserved assembler path reads do not inherit metadata placement equivalence"
+        );
+        let mut environment = archive_plan(OUTPUT, true);
+        environment
+            .execution_env
+            .push(("ARCHIVE_FLAVOR".into(), "changed".into()));
+        assert_ne!(
+            original.action_key,
+            key(&environment, b"runtime").action_key
+        );
+        let mut source = inputs(&archive);
+        source.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(archive.input_virtual_path("embedded.bin").into_bytes()),
+            object: ObjectId(compute("rabs.test.v1", b"assembler input bytes")),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        let changed = remote_dependency_key(
+            &archive,
+            &toolchain(),
+            &directories(&archive),
+            &source,
+            None,
+            TOOLCHAIN,
+            &[41; 32],
+            &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+        .unwrap();
+        assert_ne!(original.action_key, changed.action_key);
+        assert_ne!(
+            original.action_key,
+            key(&archive, b"other-runtime").action_key
+        );
+    }
+
+    #[test]
+    fn archive_replay_excludes_process_controls_but_refuses_their_tracked_reads() {
+        let original = archive_plan(OUTPUT, true);
+        let first = key(&original, b"runtime");
+        let mut changed = archive_plan(OUTPUT, true);
+        changed.execution_env.extend([
+            (
+                "CARGO_MAKEFLAGS".into(),
+                "--jobserver-auth=fifo:/__rabs/home/first".into(),
+            ),
+            ("RABS_SOCKET_PATH".into(), "/another/edge.sock".into()),
+        ]);
+        assert_eq!(first.action_key, key(&changed, b"runtime").action_key);
+        changed
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "CARGO_MAKEFLAGS")
+            .unwrap()
+            .1 = "--jobserver-auth=fifo:/__rabs/home/second".into();
+        assert_eq!(first.action_key, key(&changed, b"runtime").action_key);
+        for binding in [
+            "CARGO_MAKEFLAGS=--jobserver-auth=4,5",
+            "CARGO_MAKEFLAGS",
+            "RABS_SOCKET_PATH",
+        ] {
+            let dep_info = format!("{OUTPUT}/leaf.d: {PACKAGE}/src/lib.rs\n# env-dep:{binding}\n");
+            assert!(
+                super::super::dep_info_closure_violation(&changed, dep_info.as_bytes(), |_| true)
+                    .is_some()
+            );
+        }
+        let mut projected = archive_plan(OUTPUT, true);
+        projected
+            .keyed_env
+            .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+        assert_eq!(
+            first.descriptor.environment,
+            key(&projected, b"runtime").descriptor.environment
+        );
+        projected
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "LD_LIBRARY_PATH")
+            .unwrap()
+            .1 = format!("{OUTPUT}:/work/another-loader-parent:{TOOLCHAIN}/lib");
+        assert_ne!(first.action_key, key(&projected, b"runtime").action_key);
+    }
+
+    #[test]
+    fn archive_identity_retains_toolchain_mount_spelling_even_without_loader_env() {
+        let mut original = archive_plan(OUTPUT, true);
+        original
+            .execution_env
+            .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+        original
+            .keyed_env
+            .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+        let first = key(&original, b"runtime");
+        let mut moved = original;
+        moved.compiler = "/relocated/toolchain/bin/rustc".into();
+        moved.invocation.compiler_argv0.clone_from(&moved.compiler);
+        let relocated = remote_dependency_key(
+            &moved,
+            &toolchain(),
+            &directories(&moved),
+            &inputs(&moved),
+            None,
+            "/relocated/toolchain",
+            &[41; 32],
+            &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+        .unwrap();
+        assert_eq!(first.descriptor.toolchain, relocated.descriptor.toolchain);
+        assert_ne!(
+            first.descriptor.normalized_invocation,
+            relocated.descriptor.normalized_invocation
+        );
+        assert_ne!(
+            first.action_key, relocated.action_key,
+            "an assembler read of an absolute toolchain filename cannot inherit content-only toolchain equivalence"
+        );
+    }
+
+    #[test]
+    fn archive_class_refuses_implicit_native_mixed_and_extra_outputs() {
+        for emits in [
+            vec![],
+            vec!["link"],
+            vec!["dep-info", "link", "obj"],
+            vec!["dep-info", "metadata", "link", "asm"],
+            vec!["dep-info", "link", "link"],
+        ] {
+            let mut invocation = archive_plan(OUTPUT, true).invocation;
+            invocation.emit = emits.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                remote_dependency_output_class(&invocation),
+                Err(RemoteDependencyRefusal::OutputClass)
+            );
+        }
+        for types in [
+            vec![],
+            vec!["bin"],
+            vec!["dylib"],
+            vec!["proc-macro"],
+            vec!["lib", "rlib"],
+        ] {
+            let mut invocation = archive_plan(OUTPUT, true).invocation;
+            invocation.crate_types = types.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                remote_dependency_output_class(&invocation),
+                Err(RemoteDependencyRefusal::OutputClass)
+            );
+        }
+        let mut native = archive_plan(OUTPUT, true);
+        native
+            .invocation
+            .native_libs
+            .push("native_dependency".into());
+        assert_eq!(
+            remote_dependency_shape(&native, &directories(&native), TOOLCHAIN),
+            Err(RemoteDependencyRefusal::NativeInputs)
+        );
+        let mut external_linker = archive_plan(OUTPUT, true);
+        external_linker
+            .invocation
+            .codegen
+            .push(("linker".into(), Some("/usr/bin/cc".into())));
+        assert!(
+            remote_dependency_shape(&external_linker, &directories(&external_linker), TOOLCHAIN)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1205,14 +1548,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_inputs_do_not_admit_archive_codegen_or_undeclared_reads() {
+    fn generated_inputs_do_not_admit_undeclared_archive_outputs_or_reads() {
         let mut plan = generated_plan("/work/build/leaf/out");
         let mut inputs = generated_inputs(&plan);
         plan.invocation.emit.push("link".into());
-        assert_eq!(
+        assert!(matches!(
             generated_key(&plan, &inputs, Some(b"")),
-            Err(RemoteDependencyRefusal::MetadataOnly)
-        );
+            Err(RemoteDependencyRefusal::Local(LiveRefusal::Facts(_)))
+        ));
         plan.invocation.emit.pop();
         inputs.inputs.last_mut().unwrap().virtual_path =
             RawBytes::new(b"/usr/lib/unobserved".to_vec());
@@ -1223,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn link_extern_incoherent_generated_and_invented_runtime_inputs_are_refused() {
+    fn unmodeled_link_extern_incoherent_generated_and_invented_runtime_inputs_are_refused() {
         let runtime = compute(RUNTIME_COHORT_DOMAIN, b"runtime");
         let call = |plan: &DependencyActionPlan, runtime: &TypedDigest| {
             remote_dependency_key(
@@ -1239,10 +1582,10 @@ mod tests {
         };
         let mut linked = plan(OUTPUT);
         linked.invocation.emit.push("link".into());
-        assert_eq!(
+        assert!(matches!(
             call(&linked, &runtime),
-            Err(RemoteDependencyRefusal::MetadataOnly)
-        );
+            Err(RemoteDependencyRefusal::Local(LiveRefusal::Facts(_)))
+        ));
         let mut external = plan(OUTPUT);
         external.externs.push(PlannedExtern::Toolchain {
             name: "proc_macro".into(),

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 fn context() -> Value {
     json!({
         "version":DEPENDENCY_CONTEXT_VERSION,
+        "execution_mode":"metadata",
         "source_root":"/home/user/registry/package",
         "cwd":"/home/user/registry/package",
         "toolchain_root":"/home/user/toolchains/pinned",
@@ -66,6 +67,137 @@ fn complete_dependency_decode_preserves_paths_values_and_input_owner_slots() {
         original,
         dependency_request(),
         "decoder does not project wire identity in place"
+    );
+}
+
+fn archive_request(separate_metadata: bool) -> Value {
+    let mut request = dependency_request();
+    request["dependency_context"]["execution_mode"] = json!("rlib");
+    let emit = if separate_metadata {
+        "--emit=dep-info,metadata,link"
+    } else {
+        "--emit=dep-info,link"
+    };
+    request["args"] = json!([
+        "--crate-name",
+        "leaf",
+        "--crate-type",
+        "rlib",
+        emit,
+        "--out-dir",
+        "/work/target/debug/deps",
+        "src/lib.rs",
+    ]);
+    request["artifacts"]["files"] = if separate_metadata {
+        json!(["leaf.d", "libleaf.rmeta", "libleaf.rlib"])
+    } else {
+        json!(["leaf.d", "libleaf.rlib"])
+    };
+    request
+}
+
+#[test]
+fn closed_archive_decode_requires_its_mode_and_complete_derived_artifacts() {
+    use rabs_sandbox::dependency_context::DependencyExecutionMode;
+    for separate_metadata in [false, true] {
+        let original = archive_request(separate_metadata);
+        let parsed = parse_exec_request(&original).unwrap();
+        assert_eq!(
+            parsed.dependency_context.unwrap().execution_mode(),
+            DependencyExecutionMode::Rlib
+        );
+        assert_eq!(original, archive_request(separate_metadata));
+        let mut missing_archive = original.clone();
+        missing_archive["artifacts"]["files"] = json!(["leaf.d", "libleaf.rmeta"]);
+        assert!(parse_exec_request(&missing_archive).is_err());
+        let mut extra_output = original.clone();
+        extra_output["artifacts"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("unclaimed.o"));
+        assert!(parse_exec_request(&extra_output).is_err());
+        let mut tree = original.clone();
+        tree["artifacts"]["tree"] = json!("tree-files-v1");
+        assert!(parse_exec_request(&tree).is_err());
+        let mut missing_contract = original.clone();
+        missing_contract
+            .as_object_mut()
+            .unwrap()
+            .remove("artifacts");
+        assert!(parse_exec_request(&missing_contract).is_err());
+    }
+}
+
+#[test]
+fn archive_mode_is_never_inferred_from_argv_or_silently_downgraded() {
+    let mut absent = archive_request(true);
+    absent["dependency_context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_mode");
+    assert!(parse_exec_request(&absent).is_err());
+    for mode in [
+        Value::Null,
+        json!(true),
+        json!("metadata"),
+        json!("archive"),
+        json!("rlib-v999"),
+    ] {
+        let mut wrong = archive_request(true);
+        wrong["dependency_context"]["execution_mode"] = mode;
+        assert!(parse_exec_request(&wrong).is_err());
+    }
+    let mut metadata = dependency_request();
+    metadata["dependency_context"]["execution_mode"] = json!("rlib");
+    assert!(parse_exec_request(&metadata).is_err());
+    let mut old = archive_request(true);
+    old["dependency_context"]["version"] = json!("dependency-exec-v6");
+    assert!(parse_exec_request(&old).is_err());
+}
+
+#[test]
+fn archive_worker_refuses_native_plugins_unretained_paths_and_output_overrides() {
+    for extra in [
+        vec!["-l", "static=unretained"],
+        vec!["-L", "native=/usr/lib"],
+        vec!["-L", "dependency=/unretained"],
+        vec!["--extern", "unbound"],
+        vec!["--extern", "derive=/work/target/debug/deps/libderive.so"],
+        vec!["--extern", "other=/unretained/libother.rlib"],
+        vec!["--sysroot", "/another/toolchain"],
+        vec!["-C", "linker=/usr/bin/cc"],
+        vec!["-C", "target-cpu=native"],
+        vec!["-C", "incremental=/private/incremental"],
+        vec!["-C", "save-temps=yes"],
+        vec!["-o", "/unretained/output"],
+        vec!["--crate-type", "dylib"],
+        vec!["--emit=dep-info,metadata,link,llvm-ir"],
+    ] {
+        let mut request = archive_request(true);
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|arg| json!(arg)));
+        assert!(parse_exec_request(&request).is_err(), "{extra:?}");
+    }
+    for source in ["../outside.rs", "/unretained/source.rs", "src/../lib.rs"] {
+        let mut request = archive_request(true);
+        *request["args"].as_array_mut().unwrap().last_mut().unwrap() = json!(source);
+        assert!(parse_exec_request(&request).is_err(), "{source}");
+    }
+    let mut output = archive_request(true);
+    output["dependency_context"]["out_dir"] = json!("/different/output");
+    assert!(parse_exec_request(&output).is_err());
+    let mut direct = archive_request(true);
+    direct["args"].as_array_mut().unwrap().extend([
+        json!("--extern"),
+        json!("leaf=/work/target/debug/deps/libinput.rlib"),
+        json!("-L"),
+        json!("dependency=/work/target/debug/deps"),
+    ]);
+    assert!(
+        parse_exec_request(&direct).is_ok(),
+        "retained Rust externs remain supported"
     );
 }
 

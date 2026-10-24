@@ -5263,6 +5263,7 @@ dependencies = [
  "rabs-action",
  "rabs-asupersync",
  "rabs-cas",
+ "rabs-key",
  "rabs-protocol",
  "rabs-sandbox",
  "rustix",

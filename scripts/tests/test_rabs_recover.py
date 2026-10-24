@@ -78,7 +78,7 @@ class RecoveryDriverTests(unittest.TestCase):
                        "transport_state_dir":str(self.state), "execution_state":"unknown",
                        "recovery_mode":"resume-or-acknowledge-only",
                        "publication_authorized":False, "reexecute":False,
-                       "remote_configuration":{"remote_protocol":1, "dependency_context":"dependency-exec-v6",
+                       "remote_configuration":{"remote_protocol":1, "dependency_context":"dependency-exec-v7",
                                                "worker_id":"worker 雪", "worker_spki_sha256":"ab" * 32,
                                                "listen":"127.0.0.1:9123"}}
         self.put(self.root / "request.json", self.raw)

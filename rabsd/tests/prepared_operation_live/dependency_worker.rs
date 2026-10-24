@@ -162,6 +162,7 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
         "jobserver_grant":3,
         "dependency_context":{
             "version":DEPENDENCY_CONTEXT_VERSION,
+            "execution_mode":"metadata",
             "source_root":source,
             "cwd":source,
             "toolchain_root":toolchain,

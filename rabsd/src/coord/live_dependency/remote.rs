@@ -1,4 +1,4 @@
-//! Live remote execution of closed metadata-only dependency actions.
+//! Live remote execution of closed metadata and Rust-archive dependency actions.
 //!
 //! A reserved worker slot is not an execution lease. The authenticated transport
 //! supplies the actual worker offer before any inputs or execution are sent;
@@ -22,7 +22,8 @@ use crate::coord::source_delivery::SourceUpload;
 use crate::coord::worker_delivery::{Delivery, toolchain_identity_value};
 use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT};
 use rabs_key::live_dependency::remote::{
-    remote_dependency_key, remote_dependency_shape, remote_empty_loader_directories,
+    RemoteDependencyOutputClass, remote_dependency_isolation_policy, remote_dependency_key,
+    remote_dependency_output_class, remote_dependency_shape, remote_empty_loader_directories,
 };
 use rabs_key::live_dependency::{DependencyDirectoryFact, ToolchainFacts};
 use rabs_protocol::generation::AttemptAuthority;
@@ -30,6 +31,7 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::OutputRole;
 use rabs_sandbox::dependency_context::{
     DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
+    DependencyExecutionMode,
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
@@ -283,10 +285,31 @@ pub(super) struct RemoteValidation {
     retained: Arc<RetainedToolchain>,
     runtime: TypedDigest,
     loader: LoaderDirectoryWitness,
+    execution_mode: DependencyExecutionMode,
+    action_key: TypedDigest,
 }
 
 impl RemoteValidation {
+    pub(super) fn verify_read_closure(
+        &self,
+        request: &LiveDependencyRequest,
+    ) -> Result<(), String> {
+        if self.action_key != request.key.action_key {
+            return Err("remote closure witness belongs to another action".into());
+        }
+        request.verify_output_contract()?;
+        let toolchain = request
+            .toolchain
+            .sysroot()
+            .to_str()
+            .ok_or("remote closure has a non-UTF-8 toolchain root")?;
+        remote_dependency_shape(&request.plan, &request.dependencies.directories, toolchain)
+            .map_err(|error| error.to_string())?;
+        verify_execution_policy(&request.plan, &request.key, self.execution_mode)
+    }
+
     pub(super) fn verify(&self, request: &LiveDependencyRequest) -> Result<(), String> {
+        self.verify_read_closure(request)?;
         request.verify_toolchain()?;
         self.retained
             .image
@@ -310,6 +333,38 @@ impl RemoteValidation {
         // authorize a compiler skip under the earlier input generation.
         verify_package_generation(&request.package, &request.plan)
     }
+}
+
+fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    match remote_dependency_output_class(&plan.invocation).map_err(|error| error.to_string())? {
+        RemoteDependencyOutputClass::Metadata => Ok(DependencyExecutionMode::Metadata),
+        RemoteDependencyOutputClass::Rlib => Ok(DependencyExecutionMode::Rlib),
+    }
+}
+
+/// The cache policy and the worker's enforced namespace must describe the same
+/// output class. A metadata receipt or copied isolation label cannot authorize
+/// archives whose assembler reads require the stricter namespace.
+fn verify_execution_policy(
+    plan: &DependencyActionPlan,
+    key: &LiveDependencyKey,
+    mode: DependencyExecutionMode,
+) -> Result<(), String> {
+    if execution_mode(plan)? != mode {
+        return Err("remote output class differs from the enforced execution mode".into());
+    }
+    let policy = remote_dependency_isolation_policy(plan).map_err(|error| error.to_string())?;
+    if key.descriptor.sandbox_semantic_policy != policy {
+        return Err("remote descriptor does not bind the enforced read-closure policy".into());
+    }
+    if rabs_key::action_key::compute_action_key(&key.descriptor).final_key != key.action_key
+        || rabs_key::hit_verification::descriptor_digest(
+            &rabs_key::hit_verification::descriptor_canonical_bytes(&key.descriptor),
+        ) != key.descriptor_digest
+    {
+        return Err("remote action identity differs from its descriptor".into());
+    }
+    Ok(())
 }
 
 // The original compiler AND sysroot spellings select preparation ownership.
@@ -402,7 +457,7 @@ impl RemoteDependencies {
             .map_err(|error| error.to_string())?;
         // Derive resource intent before copying a complete compiler tree. An
         // unrepresentable or differently keyed invocation cannot request work.
-        metadata_execution_grant(plan, argv)?;
+        dependency_execution_grant(plan, argv)?;
         let empty_loader = remote_empty_loader_directories(plan, visible_root)
             .map_err(|error| error.to_string())?;
         let loader_witness = observe_loader_directories(&empty_loader, || false)
@@ -459,7 +514,9 @@ impl RemoteDependencies {
             plan.execution_env.clone(),
             runtime_bytes,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .with_execution_mode(execution_mode(plan)?);
+        verify_execution_policy(plan, &key, context.execution_mode())?;
         loader_witness.verify_absence(|| false).map_err(|error| {
             format!("original loader directories changed during keying: {error}")
         })?;
@@ -468,16 +525,19 @@ impl RemoteDependencies {
             .image
             .verify_source_unchanged(root, || false)
             .map_err(|error| format!("original toolchain changed during keying: {error}"))?;
+        let validation = RemoteValidation {
+            retained,
+            runtime,
+            loader: loader_witness,
+            execution_mode: context.execution_mode(),
+            action_key: key.action_key.clone(),
+        };
         Ok(Some((
             key,
             RemoteInvocation {
                 argv: argv.to_vec(),
                 context,
-                validation: RemoteValidation {
-                    retained,
-                    runtime,
-                    loader: loader_witness,
-                },
+                validation,
             },
         )))
     }
@@ -570,14 +630,15 @@ impl LiveDependencyLane {
         remote: Arc<RemoteDependencies>,
         invocation: RemoteInvocation,
     ) -> LiveDecision {
-        if let Err(reason) = request.verify_toolchain() {
+        if let Err(reason) = invocation
+            .validation
+            .verify_read_closure(&request)
+            .and_then(|()| request.verify_toolchain())
+        {
             return LiveDecision::PassThrough(reason);
         }
-        let request = match self.preview(request) {
-            Ok(Ok(mut pending)) => {
-                pending.remote_validation = Some(invocation.validation);
-                return LiveDecision::Hit(pending);
-            }
+        let request = match self.preview(request, Some(&invocation.validation)) {
+            Ok(Ok(pending)) => return LiveDecision::Hit(pending),
             Ok(Err(request)) => request,
             Err(reason) => return LiveDecision::PassThrough(format!("serve-fault: {reason}")),
         };
@@ -696,7 +757,7 @@ impl PendingRemote {
         let request_id = reservation
             .allocate_request_id()
             .map_err(|error| settled(format!("allocate worker request: {error}")))?;
-        let wire = metadata_execution_request(
+        let wire = dependency_execution_request(
             &request.plan,
             &invocation.argv,
             &invocation.context,
@@ -710,6 +771,7 @@ impl PendingRemote {
             .map_err(|error| settled(format!("prepare worker upload: {error}")))?;
         let owner: Arc<Mutex<Option<AdmittedRemote>>> = Arc::new(Mutex::new(None));
         let admitted_owner = Arc::clone(&owner);
+        let validation = invocation.validation.clone();
         // Persist exact recovery intent BEFORE execution can leave this process.
         // Recovery must target this reserved worker, even when the pool changes
         // order or membership. The whole pool is not a worker identity.
@@ -745,7 +807,7 @@ impl PendingRemote {
                     started,
                 };
                 let attempt = lane
-                    .begin_execution_on(request, worker)
+                    .begin_execution_on(request, worker, Some(validation))
                     .map_err(io::Error::other)?
                     .ok_or_else(|| {
                         io::Error::new(
@@ -900,19 +962,18 @@ impl PendingRemote {
     }
 }
 
-/// A standalone metadata compiler normally needs one implicit slot, but an
-/// explicit -Z threads=N frontend needs an N-slot worker-local jobserver to use
-/// its requested parallelism. NUM_JOBS is a keyed compiler environment value,
+/// A standalone compiler normally needs one implicit slot, but an explicit
+/// -Z threads=N frontend needs an N-slot worker-local jobserver to use its
+/// requested parallelism. NUM_JOBS is a keyed compiler environment value,
 /// not a per-action resource request; dispatcher descriptors cannot cross hosts.
 ///
 /// This is resource intent, not admission. The worker still caps it to its own
 /// reported slots, obtains the existing weighted host lease and supplies only
 /// grant-1 transferable tokens. No token is acquired while inputs transfer.
-/// Keep the existing metadata-only and modeled-option gates: codegen, implicit
-/// host thread counts and future concurrency flags need their own policy.
-fn metadata_execution_grant(plan: &DependencyActionPlan, argv: &[String]) -> Result<u32, String> {
-    rabs_key::live_dependency::check_dependency_cache_read_closure(&plan.invocation)
-        .map_err(|error| error.to_string())?;
+/// Only the shared metadata/archive class and modeled options can request
+/// resources; implicit host thread counts still require another policy.
+fn dependency_execution_grant(plan: &DependencyActionPlan, argv: &[String]) -> Result<u32, String> {
+    execution_mode(plan)?;
     rabs_key::output_derivation::check_dependency_output_options(&plan.invocation)
         .map_err(|error| error.to_string())?;
     let presented = rabs_key::invocation::parse(argv, None)
@@ -941,7 +1002,7 @@ fn metadata_execution_grant(plan: &DependencyActionPlan, argv: &[String]) -> Res
 /// Construct the exact request saved for recovery, authenticated on the wire
 /// and checked against the completed delivery receipt. Resource selection must
 /// happen here, never by mutating an already journaled or dispatched request.
-fn metadata_execution_request(
+fn dependency_execution_request(
     plan: &DependencyActionPlan,
     argv: &[String],
     context: &DependencyExecContext,
@@ -949,7 +1010,10 @@ fn metadata_execution_request(
     toolchain: &ToolchainIdentity,
     request_id: u64,
 ) -> Result<Value, String> {
-    let grant = metadata_execution_grant(plan, argv)?;
+    let grant = dependency_execution_grant(plan, argv)?;
+    if context.execution_mode() != execution_mode(plan)? {
+        return Err("worker context does not enforce this dependency output class".into());
+    }
     Ok(json!({
         "kind":"canonical-exec", "request_id":request_id,
         "program":plan.compiler, "args":argv[1..],
@@ -966,6 +1030,7 @@ fn metadata_execution_request(
 fn context_value(context: &DependencyExecContext) -> Value {
     json!({
         "version":DEPENDENCY_CONTEXT_VERSION,
+        "execution_mode":context.execution_mode().as_str(),
         "source_root":context.source_root(), "cwd":context.cwd(),
         "generated_root":context.generated_root(),
         "toolchain_root":context.toolchain_root(), "compiler":context.compiler(),
@@ -1732,12 +1797,16 @@ mod execution_resource_tests {
 
     impl Fixture {
         fn new(extra: &[&str]) -> Self {
+            Self::with_outputs(extra, "dep-info,metadata")
+        }
+
+        fn with_outputs(extra: &[&str], emit: &str) -> Self {
             let mut argv = vec![
                 "/toolchain/bin/rustc".into(),
                 format!("{PACKAGE}/src/lib.rs"),
                 "--crate-name=parallel".into(),
                 "--crate-type=lib".into(),
-                "--emit=dep-info,metadata".into(),
+                format!("--emit={emit}"),
                 "--cap-lints=allow".into(),
                 "--error-format=json".into(),
                 "--json=artifacts".into(),
@@ -1788,7 +1857,7 @@ mod execution_resource_tests {
         fn request(&self) -> Result<Value, String> {
             // These synthetic inventory identities exercise request assembly,
             // not source/toolchain verification, compiler execution or TLS.
-            metadata_execution_request(
+            dependency_execution_request(
                 &self.plan,
                 &self.argv,
                 &self.context,
@@ -1819,7 +1888,10 @@ mod execution_resource_tests {
         );
         assert_eq!(wire["dependency_context"], context_value(&fixture.context));
         assert_eq!(wire["artifacts"]["unit"], "dependency-0000000000000011");
-        assert_eq!(wire["artifacts"]["files"], json!(fixture.plan.output_names()));
+        assert_eq!(
+            wire["artifacts"]["files"],
+            json!(fixture.plan.output_names())
+        );
         assert_eq!(wire.as_object().unwrap().len(), 10);
     }
 
@@ -1867,7 +1939,11 @@ mod execution_resource_tests {
 
     #[test]
     fn metadata_grant_does_not_infer_jobs_from_environment_or_codegen_units() {
-        for flags in [vec![], vec!["-Ccodegen-units=256"], vec!["-Zembed-metadata=no"]] {
+        for flags in [
+            vec![],
+            vec!["-Ccodegen-units=256"],
+            vec!["-Zembed-metadata=no"],
+        ] {
             let fixture = Fixture::new(&flags);
             assert_eq!(fixture.request().unwrap()["jobserver_grant"], 1);
             assert!(
@@ -1890,7 +1966,16 @@ mod execution_resource_tests {
     #[test]
     fn malformed_or_implicit_thread_counts_never_fall_back_to_one_slot() {
         for value in [
-            "", "0", "-1", "+2", " 2", "2 ", "2.0", "0x8", "auto", "4294967296",
+            "",
+            "0",
+            "-1",
+            "+2",
+            " 2",
+            "2 ",
+            "2.0",
+            "0x8",
+            "auto",
+            "4294967296",
         ] {
             for overridden in [false, true] {
                 let mut fixture = Fixture::new(&[]);
@@ -1900,8 +1985,7 @@ mod execution_resource_tests {
                 }
                 // Deliberately bypass the planner here so this exercises the
                 // last pre-dispatch guard, not only planner rejection.
-                fixture.plan.invocation =
-                    rabs_key::invocation::parse(&fixture.argv, None).unwrap();
+                fixture.plan.invocation = rabs_key::invocation::parse(&fixture.argv, None).unwrap();
                 assert!(
                     fixture.request().is_err(),
                     "{value:?}, overridden={overridden}"
@@ -1924,16 +2008,16 @@ mod execution_resource_tests {
         let mut other_source = fixture.argv.clone();
         other_source[1] = format!("{PACKAGE}/src/other.rs");
         for argv in [Vec::new(), changed, other_compiler, other_source] {
-            assert!(metadata_execution_grant(&fixture.plan, &argv).is_err());
+            assert!(dependency_execution_grant(&fixture.plan, &argv).is_err());
         }
         assert_eq!(
-            metadata_execution_grant(&fixture.plan, &fixture.argv).unwrap(),
+            dependency_execution_grant(&fixture.plan, &fixture.argv).unwrap(),
             8
         );
     }
 
     #[test]
-    fn resource_selection_does_not_expand_the_metadata_only_execution_class() {
+    fn resource_selection_never_substitutes_another_output_class_or_context() {
         for emit in [
             "dep-info,link",
             "dep-info,metadata,link",
@@ -1949,6 +2033,155 @@ mod execution_resource_tests {
             fixture.plan.invocation = rabs_key::invocation::parse(&fixture.argv, None).unwrap();
             assert!(fixture.request().is_err(), "{emit}");
         }
+    }
+
+    #[test]
+    fn archive_execution_requires_the_enforced_mode_and_preserves_all_outputs() {
+        for emit in ["dep-info,link", "dep-info,metadata,link"] {
+            let mut fixture = Fixture::with_outputs(&["-Zthreads=3"], emit);
+            assert!(
+                fixture.request().is_err(),
+                "metadata context cannot execute archives"
+            );
+            fixture.context = fixture
+                .context
+                .with_execution_mode(DependencyExecutionMode::Rlib);
+            let wire = fixture.request().unwrap();
+            assert_eq!(wire["dependency_context"]["execution_mode"], "rlib");
+            assert_eq!(
+                wire["dependency_context"]["version"],
+                DEPENDENCY_CONTEXT_VERSION
+            );
+            assert_eq!(wire["jobserver_grant"], 3);
+            assert_eq!(wire["args"], json!(fixture.argv[1..]));
+            assert!(
+                fixture
+                    .plan
+                    .output_names()
+                    .iter()
+                    .any(|name| name.ends_with(".rlib"))
+            );
+            assert_eq!(
+                wire["artifacts"]["files"],
+                json!(fixture.plan.output_names())
+            );
+            assert!(
+                rabs_key::live_dependency::check_dependency_cache_read_closure(
+                    &fixture.plan.invocation
+                )
+                .is_err(),
+                "remote resource admission must not relax unsandboxed caching"
+            );
+        }
+        let mut metadata = Fixture::new(&[]);
+        metadata.context = metadata
+            .context
+            .with_execution_mode(DependencyExecutionMode::Rlib);
+        assert!(metadata.request().is_err());
+    }
+
+    #[test]
+    fn remote_cache_policy_must_match_the_enforced_namespace_and_exact_descriptor() {
+        use rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN;
+        use rabs_protocol::input_evidence::{
+            INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        };
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+
+        let key_for = |fixture: &Fixture| {
+            let plan = &fixture.plan;
+            let toolchain = ToolchainFacts {
+                compiler_binary_digest: rabs_key::typed_digest::compute("rabs.test.v1", b"rustc"),
+                verbose_version: "rustc 1.100.0\nhost: x86_64-unknown-linux-gnu\nLLVM version: 21"
+                    .into(),
+                sysroot_root_digest: rabs_key::typed_digest::compute("rabs.test.v1", b"sysroot"),
+                runtime_libraries: Vec::new(),
+            };
+            let directories = plan
+                .dependency_dirs
+                .iter()
+                .map(|path| DependencyDirectoryFact {
+                    path: path.clone(),
+                    artifacts: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let inputs = ActionInputManifest {
+                schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+                inputs: ["Cargo.toml", "src/lib.rs"]
+                    .into_iter()
+                    .map(|relative| PositiveInput {
+                        virtual_path: RawBytes::new(plan.input_virtual_path(relative).into_bytes()),
+                        object: ObjectId(rabs_key::typed_digest::compute(
+                            "rabs.test.v1",
+                            relative.as_bytes(),
+                        )),
+                        file_type: InputFileType::Regular,
+                        executable: false,
+                        symlink_resolution: Vec::new(),
+                    })
+                    .collect(),
+                ..ActionInputManifest::default()
+            };
+            remote_dependency_key(
+                plan,
+                &toolchain,
+                &directories,
+                &inputs,
+                None,
+                "/toolchain",
+                &[0x22; 32],
+                &rabs_key::typed_digest::compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+            )
+            .unwrap()
+        };
+        let metadata = Fixture::new(&[]);
+        let archive = Fixture::with_outputs(&[], "dep-info,metadata,link");
+        let metadata_key = key_for(&metadata);
+        let archive_key = key_for(&archive);
+        assert!(
+            verify_execution_policy(
+                &metadata.plan,
+                &metadata_key,
+                DependencyExecutionMode::Metadata
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_execution_policy(&archive.plan, &archive_key, DependencyExecutionMode::Rlib)
+                .is_ok()
+        );
+        for (plan, key, mode) in [
+            (
+                &archive.plan,
+                &archive_key,
+                DependencyExecutionMode::Metadata,
+            ),
+            (&metadata.plan, &metadata_key, DependencyExecutionMode::Rlib),
+            (&archive.plan, &metadata_key, DependencyExecutionMode::Rlib),
+            (
+                &metadata.plan,
+                &archive_key,
+                DependencyExecutionMode::Metadata,
+            ),
+        ] {
+            assert!(verify_execution_policy(plan, key, mode).is_err());
+        }
+        let mut forged = archive_key.clone();
+        forged.descriptor.sandbox_semantic_policy = metadata_key.descriptor.sandbox_semantic_policy;
+        assert!(
+            verify_execution_policy(&archive.plan, &forged, DependencyExecutionMode::Rlib).is_err()
+        );
+        let mut forged = archive_key.clone();
+        forged.action_key = metadata_key.action_key;
+        assert!(
+            verify_execution_policy(&archive.plan, &forged, DependencyExecutionMode::Rlib).is_err()
+        );
+        let mut forged = archive_key;
+        forged.descriptor_digest = metadata_key.descriptor_digest;
+        assert!(
+            verify_execution_policy(&archive.plan, &forged, DependencyExecutionMode::Rlib).is_err()
+        );
     }
 
     #[cfg(unix)]

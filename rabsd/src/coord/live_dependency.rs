@@ -115,6 +115,23 @@ impl LiveDependencyRequest {
     fn verify_read_closure(&self) -> Result<(), String> {
         check_dependency_cache_read_closure(&self.plan.invocation)
             .map_err(|refusal| refusal.to_string())?;
+        self.verify_output_contract()
+    }
+
+    /// Remote archive authority comes only from the retained, internally
+    /// constructed validation owner. A caller-supplied descriptor or remote
+    /// policy string alone can never relax the unsandboxed local guard.
+    fn verify_enforced_read_closure(
+        &self,
+        remote: Option<&remote::RemoteValidation>,
+    ) -> Result<(), String> {
+        match remote {
+            Some(remote) => remote.verify_read_closure(self),
+            None => self.verify_read_closure(),
+        }
+    }
+
+    fn verify_output_contract(&self) -> Result<(), String> {
         let expected = rabs_key::output_derivation::derive_dependency_output_declarations(
             &self.plan.invocation,
             &self.plan.host_triple,
@@ -122,7 +139,7 @@ impl LiveDependencyRequest {
         .map_err(|error| error.to_string())?;
         if expected.canonical_bytes() != self.plan.outputs.canonical_bytes() {
             return Err(
-                "LIVE_DEP_OUTPUTS: declared outputs differ from metadata invocation".into(),
+                "LIVE_DEP_OUTPUTS: declared outputs differ from the compiler invocation".into(),
             );
         }
         Ok(())
@@ -260,7 +277,10 @@ impl PendingServe {
     #[must_use]
     pub fn install(self) -> InstallResult {
         let plan = &self.request.plan;
-        if let Err(reason) = self.request.verify_read_closure() {
+        if let Err(reason) = self
+            .request
+            .verify_enforced_read_closure(self.remote_validation.as_ref())
+        {
             return InstallResult::Declined(reason);
         }
         if let Some(validation) = &self.remote_validation
@@ -716,7 +736,7 @@ impl LiveDependencyLane {
         {
             return LiveDecision::PassThrough(reason);
         }
-        let request = match self.preview(request) {
+        let request = match self.preview(request, None) {
             Ok(Ok(pending)) => return LiveDecision::Hit(pending),
             Ok(Err(request)) => request,
             // Preview writes no target file, so the compiler may run; it
@@ -734,10 +754,11 @@ impl LiveDependencyLane {
     fn preview(
         &self,
         request: LiveDependencyRequest,
+        remote_validation: Option<&remote::RemoteValidation>,
     ) -> Result<Result<PendingServe, LiveDependencyRequest>, String> {
         // Retained codegen publications from an older daemon are immutable
         // history, not current serving authority. Check before any lookup.
-        request.verify_read_closure()?;
+        request.verify_enforced_read_closure(remote_validation)?;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let key = request.key.action_key.clone();
         let loaded = {
@@ -771,7 +792,7 @@ impl LiveDependencyLane {
                 request,
                 manifest,
                 canonical_transcript,
-                remote_validation: None,
+                remote_validation: remote_validation.cloned(),
             })),
             Ok(_) => Ok(Err(request)),
             Err(error) => Err(error.to_string()),
@@ -783,7 +804,7 @@ impl LiveDependencyLane {
         request: LiveDependencyRequest,
     ) -> Result<Option<LocalAttempt>, String> {
         let worker = self.local_worker()?;
-        self.begin_execution_on(request, &worker)
+        self.begin_execution_on(request, &worker, None)
             .map(|attempt| attempt.map(LocalAttempt))
     }
 
@@ -793,8 +814,9 @@ impl LiveDependencyLane {
         &self,
         request: LiveDependencyRequest,
         worker: &WorkerSessionOffer,
+        remote_validation: Option<remote::RemoteValidation>,
     ) -> Result<Option<ExecutionAttempt>, String> {
-        request.verify_read_closure()?;
+        request.verify_enforced_read_closure(remote_validation.as_ref())?;
         let key = request.key.action_key.clone();
         let refusal = |error: SubmissionRefusal| format!("submission: {error:?}");
         if self.coord.submitted_actor(&key).map_err(refusal)?.is_some() {
@@ -850,6 +872,7 @@ impl LiveDependencyLane {
             serial,
             authority: None,
             request,
+            remote_validation,
             settled: false,
         };
         let authority = self
@@ -883,6 +906,7 @@ struct ExecutionAttempt {
     serial: u64,
     authority: Option<AttemptAuthority>,
     request: LiveDependencyRequest,
+    remote_validation: Option<remote::RemoteValidation>,
     settled: bool,
 }
 
@@ -997,7 +1021,8 @@ impl ExecutionAttempt {
         physical_outputs: &Path,
         remote_receipt: Option<&serde_json::Value>,
     ) -> Result<CapturedLocalResult, String> {
-        self.request.verify_read_closure()?;
+        self.request
+            .verify_enforced_read_closure(self.remote_validation.as_ref())?;
         self.advance(AttemptState::ProcessExited)?;
         if report.signal.is_some() || report.exit_code != Some(0) {
             return Err(format!(
@@ -1242,7 +1267,8 @@ impl ExecutionAttempt {
         &self,
         captured: CapturedLocalResult,
     ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
-        self.request.verify_read_closure()?;
+        self.request
+            .verify_enforced_read_closure(self.remote_validation.as_ref())?;
         let CapturedLocalResult {
             offer,
             transcript,
@@ -1328,7 +1354,9 @@ mod installed_output_tests {
             std::fs::create_dir_all(&out).unwrap();
             std::fs::write(package.join("lib.rs"), b"pub const VALUE: u32 = 17;").unwrap();
             let generated = populated.map(|populated| {
-                let root = directory.path().join("target/debug/build/consumer-unit/out");
+                let root = directory
+                    .path()
+                    .join("target/debug/build/consumer-unit/out");
                 std::fs::create_dir_all(&root).unwrap();
                 if populated {
                     std::fs::write(root.join("value.rs"), b"pub const GENERATED: u32 = 17;")
@@ -1533,7 +1561,10 @@ mod installed_output_tests {
             };
             assert_eq!(transcript, b"compiler transcript\n");
             assert_eq!(installed.len(), 1);
-            assert_eq!(fixture.package.generated_files.len(), usize::from(populated));
+            assert_eq!(
+                fixture.package.generated_files.len(),
+                usize::from(populated)
+            );
         }
     }
 
@@ -1545,7 +1576,12 @@ mod installed_output_tests {
         );
         // The synchronous materializer completed. Neither rollback nor an
         // unwritten-decline claim is permitted after this frontier.
-        assert!(fixture.outputs.iter().all(|output| output.destination.is_file()));
+        assert!(
+            fixture
+                .outputs
+                .iter()
+                .all(|output| output.destination.is_file())
+        );
         assert_eq!(
             std::fs::read(fixture.input.with_file_name("libconsumer.rmeta")).unwrap(),
             b"verified replacement metadata",
@@ -1562,8 +1598,7 @@ mod installed_output_tests {
             let source = Path::new(&fixture.plan.source_root);
             let result = fixture.install(|| match mutation {
                 "rewrite" => {
-                    std::fs::write(source.join("lib.rs"), b"pub const VALUE: u32 = 99;")
-                        .unwrap();
+                    std::fs::write(source.join("lib.rs"), b"pub const VALUE: u32 = 99;").unwrap();
                 }
                 "added" => {
                     std::fs::write(source.join("introduced.rs"), b"new input").unwrap();

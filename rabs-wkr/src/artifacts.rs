@@ -163,6 +163,12 @@ impl ArtifactPlan {
         self.cargo
     }
 
+    /// A compiler-unit result must declare every file before execution.
+    /// Whole-Cargo tree discovery cannot replace the archive output contract.
+    pub(crate) const fn is_exact(&self) -> bool {
+        !self.tree
+    }
+
     /// Exact worker-private roots under the explicit incremental Cargo output
     /// contract. Target-state keys bind this projection separately from mode.
     pub(crate) fn private_incremental_roots(&self) -> Option<&[String]> {
