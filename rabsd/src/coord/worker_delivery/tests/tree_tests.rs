@@ -100,6 +100,58 @@ fn cargo_fixture(destination: &Path, report: &[u8]) -> Script {
     peer
 }
 
+fn cargo_runtime_request(command: &str, private_incremental: bool) -> Value {
+    let mut request = cargo_request();
+    request["args"] = json!([
+        command,
+        if command == "run" {
+            "--bin=a"
+        } else {
+            "--workspace"
+        },
+        "--message-format=json",
+        "--target-dir",
+        "/__rabs/out/cargo",
+        "--",
+        "runtime argument",
+        "--no-run",
+    ]);
+    request["artifacts"]["cargo"] = json!(match (command, private_incremental) {
+        ("test", false) => cargo_artifacts::CARGO_TEST_ARTIFACTS_VERSION,
+        ("test", true) => cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION,
+        ("run", false) => cargo_artifacts::CARGO_RUN_ARTIFACTS_VERSION,
+        ("run", true) => cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION,
+        ("bench", false) => cargo_artifacts::CARGO_BENCH_ARTIFACTS_VERSION,
+        ("bench", true) => cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION,
+        _ => unreachable!(),
+    });
+    if private_incremental {
+        request["command_context"] = json!({"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+            "env":{"CARGO_INCREMENTAL":"1"}});
+    }
+    request
+}
+
+fn cargo_runtime_stdout(command: &str) -> Vec<u8> {
+    let kind = if command == "run" { "bin" } else { command };
+    let mut stdout = format!(
+        "{}\n{}\n",
+        json!({"reason":"compiler-artifact", "target":{"kind":[kind]},
+            "filenames":["/__rabs/out/cargo/a"], "executable":"/__rabs/out/cargo/a"}),
+        json!({"reason":"build-finished", "success":true}),
+    )
+    .into_bytes();
+    stdout.extend_from_slice(
+        concat!(
+            "{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/runtime-stdout\"]}\n",
+            "{\"reason\":\"build-finished\",\"success\":false}\n",
+        )
+        .as_bytes(),
+    );
+    stdout.extend_from_slice(b"\xff\x00opaque program stdout without a final newline");
+    stdout
+}
+
 fn private_incremental_cargo_request(test: bool) -> Value {
     let mut request = cargo_request();
     request["command_context"] = json!({"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
@@ -280,71 +332,166 @@ fn missing_cargo_outputs_or_incomplete_reports_never_acknowledge_success() {
 }
 
 #[test]
-fn cargo_test_delivery_recovery_preserves_opaque_harness_output_and_final_status() {
-    let mut request = cargo_request();
-    request["args"][0] = json!("test");
-    request["args"]
-        .as_array_mut()
-        .unwrap()
-        .extend([json!("--"), json!("--nocapture")]);
-    request["artifacts"]["cargo"] = json!("cargo-test-json-v1");
-    let stdout = concat!(
-        "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"test\"]},",
-        "\"filenames\":[\"/__rabs/out/cargo/a\"],\"executable\":\"/__rabs/out/cargo/a\"}\n",
-        "{\"reason\":\"build-finished\",\"success\":true}\n",
-        "{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/test-stdout\"]}\n",
-        "{\"reason\":\"build-finished\",\"success\":false}\n",
-        "unparsed test stdout without a final newline",
-    );
-    for exit_code in [0, 101] {
-        let owner = tempfile::tempdir().unwrap();
-        let destination = owner.path().join("tests");
-        let mut peer = cargo_fixture(&destination, stdout.as_bytes());
-        if exit_code != 0 {
-            peer.replies[1]["exit_code"] = json!(exit_code);
-            peer.replies[1]["artifact_manifest"] = Value::Null;
-            peer.replies[1]["artifact_ack_required"] = json!(false);
-            peer.replies.truncate(4);
-            peer.replies.push_back(
-                json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
-            );
-        }
-        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
-        assert!(peer.replies.is_empty());
-        assert!(delivery.acknowledgments_confirmed);
-        assert_eq!(delivery.receipt["exit_code"], exit_code);
-        assert_eq!(
-            fs::read(destination.join("diagnostics/stdout")).unwrap(),
-            stdout.as_bytes()
-        );
-        assert_eq!(
-            delivery.receipt["artifact_manifest"].is_null(),
-            exit_code != 0
-        );
-        let recovered =
-            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+fn cargo_runtime_delivery_recovery_preserves_opaque_output_and_native_status() {
+    for command in ["test", "run", "bench"] {
+        for private_incremental in [false, true] {
+            let request = cargo_runtime_request(command, private_incremental);
+            let stdout = cargo_runtime_stdout(command);
+            let failure_exit = if command == "run" { 23 } else { 101 };
+            for exit_code in [0, failure_exit] {
+                let owner = tempfile::tempdir().unwrap();
+                let destination = owner.path().join("runtime");
+                let mut peer = cargo_fixture(&destination, &stdout);
+                if exit_code != 0 {
+                    peer.replies[1]["exit_code"] = json!(exit_code);
+                    peer.replies[1]["artifact_manifest"] = Value::Null;
+                    peer.replies[1]["artifact_ack_required"] = json!(false);
+                    peer.replies.truncate(4);
+                    peer.replies.push_back(json!({
+                        "kind":"output-acknowledged", "request_id":7, "already_released":false,
+                    }));
+                }
+                let delivery =
+                    receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+                assert!(peer.replies.is_empty());
+                assert!(delivery.acknowledgments_confirmed);
+                assert_eq!(delivery.receipt["exit_code"], exit_code);
+                assert_eq!(
+                    fs::read(destination.join("diagnostics/stdout")).unwrap(),
+                    stdout
+                );
+                assert_eq!(
+                    delivery.receipt["artifact_manifest"].is_null(),
+                    exit_code != 0
+                );
+                let recovered = recover_existing_delivery(
+                    &request,
+                    "worker",
+                    &destination,
+                    DeliveryTrust::Loopback,
+                )
                 .unwrap()
                 .unwrap();
-        assert_eq!(recovered.receipt, delivery.receipt);
-        assert_eq!(recovered.receipt["publication_authorized"], false);
-        assert!(
-            !peer
-                .sent
-                .iter()
-                .any(|frame| exit_code != 0 && frame["kind"] == "artifact-ack")
-        );
-    }
+                assert_eq!(recovered.receipt, delivery.receipt);
+                assert_eq!(recovered.receipt["publication_authorized"], false);
+                assert_eq!(recovered.receipt["reexecute"], false);
+                assert_eq!(peer.sent[1], request);
+                assert_eq!(
+                    peer.sent
+                        .iter()
+                        .filter(|frame| frame["kind"] == "canonical-exec")
+                        .count(),
+                    1
+                );
+                assert!(!peer.sent.iter().any(|frame| exit_code != 0
+                    && matches!(
+                        frame["kind"].as_str(),
+                        Some("artifact-read" | "artifact-ack")
+                    )));
+                let mut different_execution = request.clone();
+                different_execution["args"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("different runtime argument"));
+                assert!(
+                    recover_existing_delivery(
+                        &different_execution,
+                        "worker",
+                        &destination,
+                        DeliveryTrust::Loopback
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    fs::read(destination.join("diagnostics/stdout")).unwrap(),
+                    stdout
+                );
+            }
 
-    let owner = tempfile::tempdir().unwrap();
-    let destination = owner.path().join("contradictory-failure");
-    let mut peer = cargo_fixture(&destination, stdout.as_bytes());
-    peer.replies[1]["exit_code"] = json!(101);
-    let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
-    assert!(failure.detail.contains("failed-execution artifacts"));
-    assert!(
-        no_ack(&peer),
-        "a test failure cannot offer successful artifacts"
-    );
+            let owner = tempfile::tempdir().unwrap();
+            let destination = owner.path().join("contradictory-failure");
+            let mut peer = cargo_fixture(&destination, &stdout);
+            peer.replies[1]["exit_code"] = json!(failure_exit);
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(failure.detail.contains("failed-execution artifacts"));
+            assert!(
+                no_ack(&peer),
+                "a native runtime failure cannot offer successful artifacts"
+            );
+        }
+    }
+}
+
+#[test]
+fn run_and_bench_resume_retrieves_original_outputs_without_executing_again() {
+    for command in ["run", "bench"] {
+        for private_incremental in [false, true] {
+            let request = cargo_runtime_request(command, private_incremental);
+            let stdout = cargo_runtime_stdout(command);
+            let owner = tempfile::tempdir().unwrap();
+            let destination = owner.path().join("resumed-runtime");
+            let mut peer = cargo_fixture(&destination, &stdout);
+            peer.replies[0]["request_high_water"] = json!(7);
+            peer.replies[0]["result_retentions"] = json!([RESULT_RETENTION]);
+            peer.replies[1]["resumed"] = json!(true);
+            peer.replies[1]["result_retention"] = json!(RESULT_RETENTION);
+            peer.replies[1]["retained_result_sha256"] = json!(hash(b"retained runtime execution"));
+            let delivered = receive_operation(
+                &mut peer,
+                &request,
+                "worker",
+                &destination,
+                DeliveryMode::Resume,
+            )
+            .unwrap();
+            assert!(peer.replies.is_empty());
+            assert!(delivered.acknowledgments_confirmed);
+            assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
+            assert!(
+                peer.sent
+                    .iter()
+                    .all(|frame| frame["kind"] != "canonical-exec")
+            );
+            assert_eq!(delivered.receipt["publication_authorized"], false);
+            assert_eq!(delivered.receipt["reexecute"], false);
+            assert_eq!(
+                fs::read(destination.join("diagnostics/stdout")).unwrap(),
+                stdout
+            );
+            let recovered = recover_existing_delivery(
+                &request,
+                "worker",
+                &destination,
+                DeliveryTrust::Loopback,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(recovered.receipt, delivered.receipt);
+        }
+    }
+}
+
+#[test]
+fn run_and_bench_refuse_compilation_only_contracts_before_dispatch() {
+    for command in ["run", "bench"] {
+        for private_incremental in [false, true] {
+            let mut request = cargo_runtime_request(command, private_incremental);
+            request["artifacts"]["cargo"] = json!(if private_incremental {
+                cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION
+            } else {
+                cargo_artifacts::CARGO_ARTIFACTS_VERSION
+            });
+            let owner = tempfile::tempdir().unwrap();
+            let destination = owner.path().join("never-dispatched");
+            let mut peer = cargo_fixture(&destination, &cargo_runtime_stdout(command));
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run);
+            assert!(peer.sent.is_empty());
+            assert!(!destination.exists());
+        }
+    }
 }
 
 #[test]

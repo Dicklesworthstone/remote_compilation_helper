@@ -142,7 +142,7 @@ pub fn compatible_arguments(
 ) -> Option<Vec<String>> {
     let command = args.first()?.as_str();
     let clippy = match (program, command, mode) {
-        ("/__rabs/toolchain/bin/cargo", "build" | "check" | "test", _) => false,
+        ("/__rabs/toolchain/bin/cargo", "build" | "check" | "test" | "run" | "bench", _) => false,
         ("/__rabs/toolchain/bin/cargo-clippy", "clippy", CargoArtifactMode::Compilation) => true,
         _ => return None,
     };
@@ -150,23 +150,24 @@ pub fn compatible_arguments(
         if clippy {
             "cargo-clippy"
         } else {
-            "cargo-build-check-test"
+            "cargo-compilation"
         }
         .to_owned(),
     ];
     let mut no_run = false;
     let mut filter = false;
+    let mut profile = None;
     let mut at = 1;
     while at < args.len() {
         let argument = &args[at];
         if argument == "--" {
             if clippy {
                 // The admitted artifact contract validates a lint-only tail.
-                // Unlike test-process arguments, lints change compilation.
+                // Unlike runtime arguments, lints change compilation.
                 normalized.extend(args[at..].iter().cloned());
                 break;
             }
-            if command != "test" || no_run {
+            if !matches!(command, "test" | "run" | "bench") || no_run {
                 return None;
             }
             break;
@@ -177,10 +178,10 @@ pub fn compatible_arguments(
                 (option, Some(value))
             });
         match option {
-            "--no-run" if inline.is_none() && command == "test" && !no_run => {
+            "--no-run" if inline.is_none() && matches!(command, "test" | "bench") && !no_run => {
                 no_run = true;
             }
-            "--no-fail-fast" if inline.is_none() && command == "test" => {}
+            "--no-fail-fast" if inline.is_none() && matches!(command, "test" | "bench") => {}
             "--bin" | "--example" | "--test" | "--bench" | "--package" | "-p" | "--exclude" => {
                 // Cargo rechecks each selected unit. Clippy must keep selection:
                 // a --no-deps dependency otherwise might stay fresh when made
@@ -211,7 +212,7 @@ pub fn compatible_arguments(
                 }
             }
             "--features" | "-F" | "--target" | "--color" | "--message-format"
-            | "--manifest-path" | "--target-dir" | "--profile" | "--jobs" | "-j" => {
+            | "--manifest-path" | "--target-dir" | "--jobs" | "-j" => {
                 normalized.push(argument.clone());
                 let value = if let Some(value) = inline {
                     value
@@ -225,9 +226,23 @@ pub fn compatible_arguments(
                     return None;
                 }
             }
-            "--release"
-            | "-r"
-            | "--locked"
+            "--profile" => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        at += 1;
+                        args.get(at)?.as_str()
+                    }
+                };
+                if profile.is_some() || value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+                profile = Some(value);
+            }
+            "--release" | "-r" if inline.is_none() && profile.is_none() && command != "bench" => {
+                profile = Some("release");
+            }
+            "--locked"
             | "--offline"
             | "--frozen"
             | "--all-features"
@@ -247,7 +262,7 @@ pub fn compatible_arguments(
             "--no-deps" if inline.is_none() && clippy => {
                 normalized.push(argument.clone());
             }
-            _ if command == "test" && !argument.starts_with('-') && !filter => {
+            _ if matches!(command, "test" | "bench") && !argument.starts_with('-') && !filter => {
                 filter = true;
             }
             _ => return None,
@@ -257,9 +272,27 @@ pub fn compatible_arguments(
     if no_run && filter {
         return None;
     }
+    // This is private Cargo state only: Cargo still runs and checks every
+    // fingerprint. Keep debug/release/custom output families separate, while
+    // equivalent profile spellings can seed builds, runs, tests and benchmarks.
+    // Clippy retains its exact profile because lint freshness is distinct.
+    let profile = match profile {
+        Some("dev" | "test") if !clippy => "debug",
+        Some("release" | "bench") if !clippy => "release",
+        Some(profile) => profile,
+        None if command == "bench" => "release",
+        None => "debug",
+    };
+    normalized.push(format!("private-target-profile={profile}"));
     match mode {
-        CargoArtifactMode::Compilation if command != "test" || no_run => Some(normalized),
+        CargoArtifactMode::Compilation
+            if command != "run" && (!matches!(command, "test" | "bench") || no_run) =>
+        {
+            Some(normalized)
+        }
         CargoArtifactMode::TestExecution if command == "test" && !no_run => Some(normalized),
+        CargoArtifactMode::RunExecution if command == "run" && !no_run => Some(normalized),
+        CargoArtifactMode::BenchExecution if command == "bench" && !no_run => Some(normalized),
         _ => None,
     }
 }
@@ -608,6 +641,22 @@ mod tests {
                 ][..],
                 CargoArtifactMode::TestExecution,
             ),
+            (
+                "run",
+                &[
+                    "--package=app",
+                    "--bin=app",
+                    "--",
+                    "--no-run",
+                    "--profile=release",
+                ][..],
+                CargoArtifactMode::RunExecution,
+            ),
+            (
+                "bench",
+                &["--profile=dev", "--bench=measured", "--", "--exact"][..],
+                CargoArtifactMode::BenchExecution,
+            ),
         ] {
             assert_eq!(
                 compatible_arguments(cargo, &invocation(command, tail), mode),
@@ -650,6 +699,25 @@ mod tests {
             ),
             ("build", &[][..], CargoArtifactMode::TestExecution),
             ("test", &[][..], CargoArtifactMode::Compilation),
+            ("run", &[][..], CargoArtifactMode::Compilation),
+            ("run", &["--no-run"][..], CargoArtifactMode::RunExecution),
+            ("bench", &[][..], CargoArtifactMode::Compilation),
+            (
+                "bench",
+                &["--no-run"][..],
+                CargoArtifactMode::BenchExecution,
+            ),
+            (
+                "bench",
+                &["--release"][..],
+                CargoArtifactMode::BenchExecution,
+            ),
+            ("bench", &["-r"][..], CargoArtifactMode::BenchExecution),
+            (
+                "bench",
+                &["--no-run", "--", "--exact"][..],
+                CargoArtifactMode::Compilation,
+            ),
         ] {
             assert_eq!(
                 compatible_arguments(cargo, &invocation(command, tail), mode),
@@ -664,6 +732,95 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn benchmark_default_profile_shares_only_the_release_compilation_family() {
+        let cargo = "/__rabs/toolchain/bin/cargo";
+        let release = compatible_arguments(
+            cargo,
+            &invocation("build", &["--release"]),
+            CargoArtifactMode::Compilation,
+        )
+        .unwrap();
+        for (command, tail, mode) in [
+            ("build", vec!["-r"], CargoArtifactMode::Compilation),
+            (
+                "build",
+                vec!["--profile", "release"],
+                CargoArtifactMode::Compilation,
+            ),
+            (
+                "run",
+                vec!["--release", "--example=demo", "--", "--profile=dev"],
+                CargoArtifactMode::RunExecution,
+            ),
+            (
+                "test",
+                vec!["--profile=bench", "filter", "--", "--nocapture"],
+                CargoArtifactMode::TestExecution,
+            ),
+            (
+                "bench",
+                vec!["--bench=measured", "filter", "--", "--no-run"],
+                CargoArtifactMode::BenchExecution,
+            ),
+            ("bench", vec!["--no-run"], CargoArtifactMode::Compilation),
+            (
+                "bench",
+                vec!["--profile=release"],
+                CargoArtifactMode::BenchExecution,
+            ),
+        ] {
+            let args = invocation(command, &tail);
+            assert_eq!(
+                compatible_arguments(cargo, &args, mode),
+                Some(release.clone()),
+                "{args:?}"
+            );
+        }
+        for (command, tail, mode) in [
+            ("build", vec![], CargoArtifactMode::Compilation),
+            (
+                "run",
+                vec!["--", "--release"],
+                CargoArtifactMode::RunExecution,
+            ),
+            (
+                "bench",
+                vec!["--profile=dev"],
+                CargoArtifactMode::BenchExecution,
+            ),
+            (
+                "bench",
+                vec!["--profile=ci"],
+                CargoArtifactMode::BenchExecution,
+            ),
+            (
+                "bench",
+                vec!["--target=x86_64-unknown-linux-gnu"],
+                CargoArtifactMode::BenchExecution,
+            ),
+        ] {
+            let actual = compatible_arguments(cargo, &invocation(command, &tail), mode);
+            assert!(actual.is_some());
+            assert_ne!(actual, Some(release.clone()));
+        }
+        for tail in [
+            vec!["--profile=release", "--profile=dev"],
+            vec!["--release", "--profile=dev"],
+            vec!["--profile=dev", "-r"],
+            vec!["--profile"],
+        ] {
+            assert!(
+                compatible_arguments(
+                    cargo,
+                    &invocation("run", &tail),
+                    CargoArtifactMode::RunExecution
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]

@@ -218,6 +218,13 @@ jobs:
           cargo test --release -p rabsd --test prepared_operation_live \
             actual_offline_cargo_build_uses_remote_archives_then_links_and_replays \
             --locked -- --ignored --nocapture
+      - name: Actual canonical Cargo run and bench with persistent warm targets
+        timeout-minutes: 30
+        env:
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+        run: |
+          cargo test --release -p rabsd --test prepared_operation_live \
+            actual_canonical_cargo_ --locked -- --ignored --nocapture
       - name: Cargo layout projection keys and real split-directory builds
         run: |
           cargo test --release -p rabsd cargo_placement_reuse --locked
