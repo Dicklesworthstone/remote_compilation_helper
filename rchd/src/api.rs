@@ -4823,7 +4823,7 @@ fn worker_issue(
         return Some(Issue {
             severity: "error".to_string(),
             summary: format!("Circuit open for worker '{worker_id}'"),
-            remediation: Some(format!("rch workers probe {worker_id} --force")),
+            remediation: Some(format!("rch workers probe {worker_id}")),
             worker_id: Some(worker_id.to_string()),
         });
     }
