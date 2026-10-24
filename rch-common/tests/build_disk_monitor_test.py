@@ -4,6 +4,7 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 rch-common/tests/build_disk_monitor_test.
 Fixtures are retained for inspection; these tests never fill a filesystem.
 """
 
+import gc
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -151,6 +153,27 @@ class DiskMonitorTests(unittest.TestCase):
         os.link(output, self.target / "same-inode")
         self.assertEqual(monitor.measure_outputs([str(self.target)]),
                          monitor.measure_outputs([str(self.target), str(nested)]))
+
+    def test_completed_scans_release_inode_tables_without_cyclic_collection(self):
+        for number in range(512):
+            (self.target / str(number)).touch()
+        expected = monitor.measure_outputs([str(self.target)])
+        # A long-running guardian must release each completed scan's metadata,
+        # even when the cyclic collector has not revisited its generation yet.
+        gc.collect()
+        enabled = gc.isenabled()
+        gc.disable()
+        tracemalloc.start()
+        try:
+            for _ in range(64):
+                self.assertEqual(monitor.measure_outputs([str(self.target)]), expected)
+            retained, _ = tracemalloc.get_traced_memory()
+            self.assertLess(retained, MIB, "completed scans retained inode tables")
+        finally:
+            tracemalloc.stop()
+            gc.collect()
+            if enabled:
+                gc.enable()
 
     def test_success_preserves_output_and_warm_total_highwater(self):
         (self.target / "warm-cache").write_bytes(b"w" * 3 * MIB)

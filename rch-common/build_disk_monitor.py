@@ -215,9 +215,15 @@ def measure_outputs(paths):
             # disappearing managed root is separately rejected by its binding.
             if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
                 raise
-    for path in paths:
-        visit(path)
-    return total
+    try:
+        for path in paths:
+            visit(path)
+        return total
+    finally:
+        # Recursion captures this function's own cell. Break that cycle on
+        # success AND failure so every scan releases its inode table promptly,
+        # instead of accumulating entire trees until cyclic GC runs.
+        visit = None
 
 
 def private_regular(descriptor):
