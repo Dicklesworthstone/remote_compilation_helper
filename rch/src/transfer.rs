@@ -5951,6 +5951,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 cmd.arg("-o").arg(format!("ServerAliveInterval={secs}"));
             }
         }
+        // Source retention, closure marking and freshness demand an empty stderr. With known hosts
+        // sent to /dev/null, OpenSSH re-announces the key on every call at INFO, so `rch jobs
+        // recover` could never retire a dead wrapper's build on such a worker.
+        source_content_barrier::configure_ssh_command(cmd.as_std_mut());
         cmd.arg(format!("{}@{}", worker.user, worker.host));
         if bind_activity && let Some(prefix) = &self.source_authority_prefix {
             cmd.arg(prefix);
@@ -14466,6 +14470,24 @@ Number of files transferred: 42
         assert!(!ordinary.contains("LogLevel"));
         assert!(barrier.contains(&"--checksum".to_owned()));
         assert!(barrier.contains(&"-azn".to_owned()));
+    }
+
+    #[test]
+    fn control_plane_ssh_keeps_known_host_notices_out_of_exact_stderr_proofs() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        let args = command_args(&pipeline.worker_ssh_command(&worker, &["sh", "-s"]));
+        let level = args
+            .windows(2)
+            .position(|pair| pair[0] == "-o" && pair[1] == "LogLevel=ERROR")
+            .expect("LogLevel=ERROR");
+        let destination = args
+            .iter()
+            .position(|arg| arg == "ubuntu@worker.example")
+            .expect("destination");
+        assert!(level < destination, "{args:?}");
+        assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_owned()));
     }
 
     #[test]
