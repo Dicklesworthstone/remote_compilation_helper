@@ -16,6 +16,8 @@ const DAEMON_COMMAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
+const DAEMON_RESTART_ADMISSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(unix)]
 const DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Extra wall-clock margin added on top of a self-test's per-worker `timeout`
 /// budget when waiting for the daemon response. The daemon caps each worker's
@@ -779,6 +781,10 @@ pub(crate) async fn send_daemon_command_to_socket(
 fn daemon_command_response_timeout(command: &str) -> Duration {
     if daemon_command_is_capabilities_refresh(command) {
         DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+    } else if command.starts_with("POST /restart-admission") {
+        // A daemon on a host at load ~130 took over 10 s to answer; the
+        // barrier is an operator action, so wait for its verdict.
+        DAEMON_RESTART_ADMISSION_RESPONSE_TIMEOUT
     } else if let Some(budget) = daemon_command_self_test_budget(command) {
         // A self-test run blocks the daemon for the duration of a real canary
         // build, which routinely exceeds the default 10s IO timeout. Wait for

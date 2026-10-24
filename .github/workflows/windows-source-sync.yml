@@ -1,0 +1,177 @@
+name: Windows source selection and transport
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/transfer.rs'
+      - 'rch/src/transfer/source_archive.rs'
+      - 'rch/src/transfer/source_archive/**'
+      - 'rch-common/src/types.rs'
+      - 'rch-common/tests/source_sync_excludes.rs'
+      - '.github/patches/windows-source-parent.patch'
+      - '.github/workflows/windows-source-sync.yml'
+  workflow_dispatch:
+  # An owner can invoke the same checked integration after an API-only push
+  # by commenting /rch-verify-windows-source-sync on issue #109. No comment
+  # text is evaluated as code, a ref, a path, or a shell argument.
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-source-sync-main
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: >-
+      github.repository == 'Dicklesworthstone/remote_compilation_helper' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.number == 109 &&
+        !github.event.issue.pull_request &&
+        github.event.comment.user.login == 'Dicklesworthstone' &&
+        github.event.comment.author_association == 'OWNER' &&
+        github.event.comment.body == '/rch-verify-windows-source-sync'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      patch_sha256: ${{ steps.evidence.outputs.patch_sha256 }}
+      needs_integration: ${{ steps.integrate.outputs.needs_integration }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Apply the reviewed parent integration with an exact source guard
+        id: integrate
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch=.github/patches/windows-source-parent.patch
+          if git apply --reverse --check "$patch" 2>/dev/null; then
+            echo 'needs_integration=false' >> "$GITHUB_OUTPUT"
+          else
+            # Refuse a different parent implementation rather than guessing
+            # around concurrent source changes or replacing the whole module.
+            # Reviewed through the current transfer blob: preserve concurrent
+            # artifact-header, retrieval, and tracked-input changes.
+            test "$(git hash-object rch/src/transfer.rs)" = 2291542a0bc0e2568ddd611d6f85d2ed7e729131
+            git apply --check "$patch"
+            git apply "$patch"
+            echo 'needs_integration=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install the repository-pinned Rust toolchain and transport prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          command -v git
+          command -v tar
+          command -v rsync
+      - uses: Swatinem/rust-cache@v2
+      - name: Format only the new implementation and tests; check the parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ '${{ steps.integrate.outputs.needs_integration }}' = true ]; then
+            rustfmt --edition 2024 --config skip_children=true rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs rch/src/transfer/source_archive/windows_paths.rs
+          else
+            rustfmt --edition 2024 --config skip_children=true --check rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs rch/src/transfer/source_archive/windows_paths.rs
+          fi
+          rustfmt --edition 2024 --config skip_children=true --check rch/src/transfer.rs
+          git diff --check
+      - name: Run compiled source-selection, archive, upload and receipt regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p rch --bin rch source_archive:: -- --test-threads=1
+          cargo test --locked -p rch --bin rch source_content -- --test-threads=1
+          cargo test --locked -p rch --bin rch selected_source_archive -- --test-threads=1
+          cargo test --locked -p rch-common --test source_sync_excludes -- --test-threads=1
+      - name: Check and lint the actual RCH client targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked -p rch -p rch-common --all-targets
+          cargo clippy --locked -p rch -p rch-common --all-targets -- -D warnings
+      - name: Retain the exact checked source diff
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-sync-verified"
+          git diff --binary -- rch/src/transfer.rs rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs rch/src/transfer/source_archive/windows_paths.rs > "$RUNNER_TEMP/source-sync-verified/verified.patch"
+          digest=$(sha256sum "$RUNNER_TEMP/source-sync-verified/verified.patch" | cut -d' ' -f1)
+          echo "patch_sha256=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-windows-source-${{ github.sha }}
+          path: ${{ runner.temp }}/source-sync-verified/verified.patch
+          retention-days: 7
+          if-no-files-found: error
+
+  # Validation has read-only permissions and no persisted Git credentials.
+  # This job only applies the exact verified diff, never executes project code.
+  # The no-force push refuses if main advanced; rerun against a new main commit
+  # only after reviewing any parent conflict. There is no automatic rebase.
+  integrate-verified-source:
+    needs: validate
+    if: needs.validate.outputs.needs_integration == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-windows-source-${{ github.sha }}
+          path: ${{ runner.temp }}/source-sync-verified
+      - name: Verify and stage only the checked source files
+        env:
+          PATCH_SHA256: ${{ needs.validate.outputs.patch_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/source-sync-verified/verified.patch"
+          printf '%s  %s\n' "$PATCH_SHA256" "$patch" | sha256sum --check --strict -
+          git apply --check "$patch"
+          git apply --index "$patch"
+          python3 - <<'PY'
+          import subprocess
+          allowed = {
+              b'rch/src/transfer.rs',
+              b'rch/src/transfer/source_archive.rs',
+              b'rch/src/transfer/source_archive/tests.rs',
+              b'rch/src/transfer/source_archive/windows_paths.rs',
+          }
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only', '-z']).split(b'\0')) - {b''}
+          assert b'rch/src/transfer.rs' in paths and paths <= allowed, paths
+          deleted = subprocess.check_output(['git', 'diff', '--cached', '--diff-filter=D', '--name-only'])
+          assert not deleted, deleted
+          PY
+          git diff --cached --check
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix(sync): unify Windows source uploads with rsync selection' -m 'Integrate the reviewed source-selection and bounded tar transport after pinned-toolchain Rust tests, check, Clippy and formatting passed. No worker cleanup. Refs #109.'
+      - name: Publish directly to main without rewriting concurrent work
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MAIN: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$EXPECTED_MAIN"
+          authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$authorization"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $authorization" push origin HEAD:refs/heads/main
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          test "$actual" = "$(git rev-parse HEAD)"
+          printf 'Verified integration commit: `%s`\n' "$actual" >> "$GITHUB_STEP_SUMMARY"

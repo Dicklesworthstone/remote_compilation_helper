@@ -1,0 +1,1971 @@
+#!/usr/bin/env python3
+"""Opt-in Cargo entry point for the existing RABS live dependency lane.
+
+This is a launcher, not a cache or a second build executor. Cargo still plans
+and runs the build; rabs-wrap and rabsd retain all admission, capture, sampling,
+publication and compiler-skip authority. Local setup requires Linux; remote
+dispatch supports Linux/macOS clients. Python 3.9+ is required.
+"""
+
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import selectors
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+
+# Versioned import contract for RCH's worker-local cache adapter. Importing
+# this module never runs Cargo; prepare(env, no_start) only sets up RABS and
+# returns a new environment. Bump this before changing that contract.
+RCH_WORKER_PREPARATION_API = 1
+
+MAX_FRAME = 64 * 1024
+# A full worker pool can exceed 64 KiB after JSON escaping of valid worker IDs.
+# Other setup/configuration messages retain their original smaller bound.
+MAX_STATUS_FRAME = 128 * 1024
+DEFAULT_STARTUP_MS = 5000
+MAX_STARTUP_MS = 30000
+OWNER_RECEIPT = "daemon-owner.json"
+MAX_OWNER_RECEIPT = 2048
+DEPENDENCY_CONTEXT = "dependency-exec-v7"
+DEPENDENCY_WORKER_KEYS = (
+    "RABS_DEPENDENCY_WORKER_LISTEN",
+    "RABS_DEPENDENCY_WORKER_ID",
+    "RABS_DEPENDENCY_WORKER_SPKI_SHA256",
+)
+DEPENDENCY_POOL_KEY = "RABS_DEPENDENCY_WORKERS_JSON"
+DEPENDENCY_WORKER_FIELDS = ("listen", "worker_id", "worker_spki_sha256")
+MAX_DEPENDENCY_WORKERS = 32
+MAX_DEPENDENCY_CONFIG = 128 * 1024
+ROOT_ADMISSION_KEYS = (
+    "CARGO_RABS_ROOT_BUDGET_DIR", "CARGO_RABS_ROOT_CAPACITY", "CARGO_RABS_ROOT_CGROUP",
+)
+HELLO = {
+    "kind": "hello",
+    "transport": {"minimum_compatible": 1, "current": 1},
+    "application": {"minimum_compatible": 1, "current": 1},
+}
+HELP = """Usage: cargo rabs [--rabs-remote | --rabs-no-start] [--rabs-require-daemon] [--] [CARGO ARGS...]
+
+Run Cargo through RABS's evidence-gated live dependency cache. No arguments
+means `build`. Cargo arguments after the first non-launcher option are passed
+unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
+
+  --rabs-no-start        Only use an already-running daemon.
+  --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
+  --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
+  --rabs-canonical FILE  Build, check, lint or test through a canonical worker.
+  --rabs-recover DIR     Recover a retained canonical operation; never execute it again.
+  --help                Show this help without starting a daemon or Cargo.
+
+Canonical mode: cargo rabs --rabs-canonical PROFILE.json -- build --bin NAME
+It runs the existing rabsd source/toolchain preparation and pinned-TLS worker
+build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
+explicit upload boundary, profile and worker connection setup. This Linux-only
+profile uses a captured toolchain, explicit worker environment and new output tree;
+it is not transparent local-path replay, per-action scheduling or cache serving.
+Builds, checks, Clippy and tests accept ordinary workspace/target selection.
+Clippy accepts lint controls after -- and uses the captured cargo-clippy/driver.
+Test filters and arguments after -- are preserved; --no-run remains compilation-only.
+Cargo's artifact reports identify the required real outputs in the captured tree.
+Test execution success requires Cargo's final exit, never build-finished alone.
+Profiles may select an existing vendor tree or an explicit cargo_home_source
+for checksum-verified, locked crates.io dependencies from the offline cache.
+An optional env object supplies literal build-script, env!/option_env! and test
+inputs. Values are strings (including empty strings), not shell expressions or
+names to inherit from the dispatcher. They are retained in the private request
+and sent to the worker; do not use this as a secret-delivery channel. Toolchain,
+Cargo, loader, jobserver and RABS/RCH control variables remain reserved. These
+values do not reconfigure the local preparing driver or its TLS credentials.
+Cargo metadata may run locally; builds never do. No local/RCH fallback or
+automatic execution retry occurs. After complete verified delivery, the native
+driver replays Cargo/test stdout and stderr exactly and sends its result report
+to stderr. Test stdout may include arbitrary harness output after Cargo's JSON.
+Direct mode durably allocates each new worker request ID under the same
+RABS_STATE_DIR; keep that state across builds. spec.json and operation.json
+record allocation intent, not an assigned ID. Its prepared bundle/request.json
+contains the numeric execution identity used unchanged for result recovery.
+An optional daemon_socket in the profile submits captured inputs to an already
+running daemon's durable job queue and waits for verified diagnostics/results.
+The daemon allocates and saves the worker request ID when the queued job starts;
+this mode's bundle/request.json remains an explicit allocation template. The
+retained operation.json records its job ID for status, cancellation and recovery;
+exiting the waiting client does not cancel or retry that job.
+
+Canonical recovery: cargo rabs --rabs-recover /absolute/cargo-OPERATION
+Direct operations select native --resume with the saved worker, pin and
+bundle/request.json, never --prepare-from. A complete delivery is verified/replayed
+offline. An absent delivery may be retrieved from the original pinned worker;
+an incomplete existing delivery is not overwritten. Use --resume-to
+/absolute/NEW-DELIVERY for a fresh receiver, optionally with --prefix-from
+/absolute/PARTIAL-DELIVERY for independently verified prefix reuse. Later use
+--delivery /absolute/RECOVERED-DELIVERY to verify and replay that complete receipt
+without downloading again. These path options are recovery-only, not Cargo
+arguments. --delivery and --resume-to are exclusive.
+Daemon operations instead select native --job-wait for the saved job and socket.
+This waits for or replays its verified completion without submitting another job.
+Use --status alone to inspect that job without waiting for compiler completion,
+or --cancel alone to request cancellation of that same job. Both are daemon-only
+and cannot combine with recovery path options. They preserve native job-control
+status and exit codes, not the compiler's exit code. A cancellation response can
+still report cancelling or uncertain; it does not prove the worker has stopped.
+Inspect the same job again after a lost response; no automatic retry is made.
+For an uncertain daemon job, --resume-to requests native --job-resume, optionally
+with --prefix-from. --delivery requests native --job-recover-local for a complete
+delivery already owned by that job. --acknowledge /absolute/OWNED-DELIVERY requests
+native --job-acknowledge to reconcile lost worker release acknowledgments; it is
+daemon-only. These actions report native job-control status, NOT compiler success
+or replayed diagnostics. Run --rabs-recover on the same operation without options
+afterward to wait for verified completion. Inspect that same job after any lost
+response; the launcher never retries a control request or creates a new job.
+--resume-to, --delivery and --acknowledge are mutually exclusive. Only resume
+accepts --prefix-from. Daemon recovery never selects a direct worker receiver.
+The original profile, checkout and toolchain are not needed. Keep the original
+operation/bundle paths, installed rabsd and matching RABS_STATE_DIR/TLS settings.
+The installed driver, not the saved executable pathname, is invoked exactly once;
+receipt verification and installation remain native. No counter/journal reset,
+local compilation, new request identity, or execution retry is introduced.
+
+Remote mode requires a matching RCH installation and configured POSIX workers.
+It execs `rch exec --source-content-receipt -- cargo ...`, with remote execution
+required and the worker-local cache bridge enabled. RCH owns worker selection,
+toolchain resolution, source/target leases, cancellation, recovery and artifact
+delivery. The launcher starts neither a local build nor a local RABS daemon.
+There is no launcher-side retry or local fallback, including after an uncertain
+remote outcome. RCH's own output contracts and recovery instructions apply.
+This is whole-command remote execution with worker-local dependency reuse, not
+fleet-wide per-action scheduling or a shared cross-worker cache. Cache setup is
+best effort on the worker; a remote build need not produce any cache hits.
+--rabs-remote cannot combine with the two local-daemon options. Linux and macOS
+dispatchers are supported; CARGO_RABS_RCH can select an explicit RCH executable.
+The dispatcher's CARGO executable path is not used as a worker command. Existing
+RUSTUP_TOOLCHAIN, Cargo +toolchain arguments and RCH routing settings are passed
+to RCH without reinterpretation. Custom local Cargo binaries are not transported.
+
+The first invocation can start one shared rabsd with RABS_LIVE_DEPENDENCY=1.
+New daemons also default RABS_REUSE_CARGO_LAYOUT=1 so separate Cargo target/build
+directories can reuse eligible dependency results. An explicit value is kept;
+set RABS_REUSE_CARGO_LAYOUT=0 to retain exact layout keying. The default is set
+only for daemon startup, never added to Cargo's or rustc's environment. Tracked
+reads of projected layout variables still veto cache publication.
+Later invocations reuse the daemon. An existing daemon is never stopped, replaced,
+or reconfigured: its serving and layout policies remain its own. A connected daemon is
+accepted only when it reports the live dependency lane; a shadow or older
+daemon gives a setup error with the ordinary stock-Cargo fallback. Readiness
+is not a promise of a cache hit. Unsupported units, warming facts and required
+verification runs still compile normally.
+
+Set all of RABS_DEPENDENCY_WORKER_LISTEN, RABS_DEPENDENCY_WORKER_ID and
+RABS_DEPENDENCY_WORKER_SPKI_SHA256 to select the authenticated per-dependency
+worker lane, or set RABS_DEPENDENCY_WORKERS_JSON to a JSON array of 1..32 workers
+with exactly listen, worker_id and worker_spki_sha256 fields. Pool listeners,
+IDs and pins must each be unique; pool and singleton settings cannot be mixed.
+New daemons also require the existing RABS_COORD_TLS_* credentials. The connected
+daemon must advertise the exact normalized worker configuration, including pool
+order, and dependency-exec-v7 capability. A different, local-only or older daemon
+produces a setup error and an explicit stock-Cargo fallback; use
+--rabs-require-daemon to refuse setup instead. Settings never reconfigure an
+attached daemon. A matching configuration does not promise a connected worker
+or a cache hit; eligible requests retain the worker's execution checks. The
+pool admits independent metadata and pure Rust archive dependency compilations
+on separate workers. Archive compilation requires its closed codegen view and
+exact original paths; native linking, proc macros and build-script execution
+retain the local path.
+See docs/rabs-worker-delivery.md for worker connection and pool setup.
+
+RABS_CONFIG, RABS_SOCKET_PATH and RABS_STATE_DIR retain rabsd's meanings.
+CARGO_RABS_DAEMON and CARGO_RABS_WRAP select executable paths explicitly;
+otherwise installed siblings, PATH, then this checkout's target/release are
+searched. CARGO_RABS_STARTUP_MS bounds setup (default 5000, maximum 30000).
+
+An existing RUSTC_WRAPPER or CARGO_BUILD_RUSTC_WRAPPER environment override is
+preserved unless it already names this rabs-wrap. RUSTC_WORKSPACE_WRAPPER,
+jobserver descriptors, stdin, stdout, stderr and the toolchain environment are
+not rewritten. On successful setup this invocation explicitly selects
+rabs-wrap via RUSTC_WRAPPER, overriding Cargo's build.rustc-wrapper config.
+No project or global Cargo config is edited.
+
+Explicit Linux local-root admission: set CARGO_RABS_ROOT_BUDGET_DIR,
+CARGO_RABS_ROOT_CAPACITY and CARGO_RABS_ROOT_CGROUP together. The native
+rabs-cargo-root helper then holds one durable host-local root credit through
+Cargo and descendant cleanup in an explicitly delegated cgroup-v2 subtree.
+This limits simultaneous Cargo trees; it does not replace Cargo's jobserver
+or impose a CPU limit. Unavailable delegation refuses before Cargo starts,
+including when daemon setup falls back to stock Cargo. These settings cannot
+combine with remote/canonical mode. CARGO_RABS_ROOT_HELPER selects an explicit
+helper executable. See docs/rabs-cargo-root.md for setup and crash quarantine.
+
+New daemon logs: <RABS_STATE_DIR>/cargo-launcher/daemon-<pid>-<time>.log.
+Daemon startup holds both state-directory and socket-endpoint lifetime locks.
+The endpoint lock is .rabs-<socket-name>.startup.lock beside the socket, so
+different state directories cannot start competing daemons for one endpoint.
+Starting a daemon requires a same-user socket parent without group/world write
+permission; attaching to an already-running daemon does not create any locks.
+After a confirmed launcher-owned daemon crashes, a later invocation can restart
+it against the same state store. Recovery requires its private ownership receipt,
+the unchanged socket generation, both lifetime locks, and proof that the recorded
+process exited. rabsd performs its own stale-socket takeover; the launcher never
+unlinks an endpoint or kills a daemon. Unmanaged/legacy stale sockets, unknown
+ownership, live but unresponsive peers, and --rabs-no-start never trigger recovery.
+New owner receipts also bind the Linux boot, PID namespace and process start
+ticks. A reused PID is not the old daemon; an unknown/foreign namespace is not
+proof of exit. Older PID-only receipts retain conservative absence-only recovery.
+"""
+
+
+class SetupError(Exception):
+    """Acceleration could not be set up; no compiler or output writer started."""
+
+
+class RemoteConfigurationMismatch(SetupError):
+    """A connected daemon cannot honor the requested dependency worker."""
+
+
+class StaleEndpoint(SetupError):
+    """A connect was refused by one unchanged private socket, not a read timeout."""
+
+    def __init__(self, identity):
+        super().__init__("RABS endpoint refused connection; recovery requires recorded ownership")
+        self.identity = identity
+
+
+def valid_boot_id(value):
+    return (type(value) is str and len(value) == 36
+            and all(char == "-" if index in (8, 13, 18, 23)
+                    else char in "0123456789abcdef" for index, char in enumerate(value)))
+
+
+def valid_process_identity(value):
+    """Strict bounded receipt schema; bool is not an inode or a start tick."""
+    if type(value) is not dict or value.keys() != {"boot", "pid_namespace", "start_ticks"}:
+        return False
+    namespace = value.get("pid_namespace")
+    ticks = value.get("start_ticks")
+    return (valid_boot_id(value.get("boot"))
+            and type(namespace) is list and len(namespace) == 2
+            and all(type(number) is int and 0 <= number <= 0xffffffffffffffff
+                    for number in namespace) and namespace[1] != 0
+            and type(ticks) is int and 0 < ticks <= 0xffffffffffffffff)
+
+
+def read_proc_bytes(path, maximum):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SetupError("RABS process identity is not a regular procfs record")
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(descriptor, maximum + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+    finally:
+        os.close(descriptor)
+    if not data or len(data) > maximum:
+        raise SetupError("RABS process identity exceeds its procfs bound")
+    return bytes(data)
+
+
+def process_scope():
+    """Use the kernel view of this PID namespace, not a guessed /proc mount.
+
+    This is host-local recovery evidence, never authority to signal a PID.
+    As with the private socket/locks, a trusted native filesystem is required.
+    """
+    if sys.platform != "linux" or os.readlink("/proc/self") != str(os.getpid()):
+        raise SetupError("RABS process identity requires matching native procfs")
+    boot = read_proc_bytes("/proc/sys/kernel/random/boot_id", 37)
+    if boot.endswith(b"\n"):
+        boot = boot[:-1]
+    try:
+        boot = boot.decode("ascii")
+    except UnicodeError as error:
+        raise SetupError("RABS kernel boot identity is malformed") from error
+    if not valid_boot_id(boot):
+        raise SetupError("RABS kernel boot identity is malformed")
+    namespace = os.stat("/proc/self/ns/pid")
+    return {"boot": boot, "pid_namespace": [namespace.st_dev, namespace.st_ino]}
+
+
+def process_start_ticks(data, pid):
+    # /proc/PID/stat's comm is parenthesized and may itself contain spaces,
+    # closing parentheses, newlines and non-UTF-8. Field 22 follows the LAST
+    # ') ', not the first whitespace token. Keep kernel ticks, never seconds.
+    prefix, separator, tail = data.rpartition(b") ")
+    fields = tail.split()
+    if (not separator or not prefix.startswith(str(pid).encode("ascii") + b" (")
+            or len(fields) < 20 or len(fields[0]) != 1
+            or fields[0] not in (b"R", b"S", b"D", b"Z", b"T", b"t", b"X", b"x", b"K", b"W", b"P", b"I")
+            or not fields[19].isdigit() or len(fields[19]) > 20):
+        raise SetupError("RABS process stat identity is malformed")
+    ticks = int(fields[19])
+    if not 0 < ticks <= 0xffffffffffffffff or str(ticks).encode("ascii") != fields[19]:
+        raise SetupError("RABS process start ticks are malformed")
+    return ticks
+
+
+def process_identity(pid):
+    if type(pid) is not int or not 1 < pid <= 0x7fffffff:
+        raise SetupError("RABS process identity requires a valid PID")
+    scope = process_scope()
+    namespace = os.stat("/proc/{}/ns/pid".format(pid))
+    data = read_proc_bytes("/proc/{}/stat".format(pid), 4096)
+    if ([namespace.st_dev, namespace.st_ino] != scope["pid_namespace"]
+            or process_scope() != scope):
+        raise SetupError("RABS process identity namespace changed or is foreign")
+    identity = dict(scope, start_ticks=process_start_ticks(data, pid))
+    if not valid_process_identity(identity):
+        raise SetupError("RABS process identity is unrepresentable")
+    return identity
+
+
+def process_exited(pid, recorded=None):
+    """Affirmative owner absence, never an unfenced signal to a stored PID.
+
+    New receipts can recognize reboot/PID reuse. Unknown scope or observation
+    refuses; a different PID namespace cannot prove this recorded owner gone.
+    Legacy receipts keep the old, stricter PID-absence-only interpretation.
+    """
+    if type(pid) is not int or not 1 < pid <= 0x7fffffff:
+        return False
+    if recorded is not None:
+        if not valid_process_identity(recorded):
+            return False
+        try:
+            scope = process_scope()
+            if scope["boot"] != recorded["boot"]:
+                return True
+            if scope["pid_namespace"] != recorded["pid_namespace"]:
+                return False
+            try:
+                current = process_identity(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                current = None
+            if process_scope() != scope:
+                return False
+            if current is not None:
+                if (current["boot"] != scope["boot"]
+                        or current["pid_namespace"] != scope["pid_namespace"]):
+                    return False
+                if current["start_ticks"] != recorded["start_ticks"]:
+                    return True
+            # A matching process may be an unreaped zombie. An absent procfs
+            # entry alone is not enough: retain the existing kernel exit probe.
+        except (SetupError, OSError):
+            return False
+    return pid_exited(pid)
+
+
+def pid_exited(pid):
+    """PID-only exit observation for a matching scope or a legacy receipt.
+
+    A reused live PID conservatively prevents recovery. pidfds also recognize
+    an exited child awaiting reaping; a kill(0) fallback alone cannot do that.
+    Unsupported/denied pidfds fall back to the stricter absence-only test.
+    """
+    try:
+        descriptor = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (AttributeError, OSError):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            return bool(selector.select(0))
+    finally:
+        os.close(descriptor)
+
+
+def remaining(deadline):
+    duration = deadline - time.monotonic()
+    if duration <= 0:
+        raise SetupError("RABS setup deadline expired")
+    return duration
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def decode_object(data):
+    try:
+        result = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise SetupError("RABS returned malformed JSON") from error
+    if not isinstance(result, dict):
+        raise SetupError("RABS returned a non-object reply")
+    return result
+
+
+def executable(name, override, env):
+    explicit = env.get(override)
+    if explicit is not None:
+        candidates = [explicit]
+    else:
+        here = Path(__file__).resolve().parent
+        candidates = [str(here / name), shutil.which(name, path=env.get("PATH"))]
+        if here.name == "scripts":
+            candidates.append(str(here.parent / "target" / "release" / name))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            # Do not resolve the executable's final symlink: rustup and other
+            # multi-call programs can depend on the invoked basename.
+            return os.path.abspath(candidate)
+    raise SetupError("{} is not installed (or {} is not executable)".format(name, override))
+
+
+def root_admission_helper(env):
+    """Resolve an explicit native owner; Python never supervises the build."""
+    if not any(key in env for key in ROOT_ADMISSION_KEYS):
+        return None
+    if not all(key in env for key in ROOT_ADMISSION_KEYS):
+        raise SetupError("local root admission requires all of " + ", ".join(ROOT_ADMISSION_KEYS))
+    if "CARGO_RABS_ROOT_ACTIVE" in env:
+        raise SetupError("nested cargo-rabs root admission is unsupported; use ordinary Cargo in the admitted tree")
+    capacity = env["CARGO_RABS_ROOT_CAPACITY"]
+    if not 1 <= len(capacity) <= 4 or not capacity.isascii() or not capacity.isdecimal() or not 1 <= int(capacity) <= 4096 or str(int(capacity)) != capacity:
+        raise SetupError("CARGO_RABS_ROOT_CAPACITY must be canonical decimal from 1 to 4096")
+    for key in ("CARGO_RABS_ROOT_BUDGET_DIR", "CARGO_RABS_ROOT_CGROUP"):
+        path = Path(env[key])
+        if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+            raise SetupError(key + " must be an ordinary absolute path")
+    if sys.platform != "linux":
+        raise SetupError("managed local Cargo roots require Linux cgroup v2")
+    return executable("rabs-cargo-root", "CARGO_RABS_ROOT_HELPER", env)
+
+
+def same_executable(value, expected, env):
+    if not value:
+        return False
+    candidate = shutil.which(value, path=env.get("PATH"))
+    try:
+        return candidate is not None and os.path.samefile(candidate, expected)
+    except OSError:
+        return False
+
+
+def check_wrapper_environment(env, wrapper):
+    for name in ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"):
+        if name in env and not same_executable(env[name], wrapper, env):
+            raise SetupError("{} already selects another wrapper or disables wrapping".format(name))
+
+
+def checked_config(daemon, env, deadline):
+    """Ask the real daemon to resolve its config; do not maintain a second parser.
+
+    Drain bounded stdout under one deadline. No inherited terminal input and
+    no unbounded communicate()/readline() allocation on the setup path.
+    """
+    process = subprocess.Popen(
+        [daemon, "--check-config"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    data = bytearray()
+    probe_deadline = min(deadline, time.monotonic() + 2.0)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                if not selector.select(remaining(probe_deadline)):
+                    raise SetupError("rabsd --check-config timed out")
+                chunk = os.read(process.stdout.fileno(), min(4096, MAX_FRAME + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > MAX_FRAME:
+                    raise SetupError("rabsd --check-config exceeded its output bound")
+        try:
+            status = process.wait(timeout=remaining(probe_deadline))
+        except subprocess.TimeoutExpired as error:
+            raise SetupError("rabsd --check-config did not exit") from error
+        if status != 0:
+            raise SetupError("rabsd refused its configuration (run rabsd --check-config)")
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            # This is our short-lived config child, never a shared daemon.
+            process.kill()
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+    config = decode_object(bytes(data))
+    if config.get("kind") != "rabsd-config" or config.get("live_dependency") is not True:
+        raise SetupError("installed rabsd does not acknowledge the opt-in live dependency lane")
+    path = config.get("socket_path")
+    if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
+        raise SetupError("rabsd configured an invalid absolute socket path")
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeError as error:
+        raise SetupError("rabsd socket path is not UTF-8") from error
+    if len(encoded) > 107:
+        raise SetupError("rabsd socket path exceeds Linux sun_path")
+    return path
+
+
+def socket_identity(path):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise SetupError("RABS endpoint exists but is not a socket; leaving it untouched")
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise SetupError("RABS socket is not private to this user; leaving it untouched")
+    # A newly bound socket may reuse an old inode; bind/chmod changes ctime.
+    return metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns
+
+
+class Frames:
+    def __init__(self, stream, deadline):
+        self.stream = stream
+        self.deadline = deadline
+        self.buffer = bytearray()
+
+    def send(self, value):
+        self.stream.settimeout(remaining(self.deadline))
+        self.stream.sendall(json.dumps(value, separators=(",", ":")).encode("utf-8") + b"\n")
+
+    def receive(self, maximum=MAX_FRAME):
+        while True:
+            remaining(self.deadline)
+            end = self.buffer.find(b"\n")
+            if end >= 0:
+                if end + 1 > maximum:
+                    raise SetupError("RABS reply exceeded its frame bound")
+                data = bytes(self.buffer[:end])
+                del self.buffer[:end + 1]
+                return decode_object(data)
+            if len(self.buffer) >= maximum:
+                raise SetupError("RABS reply exceeded its frame bound")
+            self.stream.settimeout(remaining(self.deadline))
+            chunk = self.stream.recv(min(4096, maximum - len(self.buffer)))
+            if not chunk:
+                raise SetupError("RABS closed before a complete reply")
+            self.buffer.extend(chunk)
+
+
+def dependency_worker_endpoint(values, labels):
+    """Normalize the same literal address and pinned identity as rabsd."""
+    for name, value in zip(labels, values):
+        if not isinstance(value, str) or not value:
+            raise SetupError("all dependency worker settings are required; missing " + name)
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError as error:
+            raise SetupError(name + " must be UTF-8") from error
+        if len(encoded) > 1024 or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise SetupError(name + " must be a bounded string without controls")
+    listen, worker, pin = values
+    host, separator, port = listen.rpartition(":")
+    if not separator or not port or any(char not in "0123456789" for char in port):
+        raise SetupError(labels[0] + " must be a literal IP and nonzero port")
+    bracketed = host.startswith("[") and host.endswith("]")
+    address_text = host[1:-1] if bracketed else host
+    try:
+        address = ipaddress.ip_address(address_text)
+    except ValueError as error:
+        raise SetupError(labels[0] + " must use a literal IP address") from error
+    if (bracketed != (address.version == 6) or "%" in address_text
+            or not 0 < int(port) <= 65535):
+        raise SetupError(labels[0] + " must use IPv4:port or [IPv6]:port")
+    # Match Rust SocketAddr display, including its dotted IPv4-mapped suffix.
+    display = ("::ffff:" + str(address.ipv4_mapped)
+               if address.version == 6 and address.ipv4_mapped is not None else str(address))
+    listen = ("[{}]:{}" if address.version == 6 else "{}:{}").format(display, int(port))
+    if len(pin) != 64 or any(char not in "0123456789abcdef" for char in pin) or pin == "0" * 64:
+        raise SetupError(labels[2] + " must be a nonzero value of 64 lowercase hex digits")
+    return {
+        "listen": listen,
+        "worker_id": worker,
+        "worker_spki_sha256": pin,
+    }
+
+
+def requested_dependency_worker(env):
+    """Explicit deployment expectations, checked against the connected daemon.
+
+    No DNS lookup or worker connection happens here. The native daemon still
+    validates its own configuration and owns the selected worker transport.
+    """
+    singleton = any(name in env for name in DEPENDENCY_WORKER_KEYS)
+    if DEPENDENCY_POOL_KEY in env:
+        if singleton:
+            raise SetupError("dependency worker pool cannot be mixed with singleton settings")
+        value = env[DEPENDENCY_POOL_KEY]
+        if not isinstance(value, str):
+            raise SetupError(DEPENDENCY_POOL_KEY + " must be a UTF-8 JSON array")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError as error:
+            raise SetupError(DEPENDENCY_POOL_KEY + " must be UTF-8") from error
+        if len(encoded) > MAX_DEPENDENCY_CONFIG:
+            raise SetupError("dependency worker pool exceeds the configuration byte limit")
+        try:
+            workers = json.loads(value, object_pairs_hook=unique_object)
+        except (ValueError, RecursionError) as error:
+            raise SetupError("invalid dependency worker pool JSON: " + str(error)) from error
+        if (not isinstance(workers, list)
+                or not 1 <= len(workers) <= MAX_DEPENDENCY_WORKERS):
+            raise SetupError("dependency worker pool requires 1..={} workers".format(MAX_DEPENDENCY_WORKERS))
+        endpoints = []
+        seen = {name: set() for name in DEPENDENCY_WORKER_FIELDS}
+        for index, worker in enumerate(workers):
+            label = "{}[{}]".format(DEPENDENCY_POOL_KEY, index)
+            if not isinstance(worker, dict) or worker.keys() != set(DEPENDENCY_WORKER_FIELDS):
+                raise SetupError(label + " requires exactly listen, worker_id and worker_spki_sha256")
+            endpoint = dependency_worker_endpoint(
+                [worker[name] for name in DEPENDENCY_WORKER_FIELDS],
+                [label + "." + name for name in DEPENDENCY_WORKER_FIELDS],
+            )
+            for name in DEPENDENCY_WORKER_FIELDS:
+                if endpoint[name] in seen[name]:
+                    raise SetupError("duplicate dependency worker " + name)
+                seen[name].add(endpoint[name])
+            endpoints.append(endpoint)
+        configuration = {"workers": endpoints}
+    elif singleton:
+        configuration = dependency_worker_endpoint(
+            [env.get(name) for name in DEPENDENCY_WORKER_KEYS], DEPENDENCY_WORKER_KEYS)
+    else:
+        return None
+    configuration.update(remote_protocol=1, dependency_context=DEPENDENCY_CONTEXT)
+    return configuration
+
+
+def require_dependency_worker(status, expected):
+    if expected is None:
+        return
+    actual = status.get("remote_dependency")
+    if not isinstance(actual, dict):
+        mismatch = "remote capability is not advertised"
+    else:
+        fields = [name for name, value in expected.items()
+                  if type(actual.get(name)) is not type(value) or actual.get(name) != value]
+        if not fields:
+            return
+        mismatch = ", ".join(fields)
+    raise RemoteConfigurationMismatch(
+        "the connected RABS daemon does not match the requested dependency worker "
+        "configuration ({}); use a separate RABS_STATE_DIR and RABS_SOCKET_PATH "
+        "with a daemon configured for these dependency worker settings".format(mismatch))
+
+
+def probe(path, deadline, expected_pid=None, expected_remote=None):
+    """Readiness only, never evidence of a hit or authorization to skip rustc."""
+    identity = socket_identity(path)
+    if identity is None:
+        return False
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(remaining(deadline))
+        try:
+            stream.connect(path)
+        except ConnectionRefusedError as error:
+            if socket_identity(path) != identity:
+                raise SetupError("RABS endpoint changed during connection") from error
+            raise StaleEndpoint(identity) from error
+        credentials = stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, _ = struct.unpack("3i", credentials)
+        if uid != os.geteuid() or socket_identity(path) != identity:
+            raise SetupError("RABS endpoint ownership changed during connection")
+        if expected_pid is not None and pid != expected_pid:
+            raise SetupError("RABS readiness peer is not the daemon this launcher started")
+        frames = Frames(stream, deadline)
+        frames.send(HELLO)
+        hello = frames.receive()
+        if (hello.get("kind") != "hello-ok"
+                or type(hello.get("transport")) is not int or hello["transport"] != 1
+                or type(hello.get("application")) is not int or hello["application"] != 1):
+            raise SetupError("RABS refused protocol version 1")
+        frames.send({"kind": "status"})
+        status = frames.receive(MAX_STATUS_FRAME)
+        if status.get("kind") != "coord-status":
+            raise SetupError("RABS did not return coordinator status")
+        if status.get("live_dependency") is not True:
+            raise SetupError(
+                "the connected RABS daemon does not enable live dependency serving; "
+                "use a separate RABS_STATE_DIR and RABS_SOCKET_PATH for cargo rabs, "
+                "or start that daemon with RABS_LIVE_DEPENDENCY=1")
+        require_dependency_worker(status, expected_remote)
+        if socket_identity(path) != identity:
+            raise SetupError("RABS endpoint changed during the readiness exchange")
+    return True
+
+
+def private_directory(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    metadata = os.fstat(descriptor)
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+        os.close(descriptor)
+        raise SetupError("RABS startup directory has unsafe ownership or permissions")
+    return descriptor
+
+
+def private_lock(directory, name):
+    descriptor = os.open(
+        name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        0o600, dir_fd=directory,
+    )
+    try:
+        check_lock_metadata(os.fstat(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def check_lock_metadata(metadata):
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_nlink != 1):
+        raise SetupError("RABS startup lock has unsafe identity or permissions")
+
+
+class StartupLock:
+    """Two stable flock inodes, inherited only by a newly admitted daemon.
+
+    The state lock prevents two endpoints from opening one state store. The
+    endpoint lock prevents two state stores from racing to bind one socket.
+    Keep the original state lock path: an older launcher-owned daemon still
+    holds it. Always acquire state then endpoint, with the same deadline.
+
+    Both locks survive launcher exit/timeout in the daemon. Parent-directory
+    aliases converge on the endpoint lock's actual inode, not a path hash.
+    Ready-daemon callers bypass locks entirely. Close, never explicitly unlock,
+    the parent's descriptors: unlocking would release the child's locks too.
+    """
+    def __init__(self, state, socket_path, deadline):
+        self.directory = None
+        self.lock = None
+        self.socket_directory = None
+        self.endpoint_lock = None
+        self.acquired = False
+        self.deadline = deadline
+        self.path = os.path.join(state, "cargo-launcher")
+        self.socket_parent, socket_name = os.path.split(socket_path)
+        if not socket_name or socket_name in (".", ".."):
+            raise SetupError("RABS socket must name a directory entry")
+        self.endpoint_name = ".rabs-{}.startup.lock".format(socket_name)
+        parent = private_directory(state)
+        try:
+            try:
+                os.mkdir("cargo-launcher", mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            self.directory = os.open(
+                "cargo-launcher", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+            metadata = os.fstat(self.directory)
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("RABS startup directory is not private to this user")
+            self.lock = private_lock(self.directory, "startup.lock")
+            # Resolve transport-parent aliases only, not a final socket entry.
+            # Verification below requires the original spelling to keep naming
+            # this directory. No socket or existing lock is repaired/unlinked.
+            self.socket_directory = private_directory(os.path.realpath(self.socket_parent))
+            self.endpoint_lock = private_lock(self.socket_directory, self.endpoint_name)
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            os.close(parent)
+
+    def __enter__(self):
+        return self
+
+    def verify(self):
+        # flock protects an inode, not a pathname. Never spawn with a lock
+        # whose entry or containing directory was replaced after we opened it.
+        for path, descriptor, follow, mask in [
+            (self.path, self.directory, False, 0o077),
+            (self.socket_parent, self.socket_directory, True, 0o022),
+        ]:
+            held = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=follow)
+            if (not stat.S_ISDIR(named.st_mode) or named.st_uid != os.geteuid()
+                    or stat.S_IMODE(named.st_mode) & mask
+                    or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)):
+                raise SetupError("RABS startup directory identity changed")
+        for directory, name, descriptor in [
+            (self.directory, "startup.lock", self.lock),
+            (self.socket_directory, self.endpoint_name, self.endpoint_lock),
+        ]:
+            held = os.fstat(descriptor)
+            named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            check_lock_metadata(held)
+            check_lock_metadata(named)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                raise SetupError("RABS startup lock identity changed")
+
+    def inherited_fds(self):
+        self.verify()
+        return self.lock, self.endpoint_lock
+
+    def acquire(self, socket_path):
+        """True: may start; False: the lock holder became a ready daemon."""
+        for descriptor in (self.lock, self.endpoint_lock):
+            if not self.acquire_one(descriptor, socket_path):
+                return False
+        self.acquired = True
+        return True
+
+    def owner_binding(self, pid, identity, process=None):
+        self.verify()
+        if not self.acquired:
+            raise SetupError("RABS recovery requires both held startup locks")
+        state = os.fstat(self.directory)
+        endpoint = os.fstat(self.endpoint_lock)
+        value = {"v": 1, "pid": pid, "socket": list(identity),
+                 "state": [state.st_dev, state.st_ino],
+                 "endpoint_lock": [endpoint.st_dev, endpoint.st_ino]}
+        if process is not None:
+            if not valid_process_identity(process):
+                raise SetupError("RABS owner receipt has invalid process evidence")
+            value.update(v=2, process=process)
+        return value
+
+    def record_owner(self, pid, identity):
+        """Persist only a socket whose SO_PEERCRED matched our own ready child.
+
+        One atomic replacement under both locks; no existing receipt is exposed
+        truncated. Missing/failed persistence disables later recovery, not builds.
+        """
+        # The readiness peer was our unreaped Popen child: its PID cannot be
+        # recycled between that exchange and this observation. Unavailable
+        # native identity disables recording, not the already healthy daemon.
+        value = self.owner_binding(pid, identity, process_identity(pid))
+        try:
+            existing = os.stat(OWNER_RECEIPT, dir_fd=self.directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            check_lock_metadata(existing)
+        name = "daemon-owner-{}-{}.tmp".format(os.getpid(), time.time_ns())
+        descriptor = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=self.directory,
+        )
+        with os.fdopen(descriptor, "wb") as receipt:
+            receipt.write(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+            receipt.flush()
+            os.fsync(receipt.fileno())
+        self.verify()
+        os.replace(name, OWNER_RECEIPT, src_dir_fd=self.directory, dst_dir_fd=self.directory)
+        os.fsync(self.directory)
+
+    def authorize_recovery(self, identity):
+        """Uncertainty retains the endpoint; nothing in this method mutates it."""
+        self.verify()
+        descriptor = os.open(
+            OWNER_RECEIPT, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=self.directory,
+        )
+        with os.fdopen(descriptor, "rb") as receipt:
+            before = os.fstat(receipt.fileno())
+            check_lock_metadata(before)
+            if before.st_size > MAX_OWNER_RECEIPT:
+                raise SetupError("RABS owner receipt exceeds its bound")
+            data = receipt.read(MAX_OWNER_RECEIPT + 1)
+            after = os.fstat(receipt.fileno())
+            named = os.stat(OWNER_RECEIPT, dir_fd=self.directory, follow_symlinks=False)
+        signature = lambda metadata: (metadata.st_dev, metadata.st_ino, metadata.st_size,
+                                      metadata.st_ctime_ns, metadata.st_mtime_ns)
+        if (len(data) != before.st_size or signature(before) != signature(after)
+                or signature(before) != signature(named)):
+            raise SetupError("RABS owner receipt changed while reading")
+        check_lock_metadata(named)
+        value = decode_object(data)
+        pid = value.get("pid")
+        if type(pid) is not int or not 1 < pid <= 0x7fffffff:
+            raise SetupError("RABS owner receipt has no valid process identity")
+        version = value.get("v")
+        if type(version) is not int or version not in (1, 2):
+            raise SetupError("RABS owner receipt has an unsupported identity version")
+        process = None
+        if version == 2:
+            process = value.get("process")
+            if not valid_process_identity(process):
+                raise SetupError("RABS owner receipt has invalid process evidence")
+        expected = self.owner_binding(pid, identity, process)
+        # Validate shallow, typed fields without recursively comparing or
+        # re-encoding an untrusted JSON subtree. bool is not a device/inode/PID.
+        matches = (value.keys() == expected.keys() and type(value.get("v")) is int
+                   and value["v"] == expected["v"])
+        for field in ("socket", "state", "endpoint_lock"):
+            observed = value.get(field)
+            matches = matches and (type(observed) is list and len(observed) == len(expected[field])
+                                   and all(type(number) is int for number in observed)
+                                   and observed == expected[field])
+        if not matches:
+            raise SetupError("RABS stale endpoint does not match this launcher's ownership receipt")
+        if not process_exited(pid, process):
+            raise SetupError("RABS recorded daemon has not exited; leaving its endpoint untouched")
+        self.verify()
+
+    def acquire_one(self, descriptor, socket_path):
+        while True:
+            remaining(self.deadline)
+            self.verify()
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.verify()
+                return True
+            except BlockingIOError:
+                # The service deliberately owns this lock for its lifetime.
+                # Callers that arrived before bind must switch to the ready
+                # service instead of waiting for that healthy service to die.
+                try:
+                    if probe(socket_path, min(self.deadline, time.monotonic() + 0.25)):
+                        return False
+                except (SetupError, OSError):
+                    pass
+                time.sleep(min(0.025, remaining(self.deadline)))
+
+    def new_log(self):
+        self.verify()
+        name = "daemon-{}-{}.log".format(os.getpid(), time.time_ns())
+        descriptor = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=self.directory,
+        )
+        return descriptor, os.path.join(self.path, name)
+
+    def close(self):
+        self.acquired = False
+        for name in ("endpoint_lock", "socket_directory", "lock", "directory"):
+            descriptor = getattr(self, name)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, name, None)
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
+    expected_remote = requested_dependency_worker(env)
+    stale = None
+    if socket_identity(socket_path) is not None:
+        try:
+            if not probe(socket_path, min(deadline, time.monotonic() + 1.0),
+                         expected_remote=expected_remote):
+                raise SetupError("RABS endpoint disappeared during readiness checking")
+            return
+        except StaleEndpoint as error:
+            stale = error.identity
+        # A connected peer's timeout, malformed reply or protocol refusal is
+        # never proof of death. Only connect-time ECONNREFUSED reaches recovery.
+    if no_start:
+        raise SetupError("no RABS daemon is listening and --rabs-no-start was requested")
+    with StartupLock(state, socket_path, deadline) as lock:
+        if not lock.acquire(socket_path):
+            # The lifetime-lock handoff proves ordinary readiness only. Its
+            # newly connected daemon must satisfy this caller's selected worker.
+            if not probe(socket_path, min(deadline, time.monotonic() + 1.0),
+                         expected_remote=expected_remote):
+                raise SetupError("RABS endpoint disappeared after startup handoff")
+            return
+        if socket_identity(socket_path) is not None:
+            try:
+                if not probe(socket_path, min(deadline, time.monotonic() + 1.0),
+                             expected_remote=expected_remote):
+                    raise SetupError("RABS endpoint disappeared during readiness checking")
+                return
+            except StaleEndpoint as error:
+                if stale != error.identity:
+                    raise SetupError("RABS stale endpoint changed before recovery") from error
+                lock.authorize_recovery(stale)
+        remaining(deadline)
+        descriptor, log = lock.new_log()
+        try:
+            if stale is not None and socket_identity(socket_path) != stale:
+                raise SetupError("RABS endpoint changed before daemon restart")
+            child = subprocess.Popen(
+                [daemon], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=descriptor, close_fds=True, start_new_session=True,
+                pass_fds=lock.inherited_fds(),
+            )
+        finally:
+            os.close(descriptor)
+        while True:
+            status = child.poll()
+            if status is not None:
+                raise SetupError("rabsd exited during startup; see {}".format(log))
+            try:
+                identity = socket_identity(socket_path)
+                if probe(socket_path, min(deadline, time.monotonic() + 0.25),
+                         child.pid, expected_remote):
+                    if socket_identity(socket_path) != identity:
+                        raise SetupError("RABS endpoint changed before recording its owner")
+                    try:
+                        lock.record_owner(child.pid, identity)
+                    except (SetupError, OSError) as error:
+                        print("cargo-rabs: daemon ready, but crash recovery ownership was not "
+                              "recorded: {}".format(error), file=sys.stderr)
+                    return
+            except RemoteConfigurationMismatch:
+                # An authenticated status mismatch cannot improve by waiting.
+                # Preserve the shared daemon, but surface the selected-worker error.
+                raise
+            except (SetupError, OSError):
+                # Only this newly-started daemon gets a readiness grace period.
+                # Its process and socket are never killed/unlinked on timeout;
+                # another Cargo caller may already be using the shared service.
+                pass
+            try:
+                time.sleep(min(0.025, remaining(deadline)))
+            except SetupError as error:
+                raise SetupError("rabsd startup was not confirmed; see {}".format(log)) from error
+
+
+def prepare(env, no_start):
+    if sys.platform != "linux":
+        raise SetupError("the live dependency launcher currently requires Linux")
+    try:
+        milliseconds = int(env.get("CARGO_RABS_STARTUP_MS", str(DEFAULT_STARTUP_MS)))
+    except ValueError as error:
+        raise SetupError("CARGO_RABS_STARTUP_MS must be an integer") from error
+    if not 0 <= milliseconds <= MAX_STARTUP_MS:
+        raise SetupError("CARGO_RABS_STARTUP_MS must be between 0 and 30000")
+    deadline = time.monotonic() + milliseconds / 1000
+    wrapper = executable("rabs-wrap", "CARGO_RABS_WRAP", env)
+    check_wrapper_environment(env, wrapper)
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    daemon_env = dict(env)
+    daemon_env["RABS_LIVE_DEPENDENCY"] = "1"
+    # The launcher explicitly opts this build into dependency reuse. Match the
+    # worker-cache profile so independent target/build layouts can share eligible
+    # results. Keep an operator's value (including 0 or empty) and do not inject
+    # this default into Cargo/build scripts, whose environment remains exact.
+    # ensure_daemon never reconfigures an already-running shared daemon.
+    daemon_env.setdefault("RABS_REUSE_CARGO_LAYOUT", "1")
+    socket_path = checked_config(daemon, daemon_env, deadline)
+    home = env.get("HOME")
+    state = env.get("RABS_STATE_DIR")
+    if state is None:
+        if not home or not os.path.isabs(home):
+            raise SetupError("an absolute HOME or RABS_STATE_DIR is required")
+        state = os.path.join(home, ".cache", "rch", "rabs-state")
+    if not state or not os.path.isabs(state):
+        raise SetupError("RABS_STATE_DIR must be an absolute directory")
+    daemon_env["RABS_SOCKET_PATH"] = socket_path
+    daemon_env["RABS_STATE_DIR"] = state
+    ensure_daemon(daemon, socket_path, state, daemon_env, deadline, no_start)
+    cargo_env = dict(env)
+    cargo_env["RUSTC_WRAPPER"] = wrapper
+    cargo_env["RABS_SOCKET_PATH"] = socket_path
+    return cargo_env
+
+
+def arguments(argv):
+    args = list(argv)
+    if args and args[0] == "rabs":
+        args.pop(0)  # Cargo's external-subcommand invocation contract.
+    no_start = False
+    required = False
+    remote = False
+    while args:
+        if args[0] == "--":
+            args.pop(0)
+            break
+        if args[0] == "--help":
+            return None, False, False, False
+        if args[0] == "--rabs-no-start":
+            no_start = True
+        elif args[0] == "--rabs-require-daemon":
+            required = True
+        elif args[0] == "--rabs-remote":
+            remote = True
+        elif args[0] in ("--rabs-canonical", "--rabs-recover"):
+            raise SetupError(args[0] + " must be the first and only launcher mode")
+        else:
+            break
+        args.pop(0)
+    if remote and (no_start or required):
+        raise SetupError("--rabs-remote cannot combine with local-daemon options")
+    return args or ["build"], no_start, required, remote
+
+
+def remote_invocation(args, env):
+    """Prepare one RCH argv, never a shell string or a second build executor.
+
+    The Unix RCH backend enforces remote-required refusals and owns all remote
+    effects. The Windows backend has different fallback semantics, so it is
+    deliberately not selected here. No local daemon/compiler probe is needed.
+    RCH already quotes each command argv element: prequoting here would change
+    literal Cargo arguments or turn data into shell syntax.
+    """
+    if sys.platform not in ("linux", "darwin"):
+        raise SetupError("remote dispatch requires a Linux or macOS RCH client")
+    if (env.get("CARGO_RABS_REMOTE_ACTIVE") == "1"
+            or env.get("RCH_RABS_WORKER_ACTIVE") == "1"):
+        raise SetupError("nested remote dispatch is not supported")
+    # RCH's command boundary is Vec<String>. Local passthrough still accepts
+    # opaque Unix argv; remote requests must refuse rather than replace bytes.
+    try:
+        for arg in args:
+            arg.encode("utf-8")
+            if "\0" in arg:
+                raise ValueError("NUL in argument")
+    except (UnicodeError, ValueError) as error:
+        raise SetupError("remote Cargo arguments must be UTF-8 without NUL") from error
+    rch = executable("rch", "CARGO_RABS_RCH", env)
+    if os.path.samefile(rch, __file__):
+        raise SetupError("CARGO_RABS_RCH resolves to cargo-rabs itself")
+    child_env = dict(env)
+    # These are the explicit meaning of --rabs-remote, not global defaults.
+    # Do not alter RCH's selection/retry policy or relax any serving gate.
+    child_env["RCH_REQUIRE_REMOTE"] = "1"
+    child_env["RCH_RABS_WORKER_CACHE"] = "1"
+    child_env["CARGO_RABS_REMOTE_ACTIVE"] = "1"
+    return rch, [rch, "exec", "--source-content-receipt", "--", "cargo"] + args, child_env
+
+
+def canonical_path(value, absolute=False):
+    """A path spelling for the existing canonical source/output contracts."""
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise SetupError("canonical profile paths must be bounded nonempty strings")
+    try:
+        value.encode("utf-8")
+    except UnicodeError as error:
+        raise SetupError("canonical paths must be UTF-8") from error
+    parts = value[1:].split("/") if absolute else value.split("/")
+    if (value.startswith("/") != absolute or "\\" in value or ":" in value
+            or any(ord(c) < 32 or ord(c) == 127 for c in value)
+            or any(part in ("", ".", "..") for part in parts)):
+        raise SetupError("canonical paths must not contain aliases or traversal")
+    return value
+
+
+def canonical_daemon_endpoint(value):
+    endpoint = Path(canonical_path(value, absolute=True))
+    if len(os.fsencode(endpoint)) >= 108:
+        raise SetupError("canonical daemon socket exceeds the Linux socket path bound")
+    for parent in reversed(endpoint.parents):
+        if not stat.S_ISDIR(parent.lstat().st_mode):
+            raise SetupError("canonical daemon socket requires ordinary directory ancestors")
+    parent = endpoint.parent.lstat()
+    if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o022:
+        raise SetupError("canonical daemon socket parent must be owned by this user and not writable by others")
+    if socket_identity(str(endpoint)) is None:
+        raise SetupError("canonical daemon mode requires an existing private daemon socket")
+    return endpoint
+
+
+def canonical_command_environment(values, clippy=False, incremental=False):
+    """Bind explicit build inputs without inheriting host variables or policy.
+
+    The native env-cwd-v1 validator remains authoritative. This frontend is
+    narrower: its fixed Cargo/toolchain/lint contract cannot be replaced through
+    an environment alternative to a refused command-line option. Only this
+    request receives the values, never the local preparation/control process.
+    """
+    import re
+    environment = {"CARGO_INCREMENTAL": "1" if incremental else "0"}
+    if clippy:
+        environment.update(CARGO="/__rabs/toolchain/bin/cargo", RUSTC="/__rabs/toolchain/bin/rustc")
+    if type(values) is not dict or len(values) + len(environment) > 256:
+        raise SetupError("canonical env must be an object within the native entry limit")
+    reserved = {
+        "PATH", "HOME", "CARGO_HOME", "TMPDIR", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN",
+        "LANG", "LC_ALL", "TZ", "MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS", "NUM_JOBS",
+        "CARGO", "RUSTC", "RUSTDOC", "RUSTFLAGS", "RUSTDOCFLAGS", "GLIBC_TUNABLES",
+    }
+    prefixes = ("CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_",
+                "RABS_", "RCH_", "LD_", "DYLD_")
+    total = sum(len(name) + len(value) + 2 for name, value in environment.items())
+    for name, value in values.items():
+        if type(name) is not str or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,255}", name) is None:
+            raise SetupError("canonical env names must be bounded POSIX identifiers")
+        if name in reserved or name.startswith(prefixes):
+            raise SetupError("canonical env cannot override worker or build-tool controls: " + name)
+        if type(value) is not str or "\0" in value:
+            raise SetupError("canonical env values must be literal strings without NUL")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError as error:
+            raise SetupError("canonical env values must be UTF-8") from error
+        if len(encoded) > 64 * 1024:
+            raise SetupError("canonical env value exceeds the native byte limit")
+        total += len(name) + len(encoded) + 2
+        if total > 128 * 1024:
+            raise SetupError("canonical env exceeds the native total byte limit")
+        environment[name] = value
+    # Request identity must not depend on the order of fields in the profile.
+    return dict(sorted(environment.items()))
+
+
+def canonical_worker_pool(value, address_field="listen"):
+    """Validate ordered placement intent without selecting or contacting a worker."""
+    import re
+    if type(value) is not list or not 1 <= len(value) <= 32:
+        raise SetupError("canonical workers must contain from 1 to 32 explicit worker entries")
+    fields = {address_field, "worker", "worker_spki_sha256"}
+    endpoints, workers, pins = [], set(), set()
+    pool = []
+    for worker in value:
+        if type(worker) is not dict or worker.keys() != fields:
+            raise SetupError("canonical worker pool entries require only listen, worker and worker_spki_sha256")
+        if (not isinstance(worker[address_field], str) or len(worker[address_field]) > 128
+                or not isinstance(worker["worker"], str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", worker["worker"]) is None):
+            raise SetupError("canonical worker pool requires bounded literal endpoints and worker identities")
+        endpoint = dependency_worker_endpoint(
+            [worker[address_field], worker["worker"], worker["worker_spki_sha256"]],
+            (address_field, "worker", "worker_spki_sha256"))
+        address, identity, pin = (endpoint[key] for key in ("listen", "worker_id", "worker_spki_sha256"))
+        host, port = address.rsplit(":", 1)
+        ip = ipaddress.ip_address(host[1:-1] if host.startswith("[") else host)
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        port = int(port)
+        # Match durable admission: mapped IPv4 aliases share a listener, and a
+        # wildcard can own every interface (including a dual-stack IPv6 bind).
+        collision = any(port == other_port and
+                        (ip == other_ip or ip.is_unspecified or other_ip.is_unspecified)
+                        for other_ip, other_port in endpoints)
+        if collision or identity in workers or pin in pins:
+            raise SetupError("canonical worker pool contains an overlapping listener, worker identity or pin")
+        endpoints.append((ip, port))
+        workers.add(identity)
+        pins.add(pin)
+        pool.append({"address": address, "worker": identity, "worker_spki_sha256": pin})
+    return pool
+
+
+def canonical_profile(path, required_tools=("cargo", "rustc")):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_FRAME:
+            raise SetupError("canonical profile must be a bounded regular file")
+        data = source.read(MAX_FRAME + 1)
+        after = os.fstat(source.fileno())
+        signature = lambda m: (m.st_dev, m.st_ino, m.st_size, m.st_mtime_ns, m.st_ctime_ns)
+        if len(data) != before.st_size or signature(before) != signature(after):
+            raise SetupError("canonical profile changed during reading")
+    profile = decode_object(data)
+    required = {"version", "source_root", "toolchain_root", "operation_root"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobserver_grant", "daemon_socket", "env", "incremental"}
+    singular = {"listen", "worker", "worker_spki_sha256"}
+    if "workers" in profile:
+        required.add("workers")
+        if profile.keys() & singular:
+            raise SetupError("canonical workers cannot be combined with singular worker settings")
+        if "daemon_socket" not in profile:
+            raise SetupError("canonical worker pools require an explicit daemon_socket")
+    else:
+        required |= singular
+    if (not required <= profile.keys() or profile.keys() - required - optional
+            or profile["version"] != "canonical-cargo-v1"):
+        raise SetupError("invalid canonical-cargo-v1 profile fields")
+    if "vendor" in profile and "cargo_home_source" in profile:
+        raise SetupError("canonical profile must select either vendor or cargo_home_source")
+    if "incremental" in profile and type(profile["incremental"]) is not bool:
+        raise SetupError("canonical incremental must be a boolean")
+    if "jobserver_grant" in profile:
+        grant = profile["jobserver_grant"]
+        if type(grant) is not int or not 1 <= grant <= 4096:
+            raise SetupError("canonical jobserver_grant must be an integer from 1 to 4096")
+    if "workers" in profile:
+        canonical_worker_pool(profile["workers"])
+    else:
+        import ipaddress
+        import re
+        address = profile["listen"]
+        if not isinstance(address, str) or len(address) > 128:
+            raise SetupError("listen must be a literal coordinator IP:port")
+        try:
+            host, port = address.rsplit(":", 1)
+            # Brackets are required for IPv6, as by Rust's SocketAddr parser.
+            parsed = ipaddress.ip_address(host[1:-1] if host.startswith("[") and host.endswith("]") else host)
+            if ("%" in host or (parsed.version == 6) != (host.startswith("[") and host.endswith("]"))
+                    or not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535):
+                raise ValueError("invalid address or port")
+        except ValueError as error:
+            raise SetupError("listen must be a literal coordinator IP and nonzero port") from error
+        if (not isinstance(profile["worker"], str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", profile["worker"]) is None
+                or not isinstance(profile["worker_spki_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", profile["worker_spki_sha256"]) is None):
+            raise SetupError("canonical worker identity and lowercase SHA-256 pin are required")
+    roots = ("source_root", "toolchain_root", "operation_root")
+    if "cargo_home_source" in profile:
+        roots += ("cargo_home_source",)
+    for field in roots:
+        path = Path(canonical_path(profile[field], absolute=True))
+        # Do not normalize away an unsafe ancestor or follow a profile alias.
+        for parent in reversed((path,) + tuple(path.parents)):
+            if not stat.S_ISDIR(parent.lstat().st_mode):
+                raise SetupError("canonical roots require ordinary directory ancestors")
+    operation = Path(profile["operation_root"])
+    metadata = operation.lstat()
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise SetupError("canonical operation root must be private to this user")
+    for field in ("source_root", "toolchain_root"):
+        source = Path(profile[field])
+        if operation == source or operation in source.parents or source in operation.parents:
+            raise SetupError("canonical operation root must be disjoint from inputs")
+    if "cargo_home_source" in profile:
+        cargo_home = Path(profile["cargo_home_source"])
+        for field in ("source_root", "toolchain_root", "operation_root"):
+            other = Path(profile[field])
+            if cargo_home == other or cargo_home in other.parents or other in cargo_home.parents:
+                raise SetupError("canonical cargo_home_source must be disjoint from other roots")
+    if "daemon_socket" in profile:
+        endpoint = canonical_daemon_endpoint(profile["daemon_socket"])
+        for field in ("source_root", "toolchain_root", "cargo_home_source"):
+            if field in profile and Path(profile[field]) in endpoint.parents:
+                raise SetupError("canonical daemon socket must be outside captured inputs")
+    profile["manifest"] = canonical_path(profile.get("manifest", "Cargo.toml"))
+    if Path(profile["manifest"]).name != "Cargo.toml":
+        raise SetupError("canonical manifest must name Cargo.toml")
+    if "vendor" in profile:
+        canonical_path(profile["vendor"])
+    for name in required_tools:
+        tool = Path(profile["toolchain_root"]) / "bin" / name
+        if (not stat.S_ISDIR(tool.parent.lstat().st_mode)
+                or not stat.S_ISREG(tool.lstat().st_mode) or not os.access(tool, os.X_OK)):
+            raise SetupError("canonical toolchain requires ordinary executable " + name)
+    return profile
+
+
+def canonical_clippy_lints(args):
+    """Allow literal lint controls, without adding another rustc command surface.
+
+    cargo-clippy encodes these arguments in CLIPPY_ARGS with an internal
+    delimiter. Lowercase lint identifiers exclude that delimiter as well as
+    response files, paths, output switches and argument-looking lint values.
+    """
+    import re
+    if len(args) > 128 or sum(len(arg) for arg in args) > 16384:
+        raise SetupError("canonical Clippy lint arguments exceed their bounds")
+    short = ("-A", "-W", "-D", "-F")
+    long = ("--allow", "--warn", "--force-warn", "--deny", "--forbid", "--cap-lints")
+    at = 0
+    while at < len(args):
+        option, separator, value = args[at].partition("=")
+        if args[at] in short + long:
+            option = args[at]
+            at += 1
+            if at == len(args):
+                raise SetupError("canonical Clippy lint option requires a value")
+            value = args[at]
+        elif separator and option in long:
+            pass
+        elif args[at][:2] in short:
+            option, value = args[at][:2], args[at][2:]
+        else:
+            raise SetupError("canonical Clippy accepts only lint controls after --")
+        if option == "--cap-lints":
+            if value not in ("allow", "warn", "deny", "forbid"):
+                raise SetupError("invalid canonical Clippy lint cap")
+        elif (len(value) > 256
+              or re.fullmatch(r"[a-z][a-z0-9_-]*(?:::[a-z][a-z0-9_-]*)*", value) is None):
+            raise SetupError("canonical Clippy requires literal lowercase lint names")
+        at += 1
+
+
+def canonical_build_arguments(args):
+    """Preserve Cargo compilation/lint/test intent and bounded trailing arguments.
+
+    Cargo's JSON reports supply actual library, metadata, binary and test names,
+    including toolchain-specific intermediate and target-triple layouts.
+    """
+    import re
+    if not args or args[0] not in ("build", "check", "clippy", "test") or len(args) > 256:
+        raise SetupError("canonical mode requires build, check, clippy or test")
+    if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
+        raise SetupError("canonical Cargo arguments exceed their bounds")
+    try:
+        for arg in args:
+            arg.encode("utf-8")
+    except UnicodeError as error:
+        raise SetupError("canonical Cargo arguments must be UTF-8") from error
+    target = None
+    profile = None
+    release = False
+    no_run = False
+    workspace = False
+    excluded = False
+    test_filter = False
+    selections = set()
+    at = 1
+    while at < len(args):
+        if args[at] == "--":
+            if args[0] == "clippy":
+                canonical_clippy_lints(args[at + 1:])
+            elif args[0] != "test" or no_run:
+                raise SetupError("test-harness arguments require canonical test execution")
+            # The remaining bounded UTF-8 arguments belong to the program,
+            # including strings that look like Cargo or launcher options.
+            break
+        option, separator, value = args[at].partition("=")
+        if option in ("--bin", "--example", "--test", "--bench", "--package", "-p",
+                      "--features", "-F", "--target", "--color", "--exclude", "--profile"):
+            if not separator:
+                at += 1
+                if at == len(args):
+                    raise SetupError("canonical Cargo option requires a value")
+                value = args[at]
+            if not value or value.startswith("-"):
+                raise SetupError("invalid canonical Cargo option value")
+            if option in ("--bin", "--example", "--test", "--bench"):
+                if (re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,127}", value) is None
+                        or (option, value) in selections or len(selections) >= 128):
+                    raise SetupError("canonical target names must be unique literal names")
+                selections.add((option, value))
+            elif option == "--target":
+                if target is not None or value not in (
+                    "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+                    "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
+                ):
+                    raise SetupError("canonical target must be one explicit supported Linux triple")
+                target = value
+            elif option == "--color" and value not in ("auto", "always", "never"):
+                raise SetupError("invalid Cargo color choice")
+            elif option == "--exclude":
+                excluded = True
+            elif option == "--profile":
+                if (profile is not None or release
+                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value) is None):
+                    raise SetupError("canonical Cargo requires one literal profile without --release")
+                profile = value
+        elif not separator and option in ("--release", "-r"):
+            if profile is not None:
+                raise SetupError("canonical Cargo --release conflicts with --profile")
+            release = True
+        elif not separator and option == "--no-run" and args[0] == "test" and not no_run:
+            no_run = True
+        elif not separator and option == "--workspace":
+            workspace = True
+        elif not separator and option in ("--no-fail-fast", "--doc") and args[0] == "test":
+            pass
+        elif not separator and option == "--no-deps" and args[0] == "clippy":
+            pass
+        elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
+                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q",
+                                          "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets"):
+            pass
+        elif args[0] == "test" and not args[at].startswith("-") and not test_filter:
+            test_filter = True
+        else:
+            raise SetupError("unsupported canonical Cargo argument: " + args[at])
+        at += 1
+    if no_run and (test_filter or "--doc" in args):
+        raise SetupError("test filters and --doc require canonical test execution")
+    if excluded and not workspace:
+        raise SetupError("canonical --exclude requires --workspace")
+    return list(args), []
+
+
+def canonical_invocation(profile_path, args, env):
+    """Create local intent, then hand everything to the existing native driver.
+
+    These files contain no proof, executable result or cache-publication grant.
+    Preparation, execution, cancellation and delivery remain native operations.
+    """
+    if sys.platform != "linux":
+        raise SetupError("canonical Cargo preparation currently requires Linux")
+    if any(env.get(name) == "1" for name in (
+        "CARGO_RABS_CANONICAL_ACTIVE", "CARGO_RABS_REMOTE_ACTIVE", "RCH_RABS_WORKER_ACTIVE",
+    )):
+        raise SetupError("nested canonical/remote dispatch is not supported")
+    cargo_args, outputs = canonical_build_arguments(args)
+    separator = cargo_args.index("--") if "--" in cargo_args else len(cargo_args)
+    trailing_args = cargo_args[separator:]
+    cargo_args = cargo_args[:separator]
+    test_execution = cargo_args[0] == "test" and "--no-run" not in cargo_args
+    clippy = cargo_args[0] == "clippy"
+    required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
+    profile = canonical_profile(profile_path, required_tools)
+    incremental = profile.get("incremental", False)
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    if os.path.samefile(daemon, __file__):
+        raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
+    manifest = "/__rabs/workspace/" + profile["manifest"]
+    if "--frozen" not in cargo_args:
+        for flag in ("--locked", "--offline"):
+            if flag not in cargo_args:
+                cargo_args.append(flag)
+    cargo_args += ["--message-format=json", "--manifest-path", manifest, "--target-dir", "/__rabs/out/cargo"]
+    cargo_args += trailing_args
+    command_env = canonical_command_environment(profile.get("env", {}), clippy, incremental)
+    if incremental:
+        # The matching native contract retains compiler state privately and
+        # excludes only its verified incremental roots from artifact delivery.
+        # Older peers must refuse this distinct contract before execution.
+        artifact_contract = "cargo-private-incremental-test-json-v1" if test_execution else "cargo-private-incremental-json-v1"
+    else:
+        artifact_contract = "cargo-test-json-v1" if test_execution else "cargo-json-v1"
+    import secrets
+    specification = {
+        # This is LOCAL preparation intent. The combined TLS driver reserves a
+        # durable monotonic ID and holds its worker admission through dispatch.
+        # Random operation names below isolate storage; they are not wire IDs.
+        "kind": "canonical-exec", "request_id": "allocate",
+        "program": "/__rabs/toolchain/bin/cargo-clippy" if clippy else "/__rabs/toolchain/bin/cargo",
+        "args": cargo_args,
+        "command_context": {"version": "env-cwd-v1", "cwd": str(Path(manifest).parent),
+                            "env": command_env},
+        "toolchain_source": profile["toolchain_root"],
+        "cargo_source": {"manifest": profile["manifest"]},
+        "artifacts": {"unit": "cargo", "tree": "tree-files-v1", "files": outputs,
+                      "cargo": artifact_contract},
+    }
+    if "vendor" in profile:
+        specification["cargo_source"]["vendor"] = profile["vendor"]
+    if "cargo_home_source" in profile:
+        specification["cargo_source"]["cargo_home_source"] = profile["cargo_home_source"]
+    if "jobserver_grant" in profile:
+        specification["jobserver_grant"] = profile["jobserver_grant"]
+    encoded_specification = json.dumps(specification, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded_specification) > MAX_FRAME:
+        raise SetupError("canonical Cargo specification exceeds its frontend bound")
+    operation_id = secrets.token_hex(16)
+    operation = Path(profile["operation_root"]) / ("cargo-" + operation_id)
+    # Exclusive, retained state. No retry into an old operation and no deletion
+    # on failure. The approved source/toolchain are untouched by this launcher.
+    operation.mkdir(mode=0o700)
+    bundle, delivery, output = (str(operation / name) for name in ("bundle", "delivery", "outputs"))
+    pool = canonical_worker_pool(profile["workers"]) if "workers" in profile else None
+    if pool is not None:
+        pool_path = str(operation / "pool.json")
+        placement = ["--worker-pool", pool_path, bundle, delivery, output]
+    else:
+        placement = [profile["listen"], profile["worker"], profile["worker_spki_sha256"], bundle, delivery, output]
+    if "daemon_socket" in profile:
+        native = [daemon, "--job-build", operation_id] + placement
+    else:
+        native = [daemon, "--worker-build-tls", "--replay-diagnostics"] + placement
+    metadata = {"version": "canonical-cargo-v1", "request_id": specification["request_id"],
+                "operation_directory": str(operation),
+                "automatic_retry": False, "publication_authorized": False}
+    if "daemon_socket" in profile:
+        submit = ([daemon, "--job-submit-pool", operation_id, pool_path, bundle, delivery, output]
+                  if pool is not None else [daemon, "--job-submit-allocated", operation_id] + placement)
+        metadata.update(job_id=operation_id, daemon_socket=profile["daemon_socket"],
+                        job_submit_argv=submit,
+                        job_status_argv=[daemon, "--job-status", operation_id],
+                        job_wait_argv=[daemon, "--job-wait", operation_id],
+                        job_cancel_argv=[daemon, "--job-cancel", operation_id])
+        if pool is not None:
+            # This is ordered placement intent. Only the daemon's durable job
+            # status identifies the selected worker and bound request number.
+            metadata["worker_pool"] = pool
+    else:
+        metadata["prepared_build_argv"] = native
+    files = [("spec.json", specification), ("operation.json", metadata)]
+    if pool is not None:
+        files.insert(0, ("pool.json", pool))
+    for name, value in files:
+        descriptor = os.open(str(operation / name), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+            file.flush()
+            os.fsync(file.fileno())
+    for path in (operation, operation.parent):
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    child_env = dict(env)
+    child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
+    # The existing offline metadata planner explicitly resolves these tools.
+    # TLS credentials stay local in env, never in the uploaded command context.
+    child_env["CARGO"] = str(Path(profile["toolchain_root"]) / "bin/cargo")
+    child_env["RUSTC"] = str(Path(profile["toolchain_root"]) / "bin/rustc")
+    if "daemon_socket" in profile:
+        child_env["RABS_SOCKET_PATH"] = profile["daemon_socket"]
+        command = native[:2] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[2:]
+    else:
+        command = native[:3] + ["--prepare-from", profile["source_root"], str(operation / "spec.json")] + native[3:]
+    print("cargo-rabs: canonical operation retained at " + str(operation), file=sys.stderr, flush=True)
+    return daemon, command, child_env
+
+
+def run_canonical(args, env):
+    try:
+        if not args or not args[0] or args[0].startswith("--"):
+            raise SetupError("--rabs-canonical requires a profile file")
+        cargo_args = args[1:]
+        if cargo_args[:1] == ["--"]:
+            cargo_args = cargo_args[1:]
+        daemon, command, child_env = canonical_invocation(args[0], cargo_args, env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: canonical setup refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
+        os.execvpe(daemon, command, child_env)
+    except OSError as error:
+        print("cargo-rabs: cannot execute canonical driver: {}".format(error), file=sys.stderr)
+        return 127
+
+
+def canonical_recovery_directory(value, allow_missing=False):
+    """Validate a recovery path without creating, resolving or repairing it."""
+    path = Path(canonical_path(value, absolute=True))
+    for parent in reversed((path,) + tuple(path.parents)):
+        try:
+            metadata = parent.lstat()
+        except FileNotFoundError:
+            if allow_missing and parent == path:
+                continue
+            raise
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SetupError("canonical recovery paths require ordinary directory ancestors")
+    return path
+
+
+def canonical_recovery_record(operation):
+    """Read private launcher intent, never an execution or result receipt.
+
+    Retained state must stay exclusively operator-owned during handoff. Like
+    native recovery this is not an interface for hostile same-user mutation.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    directory = os.open(operation, flags | os.O_DIRECTORY)
+    try:
+        owner = os.fstat(directory)
+        if owner.st_uid != os.geteuid() or stat.S_IMODE(owner.st_mode) & 0o077:
+            raise SetupError("canonical recovery operation must be private to this user")
+        descriptor = os.open("operation.json", flags | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            before = os.fstat(descriptor)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o077
+                    or not 0 < before.st_size <= MAX_FRAME):
+                raise SetupError("canonical recovery record must be a bounded private single-link file")
+            data = bytearray()
+            while len(data) <= MAX_FRAME:
+                chunk = os.read(descriptor, min(4096, MAX_FRAME + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            signature = lambda m: (m.st_dev, m.st_ino, m.st_uid, m.st_mode, m.st_nlink,
+                                   m.st_size, m.st_mtime_ns, m.st_ctime_ns)
+            named = os.stat("operation.json", dir_fd=directory, follow_symlinks=False)
+            if (len(data) != before.st_size or len(data) > MAX_FRAME
+                    or signature(before) != signature(os.fstat(descriptor))
+                    or signature(before) != signature(named)):
+                raise SetupError("canonical recovery record changed while reading")
+        finally:
+            os.close(descriptor)
+        canonical_recovery_directory(str(operation))
+        named = operation.lstat()
+        if (owner.st_dev, owner.st_ino, owner.st_uid, owner.st_mode) != (
+                named.st_dev, named.st_ino, named.st_uid, named.st_mode):
+            raise SetupError("canonical recovery operation changed while reading")
+    finally:
+        os.close(directory)
+    return decode_object(bytes(data))
+
+
+def canonical_job_recovery_invocation(operation, record, options, env):
+    """Recover through the same durable owner, never its allocation template.
+
+    Only the daemon owns the bound numeric request and delivery frontier. A
+    direct --resume on this operation's saved template would bypass that owner.
+    Control actions hand off once and return native admission/status, not the
+    historical compiler result. Only a later explicit --job-wait replays it.
+    """
+    import re
+    job_id = record["job_id"]
+    if (type(job_id) is not str or re.fullmatch(r"[0-9a-f]{32}", job_id) is None
+            or operation.name != "cargo-" + job_id or record["request_id"] != "allocate"):
+        raise SetupError("invalid canonical daemon recovery job identity")
+    saved_driver = None
+    pooled = "worker_pool" in record
+    for action in ("wait", "status", "cancel", "submit"):
+        saved = record["job_" + action + "_argv"]
+        command = ("--job-submit-pool" if pooled else "--job-submit-allocated") if action == "submit" else "--job-" + action
+        count = (7 if pooled else 9) if action == "submit" else 3
+        if (type(saved) is not list or len(saved) != count
+                or any(type(value) is not str or not value or len(value) > 4096 or "\0" in value for value in saved)
+                or saved[1:3] != [command, job_id]):
+            raise SetupError("canonical daemon recovery record changed its fixed native job contract")
+        canonical_path(saved[0], absolute=True)
+        if saved_driver is None:
+            saved_driver = saved[0]
+        elif saved[0] != saved_driver:
+            raise SetupError("canonical daemon recovery record changed its saved driver identity")
+    saved = record["job_submit_argv"]
+    if pooled:
+        canonical_worker_pool(record["worker_pool"], "address")
+        if saved[3] != str(operation / "pool.json"):
+            raise SetupError("canonical daemon recovery record changed its fixed worker pool path")
+    else:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", saved[4]) is None:
+            raise SetupError("invalid recorded canonical worker identity")
+        dependency_worker_endpoint(saved[3:6], ("listen", "worker", "worker_spki_sha256"))
+    if saved[-3:] != [str(operation / name) for name in ("bundle", "delivery", "outputs")]:
+        raise SetupError("canonical daemon recovery record changed its fixed bundle/delivery/output paths")
+    command = ["--job-wait", job_id]
+    if options.keys() == {"--status"}:
+        command = ["--job-status", job_id]
+    elif options.keys() == {"--cancel"}:
+        # Request cleanup from the durable owner, never signal a remembered PID
+        # or infer that worker resources are free from a control response.
+        command = ["--job-cancel", job_id]
+    elif options:
+        # The record fixes ownership, not the contents of a result. In
+        # particular, do not open/rewrite request.json: daemon submissions may
+        # retain an allocation template rather than the numeric wire request.
+        bundle, original_delivery, output = (operation / name for name in ("bundle", "delivery", "outputs"))
+        overlap = lambda a, b: a == b or a in b.parents or b in a.parents
+        new = "--resume-to" in options
+        selection = "--resume-to" if new else "--delivery" if "--delivery" in options else "--acknowledge"
+        destination = canonical_recovery_directory(options[selection], allow_missing=new)
+        if new:
+            if os.path.lexists(destination):
+                raise SetupError("canonical --resume-to requires a new delivery directory")
+        else:
+            metadata = destination.lstat()
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("canonical daemon recovery delivery must be private to this user")
+        protected = (bundle, output, original_delivery) if new else (bundle, output)
+        if any(overlap(destination, path) for path in protected):
+            raise SetupError("canonical daemon recovery delivery overlaps retained state")
+        action = "--job-resume" if new else "--job-recover-local" if selection == "--delivery" else "--job-acknowledge"
+        command = [action, job_id, str(destination)]
+        if "--prefix-from" in options:
+            prefix = canonical_recovery_directory(options["--prefix-from"])
+            metadata = prefix.lstat()
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("canonical recovery prefix must be private to this user")
+            if any(overlap(prefix, path) for path in (bundle, output, destination)):
+                raise SetupError("canonical recovery prefix overlaps a destination or retained bundle")
+            command.append(str(prefix))
+        # Other retained attempts and daemon-state paths are known only to the
+        # durable owner. Its existing admission/receipt checks remain final;
+        # a locally valid path is never evidence of a result or a free worker.
+    endpoint = canonical_daemon_endpoint(record["daemon_socket"])
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    if os.path.samefile(daemon, __file__):
+        raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
+    child_env = dict(env)
+    child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
+    child_env["RABS_SOCKET_PATH"] = str(endpoint)
+    return daemon, [daemon] + command, child_env
+
+
+def canonical_recovery_invocation(args, env):
+    """Construct one native recovery-only handoff. Saved argv is never executed.
+
+    The native direct-recovery or daemon-job paths own request/receipt validation,
+    TLS, byte recovery, release and installation, including partial refusals.
+    No branch here can request execution, recapture inputs or allocate an ID.
+    """
+    if sys.platform != "linux":
+        raise SetupError("canonical recovery currently requires Linux")
+    if not args or args[0].startswith("--"):
+        raise SetupError("--rabs-recover requires an absolute operation directory")
+    options = {}
+    if len(args) == 2 and args[1] in ("--status", "--cancel"):
+        # Controls take no value and must stand alone. Preserve the existing
+        # path-pair grammar instead of treating flags as paths or vice versa.
+        options[args[1]] = True
+    else:
+        if len(args) not in (1, 3, 5):
+            raise SetupError("canonical recovery requires path options or one --status/--cancel control")
+        for index in range(1, len(args), 2):
+            flag, value = args[index:index + 2]
+            if flag not in ("--resume-to", "--delivery", "--prefix-from", "--acknowledge") or flag in options:
+                raise SetupError("unknown or duplicate canonical recovery option")
+            options[flag] = value
+    if (len(options.keys() & {"--resume-to", "--delivery", "--acknowledge"}) > 1
+            or "--prefix-from" in options and "--resume-to" not in options):
+        raise SetupError("canonical recovery requires one destination; prefix reuse requires --resume-to")
+    operation = canonical_recovery_directory(args[0])
+    record = canonical_recovery_record(operation)
+    fields = {"version", "request_id", "operation_directory", "automatic_retry", "publication_authorized"}
+    if "job_id" in record:
+        fields |= {"job_id", "daemon_socket", "job_submit_argv", "job_status_argv",
+                   "job_wait_argv", "job_cancel_argv"}
+        if "worker_pool" in record:
+            fields.add("worker_pool")
+    else:
+        fields.add("prepared_build_argv")
+    request_id = record.get("request_id")
+    if (record.keys() != fields or record["version"] != "canonical-cargo-v1"
+            or record["operation_directory"] != str(operation)
+            or record["automatic_retry"] is not False or record["publication_authorized"] is not False
+            or not (request_id == "allocate" or type(request_id) is int and 0 < request_id < 2**64)):
+        raise SetupError("invalid canonical recovery record identity or authority policy")
+    if "job_id" in record:
+        return canonical_job_recovery_invocation(operation, record, options, env)
+    if options.keys() & {"--status", "--cancel"}:
+        raise SetupError("canonical --status/--cancel requires a daemon-owned operation")
+    if "--acknowledge" in options:
+        raise SetupError("canonical --acknowledge requires a daemon-owned operation")
+    saved = record["prepared_build_argv"]
+    if (type(saved) is not list or len(saved) != 9
+            or any(type(value) is not str or not value or len(value) > 4096 or "\0" in value for value in saved)
+            or saved[1:3] != ["--worker-build-tls", "--replay-diagnostics"]):
+        raise SetupError("canonical recovery record does not name the fixed native build contract")
+    # The old executable may have moved or been replaced. Validate its spelling
+    # but resolve today's installed rabsd independently; never execute this argv.
+    canonical_path(saved[0], absolute=True)
+    import re
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", saved[4]) is None:
+        raise SetupError("invalid recorded canonical worker identity")
+    dependency_worker_endpoint(saved[3:6], ("listen", "worker", "worker_spki_sha256"))
+    bundle, original_delivery, output = (operation / name for name in ("bundle", "delivery", "outputs"))
+    if saved[6:] != [str(bundle), str(original_delivery), str(output)]:
+        raise SetupError("canonical recovery record changed its fixed bundle/delivery/output paths")
+    canonical_recovery_directory(str(bundle))
+    canonical_recovery_directory(str(output), allow_missing=True)
+    overlap = lambda a, b: a == b or a in b.parents or b in a.parents
+    destination = original_delivery
+    if "--resume-to" in options or "--delivery" in options:
+        new = "--resume-to" in options
+        destination = canonical_recovery_directory(
+            options["--resume-to" if new else "--delivery"], allow_missing=new)
+        if new and os.path.lexists(destination):
+            raise SetupError("canonical --resume-to requires a new delivery directory")
+        if (overlap(destination, bundle) or overlap(destination, output)
+                or destination != original_delivery and overlap(destination, original_delivery)):
+            raise SetupError("canonical recovery destination overlaps retained state")
+        if not new:
+            metadata = destination.lstat()
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("canonical recovered delivery must be private to this user")
+    else:
+        canonical_recovery_directory(str(destination), allow_missing=True)
+    recovery = ["--resume"]
+    if "--prefix-from" in options:
+        prefix = canonical_recovery_directory(options["--prefix-from"])
+        metadata = prefix.lstat()
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise SetupError("canonical recovery prefix must be private to this user")
+        if any(overlap(prefix, path) for path in (bundle, output, destination)):
+            raise SetupError("canonical recovery prefix overlaps a destination or retained bundle")
+        recovery = ["--resume-from", str(prefix)]
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    if os.path.samefile(daemon, __file__):
+        raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
+    command = [daemon, "--worker-build-tls", "--replay-diagnostics"] + recovery
+    command += saved[3:6] + [str(bundle), str(destination), str(output)]
+    child_env = dict(env)
+    child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
+    return daemon, command, child_env
+
+
+def run_canonical_recovery(args, env):
+    try:
+        daemon, command, child_env = canonical_recovery_invocation(args, env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: canonical recovery refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
+        os.execvpe(daemon, command, child_env)
+    except OSError as error:
+        print("cargo-rabs: cannot execute canonical recovery driver: {}".format(error), file=sys.stderr)
+        return 127
+
+
+def main():
+    # Keep the preparation import API and all older modes unchanged. This
+    # explicit profile transfers ownership directly to the existing native
+    # preparation/execution driver; there is no Python build supervisor.
+    raw = sys.argv[1:]
+    if raw[:1] == ["rabs"]:
+        raw = raw[1:]
+    if raw[:1] == ["--rabs-recover"]:
+        return run_canonical_recovery(raw[1:], dict(os.environ))
+    if raw[:1] == ["--rabs-canonical"]:
+        if any(key in os.environ for key in ROOT_ADMISSION_KEYS):
+            print("cargo-rabs: local root admission cannot combine with canonical mode", file=sys.stderr)
+            return 2
+        return run_canonical(raw[1:], dict(os.environ))
+    try:
+        args, no_start, required, remote = arguments(sys.argv[1:])
+    except SetupError as error:
+        print("cargo-rabs: {}".format(error), file=sys.stderr)
+        return 2
+    if args is None:
+        print(HELP, end="")
+        return 0
+    env = dict(os.environ)
+    if remote:
+        if any(key in env for key in ROOT_ADMISSION_KEYS):
+            print("cargo-rabs: local root admission cannot combine with remote mode", file=sys.stderr)
+            return 2
+        try:
+            rch, command, child_env = remote_invocation(args, env)
+        except (SetupError, OSError) as error:
+            print("cargo-rabs: remote setup refused: {}".format(error), file=sys.stderr)
+            return 2
+        try:
+            # Transfer ownership once. No wait/retry/fallback branch can run
+            # a local build after RCH has admitted or executed remote work.
+            os.execvpe(rch, command, child_env)
+        except OSError as error:
+            print("cargo-rabs: cannot execute RCH: {}".format(error), file=sys.stderr)
+            return 127
+    cargo = env.get("CARGO") or shutil.which("cargo")
+    if not cargo:
+        print("cargo-rabs: cargo is not installed", file=sys.stderr)
+        return 127
+    try:
+        recursive = os.path.samefile(cargo, __file__)
+    except OSError:
+        recursive = False  # exec below retains ordinary command-not-found behavior.
+    if recursive:
+        print("cargo-rabs: CARGO resolves to cargo-rabs itself", file=sys.stderr)
+        return 127
+    try:
+        root_helper = root_admission_helper(env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: local root admission refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
+        cargo_env = prepare(env, no_start)
+    except (SetupError, OSError, subprocess.SubprocessError) as error:
+        print("cargo-rabs: {}; {}".format(
+            error, "setup refused" if required else "running stock Cargo"
+        ), file=sys.stderr)
+        if required:
+            return 2
+        cargo_env = env
+    try:
+        if root_helper is not None:
+            # A single ownership handoff; an uncertain native outcome never
+            # retries or bypasses explicitly requested root admission.
+            os.execvpe(root_helper, [root_helper, "--", cargo] + args, cargo_env)
+        # With no explicit admission policy, retain the original exec boundary.
+        os.execvpe(cargo, [cargo] + args, cargo_env)
+    except OSError as error:
+        print("cargo-rabs: cannot execute Cargo: {}".format(error), file=sys.stderr)
+        return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -67,7 +67,7 @@ dirs, per-job dirs, tmp-base strays) before touching anything by hand:
 rch status --remediation                   # "Disk Pressure … tightest free-disk ratio"
 rch cache status --workers <id>            # read-only per-dir verdicts
 rch gc --dry-run --workers <id>            # what the sweep would remove
-rch gc --workers <id>                      # remove (pass --workers; sweeping all can hang — open bug)
+rch gc --apply --workers <id>              # remove (2.0.0 needs --apply; 1.0.58 has no --apply and removes without it, and sweeping all workers can hang there)
 ```
 
 Only for legacy/foreign trees rch doesn't own:
@@ -103,6 +103,16 @@ After the fix, rerun:
 rch diagnose --dry-run "cargo build --release"
 rch exec -- cargo build --release
 ```
+
+### 7) Dual-role hosts: declare live checkouts
+
+A host that is both a dispatcher and a worker keeps people's and agents' working trees at the canonical roots, and a multi-repo build from another dispatcher syncs into those same roots with `rsync --delete`. Declare such a host so the worker refuses to sync into any Git checkout there:
+
+```bash
+ssh <user>@<host> 'sudo mkdir -p /etc/rch && sudo touch /etc/rch/live-checkouts'
+```
+
+A refused build prints `RCH_SYNC_LIVE_CHECKOUT_REFUSED` (exit 73) and retries on another worker. Do not declare pure workers: their `.git` checkouts at the canonical roots are rch's own repo-convergence clones, and multi-repo builds must be able to sync into them. Every worker refuses `/` and destinations containing `.` or `..` components, whether or not it is declared.
 
 ---
 
@@ -206,7 +216,7 @@ rch config show --sources
 Operational notes:
 
 - Don't hand-pick remote target dirs: `CARGO_TARGET_DIR` (and `TMPDIR`, Go caches) are rewritten on the worker to managed pooled paths under the project mirror regardless of what you pass. `RCH_DISABLE_TARGET_REUSE=1` only switches pooled → per-job.
-- If the working tree itself cannot sync because the remote canonical mirror is broken, either repair ownership on the worker (§6 above; a fleet-wide `rch doctor --reliability --scope ownership` probe exists on main only) or temporarily build from a clean directory under the canonical root (`/data/projects`), not `/tmp`.
+- If the working tree itself cannot sync because the remote canonical mirror is broken, either repair ownership on the worker (§6 above; a fleet-wide `rch doctor --reliability --scope ownership` probe exists from 2.0.0; not in 1.0.58) or temporarily build from a clean directory under the canonical root (`/data/projects`), not `/tmp`.
 - For builds that must not see other agents' uncommitted edits, use `rch exec --base HEAD --clean-overlay …` (`EXEC_MODES.md`).
 - Payload caps (`transfer skipped`): `[transfer] max_transfer_mb` / `max_transfer_time_ms`; per-attempt upload budget `RCH_SYNC_TIMEOUT_MS`.
 
@@ -237,7 +247,7 @@ Use cancellation when builds are wedged or backlog pressure is starving high-pri
 | Assume `/tmp` pressure and `/` pressure are the same problem | They often are not; fixing the wrong one wastes time | Check `df -h / /tmp` and inspect the matching artifact surface |
 | Delete large build dirs without checking for open files | Risks breaking active remote builds | `rch gc --dry-run --workers <id>` first; manual `rm` only after `lsof` and `rch queue` are clear |
 | Chain cargo commands in a shell string (`rch exec -- bash -lc "cargo a && cargo b"`) | Refused with `RCH-E301`; rch can't bind the output path | Separate `rch exec -- cargo …` invocations |
-| `rch daemon restart -y` while `rch queue` shows active builds | It interrupts them (`-y` only skips the warning); the daemon may answer `shutdown_blocked` | Wait for 0 active builds or `rch cancel` first |
+| `rch daemon restart -y` while `rch queue` shows active builds | 1.0.58: it interrupts them (`-y` only skips the warning); the daemon may answer `shutdown_blocked`. 2.0.0: it refuses unless `--drain` or `--force` | Wait for 0 active builds (2.0.0: `--drain`) or `rch cancel` first |
 | Uninstall the shim because a build exited 103 | 103 means the *fleet* had nothing admissible | `rch status --remediation`, fix, retry |
 | Prefix `RCH_ENABLED=0` inside an agent command to "go local" | The hook rewrites it anyway | `.rch/config.toml` `force_local = true` + `RCH_CARGO_WRAPPER_BYPASS=1` (`SHIM.md`) |
 | Hand-tune `priority`/`total_slots` | Inverts capacity silently | Benchmark, verify scores differ, then set (`SKILL.md`) |

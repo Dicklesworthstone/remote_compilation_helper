@@ -941,8 +941,585 @@ fn print_worker_report(report: &rabs_cas::worker_reconcile::WorkerReconcileRepor
     }
 }
 
-/// `rch rabs <group>` command groups (R005 lands `gc`; R006 lands
-/// `worker` + `doctor`).
+/// Schema identifier for `rch rabs release-verdict` receipts (`bd-dockb`).
+const RELEASE_VERDICT_SCHEMA: &str = "rch.rabs-release-verdict.v1";
+
+/// Serialized durable [`rabs_protocol::release_authorization::ReleaseVerdict`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JsonReleaseVerdict {
+    pub build: String,
+    pub corpus: String,
+    pub replayed: u64,
+    pub explained: u64,
+    pub evaluated_at_unix_micros: i64,
+    pub maximum_age_micros: Option<u64>,
+    pub clock_uncertainty_micros: u64,
+    pub coordinator_clock_epoch: u64,
+}
+
+impl From<&rabs_protocol::release_authorization::ReleaseVerdict> for JsonReleaseVerdict {
+    fn from(v: &rabs_protocol::release_authorization::ReleaseVerdict) -> Self {
+        Self {
+            build: v.build.clone(),
+            corpus: v.corpus.clone(),
+            replayed: v.replayed,
+            explained: v.explained,
+            evaluated_at_unix_micros: v.validity.evaluated_at_unix_micros,
+            maximum_age_micros: v.validity.maximum_age_micros,
+            clock_uncertainty_micros: v.validity.clock_uncertainty_micros,
+            coordinator_clock_epoch: v.validity.coordinator_clock_epoch,
+        }
+    }
+}
+
+/// Receipt emitted by `rch rabs release-verdict show` and `record` (`bd-dockb`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseVerdictReceipt {
+    pub schema: &'static str,
+    pub cas_root: String,
+    pub build: String,
+    pub standing: &'static str,
+    pub permits_advisory: bool,
+    pub permits_required: bool,
+    pub evaluated_at_unix_micros: i64,
+    pub clock_epoch: u64,
+    pub verdict: Option<JsonReleaseVerdict>,
+}
+
+fn current_unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
+
+fn build_release_verdict_receipt(
+    store: &mut dyn RabsMetadataStore,
+    cas_root: &Path,
+    build: &str,
+    now_unix_micros: i64,
+    clock_epoch: u64,
+) -> anyhow::Result<ReleaseVerdictReceipt> {
+    use rabs_protocol::release_authorization::{ReleaseAuthorizationMode, authorization};
+
+    let stored = store
+        .release_verdict(build)
+        .map_err(|e| anyhow::anyhow!("read release verdict: {e:?}"))?;
+    let standing = authorization(stored.as_ref(), build, now_unix_micros, clock_epoch);
+    Ok(ReleaseVerdictReceipt {
+        schema: RELEASE_VERDICT_SCHEMA,
+        cas_root: cas_root.display().to_string(),
+        build: build.to_owned(),
+        standing: standing.token(),
+        permits_advisory: standing.permits_serving(ReleaseAuthorizationMode::Advisory),
+        permits_required: standing.permits_serving(ReleaseAuthorizationMode::Required),
+        evaluated_at_unix_micros: now_unix_micros,
+        clock_epoch,
+        verdict: stored.as_ref().map(JsonReleaseVerdict::from),
+    })
+}
+
+fn record_and_verify_release_verdict(
+    store: &mut dyn RabsMetadataStore,
+    cas_root: &Path,
+    verdict: &rabs_protocol::release_authorization::ReleaseVerdict,
+    now_unix_micros: i64,
+    clock_epoch: u64,
+) -> anyhow::Result<ReleaseVerdictReceipt> {
+    if verdict.build.trim().is_empty() {
+        anyhow::bail!("release verdict build identity must not be empty");
+    }
+    if verdict.corpus.trim().is_empty() {
+        anyhow::bail!("release verdict corpus identity must not be empty");
+    }
+    if verdict.replayed == 0 {
+        anyhow::bail!(
+            "release verdict requires replayed > 0 (zero replayed records can never authorize serving)"
+        );
+    }
+    store
+        .record_release_verdict(verdict)
+        .map_err(|e| anyhow::anyhow!("record release verdict: {e:?}"))?;
+    build_release_verdict_receipt(
+        store,
+        cas_root,
+        &verdict.build,
+        now_unix_micros,
+        clock_epoch,
+    )
+}
+
+fn open_or_init_store(cas_root: &Path) -> anyhow::Result<SqlMetadataStore<RusqliteEngine>> {
+    std::fs::create_dir_all(cas_root)
+        .map_err(|e| anyhow::anyhow!("create CAS root directory {}: {e}", cas_root.display()))?;
+    let meta = cas_root.join("meta.sqlite");
+    let engine =
+        RusqliteEngine::open(&meta).map_err(|e| anyhow::anyhow!("metadata engine: {e:?}"))?;
+    SqlMetadataStore::open(engine).map_err(|e| anyhow::anyhow!("metadata store: {e:?}"))
+}
+
+fn print_release_verdict(receipt: &ReleaseVerdictReceipt) {
+    println!(
+        "release verdict [{}]: build={} standing={} (advisory={}, required={})",
+        receipt.cas_root,
+        receipt.build,
+        receipt.standing,
+        if receipt.permits_advisory {
+            "permitted"
+        } else {
+            "refused"
+        },
+        if receipt.permits_required {
+            "permitted"
+        } else {
+            "refused"
+        },
+    );
+    if let Some(v) = &receipt.verdict {
+        println!(
+            "  corpus={} replayed={} explained={} evaluated_at_us={} max_age_us={:?} epoch={}",
+            v.corpus,
+            v.replayed,
+            v.explained,
+            v.evaluated_at_unix_micros,
+            v.maximum_age_micros,
+            v.coordinator_clock_epoch,
+        );
+    } else {
+        println!(
+            "  no verdict recorded for build {} (run `rch rabs release-verdict record ...`)",
+            receipt.build
+        );
+    }
+}
+
+/// Entry point for `rch rabs release-verdict <action>` (`bd-dockb`).
+///
+/// # Errors
+/// Propagates store and validation failures under the caller's exit-code
+/// convention.
+pub async fn run_release_verdict(
+    action: ReleaseVerdictAction,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    match action {
+        ReleaseVerdictAction::Show {
+            cas_root,
+            build,
+            now_micros,
+            clock_epoch,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let build =
+                build.unwrap_or_else(rabs_protocol::release_authorization::default_build_identity);
+            let now = now_micros.unwrap_or_else(current_unix_micros);
+            let receipt =
+                build_release_verdict_receipt(&mut store, &root, &build, now, clock_epoch)?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs release-verdict show", &receipt))?;
+            } else {
+                print_release_verdict(&receipt);
+            }
+            Ok(())
+        }
+        ReleaseVerdictAction::Record {
+            cas_root,
+            build,
+            corpus,
+            replayed,
+            explained,
+            max_age_secs,
+            evaluated_at_micros,
+            clock_uncertainty_micros,
+            clock_epoch,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_or_init_store(&root)?;
+            let build =
+                build.unwrap_or_else(rabs_protocol::release_authorization::default_build_identity);
+            let evaluated_at = evaluated_at_micros.unwrap_or_else(current_unix_micros);
+            let maximum_age_micros = max_age_secs.map(|s| s.saturating_mul(1_000_000));
+            let verdict = rabs_protocol::release_authorization::ReleaseVerdict {
+                build,
+                corpus,
+                replayed,
+                explained,
+                validity: rabs_protocol::serving::ServingValidity {
+                    evaluated_at_unix_micros: evaluated_at,
+                    maximum_age_micros,
+                    clock_uncertainty_micros,
+                    coordinator_clock_epoch: clock_epoch,
+                },
+            };
+            let receipt = record_and_verify_release_verdict(
+                &mut store,
+                &root,
+                &verdict,
+                evaluated_at,
+                clock_epoch,
+            )?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs release-verdict record", &receipt))?;
+            } else {
+                print_release_verdict(&receipt);
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// R004: CAS verify, locate, and quarantine list/inspect/release commands
+// ---------------------------------------------------------------------
+
+const VERIFY_SCHEMA: &str = "rch.rabs-cas-verify.v1";
+const LOCATE_SCHEMA: &str = "rch.rabs-cas-locate.v1";
+const QUARANTINE_LIST_SCHEMA: &str = "rch.rabs-quarantine-list.v1";
+const QUARANTINE_INSPECT_SCHEMA: &str = "rch.rabs-quarantine-inspect.v1";
+const QUARANTINE_RELEASE_SCHEMA: &str = "rch.rabs-quarantine-release.v1";
+
+/// Receipt emitted by `rch rabs verify` (R004 / H023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CasVerifyReceipt {
+    pub schema: &'static str,
+    pub cas_root: String,
+    pub scanned_locations: usize,
+    pub healthy_locations: usize,
+    pub quarantined_locations: Vec<String>,
+    pub repaired_locations: Vec<String>,
+    pub escalated_logical_objects: Vec<String>,
+}
+
+/// Replica location row emitted by `rch rabs locate` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocatedReplicaDto {
+    pub store_path: String,
+    pub encoding_profile: String,
+    pub verified_raw: bool,
+    pub quarantined: bool,
+    pub exists_on_disk: bool,
+}
+
+/// Receipt emitted by `rch rabs locate <object_key>` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CasLocateReceipt {
+    pub schema: &'static str,
+    pub object_key: String,
+    pub logical_quarantined: bool,
+    pub replicas: Vec<LocatedReplicaDto>,
+}
+
+/// Serialized quarantine row for `rch rabs quarantine` (R004 / H012).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineEntryDto {
+    pub scope: String,
+    pub subject: String,
+    pub reason: String,
+}
+
+impl From<&rabs_cas::materialization::QuarantineRow> for QuarantineEntryDto {
+    fn from(row: &rabs_cas::materialization::QuarantineRow) -> Self {
+        Self {
+            scope: row.scope.as_str().to_owned(),
+            subject: row.subject.clone(),
+            reason: row.reason.clone(),
+        }
+    }
+}
+
+/// Receipt emitted by `rch rabs quarantine list` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineListReceipt {
+    pub schema: &'static str,
+    pub count: usize,
+    pub entries: Vec<QuarantineEntryDto>,
+}
+
+/// Receipt emitted by `rch rabs quarantine inspect` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineInspectReceipt {
+    pub schema: &'static str,
+    pub scope: String,
+    pub subject: String,
+    pub quarantined: bool,
+    pub entry: Option<QuarantineEntryDto>,
+}
+
+/// Receipt emitted by `rch rabs quarantine release` (R004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineReleaseReceipt {
+    pub schema: &'static str,
+    pub scope: String,
+    pub subject: String,
+    pub repair_receipt_id: String,
+    pub seq: u64,
+    pub released: bool,
+}
+
+fn parse_quarantine_scope(
+    scope: &str,
+) -> anyhow::Result<rabs_cas::metadata_store::QuarantineScope> {
+    rabs_cas::metadata_store::QuarantineScope::from_str_name(&scope.to_ascii_lowercase())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid quarantine scope '{scope}' (expected location|logical-object|action-entry)"
+            )
+        })
+}
+
+/// Compute the `rch rabs verify` receipt over `store` (R004 / H023).
+pub fn verify_cas_receipt(
+    store: &mut dyn RabsMetadataStore,
+    cas_root: &Path,
+) -> anyhow::Result<CasVerifyReceipt> {
+    let seq = next_seq(store).map_err(|e| anyhow::anyhow!("allocate verify seq: {e:?}"))?;
+    let report = rabs_cas::materialization::scrub_and_repair_locations(store, seq)
+        .map_err(|e| anyhow::anyhow!("CAS verify/scrub failed: {e:?}"))?;
+    Ok(CasVerifyReceipt {
+        schema: VERIFY_SCHEMA,
+        cas_root: cas_root.display().to_string(),
+        scanned_locations: report.scanned_locations,
+        healthy_locations: report.healthy_locations,
+        quarantined_locations: report.quarantined_locations,
+        repaired_locations: report.repaired_locations,
+        escalated_logical_objects: report.escalated_logical_objects,
+    })
+}
+
+/// Compute the `rch rabs locate <object_key>` receipt over `store` (R004).
+pub fn locate_object_receipt(
+    store: &mut dyn RabsMetadataStore,
+    object_key: &str,
+) -> anyhow::Result<CasLocateReceipt> {
+    let rows = store
+        .query(
+            "SELECT store_path, encoding, durable, quarantined \
+             FROM object_locations WHERE object_key = ?1 ORDER BY store_path ASC",
+            &[SqlValue::Text(object_key.to_owned())],
+        )
+        .map_err(|e| anyhow::anyhow!("query object_locations: {e:?}"))?;
+    let mut replicas = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let [
+            SqlValue::Text(store_path),
+            SqlValue::Text(encoding_profile),
+            SqlValue::Int(verified_raw),
+            SqlValue::Int(quarantined),
+        ] = row.as_slice()
+        {
+            let exists_on_disk = Path::new(store_path).exists();
+            replicas.push(LocatedReplicaDto {
+                store_path: store_path.clone(),
+                encoding_profile: encoding_profile.clone(),
+                verified_raw: *verified_raw != 0,
+                quarantined: *quarantined != 0,
+                exists_on_disk,
+            });
+        }
+    }
+    let logical_quarantined = rabs_cas::materialization::inspect_quarantine(
+        store,
+        rabs_cas::metadata_store::QuarantineScope::LogicalObject,
+        object_key,
+    )
+    .map_err(|e| anyhow::anyhow!("inspect logical quarantine: {e:?}"))?
+    .is_some();
+
+    Ok(CasLocateReceipt {
+        schema: LOCATE_SCHEMA,
+        object_key: object_key.to_owned(),
+        logical_quarantined,
+        replicas,
+    })
+}
+
+/// Compute the `rch rabs quarantine list` receipt over `store` (R004).
+pub fn quarantine_list_receipt(
+    store: &mut dyn RabsMetadataStore,
+    scope: Option<&str>,
+) -> anyhow::Result<QuarantineListReceipt> {
+    let parsed_scope = match scope {
+        Some(s) => Some(parse_quarantine_scope(s)?),
+        None => None,
+    };
+    let rows = rabs_cas::materialization::list_quarantines(store, parsed_scope)
+        .map_err(|e| anyhow::anyhow!("list quarantines: {e:?}"))?;
+    let entries: Vec<QuarantineEntryDto> = rows.iter().map(QuarantineEntryDto::from).collect();
+    Ok(QuarantineListReceipt {
+        schema: QUARANTINE_LIST_SCHEMA,
+        count: entries.len(),
+        entries,
+    })
+}
+
+/// Compute the `rch rabs quarantine inspect` receipt over `store` (R004).
+pub fn quarantine_inspect_receipt(
+    store: &mut dyn RabsMetadataStore,
+    scope: &str,
+    subject: &str,
+) -> anyhow::Result<QuarantineInspectReceipt> {
+    let parsed_scope = parse_quarantine_scope(scope)?;
+    let row = rabs_cas::materialization::inspect_quarantine(store, parsed_scope, subject)
+        .map_err(|e| anyhow::anyhow!("inspect quarantine: {e:?}"))?;
+    let entry = row.as_ref().map(QuarantineEntryDto::from);
+    Ok(QuarantineInspectReceipt {
+        schema: QUARANTINE_INSPECT_SCHEMA,
+        scope: parsed_scope.as_str().to_owned(),
+        subject: subject.to_owned(),
+        quarantined: entry.is_some(),
+        entry,
+    })
+}
+
+/// Execute `rch rabs quarantine release` over `store` (R004 / H012).
+///
+/// Requires a durable verified repair receipt (`rabs-quarantine-repair-v1`)
+/// matching `(subject, repair_receipt_id)`.
+pub fn quarantine_release_receipt(
+    store: &mut dyn RabsMetadataStore,
+    scope: &str,
+    subject: &str,
+    repair_receipt_id: &str,
+    seq: Option<u64>,
+) -> anyhow::Result<QuarantineReleaseReceipt> {
+    let parsed_scope = parse_quarantine_scope(scope)?;
+    let release_seq = match seq {
+        Some(s) => s,
+        None => next_seq(store).map_err(|e| anyhow::anyhow!("allocate release seq: {e:?}"))?,
+    };
+    let released = store
+        .release_quarantine_with_receipt(parsed_scope, subject, repair_receipt_id, release_seq)
+        .map_err(|e| anyhow::anyhow!("release quarantine refused: {e:?}"))?;
+    Ok(QuarantineReleaseReceipt {
+        schema: QUARANTINE_RELEASE_SCHEMA,
+        scope: parsed_scope.as_str().to_owned(),
+        subject: subject.to_owned(),
+        repair_receipt_id: repair_receipt_id.to_owned(),
+        seq: release_seq,
+        released,
+    })
+}
+
+/// Entry point for `rch rabs verify` (R004).
+pub async fn run_verify(cas_root: Option<PathBuf>, ctx: &OutputContext) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let receipt = verify_cas_receipt(&mut store, &root)?;
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok("rabs verify", &receipt))?;
+    } else {
+        println!(
+            "rabs verify [{}]: scanned={} healthy={} quarantined={} repaired={} escalated={}",
+            receipt.cas_root,
+            receipt.scanned_locations,
+            receipt.healthy_locations,
+            receipt.quarantined_locations.len(),
+            receipt.repaired_locations.len(),
+            receipt.escalated_logical_objects.len(),
+        );
+    }
+    Ok(())
+}
+
+/// Entry point for `rch rabs locate <object_key>` (R004).
+pub async fn run_locate(
+    object_key: String,
+    cas_root: Option<PathBuf>,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let receipt = locate_object_receipt(&mut store, &object_key)?;
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok("rabs locate", &receipt))?;
+    } else {
+        println!(
+            "rabs locate {}: logical_quarantined={} replicas={}",
+            receipt.object_key,
+            receipt.logical_quarantined,
+            receipt.replicas.len()
+        );
+        for r in &receipt.replicas {
+            println!(
+                "  {} profile={} verified_raw={} quarantined={} exists={}",
+                r.store_path, r.encoding_profile, r.verified_raw, r.quarantined, r.exists_on_disk
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Entry point for `rch rabs quarantine <action>` (R004).
+pub async fn run_quarantine(action: QuarantineAction, ctx: &OutputContext) -> anyhow::Result<()> {
+    match action {
+        QuarantineAction::List { cas_root, scope } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let receipt = quarantine_list_receipt(&mut store, scope.as_deref())?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs quarantine list", &receipt))?;
+            } else {
+                println!("rabs quarantine list: count={}", receipt.count);
+                for e in &receipt.entries {
+                    println!("  [{}] {} -> {}", e.scope, e.subject, e.reason);
+                }
+            }
+            Ok(())
+        }
+        QuarantineAction::Inspect {
+            scope,
+            subject,
+            cas_root,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let receipt = quarantine_inspect_receipt(&mut store, &scope, &subject)?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs quarantine inspect", &receipt))?;
+            } else if let Some(entry) = &receipt.entry {
+                println!(
+                    "rabs quarantine inspect: [{}] {} QUARANTINED ({})",
+                    entry.scope, entry.subject, entry.reason
+                );
+            } else {
+                println!(
+                    "rabs quarantine inspect: [{}] {} not quarantined",
+                    receipt.scope, receipt.subject
+                );
+            }
+            Ok(())
+        }
+        QuarantineAction::Release {
+            scope,
+            subject,
+            receipt_id,
+            seq,
+            cas_root,
+        } => {
+            let root = resolve_cas_root(cas_root.as_deref())?;
+            let mut store = open_store(&root)?;
+            let receipt =
+                quarantine_release_receipt(&mut store, &scope, &subject, &receipt_id, seq)?;
+            if ctx.is_json() || ctx.is_toon() {
+                ctx.json(&ApiResponse::ok("rabs quarantine release", &receipt))?;
+            } else {
+                println!(
+                    "rabs quarantine release: [{}] {} receipt_id={} seq={} released={}",
+                    receipt.scope,
+                    receipt.subject,
+                    receipt.repair_receipt_id,
+                    receipt.seq,
+                    receipt.released
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `rch rabs <group>` command groups (R004 lands `verify`, `locate`,
+/// `quarantine`; R005 lands `gc`; R006 lands `worker` + `doctor`;
+/// `bd-dockb` lands `release-verdict`).
 #[derive(Debug, Subcommand)]
 pub enum RabsCommand {
     /// Content-addressed store garbage collection (H014 engine)
@@ -973,6 +1550,27 @@ pub enum RabsCommand {
         #[arg(long, value_name = "SEQS", default_value_t = 1_000)]
         min_seq_lag: u64,
     },
+    /// Scrub and verify physical CAS locations, repairing corrupt copies from healthy replicas (R004 / H023)
+    Verify {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+    },
+    /// Locate physical CAS replicas and quarantine state for an object key (R004)
+    Locate {
+        /// Object digest key (`domain:hex`)
+        #[arg(value_name = "OBJECT_KEY")]
+        object_key: String,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+    },
+    /// List, inspect, or release CAS quarantines with a verified repair receipt (R004 / H012)
+    Quarantine {
+        /// Quarantine operation
+        #[command(subcommand)]
+        action: QuarantineAction,
+    },
     /// What is cached where: edge L1, local L2 projects, toolchains,
     /// store facts — with namespace existence-hiding (K006/K010 ACL)
     Inventory {
@@ -986,6 +1584,110 @@ pub enum RabsCommand {
         /// (repeatable; unlisted namespaces collapse into a count)
         #[arg(long, value_name = "NAMESPACE")]
         allow_namespace: Vec<String>,
+    },
+    /// Inspect or record durable T011 release-gate verdicts (`bd-dockb`)
+    #[command(
+        name = "release-verdict",
+        after_help = "EXAMPLES:\n    rch rabs release-verdict show\n    rch rabs release-verdict show --build rabs-2.1.34 --json\n    rch rabs release-verdict record --corpus shadow-ci --replayed 128 --max-age-secs 86400"
+    )]
+    ReleaseVerdict {
+        /// Release-verdict operation
+        #[command(subcommand)]
+        action: ReleaseVerdictAction,
+    },
+}
+
+/// One quarantine operation (R004 / H012).
+#[derive(Debug, Subcommand)]
+pub enum QuarantineAction {
+    /// List active quarantines (optionally filtered by scope)
+    List {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Optional scope filter (`location|logical-object|action-entry`)
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+    },
+    /// Inspect quarantine status for a specific (scope, subject)
+    Inspect {
+        /// Quarantine scope (`location|logical-object|action-entry`)
+        #[arg(value_name = "SCOPE")]
+        scope: String,
+        /// Quarantine subject (store path, object key, or action key)
+        #[arg(value_name = "SUBJECT")]
+        subject: String,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+    },
+    /// Release a quarantine using a verified repair receipt ID (`rabs-quarantine-repair-v1`)
+    Release {
+        /// Quarantine scope (`location|logical-object|action-entry`)
+        #[arg(value_name = "SCOPE")]
+        scope: String,
+        /// Quarantine subject (store path, object key, or action key)
+        #[arg(value_name = "SUBJECT")]
+        subject: String,
+        /// Verified repair receipt ID (`rabs-quarantine-repair-v1`)
+        #[arg(long, value_name = "RECEIPT_ID")]
+        receipt_id: String,
+        /// Optional decision sequence override
+        #[arg(long, value_name = "SEQ")]
+        seq: Option<u64>,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+    },
+}
+
+/// One release-verdict operation (`bd-dockb`).
+#[derive(Debug, Subcommand)]
+pub enum ReleaseVerdictAction {
+    /// Inspect the durable release verdict and standing for a build
+    Show {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Build identity to inspect (default: this binary's derived identity)
+        #[arg(long, value_name = "BUILD")]
+        build: Option<String>,
+        /// Evaluation timestamp in Unix microseconds (default: current wall clock)
+        #[arg(long, value_name = "MICROS")]
+        now_micros: Option<i64>,
+        /// Coordinator clock epoch to evaluate against
+        #[arg(long, value_name = "EPOCH", default_value_t = 0)]
+        clock_epoch: u64,
+    },
+    /// Record a durable release verdict for a build after a passing corpus run
+    Record {
+        /// CAS root directory (default: rabsd's state dir; initialized if absent)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Build identity to authorize (default: this binary's derived identity)
+        #[arg(long, value_name = "BUILD")]
+        build: Option<String>,
+        /// Corpus identifier that produced this verdict
+        #[arg(long, value_name = "CORPUS")]
+        corpus: String,
+        /// Number of records that replayed under both stock and RABS (> 0)
+        #[arg(long, value_name = "N")]
+        replayed: u64,
+        /// Number of divergences explicitly explained by operator policy
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        explained: u64,
+        /// Optional validity window in seconds
+        #[arg(long, value_name = "SECS")]
+        max_age_secs: Option<u64>,
+        /// Evaluation timestamp in Unix microseconds (default: current wall clock)
+        #[arg(long, value_name = "MICROS")]
+        evaluated_at_micros: Option<i64>,
+        /// Conservative clock uncertainty in microseconds
+        #[arg(long, value_name = "MICROS", default_value_t = 0)]
+        clock_uncertainty_micros: u64,
+        /// Coordinator clock epoch
+        #[arg(long, value_name = "EPOCH", default_value_t = 0)]
+        clock_epoch: u64,
     },
 }
 
@@ -1339,5 +2041,174 @@ mod tests {
         };
         assert!(err.to_string().contains(RC_CAS_ROOT_MISSING), "{err}");
         assert!(!root.exists(), "must not create anything");
+    }
+
+    #[test]
+    fn release_verdict_show_and_record_round_trip_and_enforce_evidence_and_expiry() {
+        let mut ts = fresh_store("release-verdict");
+        let build = rabs_protocol::release_authorization::default_build_identity();
+        let root = ts._dir.path().to_path_buf();
+
+        let initial =
+            build_release_verdict_receipt(&mut ts.store, &root, &build, 1_000, 0).expect("show");
+        assert_eq!(initial.standing, "absent");
+        assert!(initial.permits_advisory);
+        assert!(!initial.permits_required);
+        assert!(initial.verdict.is_none());
+
+        let zero_replayed = rabs_protocol::release_authorization::ReleaseVerdict {
+            build: build.clone(),
+            corpus: "shadow-ci".to_owned(),
+            replayed: 0,
+            explained: 0,
+            validity: rabs_protocol::serving::ServingValidity {
+                evaluated_at_unix_micros: 1_000,
+                maximum_age_micros: Some(10_000),
+                clock_uncertainty_micros: 0,
+                coordinator_clock_epoch: 0,
+            },
+        };
+        assert!(
+            record_and_verify_release_verdict(&mut ts.store, &root, &zero_replayed, 1_000, 0)
+                .is_err(),
+            "zero-replayed verdicts must be refused at record time"
+        );
+
+        let valid = rabs_protocol::release_authorization::ReleaseVerdict {
+            build: build.clone(),
+            corpus: "shadow-ci".to_owned(),
+            replayed: 64,
+            explained: 1,
+            validity: rabs_protocol::serving::ServingValidity {
+                evaluated_at_unix_micros: 1_000,
+                maximum_age_micros: Some(10_000),
+                clock_uncertainty_micros: 0,
+                coordinator_clock_epoch: 0,
+            },
+        };
+        let recorded = record_and_verify_release_verdict(&mut ts.store, &root, &valid, 2_000, 0)
+            .expect("record");
+        assert_eq!(recorded.standing, "authorized");
+        assert!(recorded.permits_advisory);
+        assert!(recorded.permits_required);
+        assert_eq!(
+            recorded.verdict.as_ref().map(|v| v.replayed),
+            Some(64),
+            "{recorded:?}"
+        );
+
+        let expired = build_release_verdict_receipt(&mut ts.store, &root, &build, 25_000, 0)
+            .expect("show expired");
+        assert_eq!(expired.standing, "expired");
+        assert!(expired.permits_advisory);
+        assert!(!expired.permits_required);
+    }
+
+    #[test]
+    fn r004_verify_locate_and_quarantine_list_inspect_release_enforce_receipts() {
+        let mut ts = fresh_store("r004");
+        let root = ts._dir.path().to_path_buf();
+        let bytes = b"r004-verified-cas-payload";
+        let obj = rabs_cas::digest_set::digest_set(
+            bytes,
+            rabs_cas::digest_set::DigestRequest::default(),
+            None,
+        )
+        .expect("digest")
+        .atp_content_id;
+        let obj_key = rabs_cas::metadata_store::digest_key(&obj);
+
+        let replica_path = root.join("replica.bin");
+        std::fs::write(&replica_path, bytes).expect("write replica");
+        let replica_str = replica_path.to_str().expect("utf8").to_owned();
+
+        ts.store
+            .record_object(&obj, bytes.len() as u64)
+            .expect("record object");
+        ts.store
+            .add_location(&obj, &replica_str, Some(1), "raw-v1", true)
+            .expect("add location");
+
+        // 1. Locate healthy replica
+        let located = locate_object_receipt(&mut ts.store, &obj_key).expect("locate");
+        assert!(!located.logical_quarantined);
+        assert_eq!(located.replicas.len(), 1);
+        assert!(!located.replicas[0].quarantined);
+        assert!(located.replicas[0].exists_on_disk);
+
+        // 2. Corrupt the single replica and run `verify` -> escalates to logical-object quarantine
+        std::fs::write(&replica_path, b"corrupt-r004-bytes").expect("corrupt replica");
+        let verify = verify_cas_receipt(&mut ts.store, &root).expect("verify");
+        assert_eq!(verify.scanned_locations, 1);
+        assert_eq!(verify.healthy_locations, 0);
+        assert_eq!(verify.quarantined_locations, vec![replica_str.clone()]);
+        assert_eq!(verify.escalated_logical_objects, vec![obj_key.clone()]);
+
+        // 3. Quarantine list and inspect
+        let list = quarantine_list_receipt(&mut ts.store, None).expect("list");
+        assert_eq!(list.count, 2);
+        let loc_list = quarantine_list_receipt(&mut ts.store, Some("location")).expect("list loc");
+        assert_eq!(loc_list.count, 1);
+        assert_eq!(loc_list.entries[0].subject, replica_str);
+
+        let inspected =
+            quarantine_inspect_receipt(&mut ts.store, "logical-object", &obj_key).expect("inspect");
+        assert!(inspected.quarantined);
+
+        // 4. Release without a verified repair receipt must be refused
+        assert!(
+            quarantine_release_receipt(
+                &mut ts.store,
+                "logical-object",
+                &obj_key,
+                "missing-receipt-id",
+                None,
+            )
+            .is_err(),
+            "quarantine release without a verified repair receipt must be refused"
+        );
+
+        // 5. Restore bytes, record verified repair receipt, and release both quarantines
+        std::fs::write(&replica_path, bytes).expect("restore replica");
+        rabs_cas::materialization::record_verified_repair_receipt(
+            &mut ts.store,
+            &replica_str,
+            "repair-loc-1",
+            "restored-from-source",
+            50,
+        )
+        .expect("loc receipt");
+        rabs_cas::materialization::record_verified_repair_receipt(
+            &mut ts.store,
+            &obj_key,
+            "repair-obj-1",
+            "restored-from-source",
+            51,
+        )
+        .expect("obj receipt");
+
+        let rel_loc = quarantine_release_receipt(
+            &mut ts.store,
+            "location",
+            &replica_str,
+            "repair-loc-1",
+            None,
+        )
+        .expect("release location");
+        assert!(rel_loc.released);
+        let rel_obj = quarantine_release_receipt(
+            &mut ts.store,
+            "logical-object",
+            &obj_key,
+            "repair-obj-1",
+            None,
+        )
+        .expect("release logical object");
+        assert!(rel_obj.released);
+
+        let after_verify = verify_cas_receipt(&mut ts.store, &root).expect("verify after repair");
+        assert_eq!(after_verify.scanned_locations, 1);
+        assert_eq!(after_verify.healthy_locations, 1);
+        assert!(after_verify.quarantined_locations.is_empty());
     }
 }

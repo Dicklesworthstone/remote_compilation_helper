@@ -8,9 +8,8 @@
 //! across crashes. Offline verification does not manufacture a remote release ACK.
 
 use super::{
-    MAX_RUNNING, OperationClaim, OperationOutcome, OperationState, OperationStatus,
-    PreparedOperationStore, Record, State, StoredMode, invalid, ordinary_directory, overlap,
-    path_shape, require, valid_id,
+    OperationClaim, OperationOutcome, OperationState, OperationStatus, PreparedOperationStore,
+    Record, State, StoredMode, invalid, ordinary_directory, overlap, path_shape, require, valid_id,
 };
 use crate::coord::delivery_recovery::{
     DeliveryTrust, install_delivery_outputs, recover_existing_delivery,
@@ -36,7 +35,7 @@ impl PreparedOperationStore {
     pub fn recover_next_local(self: &Arc<Self>) -> io::Result<Option<OperationStatus>> {
         let (mut claim, acceptance_confirmed) = {
             let mut state = self.lock_state()?;
-            if !state.accepting || state.active.len() >= MAX_RUNNING {
+            if !state.accepting || state.active.len() >= self.concurrency.get() {
                 return Ok(None);
             }
             let next = state
@@ -130,7 +129,7 @@ impl PreparedOperationStore {
         let id = record.spec.id.clone();
         require(state.accepting, "prepared operation service is stopping")?;
         require(
-            state.active.len() < MAX_RUNNING,
+            state.active.len() < self.concurrency.get(),
             "prepared operation capacity exhausted",
         )?;
         require(
@@ -200,6 +199,7 @@ impl PreparedOperationStore {
                 store: Arc::clone(self),
                 spec,
                 request: record.request,
+                allocation_pending: false,
                 mode: StoredMode::LocalRecovery,
                 resume_from: None,
                 attempt: record.attempt,

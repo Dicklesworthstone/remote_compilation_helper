@@ -21,6 +21,7 @@ use rabsd::coord::worker_delivery::{
     receive_operation, transport_interrupted, validate_request, worker_transport_error,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -28,7 +29,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod prepared_build;
-pub use prepared_build::{execute_prepared_operation, run_build, run_build_tls};
+pub use prepared_build::{
+    execute_prepared_operation, prepare_daemon_build, run_build, run_build_tls,
+};
 
 use rabsd::coord::secure_worker_delivery::OperationCancellation;
 
@@ -660,6 +663,12 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
     })
 }
 
+fn worker_admission_state() -> PathBuf {
+    std::env::var_os("RABS_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(crate::default_under_home(".cache/rch/rabs-state")))
+}
+
 struct TlsOperationControl<'a> {
     cancellation: OperationCancellation,
     preview: Option<rabsd::coord::prepared_operation::PreviewObserver>,
@@ -696,6 +705,7 @@ fn accept_tls_worker(
     request_id: &Value,
     operation: &str,
     mut control: Option<&mut TlsOperationControl<'_>>,
+    reserved: Option<prepared_build::ReservedWorkerAdmission>,
 ) -> io::Result<(
     asupersync::runtime::Runtime,
     rabs_asupersync::worker_transport::AuthenticatedPeer,
@@ -721,16 +731,19 @@ fn accept_tls_worker(
     let acceptor = coordinator_tls_files()?
         .acceptor()
         .map_err(io::Error::other)?;
-    // A stable worker name owns its persistent pin and boot history. Hold its
-    // exclusive admission capability before listening and through stream close.
-    let state = std::env::var_os("RABS_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(crate::default_under_home(".cache/rch/rabs-state")));
-    let admission = PinnedWorkerAdmission::open(&state, worker, parse_worker_pin(pin)?)?;
+    // A newly allocated request must carry the original exclusive owner into
+    // this session. Reopening would either race another request or collide
+    // with our own still-held store lock. Recovery never allocates an ID.
+    let admission = match reserved {
+        Some(reserved) => reserved.into_admission(worker, pin, request_id)?,
+        None => {
+            PinnedWorkerAdmission::open(&worker_admission_state(), worker, parse_worker_pin(pin)?)?
+        }
+    };
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| io::Error::other(format!("worker delivery runtime: {error:?}")))?;
-    let peer = runtime.block_on(async {
+    let peer = rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
         let listener = asupersync::net::TcpListener::bind(address)
             .await
             .map_err(|error| io::Error::new(error.kind(), format!("worker TLS listen: {error}")))?;
@@ -803,13 +816,14 @@ fn run_tls_operation(
     operation: WorkerOperation<'_>,
     worker_pin: &str,
 ) -> Result<Delivery, DeliveryFailure> {
-    run_tls_operation_inner(operation, worker_pin, None)
+    run_tls_operation_inner(operation, worker_pin, None, None)
 }
 
 fn run_tls_operation_inner(
     operation: WorkerOperation<'_>,
     worker_pin: &str,
     mut control: Option<TlsOperationControl<'_>>,
+    reserved: Option<prepared_build::ReservedWorkerAdmission>,
 ) -> Result<Delivery, DeliveryFailure> {
     use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
     use rabsd::coord::secure_worker_delivery::{
@@ -827,6 +841,14 @@ fn run_tls_operation_inner(
         resume_from,
     } = operation;
     let failure = |detail: String| operation_failure(directory, mode, detail);
+    if let Some(reserved) = &reserved {
+        if mode != DeliveryMode::Execute || resume_from.is_some() {
+            return Err(failure("request allocation is not result recovery".into()));
+        }
+        reserved
+            .validate_request(worker, worker_pin, request)
+            .map_err(|error| failure(error.to_string()))?;
+    }
     let (address, pin) = (|| -> Result<_, String> {
         let address: SocketAddr = address
             .parse()
@@ -878,6 +900,7 @@ fn run_tls_operation_inner(
             "canonical-exec"
         },
         control.as_mut(),
+        reserved,
     )
     .map_err(|error| {
         let mut failure = failure(error.to_string());
@@ -970,6 +993,7 @@ fn run_tls_acknowledgment_bound(
         &request["request_id"],
         "result-acknowledgment",
         control.as_mut(),
+        None,
     )
     .map_err(|error| {
         let mut failure = failure(error.to_string());
@@ -1000,7 +1024,7 @@ pub fn run_tls(args: &[String]) -> i32 {
     }
     let Some((args, mode, source_root, resume_from)) = execution_arguments(args, 5) else {
         eprintln!(
-            "usage: rabsd --worker-exec-tls [--resume | --resume-from <absolute-old-delivery> | --acknowledge | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>"
+            "usage: rabsd --worker-exec-tls [--resume | --resume-from <absolute-old-delivery> | --acknowledge | --source-root <absolute-root>] <IP:port> <worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>"
         );
         eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
         eprintln!(

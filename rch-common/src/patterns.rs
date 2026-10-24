@@ -281,12 +281,9 @@ pub enum CompilationKind {
 
     // Go commands
     //
-    // Only the non-emitting forms are offloaded. `go build -o <file>` writes a
-    // binary the caller expects to find locally, so classify_go declines it and
-    // it runs locally — a remote build whose artifact never came home would be a
-    // silent correctness bug. Plain `go build ./...` is a compile check that
-    // produces no output file, so exit status is the whole payload.
-    /// `go build ./...` (compile check; no `-o` output file)
+    // Builds require an explicit file output and durable artifact delivery.
+    // Even ./... can select one main package and emit an implicit executable.
+    /// `go build -o <file>` (required output returned through staged retrieval)
     GoBuild,
     /// `go test ./...`
     GoTest,
@@ -584,7 +581,7 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
     // rewrite offloads EVERY build in the chain. Previously only the final
     // segment was wrapped and `cargo build --release && cargo test` compiled
     // the first half locally on the dispatcher with no summary line at all.
-    // Segments that do not classify (cd, touch, `go build -o app`, ...)
+    // Segments that do not classify (cd, touch, implicit `go build`, ...)
     // are re-emitted verbatim.
     let mut prefix = String::with_capacity(cmd.len() + segments.len() * EXEC_REWRITE_PREFIX.len());
     for segment in &segments[..segments.len() - 1] {
@@ -613,9 +610,9 @@ const EXEC_REWRITE_PREFIX: &str = "rch exec -- ";
 /// command but were not classified as one, and therefore stay local when the
 /// chain is rewritten by the hook (issue #50).
 ///
-/// Example: `go build -o app ./cmd && cargo test` — `go build -o` emits a
-/// local binary and is never offloaded, so the hook rewrites only `cargo test`;
-/// this returns `["go build -o app ./cmd"]` so the hook can say so instead of
+/// Example: `go build ./cmd && cargo test` — an implicit Go output cannot yet
+/// be enumerated, so the hook rewrites only `cargo test`;
+/// this returns `["go build ./cmd"]` so the hook can say so instead of
 /// staying silent.
 /// Returns an empty vector for anything that is not a plain `&&` chain.
 pub fn compound_local_compilation_segments(cmd: &str) -> Vec<String> {
@@ -1477,7 +1474,7 @@ fn looks_like_duration_or_priority(token: &str) -> bool {
 /// quotes literal flags such as `-f%U` when rebuilding its shell command.
 /// Mixed/unterminated quoting is left unrecognized rather than guessing where
 /// the wrapped command starts.
-fn split_wrapper_word(input: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_wrapper_word(input: &str) -> Option<(&str, &str)> {
     let input = input.trim_start();
     let first = input.chars().next()?;
     if matches!(first, '\'' | '"') {
@@ -1967,8 +1964,8 @@ fn classify_full(cmd: &str) -> Classification {
     }
 
     if cmd.starts_with("cargo-xwin ") || cmd.eq("cargo-xwin") {
-        return if is_cargo_xwin_build(cmd) {
-            Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo-xwin build")
+        return if let Some(kind) = cargo_xwin_compilation_kind(cmd) {
+            Classification::compilation(kind, 0.95, "cargo-xwin compilation")
         } else {
             Classification::not_compilation("cargo-xwin subcommand not interceptable")
         };
@@ -2200,17 +2197,180 @@ fn classify_tsc(args: &str) -> Classification {
     Classification::compilation(CompilationKind::Tsc, 0.95, "tsc --noEmit typecheck")
 }
 
-/// Classify `go` subcommands.
+/// Parse a bounded literal argv without interpreting shell expansions. Whole
+/// quoted words cover `rch exec`'s reconstructed flags and output filenames;
+/// mixed or escaped quoting is conservatively left to local execution.
+fn literal_flag_words(mut command: &str) -> Option<Vec<&str>> {
+    if command.len() > 65_536 || command.contains(['\0', '\r', '\n']) {
+        return None;
+    }
+    let mut words = Vec::new();
+    while !command.trim().is_empty() {
+        command = command.trim_start();
+        let quoted = command.starts_with(['\'', '"']);
+        let (word, rest) = split_wrapper_word(command)?;
+        if !quoted
+            && word.contains([
+                '$', '`', '*', '?', '[', '{', '}', '~', '|', '&', ';', '<', '>', '(', ')', '#',
+            ])
+        {
+            return None;
+        }
+        words.push(word);
+        if words.len() > 4096 {
+            return None;
+        }
+        command = rest;
+    }
+    Some(words)
+}
+
+/// The common linker flags that do not introduce another output file. Go's
+/// lower-level flags also include profiles, temporary directories and external
+/// commands, so arbitrary -ldflags/-gcflags/-asmflags cannot share a one-file
+/// delivery contract.
+fn go_linker_flags_have_one_output(value: &str) -> bool {
+    let mut flags = value.split_whitespace();
+    let mut present = false;
+    while let Some(flag) = flags.next() {
+        present = true;
+        match flag {
+            "-s" | "-w" | "-s=true" | "-s=false" | "-w=true" | "-w=false" => {}
+            "-X" => {
+                if !flags.next().is_some_and(|value| {
+                    value
+                        .split_once('=')
+                        .is_some_and(|(name, _)| !name.is_empty())
+                }) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    present
+}
+
+/// The one project-relative file promised by a supported `go build -o`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoBuildOutput {
+    /// Literal path, relative to the invocation directory.
+    pub path: String,
+    /// Index of the -o option in the normalized argv, including `go build`.
+    /// The executor uses this to replace only the actual output option, never
+    /// an opaque argument value that happens to resemble a flag.
+    pub option_index: usize,
+}
+
+/// Plan the explicit file output of a supported Go build.
 ///
-/// Only `build` (without `-o`), `test`, and `vet` are offloaded. Everything else
-/// is either local-state-mutating or trivially fast and is listed in
-/// [`NEVER_INTERCEPT`]; this function is the second line of defence.
-///
-/// `go build -o <file>` is deliberately NOT offloaded: it writes a binary the
-/// caller expects to find on the local filesystem, and Go kinds are stream-only
-/// (no artifact sync-back). Offloading it would report success while leaving no
-/// binary behind. Plain `go build ./...` writes nothing (it is a compile check),
-/// so exit status is the entire payload and it is safe to run remotely.
+/// Classification and durable retrieval use this same parser. Implicit output
+/// names depend on the selected packages (including what ./... matches), and
+/// directories or native-library build modes can produce multiple files. Keep
+/// those forms local until their complete output sets can be planned.
+#[must_use]
+pub fn go_build_output(command: &str) -> Option<GoBuildOutput> {
+    let normalized = normalize_command(command);
+    let words = literal_flag_words(&normalized)?;
+    let mut args = words.into_iter().enumerate();
+    if args.next()?.1 != "go" || args.next()?.1 != "build" {
+        return None;
+    }
+    let mut output = None;
+    let mut packages_started = false;
+    while let Some((option_index, arg)) = args.next() {
+        if !arg.starts_with('-') {
+            packages_started = true;
+            continue;
+        }
+        if packages_started {
+            return None;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        match flag {
+            "-o" => {
+                let path = inline.or_else(|| args.next().map(|(_, value)| value))?;
+                if output
+                    .replace(GoBuildOutput {
+                        path: path.to_owned(),
+                        option_index,
+                    })
+                    .is_some()
+                    || path.is_empty()
+                    || path == "-"
+                    || path.ends_with('/')
+                    || path.chars().any(char::is_control)
+                    || !std::path::Path::new(path).components().all(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::Normal(_) | std::path::Component::CurDir
+                        )
+                    })
+                    || !std::path::Path::new(path)
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::Normal(_)))
+                {
+                    return None;
+                }
+            }
+            "-buildmode" => {
+                if !matches!(
+                    inline.or_else(|| args.next().map(|(_, value)| value))?,
+                    "default" | "exe" | "pie"
+                ) {
+                    return None;
+                }
+            }
+            "-compiler" => {
+                if inline.or_else(|| args.next().map(|(_, value)| value))? != "gc" {
+                    return None;
+                }
+            }
+            "-p" | "-tags" | "-covermode" | "-coverpkg" => {
+                if inline
+                    .or_else(|| args.next().map(|(_, value)| value))?
+                    .is_empty()
+                {
+                    return None;
+                }
+            }
+            "-ldflags" => {
+                if !go_linker_flags_have_one_output(
+                    inline.or_else(|| args.next().map(|(_, value)| value))?,
+                ) {
+                    return None;
+                }
+            }
+            "-mod" => {
+                if !matches!(
+                    inline.or_else(|| args.next().map(|(_, value)| value))?,
+                    "readonly" | "vendor"
+                ) {
+                    return None;
+                }
+            }
+            "-buildvcs" => {
+                if inline.is_some_and(|value| !matches!(value, "auto" | "true" | "false")) {
+                    return None;
+                }
+            }
+            "-a" | "-race" | "-msan" | "-asan" | "-v" | "-x" | "-trimpath" | "-modcacherw"
+            | "-cover" => {
+                if inline.is_some_and(|value| !matches!(value, "true" | "false")) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    output
+}
+
+/// Classify Go builds with a complete explicit output contract, and streaming
+/// test/vet commands. File-producing test modes remain local until they have an
+/// equivalent contract; arbitrary subcommands are never offloaded here.
 fn classify_go(cmd: &str) -> Classification {
     let mut tokens = cmd.split_whitespace();
     // Skip the leading "go".
@@ -2226,31 +2386,50 @@ fn classify_go(cmd: &str) -> Classification {
 
     match subcommand {
         "build" => {
-            // `-o <file>` (or `-o=<file>`) emits a binary locally — keep it local.
-            if args
-                .iter()
-                .any(|a| a.eq(&"-o") || a.starts_with("-o=") || a.eq(&"--output"))
-            {
+            if go_build_output(cmd).is_none() {
                 return Classification::not_compilation(
-                    "go build -o emits a local binary (not intercepted)",
+                    "go build requires a supported explicit -o file for artifact delivery",
+                );
+            }
+            if !cfg!(unix) {
+                return Classification::not_compilation(
+                    "Go output delivery requires a Unix dispatcher and worker",
                 );
             }
             Classification::compilation(CompilationKind::GoBuild, 0.95, "go build command")
         }
         "test" => {
-            // `-exec` runs an arbitrary local wrapper binary; keep it local.
-            if args
-                .iter()
-                .any(|a| a.eq(&"-exec") || a.starts_with("-exec="))
-            {
+            // These flags accept both separated and = values. Profiling flags
+            // may also be passed directly to the test binary as -test.*.
+            if args.iter().any(|arg| {
+                // Also catch a quoted -flag=value whose value contains spaces.
+                // A flag-looking value is conservatively left local.
+                let arg = arg.trim_matches(['\'', '"']);
+                if !arg.starts_with('-') {
+                    return false;
+                }
+                let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+                let flag = flag.trim_start_matches('-');
+                let flag = flag.strip_prefix("test.").unwrap_or(flag);
+                matches!(
+                    flag,
+                    "c" | "o"
+                        | "exec"
+                        | "coverprofile"
+                        | "cpuprofile"
+                        | "memprofile"
+                        | "blockprofile"
+                        | "mutexprofile"
+                        | "trace"
+                        | "outputdir"
+                        | "fuzz"
+                        | "fuzzcachedir"
+                        | "gocoverdir"
+                        | "testlogfile"
+                )
+            }) {
                 return Classification::not_compilation(
-                    "go test -exec runs a local wrapper (not intercepted)",
-                );
-            }
-            // `-c` compiles the test binary to disk instead of running it.
-            if args.iter().any(|a| a.eq(&"-c")) {
-                return Classification::not_compilation(
-                    "go test -c emits a local test binary (not intercepted)",
+                    "go test emits files or uses a local execution wrapper (not intercepted)",
                 );
             }
             Classification::compilation(CompilationKind::GoTest, 0.95, "go test command")
@@ -2357,40 +2536,38 @@ pub fn is_cargo_package_verification(command: &str) -> bool {
     matches!(subcommand, Some("package")) || (subcommand == Some("publish") && dry_run)
 }
 
-/// Recognize the explicit cargo-xwin build entry points, without treating a
-/// mention in a Cargo option value as permission to relax the native MSVC gate.
-/// The worker must still have the requested Rust target, cargo-xwin and its SDK.
-/// Non-build commands (including cache mutation and environment inspection) are
-/// deliberately outside this offload surface.
+/// Recognize explicit cargo-xwin build, check, and clippy entry points, without
+/// treating a mention in a Cargo option value as permission to relax the native
+/// MSVC gate. Requested Rust targets and toolchains still go through admission.
+/// Cache mutation, environment inspection, and other subcommands are deliberately
+/// outside this offload surface.
 #[must_use]
-pub fn is_cargo_xwin_build(command: &str) -> bool {
+pub fn cargo_xwin_compilation_kind(command: &str) -> Option<CompilationKind> {
     let normalized = normalize_command(command);
     let cmd = normalized.as_ref();
-    if check_structure(cmd).is_some() || cmd.contains(['\'', '"', '\\', '$', '`']) {
-        return false;
+    let mut tokens = cmd.split_whitespace().map(unquote_literal_option_word);
+    if check_structure(cmd).is_some()
+        || tokens
+            .clone()
+            .any(|token| token.contains(['\'', '"', '\\', '$', '`']))
+    {
+        return None;
     }
-    let mut tokens = cmd.split_whitespace();
-    match tokens.next() {
+    let subcommand = match tokens.next() {
         Some("cargo-xwin") => {
-            let mut subcommand = tokens.next();
+            let subcommand = tokens.next();
             if subcommand == Some("xwin") {
-                subcommand = tokens.next();
-            }
-            if subcommand != Some("build") {
-                return false;
+                tokens.next()
+            } else {
+                subcommand
             }
         }
         Some("cargo") => loop {
             match tokens.next() {
-                Some("xwin") => {
-                    if tokens.next() != Some("build") {
-                        return false;
-                    }
-                    break;
-                }
+                Some("xwin") => break tokens.next(),
                 Some("--color" | "--config" | "-Z" | "-C") => {
                     if tokens.next().is_none_or(|value| value.starts_with('-')) {
-                        return false;
+                        return None;
                     }
                 }
                 Some("--locked" | "--offline" | "--frozen" | "-v" | "-vv" | "-q") => {}
@@ -2398,12 +2575,30 @@ pub fn is_cargo_xwin_build(command: &str) -> bool {
                     if token.starts_with('+')
                         || token.starts_with("--color=")
                         || token.starts_with("--config=") => {}
-                _ => return false,
+                _ => return None,
             }
         },
-        _ => return false,
+        _ => return None,
+    };
+    let kind = match subcommand? {
+        "build" => CompilationKind::CargoBuild,
+        "check" => CompilationKind::CargoCheck,
+        "clippy" => CompilationKind::CargoClippy,
+        _ => return None,
+    };
+    if tokens.any(|token| matches!(token, "--help" | "-h" | "--version" | "-V")) {
+        return None;
     }
-    !tokens.any(|token| matches!(token, "--help" | "-h" | "--version" | "-V"))
+    Some(kind)
+}
+
+/// Backward compatibility helper for cargo-xwin build commands.
+#[must_use]
+pub fn is_cargo_xwin_build(command: &str) -> bool {
+    matches!(
+        cargo_xwin_compilation_kind(command),
+        Some(CompilationKind::CargoBuild)
+    )
 }
 
 /// `rch exec` rebuilds its command with `shell_words::join`, which single-quotes
@@ -2416,6 +2611,22 @@ fn unquote_whole_word(token: &str) -> &str {
         .and_then(|rest| rest.strip_suffix('\''))
         .filter(|inner| !inner.contains('\''))
         .unwrap_or(token)
+}
+
+/// Read simple option words quoted by `shell_words::join` without interpreting
+/// quoted command names, standalone values, mixed quoting, or shell syntax.
+/// Keeping this decoder shared with admission preserves quoted target options.
+pub(crate) fn unquote_literal_option_word(token: &str) -> &str {
+    let word = unquote_whole_word(token);
+    if word.starts_with('-')
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./=:+,".contains(&byte))
+    {
+        word
+    } else {
+        token
+    }
 }
 
 /// Classify cargo subcommands.
@@ -2493,8 +2704,8 @@ fn classify_cargo(cmd: &str) -> Classification {
             Classification::compilation(CompilationKind::CargoZigbuild, 0.95, "cargo zigbuild")
         }
         "xwin" => {
-            if is_cargo_xwin_build(cmd) {
-                Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo xwin build")
+            if let Some(kind) = cargo_xwin_compilation_kind(cmd) {
+                Classification::compilation(kind, 0.95, "cargo xwin compilation")
             } else {
                 Classification::not_compilation("cargo xwin subcommand not interceptable")
             }
@@ -2804,50 +3015,98 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cargo_xwin_builds_use_the_cargo_build_contract() {
-        for command in [
-            "cargo xwin build --release --locked --target x86_64-pc-windows-msvc",
-            "cargo +nightly-2026-08-31 xwin build --target=aarch64-pc-windows-msvc",
-            "cargo --color never --locked xwin build",
-            "env CARGO_HOME=/root/.cargo cargo xwin build --release",
-            "cargo-xwin build --release",
-            "cargo-xwin xwin build --release",
-            "/home/ubuntu/.local/bin/cargo-xwin xwin build --release",
+    fn cargo_xwin_compilations_use_their_cargo_contracts() {
+        for (subcommand, kind, arguments) in [
+            (
+                "build",
+                CompilationKind::CargoBuild,
+                "--release --locked --target x86_64-pc-windows-msvc",
+            ),
+            (
+                "check",
+                CompilationKind::CargoCheck,
+                "--locked --all-targets --target aarch64-pc-windows-msvc",
+            ),
+            (
+                "clippy",
+                CompilationKind::CargoClippy,
+                "--locked --all-targets --target=x86_64-pc-windows-msvc -- -D warnings",
+            ),
         ] {
-            assert!(is_cargo_xwin_build(command), "{command}");
-            let classification = classify_command(command);
-            assert!(classification.is_compilation, "{command}");
-            assert_eq!(
-                classification.kind,
-                Some(CompilationKind::CargoBuild),
-                "{command}"
-            );
+            for prefix in [
+                "cargo xwin",
+                "cargo +nightly-2026-08-31 xwin",
+                "cargo --color never --locked xwin",
+                "cargo --config build.jobs=2 xwin",
+                "env CARGO_HOME=/root/.cargo cargo xwin",
+                "cargo-xwin",
+                "cargo-xwin xwin",
+                "/home/ubuntu/.local/bin/cargo-xwin xwin",
+            ] {
+                let command = format!("{prefix} {subcommand} {arguments}");
+                assert_eq!(
+                    cargo_xwin_compilation_kind(&command),
+                    Some(kind),
+                    "{command}"
+                );
+                let classification = classify_command(&command);
+                assert!(classification.is_compilation, "{command}");
+                assert_eq!(classification.kind, Some(kind), "{command}");
+            }
         }
     }
 
     #[test]
-    fn cargo_xwin_recognition_declines_non_builds_and_argument_mentions() {
+    fn cargo_xwin_recognition_declines_unsupported_commands_and_argument_mentions() {
         for command in [
             "cargo xwin",
             "cargo xwin env",
             "cargo xwin cache clear",
-            "cargo xwin check",
             "cargo xwin publish",
+            "cargo xwin test",
+            "cargo xwin run",
+            "cargo xwin unknown",
             "cargo xwin build --help",
+            "cargo xwin check --help",
+            "cargo xwin clippy --version",
             "cargo-xwin --version",
             "cargo-xwin cache clear",
             "cargo-xwin xwin build --help",
+            "cargo-xwin xwin check -h",
+            "cargo-xwin clippy -V",
+            "cargo-xwin xwin env",
+            "cargo-xwin check-extra",
+            "cargo xwin --help check",
+            "cargo xwin 'check'",
+            "cargo xwin $SUBCOMMAND",
             "cargo --config xwin build --target x86_64-pc-windows-msvc",
+            "cargo --config xwin check --target x86_64-pc-windows-msvc",
+            "cargo --config xwin clippy --target x86_64-pc-windows-msvc",
             "cargo build --manifest-path cargo-xwin --target x86_64-pc-windows-msvc",
-            "echo cargo xwin build",
+            "cargo check --manifest-path 'cargo xwin check' --target x86_64-pc-windows-msvc",
+            "cargo clippy --config 'alias.cross=xwin' --target x86_64-pc-windows-msvc",
+            "echo cargo xwin check",
             "cargo xwin build && cargo build",
+            "cargo xwin check && cargo check",
+            "cargo xwin clippy | cat",
         ] {
-            assert!(!is_cargo_xwin_build(command), "{command}");
+            assert_eq!(cargo_xwin_compilation_kind(command), None, "{command}");
         }
         for command in [
             "cargo xwin env",
             "cargo xwin cache clear",
+            "cargo xwin publish",
+            "cargo xwin test",
+            "cargo xwin run",
+            "cargo xwin unknown",
+            "cargo xwin check --help",
+            "cargo xwin clippy --version",
             "cargo-xwin --version",
+            "cargo-xwin xwin check -h",
+            "cargo-xwin clippy -V",
+            "cargo-xwin xwin env",
+            "cargo-xwin check-extra",
+            "cargo xwin 'check'",
         ] {
             assert!(!classify_command(command).is_compilation, "{command}");
         }
@@ -7000,16 +7259,13 @@ mod regression_classification {
         assert_eq!(result.command_prefix.as_deref(), Some("cd /repo && "));
 
         // A build-looking segment that must stay local is left verbatim ...
-        let result = classify_command("go build -o app ./cmd && cargo test");
+        let result = classify_command("go build ./cmd && cargo test");
         assert!(result.is_compilation);
-        assert_eq!(
-            result.command_prefix.as_deref(),
-            Some("go build -o app ./cmd && ")
-        );
+        assert_eq!(result.command_prefix.as_deref(), Some("go build ./cmd && "));
         // ... and reported, so the hook can announce it instead of staying silent.
         assert_eq!(
-            compound_local_compilation_segments("go build -o app ./cmd && cargo test"),
-            vec!["go build -o app ./cmd".to_string()]
+            compound_local_compilation_segments("go build ./cmd && cargo test"),
+            vec!["go build ./cmd".to_string()]
         );
         assert!(
             compound_local_compilation_segments("cargo build --release && cargo test").is_empty()
@@ -7369,23 +7625,21 @@ mod regression_classification {
                 reason_contains: "no compilation keyword",
                 min_confidence: 0.0,
             },
-            // Go is now a first-class offload target (previously this asserted
-            // "no compilation keyword", i.e. that `go build` was NOT intercepted
-            // and therefore ran locally on the orchestrator).
+            // Explicit Go outputs use durable delivery on Unix.
+            #[cfg(unix)]
             Case {
-                cmd: "go build .",
+                cmd: "go build -o bin/app .",
                 expect_compilation: true,
                 expected_kind: Some(CompilationKind::GoBuild),
                 reason_contains: "go build command",
                 min_confidence: 0.9,
             },
-            // …but an emitting `go build -o` still runs locally: Go kinds are
-            // stream-only, so offloading it would leave no binary behind.
+            // Implicit output names require package-aware output planning.
             Case {
-                cmd: "go build -o bin/app ./cmd/app",
+                cmd: "go build ./cmd/app",
                 expect_compilation: false,
                 expected_kind: None,
-                reason_contains: "emits a local binary",
+                reason_contains: "requires a supported explicit -o file",
                 min_confidence: 0.0,
             },
             Case {
@@ -7859,7 +8113,10 @@ mod tests_go_and_typescript {
 
     #[test]
     fn go_build_test_vet_are_classified() {
-        assert_eq!(kind_of("go build ./..."), Some(CompilationKind::GoBuild));
+        assert_eq!(
+            kind_of("go build -o bin/app ."),
+            cfg!(unix).then_some(CompilationKind::GoBuild)
+        );
         assert_eq!(kind_of("go test ./..."), Some(CompilationKind::GoTest));
         assert_eq!(kind_of("go vet ./..."), Some(CompilationKind::GoVet));
         // Real commands observed hammering the orchestrator.
@@ -7877,7 +8134,10 @@ mod tests_go_and_typescript {
     fn go_commands_clear_the_confidence_threshold() {
         // Default confidence_threshold is 0.85; anything at or below it is never
         // intercepted, which would silently keep these local.
-        for cmd in ["go build ./...", "go test ./...", "go vet ./..."] {
+        for cmd in ["go build -o app .", "go test ./...", "go vet ./..."] {
+            if !cfg!(unix) && cmd.starts_with("go build") {
+                continue;
+            }
             let c = classify_command(cmd);
             assert!(
                 c.confidence > 0.85,
@@ -7898,17 +8158,100 @@ mod tests_go_and_typescript {
     // --- Go: forms that MUST stay local (would otherwise lose artifacts) ---
 
     #[test]
-    fn go_build_with_output_flag_is_not_offloaded() {
-        // Go kinds are stream-only (no artifact sync-back). Offloading an
-        // emitting build would report success and leave no binary behind.
-        assert_eq!(kind_of("go build -o bin/app ./cmd/app"), None);
-        assert_eq!(kind_of("go build -o=bin/app ./cmd/app"), None);
+    fn go_build_explicit_outputs_share_one_literal_contract() {
+        for (command, path, option_index) in [
+            ("go build -o bin/app ./cmd/app", "bin/app", 2),
+            ("go build -o=bin/app ./cmd/app", "bin/app", 2),
+            ("go build '-o=bin/app' main.go", "bin/app", 2),
+            (
+                "go build -trimpath -p=2 -o './products/app [dev]*?' .",
+                "./products/app [dev]*?",
+                4,
+            ),
+            ("go build -ldflags '-s -w' -o app", "app", 4),
+            ("go build -ldflags '-s -X main.version=v2' -o app", "app", 4),
+            ("go build '-buildmode=pie' -o app .", "app", 3),
+            ("go build -tags -o -o app .", "app", 4),
+            ("env GOFLAGS= go build -o app .", "app", 2),
+        ] {
+            let selection = go_build_output(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(selection.path, path, "{command}");
+            assert_eq!(selection.option_index, option_index, "{command}");
+            assert_eq!(
+                kind_of(command),
+                cfg!(unix).then_some(CompilationKind::GoBuild),
+                "{command}"
+            );
+        }
     }
 
     #[test]
-    fn go_test_c_and_exec_stay_local() {
-        assert_eq!(kind_of("go test -c ./pkg"), None);
-        assert_eq!(kind_of("go test -exec sudo ./pkg"), None);
+    fn go_build_implicit_ambiguous_and_extra_outputs_stay_local() {
+        for command in [
+            "go build",
+            "go build .",
+            "go build ./...",
+            "go build main.go",
+            "go build -o",
+            "go build -o /tmp/app .",
+            "go build -o ../app .",
+            "go build -o . .",
+            "go build -o bin/ .",
+            "go build -o - .",
+            "go build -o one -o two .",
+            "go build -n -o app .",
+            "go build -n=true -o app .",
+            "go build -buildmode=c-shared -o app .",
+            "go build -buildmode=c-archive -o app .",
+            "go build -buildmode=plugin -o app .",
+            "go build -toolexec wrapper -o app .",
+            "go build -o $OUTPUT .",
+            "go build -o app* .",
+            "go build . -o app",
+            "go build -tags -o app .",
+            "go build -overlay overlay.json -o app .",
+            "go build -mod=mod -o app .",
+            "go build -ldflags '-cpuprofile=cpu.out' -o app .",
+            "go build -ldflags '-s -w -tmpdir=products' -o app .",
+            "go build -gcflags '-cpuprofile=cpu.out' -o app .",
+            "go build -asmflags '-debug' -o app .",
+        ] {
+            assert!(go_build_output(command).is_none(), "{command}");
+            assert_eq!(kind_of(command), None, "{command}");
+        }
+        assert!(go_build_output(&format!("go build -o {} .", "x".repeat(65_536))).is_none());
+        assert!(go_build_output("go build -o 'app\nnext' .").is_none());
+    }
+
+    #[test]
+    fn go_test_binary_profile_and_exec_outputs_stay_local() {
+        for command in [
+            "go test -c ./pkg",
+            "go test -c=true ./pkg",
+            "go test '-c=true' ./pkg",
+            "go test -exec sudo ./pkg",
+            "go test '-exec=sudo' ./pkg",
+            "go test -o test.bin ./pkg",
+            "go test -o=test.bin ./pkg",
+            "go test '-o=test binary' ./pkg",
+            "go test -coverprofile=coverage.out ./pkg",
+            "go test -cpuprofile cpu.out ./pkg",
+            "go test -memprofile=mem.out ./pkg",
+            "go test -blockprofile=block.out ./pkg",
+            "go test -mutexprofile=mutex.out ./pkg",
+            "go test -trace trace.out ./pkg",
+            "go test ./pkg -args -test.cpuprofile=cpu.out",
+            "go test ./pkg '-test.coverprofile=coverage.out'",
+            "go test -outputdir profiles ./pkg",
+            "go test -fuzz=FuzzParser ./pkg",
+            "go test ./pkg -args -test.fuzz FuzzParser",
+            "go test ./pkg -args -test.fuzzcachedir=fuzz-corpus",
+            "go test ./pkg -args -test.gocoverdir=coverage",
+            "go test ./pkg -args '-test.testlogfile=test log'",
+        ] {
+            assert_eq!(kind_of(command), None, "{command}");
+        }
+        assert_eq!(kind_of("go test c o exec"), Some(CompilationKind::GoTest));
     }
 
     #[test]

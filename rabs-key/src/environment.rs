@@ -233,6 +233,73 @@ impl PresentedEnvironment {
     }
 }
 
+/// Authority-side derivation of an opaque HMAC digest over
+/// `(secret value, version, scope)` generated OUTSIDE the untrusted action
+/// (bead S013; risk R56).
+///
+/// Rotating the secret value, bumping `secret_version`, changing `scope`,
+/// or rotating `authority_hmac_key` produces a distinct opaque digest and
+/// therefore changes the action key without ever exposing plaintext in the
+/// key breakdown.
+///
+/// # Errors
+/// [`rabs_protocol::secret_redaction::SecretWiped`] if `secret_value` was already wiped.
+pub fn derive_external_secret_hmac_digest(
+    authority_hmac_key: &[u8],
+    authority_id: &str,
+    slot: &str,
+    secret_version: u64,
+    scope: &str,
+    secret_value: &rabs_protocol::secret_redaction::SecretValue,
+) -> Result<
+    rabs_protocol::secret_redaction::OpaqueSecretBinding,
+    rabs_protocol::secret_redaction::SecretWiped,
+> {
+    let plaintext = secret_value.expose()?;
+    let mut enc = CanonicalEncoder::new();
+    enc.bytes(authority_hmac_key)
+        .str(authority_id)
+        .str(slot)
+        .u64(secret_version)
+        .str(scope)
+        .bytes(plaintext);
+    let hmac_digest = compute(
+        rabs_protocol::secret_redaction::OPAQUE_SECRET_HMAC_DOMAIN,
+        &enc.finish(),
+    );
+    Ok(rabs_protocol::secret_redaction::OpaqueSecretBinding {
+        slot: slot.to_owned(),
+        secret_version,
+        scope: scope.to_owned(),
+        origin: rabs_protocol::secret_redaction::SecretDerivationOrigin::TrustedExternalAuthority {
+            authority_id: authority_id.to_owned(),
+        },
+        hmac_digest,
+    })
+}
+
+/// Resolve an [`EnvDisposition`] for an output-affecting secret under S013:
+/// returns `Ok(EnvDisposition::SecretOpaqueDigest(_))` when a valid external
+/// HMAC binding is supplied, or `Err(SecretFallbackClassification::NonCacheableNonShareable)`
+/// forcing the action to run noncacheable/nonshareable (R56).
+///
+/// # Errors
+/// [`rabs_protocol::secret_redaction::SecretFallbackClassification`] when the binding is
+/// missing, internal to the untrusted action, or structurally invalid.
+pub fn environment_disposition_from_secret_binding(
+    slot: &str,
+    binding: Option<&rabs_protocol::secret_redaction::OpaqueSecretBinding>,
+) -> Result<EnvDisposition, rabs_protocol::secret_redaction::SecretFallbackClassification> {
+    match rabs_protocol::secret_redaction::classify_secret_keying_or_fallback(slot, binding) {
+        rabs_protocol::secret_redaction::SecretFallbackClassification::CacheableShareableWithOpaqueDigest(
+            digest,
+        ) => Ok(EnvDisposition::SecretOpaqueDigest(digest)),
+        fallback @ rabs_protocol::secret_redaction::SecretFallbackClassification::NonCacheableNonShareable { .. } => {
+            Err(fallback)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +517,122 @@ mod tests {
         assert_eq!(
             client_coordination_disposition(b"NUM_JOBS"),
             Some(EnvDisposition::VolatileRefusal)
+        );
+    }
+
+    #[test]
+    fn s013_external_secret_hmac_rotation_changes_key_and_untrusted_or_missing_falls_back_nonshareable()
+     {
+        use rabs_protocol::secret_redaction::{
+            SecretDerivationOrigin, SecretFallbackClassification, SecretFallbackReason, SecretValue,
+        };
+
+        let hmac_key = b"coordinator-external-secret-hmac-key-v1";
+        let secret_v1 = SecretValue::new("signing-api-token", b"secret-token-alpha-12345".to_vec());
+        let secret_v1_rotated_value =
+            SecretValue::new("signing-api-token", b"secret-token-beta-67890".to_vec());
+
+        let binding_v1 = derive_external_secret_hmac_digest(
+            hmac_key,
+            "coord-secret-authority",
+            "signing-api-token",
+            1,
+            "release-signing:v1",
+            &secret_v1,
+        )
+        .unwrap();
+
+        // 1. Value rotation MUST change the opaque HMAC and the environment key.
+        let binding_rotated_value = derive_external_secret_hmac_digest(
+            hmac_key,
+            "coord-secret-authority",
+            "signing-api-token",
+            1,
+            "release-signing:v1",
+            &secret_v1_rotated_value,
+        )
+        .unwrap();
+        assert_ne!(binding_v1.hmac_digest, binding_rotated_value.hmac_digest);
+
+        // 2. Version bump MUST change the opaque HMAC and the environment key.
+        let binding_v2 = derive_external_secret_hmac_digest(
+            hmac_key,
+            "coord-secret-authority",
+            "signing-api-token",
+            2,
+            "release-signing:v1",
+            &secret_v1,
+        )
+        .unwrap();
+        assert_ne!(binding_v1.hmac_digest, binding_v2.hmac_digest);
+
+        // 3. Scope change MUST change the opaque HMAC and the environment key.
+        let binding_other_scope = derive_external_secret_hmac_digest(
+            hmac_key,
+            "coord-secret-authority",
+            "signing-api-token",
+            1,
+            "staging-signing:v1",
+            &secret_v1,
+        )
+        .unwrap();
+        assert_ne!(binding_v1.hmac_digest, binding_other_scope.hmac_digest);
+
+        let mut env_v1 = base();
+        env_v1.variables.push((
+            b"SIGNING_API_TOKEN".to_vec(),
+            environment_disposition_from_secret_binding("signing-api-token", Some(&binding_v1))
+                .unwrap(),
+        ));
+        let mut env_rotated_val = base();
+        env_rotated_val.variables.push((
+            b"SIGNING_API_TOKEN".to_vec(),
+            environment_disposition_from_secret_binding(
+                "signing-api-token",
+                Some(&binding_rotated_value),
+            )
+            .unwrap(),
+        ));
+        let mut env_v2 = base();
+        env_v2.variables.push((
+            b"SIGNING_API_TOKEN".to_vec(),
+            environment_disposition_from_secret_binding("signing-api-token", Some(&binding_v2))
+                .unwrap(),
+        ));
+        let mut env_other_scope = base();
+        env_other_scope.variables.push((
+            b"SIGNING_API_TOKEN".to_vec(),
+            environment_disposition_from_secret_binding(
+                "signing-api-token",
+                Some(&binding_other_scope),
+            )
+            .unwrap(),
+        ));
+
+        let key_v1 = digest_of(&env_v1);
+        assert_ne!(key_v1, digest_of(&env_rotated_val));
+        assert_ne!(key_v1, digest_of(&env_v2));
+        assert_ne!(key_v1, digest_of(&env_other_scope));
+
+        // 4. Missing binding or untrusted action-internal binding falls back to NonCacheableNonShareable.
+        assert_eq!(
+            environment_disposition_from_secret_binding("signing-api-token", None),
+            Err(SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "signing-api-token".into(),
+                reason: SecretFallbackReason::NoOpaqueDigestProvided,
+            })
+        );
+        let mut forged_internal = binding_v1;
+        forged_internal.origin = SecretDerivationOrigin::UntrustedActionInternal;
+        assert_eq!(
+            environment_disposition_from_secret_binding(
+                "signing-api-token",
+                Some(&forged_internal)
+            ),
+            Err(SecretFallbackClassification::NonCacheableNonShareable {
+                slot: "signing-api-token".into(),
+                reason: SecretFallbackReason::DerivedInsideUntrustedAction,
+            })
         );
     }
 }

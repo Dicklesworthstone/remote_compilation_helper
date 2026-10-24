@@ -17,14 +17,38 @@ fn worker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wkr")
 }
 
-fn toolchain_dir() -> String {
+fn stage_sysroot_rustc() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
     let cargo = std::env::var("CARGO").expect("CARGO set");
-    std::path::Path::new(&cargo)
+    let host_tc = std::path::Path::new(&cargo)
         .parent()
         .and_then(std::path::Path::parent)
-        .expect("<root>/bin/cargo")
-        .display()
-        .to_string()
+        .expect("<root>/bin/cargo");
+    let staged = tempfile::Builder::new()
+        .prefix("rabs-s5-rustc-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let root = staged.path();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    let link_or_copy = |src: &std::path::Path, dst: &std::path::Path| {
+        if std::fs::hard_link(src, dst).is_err() {
+            std::fs::copy(src, dst).unwrap();
+        }
+    };
+    link_or_copy(&host_tc.join("bin/rustc"), &root.join("bin/rustc"));
+    for entry in std::fs::read_dir(host_tc.join("lib")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if (name_str.starts_with("librustc_driver-") || name_str.starts_with("libLLVM"))
+            && entry.file_type().unwrap().is_file()
+        {
+            link_or_copy(&entry.path(), &root.join("lib").join(&name));
+        }
+    }
+    staged
 }
 
 fn canonical_supported() -> bool {
@@ -92,14 +116,14 @@ fn orchestrated_canonical_exec_reports_d005_sysroot() {
 
     // THE ORCHESTRATION PROOF: rustc --print sysroot through the
     // session, run inside the canonical namespace on the worker.
-    let toolchain = toolchain_dir();
+    let toolchain = stage_sysroot_rustc();
     let workspace = tempfile::tempdir().unwrap();
     let request = format!(
         "{{\"kind\":\"canonical-exec\",\"request_id\":42,\
          \"program\":\"/__rabs/toolchain/bin/rustc\",\
          \"args\":[\"--print\",\"sysroot\"],\
          \"toolchain_backing\":\"{}\",\"workspace_backing\":\"{}\"}}",
-        toolchain,
+        toolchain.path().display(),
         workspace.path().display(),
     );
     writeln!(writer, "{request}").unwrap();

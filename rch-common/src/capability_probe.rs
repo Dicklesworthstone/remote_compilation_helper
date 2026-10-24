@@ -126,8 +126,11 @@ impl TryFrom<&crate::types::WorkerToolProbe> for NamedToolProbe {
 pub struct ProbeSpec {
     /// SSH login user the probe runs as.
     pub remote_user: String,
-    /// Exact path to the `rch-wkr` binary RCH will invoke.
-    pub rch_wkr_path: String,
+    /// Fixed locations of the deployed `rch-wkr`, in the order the probe tries
+    /// them (never PATH-resolved). The first regular executable file is probed
+    /// and reported as the `rch_wkr_path` fact. A leading `~/` expands to the
+    /// remote user's `$HOME` on the worker; nothing guesses the home locally.
+    pub rch_wkr_paths: Vec<String>,
     /// Exact path to `cargo`, if known (else the probe tries `command -v`).
     pub cargo_path: Option<String>,
     /// Exact path to `rustup`, if known.
@@ -139,15 +142,28 @@ pub struct ProbeSpec {
 }
 
 impl ProbeSpec {
+    /// A spec that probes `rch-wkr` at exactly one path.
     #[must_use]
     pub fn new(remote_user: impl Into<String>, rch_wkr_path: impl Into<String>) -> Self {
         Self {
             remote_user: remote_user.into(),
-            rch_wkr_path: rch_wkr_path.into(),
+            rch_wkr_paths: vec![rch_wkr_path.into()],
             cargo_path: None,
             rustup_path: None,
             disk_roots: Vec::new(),
             tools: Vec::new(),
+        }
+    }
+
+    /// A spec for a configured worker: probes the locations RCH deploys
+    /// `rch-wkr` to on a host of `declared_os` (see
+    /// [`remote_worker_binary_paths`]). Single source of truth for the daemon's
+    /// bypass-recovery prober and the `rch self-test --smoke` scenarios.
+    #[must_use]
+    pub fn for_worker(remote_user: &str, declared_os: Option<&str>) -> Self {
+        Self {
+            rch_wkr_paths: remote_worker_binary_paths(remote_user, declared_os),
+            ..Self::new(remote_user, String::new())
         }
     }
 
@@ -164,26 +180,40 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The canonical ABSOLUTE path to the deployed `rch-wkr` binary for a remote
-/// user and host OS. Unix workers use `/root` or `/home/<user>`; Windows workers
-/// run under Git Bash and use `/c/Users/<user>` plus the native `.exe` suffix.
-/// The probe script shell-quotes this path, so it MUST be absolute: a literal
-/// `~/.local/bin/...` would be single-quoted and never expand, making `[ -x ... ]`
-/// fail and every worker look like it has a missing binary. Single source of
-/// truth for both the daemon bypass-recovery prober and the
-/// `rch self-test --smoke` capability scenario.
-#[must_use]
-pub fn remote_worker_binary_path(user: &str, declared_os: Option<&str>) -> String {
-    if declared_os.is_some_and(|os| os.eq_ignore_ascii_case("windows")) {
-        return format!("/c/Users/{user}/.local/bin/rch-wkr.exe");
+/// Shell-quote a probe path, expanding a leading `~/` to the remote `$HOME`.
+///
+/// A fully single-quoted `~/...` would never expand, so `[ -x ... ]` would fail
+/// and every worker would look like it has a missing binary. The home part is
+/// emitted as `"${HOME:-}"` (one word whatever the home contains, and safe under
+/// the script's `set -u`); the rest stays single-quoted and literal.
+fn shq_path(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("\"${{HOME:-}}\"{}", shq(&format!("/{rest}"))),
+        None => shq(path),
     }
+}
 
-    let home = if user == "root" {
-        "/root".to_string()
-    } else {
-        format!("/home/{user}")
-    };
-    format!("{home}/.local/bin/rch-wkr")
+/// Where RCH deploys `rch-wkr` on a worker, in the order the capability probe
+/// tries them.
+///
+/// Unix: `/usr/local/bin/rch-wkr`, then `~/.local/bin/rch-wkr`. That is the
+/// order `rch workers setup` installs in (`/usr/local/bin` when the SSH user can
+/// write there), and `~/.local/bin` is where `rch fleet deploy` installs and
+/// where the daemon falls back to. The home is resolved on the worker: guessing
+/// `/home/<user>` (or `/root`) locally was wrong on macOS (`/Users/<user>`,
+/// root's `/var/root`) and for any Linux account whose home lives elsewhere, so
+/// the binary looked missing there and bypass recovery never readmitted the
+/// worker (#116). Windows workers run under Git Bash and use `/c/Users/<user>`
+/// plus the native `.exe` suffix.
+#[must_use]
+pub fn remote_worker_binary_paths(user: &str, declared_os: Option<&str>) -> Vec<String> {
+    if declared_os.is_some_and(|os| os.eq_ignore_ascii_case("windows")) {
+        return vec![format!("/c/Users/{user}/.local/bin/rch-wkr.exe")];
+    }
+    vec![
+        "/usr/local/bin/rch-wkr".to_string(),
+        "~/.local/bin/rch-wkr".to_string(),
+    ]
 }
 
 /// Build the capability-probe shell script. It is intentionally fail-soft:
@@ -192,7 +222,12 @@ pub fn remote_worker_binary_path(user: &str, declared_os: Option<&str>) -> Strin
 /// crash (reachability).
 #[must_use]
 pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
-    let wkr = shq(&spec.rch_wkr_path);
+    let wkr_candidates = spec
+        .rch_wkr_paths
+        .iter()
+        .map(|path| shq_path(path))
+        .collect::<Vec<_>>()
+        .join(" ");
     let cargo = spec
         .cargo_path
         .as_deref()
@@ -208,12 +243,21 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     s.push_str("printf '%sos=%s\\n' \"$P\" \"$(uname -s | tr 'A-Z' 'a-z')\"; ");
     s.push_str("printf '%sarch=%s\\n' \"$P\" \"$(uname -m)\"; ");
     s.push_str("printf '%suser=%s\\n' \"$P\" \"$(id -un 2>/dev/null)\"; ");
-    // Worker binary at the EXACT path (version + protocol). Absent => broken.
-    s.push_str(&format!("printf '%srch_wkr_path=%s\\n' \"$P\" {wkr}; "));
-    s.push_str(&format!(
-        "if [ -x {wkr} ]; then v=$({wkr} --version 2>/dev/null) && printf '%sworker_version=%s\\n' \"$P\" \"$v\"; \
-         pr=$({wkr} --protocol-version 2>/dev/null) && printf '%sworker_protocol=%s\\n' \"$P\" \"$pr\"; fi; "
-    ));
+    // Worker binary at the first EXACT deployed location that holds an
+    // executable file (version + protocol). The fact names the binary probed,
+    // or every location tried when none exists. Absent version => broken.
+    s.push_str("w=''; ws=''; ");
+    if !wkr_candidates.is_empty() {
+        s.push_str(&format!(
+            "for c in {wkr_candidates}; do ws=\"${{ws:+$ws or }}$c\"; \
+             if [ -z \"$w\" ] && [ -f \"$c\" ] && [ -x \"$c\" ]; then w=$c; fi; done; "
+        ));
+    }
+    s.push_str("printf '%srch_wkr_path=%s\\n' \"$P\" \"${w:-$ws}\"; ");
+    s.push_str(
+        "if [ -n \"$w\" ]; then v=$(\"$w\" --version 2>/dev/null) && printf '%sworker_version=%s\\n' \"$P\" \"$v\"; \
+         pr=$(\"$w\" --protocol-version 2>/dev/null) && printf '%sworker_protocol=%s\\n' \"$P\" \"$pr\"; fi; ",
+    );
     // Cargo / rust.
     s.push_str(&format!(
         "cv=$({cargo} --version 2>/dev/null) && printf '%scargo_version=%s\\n' \"$P\" \"$cv\"; "
@@ -715,6 +759,21 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
     // would be indistinguishable from the job's own nonzero exit (job mode
     // surfaces remote status verbatim).
     for needed in &req.needs_tools {
+        // Share exact-version semantics with the daemon's live selection gate.
+        // A versioned requirement cannot fall back to an operator-named label.
+        if let Some(check) = crate::tool_requirement::check_exact_runtime(
+            needed,
+            facts.runtimes.node_version.as_deref(),
+            facts.runtimes.bun_version.as_deref(),
+        ) {
+            if let Err(detail) = check {
+                return CapabilityVerdict::Rejected {
+                    reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                    detail,
+                };
+            }
+            continue;
+        }
         if !facts.has_tool(needed) {
             return CapabilityVerdict::Rejected {
                 reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
@@ -1456,40 +1515,120 @@ mod tests {
         assert_eq!(v_after, EligibilityVerdict::Eligible);
     }
 
+    /// #116: no Unix home is guessed locally. The deployed locations are tried
+    /// in `rch workers setup` order, and the home-relative one is expanded by the
+    /// worker's shell, so macOS (`/Users/<user>`, root's `/var/root`) and Linux
+    /// accounts homed outside `/home` are found.
     #[test]
-    fn remote_worker_binary_path_is_absolute_per_user() {
-        assert_eq!(
-            remote_worker_binary_path("root", None),
-            "/root/.local/bin/rch-wkr"
-        );
-        assert_eq!(
-            remote_worker_binary_path("ubuntu", Some("linux")),
-            "/home/ubuntu/.local/bin/rch-wkr"
-        );
-        // The path must be absolute: the probe script single-quotes it, so a
-        // literal `~` would never expand and `[ -x ... ]` would always fail.
-        for user in ["root", "rch", "ubuntu"] {
-            let path = remote_worker_binary_path(user, None);
-            assert!(!path.contains('~'), "{path} must not contain a tilde");
-            assert!(path.starts_with('/'), "{path} must be absolute");
-            let spec = ProbeSpec::new(user, path);
-            let script = build_capability_probe_script(&spec);
-            // The shell-quoted binary path embedded in the script is absolute,
-            // so `[ -x ... ]` resolves on the real worker.
-            assert!(script.contains("/.local/bin/rch-wkr'"));
-            assert!(!script.contains("'~/.local/bin/rch-wkr'"));
+    fn remote_worker_binary_paths_resolve_the_home_on_the_worker() {
+        for (user, os) in [
+            ("root", None),
+            ("ubuntu", Some("linux")),
+            ("alice", Some("darwin")),
+            ("alice", Some("macos")),
+        ] {
+            assert_eq!(
+                remote_worker_binary_paths(user, os),
+                ["/usr/local/bin/rch-wkr", "~/.local/bin/rch-wkr"],
+                "{user} {os:?}"
+            );
+            let script = build_capability_probe_script(&ProbeSpec::for_worker(user, os));
+            // `~/` becomes an expanding `$HOME`, never a single-quoted tilde
+            // that `[ -x ... ]` could not resolve, and never a guessed home.
+            assert!(script.contains(
+                "for c in '/usr/local/bin/rch-wkr' \"${HOME:-}\"'/.local/bin/rch-wkr'; do"
+            ));
+            assert!(!script.contains("'~/"));
+            assert!(!script.contains("/home/"));
+            assert!(!script.contains("/root/"));
         }
     }
 
     #[test]
-    fn remote_worker_binary_path_uses_git_bash_home_for_windows() {
+    fn remote_worker_binary_paths_use_git_bash_home_for_windows() {
+        for os in ["windows", "WINDOWS"] {
+            assert_eq!(
+                remote_worker_binary_paths("jeffr", Some(os)),
+                ["/c/Users/jeffr/.local/bin/rch-wkr.exe"]
+            );
+        }
+        let script =
+            build_capability_probe_script(&ProbeSpec::for_worker("jeffr", Some("windows")));
+        assert!(script.contains("for c in '/c/Users/jeffr/.local/bin/rch-wkr.exe'; do"));
+    }
+
+    /// #116, run for real: the probe expands the remote `$HOME` (here with a
+    /// space and a quote in it), skips a candidate that is not a regular file,
+    /// probes the first executable it finds and reports that path; on a miss it
+    /// reports every location it tried, so the rejection names them.
+    #[cfg(unix)]
+    #[test]
+    fn live_probe_finds_rch_wkr_under_the_remote_home_and_names_misses() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("it's a home");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A fake rch-wkr written by a child process, so this multithreaded
+        // test binary never holds a write descriptor that a sibling test's
+        // fork could inherit (exec would then fail with ETXTBSY). A symlink to
+        // a system binary is no substitute: a multicall coreutils (uutils,
+        // busybox) dispatches on the link's name and does not act as `echo`.
+        let fake = bin.join("rch-wkr");
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&fake)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            &mut writer.stdin.take().unwrap(),
+            b"#!/bin/sh\ncase \"$1\" in\n  --version) echo 'rch-wkr 9.9.9-probe' ;;\n  --protocol-version) echo 7 ;;\n  *) exit 2 ;;\nesac\n",
+        )
+        .unwrap();
+        assert!(writer.wait().unwrap().success(), "{}", fake.display());
+        let not_a_binary = root.path().join("dir/rch-wkr");
+        std::fs::create_dir_all(&not_a_binary).unwrap();
+        let mut spec = ProbeSpec::new("probe", not_a_binary.to_str().unwrap());
+        spec.rch_wkr_paths.push("~/.local/bin/rch-wkr".to_string());
+        let run = |home: &std::path::Path| {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(build_capability_probe_script(&spec))
+                .env("HOME", home)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_capability_probe(std::str::from_utf8(&output.stdout).unwrap())
+        };
+
+        let found = run(&home);
+        let expected = bin.join("rch-wkr");
+        assert_eq!(found.rch_wkr_path.as_deref(), expected.to_str());
+        let worker = found.worker.expect("the binary under $HOME ran");
+        assert_eq!(worker.rch_wkr_path, expected.to_str().unwrap());
+        assert_eq!(worker.version, "rch-wkr 9.9.9-probe");
+        assert_eq!(worker.protocol_version, 7);
+
+        let empty_home = root.path().join("empty home");
+        std::fs::create_dir(&empty_home).unwrap();
+        let missed = run(&empty_home);
+        assert!(missed.worker.is_none());
         assert_eq!(
-            remote_worker_binary_path("jeffr", Some("windows")),
-            "/c/Users/jeffr/.local/bin/rch-wkr.exe"
+            missed.rch_wkr_path,
+            Some(format!(
+                "{} or {}/.local/bin/rch-wkr",
+                not_a_binary.display(),
+                empty_home.display()
+            ))
         );
-        assert_eq!(
-            remote_worker_binary_path("jeffr", Some("WINDOWS")),
-            "/c/Users/jeffr/.local/bin/rch-wkr.exe"
-        );
+        assert!(matches!(
+            assess_admissibility(&missed, &CapabilityRequirement::rust(0)),
+            CapabilityVerdict::Rejected { reason: IncidentReasonCode::WrongUserPathWorkerBinary, ref detail }
+                if detail.contains(" or ")
+        ));
     }
 }

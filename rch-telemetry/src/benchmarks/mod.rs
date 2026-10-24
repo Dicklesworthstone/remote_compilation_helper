@@ -1,13 +1,8 @@
-//! Synthetic benchmarks for measuring worker performance.
+//! Benchmarks for measuring worker performance.
 //!
-//! This module provides pure-Rust benchmark implementations for measuring
-//! worker computational capabilities across multiple dimensions: CPU,
-//! memory bandwidth, disk I/O, and network throughput.
-//!
-//! Benchmarks are designed to be:
-//! - **Reproducible**: Same result on same hardware regardless of system state
-//! - **Fast**: Complete in <5 seconds to minimize scheduling disruption
-//! - **Representative**: Exercise operations similar to actual compilation workloads
+//! Synthetic CPU, memory, disk and network workloads complement real compiler
+//! workloads. Paired serial/parallel compilation is an explicit, longer-running
+//! diagnostic; callers must arrange idle/admitted execution before running it.
 
 pub mod compilation;
 pub mod cpu;
@@ -15,6 +10,8 @@ pub mod disk;
 pub mod error;
 pub mod memory;
 pub mod network;
+pub mod parallel_compilation;
+pub mod report;
 pub mod retry;
 
 pub use compilation::{
@@ -28,4 +25,5 @@ pub use network::{
     NetworkBenchmark, NetworkBenchmarkError, NetworkBenchmarkResult, WorkerConnection,
     calculate_latency_stats,
 };
+pub use parallel_compilation::{ParallelCompilationBenchmark, ParallelCompilationResult};
 pub use retry::{BenchmarkRetryPolicy, RetryableError, run_with_retry};

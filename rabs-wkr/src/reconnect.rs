@@ -129,6 +129,13 @@ fn shutdown_exit(report: &CapabilityReport, journal: &WorkerJournal) -> i32 {
     i32::from(!clean)
 }
 
+/// Worker-owned resources retained across reconnects and dropped after drain.
+#[derive(Clone)]
+pub(super) struct RuntimeResources {
+    pub host_budget: Option<Arc<rabs_wkr::host_budget::HostBudget>>,
+    pub target_cache: Option<Arc<rabs_wkr::target_cache::TargetCache>>,
+}
+
 /// Run until process shutdown or an unrecoverable journal failure. `once` keeps
 /// the explicit one-session operator/test contract, including no connect retry.
 /// Socket errors and peer EOF never cause the caller to replay a compiler.
@@ -137,6 +144,7 @@ pub(super) fn run(
     report: CapabilityReport,
     once: bool,
     mut journal: WorkerJournal,
+    resources: RuntimeResources,
 ) -> i32 {
     // This strong scope spans reconnects but not process exit. The registry is
     // weak, so every ordinary return releases idle datasets AFTER session drain.
@@ -166,31 +174,34 @@ pub(super) fn run(
         let handle = runtime.handle();
         let endpoint = coordinator.clone();
         let capability = Arc::clone(&report);
+        let resources = resources.clone();
         let shutdown = controller.subscribe();
-        let (outcome, returned_journal, admitted_for) = runtime.block_on(async move {
-            handle
-                .spawn(async move {
-                    let cx = Cx::current().expect("runtime task Cx");
-                    let mut admitted_at: Option<Instant> = None;
-                    let outcome = drain_on_shutdown(
-                        &cx,
-                        shutdown,
-                        super::session_loop(
+        let (outcome, returned_journal, admitted_for) =
+            crate::block_on_worker_runtime(&runtime, async move {
+                handle
+                    .spawn(async move {
+                        let cx = Cx::current().expect("runtime task Cx");
+                        let mut admitted_at: Option<Instant> = None;
+                        let outcome = drain_on_shutdown(
                             &cx,
-                            &endpoint,
-                            &capability,
-                            once,
-                            &mut journal,
-                            &mut admitted_at,
-                        ),
-                    )
-                    .await;
-                    // session_loop has joined process cleanup and dropped both
-                    // range-transfer owners before we regain durable ownership.
-                    (outcome, journal, admitted_at.map(|start| start.elapsed()))
-                })
-                .await
-        });
+                            shutdown,
+                            super::session_loop(
+                                &cx,
+                                &endpoint,
+                                &capability,
+                                once,
+                                &mut journal,
+                                &mut admitted_at,
+                                resources,
+                            ),
+                        )
+                        .await;
+                        // session_loop has joined process cleanup and dropped both
+                        // range-transfer owners before we regain durable ownership.
+                        (outcome, journal, admitted_at.map(|start| start.elapsed()))
+                    })
+                    .await
+            });
         journal = returned_journal;
         if controller.is_shutting_down() {
             // No spool reload, new handshake or new admission after shutdown.
@@ -241,7 +252,9 @@ pub(super) fn run(
         // The exclusive journal lock remains held, including during backoff.
         let handle = runtime.handle();
         let shutdown = controller.subscribe();
-        runtime.block_on(async move { handle.spawn(backoff_or_shutdown(shutdown, delay)).await });
+        crate::block_on_worker_runtime(&runtime, async move {
+            handle.spawn(backoff_or_shutdown(shutdown, delay)).await
+        });
     }
 }
 
@@ -293,7 +306,7 @@ mod tests {
     fn shutdown_polls_session_cleanup_instead_of_dropping_it() {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let handle = runtime.handle();
-        runtime.block_on(async move {
+        crate::block_on_worker_runtime(&runtime, async move {
             handle
                 .spawn(async move {
                     let cx = Cx::current().unwrap();
@@ -330,7 +343,7 @@ mod tests {
         controller.shutdown();
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let handle = runtime.handle();
-        runtime.block_on(async move {
+        crate::block_on_worker_runtime(&runtime, async move {
             handle
                 .spawn(async move {
                     assert!(
@@ -346,11 +359,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_receipt_cannot_certify_an_uncertain_admission() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut journal = WorkerJournal::open(root.path(), "shutdown-test", "coord").unwrap();
         let report = CapabilityReport {
             worker_id: "shutdown-test".to_owned(),
             canonical_namespace: false,
+            dependency_modes: vec![],
             missing: Vec::new(),
             slots: 1,
         };
@@ -448,14 +464,14 @@ mod tests {
             WorkerJournal::open(&root.path().join("state"), "shutdown-test", &address).unwrap();
         let spill_root = root.path().join("spills");
         let process_pid_file = pid_file.clone();
-        journal = runtime.block_on(async move {
+        journal = crate::block_on_worker_runtime(&runtime, async move {
             handle.spawn(async move {
                 let cx = Cx::current().unwrap();
                 let socket = asupersync::net::TcpStream::connect(address).await.unwrap();
                 let mut stream = WorkerConnection::LoopbackFixture(socket);
                 let report = CapabilityReport {
                     worker_id:"shutdown-test".to_owned(), canonical_namespace:true,
-                    missing:Vec::new(), slots:1,
+                    dependency_modes:Vec::new(), missing:Vec::new(), slots:1,
                 };
                 let driver = crate::drive_session(
                     &mut stream, &report, false, Some(&mut journal), false,

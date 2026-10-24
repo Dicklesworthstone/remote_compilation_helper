@@ -44,6 +44,7 @@ async fn resume_queued_selection(
     query: &str,
     deadline: tokio::time::Instant,
     disk_headroom_gib: u32,
+    required_tools: bool,
 ) -> anyhow::Result<SelectionResponse> {
     let result = async {
         let stream = loop {
@@ -73,7 +74,7 @@ async fn resume_queued_selection(
             }
         };
         let (reader, mut writer) = stream.into_split();
-        let route = selection_route(disk_headroom_gib, true);
+        let route = selection_route(disk_headroom_gib, true, required_tools);
         let request = format!("GET {route}?{query}\n");
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         anyhow::ensure!(
@@ -285,6 +286,79 @@ pub(crate) async fn restart_admission_is_closed(socket_path: &str) -> anyhow::Re
     Ok(status.admission_closed)
 }
 
+/// Default bound on how long a build waits for a daemon restart's admission
+/// barrier to reopen. Override with `RCH_RESTART_ADMISSION_WAIT_SECS` (0 keeps
+/// the old fail-fast behaviour).
+pub(crate) const DEFAULT_RESTART_ADMISSION_WAIT: Duration = Duration::from_secs(600);
+
+pub(crate) fn restart_admission_wait_bound() -> Duration {
+    std::env::var("RCH_RESTART_ADMISSION_WAIT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_RESTART_ADMISSION_WAIT, Duration::from_secs)
+}
+
+/// How a wait for restart admission ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RestartAdmissionWait {
+    /// Admission is open, or there was no barrier to wait for.
+    Open,
+    /// A closed barrier was observed and reopening was not verified before the bound expired.
+    StillClosed,
+}
+
+/// A daemon restart (`rch daemon restart --drain`) closes admission for its
+/// drain window. Every build arriving then used to fail outright: on
+/// 2026-10-13 the 2.1.19 rollout failed about 30 agent builds on css alone.
+/// Wait, bounded, for the barrier to reopen instead. Once a closed barrier has
+/// been seen, an unreachable daemon is the restart in progress, so keep
+/// waiting for it. If no barrier was ever seen, a probe error keeps the
+/// previous meaning: proceed and let selection and recovery handle the daemon.
+/// `on_wait` runs before each sleep (the caller heartbeats and reports).
+/// After a closed observation, later probes share the remaining wait budget;
+/// a stalled socket cannot extend that budget by its independent I/O timeout.
+pub(crate) async fn wait_for_restart_admission<F, Fut>(
+    mut probe: F,
+    bound: Duration,
+    poll: Duration,
+    mut on_wait: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<RestartAdmissionWait>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut saw_closed = false;
+    loop {
+        let observation = if saw_closed {
+            let remaining = bound.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(RestartAdmissionWait::StillClosed);
+            }
+            match timeout(remaining, probe()).await {
+                Ok(observation) => observation,
+                Err(_) => return Ok(RestartAdmissionWait::StillClosed),
+            }
+        } else {
+            // Always allow the initial bounded status probe, including when
+            // the operator selected zero wait. Without a closed observation,
+            // selection retains responsibility for recovering an unavailable daemon.
+            probe().await
+        };
+        match observation {
+            Ok(false) => return Ok(RestartAdmissionWait::Open),
+            Ok(true) => saw_closed = true,
+            Err(_) if !saw_closed => return Ok(RestartAdmissionWait::Open),
+            Err(_) => {}
+        }
+        if started.elapsed() >= bound {
+            return Ok(RestartAdmissionWait::StillClosed);
+        }
+        on_wait()?;
+        tokio::time::sleep(poll.min(bound.saturating_sub(started.elapsed()))).await;
+    }
+}
+
 /// An optional field must not turn a failed client-side Rustup resolution into
 /// permission to use the worker's default compiler. Apply the same preflight to
 /// actual admission and dry-run diagnostics, before any socket or queue owner
@@ -393,6 +467,40 @@ pub(crate) async fn query_daemon_dry_run(
         true,
     )
     .await
+}
+
+/// Query the versioned, non-owning admission-preview route. Unlike a dry-run
+/// flag on a reservation endpoint, this route cannot be silently ignored by an
+/// older daemon: an unsupported daemon rejects the route instead of admitting a
+/// build. The response is accepted only if the shared protocol validates that
+/// it contains no build ownership and that worker/reason fields are consistent.
+pub(crate) async fn query_admission_preview(
+    socket_path: &str,
+    request: &rch_common::admission_preview::PreviewRequest,
+) -> anyhow::Result<rch_common::admission_preview::PreviewResponse> {
+    request.validate().map_err(anyhow::Error::new)?;
+    if !Path::new(socket_path).exists() {
+        return Err(DaemonError::SocketNotFound {
+            socket_path: socket_path.to_string(),
+        }
+        .into());
+    }
+    let stream = timeout(daemon_io_timeout(), UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Daemon connect timed out after {}ms",
+                daemon_io_timeout().as_millis()
+            )
+        })??;
+    let (reader, mut writer) = stream.into_split();
+    let line = request.request_line().map_err(anyhow::Error::new)?;
+    write_daemon_request(&mut writer, line.as_bytes(), daemon_io_timeout()).await?;
+    let body = read_daemon_body(reader, daemon_io_timeout(), false).await?;
+    let response: rch_common::admission_preview::PreviewResponse =
+        serde_json::from_str(&body).context("invalid admission-preview response")?;
+    response.validate().map_err(anyhow::Error::new)?;
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
@@ -512,9 +620,8 @@ async fn query_daemon_with_mode(
         query.push_str("&job_mode=1");
     }
 
-    // Verified named-tool requirements (bd-ceewf), repeatable. Job mode only —
-    // the compilation classifier never produces them, so ordinary offloaded
-    // builds send a byte-identical query.
+    // Verified named-tool requirements are valid for compilation and jobs.
+    // Their dedicated endpoint prevents older daemons ignoring these keys.
     for tool in required_tools {
         query.push_str(&format!("&require_tool={}", urlencoding_encode(tool)));
     }
@@ -526,7 +633,7 @@ async fn query_daemon_with_mode(
         // Keep daemon queue timeout aligned with the client-side socket timeout
         // so queued requests return a structured SelectionReason instead of
         // triggering a client communication timeout.
-        let wait_timeout_secs = daemon_response_timeout(wait_for_worker)
+        let wait_timeout_secs = daemon_response_timeout(wait_for_worker, job_mode)
             .as_secs()
             .saturating_sub(1)
             .max(1);
@@ -538,9 +645,9 @@ async fn query_daemon_with_mode(
     }
 
     // Bound writes independently from the longer, queue-aware response wait.
-    let route = selection_route(disk_headroom_gib, false);
+    let route = selection_route(disk_headroom_gib, false, !required_tools.is_empty());
     let request = format!("GET {route}?{query}\n");
-    let response_budget = daemon_response_timeout(wait_for_worker);
+    let response_budget = daemon_response_timeout(wait_for_worker, job_mode);
     let deadline = tokio::time::Instant::now() + response_budget;
     let result = timeout(
         response_budget,
@@ -576,7 +683,14 @@ async fn query_daemon_with_mode(
             // The query is byte-identical, including the original timeout,
             // worker pins and toolchain/tool constraints. The daemon checks
             // these against durable queue ownership before selecting.
-            resume_queued_selection(socket_path, &query, deadline, disk_headroom_gib).await?
+            resume_queued_selection(
+                socket_path,
+                &query,
+                deadline,
+                disk_headroom_gib,
+                !required_tools.is_empty(),
+            )
+            .await?
         }
         Err(error) => return Err(error),
     };
@@ -633,15 +747,19 @@ async fn query_daemon_with_mode(
     Ok(response)
 }
 
-/// Positive budgets use an exact route that older daemons cannot admit.
-/// Merely adding a query parameter would let an older daemon ignore the hard
-/// requirement and reserve a worker without accounting for any disk budget.
-fn selection_route(disk_headroom_gib: u32, resume: bool) -> &'static str {
-    match (disk_headroom_gib > 0, resume) {
-        (false, false) => "/select-worker",
-        (false, true) => "/select-worker/resume-queued",
-        (true, false) => "/select-worker/disk-budget",
-        (true, true) => "/select-worker/resume-queued/disk-budget",
+/// Hard requirements use exact routes that older daemons cannot admit.
+/// The tools endpoint deliberately has a different prefix: a daemon with an
+/// old permissive /select-worker prefix parser must not ignore tool constraints.
+fn selection_route(disk_headroom_gib: u32, resume: bool, required_tools: bool) -> &'static str {
+    match (disk_headroom_gib > 0, resume, required_tools) {
+        (false, false, false) => "/select-worker",
+        (false, true, false) => "/select-worker/resume-queued",
+        (true, false, false) => "/select-worker/disk-budget",
+        (true, true, false) => "/select-worker/resume-queued/disk-budget",
+        (false, false, true) => "/select-verified-tools",
+        (false, true, true) => "/select-verified-tools/resume-queued",
+        (true, false, true) => "/select-verified-tools/disk-budget",
+        (true, true, true) => "/select-verified-tools/resume-queued/disk-budget",
     }
 }
 
@@ -668,11 +786,25 @@ pub(crate) async fn release_worker(
         bytes_transferred,
         timing,
         local_wrapper_id,
-        false,
-        false,
-        &[],
+        ReleaseFaults::default(),
     )
     .await
+}
+
+/// What a failed remote attempt says about its worker, for the release.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReleaseFaults<'a> {
+    /// The failure blamed the worker (`remote_failure_is_worker_fault`).
+    pub(crate) worker_fault: bool,
+    /// Confirmed disk exhaustion on `worker_disk_roots`.
+    pub(crate) worker_disk_full: bool,
+    pub(crate) worker_disk_roots: &'a [String],
+    /// The worker's live checkout of the project refused the source sync.
+    pub(crate) live_checkout_refused: bool,
+    /// Another owner held this worker's source past the admission wait.
+    pub(crate) source_busy: bool,
+    /// Attributable output high water, even when the job exceeded its budget.
+    pub(crate) disk_peak_output_bytes: Option<u64>,
 }
 
 /// [`release_worker`] for a completed remote run, also telling the daemon
@@ -691,9 +823,7 @@ pub(crate) async fn release_worker_with_fault(
     bytes_transferred: Option<u64>,
     timing: Option<&CommandTimingBreakdown>,
     local_wrapper_id: Option<&str>,
-    worker_fault: bool,
-    worker_disk_full: bool,
-    worker_disk_roots: &[String],
+    faults: ReleaseFaults<'_>,
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
@@ -730,15 +860,24 @@ pub(crate) async fn release_worker_with_fault(
     if let Some(bytes_transferred) = bytes_transferred {
         request.push_str(&format!("&bytes_transferred={}", bytes_transferred));
     }
-    if worker_fault {
+    if let Some(peak) = faults.disk_peak_output_bytes {
+        request.push_str(&format!("&disk_peak_output_bytes={peak}"));
+    }
+    if faults.worker_fault {
         request.push_str("&worker_fault=1");
     }
-    if worker_disk_full {
+    if faults.worker_disk_full {
         request.push_str("&worker_disk_full=1");
         request.push_str(&format!(
             "&worker_disk_roots={}",
-            urlencoding_encode(&serde_json::to_string(worker_disk_roots)?)
+            urlencoding_encode(&serde_json::to_string(faults.worker_disk_roots)?)
         ));
+    }
+    if faults.live_checkout_refused {
+        request.push_str("&worker_live_checkout_refused=1");
+    }
+    if faults.source_busy {
+        request.push_str("&worker_source_busy=1");
     }
     request.push('\n');
 
@@ -857,6 +996,9 @@ pub(super) fn urlencoding_encode(s: &str) -> String {
 
 pub(super) const DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS: u64 = 30;
 pub(super) const DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS: u64 = 330;
+/// A `--job` never falls back to local, so it waits for admission much longer
+/// than a compilation (bd-decdd). The daemon grants a job up to 24 h.
+pub(super) const DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS: u64 = 6 * 3600;
 
 pub(super) fn queue_when_busy_enabled_from(value: Option<&str>) -> bool {
     let Some(value) = value else {
@@ -912,6 +1054,7 @@ fn parse_timeout_secs(raw: &str) -> Option<u64> {
 
 pub(super) fn daemon_response_timeout_for(
     wait_for_worker: bool,
+    job_mode: bool,
     global_override: Option<&str>,
     wait_override: Option<&str>,
 ) -> Duration {
@@ -922,18 +1065,23 @@ pub(super) fn daemon_response_timeout_for(
     if wait_for_worker {
         let secs = wait_override
             .and_then(parse_timeout_secs)
-            .unwrap_or(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS);
+            .unwrap_or(if job_mode {
+                DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS
+            } else {
+                DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS
+            });
         return Duration::from_secs(secs);
     }
 
     Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
 }
 
-fn daemon_response_timeout(wait_for_worker: bool) -> Duration {
+fn daemon_response_timeout(wait_for_worker: bool, job_mode: bool) -> Duration {
     let global_override = std::env::var("RCH_DAEMON_RESPONSE_TIMEOUT_SECS").ok();
     let wait_override = std::env::var("RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS").ok();
     daemon_response_timeout_for(
         wait_for_worker,
+        job_mode,
         global_override.as_deref(),
         wait_override.as_deref(),
     )
@@ -997,6 +1145,20 @@ mod daemon_io_timeout_tests {
 #[cfg(test)]
 mod bounded_ipc_tests {
     use super::*;
+
+    #[test]
+    fn tool_requirement_routes_never_fall_back_to_legacy_selection() {
+        for (budget, resume, expected) in [
+            (0, false, "/select-verified-tools"),
+            (0, true, "/select-verified-tools/resume-queued"),
+            (64, false, "/select-verified-tools/disk-budget"),
+            (64, true, "/select-verified-tools/resume-queued/disk-budget"),
+        ] {
+            assert_eq!(selection_route(budget, resume, true), expected);
+            assert!(!selection_route(budget, resume, true).starts_with("/select-worker"));
+        }
+        assert_eq!(selection_route(0, false, false), "/select-worker");
+    }
 
     #[tokio::test]
     async fn unresolved_rust_queries_never_connect_or_create_a_queue_owner() {
@@ -1130,6 +1292,54 @@ mod bounded_ipc_tests {
         );
     }
 
+    #[tokio::test]
+    async fn admission_preview_uses_dedicated_non_owning_route_and_validates_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admission-preview.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let request = rch_common::admission_preview::PreviewRequest {
+            protocol_version: rch_common::admission_preview::PROTOCOL_VERSION,
+            project: "project with spaces".into(),
+            command: "./run job --arg='a&b'".into(),
+            estimated_cores: 3,
+            disk_headroom_gib: 9,
+            preferred_workers: vec![WorkerId::new("worker-a")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            job_mode: true,
+            required_tools: vec!["clang".into()],
+        };
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("GET /admission-preview?request="), "{line}");
+            assert!(!line.contains("/select-worker"), "{line}");
+            writer
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n\r\n",
+                        "{\"protocol_version\":1,\"selection\":{",
+                        "\"worker\":null,\"reason\":\"all_workers_busy\",",
+                        "\"build_id\":null,\"diagnostics\":null}}"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        };
+        let client = query_admission_preview(path.to_str().unwrap(), &request);
+        let (response, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server)
+        })
+        .await
+        .unwrap();
+        let response = response.unwrap();
+        assert!(response.selection.build_id.is_none());
+        assert!(matches!(response.selection.reason, SelectionReason::AllWorkersBusy));
+    }
+
     async fn caller_fixture(
         response: Vec<u8>,
         expected_request: &'static str,
@@ -1252,9 +1462,14 @@ mod bounded_ipc_tests {
     async fn release_carries_the_worker_fault_flag_only_when_set() {
         // Review of GH #81: the daemon withholds cache warmth for a failure
         // the hook blamed on the worker, so the flag must reach the wire.
-        for (worker_fault, worker_disk_full) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (worker_fault, worker_disk_full, live_checkout_refused, source_busy) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+        ] {
             let root = tempfile::tempdir().unwrap().keep();
             let path = root.join("ipc.sock");
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -1280,9 +1495,14 @@ mod bounded_ipc_tests {
                 None,
                 None,
                 None,
-                worker_fault,
-                worker_disk_full,
-                &[],
+                ReleaseFaults {
+                    worker_fault,
+                    worker_disk_full,
+                    worker_disk_roots: &[],
+                    live_checkout_refused,
+                    source_busy,
+                    disk_peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                },
             );
             let (result, request) = timeout(Duration::from_secs(2), async {
                 tokio::join!(client, server)
@@ -1290,6 +1510,10 @@ mod bounded_ipc_tests {
             .await
             .expect("release fixture must terminate");
             result.unwrap();
+            assert!(
+                request.contains("&disk_peak_output_bytes=22548578304"),
+                "{request}"
+            );
             assert!(
                 request.starts_with("POST /release-worker?worker=ipc-test&slots=1&build_id=42"),
                 "{request}"
@@ -1302,6 +1526,16 @@ mod bounded_ipc_tests {
             assert_eq!(
                 request.contains("&worker_disk_full=1"),
                 worker_disk_full,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_live_checkout_refused=1"),
+                live_checkout_refused,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_source_busy=1"),
+                source_busy,
                 "{request}"
             );
         }
@@ -1440,16 +1674,122 @@ mod bounded_ipc_tests {
             .unwrap_err();
         assert!(error.to_string().contains("response timed out"));
         assert_eq!(
-            daemon_response_timeout_for(false, None, None),
+            daemon_response_timeout_for(false, false, None, None),
             Duration::from_secs(30)
         );
         assert_eq!(
-            daemon_response_timeout_for(true, None, None),
+            daemon_response_timeout_for(true, false, None, None),
             Duration::from_secs(330)
         );
         assert_eq!(
-            daemon_response_timeout_for(true, Some("90"), Some("450")),
+            daemon_response_timeout_for(true, false, Some("90"), Some("450")),
             Duration::from_secs(90)
+        );
+    }
+    #[tokio::test]
+    async fn restart_admission_wait_reopens_tolerates_the_restart_gap_and_is_bounded() {
+        use std::collections::VecDeque;
+        // Real time with millisecond polls (rch does not enable tokio's test-util).
+        async fn run(
+            script: &[Option<bool>],
+            bound_ms: u64,
+        ) -> (RestartAdmissionWait, usize, usize) {
+            let mut script: VecDeque<Option<bool>> = script.iter().copied().collect();
+            let mut probes = 0;
+            let mut waits = 0;
+            let outcome = wait_for_restart_admission(
+                || {
+                    probes += 1;
+                    let result = match script.pop_front().unwrap_or(Some(true)) {
+                        Some(closed) => Ok(closed),
+                        None => Err(anyhow::anyhow!("socket missing")),
+                    };
+                    std::future::ready(result)
+                },
+                Duration::from_millis(bound_ms),
+                Duration::from_millis(1),
+                || {
+                    waits += 1;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            (outcome, probes, waits)
+        }
+        // Open at once: no wait.
+        assert_eq!(
+            run(&[Some(false)], 60_000).await,
+            (RestartAdmissionWait::Open, 1, 0)
+        );
+        // No daemon and no barrier seen: proceed as before (selection recovers).
+        assert_eq!(
+            run(&[None], 60_000).await,
+            (RestartAdmissionWait::Open, 1, 0)
+        );
+        // Closed, daemon gone while it restarts, then open on the new daemon.
+        assert_eq!(
+            run(&[Some(true), Some(true), None, None, Some(false)], 60_000).await,
+            (RestartAdmissionWait::Open, 5, 4)
+        );
+        // Never reopens: bounded.
+        let (outcome, probes, _) = run(&[], 20).await;
+        assert_eq!(outcome, RestartAdmissionWait::StillClosed);
+        assert!(probes >= 2, "{probes}");
+        // A zero bound keeps the old fail-fast behaviour.
+        assert_eq!(
+            run(&[Some(true)], 0).await,
+            (RestartAdmissionWait::StillClosed, 1, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_admission_wait_bounds_a_stalled_probe_after_observing_closed() {
+        let mut probes = 0;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_restart_admission(
+                || {
+                    probes += 1;
+                    let first = probes == 1;
+                    async move {
+                        if first {
+                            Ok(true)
+                        } else {
+                            std::future::pending::<anyhow::Result<bool>>().await
+                        }
+                    }
+                },
+                Duration::from_millis(100),
+                Duration::ZERO,
+                || Ok(()),
+            ),
+        )
+        .await
+        .expect("a later stalled probe must not outlive the admission wait budget")
+        .unwrap();
+        assert_eq!(outcome, RestartAdmissionWait::StillClosed);
+        assert!((1..=2).contains(&probes));
+    }
+
+    #[tokio::test]
+    async fn restart_admission_wait_stops_on_unrecorded_wait_ownership() {
+        let mut probes = 0;
+        let error = wait_for_restart_admission(
+            || {
+                probes += 1;
+                std::future::ready(Ok(true))
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            || anyhow::bail!("durable heartbeat failed"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("durable heartbeat failed"));
+        assert_eq!(
+            probes, 1,
+            "unrecorded ownership must stop before another wait"
         );
     }
 }

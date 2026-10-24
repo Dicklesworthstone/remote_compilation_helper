@@ -121,6 +121,195 @@ fn copied_dataset_is_complete_and_independent_of_source_inodes() {
 }
 
 #[test]
+fn source_witness_covers_custom_loader_trees_and_negative_membership() {
+    for change in 0..6 {
+        let source = private();
+        fixture(source.path());
+        write(
+            source.path(),
+            "custom/loader/library.so",
+            b"unchanged-library",
+            0o644,
+        );
+        write(
+            source.path(),
+            "custom/loader/equal.so",
+            b"unchanged-library",
+            0o644,
+        );
+        symlink("library.so", source.path().join("custom/loader/current")).unwrap();
+        let parent = private();
+        let retained = capture_toolchain(
+            source.path(),
+            &parent.path().join("copy"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        retained
+            .verify_source_unchanged(source.path(), || false)
+            .unwrap();
+        let library = source.path().join("custom/loader/library.so");
+        match change {
+            0 => {
+                // Restore mtime after a same-length content change: ctime still
+                // invalidates the original source generation.
+                let modified = fs::metadata(&library).unwrap().modified().unwrap();
+                fs::write(&library, b"different-library").unwrap();
+                File::open(&library)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            }
+            1 => {
+                write(
+                    source.path(),
+                    "custom/loader/new.so",
+                    b"new candidate",
+                    0o644,
+                );
+            }
+            2 => {
+                fs::rename(&library, parent.path().join("previous-library")).unwrap();
+                write(
+                    source.path(),
+                    "custom/loader/library.so",
+                    b"unchanged-library",
+                    0o644,
+                );
+            }
+            3 => {
+                fs::set_permissions(&library, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            4 => {
+                let alias = source.path().join("custom/loader/current");
+                fs::rename(&alias, parent.path().join("previous-alias")).unwrap();
+                symlink("equal.so", alias).unwrap();
+            }
+            _ => {
+                fs::rename(source.path(), parent.path().join("previous-source")).unwrap();
+                fs::create_dir(source.path()).unwrap();
+                fixture(source.path());
+                write(
+                    source.path(),
+                    "custom/loader/library.so",
+                    b"unchanged-library",
+                    0o644,
+                );
+                write(
+                    source.path(),
+                    "custom/loader/equal.so",
+                    b"unchanged-library",
+                    0o644,
+                );
+                symlink("library.so", source.path().join("custom/loader/current")).unwrap();
+            }
+        }
+        assert!(
+            retained
+                .verify_source_unchanged(source.path(), || false)
+                .is_err(),
+            "complete source mutation {change} must invalidate its original witness"
+        );
+        // Mutation invalidates use as a memo of this source, while the owned
+        // captured bytes remain valid as the already selected dataset.
+        retained.verify(|| false).unwrap();
+        assert_eq!(
+            fs::read(retained.root().join("custom/loader/library.so")).unwrap(),
+            b"unchanged-library"
+        );
+    }
+}
+
+#[test]
+fn source_witness_cannot_refresh_from_a_later_equal_capture() {
+    let source = private();
+    fixture(source.path());
+    let parent = private();
+    let original = capture_toolchain(
+        source.path(),
+        &parent.path().join("first"),
+        None,
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    fs::rename(
+        source.path().join("lib/runtime.so"),
+        parent.path().join("old-runtime"),
+    )
+    .unwrap();
+    write(
+        source.path(),
+        "lib/runtime.so",
+        b"fixture runtime\0\xff",
+        0o644,
+    );
+    let later = capture_toolchain(
+        source.path(),
+        &parent.path().join("later"),
+        None,
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    assert_eq!(original.identity(), later.identity());
+    later
+        .verify_source_unchanged(source.path(), || false)
+        .unwrap();
+    assert!(
+        original
+            .verify_source_unchanged(source.path(), || false)
+            .is_err()
+    );
+}
+
+#[test]
+fn source_witness_requires_its_original_root_and_handles_cancellation() {
+    let source = private();
+    fixture(source.path());
+    let parent = private();
+    let retained = capture_toolchain(
+        source.path(),
+        &parent.path().join("copy"),
+        None,
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    retained
+        .verify_source_unchanged(source.path(), || false)
+        .unwrap();
+    assert!(
+        retained
+            .verify_source_unchanged(retained.root(), || false)
+            .is_err()
+    );
+    assert_eq!(
+        retained
+            .verify_source_unchanged(source.path(), || true)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
+    let reopened = rabs_sandbox::toolchain_dataset::open_toolchain(
+        retained.root(),
+        retained.identity(),
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    reopened.verify(|| false).unwrap();
+    assert!(
+        reopened
+            .verify_source_unchanged(source.path(), || false)
+            .is_err(),
+        "opening a retained copy does not prove correspondence to an arbitrary source tree"
+    );
+}
+
+#[test]
 fn external_source_hardlinks_are_copied_without_sharing_mutable_storage() {
     let source = private();
     let other = private();

@@ -81,6 +81,13 @@ fn object_file(path: &Path) -> rabs_protocol::result_identity::TypedDigest {
     }
 }
 
+fn real_rustc() -> std::path::PathBuf {
+    let sysroot =
+        String::from_utf8(checked(Command::new("rustc").args(["--print", "sysroot"])).stdout)
+            .unwrap();
+    Path::new(sysroot.trim()).join("bin/rustc")
+}
+
 fn real_toolchain(plan: &DependencyActionPlan) -> ToolchainFacts {
     use rabs_key::canonical::CanonicalEncoder;
     let compiler = Path::new(&plan.compiler);
@@ -220,19 +227,25 @@ fn try_actual_key(
         .dependency_dirs
         .iter()
         .map(|root| {
+            // The edge's rule (rustc's crate locator): only `lib*` entries can
+            // be opened as crates, and a library compile never opens an
+            // `.rlib` once a non-empty same-stem `.rmeta` supplies metadata.
             let mut artifacts = Vec::new();
-            let mut dep_info_names = Vec::new();
             for entry in std::fs::read_dir(root).unwrap() {
                 let path = entry.unwrap().path();
                 let name = path.file_name().unwrap().to_str().unwrap().to_owned();
-                if root == &plan.out_dir && plan.output_names().contains(&name) {
+                if !name.starts_with("lib")
+                    || (root == &plan.out_dir && plan.output_names().contains(&name))
+                {
                     continue;
                 }
                 assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
-                if name.ends_with(".d") {
-                    dep_info_names.push(name);
-                } else {
-                    assert!(name.ends_with(".rlib") || name.ends_with(".rmeta"));
+                assert!(name.ends_with(".rlib") || name.ends_with(".rmeta"));
+                let shadowed = name.strip_suffix(".rlib").is_some_and(|stem| {
+                    std::fs::metadata(Path::new(root).join(format!("{stem}.rmeta")))
+                        .is_ok_and(|meta| meta.len() > 0)
+                });
+                if !shadowed {
                     artifacts.push(ExternFact {
                         path: path.to_str().unwrap().to_owned(),
                         content_digest: object_file(&path),
@@ -240,11 +253,9 @@ fn try_actual_key(
                 }
             }
             artifacts.sort_by(|a, b| a.path.cmp(&b.path));
-            dep_info_names.sort();
             DependencyDirectoryFact {
                 path: root.clone(),
                 artifacts,
-                dep_info_names,
             }
         })
         .collect();
@@ -349,13 +360,13 @@ fn main() {
         .arg(&target)
         .env("CARGO_HOME", root.join("cargo-home"))
         .env("CARGO_INCREMENTAL", "0")
+        .env("RUSTC", real_rustc())
         .env("RUSTC_WRAPPER", &wrapper)
         .env("RABS_TEST_RECORD", &record);
     for name in [
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
         "RUSTC_WORKSPACE_WRAPPER",
-        "RUSTC",
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_TARGET",
         "RABS_TEST_UNKEYED_ENV",
@@ -559,13 +570,13 @@ fn actual_cargo_dependency_chain_reuses_complete_keys_across_target_directories(
             .arg(&target)
             .env("CARGO_HOME", root.join("cargo-home"))
             .env("CARGO_INCREMENTAL", "0")
+            .env("RUSTC", real_rustc())
             .env("RUSTC_WRAPPER", &wrapper)
             .env("RABS_TEST_RECORD", &record);
         for name in [
             "RUSTFLAGS",
             "CARGO_ENCODED_RUSTFLAGS",
             "RUSTC_WORKSPACE_WRAPPER",
-            "RUSTC",
             "CARGO_TARGET_DIR",
             "CARGO_BUILD_TARGET",
         ] {

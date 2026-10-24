@@ -13,6 +13,7 @@
 #   bash install.sh --local              # Same as above (default mode)
 #   bash install.sh --worker             # Worker-only install (no daemon)
 #   bash install.sh --from-source        # Build from source
+#   bash install.sh --with-rabs          # Also install the complete opt-in RABS toolset (Linux GNU)
 #   bash install.sh --easy-mode          # Configure PATH + detect agents + run doctor
 #   bash install.sh --no-service         # Install without system service
 #   bash install.sh --offline <tarball>  # Install from local tarball
@@ -20,12 +21,14 @@
 #
 # Environment:
 #   RCH_INSTALL_DIR     Where to install binaries (default: ~/.local/bin)
+#   RCH_RABS_INSTALL_DIR Optional separate RABS bin directory (default: RCH_INSTALL_DIR)
 #   RCH_CONFIG_DIR      Where to store config (default: ~/.config/rch)
 #   RCH_NO_HOOK         Skip Claude Code hook setup if set
 #   RCH_SKIP_FLEET_SYNC Skip worker deploy/health checks after install
 #   RCH_SKIP_DAEMON_RESTART Skip rchd restart after install
 #   RCH_NO_COLOR        Disable colored output
 #   RCH_SKIP_DOCTOR     Skip post-install doctor check
+#   RCH_SKIP_SKILL      Set to 1 to leave the Claude/Codex rch skill untouched
 #   HTTP_PROXY          HTTP proxy URL
 #   HTTPS_PROXY         HTTPS proxy URL
 #   NO_PROXY            Comma-separated list of hosts to bypass proxy
@@ -39,7 +42,7 @@ set -euo pipefail
 # Last-resort floor used only when every release-discovery path fails. Keep it in
 # step with the newest published release; enforce_no_downgrade() stops a stale
 # value here from clobbering a newer install.
-INSTALLER_VERSION="1.0.57"
+INSTALLER_VERSION="2.1.34"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
 # Records whether the caller pinned a version (VERSION=... or --version), which
 # suppresses the no-downgrade guard so deliberate rollbacks still work.
@@ -64,6 +67,8 @@ WORKER_BIN="rch-wkr"
 USE_COLOR=true
 USE_GUM=false
 TEMP_DIR=""
+# Expand arrays that may be empty as ${a[@]+"${a[@]}"}: under `set -u`, macOS's
+# /bin/bash 3.2 treats an empty "${a[@]}" as an unbound variable and exits.
 PROXY_ARGS=()
 
 # Default color values (set properly by setup_ui)
@@ -445,6 +450,19 @@ detect_platform() {
         RELEASE_TARGETS=("$TARGET")
     fi
 
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        # RABS is published only in the Linux GNU archives. Selecting the
+        # preferred core-only musl archive would otherwise silently omit it.
+        case "$TARGET" in
+            linux-x86_64) RELEASE_TARGETS=("x86_64-unknown-linux-gnu") ;;
+            linux-aarch64) RELEASE_TARGETS=("aarch64-unknown-linux-gnu") ;;
+            *) die "--with-rabs supports Linux GNU x86_64 and aarch64 only ($TARGET is unsupported)" ;;
+        esac
+        if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+            die "--with-rabs requires a GNU libc host; musl RABS releases are not available"
+        fi
+    fi
+
     success "Platform: $TARGET"
 }
 
@@ -472,13 +490,22 @@ check_prerequisites() {
 
     local errors=0
 
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        if ! command_exists python3 || ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+            die "--with-rabs requires Python 3.9 or later for installation and cargo-rabs"
+        fi
+        if [[ "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}" != /* ]]; then
+            die "The RABS installation directory must be absolute (RCH_RABS_INSTALL_DIR or RCH_INSTALL_DIR)"
+        fi
+    fi
+
     # Required for building from source
     if [[ "${FROM_SOURCE:-false}" == "true" ]]; then
         if command_exists cargo; then
             success "cargo: $(cargo --version)"
         else
             error "cargo not found (required for source build)"
-            ((errors++))
+            errors=$((errors + 1))
         fi
 
         if command_exists rustc; then
@@ -491,7 +518,7 @@ check_prerequisites() {
             fi
         else
             error "rustc not found (required for source build)"
-            ((errors++))
+            errors=$((errors + 1))
         fi
     fi
 
@@ -501,14 +528,14 @@ check_prerequisites() {
     else
         error "rsync not found"
         echo "  Install with: apt install rsync / brew install rsync"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     if command_exists ssh; then
         success "ssh: available"
     else
         error "ssh not found"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Optional but recommended
@@ -542,7 +569,7 @@ verify_worker_toolchain() {
     else
         error "rustup: not found"
         echo "  Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check for Rust nightly
@@ -562,7 +589,7 @@ verify_worker_toolchain() {
         success "clang: $(clang --version | head -1)"
     else
         error "No C compiler found (gcc or clang required)"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check rsync
@@ -571,7 +598,7 @@ verify_worker_toolchain() {
     else
         error "rsync: not found"
         echo "  Install with: apt install rsync / brew install rsync"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check zstd
@@ -580,7 +607,7 @@ verify_worker_toolchain() {
     else
         error "zstd: not found"
         echo "  Install with: apt install zstd / brew install zstd"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check SSH server (for incoming connections)
@@ -605,7 +632,7 @@ verify_worker_toolchain() {
 create_directories() {
     info "Creating directories..."
 
-    mkdir -p "$INSTALL_DIR"
+    mkdir -m 0755 -p "$INSTALL_DIR"
     mkdir -p "$CONFIG_DIR"
 
     local runtime_dir="${RUNTIME_DIR:-${RCH_RUNTIME_DIR:-${TMPDIR:-/tmp}/rch}}"
@@ -634,8 +661,8 @@ install_binary_file() {
 
 # A021 split-profile installer: resolve NAME built under PROFILE, falling back
 # to the legacy single-profile target/release layout. Required binaries abort
-# the install when missing; optional ones (the RABS spine) are skipped with a
-# note so a transient spine breakage can never block the core fleet install.
+# the install when missing; optional ones are skipped with a note. RABS uses
+# install_rabs_toolset instead so its launcher and binaries cannot be mixed.
 install_split_binary() {
     local name="$1" profile="$2" required="$3"
     local candidate src=""
@@ -656,6 +683,93 @@ install_split_binary() {
     success "Installed $name ($profile)"
 }
 
+check_rabs_launchers() {
+    # Use the bundle installer's existing file/ELF validation before executing
+    # supplied tools. An empty validator selects already-installed public links
+    # for --verify-only. Version/probe commands have a finite lifetime and never
+    # enroll workers, consult the daemon, or start a RABS service.
+    python3 -I - "$@" <<'PY'
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+
+validator, source_kind, source_path = sys.argv[1:]
+try:
+    if validator:
+        api = runpy.run_path(validator)
+        paths = (api["source_files"](None, source_path) if source_kind == "--from-build"
+                 else api["source_files"](source_path, None))
+        machine = api["host_machine"]()
+        for name in ("rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root"):
+            with paths[name].open("rb") as reader:
+                api["require_native_elf"](name, reader.read(64), machine)
+    else:
+        paths = {name: Path(source_path) / name
+                 for name in ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root")}
+    probe_tool = shutil.which("true")
+    if probe_tool is None:
+        raise RuntimeError("wrapper verification requires an external true executable")
+    for name, arguments in (("cargo-rabs", ["--help"]), ("rabsd", ["--version"]),
+                            ("rabs-wkr", ["--version"]), ("rabs-cargo-root", ["--version"]),
+                            ("rabs-wrap", [probe_tool, "-vV"])):
+        if not paths[name].is_file() or not os.access(paths[name], os.X_OK):
+            raise RuntimeError(name + " is missing or not executable")
+        try:
+            result = subprocess.run([str(paths[name]), *arguments], timeout=10,
+                                    stdout=subprocess.DEVNULL if name == "cargo-rabs" else None)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(name + " cannot execute on this host: " + str(error)) from error
+        if result.returncode:
+            raise RuntimeError(name + " launch check failed with exit " + str(result.returncode))
+except Exception as error:
+    print("RABS launch check: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+install_rabs_toolset() {
+    [[ "${WITH_RABS:-false}" == "true" ]] || return 0
+    local installer="$1" source_option="$2" source_path="$3"
+    local bin_dir="${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"
+    if [[ ! -f "$installer" || -L "$installer" ]]; then
+        die "Requested RABS toolset is incomplete: install-rabs is missing; use a Linux GNU release containing all RABS tools"
+    fi
+    local probe_source="$source_path" probe_kind="$source_option"
+    if [[ "$source_option" == "--from-archive" ]]; then
+        # Both archive paths have already extracted this exact trusted bundle.
+        # The installer validates the original archive again during staging.
+        probe_source="${installer%/*}"
+        probe_kind="--from-bundle"
+    fi
+    if ! check_rabs_launchers "$installer" "$probe_kind" "$probe_source"; then
+        die "Requested RABS executables failed launch checks; generation activation was not attempted"
+    fi
+    info "Installing the complete RABS toolset into $bin_dir..."
+    # Use the supplied bundle/build's installer and its atomic generation
+    # switch. It verifies all four tools before activating any of them and
+    # refuses to overwrite unmanaged files from an older loose installation.
+    if ! python3 -I "$installer" "$source_option" "$source_path" --bin-dir "$bin_dir"; then
+        die "Requested RABS installation failed; inspect the reported error before retrying. For an existing unmanaged installation, choose a separate RCH_RABS_INSTALL_DIR."
+    fi
+    success "Installed cargo-rabs, rabs-wrap, rabsd, rabs-wkr and rabs-cargo-root"
+}
+
+build_rabs_toolset() {
+    [[ "${WITH_RABS:-false}" == "true" ]] || return 0
+    local project_dir="$1"
+    info "Building the requested RABS toolset..."
+    if ! cargo build --locked --profile wrapper-release -p rabs-wrap; then
+        die "Requested RABS wrapper build failed; installation stopped"
+    fi
+    if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; then
+        die "Requested RABS daemon/worker build failed; installation stopped"
+    fi
+    install_rabs_toolset "$project_dir/scripts/install-rabs" --from-build "$TARGET_DIR"
+}
+
 build_from_source() {
     info "Building from source..."
 
@@ -669,11 +783,18 @@ build_from_source() {
         die "Cannot find RCH source directory. Run from project root or clone the repo first."
     fi
 
+    project_dir=$(cd "$project_dir" && pwd) || return 1
     cd "$project_dir"
+    if [[ "${VERSION_EXPLICIT:-false}" == "true" ]]; then
+        local requested_tag
+        requested_tag=$(installer_release_tag "$VERSION") || return 1
+        verify_source_release "$project_dir" "$requested_tag" || return 1
+    fi
 
     # A021 split profiles: hook CLI under wrapper-release (startup +
     # footprint first), daemon/worker under daemon-release (throughput,
-    # symbols retained for crashpacks). The RABS spine builds best-effort.
+    # symbols retained for crashpacks). RABS is built only when requested and
+    # its complete generation must install successfully before reporting success.
     if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
         TARGET_DIR="${CARGO_TARGET_DIR%/}"
     else
@@ -681,40 +802,65 @@ build_from_source() {
     fi
 
     if $USE_GUM; then
-        spin "Building rch (wrapper-release profile)..." cargo +nightly build --profile wrapper-release -p rch
-        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo +nightly build --profile daemon-release -p rchd -p rch-wkr
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
-        fi
+        spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch
+        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr
     else
         info "Building rch (wrapper-release profile; this may take a while)..."
-        cargo +nightly build --profile wrapper-release -p rch
+        cargo build --locked --profile wrapper-release -p rch
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        cargo +nightly build --profile daemon-release -p rchd -p rch-wkr
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
-        fi
+        cargo build --locked --profile daemon-release -p rchd -p rch-wkr
     fi
+
+    build_rabs_toolset "$project_dir"
 
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wkr" "daemon-release" optional
     else
         # Local mode: hook CLI from wrapper-release; daemon and worker from
         # daemon-release (worker binary needed for fleet deploy).
         install_split_binary "$HOOK_BIN" "wrapper-release" required
         install_split_binary "$DAEMON_BIN" "daemon-release" required
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wrap" "wrapper-release" optional
-        install_split_binary "rabsd" "daemon-release" optional
-        install_split_binary "rabs-wkr" "daemon-release" optional
     fi
 
     success "Build complete"
+}
+
+installer_release_tag() {
+    local version="${1:-}"
+    local tag="v${version#v}"
+    if [[ -z "$version" || ! "$tag" =~ ^v[0-9][A-Za-z0-9._+-]*$ ]]; then
+        error "Cannot bind installation to release version: $version"
+        return 1
+    fi
+    printf '%s\n' "$tag"
+}
+
+release_download_url() {
+    local tag="$1" asset="$2"
+    if [[ ! "$tag" =~ ^v[0-9][A-Za-z0-9._+-]*$ ||
+          ! "$asset" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+        error "Invalid release tag or asset name"
+        return 1
+    fi
+    printf 'https://github.com/%s/releases/download/%s/%s\n' "$GITHUB_REPO" "$tag" "$asset"
+}
+
+verify_source_release() {
+    local source_root="$1" source_tag
+    local source_commit release_commit source_status
+    source_tag=$(installer_release_tag "$2") || return 1
+    source_commit=$(git -C "$source_root" rev-parse --verify HEAD) || return 1
+    release_commit=$(git -C "$source_root" rev-parse --verify "refs/tags/${source_tag}^{commit}") || return 1
+    if [[ "$source_commit" != "$release_commit" ]]; then
+        error "Source checkout does not match release tag $source_tag; build refused"
+        return 1
+    fi
+    source_status=$(git -C "$source_root" status --porcelain --untracked-files=all) || return 1
+    if [[ -n "$source_status" ]]; then
+        error "Source checkout has changes outside release tag $source_tag; build refused"
+        return 1
+    fi
 }
 
 download_binaries() {
@@ -723,7 +869,7 @@ download_binaries() {
 
     info "Checking for pre-built binaries..."
 
-    # Prefer versioned GH Actions artifacts (matches release workflow)
+    # Prefer versioned release artifacts, bound to the one resolved tag.
     local asset_name=""
     local checksum_url=""
     local downloaded=false
@@ -736,13 +882,15 @@ download_binaries() {
     trap 'rm -rf "$TEMP_DIR"; cleanup_lock' EXIT
 
     if [[ -n "${VERSION:-}" ]]; then
-        tag_name="v${VERSION#v}"
+        tag_name=$(installer_release_tag "$VERSION") || return 1
     else
         local release_url="${GITHUB_API}/releases/latest"
-        release_info=$(curl -sL --connect-timeout 10 "${PROXY_ARGS[@]}" "$release_url" 2>/dev/null || echo "")
+        release_info=$(curl -sL --connect-timeout 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$release_url" 2>/dev/null || echo "")
         if [[ -n "$release_info" ]] && echo "$release_info" | grep -q '"tag_name"'; then
             tag_name=$(echo "$release_info" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
         fi
+        tag_name=$(installer_release_tag "$tag_name") || return 1
+        VERSION="${tag_name#v}"
     fi
 
     if [[ -n "$tag_name" && ${#RELEASE_TARGETS[@]} -gt 0 ]]; then
@@ -750,14 +898,15 @@ download_binaries() {
         # asset that actually exists in this release (rch#23: linux-x86_64 falls
         # back from -musl to -gnu when only -gnu was published).
         local candidate_target
-        for candidate_target in "${RELEASE_TARGETS[@]}"; do
+        for candidate_target in ${RELEASE_TARGETS[@]+"${RELEASE_TARGETS[@]}"}; do
             local versioned_asset="rch-${tag_name}-${candidate_target}.${asset_ext}"
-            local versioned_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}"
+            local versioned_url
+            versioned_url=$(release_download_url "$tag_name" "$versioned_asset") || return 1
             info "Downloading $versioned_asset from $tag_name..."
-            if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
                 downloaded=true
                 asset_name="$versioned_asset"
-                checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}.sha256"
+                checksum_url=$(release_download_url "$tag_name" "${versioned_asset}.sha256") || return 1
                 checksum_tag="$tag_name"
                 break
             fi
@@ -765,26 +914,19 @@ download_binaries() {
     fi
 
     if [[ "$downloaded" != "true" ]]; then
-        local unversioned_asset="rch-${TARGET}.${asset_ext}"
-        local latest_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${unversioned_asset}"
-        info "Downloading $unversioned_asset from latest release..."
-        if curl -fsSL "${PROXY_ARGS[@]}" "$latest_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
-            downloaded=true
-            asset_name="$unversioned_asset"
-            checksum_tag="$tag_name"
-        fi
-    fi
-
-    if [[ "$downloaded" != "true" && -n "${VERSION:-}" ]]; then
-        local version_tag="v${VERSION#v}"
-        local unversioned_asset="rch-${TARGET}.${asset_ext}"
-        local version_url="https://github.com/${GITHUB_REPO}/releases/download/${version_tag}/${unversioned_asset}"
-        info "Downloading $unversioned_asset from $version_tag..."
-        if curl -fsSL "${PROXY_ARGS[@]}" "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
-            downloaded=true
-            asset_name="$unversioned_asset"
-            checksum_tag="$version_tag"
-        fi
+        local candidate_target unversioned_asset version_url
+        for candidate_target in ${RELEASE_TARGETS[@]+"${RELEASE_TARGETS[@]}"} "$TARGET"; do
+            unversioned_asset="rch-${candidate_target}.${asset_ext}"
+            version_url=$(release_download_url "$tag_name" "$unversioned_asset") || return 1
+            info "Downloading $unversioned_asset from $tag_name..."
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
+                downloaded=true
+                asset_name="$unversioned_asset"
+                checksum_tag="$tag_name"
+                checksum_url=$(release_download_url "$tag_name" "${unversioned_asset}.sha256") || return 1
+                break
+            fi
+        done
     fi
 
     if [[ "$downloaded" != "true" ]]; then
@@ -795,39 +937,24 @@ download_binaries() {
         return
     fi
 
-    if [[ -n "$checksum_url" || -n "$checksum_tag" ]]; then
-        info "Verifying checksum..."
-        local expected=""
-        if [[ -n "$checksum_url" ]]; then
-            expected=$(curl -fsSL "${PROXY_ARGS[@]}" "$checksum_url" 2>/dev/null | cut -d' ' -f1 || true)
+    local checksum_file="$TEMP_DIR/SHA256SUMS"
+    local sidecar_file="$TEMP_DIR/${asset_name}.sha256"
+    if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$checksum_url" -o "$sidecar_file"; then
+        local expected
+        if ! expected=$(extract_checksum_from_manifest "$(cat "$sidecar_file")" "$asset_name" true); then
+            error "Invalid or ambiguous checksum sidecar for $asset_name"
+            return 1
         fi
-        if [[ -z "$expected" && -n "$checksum_tag" ]]; then
-            local manifest_url="https://github.com/${GITHUB_REPO}/releases/download/${checksum_tag}/SHA256SUMS"
-            local manifest_content=""
-            manifest_content=$(curl -fsSL "${PROXY_ARGS[@]}" "$manifest_url" 2>/dev/null || true)
-            if [[ -n "$manifest_content" ]]; then
-                expected=$(extract_checksum_from_manifest "$manifest_content" "$asset_name")
-            fi
-        fi
-        if [[ -n "$expected" ]]; then
-            local actual=""
-            if command -v sha256sum >/dev/null 2>&1; then
-                actual=$(sha256sum "$TEMP_DIR/$asset_name" | cut -d' ' -f1)
-            else
-                actual=$(shasum -a 256 "$TEMP_DIR/$asset_name" | cut -d' ' -f1)
-            fi
-            if [[ "$expected" != "$actual" ]]; then
-                warn "Checksum verification failed"
-                info "Falling back to building from source..."
-                rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-                clone_and_build_from_source
-                return
-            fi
-            success "Checksum verified"
-        else
-            warn "Checksum file not found for $asset_name"
+        printf '%s  %s\n' "$expected" "$asset_name" > "$checksum_file"
+    else
+        local manifest_url
+        manifest_url=$(release_download_url "$checksum_tag" SHA256SUMS) || return 1
+        if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$manifest_url" -o "$checksum_file"; then
+            error "No checksum available for $asset_name from $checksum_tag; installation refused"
+            return 1
         fi
     fi
+    verify_checksum "$TEMP_DIR/$asset_name" "$checksum_file" "$asset_name" || return 1
 
     # Extract and install
     info "Extracting binaries..."
@@ -855,6 +982,8 @@ download_binaries() {
             return
         fi
     fi
+
+    install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$TEMP_DIR/$asset_name"
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
@@ -889,6 +1018,8 @@ clone_and_build_from_source() {
     # Clone the repository and build from source
     # This is the fallback when pre-built binaries aren't available
 
+    local source_tag
+    source_tag=$(installer_release_tag "$VERSION") || return 1
     ensure_command git
 
     # Check for Rust toolchain
@@ -904,16 +1035,17 @@ clone_and_build_from_source() {
 
     info "Cloning repository..."
     if $USE_GUM; then
-        if ! spin "Cloning RCH repository..." git clone --depth 1 "$REPO_URL" "$TEMP_DIR/rch"; then
+        if ! spin "Cloning RCH release $source_tag..." git clone --depth 1 --branch "$source_tag" -- "$REPO_URL" "$TEMP_DIR/rch"; then
             die "Failed to clone repository from $REPO_URL"
         fi
     else
-        if ! git clone --depth 1 "$REPO_URL" "$TEMP_DIR/rch"; then
+        if ! git clone --depth 1 --branch "$source_tag" -- "$REPO_URL" "$TEMP_DIR/rch"; then
             die "Failed to clone repository from $REPO_URL"
         fi
     fi
 
     cd "$TEMP_DIR/rch" || die "Failed to change to cloned repository directory"
+    verify_source_release "$TEMP_DIR/rch" "$source_tag" || return 1
 
     # A021 split profiles (see build_from_source for rationale).
     if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
@@ -923,43 +1055,31 @@ clone_and_build_from_source() {
     fi
 
     if $USE_GUM; then
-        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo +nightly build --profile wrapper-release -p rch; then
+        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo build --locked --profile wrapper-release -p rch; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
-        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo +nightly build --profile daemon-release -p rchd -p rch-wkr; then
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
-        fi
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
         fi
     else
         info "Building rch (wrapper-release profile; this may take a few minutes)..."
-        if ! cargo +nightly build --profile wrapper-release -p rch; then
+        if ! cargo build --locked --profile wrapper-release -p rch; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        if ! cargo +nightly build --profile daemon-release -p rchd -p rch-wkr; then
+        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
-        fi
-        info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
-            info "RABS spine build unavailable; installing core binaries only"
         fi
     fi
 
+    build_rabs_toolset "$TEMP_DIR/rch"
+
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wkr" "daemon-release" optional
     else
         install_split_binary "$HOOK_BIN" "wrapper-release" required
         install_split_binary "$DAEMON_BIN" "daemon-release" required
         install_split_binary "$WORKER_BIN" "daemon-release" required
-        install_split_binary "rabs-wrap" "wrapper-release" optional
-        install_split_binary "rabsd" "daemon-release" optional
-        install_split_binary "rabs-wkr" "daemon-release" optional
     fi
 
     success "Build from source complete"
@@ -975,7 +1095,7 @@ install_rust_toolchain() {
 
     info "Installing Rust via rustup..."
     # Note: rustup respects HTTPS_PROXY/HTTP_PROXY environment variables automatically
-    if curl --proto '=https' --tlsv1.2 -sSf "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly; then
+    if curl --proto '=https' --tlsv1.2 -sSf ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly; then
         # Source cargo env for current session
         if [[ -f "$HOME/.cargo/env" ]]; then
             # shellcheck source=/dev/null
@@ -1000,7 +1120,10 @@ verify_checksum() {
     info "Verifying checksum..."
 
     local expected
-    expected=$(grep "$filename" "$checksum_file" | awk '{print $1}')
+    if ! expected=$(extract_checksum_from_manifest "$(cat "$checksum_file")" "$filename"); then
+        error "Checksum missing, malformed or ambiguous for $filename"
+        return 1
+    fi
 
     if [[ -z "$expected" ]]; then
         error "Checksum not found for $filename"
@@ -1030,15 +1153,28 @@ verify_checksum() {
 extract_checksum_from_manifest() {
     local manifest_content="$1"
     local filename="$2"
+    local allow_bare="${3:-false}"
 
-    printf '%s\n' "$manifest_content" | awk -v file="$filename" '
-        NF >= 2 {
-            checksum = $1
-            path = $NF
-            if (path == file || path ~ ("/" file "$") || path ~ ("\\\\" file "$")) {
-                print checksum
-                exit
+    printf '%s\n' "$manifest_content" | awk -v file="$filename" -v bare="$allow_bare" '
+        {
+            sub(/\r$/, "")
+            if (!NF) next
+            records++
+            path = $2
+            sub(/^\*/, "", path)
+            sub(/^\.\//, "", path)
+            if (path == file || (bare == "true" && NF == 1)) {
+                count++
+                if ((NF != 2 && !(bare == "true" && NF == 1)) ||
+                    length($1) != 64 || $1 !~ /^[[:xdigit:]]+$/) {
+                    invalid = 1
+                }
+                checksum = tolower($1)
             }
+        }
+        END {
+            if (count != 1 || invalid || (bare == "true" && records != 1)) exit 1
+            print checksum
         }
     '
 }
@@ -1222,7 +1358,7 @@ verify_sigstore_bundle() {
     local bundle_file="${file}.sigstore.json"
 
     info "Downloading Sigstore bundle..."
-    if ! curl -fsSL "${PROXY_ARGS[@]}" "$bundle_url" -o "$bundle_file" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$bundle_url" -o "$bundle_file" 2>/dev/null; then
         warn "Could not download Sigstore bundle; skipping signature verification"
         return 0
     fi
@@ -1260,6 +1396,37 @@ _rch_skill_is_full() {
     return 1
 }
 
+# An `rch` skill package installed by jsm (jeffreys-skills.md) belongs to jsm,
+# and copying RCH's tree over it would leave a hybrid of the two distributions
+# (GH#93). Without jsm on PATH this is never true, so behaviour is unchanged.
+# If jsm is present but cannot list its packages, nothing is known about
+# ownership: warn and keep today's behaviour (install), and point at the
+# explicit opt-out, which never depends on this detection.
+_rch_skill_managed_by_jsm() {
+    command_exists jsm || return 1
+    local listing=""
+    local -a runner=()
+    if command_exists timeout; then
+        runner=(timeout 20)
+    elif command_exists gtimeout; then
+        runner=(gtimeout 20)
+    fi
+    # `jsm list --json` reads local installed state. JSM_OFFLINE=true keeps it
+    # off the network; unlike the --offline flag, a jsm release that predates
+    # offline mode ignores the variable instead of rejecting the command.
+    # Its output is {"skills": [{"name": "...", ...}], ...}.
+    # The `+` form keeps an empty runner safe under `set -u` on bash < 4.4.
+    if ! listing=$(JSM_OFFLINE=true ${runner[@]+"${runner[@]}"} jsm list --json 2>/dev/null); then
+        warn "jsm is installed but 'jsm list --json' failed; cannot tell whether jsm manages the rch skill. Set RCH_SKIP_SKILL=1 (or pass --skip-skill) to leave it untouched."
+        return 1
+    fi
+    # Match in-process, not with `printf | grep -q`: grep -q exits at the first
+    # match, and under pipefail the writer's SIGPIPE on a listing larger than a
+    # pipe buffer would turn that match into a miss.
+    local rch_entry='"name"[[:space:]]*:[[:space:]]*"rch"'
+    [[ "$listing" =~ $rch_entry ]]
+}
+
 install_skill() {
     local claude_dest="$HOME/.claude/skills/rch"
     local codex_dest="$HOME/.codex/skills/rch"
@@ -1282,12 +1449,43 @@ install_skill() {
         "assets/workers-template.toml"
         "references/COMMANDS.md"
         "references/CONFIGURATION.md"
+        "references/DISK_AND_PRESSURE.md"
+        "references/ERROR_CODES.md"
+        "references/EXEC_MODES.md"
+        "references/FAIL_OPEN.md"
         "references/HOOKS.md"
+        "references/MACHINE_INTROSPECTION.md"
+        "references/MULTI_AGENT_CONTENTION.md"
         "references/OPERATIONS.md"
+        "references/PATH_DEPENDENCIES.md"
+        "references/RECOVERY_PLAYBOOKS.md"
+        "references/SELF_HEALING.md"
+        "references/SHIM.md"
+        "references/SSH_KEY_RECOVERY.md"
+        "references/SSH_TUNING.md"
+        "references/TELEMETRY_RECOVERY.md"
         "references/TROUBLESHOOTING.md"
         "references/WORKERS.md"
+        "scripts/auto_recover.sh"
+        "scripts/diagnose-rch.sh"
+        "scripts/mine_rch_history.sh"
+        "scripts/multi_agent_safety.sh"
+        "scripts/protocol_test.sh"
         "scripts/validate-setup.sh"
+        "scripts/worker_disk_triage.sh"
     )
+
+    # GH#93: decide before creating, downloading or copying anything, so a skip
+    # leaves both skill trees exactly as they were. Only the companion skill is
+    # skipped; binaries, hook and daemon setup are unaffected.
+    if [[ "${SKIP_SKILL:-false}" == "true" || "${RCH_SKIP_SKILL:-}" == "1" ]]; then
+        info "Skipping the RCH companion skill (RCH_SKIP_SKILL=1 / --skip-skill)"
+        return 0
+    fi
+    if _rch_skill_managed_by_jsm; then
+        info "Skipping the RCH companion skill: jsm manages the installed rch skill (update it with jsm)"
+        return 0
+    fi
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -1309,7 +1507,7 @@ install_skill() {
 
     mkdir -p "$skill_stage/assets" "$skill_stage/references" "$skill_stage/scripts"
     # SKILL.md is mandatory; without it the raw tree cannot yield a usable skill.
-    if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/SKILL.md" -o "${skill_stage}/SKILL.md" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "${skill_raw_base}/SKILL.md" -o "${skill_stage}/SKILL.md" 2>/dev/null; then
         raw_skill_ok=false
     fi
     # Companion files are best-effort: a single missing/renamed file must not
@@ -1318,7 +1516,7 @@ install_skill() {
     if $raw_skill_ok; then
         for rel_path in "${skill_files[@]}"; do
             mkdir -p "${skill_stage}/$(dirname "$rel_path")"
-            if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/${rel_path}" -o "${skill_stage}/${rel_path}" 2>/dev/null; then
+            if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "${skill_raw_base}/${rel_path}" -o "${skill_stage}/${rel_path}" 2>/dev/null; then
                 warn "Skill companion file not found (skipping): ${rel_path}"
                 rm -f "${skill_stage}/${rel_path}" 2>/dev/null || true
             fi
@@ -1332,7 +1530,7 @@ install_skill() {
     fi
 
     # Try release-packaged skill only after repo-local and raw repo sources.
-    if curl -fsSL "${PROXY_ARGS[@]}" "$skill_url" -o "$skill_temp" 2>/dev/null; then
+    if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$skill_url" -o "$skill_temp" 2>/dev/null; then
         if tar -xzf "$skill_temp" -C "$HOME/.claude/skills" 2>/dev/null; then
             installed_claude=true
         fi
@@ -1508,7 +1706,7 @@ show_skill_info() {
             "It provides setup guidance, troubleshooting, and quick fixes." \
             "" \
             "Installed to:" \
-            "${loc_lines[@]}" \
+            ${loc_lines[@]+"${loc_lines[@]}"} \
             "" \
             "How Skills Work:" \
             "  When you describe an RCH problem to your AI agent," \
@@ -1539,7 +1737,7 @@ show_skill_info() {
         echo "  It provides setup guidance, troubleshooting, and quick fixes."
         echo ""
         echo "  Installed to:"
-        for line in "${loc_lines[@]}"; do
+        for line in ${loc_lines[@]+"${loc_lines[@]}"}; do
             echo "$line"
         done
         echo ""
@@ -1597,6 +1795,8 @@ install_from_tarball() {
         info "Extracting tarball..."
         tar -xzf "$tarball" -C "$TEMP_DIR"
     fi
+
+    install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$tarball"
 
     # Install binaries from tarball
     if [[ "$MODE" == "worker" ]]; then
@@ -2161,7 +2361,7 @@ configure_dispatcher_shim() {
     fi
     # Reassert at the end: an updater may have appended its own PATH prepend
     # after an older RCH line. Consecutive installs remain idempotent.
-    for shell_rc in "${shell_files[@]}"; do
+    for shell_rc in ${shell_files[@]+"${shell_files[@]}"}; do
         mkdir -p "$(dirname "$shell_rc")"
         if [[ ! -f "$shell_rc" ]] || [[ "$(tail -n 1 "$shell_rc")" != "$path_line" ]]; then
             printf '\n# RCH dispatcher: keep Cargo offload ahead of toolchain binaries\n%s\n' "$path_line" >> "$shell_rc"
@@ -2568,6 +2768,13 @@ verify_installation() {
 
     local failed=0
 
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        if ! check_rabs_launchers "" --installed "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"; then
+            die "Installed RABS toolset failed launch checks"
+        fi
+        success "RABS toolset launch checks passed"
+    fi
+
     if [[ "$MODE" == "worker" ]]; then
         if [[ -x "$INSTALL_DIR/$WORKER_BIN" ]]; then
             local version
@@ -2575,7 +2782,7 @@ verify_installation() {
             success "$WORKER_BIN: $version"
         else
             error "Worker binary not found or not executable"
-            ((failed++))
+            failed=$((failed + 1))
         fi
     else
         for binary in "$HOOK_BIN" "$DAEMON_BIN"; do
@@ -2586,7 +2793,7 @@ verify_installation() {
                 success "$binary: $version"
             else
                 error "$binary: not found or not executable"
-                ((failed++))
+                failed=$((failed + 1))
             fi
         done
 
@@ -2599,13 +2806,13 @@ verify_installation() {
                 warn "$WORKER_BIN: not installed (fleet sync disabled)"
             else
                 error "$WORKER_BIN: not found or not executable"
-                ((failed++))
+                failed=$((failed + 1))
             fi
         fi
 
         if [[ ! -f "$CONFIG_DIR/daemon.toml" ]]; then
             error "Daemon config not found"
-            ((failed++))
+            failed=$((failed + 1))
         fi
     fi
 
@@ -2647,6 +2854,16 @@ print_summary() {
     echo "  📁 Binaries:    $INSTALL_DIR"
     echo "  ⚙️  Config:      $CONFIG_DIR"
     echo ""
+
+    if [[ "${WITH_RABS:-false}" == "true" ]]; then
+        echo "  RABS tools: ${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"
+        echo "  Opt in to a build with 'cargo rabs build'; see 'cargo rabs --help'."
+        echo "  RABS services and Cargo configuration were not changed."
+        if [[ "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}" != "$INSTALL_DIR" ]]; then
+            printf '  Add the RABS tools to PATH: export PATH=%q:$PATH\n' "$RCH_RABS_INSTALL_DIR"
+        fi
+        echo ""
+    fi
 
     if [[ "$MODE" == "worker" ]]; then
         echo "  🔧 Worker binary: $INSTALL_DIR/$WORKER_BIN"
@@ -2852,11 +3069,13 @@ Options:
   --local              Install hook and daemon (default)
   --worker             Install worker agent only
   --from-source        Build from source (requires Rust)
+  --with-rabs          Also install complete opt-in RABS tools (Linux GNU only)
   --offline <tarball>  Install from local tarball (airgap mode)
   --easy-mode          Configure PATH + detect agents + run doctor
   --verify-only        Verify existing installation
   --install-service    Enable background service without prompting
   --no-service         Skip systemd/launchd service setup
+  --skip-skill         Leave the Claude/Codex rch skill untouched (same as RCH_SKIP_SKILL=1)
   --uninstall          Remove RCH installation
   --no-gum             Disable Gum UI (use ANSI fallback)
   --yes                Skip confirmation prompts
@@ -2864,15 +3083,23 @@ Options:
 
 Environment:
   RCH_INSTALL_DIR      Installation directory (default: ~/.local/bin)
+  RCH_RABS_INSTALL_DIR Separate RABS bin directory (default: RCH_INSTALL_DIR)
   RCH_CONFIG_DIR       Config directory (default: ~/.config/rch)
   RCH_NO_HOOK          Skip Claude Code hook setup if set
   RCH_NO_COLOR         Disable colored output
   RCH_SKIP_DOCTOR      Skip post-install doctor check
   RCH_SKIP_DAEMON_RESTART  Skip rchd restart after install
   RCH_SKIP_FLEET_SYNC  Skip worker deploy/health checks after install
+  RCH_SKIP_SKILL       Set to 1 to leave the Claude/Codex rch skill untouched
   HTTP_PROXY           HTTP proxy URL
   HTTPS_PROXY          HTTPS proxy URL
   NO_PROXY             Hosts to bypass proxy
+
+Companion skill:
+  The installer refreshes ~/.claude/skills/rch and ~/.codex/skills/rch. It skips
+  both when jsm reports that it manages an installed rch skill, or when
+  --skip-skill / RCH_SKIP_SKILL=1 is given. Skipping never affects binaries,
+  the hook or the daemon.
 
 Service Setup:
   On Linux:  systemd user service is offered during install (auto-accept in --easy-mode/--yes).
@@ -2886,6 +3113,7 @@ Service Setup:
 Examples:
   ./install.sh                         # Install locally (auto-detects source)
   ./install.sh --from-source           # Force build from source
+  ./install.sh --with-rabs             # Install RCH and the complete RABS toolset
   ./install.sh --worker                # Install on a worker machine
   ./install.sh --easy-mode             # Full setup with PATH and detection
   ./install.sh --offline rch.tar.gz    # Install from local tarball
@@ -2904,6 +3132,7 @@ main() {
     # Parse arguments
     MODE="local"
     FROM_SOURCE="false"
+    WITH_RABS="false"
     UNINSTALL="false"
     VERIFY_ONLY="false"
     EASY_MODE="false"
@@ -2911,6 +3140,7 @@ main() {
     INSTALL_SERVICE="false"
     ENABLE_SERVICE="true"
     YES="false"
+    SKIP_SKILL="false"
     OFFLINE_TARBALL=""
 
     while [[ $# -gt 0 ]]; do
@@ -2925,6 +3155,10 @@ main() {
                 ;;
             --from-source)
                 FROM_SOURCE="true"
+                shift
+                ;;
+            --with-rabs)
+                WITH_RABS="true"
                 shift
                 ;;
             --offline)
@@ -2949,6 +3183,10 @@ main() {
                 ;;
             --no-service)
                 NO_SERVICE="true"
+                shift
+                ;;
+            --skip-skill)
+                SKIP_SKILL="true"
                 shift
                 ;;
             --uninstall)
@@ -2978,6 +3216,10 @@ main() {
     # Setup UI
     setup_ui
 
+    if [[ "$WITH_RABS" == "true" && "$UNINSTALL" == "true" ]]; then
+        die "--with-rabs is an installation option; it cannot be combined with --uninstall. RABS generations are retained."
+    fi
+
     # Detect target version (needed for header and upgrade banner)
     detect_target_version
 
@@ -3000,6 +3242,9 @@ main() {
     # Never let a failed release lookup downgrade a working install
     enforce_no_downgrade
     if [[ "$SKIP_INSTALL_NO_DOWNGRADE" == "true" ]]; then
+        if [[ "$WITH_RABS" == "true" ]]; then
+            die "RABS was requested but version discovery would downgrade RCH. Retry with VERSION=$VERSION to install matching RABS tools."
+        fi
         success "rch v${VERSION} is already installed and newer than the resolved target; nothing to do."
         exit 0
     fi

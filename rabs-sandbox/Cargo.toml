@@ -19,12 +19,15 @@ doctest = false
 # rabs-asupersync. Privileged helpers are separate audited binaries recorded
 # in the unsafe-boundary ledger (bead A011).
 [dependencies]
+memchr = { workspace = true }
 rabs-protocol = { path = "../rabs-protocol" }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Descriptor-relative source capture without unsafe code in this crate.
-rustix = { version = "1.1.4", features = ["fs"] }
+[target.'cfg(unix)'.dependencies]
+# Descriptor-relative source/endpoint ownership and effective-UID checks
+# without unsafe code in this crate. The package/version is unchanged.
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"

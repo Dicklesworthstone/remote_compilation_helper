@@ -17,6 +17,8 @@ use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::metadata_store::{RusqliteEngine, SqlMetadataStore};
 
 fn boot_once(state_dir: &std::path::Path) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .args(["--run-for-ms", "1500"])
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))
@@ -65,7 +67,9 @@ fn daemon_recovers_from_a_store_torn_mid_publication() {
     // will mount: object linked into the published namespace, metadata
     // never recorded (the classic "died between link and commit" tear).
     {
+        use std::os::unix::fs::PermissionsExt;
         let layout = BlobStoreLayout::open(&cas.join("blobs")).unwrap();
+        std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o700)).unwrap();
         let engine = RusqliteEngine::open(&cas.join("meta.sqlite")).unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
         let bytes = b"torn-object-payload";

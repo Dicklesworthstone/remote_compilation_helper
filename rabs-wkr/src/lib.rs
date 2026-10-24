@@ -18,11 +18,15 @@
 
 pub mod artifacts;
 pub mod execution;
+pub mod host_budget;
 pub mod jobserver;
 pub mod output;
 pub mod request_journal;
 pub mod result_spool;
+#[cfg(target_os = "linux")]
+pub mod root_admission;
 pub mod session;
 pub mod source_task;
 pub mod source_transfer;
+pub mod target_cache;
 pub mod toolchain_transfer;

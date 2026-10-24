@@ -156,10 +156,11 @@ retry_delay_ms = 1000
 canonical_root = "/data/projects"   # env RCH_CANONICAL_PROJECT_ROOT; "" = unset; ~ expands
 alias_root = "/dp"                  # env RCH_ALIAS_PROJECT_ROOT; set equal to canonical_root if you have no alias
 
-[layer0]                    # Cargo profile pack forced onto remote release builds; hook path never injects
-enabled = false
+[layer0]                    # CARGO_PROFILE_* env on the remote command; never in --clean-overlay / --source-content-receipt lanes
+enabled = false             # master switch; every knob below is independent
 release_lto_thin = false
 release_codegen_units_1 = false
+debug_line_tables_only = false   # dev+test debug = "line-tables-only": far smaller worker targets; debuggers lose locals
 
 [remediation.pooled_target]
 pooling_enabled = true
@@ -235,7 +236,7 @@ log_level = "info"
 [queue]
 enabled = false                      # daemon-side queue; hook-side RCH_QUEUE_WHEN_BUSY is what agents see
 max_depth = 100                      # 0 = unlimited
-timeout_secs = 300
+timeout_secs = 300                   # cap on a compilation's queue wait; an --job wait may run to 24 h
 
 [cache_cleanup]
 enabled = true
@@ -267,7 +268,7 @@ Loader-consumed (`rch config export` emits these names):
 | `RCH_ENABLED` | `general.enabled` | `0/false/no/off` disables. Must be in the **process env** of the hook/`rch exec`; an inline prefix inside an agent's Bash command does not bypass the hook |
 | `RCH_LOG_LEVEL` | `general.log_level` | `trace..off`; `RUST_LOG` (if set) overrides the whole filter |
 | `RCH_FORCE_REMOTE` / `RCH_REQUIRE_REMOTE` | `general.force_remote` | REQUIRE also fails closed; wins over FORCE |
-| `RCH_SOCKET_PATH` | `general.socket_path` | (`RCH_DAEMON_SOCKET` is **not** read by any code) |
+| `RCH_SOCKET_PATH` | `general.socket_path` | (`RCH_DAEMON_SOCKET` is **not** read on 1.0.58; on 2.0.0 it is an alias, and `RCH_SOCKET_PATH` wins) |
 | `RCH_CONFIDENCE_THRESHOLD`, `RCH_MIN_LOCAL_TIME_MS`, `RCH_REMOTE_SPEEDUP_THRESHOLD`, `RCH_BUILD_SLOTS`, `RCH_TEST_SLOTS`, `RCH_CHECK_SLOTS`, `RCH_BUILD_TIMEOUT_SEC`, `RCH_TEST_TIMEOUT_SEC`, `RCH_BUN_TIMEOUT_SEC`, `RCH_EXTERNAL_TIMEOUT_ENABLED` | `[compilation]` | |
 | `RCH_COMPRESSION_LEVEL` (legacy alias `RCH_COMPRESSION`) | `transfer.compression_level` | `RCH_TRANSFER_ZSTD_LEVEL` only triggers a validator warning — it does nothing |
 | `RCH_SYNC_TIMEOUT_MS` | `transfer.sync_timeout_ms` | per-attempt; 1000..=3600000 |
@@ -287,15 +288,15 @@ Placement controls (resolved per command; visible in `rch diagnose --json` → `
 | `RCH_PRESET` | profile name | recorded as `requested_profile` |
 | `RCH_REQUIRE_REMOTE` / `RCH_FORCE_REMOTE` | `0\|1` | strict (fail-closed) vs. force (fail-open) |
 | `RCH_QUEUE_WHEN_BUSY` | `0\|1` (default `1`) | wait for a slot instead of local fallback; unrecognized ⇒ warning, treated as 1 |
-| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | secs > 0 | max wait for a queued worker |
+| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | secs > 0 | max wait for a queued worker (daemon caps compilations at `[queue] timeout_secs`, jobs at 24 h) |
 | `RCH_DISABLE_TARGET_REUSE` | `0\|1` | legacy per-job remote target dir instead of pooled |
 
 Hook/exec-side knobs that are **not** part of the placement plan (read directly
 in `rch/src/hook.rs`): `RCH_PRIORITY` (`low|normal|high`, default `normal`;
 invalid ⇒ `normal`), `RCH_MAX_REMOTE_ATTEMPTS` (u32 ≥ 1, default 3). The
 queued-wait default behind `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (and its
-alias) is **330 s**; the non-queued daemon IPC default is 30 s and is not
-env-tunable.
+alias) is **330 s**, or **6 h** for `rch exec --job`, which never falls back to
+local; the non-queued daemon IPC default is 30 s and is not env-tunable.
 
 Other runtime: `RCH_CONFIG_DIR`, `RCH_STATE_HOME` (default `$XDG_STATE_HOME/rch`
 → `~/.local/state/rch`), `RCH_PROFILE` (`dev|prod|test`), `RCH_LOG_FORMAT`
@@ -310,8 +311,16 @@ Worker-side: `RCH_WORKER_ID` (falls back to `HOSTNAME`), `RCH_WKR_CANONICAL_ROOT
 
 Validation-only names (appear in `rch --help`/validators but are **not read as
 overrides**): `RCH_DAEMON_TIMEOUT_MS`, `RCH_SSH_KEY`, `RCH_TRANSFER_ZSTD_LEVEL`.
-Non-existent: `RCH_DISABLED`, `RCH_BYPASS`, `RCH_FORCE_LOCAL`, `RCH_DAEMON_SOCKET`,
-`RCH_LOG`, `RCH_DRY_RUN`, `RCH_NO_COLOR`.
+
+### Things That Do NOT Exist
+
+These env vars are not read (never set them expecting an effect): `RCH_DISABLED`, `RCH_BYPASS`,
+`RCH_FORCE_LOCAL`, `RCH_DAEMON_SOCKET`, `RCH_LOG`, `RCH_DRY_RUN`, `RCH_NO_COLOR`.
+
+2.0.0 changes two of these (issue #57): `RCH_DAEMON_TIMEOUT_MS` is read as the
+hook's daemon-socket connect/read timeout (100..=600000 ms, default 5000), and
+`RCH_DAEMON_SOCKET` is read as an alias of `RCH_SOCKET_PATH` (the canonical
+name wins when both are set).
 
 Boolean parsing: loader accepts `1|true|yes|on` / `0|false|no|off|""`; the
 placement resolver additionally accepts `enabled|disabled`.

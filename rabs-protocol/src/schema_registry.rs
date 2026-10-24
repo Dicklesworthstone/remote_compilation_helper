@@ -231,33 +231,34 @@ pub fn lookup(domain: SchemaDomain, name: &str) -> Option<&'static SchemaEntry> 
         .find(|e| e.domain == domain && e.name == name)
 }
 
+/// Golden FNV-1a fingerprint of [`REGISTRY`] (bead A005 / R013).
+pub const CURRENT_REGISTRY_FINGERPRINT: u64 = 0x1a61_e5bd_8ad2_cfb5;
+
+/// Compute the FNV-1a change-detector fingerprint over [`REGISTRY`]'s identity-bearing fields.
+#[must_use]
+pub fn registry_fingerprint() -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(FNV_PRIME);
+    };
+    for e in REGISTRY {
+        eat(e.domain.as_str().as_bytes());
+        eat(e.name.as_bytes());
+        eat(&e.version.to_le_bytes());
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// FNV-1a over the registry's identity-bearing fields. Deliberately
-    /// simple and dependency-free: this is a change detector, not a
-    /// cryptographic commitment (authoritative digests are typed SHA-256
-    /// per bead F034).
-    fn registry_fingerprint() -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut h = FNV_OFFSET;
-        let mut eat = |bytes: &[u8]| {
-            for &b in bytes {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(FNV_PRIME);
-            }
-            h ^= 0xff;
-            h = h.wrapping_mul(FNV_PRIME);
-        };
-        for e in REGISTRY {
-            eat(e.domain.as_str().as_bytes());
-            eat(e.name.as_bytes());
-            eat(&e.version.to_le_bytes());
-        }
-        h
-    }
 
     /// Any edit to registry entries (add/remove/rename/renumber) must be
     /// deliberate: update this golden in the SAME change, with review.
@@ -265,7 +266,7 @@ mod tests {
     fn registry_change_is_deliberate() {
         let fp = registry_fingerprint();
         assert_eq!(
-            fp, 0x1a61_e5bd_8ad2_cfb5,
+            fp, CURRENT_REGISTRY_FINGERPRINT,
             "schema registry changed (fingerprint {fp:#x}); if intentional, \
              bump the affected schema versions per the epoch doctrine and \
              update this golden in the same commit"

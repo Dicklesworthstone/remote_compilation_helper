@@ -296,3 +296,95 @@ fn t010_repeated_release_does_not_move_either_curve() {
         "a replayed release moved the protection curve"
     );
 }
+
+#[test]
+fn t010_concurrent_gc_snapshot_during_active_pin_mutation_never_observes_torn_view() {
+    use rabs_cas::metadata_store::digest_key;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let mut store = fresh();
+    let anchor = digest(0xDEAD_BEEF);
+    let anchor_key = digest_key(&anchor);
+    store
+        .create_pin(
+            999_999,
+            &anchor,
+            "coordinator",
+            PUBLICATION_PIN_CLASS,
+            None,
+            None,
+            true,
+            "anchor root",
+        )
+        .expect("create anchor pin");
+
+    let shared = Arc::new(Mutex::new(store));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let writer_shared = Arc::clone(&shared);
+    let writer_done = Arc::clone(&done);
+    let writer = std::thread::spawn(move || {
+        for cycle in 1_u128..=500 {
+            {
+                let mut guard = writer_shared.lock().expect("writer lock create");
+                guard
+                    .create_pin(
+                        cycle,
+                        &digest(cycle),
+                        "coordinator",
+                        PUBLICATION_PIN_CLASS,
+                        None,
+                        None,
+                        true,
+                        "concurrent active pin",
+                    )
+                    .expect("create active pin");
+            }
+            std::thread::yield_now();
+            {
+                let mut guard = writer_shared.lock().expect("writer lock release");
+                assert_eq!(
+                    release_pin_scoped(&mut *guard, cycle, &Releaser::Coordinator(authority()))
+                        .expect("release active pin"),
+                    rabs_cas::pin_leases::ReleaseOutcome::Released
+                );
+            }
+        }
+        writer_done.store(true, Ordering::Release);
+    });
+
+    let mut snapshots_taken = 0_usize;
+    let mut saw_inflight_pin = false;
+    while !done.load(Ordering::Acquire) || snapshots_taken == 0 {
+        let snap = {
+            let mut guard = shared.lock().expect("collector lock");
+            guard
+                .gc_snapshot(u64::try_from(snapshots_taken + 2).unwrap())
+                .expect("gc_snapshot during active work")
+        };
+        assert!(
+            snap.pinned_roots.contains(&anchor_key),
+            "concurrent gc_snapshot lost the anchor root (torn view)"
+        );
+        assert!(
+            snap.pinned_roots.len() == 1 || snap.pinned_roots.len() == 2,
+            "concurrent gc_snapshot must see anchor plus at most 1 active pin, got {}",
+            snap.pinned_roots.len()
+        );
+        if snap.pinned_roots.len() == 2 {
+            saw_inflight_pin = true;
+        }
+        snapshots_taken += 1;
+        std::thread::yield_now();
+    }
+
+    writer.join().expect("writer thread join");
+    let _ = saw_inflight_pin;
+
+    // After active mutation completes, only the anchor remains protected.
+    let mut guard = shared.lock().expect("final lock");
+    let final_snap = guard.gc_snapshot(10_000).expect("final gc_snapshot");
+    assert_eq!(final_snap.pinned_roots.len(), 1);
+    assert!(final_snap.pinned_roots.contains(&anchor_key));
+}

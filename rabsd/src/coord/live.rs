@@ -25,10 +25,12 @@
 //! abandoned so nothing hides.
 
 mod output_install;
+#[cfg(test)]
+mod produced_result_tests;
 
 use crate::coord::action_actor::{
-    ActionActor, AttemptPurpose, JoinReceipt, JoinRequest, OpenGenerationReceipt, RegisterAttempt,
-    RegisterAttemptReceipt,
+    ActionActor, AttemptPurpose, CancelReceipt, JoinReceipt, JoinRequest, OpenGenerationReceipt,
+    PromoteReceipt, RegisterAttempt, RegisterAttemptReceipt, SubscriptionRequirements,
 };
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::{BundleId, DestinationArbiter, reserve_scoped};
@@ -38,22 +40,31 @@ use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
 use rabs_cas::materialization::ActionMaterializeFailure;
-use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key};
+use rabs_cas::metadata_store::{
+    AuthorityRow, RabsMetadataStore, SqlValue, StoreError, TrustEvaluationRow, digest_key,
+};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
     OfferPreparedActionResult, OfferRefusal, PublicationOutcome, SEMANTIC_PROJECTION_DOMAIN,
-    authority_digest, process_offer,
+    authority_digest, process_offer_resolving,
 };
 use rabs_cas::serving_sample_gate::{
     ActionClassRisk, PrivateExecutionReason, SampleGateDecision, SamplingPolicy,
-    serving_sample_decision,
+    class_safety_refusal, serving_sample_decision,
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
+use rabs_cas::trust_evidence::{DISPOSITION_SERVABLE, evidence_set_digest};
 use rabs_key::action_key::{action_input_manifest_digest, compute_action_key};
 use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
+use rabs_protocol::dashboards::{
+    SpeculationDefaultOnDecisionRecord, SpeculationDefaultOnGateInput, SpeculationDefaultOnPosture,
+    SpeculationRoiPanel, SpeculationRunOutcome, SpeculationRunRecord, build_speculation_roi,
+    evaluate_speculation_default_on_gate,
+};
 use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
+use rabs_protocol::durable_ids::BuildOperationId;
 use rabs_protocol::generation::{
     AttemptAuthority, AttemptId, ExecutionLeaseId, LeaseRenewal, LeaseRenewalSeq,
     WorkerIncarnationId,
@@ -62,11 +73,19 @@ use rabs_protocol::input_evidence::{ActionInputManifest, InputFileType};
 use rabs_protocol::release_authorization::{
     ReleaseAuthorization, ReleaseAuthorizationMode, authorization as release_standing,
 };
-use rabs_protocol::result_identity::{CanonicalActionResultManifest, DigestAlgorithm, TypedDigest};
+use rabs_protocol::result_identity::{
+    CanonicalActionResultManifest, DigestAlgorithm, ObjectId, TypedDigest,
+};
+use rabs_protocol::serving::{
+    CiCanonicalWriterClaim, CiCanonicalWriterPolicy, CiEvaluationContext, CiPolicyApproval,
+    CiPolicyRefusal, TrustEvidenceTier, evaluate_ci_canonical_writer_claim,
+};
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
-use rabs_scheduler::speculation_brownout::{BrownoutDecision, PressureBand, WorkCategory, decide};
+use rabs_scheduler::speculation_brownout::{
+    BrownoutDecision, PressureBand, SpeculationProvenance, WorkCategory, band, decide,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -212,6 +231,9 @@ pub enum ReplayRefusal {
         /// Number of adverse observations retained for this action.
         observations: u64,
     },
+    /// The latest independently verified result has exhausted its replay
+    /// allowance, or no durable live comparison has established one yet.
+    FreshVerificationRequired,
     /// The existing class/evidence/sampling policy requires private execution.
     Sampling(PrivateExecutionReason),
 }
@@ -408,8 +430,15 @@ const LIVE_PRIVATE_CLASS: &str = "private-only";
 // This is an additional floor, not a replacement for the stored serving policy.
 // In particular it never promotes a quarantined/evidence-pending record, renews
 // its TTL, or changes a trust-policy version. Every edge-delivered artifact
-// passes this floor; the Cargo wrapper itself remains in shadow mode.
+// passes this floor, including the opt-in live dependency lane.
 const LIVE_SAMPLING_POLICY: SamplingPolicy = SamplingPolicy::sample_all(2, 10_000);
+const LIVE_VERIFICATION_RECEIPT: &str = "rabs-live-verification-v1";
+const LIVE_INSTALL_RECEIPT: &str = "rabs-live-replay-install-v1";
+
+/// Default cache installations after one new independent comparison.
+/// Opt-in SPRT replaces only this ceiling with its evidence-qualified limit;
+/// the same comparison binding and durable installation receipts remain required.
+pub const LIVE_REPLAY_INSTALL_LIMIT: u64 = 16;
 
 fn record_descriptor_class(
     store: &mut dyn RabsMetadataStore,
@@ -530,7 +559,102 @@ fn record_live_verification(
         .max()
         .map_or(Some(0), |seq| seq.checked_add(1))
         .ok_or_else(|| StoreError::Backend("verification sequence exhausted".to_owned()))?;
-    store.record_verification_sample(action, attempt, passed, seq)
+    store.record_verification_sample(action, attempt, passed, seq)?;
+    if passed {
+        // Only this admission path can renew replay authority. Raw samples,
+        // retransmissions, the original winner, and failed attempts cannot.
+        // If this second durable write fails, the old allowance remains in
+        // force; another independent comparison is needed to renew it.
+        store.record_decision_receipt(
+            LIVE_VERIFICATION_RECEIPT,
+            &digest_key(action),
+            seq,
+            &format!("{attempt:032x}"),
+            &digest_key(&offer.manifest_id.0),
+        )?;
+    }
+    Ok(())
+}
+
+struct ReplayInstallPermit {
+    subject: String,
+    seq: u64,
+}
+
+/// Inspect the durable allowance without spending it. Both preview and install
+/// read it afresh under the CAS lock; only an actual installation appends a
+/// receipt, before any output writes. The comparison and spent permits survive
+/// coordinator restarts and cannot be reset by replaying an old offer.
+fn live_replay_permit(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    manifest_key: &str,
+) -> Result<Option<ReplayInstallPermit>, StoreError> {
+    let action_key = digest_key(action);
+    let rows = store.query(
+        "SELECT seq, decision, reason FROM decision_receipts \
+         WHERE kind = ?1 AND subject = ?2 ORDER BY seq DESC LIMIT 1",
+        &[
+            SqlValue::Text(LIVE_VERIFICATION_RECEIPT.to_owned()),
+            SqlValue::Text(action_key.clone()),
+        ],
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let [
+        SqlValue::Int(seq),
+        SqlValue::Text(attempt),
+        SqlValue::Text(manifest),
+    ] = row.as_slice()
+    else {
+        return Err(StoreError::Corruption(
+            "live verification receipt shape".into(),
+        ));
+    };
+    let seq = u64::try_from(*seq)
+        .map_err(|_| StoreError::Corruption("live verification sequence".into()))?;
+    if manifest != manifest_key
+        || attempt.len() != 32
+        || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !store
+            .list_verification_samples(action)?
+            .iter()
+            .any(|sample| sample.passed && sample.seq == seq && sample.attempt_hex == *attempt)
+    {
+        return Err(StoreError::Corruption(
+            "unbound live verification receipt".into(),
+        ));
+    }
+    let subject = format!("{action_key}:{seq}");
+    let installed = store.query(
+        "SELECT seq, decision, reason FROM decision_receipts \
+         WHERE kind = ?1 AND subject = ?2 ORDER BY seq",
+        &[
+            SqlValue::Text(LIVE_INSTALL_RECEIPT.to_owned()),
+            SqlValue::Text(subject.clone()),
+        ],
+    )?;
+    for (index, row) in installed.iter().enumerate() {
+        let expected_seq = i64::try_from(index)
+            .map_err(|_| StoreError::Corruption("live replay sequence exhausted".into()))?;
+        if !matches!(
+            row.as_slice(),
+            [SqlValue::Int(seq), SqlValue::Text(decision), SqlValue::Text(reason)]
+                if *seq == expected_seq && decision == "install" && reason == manifest_key
+        ) {
+            return Err(StoreError::Corruption("invalid live replay receipt".into()));
+        }
+    }
+    let used = u64::try_from(installed.len())
+        .map_err(|_| StoreError::Corruption("live replay count exhausted".into()))?;
+    // None means the opt-in is off, not that evidence failed. Some(0) is a
+    // hard verification requirement and must never inherit the fixed budget.
+    // Policy changes reuse these same receipts, so they cannot replenish it.
+    let limit = LIVE_SAMPLING_POLICY
+        .replay_install_limit(store, action)?
+        .unwrap_or(LIVE_REPLAY_INSTALL_LIMIT);
+    Ok((used < limit).then_some(ReplayInstallPermit { subject, seq: used }))
 }
 
 /// Final live replay admission, called with the SAME store lock subsequently
@@ -556,6 +680,30 @@ fn live_replay_gate(
         SampleGateDecision::ServeFromCache => Ok(None),
         SampleGateDecision::ExecutePrivately(reason) => Ok(Some(ReplayRefusal::Sampling(reason))),
     }
+}
+
+/// A current primary producer bypasses positive sample counts and replay
+/// cadence, while retaining every adverse-evidence and class admission veto.
+fn live_producer_gate(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+) -> Result<Option<ReplayRefusal>, StoreError> {
+    if recorded_action_risk(store, action)? == ActionClassRisk::Elevated {
+        return Ok(Some(ReplayRefusal::Sampling(
+            PrivateExecutionReason::ElevatedClassRisk,
+        )));
+    }
+    let adverse = store
+        .list_verification_samples(action)?
+        .iter()
+        .filter(|sample| !sample.passed)
+        .count();
+    if adverse != 0 {
+        return Ok(Some(ReplayRefusal::FailedVerification {
+            observations: u64::try_from(adverse).unwrap_or(u64::MAX),
+        }));
+    }
+    Ok(class_safety_refusal(store, action)?.map(ReplayRefusal::Sampling))
 }
 
 /// Refusal from the shared foreground/speculative submission path.
@@ -746,6 +894,16 @@ impl ActionSubmission {
         }
         Ok(backing)
     }
+
+    /// Total projected source bytes across validated inputs (for Q009 transfer/storage cost accounting).
+    #[must_use]
+    pub fn source_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .filter_map(|file| self.source.file_bytes(&file.root, &file.relative))
+            .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add)
+    }
 }
 
 fn source_component(value: &str) -> bool {
@@ -767,6 +925,9 @@ struct SubmittedActor {
     input: Arc<ActionSubmission>,
     state: DispatchState,
     order: u64,
+    started_as_speculative: bool,
+    promoted_from_speculation: bool,
+    started_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -907,6 +1068,26 @@ impl EdgeSubscriber {
             .submit_action(input, request, now_unix_micros, clock_epoch)
     }
 
+    /// Detach a subscriber's interest from an in-flight action (bead G005).
+    pub fn cancel_subscriber(
+        &self,
+        action_key: &TypedDigest,
+        operation: BuildOperationId,
+    ) -> Result<CancelReceipt, SubmissionRefusal> {
+        self.coord.cancel_subscriber(action_key, operation)
+    }
+
+    /// Promote an attached subscriber's interest in place (bead Q005 / G004).
+    pub fn promote_subscriber(
+        &self,
+        action_key: &TypedDigest,
+        operation: BuildOperationId,
+        deadline_unix_micros: Option<i64>,
+    ) -> Result<PromoteReceipt, SubmissionRefusal> {
+        self.coord
+            .promote_subscriber(action_key, operation, deadline_unix_micros)
+    }
+
     pub fn serve_action(
         &self,
         action_key: &TypedDigest,
@@ -949,6 +1130,193 @@ impl EdgeSubscriber {
     }
 }
 
+/// Durable `decision_receipts` kind written whenever the Q010 default-on
+/// speculation gate is evaluated (`rabsd::coord::live`).
+pub const SPECULATION_DEFAULT_ON_RECEIPT_KIND: &str = "speculation_default_on_gate";
+
+/// Durable `decision_receipts` kind written whenever a Q007 git/worktree
+/// prewarm event is handled (`rabsd::coord::live`).
+pub const GIT_PREWARM_RECEIPT_KIND: &str = "q007_git_prewarm_event";
+
+/// Durable `decision_receipts` kind written whenever a Q008 CI canonical
+/// prewarm publication is promoted (`rabsd::coord::live`).
+pub const CI_CANONICAL_PREWARM_RECEIPT_KIND: &str = "q008_ci_canonical_prewarm";
+
+/// Git / workspace lifecycle event triggering prewarm (bead Q007; plan §15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitPrewarmEventKind {
+    /// `git checkout <branch>` or `git switch`.
+    BranchCheckout,
+    /// `HEAD` moved within the active worktree.
+    HeadChange,
+    /// `git pull`, `git rebase`, or `git merge`.
+    PullRebaseMerge,
+    /// `git worktree add` created a new worktree.
+    WorktreeCreation,
+    /// `Cargo.lock` or package lockfile updated.
+    LockfileUpdate,
+    /// `rust-toolchain.toml` or compiler version changed.
+    ToolchainChange,
+    /// Commit pushed to CI canonical prewarm pipeline.
+    CiPush,
+}
+
+impl GitPrewarmEventKind {
+    /// Stable machine token for durable receipts and logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BranchCheckout => "branch-checkout",
+            Self::HeadChange => "head-change",
+            Self::PullRebaseMerge => "pull-rebase-merge",
+            Self::WorktreeCreation => "worktree-creation",
+            Self::LockfileUpdate => "lockfile-update",
+            Self::ToolchainChange => "toolchain-change",
+            Self::CiPush => "ci-push",
+        }
+    }
+}
+
+/// Outcome for one critical-path or test-subset action during a Q007 prewarm event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrewarmStageOutcome {
+    /// Action is already committed and servable in CAS (or warm from nearest ancestor / CI).
+    AlreadyWarm {
+        /// Semantic action key.
+        action_key: TypedDigest,
+    },
+    /// Action was queued in the coordinator under `SubscriberKind::GitPrewarm`.
+    QueuedPrewarm {
+        /// Semantic action key.
+        action_key: TypedDigest,
+        /// Whether this prewarm created a new `ActionActor` or joined an existing one.
+        actor_created: bool,
+    },
+    /// Prewarm stopped immediately due to foreground pressure or brownout.
+    StoppedUnderForegroundPressure {
+        /// Semantic action key skipped when foreground pressure interrupted prewarm.
+        action_key: TypedDigest,
+    },
+}
+
+/// Structured input event for Q007 git checkout/HEAD/worktree prewarm.
+#[derive(Debug)]
+pub struct GitPrewarmEvent {
+    /// Unique event identifier for durable receipt correlation.
+    pub event_id: String,
+    /// Triggering git / worktree lifecycle event kind.
+    pub kind: GitPrewarmEventKind,
+    /// Target `HEAD` commit OID being warmed.
+    pub head_commit_oid: String,
+    /// Candidate ancestor commit OIDs ordered nearest-first.
+    pub parent_commit_oids: Vec<String>,
+    /// Worktree identifier.
+    pub worktree_id: String,
+    /// Digest of the lockfile state.
+    pub lockfile_digest: TypedDigest,
+    /// Digest of the active toolchain state.
+    pub toolchain_digest: TypedDigest,
+    /// Dependency critical-path actions to prewarm first.
+    pub dependency_critical_path: Vec<ActionSubmission>,
+    /// Workspace critical-path actions to prewarm second.
+    pub workspace_critical_path: Vec<ActionSubmission>,
+    /// Optional canonical test subset to prewarm after compile critical paths.
+    pub canonical_test_subset: Vec<ActionSubmission>,
+    /// Candidate worker peers to seed for this prewarm wave.
+    pub likely_workers: Vec<PeerId>,
+    /// Base `BuildOperationId` used to mint distinct subscriber IDs per prewarmed action.
+    pub operation_base_id: u128,
+    /// Timestamp (Unix microseconds).
+    pub now_unix_micros: i64,
+    /// Coordinator clock epoch.
+    pub clock_epoch: u64,
+}
+
+/// Auditable receipt emitted by [`CoordLive::handle_git_prewarm_event`] (bead Q007).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPrewarmReceipt {
+    /// Event identifier.
+    pub event_id: String,
+    /// Event kind.
+    pub kind: GitPrewarmEventKind,
+    /// Target `HEAD` commit OID.
+    pub head_commit_oid: String,
+    /// Nearest warm ancestor commit located from coordinator/CI state, if any.
+    pub nearest_ancestor_commit_oid: Option<String>,
+    /// Per-action outcomes along the dependency critical path.
+    pub dependency_actions: Vec<PrewarmStageOutcome>,
+    /// Per-action outcomes along the workspace critical path.
+    pub workspace_actions: Vec<PrewarmStageOutcome>,
+    /// Per-action outcomes for the optional canonical test subset.
+    pub canonical_test_actions: Vec<PrewarmStageOutcome>,
+    /// Admitted non-ambiguous workers seeded for this prewarm event.
+    pub seeded_workers: Vec<PeerId>,
+    /// Whether prewarm stopped early due to foreground pressure.
+    pub stopped_under_foreground_pressure: bool,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Auditable receipt emitted when a CI canonical profile publication is promoted to
+/// `TrustEvidenceTier::CiPolicyApproved` and registered for developer pull prewarm (bead Q008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiCanonicalPrewarmReceipt {
+    /// Pushed commit OID that CI prebuilt.
+    pub commit_oid: String,
+    /// Canonical profile name (e.g. `"check"`, `"test"`, `"clippy"`, `"release"`).
+    pub profile_name: String,
+    /// Content-addressed semantic action key (identical for local agent and CI builds).
+    pub action_key: TypedDigest,
+    /// Verified S011 CI policy approval record.
+    pub approval: CiPolicyApproval,
+    /// Assigned trust tier (`TrustEvidenceTier::CiPolicyApproved`).
+    pub assigned_tier: TrustEvidenceTier,
+    /// Version appended to `action_trust_evaluations`.
+    pub trust_ledger_version: u32,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Access/publication policy decision when consulting an action under a required
+/// [`TrustEvidenceTier`] (bead Q008).
+///
+/// Trust tier is publication/access policy, NEVER content identity: local agent
+/// results and CI canonical results share the same [`TypedDigest`] action key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustAccessDecision {
+    /// The action's evaluated trust tier meets or exceeds `required_tier`.
+    Permitted {
+        /// Current evaluated tier on the action's trust ledger.
+        observed_tier: TrustEvidenceTier,
+        /// Minimum tier demanded by the caller/lane.
+        required_tier: TrustEvidenceTier,
+    },
+    /// The action is useful for lower-tier (e.g. local developer/agent) use,
+    /// but requires additional verification or CI policy approval before
+    /// serving a higher-tier (e.g. release) lane.
+    NeedsAdditionalVerification {
+        /// Current evaluated tier on the action's trust ledger.
+        observed_tier: TrustEvidenceTier,
+        /// Minimum tier demanded by the caller/lane.
+        required_tier: TrustEvidenceTier,
+    },
+}
+
+#[derive(Default)]
+struct PrewarmCoordinatorState {
+    warm_commits: BTreeMap<String, BTreeSet<String>>,
+    receipts: Vec<GitPrewarmReceipt>,
+}
+
+#[derive(Default)]
+struct SpeculationGateState {
+    posture: SpeculationDefaultOnPosture,
+    baseline_foreground_latencies_ms: Vec<u64>,
+    with_speculation_foreground_latencies_ms: Vec<u64>,
+    pressure_regressions: u64,
+    last_decision: Option<SpeculationDefaultOnDecisionRecord>,
+}
+
 /// The live coordinator state shared edge↔coord in-process.
 #[derive(Default)]
 pub struct CoordLive {
@@ -959,6 +1327,10 @@ pub struct CoordLive {
     /// Actual keyed actors and dispatch ownership; shared by all subscriber kinds.
     submissions: Mutex<ActionSubmissions>,
     speculation_pressure: Mutex<Option<PressureBand>>,
+    speculation_provenance: Mutex<SpeculationProvenance>,
+    speculation_runs: Mutex<Vec<SpeculationRunRecord>>,
+    speculation_gate: Mutex<SpeculationGateState>,
+    prewarm_state: Mutex<PrewarmCoordinatorState>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -1037,6 +1409,7 @@ impl CoordLive {
             boot_nonce: boot_micros(),
             next_seq: AtomicU64::new(boot_micros()),
             lease_clock: OnceLock::from(Instant::now()),
+            build_identity: rabs_protocol::release_authorization::default_build_identity(),
             ..Self::default()
         }
     }
@@ -1071,6 +1444,24 @@ impl CoordLive {
             release_mode,
             ..self
         }
+    }
+
+    /// T011 (`bd-dockb`): set the release-authorization mode while keeping
+    /// the coordinator's derived [`default_build_identity`].
+    ///
+    /// [`default_build_identity`]: rabs_protocol::release_authorization::default_build_identity
+    #[must_use]
+    pub fn with_release_mode(self, release_mode: ReleaseAuthorizationMode) -> Self {
+        Self {
+            release_mode,
+            ..self
+        }
+    }
+
+    /// The running build identity consulted against durable release verdicts.
+    #[must_use]
+    pub fn build_identity(&self) -> &str {
+        &self.build_identity
     }
 
     /// T011: this coordinator's standing with the stock differential
@@ -1148,17 +1539,737 @@ impl CoordLive {
         }
     }
 
-    /// Set optional-work admission pressure. Foreground joins remain eligible.
-    /// Already-started work is not cancelled here (Q006 owns that policy).
+    /// Set optional-work admission and execution pressure (bead Q006; I012).
+    ///
+    /// - `PressureBand::Soft`: stops admitting new speculative/optional work;
+    ///   already-running speculative work finishes.
+    /// - `PressureBand::Hard`: stops admitting new speculative/optional work
+    ///   AND cancels/drains running low-value speculative work (tombstoning its
+    ///   durable generation in the store), while foreground-promoted work and
+    ///   cleanup/object-integrity work remain unaffected.
     pub fn set_speculation_pressure(
         &self,
         pressure: PressureBand,
     ) -> Result<(), SubmissionRefusal> {
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let mut cancelled_runs: Vec<SpeculationRunRecord> = Vec::new();
+        if decide(WorkCategory::RunningLowValueSpeculation, pressure)
+            == BrownoutDecision::CancelAndDrain
+        {
+            let mut to_tombstone: Vec<u128> = Vec::new();
+            for entry in submissions.entries.values_mut() {
+                if !matches!(entry.state, DispatchState::Started(_)) {
+                    continue;
+                }
+                if let Some(generation_id) = entry
+                    .actor
+                    .cancel_low_value_speculation_under_pressure(pressure)
+                {
+                    to_tombstone.push(generation_id.0);
+                    let elapsed_ms = entry.started_at.take().map_or(1, |started| {
+                        u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX)
+                            .max(1)
+                    });
+                    let bytes = entry.input.source_bytes();
+                    entry.state = DispatchState::Queued;
+                    cancelled_runs.push(SpeculationRunRecord {
+                        outcome: SpeculationRunOutcome::CancelledUnderPressure,
+                        saved_foreground_latency_ms: 0,
+                        execution_cost_ms: elapsed_ms,
+                        transfer_cost_bytes: bytes,
+                        storage_cost_bytes: bytes,
+                    });
+                }
+            }
+            if !to_tombstone.is_empty()
+                && let Some(cas) = self.cas.as_ref()
+            {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| SubmissionRefusal::Unavailable)?;
+                for generation_id in to_tombstone {
+                    store.tombstone_generation(generation_id).map_err(|error| {
+                        SubmissionRefusal::Admission(format!(
+                            "pressure generation cleanup: {error:?}"
+                        ))
+                    })?;
+                }
+            }
+        }
         *self
             .speculation_pressure
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)? = Some(pressure);
+        if !cancelled_runs.is_empty() {
+            let mut provenance = self
+                .speculation_provenance
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            for _ in 0..cancelled_runs.len() {
+                provenance.record(BrownoutDecision::CancelAndDrain, true);
+            }
+            drop(provenance);
+            self.speculation_runs
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?
+                .extend(cancelled_runs);
+        }
         Ok(())
+    }
+
+    /// Classify raw pressure permille against soft/hard thresholds and apply
+    /// the resulting [`PressureBand`] (bead Q006; I012).
+    pub fn apply_speculation_pressure_permille(
+        &self,
+        pressure_permille: u16,
+        soft_threshold: u16,
+        hard_threshold: u16,
+    ) -> Result<PressureBand, SubmissionRefusal> {
+        let classified = band(pressure_permille, soft_threshold, hard_threshold);
+        self.set_speculation_pressure(classified)?;
+        Ok(classified)
+    }
+
+    /// Current speculation pressure band (`PressureBand::Normal` by default).
+    pub fn speculation_pressure(&self) -> Result<PressureBand, SubmissionRefusal> {
+        Ok(self
+            .speculation_pressure
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .unwrap_or(PressureBand::Normal))
+    }
+
+    /// Whether a work category is admitted under current pressure (cleanup and
+    /// object-integrity work remain required at every band; bead Q006 / I012).
+    pub fn work_category_admitted(
+        &self,
+        category: WorkCategory,
+    ) -> Result<bool, SubmissionRefusal> {
+        let pressure = self.speculation_pressure()?;
+        Ok(decide(category, pressure) == BrownoutDecision::Admit)
+    }
+
+    /// Snapshot of speculation brownout provenance accounting (bead Q006 / I012).
+    pub fn speculation_provenance(&self) -> Result<SpeculationProvenance, SubmissionRefusal> {
+        Ok(*self
+            .speculation_provenance
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?)
+    }
+
+    /// Snapshot of recorded speculation run provenance records (bead Q009).
+    pub fn speculation_runs(&self) -> Result<Vec<SpeculationRunRecord>, SubmissionRefusal> {
+        Ok(self
+            .speculation_runs
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .clone())
+    }
+
+    /// Build the [`SpeculationRoiPanel`] from live speculation provenance runs (bead Q009).
+    pub fn speculation_roi_panel(&self) -> Result<SpeculationRoiPanel, SubmissionRefusal> {
+        let runs = self
+            .speculation_runs
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        Ok(build_speculation_roi(&runs))
+    }
+
+    /// Current default-on speculation posture (bead Q010; defaults to [`SpeculationDefaultOnPosture::DefaultOff`]).
+    pub fn speculation_default_on_posture(
+        &self,
+    ) -> Result<SpeculationDefaultOnPosture, SubmissionRefusal> {
+        Ok(self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .posture)
+    }
+
+    /// Record a foreground command latency sample with or without speculation active (bead Q010).
+    pub fn record_foreground_latency_sample(
+        &self,
+        with_speculation: bool,
+        latency_ms: u64,
+    ) -> Result<(), SubmissionRefusal> {
+        let mut gate = self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if with_speculation {
+            gate.with_speculation_foreground_latencies_ms
+                .push(latency_ms);
+        } else {
+            gate.baseline_foreground_latencies_ms.push(latency_ms);
+        }
+        Ok(())
+    }
+
+    /// Record a pressure regression attributed to speculation and immediately demote
+    /// default-on posture back to [`SpeculationDefaultOnPosture::DefaultOff`] (bead Q010).
+    pub fn record_speculation_pressure_regression(&self) -> Result<(), SubmissionRefusal> {
+        let mut gate = self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        gate.pressure_regressions = gate.pressure_regressions.saturating_add(1);
+        gate.posture = SpeculationDefaultOnPosture::DefaultOff;
+        Ok(())
+    }
+
+    /// Evaluate the Q010 default-on speculation gate against the live ROI dashboard,
+    /// foreground p95 latency samples, and pressure regressions, updating the coordinator's
+    /// default-on posture and writing a durable decision receipt when a CAS store is mounted.
+    pub fn evaluate_speculation_default_on_gate(
+        &self,
+    ) -> Result<SpeculationDefaultOnDecisionRecord, SubmissionRefusal> {
+        let roi = self.speculation_roi_panel()?;
+        let decision = {
+            let mut gate = self
+                .speculation_gate
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            let input = SpeculationDefaultOnGateInput {
+                roi,
+                baseline_foreground_latencies_ms: gate.baseline_foreground_latencies_ms.clone(),
+                with_speculation_foreground_latencies_ms: gate
+                    .with_speculation_foreground_latencies_ms
+                    .clone(),
+                pressure_regressions: gate.pressure_regressions,
+            };
+            let record = evaluate_speculation_default_on_gate(&input);
+            gate.posture = record.posture;
+            gate.last_decision = Some(record.clone());
+            record
+        };
+        if let Some(cas) = self.cas.as_ref() {
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    SPECULATION_DEFAULT_ON_RECEIPT_KIND,
+                    &self.build_identity,
+                    seq,
+                    decision.decision_token(),
+                    &decision.reason_summary(),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!(
+                        "speculation gate decision receipt failed: {error:?}"
+                    ))
+                })?;
+        }
+        Ok(decision)
+    }
+
+    /// Latest evaluated [`SpeculationDefaultOnDecisionRecord`], if any (bead Q010).
+    pub fn latest_speculation_default_on_decision(
+        &self,
+    ) -> Result<Option<SpeculationDefaultOnDecisionRecord>, SubmissionRefusal> {
+        Ok(self
+            .speculation_gate
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .last_decision
+            .clone())
+    }
+
+    /// Submit a default-on speculative action gated on [`SpeculationDefaultOnPosture::DefaultOn`] (bead Q010).
+    ///
+    /// Ships default-off: until [`Self::evaluate_speculation_default_on_gate`] proves positive
+    /// net saved foreground latency and improved foreground p95 without pressure regressions,
+    /// automatic default-on speculation is refused with [`SubmissionRefusal::Admission`].
+    pub fn submit_default_on_speculation(
+        &self,
+        input: ActionSubmission,
+        request: JoinRequest,
+        now_unix_micros: i64,
+        clock_epoch: u64,
+    ) -> Result<SubmissionReceipt, SubmissionRefusal> {
+        if !matches!(
+            request.kind,
+            SubscriberKind::Speculative | SubscriberKind::GitPrewarm
+        ) {
+            return Err(SubmissionRefusal::Admission(
+                "submit_default_on_speculation requires optional SubscriberKind".to_owned(),
+            ));
+        }
+        if !self.speculation_default_on_posture()?.permits_default_on() {
+            return Err(SubmissionRefusal::Admission(
+                "default-on speculation gated off: requires positive p95 ROI and improved foreground p95 without pressure regressions".to_owned(),
+            ));
+        }
+        self.submit_action(input, request, now_unix_micros, clock_epoch)
+    }
+
+    fn has_queued_foreground_pressure(&self) -> Result<bool, SubmissionRefusal> {
+        let submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        Ok(submissions.entries.values().any(|entry| {
+            entry.state == DispatchState::Queued && entry.actor.has_foreground_interest()
+        }))
+    }
+
+    fn is_action_already_warm_in_store(
+        &self,
+        action_key: &TypedDigest,
+        now_unix_micros: i64,
+        clock_epoch: u64,
+    ) -> Result<bool, SubmissionRefusal> {
+        let Some(cas) = self.cas.as_ref() else {
+            return Ok(false);
+        };
+        let key_str = digest_key(action_key);
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        declare_coordinator_domains(&mut *store);
+        Ok(matches!(
+            serving_gate(&mut *store, &key_str, now_unix_micros, clock_epoch),
+            Ok(ServeDecision::Servable)
+        ))
+    }
+
+    /// Handle a Q007 git checkout / HEAD / worktree / lockfile / toolchain / CI push
+    /// prewarm event:
+    ///
+    /// 1. Locate the nearest warm ancestor state from `event.parent_commit_oids`.
+    /// 2. Prewarm the dependency critical path, workspace critical path, and optional
+    ///    canonical test subset in priority order (`190`, `180`, `170`).
+    /// 3. Stop instantly if foreground pressure (`Soft`/`Hard` band or queued foreground
+    ///    work) is active before or during submission.
+    /// 4. Seed admitted, non-ambiguous `likely_workers`.
+    /// 5. Emit a structured [`GitPrewarmReceipt`] and append a durable row to
+    ///    `decision_receipts` (`GIT_PREWARM_RECEIPT_KIND`).
+    pub fn handle_git_prewarm_event(
+        &self,
+        event: GitPrewarmEvent,
+    ) -> Result<GitPrewarmReceipt, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let (nearest_ancestor_commit_oid, mut head_warm_keys) = {
+            let prewarm = self
+                .prewarm_state
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            let found = event.parent_commit_oids.iter().find_map(|parent| {
+                prewarm
+                    .warm_commits
+                    .get(parent)
+                    .map(|keys| (parent.clone(), keys.clone()))
+            });
+            match found {
+                Some((ancestor, keys)) => (Some(ancestor), keys),
+                None => (None, BTreeSet::new()),
+            }
+        };
+
+        let mut op_cursor = event.operation_base_id;
+        let mut stopped_under_foreground_pressure = false;
+        let presentation = rabs_key::typed_digest::compute("rabs.presentation.v1", b"git-prewarm");
+
+        let mut process_stage = |submissions: Vec<ActionSubmission>,
+                                 priority: u8|
+         -> Result<Vec<PrewarmStageOutcome>, SubmissionRefusal> {
+            let mut outcomes = Vec::with_capacity(submissions.len());
+            for submission in submissions {
+                let action_key = submission.key();
+                let key_str = digest_key(&action_key);
+                if stopped_under_foreground_pressure
+                    || !self.optional_admitted()?
+                    || self.has_queued_foreground_pressure()?
+                {
+                    stopped_under_foreground_pressure = true;
+                    outcomes
+                        .push(PrewarmStageOutcome::StoppedUnderForegroundPressure { action_key });
+                    continue;
+                }
+                if head_warm_keys.contains(&key_str)
+                    || self.is_action_already_warm_in_store(
+                        &action_key,
+                        event.now_unix_micros,
+                        event.clock_epoch,
+                    )?
+                {
+                    head_warm_keys.insert(key_str);
+                    outcomes.push(PrewarmStageOutcome::AlreadyWarm { action_key });
+                    continue;
+                }
+                let op_id = op_cursor;
+                op_cursor = op_cursor.saturating_add(1);
+                let request = JoinRequest {
+                    operation: BuildOperationId(op_id),
+                    kind: SubscriberKind::GitPrewarm,
+                    queue_priority: priority,
+                    deadline_unix_micros: None,
+                    presentation: presentation.clone(),
+                    requirements: SubscriptionRequirements::unrestricted(),
+                };
+                match self.submit_action(
+                    submission,
+                    request,
+                    event.now_unix_micros,
+                    event.clock_epoch,
+                ) {
+                    Ok(receipt) => {
+                        head_warm_keys.insert(key_str);
+                        outcomes.push(PrewarmStageOutcome::QueuedPrewarm {
+                            action_key: receipt.action_key,
+                            actor_created: receipt.actor_created,
+                        });
+                    }
+                    Err(SubmissionRefusal::Brownout) => {
+                        stopped_under_foreground_pressure = true;
+                        outcomes.push(PrewarmStageOutcome::StoppedUnderForegroundPressure {
+                            action_key,
+                        });
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            Ok(outcomes)
+        };
+
+        let dependency_actions = process_stage(event.dependency_critical_path, 190)?;
+        let workspace_actions = process_stage(event.workspace_critical_path, 180)?;
+        let canonical_test_actions = process_stage(event.canonical_test_subset, 170)?;
+
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let receipt_seq = self.next_seq();
+        let mut seeded_workers = Vec::new();
+        {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            for worker in &event.likely_workers {
+                let admitted = store
+                    .worker_incarnation_fence(worker)
+                    .map_err(|error| {
+                        SubmissionRefusal::Admission(format!("worker fence lookup: {error:?}"))
+                    })?
+                    .is_some_and(|fence| !fence.clone_ambiguous);
+                if admitted && !seeded_workers.contains(worker) {
+                    seeded_workers.push(worker.clone());
+                }
+            }
+            let decision_token = if stopped_under_foreground_pressure {
+                "stopped-foreground-pressure"
+            } else {
+                "prewarm-dispatched"
+            };
+            let summary = format!(
+                "kind={};head={};ancestor={};worktree={};lockfile={};toolchain={};dep={};ws={};tests={};workers={}",
+                event.kind.as_str(),
+                event.head_commit_oid,
+                nearest_ancestor_commit_oid.as_deref().unwrap_or("none"),
+                event.worktree_id,
+                digest_key(&event.lockfile_digest),
+                digest_key(&event.toolchain_digest),
+                dependency_actions.len(),
+                workspace_actions.len(),
+                canonical_test_actions.len(),
+                seeded_workers.len(),
+            );
+            store
+                .record_decision_receipt(
+                    GIT_PREWARM_RECEIPT_KIND,
+                    &event.event_id,
+                    receipt_seq,
+                    decision_token,
+                    &summary,
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("git prewarm receipt: {error:?}"))
+                })?;
+        }
+
+        let receipt = GitPrewarmReceipt {
+            event_id: event.event_id,
+            kind: event.kind,
+            head_commit_oid: event.head_commit_oid.clone(),
+            nearest_ancestor_commit_oid,
+            dependency_actions,
+            workspace_actions,
+            canonical_test_actions,
+            seeded_workers,
+            stopped_under_foreground_pressure,
+            receipt_seq,
+        };
+        {
+            let mut prewarm = self
+                .prewarm_state
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            prewarm
+                .warm_commits
+                .insert(event.head_commit_oid, head_warm_keys);
+            prewarm.receipts.push(receipt.clone());
+        }
+        Ok(receipt)
+    }
+
+    /// Snapshot of recorded Q007 git/worktree prewarm receipts.
+    pub fn prewarm_receipts(&self) -> Result<Vec<GitPrewarmReceipt>, SubmissionRefusal> {
+        Ok(self
+            .prewarm_state
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .receipts
+            .clone())
+    }
+
+    /// Promote a committed canonical profile build from a CI writer lane to
+    /// [`TrustEvidenceTier::CiPolicyApproved`] via the S011 policy evaluator and
+    /// register its commit/action in the prewarm ledger so developer pulls receive
+    /// guaranteed-warm artifacts (bead Q008; depends on Q007 + S011).
+    ///
+    /// Trust tier is publication/access policy, NEVER content identity: the
+    /// `action_key` is unchanged from a local-agent build of the same descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_ci_canonical_prewarm<P, F>(
+        &self,
+        commit_oid: &str,
+        profile_name: &str,
+        expected_policy_id: &TypedDigest,
+        policy_history: &[CiCanonicalWriterPolicy],
+        claim: &CiCanonicalWriterClaim,
+        independently_observed_verification: rabs_protocol::provenance_receipt::VerificationLevel,
+        verify_policy_content: P,
+        verify_signature: F,
+    ) -> Result<CiCanonicalPrewarmReceipt, SubmissionRefusal>
+    where
+        P: FnOnce(&TypedDigest, &[u8]) -> bool,
+        F: FnOnce(
+            rabs_protocol::serving::CiSignatureAlgorithm,
+            &TypedDigest,
+            u64,
+            &[u8],
+            &[u8],
+        ) -> bool,
+    {
+        if !self.available() || self.cas.is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let held = self.authority().ok_or(SubmissionRefusal::Unavailable)?;
+        let held_digest = authority_digest(&held);
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+
+        let active_policy = policy_history
+            .iter()
+            .filter(|p| &p.policy_id == expected_policy_id)
+            .max_by_key(|p| p.version)
+            .ok_or_else(|| {
+                SubmissionRefusal::Admission(format!(
+                    "ci policy refusal: {:?}",
+                    CiPolicyRefusal::NoCurrentPolicy
+                ))
+            })?;
+
+        let (approval, ledger_version, receipt_seq) = {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            declare_coordinator_domains(&mut *store);
+            match store.active_authority().map_err(|error| {
+                SubmissionRefusal::Admission(format!("active authority: {error:?}"))
+            })? {
+                Some(active) if active.digest == held_digest => {}
+                _ => return Err(SubmissionRefusal::Unavailable),
+            }
+            let action_key_str = digest_key(&claim.action_key);
+            let quarantined = !store
+                .query(
+                    "SELECT 1 FROM quarantines WHERE scope = 'action-entry' AND subject = ?1 LIMIT 1",
+                    &[SqlValue::Text(action_key_str.clone())],
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("quarantine check: {error:?}"))
+                })?
+                .is_empty();
+            if quarantined {
+                return Err(SubmissionRefusal::Admission(
+                    "cannot promote quarantined action to CiPolicyApproved".to_owned(),
+                ));
+            }
+            let manifest_key = store
+                .published_manifest_key(&claim.action_key)
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("published manifest lookup: {error:?}"))
+                })?
+                .ok_or_else(|| {
+                    SubmissionRefusal::Admission(
+                        "action has no committed publication to approve".to_owned(),
+                    )
+                })?;
+            let manifest_digest = object_id_from_key(&manifest_key).ok_or_else(|| {
+                SubmissionRefusal::Admission("invalid published manifest key".to_owned())
+            })?;
+            let evidence_keys = store
+                .list_evidence_keys(&claim.action_key)
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("evidence keys lookup: {error:?}"))
+                })?;
+            let expected_evidence_set_digest = evidence_set_digest(&evidence_keys);
+            let latest_eval =
+                store
+                    .latest_trust_evaluation(&claim.action_key)
+                    .map_err(|error| {
+                        SubmissionRefusal::Admission(format!("trust ledger lookup: {error:?}"))
+                    })?;
+            let trust_ledger_high_water = latest_eval.as_ref().map_or(0, |row| row.evaluated_seq);
+            let publication_causal_sequence = trust_ledger_high_water.max(1);
+            let ledger_version = latest_eval
+                .as_ref()
+                .map_or(Some(1), |row| row.version.checked_add(1))
+                .ok_or(SubmissionRefusal::IdentityExhausted)?;
+
+            let context = CiEvaluationContext {
+                expected_policy_id: expected_policy_id.clone(),
+                expected_policy_version: active_policy.version,
+                expected_policy_content_digest: active_policy.policy_content_digest.clone(),
+                expected_action_key: claim.action_key.clone(),
+                expected_canonical_result_manifest_id: ObjectId(manifest_digest),
+                expected_evidence_set_digest,
+                independently_observed_verification,
+                coordinator_causal_sequence: claim.evaluated_causal_sequence,
+                publication_causal_sequence,
+                trust_ledger_high_water,
+            };
+            let approval = evaluate_ci_canonical_writer_claim(
+                policy_history,
+                claim,
+                &context,
+                verify_policy_content,
+                verify_signature,
+            )
+            .map_err(|refusal| {
+                SubmissionRefusal::Admission(format!("ci policy refusal: {refusal:?}"))
+            })?;
+
+            store
+                .append_trust_evaluation(
+                    &held_digest,
+                    &claim.action_key,
+                    &TrustEvaluationRow {
+                        version: ledger_version,
+                        state: "ci-policy-approved".to_owned(),
+                        reason: format!(
+                            "ci-lane={};policy-v={};commit={};profile={}",
+                            approval.lane_id(),
+                            approval.policy_version(),
+                            commit_oid,
+                            profile_name,
+                        ),
+                        evaluated_seq: claim.evaluated_causal_sequence,
+                    },
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("append trust evaluation: {error:?}"))
+                })?;
+            store
+                .set_serving_disposition_key(&action_key_str, DISPOSITION_SERVABLE)
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("set serving disposition: {error:?}"))
+                })?;
+            let receipt_seq = self.next_seq();
+            store
+                .record_decision_receipt(
+                    CI_CANONICAL_PREWARM_RECEIPT_KIND,
+                    &format!("{commit_oid}:{profile_name}"),
+                    receipt_seq,
+                    "ci-policy-approved",
+                    &action_key_str,
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("ci prewarm decision receipt: {error:?}"))
+                })?;
+            (approval, ledger_version, receipt_seq)
+        };
+
+        {
+            let mut prewarm = self
+                .prewarm_state
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            prewarm
+                .warm_commits
+                .entry(commit_oid.to_owned())
+                .or_default()
+                .insert(digest_key(&claim.action_key));
+        }
+
+        Ok(CiCanonicalPrewarmReceipt {
+            commit_oid: commit_oid.to_owned(),
+            profile_name: profile_name.to_owned(),
+            action_key: claim.action_key.clone(),
+            assigned_tier: approval.evaluation().evaluated_tier(),
+            approval,
+            trust_ledger_version: ledger_version,
+            receipt_seq,
+        })
+    }
+
+    /// Evaluate whether a committed action satisfies `required_tier` under
+    /// publication/access policy (bead Q008).
+    ///
+    /// Local agent results (e.g. `UnverifiedCandidate` or `ShadowMatched`)
+    /// remain immediately useful for developer/agent tiers, while release or
+    /// CI-gated lanes require `TrustEvidenceTier::CiPolicyApproved` or higher
+    /// verification without changing the content-addressed `action_key`.
+    pub fn evaluate_trust_tier_access(
+        &self,
+        action_key: &TypedDigest,
+        required_tier: TrustEvidenceTier,
+    ) -> Result<TrustAccessDecision, SubmissionRefusal> {
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        declare_coordinator_domains(&mut *store);
+        if !store.has_publication(action_key).map_err(|error| {
+            SubmissionRefusal::Admission(format!("publication check: {error:?}"))
+        })? {
+            return Err(SubmissionRefusal::Admission(
+                "action has no committed publication".to_owned(),
+            ));
+        }
+        let latest = store
+            .latest_trust_evaluation(action_key)
+            .map_err(|error| SubmissionRefusal::Admission(format!("trust lookup: {error:?}")))?;
+        let observed_tier = match latest.as_ref().map(|row| row.state.as_str()) {
+            Some("project-release-eligible") => TrustEvidenceTier::ProjectReleaseEligible,
+            Some("ci-policy-approved") => TrustEvidenceTier::CiPolicyApproved,
+            Some("reproducible-cross-worker") => TrustEvidenceTier::ReproducibleCrossWorker,
+            Some("reproducible-same-worker") => TrustEvidenceTier::ReproducibleSameWorker,
+            Some("shadow-matched") => TrustEvidenceTier::ShadowMatched,
+            _ => TrustEvidenceTier::UnverifiedCandidate,
+        };
+        if observed_tier >= required_tier {
+            Ok(TrustAccessDecision::Permitted {
+                observed_tier,
+                required_tier,
+            })
+        } else {
+            Ok(TrustAccessDecision::NeedsAdditionalVerification {
+                observed_tier,
+                required_tier,
+            })
+        }
     }
 
     fn optional_admitted(&self) -> Result<bool, SubmissionRefusal> {
@@ -1170,6 +2281,24 @@ impl CoordLive {
             WorkCategory::NewSpeculation,
             pressure.unwrap_or(PressureBand::Normal),
         ) == BrownoutDecision::Admit)
+    }
+
+    fn record_brownout_refusal(&self) -> Result<(), SubmissionRefusal> {
+        self.speculation_provenance
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .record(BrownoutDecision::StopAdmitting, false);
+        self.speculation_runs
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .push(SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::AdmissionRefusedBrownout,
+                saved_foreground_latency_ms: 0,
+                execution_cost_ms: 0,
+                transfer_cost_bytes: 0,
+                storage_cost_bytes: 0,
+            });
+        Ok(())
     }
 
     /// Submit a cache-miss demand to the ONE coordinator actor registry. Both
@@ -1192,6 +2321,7 @@ impl CoordLive {
             SubscriberKind::Speculative | SubscriberKind::GitPrewarm
         );
         if optional && !self.optional_admitted()? {
+            self.record_brownout_refusal()?;
             return Err(SubmissionRefusal::Brownout);
         }
         // Caller-provided numeric priority cannot make optional work compete in
@@ -1223,7 +2353,11 @@ impl CoordLive {
             {
                 return Err(SubmissionRefusal::ChangedRequirements);
             }
+            let was_optional_only = !entry.actor.has_foreground_interest();
             let join = entry.actor.join(request, now_unix_micros, clock_epoch);
+            if was_optional_only && entry.actor.has_foreground_interest() {
+                entry.promoted_from_speculation = true;
+            }
             return Ok(SubmissionReceipt {
                 action_key: key,
                 actor_created: false,
@@ -1269,6 +2403,9 @@ impl CoordLive {
                 input: Arc::new(input),
                 state: DispatchState::Queued,
                 order,
+                started_as_speculative: optional,
+                promoted_from_speculation: false,
+                started_at: None,
             },
         );
         Ok(SubmissionReceipt {
@@ -1276,6 +2413,87 @@ impl CoordLive {
             actor_created: true,
             join,
         })
+    }
+
+    /// Detach a subscriber's interest from an in-flight action (bead G005).
+    ///
+    /// - When other subscribers remain attached, the action and its active
+    ///   attempt/generation survive without interruption.
+    /// - When the last subscriber detaches, the active generation is drained
+    ///   and tombstoned in the durable store so no in-flight worker attempt can
+    ///   publish after cancellation.
+    pub fn cancel_subscriber(
+        &self,
+        key: &TypedDigest,
+        operation: BuildOperationId,
+    ) -> Result<CancelReceipt, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        let active_generation_id = entry
+            .actor
+            .active_generation()
+            .map(|generation| generation.generation_id.0);
+        let receipt = entry.actor.cancel_subscriber(operation);
+        if receipt == CancelReceipt::LastInterestCancelledGeneration {
+            if matches!(
+                entry.state,
+                DispatchState::Claimed(_) | DispatchState::Started(_)
+            ) {
+                entry.state = DispatchState::Queued;
+            }
+            if let Some(generation_id) = active_generation_id
+                && let Some(cas) = self.cas.as_ref()
+            {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| SubmissionRefusal::Unavailable)?;
+                store.tombstone_generation(generation_id).map_err(|error| {
+                    SubmissionRefusal::Admission(format!(
+                        "last-subscriber drain generation tombstone: {error:?}"
+                    ))
+                })?;
+            }
+        }
+        Ok(receipt)
+    }
+
+    /// Promote an attached subscriber's interest in place without creating a
+    /// duplicate actor or execution attempt (bead Q005 / G004).
+    pub fn promote_subscriber(
+        &self,
+        key: &TypedDigest,
+        operation: BuildOperationId,
+        deadline_unix_micros: Option<i64>,
+    ) -> Result<PromoteReceipt, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        let was_optional_only = !entry.actor.has_foreground_interest();
+        let receipt = entry
+            .actor
+            .promote_with_deadline(operation, deadline_unix_micros);
+        if was_optional_only && entry.actor.has_foreground_interest() {
+            entry.promoted_from_speculation = true;
+        }
+        Ok(receipt)
     }
 
     /// Claim at most one pending execution, atomically with registry mutation.
@@ -1355,6 +2573,7 @@ impl CoordLive {
             return Err(SubmissionRefusal::StaleDispatch);
         }
         if !entry.actor.has_foreground_interest() && !self.optional_admitted()? {
+            self.record_brownout_refusal()?;
             return Err(SubmissionRefusal::Brownout);
         }
         // Allocate against durable history rather than the process clock. Only
@@ -1427,6 +2646,7 @@ impl CoordLive {
         }
         entry.actor = actor;
         entry.state = DispatchState::Started(serial);
+        entry.started_at = Some(Instant::now());
         Ok(authority)
     }
 
@@ -1525,6 +2745,34 @@ impl CoordLive {
             return Err(SubmissionRefusal::StaleDispatch);
         }
         entry.state = DispatchState::Finished;
+        if entry.started_as_speculative {
+            let elapsed_ms = entry.started_at.take().map_or(1, |started| {
+                u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+            });
+            let bytes = entry.input.source_bytes();
+            let outcome =
+                if entry.promoted_from_speculation || entry.actor.has_foreground_interest() {
+                    SpeculationRunOutcome::PromotedToForeground
+                } else {
+                    SpeculationRunOutcome::SavedCompleted
+                };
+            self.speculation_provenance
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?
+                .record_completed();
+            self.speculation_runs
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?
+                .push(SpeculationRunRecord {
+                    outcome,
+                    saved_foreground_latency_ms: elapsed_ms,
+                    execution_cost_ms: elapsed_ms,
+                    transfer_cost_bytes: bytes,
+                    storage_cost_bytes: bytes,
+                });
+        }
         Ok(())
     }
 
@@ -1598,6 +2846,16 @@ impl CoordLive {
             .submissions
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let pressure = self
+            .speculation_pressure
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .unwrap_or(PressureBand::Normal);
+        debug_assert_eq!(
+            decide(WorkCategory::Cleanup, pressure),
+            BrownoutDecision::Admit,
+            "cleanup work must remain required under every pressure band"
+        );
         if !submissions
             .entries
             .get(key)
@@ -1878,13 +3136,11 @@ impl CoordLive {
             .lock()
             .map_err(|_| CommitRefusal::StoreUnavailable)?;
 
-        // A018 classification needs the COMMITTED manifest for this key.
-        // Resolve it up front, out of its CAS bytes: `process_offer`
-        // borrows the store for the whole admission, so the resolver it
-        // takes cannot itself touch the store — and the only key it ever
-        // asks for is this one. Reading the bytes (rather than
-        // remembering the manifest in process memory) is what makes
-        // classification survive a restart.
+        // Retain this action's pre-offer baseline for comparison feedback.
+        // Producers are resolved on demand by the SAME admission walk below,
+        // after its fences, through the already-held store. No second graph
+        // walk, eager manifest map, nested metadata lock, or daemon-lifetime
+        // cache of producer state is needed.
         let committed_key = store
             .published_manifest_key(&offer.manifest.action_key)
             .map_err(|e| CommitRefusal::Store(format!("{e:?}")))?;
@@ -1892,12 +3148,17 @@ impl CoordLive {
             Some(key) => load_manifest(&mut *store, key),
             None => None,
         };
-        let resolver = |key: &str| match (&committed_key, &committed) {
-            (Some(committed_key), Some(manifest)) if committed_key == key => Some(manifest.clone()),
-            _ => None,
+        let resolver = |store: &mut dyn RabsMetadataStore, key: &str| {
+            if committed_key.as_deref() == Some(key) {
+                // An unavailable baseline must remain unavailable, rather than
+                // becoming a different comparison after a second read.
+                committed.clone()
+            } else {
+                load_manifest(store, key)
+            }
         };
 
-        let outcome = process_offer(
+        let outcome = process_offer_resolving(
             &mut *store,
             offer,
             expected_descriptor,
@@ -1979,6 +3240,31 @@ impl CoordLive {
         )
     }
 
+    /// Install the exact successfully published result of the current remote
+    /// producer. The opaque live-dependency owner and fresh wrapper consent
+    /// authorize this call; it is not available to the restricted edge cache
+    /// reader. All mutable authority, publication, release and quarantine gates
+    /// remain active. Subsequent reads still spend the normal replay allowance.
+    pub(super) fn serve_produced_result(
+        &self,
+        action_key: &TypedDigest,
+        manifest_key: &str,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+    ) -> Result<ServeOutcome, ServeError> {
+        self.serve_action_bound(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            0,
+            None,
+            ServeMode::Install,
+            Some(manifest_key),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn serve_action_inner(
         &self,
@@ -1990,9 +3276,33 @@ impl CoordLive {
         sampling: Option<SamplingPolicy>,
         mode: ServeMode,
     ) -> Result<ServeOutcome, ServeError> {
+        self.serve_action_bound(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            now_epoch,
+            sampling,
+            mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn serve_action_bound(
+        &self,
+        action_key: &TypedDigest,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        now_epoch: u64,
+        sampling: Option<SamplingPolicy>,
+        mode: ServeMode,
+        produced_manifest: Option<&str>,
+    ) -> Result<ServeOutcome, ServeError> {
         // Take the authority snapshot BEFORE the store lock, preserving the
         // existing authority -> store lock order during coordinator startup.
-        let replay_authority = if sampling.is_some() {
+        let replay_authority = if sampling.is_some() || produced_manifest.is_some() {
             if !self.available() {
                 return Err(ServeError::CoordinatorUnavailable);
             }
@@ -2007,12 +3317,15 @@ impl CoordLive {
             .lock()
             .map_err(|_| ServeError::StoreUnavailable)?;
         declare_coordinator_domains(&mut *store);
-        if let Some(held) = replay_authority {
+        if let Some(ref held) = replay_authority {
+            if !self.available() {
+                return Err(ServeError::CoordinatorUnavailable);
+            }
             match store
                 .active_authority()
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
             {
-                Some(active) if active.digest == authority_digest(&held) => {}
+                Some(active) if active.digest == authority_digest(held) => {}
                 _ => return Err(ServeError::CoordinatorUnavailable),
             }
         }
@@ -2052,6 +3365,12 @@ impl CoordLive {
         {
             return Ok(ServeOutcome::ExecutePrivately(refusal));
         }
+        if produced_manifest.is_some()
+            && let Some(refusal) = live_producer_gate(&mut *store, action_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
+        }
         let Some(manifest_key) = store
             .published_manifest_key(action_key)
             .map_err(|e| ServeError::Store(format!("{e:?}")))?
@@ -2060,6 +3379,9 @@ impl CoordLive {
             // store, not a hit.
             return Ok(ServeOutcome::NoCommit);
         };
+        if produced_manifest.is_some_and(|expected| expected != manifest_key) {
+            return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
+        }
         let Some(manifest) = load_manifest(&mut *store, &manifest_key) else {
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         };
@@ -2068,7 +3390,15 @@ impl CoordLive {
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
-
+        if sampling.is_some()
+            && live_replay_permit(&mut *store, action_key, &manifest_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                .is_none()
+        {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::FreshVerificationRequired,
+            ));
+        }
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.
@@ -2081,44 +3411,143 @@ impl CoordLive {
             return Ok(ServeOutcome::Servable);
         }
         if plan.outputs.is_empty() {
+            if sampling.is_some() {
+                let Some(permit) = live_replay_permit(&mut *store, action_key, &manifest_key)
+                    .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                else {
+                    return Ok(ServeOutcome::ExecutePrivately(
+                        ReplayRefusal::FreshVerificationRequired,
+                    ));
+                };
+                store
+                    .record_decision_receipt(
+                        LIVE_INSTALL_RECEIPT,
+                        &permit.subject,
+                        permit.seq,
+                        "install",
+                        &manifest_key,
+                    )
+                    .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+            }
             return Ok(ServeOutcome::Served { files: Vec::new() });
         }
 
-        // D031: reserve every destination all-or-nothing before any
-        // install, so a concurrent serve into an overlapping path is
-        // refused rather than interleaved.
+        // D031: reserve every destination all-or-nothing before any staging or
+        // install. The reservation stays live across the metadata-lock handoff,
+        // so another subscriber cannot race private preparation into the same
+        // final namespace.
         let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
         use rabs_protocol::raw_bytes::RawBytes;
         use std::os::unix::ffi::OsStrExt;
-        // BYTES, not a lossy decode. A destination is an arbitrary byte
-        // sequence on Unix, and `to_string_lossy` mapped every one that
-        // differed only in invalid UTF-8 onto the same U+FFFD-bearing
-        // key — so two concurrent serves writing genuinely different
-        // files conflicted, and the refusal named a path that was not
-        // the path either of them asked for (bd-1rofg). It also made
-        // this the one lossy decode in a pipeline T026/R89 exists to
-        // keep byte-exact.
         let paths: Vec<Vec<u8>> = plan
             .outputs
             .iter()
             .map(|out| out.destination.as_os_str().as_bytes().to_vec())
             .collect();
-        // The guard releases on drop, so the reservation cannot outlive
-        // this call however it ends — including an unwind, which
-        // previously stranded the paths for the process's lifetime
-        // (bd-v9ho1). Bound to a name, not `_`, so it lives until the
-        // end of the scope rather than being dropped immediately.
         let _reservation = reserve_scoped(&self.arbiter, bundle, &paths).map_err(|conflict| {
             ServeError::DestinationConflict {
-                // Escaped rather than lossily decoded, so the operator
-                // sees a path they can tell apart from its neighbours
-                // and map back to real bytes. Same treatment the
-                // virtual-path refusals already give (`RawBytes`).
                 path: RawBytes::new(conflict.path).escaped(),
                 holder: conflict.holder.0,
             }
         })?;
-        let files = output_install::install(&mut *store, &plan)?;
+
+        // Select exact non-quarantined replicas while metadata is authoritative,
+        // then release the global store mutex for expensive copy/hash/derivation.
+        // The staged owner exposes no final destination and carries no serving
+        // authority. A corrupt replica is settled only after reacquiring metadata.
+        let selected = output_install::select_for_install(&mut *store, &plan)?;
+        drop(store);
+        let prepared = match output_install::stage_for_install(selected, &plan) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| ServeError::StoreUnavailable)?;
+                return Err(output_install::settle_stage_failure(&mut *store, failure));
+            }
+        };
+
+        // Bytes may have taken arbitrarily long to stage. Re-enter every mutable
+        // authority/gating boundary before the FIRST rename. The prepared CAS
+        // owner independently rechecks object quarantine, selected locations and
+        // private file generations during install.
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| ServeError::StoreUnavailable)?;
+        declare_coordinator_domains(&mut *store);
+        if let Some(ref held) = replay_authority {
+            if !self.available() {
+                return Err(ServeError::CoordinatorUnavailable);
+            }
+            match store
+                .active_authority()
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            {
+                Some(active) if active.digest == authority_digest(held) => {}
+                _ => return Err(ServeError::CoordinatorUnavailable),
+            }
+        }
+        let standing = release_standing(
+            store
+                .release_verdict(&self.build_identity)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                .as_ref(),
+            &self.build_identity,
+            now_unix_micros,
+            now_epoch,
+        );
+        if !standing.permits_serving(self.release_mode) {
+            return Ok(ServeOutcome::ReleaseUnauthorized { standing });
+        }
+        match serving_gate(&mut *store, &key, now_unix_micros, now_epoch)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            ServeDecision::Servable => {}
+            decision => return Ok(ServeOutcome::NotServable(decision)),
+        }
+        if let Some(policy) = sampling
+            && let Some(refusal) = live_replay_gate(&mut *store, action_key, &policy)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
+        }
+        if produced_manifest.is_some()
+            && let Some(refusal) = live_producer_gate(&mut *store, action_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
+        }
+        match store
+            .published_manifest_key(action_key)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            Some(current) if current == manifest_key => {}
+            Some(current) => return Ok(ServeOutcome::ManifestUnavailable { key: current }),
+            None => return Ok(ServeOutcome::NoCommit),
+        }
+        if sampling.is_some() {
+            let Some(permit) = live_replay_permit(&mut *store, action_key, &manifest_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            else {
+                return Ok(ServeOutcome::ExecutePrivately(
+                    ReplayRefusal::FreshVerificationRequired,
+                ));
+            };
+            // Spend only after the post-staging gates pass. A failed/partial
+            // install still conservatively consumes this durable allowance.
+            store
+                .record_decision_receipt(
+                    LIVE_INSTALL_RECEIPT,
+                    &permit.subject,
+                    permit.seq,
+                    "install",
+                    &manifest_key,
+                )
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+        }
+        let files = output_install::install_prepared(&mut *store, &plan, prepared)?;
         Ok(ServeOutcome::Served { files })
     }
 
@@ -2229,12 +3658,13 @@ impl CoordLive {
              \"lease_registry_mounted\":{lease_holders},\"destination_arbiter_mounted\":{reservations},\
              \"cas_mounted\":{},\"authority_held\":{},\"authority_term\":{},\
              \"closed_prior_authority_generations\":{},\
-             \"release_mode\":\"{}\",\"release_standing\":\"{}\"}}",
+             \"build_identity\":\"{}\",\"release_mode\":\"{}\",\"release_standing\":\"{}\"}}",
             self.available(),
             self.cas.is_some(),
             authority.is_some(),
             authority.map_or(0, |a| a.term),
             self.closed_prior_generations(),
+            self.build_identity.replace('"', "'"),
             match self.release_mode {
                 ReleaseAuthorizationMode::Advisory => "advisory",
                 ReleaseAuthorizationMode::Required => "required",
@@ -3329,6 +4759,666 @@ mod tests {
                 renewal_seq: 2,
                 expires_at_own_monotonic_ms: 600,
             })
+        );
+    }
+
+    #[test]
+    fn speculation_browns_out_before_foreground() {
+        use rabs_action::state_machines::AttemptState;
+
+        let (_state, coord) = submission_coordinator();
+        let (_live, source, manifest, base_descriptor) = source_fixture();
+        let worker = worker_offer(1, 1);
+        coord.admit_worker_session(&worker).unwrap();
+        let lease_ttl_ms = 60_000;
+
+        let desc_with_tag = |tag: u8| {
+            let mut d = base_descriptor.clone();
+            d.normalized_invocation.bytes[0] = tag;
+            d
+        };
+
+        // 1. Normal pressure: speculative S1 starts and finishes before pressure (saved).
+        assert_eq!(
+            coord
+                .apply_speculation_pressure_permille(100, 600, 850)
+                .unwrap(),
+            PressureBand::Normal
+        );
+        let s1_desc = desc_with_tag(1);
+        let s1 = coord
+            .submit_action(
+                submission(&source, &manifest, &s1_desc),
+                request(1, SubscriberKind::Speculative, 10),
+                1,
+                0,
+            )
+            .unwrap();
+        let mut s1_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let _s1_auth = s1_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+            AttemptState::ProcessExited,
+            AttemptState::Draining,
+            AttemptState::Finished,
+        ] {
+            s1_dispatch.advance(state).unwrap();
+        }
+        s1_dispatch.complete().unwrap();
+
+        // Start S2 (speculative, then joined by ForegroundAgent -> promoted) and S3 (low-value speculative).
+        let s2_desc = desc_with_tag(2);
+        let s2 = coord
+            .submit_action(
+                submission(&source, &manifest, &s2_desc),
+                request(2, SubscriberKind::Speculative, 10),
+                2,
+                0,
+            )
+            .unwrap();
+        let mut s2_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let _s2_auth = s2_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+        ] {
+            s2_dispatch.advance(state).unwrap();
+        }
+        // Foreground subscriber joins S2 while running -> suspends brownout on S2.
+        let s2_fg = coord
+            .submit_action(
+                submission(&source, &manifest, &s2_desc),
+                request(20, SubscriberKind::ForegroundAgent, 200),
+                3,
+                0,
+            )
+            .unwrap();
+        assert!(!s2_fg.actor_created);
+
+        let s3_desc = desc_with_tag(3);
+        let s3 = coord
+            .submit_action(
+                submission(&source, &manifest, &s3_desc),
+                request(3, SubscriberKind::Speculative, 10),
+                4,
+                0,
+            )
+            .unwrap();
+        let mut s3_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let s3_auth = s3_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        s3_dispatch.advance(AttemptState::LeaseAccepted).unwrap();
+
+        // 2. Soft pressure: new speculation stops admitting; running S3 survives; foreground admits.
+        assert_eq!(
+            coord
+                .apply_speculation_pressure_permille(650, 600, 850)
+                .unwrap(),
+            PressureBand::Soft
+        );
+        let s4_desc = desc_with_tag(4);
+        assert_eq!(
+            coord
+                .submit_action(
+                    submission(&source, &manifest, &s4_desc),
+                    request(4, SubscriberKind::Speculative, 10),
+                    5,
+                    0,
+                )
+                .unwrap_err(),
+            SubmissionRefusal::Brownout
+        );
+        // Running S3 is NOT cancelled at Soft: it can still advance.
+        s3_dispatch.advance(AttemptState::AwaitingInputs).unwrap();
+        s3_dispatch.advance(AttemptState::Materializing).unwrap();
+        s3_dispatch.advance(AttemptState::Running).unwrap();
+
+        // Foreground F1 admits and starts under Soft pressure.
+        let f1_desc = desc_with_tag(5);
+        let f1 = coord
+            .submit_action(
+                submission(&source, &manifest, &f1_desc),
+                request(5, SubscriberKind::ForegroundAgent, 200),
+                6,
+                0,
+            )
+            .unwrap();
+        let mut f1_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        assert_eq!(f1_dispatch.input().key(), f1.action_key);
+        let _f1_auth = f1_dispatch.begin(&worker, lease_ttl_ms).unwrap().clone();
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+            AttemptState::Running,
+        ] {
+            f1_dispatch.advance(state).unwrap();
+        }
+
+        // 3. Hard pressure: low-value running speculation S3 cancels and drains;
+        //    promoted S2, foreground F1, and cleanup/integrity work remain unaffected.
+        assert_eq!(
+            coord
+                .apply_speculation_pressure_permille(900, 600, 850)
+                .unwrap(),
+            PressureBand::Hard
+        );
+        assert!(
+            coord
+                .work_category_admitted(WorkCategory::Foreground)
+                .unwrap()
+        );
+        assert!(coord.work_category_admitted(WorkCategory::Cleanup).unwrap());
+        assert!(
+            coord
+                .work_category_admitted(WorkCategory::ObjectIntegrity)
+                .unwrap()
+        );
+
+        // S3's attempt was transitioned to Draining, its generation closed and durably tombstoned.
+        let s3_actor = coord.submitted_actor(&s3.action_key).unwrap().unwrap();
+        assert!(s3_actor.active_generation().is_none());
+        assert_eq!(
+            s3_actor.attempts().next().unwrap().state,
+            AttemptState::Draining
+        );
+        assert_eq!(
+            s3_dispatch
+                .advance(AttemptState::ProcessExited)
+                .unwrap_err(),
+            SubmissionRefusal::StaleDispatch
+        );
+        assert!(matches!(
+            coord.renew_attempt_lease(
+                &s3_auth,
+                LeaseRenewal {
+                    lease: s3_auth.execution_lease_id,
+                    seq: LeaseRenewalSeq(1),
+                },
+                lease_ttl_ms,
+            ),
+            Err(AttemptLeaseRefusal::Store(StoreError::GenerationTombstoned))
+        ));
+        drop(s3_dispatch);
+
+        // Promoted S2 and foreground F1 continue and complete cleanly under Hard pressure.
+        for state in [
+            AttemptState::ProcessExited,
+            AttemptState::Draining,
+            AttemptState::Finished,
+        ] {
+            s2_dispatch.advance(state).unwrap();
+            f1_dispatch.advance(state).unwrap();
+        }
+        s2_dispatch.complete().unwrap();
+        f1_dispatch.complete().unwrap();
+
+        // Cleanup (`retire_finished_action`) succeeds under Hard pressure.
+        assert!(coord.retire_finished_action(&s1.action_key).unwrap());
+        assert!(coord.retire_finished_action(&s2.action_key).unwrap());
+        assert!(coord.retire_finished_action(&f1.action_key).unwrap());
+
+        // Provenance and Q009 ROI dashboard reflect exact runs (1 saved completed,
+        // 1 promoted to foreground, 1 cancelled under pressure, 1 admission refused).
+        let provenance = coord.speculation_provenance().unwrap();
+        assert_eq!(
+            provenance,
+            SpeculationProvenance {
+                wasted_cancelled: 1,
+                saved_completed: 2,
+                admissions_refused: 1,
+            }
+        );
+        let roi = coord.speculation_roi_panel().unwrap();
+        assert_eq!(roi.promoted, 1);
+        assert_eq!(roi.cancelled, 1);
+        assert_eq!(roi.wasted, 1);
+        assert_eq!(roi.saved, 2);
+        assert_eq!(roi.admissions_refused, 1);
+        assert!(roi.saved_foreground_latency_ms >= 2);
+        assert!(roi.wasted_execution_cost_ms >= 1);
+        assert!(roi.wasted_transfer_cost_bytes > 0);
+        assert!(roi.wasted_storage_cost_bytes > 0);
+
+        // Q010: Default-on speculation ships DefaultOff and refuses automatic submission until
+        // the gate evaluates positive ROI + improved foreground p95 + zero pressure regressions.
+        coord
+            .set_speculation_pressure(PressureBand::Normal)
+            .unwrap();
+        assert_eq!(
+            coord.speculation_default_on_posture().unwrap(),
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        let s6_desc = desc_with_tag(6);
+        assert!(matches!(
+            coord.submit_default_on_speculation(
+                submission(&source, &manifest, &s6_desc),
+                request(40, SubscriberKind::Speculative, 10),
+                1_900_000,
+                0,
+            ),
+            Err(SubmissionRefusal::Admission(reason)) if reason.contains("default-on speculation gated off")
+        ));
+
+        // Evaluate before foreground latency samples are recorded -> remains DefaultOff.
+        let initial_gate = coord.evaluate_speculation_default_on_gate().unwrap();
+        assert_eq!(
+            initial_gate.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!initial_gate.permits_default_on());
+
+        // Record baseline and speculative foreground latency samples showing strict p95 improvement.
+        for ms in [420_u64, 510, 640] {
+            coord.record_foreground_latency_sample(false, ms).unwrap();
+        }
+        for ms in [120_u64, 180, 240] {
+            coord.record_foreground_latency_sample(true, ms).unwrap();
+        }
+        let passing_gate = coord.evaluate_speculation_default_on_gate().unwrap();
+        assert_eq!(passing_gate.posture, SpeculationDefaultOnPosture::DefaultOn);
+        assert!(passing_gate.permits_default_on());
+        assert_eq!(passing_gate.decision_token(), "default-on-authorized");
+        assert_eq!(
+            coord.latest_speculation_default_on_decision().unwrap(),
+            Some(passing_gate.clone())
+        );
+
+        // Default-on speculation submission is now permitted.
+        let admitted_default_on = coord
+            .submit_default_on_speculation(
+                submission(&source, &manifest, &s6_desc),
+                request(40, SubscriberKind::Speculative, 10),
+                1_900_000,
+                0,
+            )
+            .unwrap();
+        assert!(admitted_default_on.actor_created);
+
+        // Recording a pressure regression immediately demotes posture back to DefaultOff.
+        coord.record_speculation_pressure_regression().unwrap();
+        assert_eq!(
+            coord.speculation_default_on_posture().unwrap(),
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        let regressed_gate = coord.evaluate_speculation_default_on_gate().unwrap();
+        assert_eq!(
+            regressed_gate.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!regressed_gate.permits_default_on());
+    }
+
+    #[test]
+    fn q007_git_prewarm_events_locate_ancestor_seed_workers_and_stop_under_foreground_pressure() {
+        let (_state, coord) = submission_coordinator();
+        let (_live, source, manifest, base_descriptor) = source_fixture();
+        let worker_ok = worker_offer(1, 0x101);
+        coord.admit_worker_session(&worker_ok).unwrap();
+
+        let desc_with_tag = |tag: u8| {
+            let mut d = base_descriptor.clone();
+            d.normalized_invocation.bytes[0] = tag;
+            d
+        };
+
+        let dep_desc = desc_with_tag(11);
+        let ws_desc = desc_with_tag(12);
+        let test_desc = desc_with_tag(13);
+        let lockfile_digest = rabs_key::typed_digest::compute("rabs.lockfile.v1", b"Cargo.lock-v1");
+        let toolchain_digest =
+            rabs_key::typed_digest::compute("rabs.toolchain.v1", b"nightly-2026-06-06");
+
+        // 1. Initial branch checkout warms dep, workspace, and canonical test subset.
+        let checkout_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-checkout-1".to_owned(),
+                kind: GitPrewarmEventKind::BranchCheckout,
+                head_commit_oid: "commit-a1".to_owned(),
+                parent_commit_oids: vec!["commit-root".to_owned()],
+                worktree_id: "wt-main".to_owned(),
+                lockfile_digest: lockfile_digest.clone(),
+                toolchain_digest: toolchain_digest.clone(),
+                dependency_critical_path: vec![submission(&source, &manifest, &dep_desc)],
+                workspace_critical_path: vec![submission(&source, &manifest, &ws_desc)],
+                canonical_test_subset: vec![submission(&source, &manifest, &test_desc)],
+                likely_workers: vec![
+                    worker_ok.worker_peer_id.clone(),
+                    PeerId("unadmitted-worker".to_owned()),
+                ],
+                operation_base_id: 500,
+                now_unix_micros: 10_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert_eq!(checkout_receipt.nearest_ancestor_commit_oid, None);
+        assert!(!checkout_receipt.stopped_under_foreground_pressure);
+        assert_eq!(
+            checkout_receipt.seeded_workers,
+            vec![worker_ok.worker_peer_id.clone()]
+        );
+        assert!(matches!(
+            checkout_receipt.dependency_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            checkout_receipt.workspace_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            checkout_receipt.canonical_test_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+
+        // 2. Child commit locates `commit-a1` as nearest warm ancestor: dep is AlreadyWarm, new ws2 queues.
+        let ws2_desc = desc_with_tag(14);
+        let head_change_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-head-2".to_owned(),
+                kind: GitPrewarmEventKind::HeadChange,
+                head_commit_oid: "commit-a2".to_owned(),
+                parent_commit_oids: vec!["commit-a1".to_owned(), "commit-root".to_owned()],
+                worktree_id: "wt-main".to_owned(),
+                lockfile_digest: lockfile_digest.clone(),
+                toolchain_digest: toolchain_digest.clone(),
+                dependency_critical_path: vec![submission(&source, &manifest, &dep_desc)],
+                workspace_critical_path: vec![submission(&source, &manifest, &ws2_desc)],
+                canonical_test_subset: Vec::new(),
+                likely_workers: vec![worker_ok.worker_peer_id.clone()],
+                operation_base_id: 600,
+                now_unix_micros: 20_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            head_change_receipt.nearest_ancestor_commit_oid.as_deref(),
+            Some("commit-a1")
+        );
+        assert!(matches!(
+            head_change_receipt.dependency_actions.as_slice(),
+            [PrewarmStageOutcome::AlreadyWarm { .. }]
+        ));
+        assert!(matches!(
+            head_change_receipt.workspace_actions.as_slice(),
+            [PrewarmStageOutcome::QueuedPrewarm {
+                actor_created: true,
+                ..
+            }]
+        ));
+
+        // 3. Submit a foreground action -> queued foreground demand causes subsequent prewarm to stop instantly.
+        let fg_desc = desc_with_tag(15);
+        coord
+            .submit_action(
+                submission(&source, &manifest, &fg_desc),
+                request(700, SubscriberKind::ForegroundAgent, 200),
+                25_000,
+                0,
+            )
+            .unwrap();
+
+        let ws3_desc = desc_with_tag(16);
+        let pressured_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-worktree-3".to_owned(),
+                kind: GitPrewarmEventKind::WorktreeCreation,
+                head_commit_oid: "commit-a3".to_owned(),
+                parent_commit_oids: vec!["commit-a2".to_owned()],
+                worktree_id: "wt-feature".to_owned(),
+                lockfile_digest,
+                toolchain_digest,
+                dependency_critical_path: Vec::new(),
+                workspace_critical_path: vec![submission(&source, &manifest, &ws3_desc)],
+                canonical_test_subset: Vec::new(),
+                likely_workers: Vec::new(),
+                operation_base_id: 800,
+                now_unix_micros: 30_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert!(pressured_receipt.stopped_under_foreground_pressure);
+        assert!(matches!(
+            pressured_receipt.workspace_actions.as_slice(),
+            [PrewarmStageOutcome::StoppedUnderForegroundPressure { .. }]
+        ));
+        assert_eq!(coord.prewarm_receipts().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn q008_ci_canonical_prewarm_promotes_trust_tier_and_warms_developer_pulls() {
+        use rabs_cas::test_support::{install_admission_world, install_offer_closure};
+        use rabs_protocol::provenance_receipt::VerificationLevel;
+        use rabs_protocol::serving::{
+            CI_CANONICAL_WRITER_POLICY_SCHEMA_VERSION, CI_POLICY_CLAIM_SCHEMA_VERSION,
+            CI_POLICY_CONTENT_DOMAIN, CI_POLICY_ID_DOMAIN, CI_SIGNER_FINGERPRINT_DOMAIN,
+            CiActionKeyScope, CiClaimAuthenticator, CiLaneAuthorization, CiLaneRole,
+            CiSignatureAlgorithm,
+        };
+
+        let (_state, coord) = submission_coordinator();
+        let held = coord.authority().unwrap();
+        let offer = offer_under(&held);
+        let action_key = offer.manifest.action_key.clone();
+        {
+            let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+            install_admission_world(&mut *store, &held);
+            install_offer_closure(&mut *store, &offer);
+        }
+        assert!(matches!(
+            coord
+                .commit_offer(&offer, &sample_expected_descriptor())
+                .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+
+        // 1. Local/initial publication is immediately useful for UnverifiedCandidate tier,
+        //    but requires additional verification for CiPolicyApproved / release lanes.
+        assert_eq!(
+            coord
+                .evaluate_trust_tier_access(&action_key, TrustEvidenceTier::UnverifiedCandidate)
+                .unwrap(),
+            TrustAccessDecision::Permitted {
+                observed_tier: TrustEvidenceTier::UnverifiedCandidate,
+                required_tier: TrustEvidenceTier::UnverifiedCandidate,
+            }
+        );
+        assert_eq!(
+            coord
+                .evaluate_trust_tier_access(&action_key, TrustEvidenceTier::CiPolicyApproved)
+                .unwrap(),
+            TrustAccessDecision::NeedsAdditionalVerification {
+                observed_tier: TrustEvidenceTier::UnverifiedCandidate,
+                required_tier: TrustEvidenceTier::CiPolicyApproved,
+            }
+        );
+
+        // 2. Build a signed S011 CI canonical writer policy + claim for the exact same action_key.
+        let policy_id = rabs_key::typed_digest::compute(CI_POLICY_ID_DOMAIN, b"ci-main-policy");
+        let signer_fp =
+            rabs_key::typed_digest::compute(CI_SIGNER_FINGERPRINT_DOMAIN, b"ci-ed25519-key-1");
+        let mut policy = CiCanonicalWriterPolicy {
+            schema_version: CI_CANONICAL_WRITER_POLICY_SCHEMA_VERSION,
+            policy_id: policy_id.clone(),
+            policy_content_digest: rabs_key::typed_digest::compute(
+                CI_POLICY_CONTENT_DOMAIN,
+                b"placeholder",
+            ),
+            version: 1,
+            revoked: false,
+            authorizations: vec![CiLaneAuthorization {
+                lane_id: "github-actions-main".to_owned(),
+                signer_fingerprint: signer_fp.clone(),
+                signer_generation: 1,
+                signature_algorithm: CiSignatureAlgorithm::Ed25519V1,
+                action_key_scope: CiActionKeyScope::Exact(action_key.clone()),
+                role: CiLaneRole::Producer,
+                minimum_verification: VerificationLevel::CoordinatorDigestRecompute,
+                revoked: false,
+            }],
+        };
+        policy.policy_content_digest =
+            rabs_key::typed_digest::compute(CI_POLICY_CONTENT_DOMAIN, &policy.canonical_bytes());
+
+        let (evidence_digest, high_water) = {
+            let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+            let keys = store.list_evidence_keys(&action_key).unwrap();
+            let high_water = store
+                .latest_trust_evaluation(&action_key)
+                .unwrap()
+                .map_or(0, |r| r.evaluated_seq);
+            (evidence_set_digest(&keys), high_water)
+        };
+
+        let claim = CiCanonicalWriterClaim {
+            schema_version: CI_POLICY_CLAIM_SCHEMA_VERSION,
+            policy_version: 1,
+            policy_id: policy_id.clone(),
+            policy_content_digest: policy.policy_content_digest.clone(),
+            lane_id: "github-actions-main".to_owned(),
+            signer_fingerprint: signer_fp,
+            signer_generation: 1,
+            action_key: action_key.clone(),
+            canonical_result_manifest_id: offer.manifest_id.clone(),
+            evidence_set_digest: evidence_digest,
+            role: CiLaneRole::Producer,
+            verification: VerificationLevel::CoordinatorDigestRecompute,
+            evaluated_causal_sequence: high_water + 10,
+            authenticator: CiClaimAuthenticator {
+                algorithm: CiSignatureAlgorithm::Ed25519V1,
+                bytes: vec![0xAA; 64],
+            },
+        };
+
+        let ci_receipt = coord
+            .publish_ci_canonical_prewarm(
+                "commit-ci-pushed-1",
+                "release",
+                &policy_id,
+                std::slice::from_ref(&policy),
+                &claim,
+                VerificationLevel::CoordinatorDigestRecompute,
+                |expected, canonical| {
+                    *expected
+                        == rabs_key::typed_digest::compute(CI_POLICY_CONTENT_DOMAIN, canonical)
+                },
+                |_alg, _fp, _gen, _body, sig| sig == [0xAA; 64],
+            )
+            .unwrap();
+        assert_eq!(
+            ci_receipt.assigned_tier,
+            TrustEvidenceTier::CiPolicyApproved
+        );
+        assert_eq!(ci_receipt.action_key, action_key);
+
+        // 3. After CI canonical writer promotion, CiPolicyApproved access is permitted on the same action_key.
+        assert_eq!(
+            coord
+                .evaluate_trust_tier_access(&action_key, TrustEvidenceTier::CiPolicyApproved)
+                .unwrap(),
+            TrustAccessDecision::Permitted {
+                observed_tier: TrustEvidenceTier::CiPolicyApproved,
+                required_tier: TrustEvidenceTier::CiPolicyApproved,
+            }
+        );
+
+        // 4. Developer pull (`PullRebaseMerge`) referencing `commit-ci-pushed-1` locates the CI prewarm state.
+        let pull_receipt = coord
+            .handle_git_prewarm_event(GitPrewarmEvent {
+                event_id: "evt-dev-pull-1".to_owned(),
+                kind: GitPrewarmEventKind::PullRebaseMerge,
+                head_commit_oid: "commit-ci-pushed-1".to_owned(),
+                parent_commit_oids: vec!["commit-ci-pushed-1".to_owned()],
+                worktree_id: "wt-dev".to_owned(),
+                lockfile_digest: rabs_key::typed_digest::compute("rabs.lockfile.v1", b"lock"),
+                toolchain_digest: rabs_key::typed_digest::compute("rabs.toolchain.v1", b"tc"),
+                dependency_critical_path: Vec::new(),
+                workspace_critical_path: Vec::new(),
+                canonical_test_subset: Vec::new(),
+                likely_workers: Vec::new(),
+                operation_base_id: 900,
+                now_unix_micros: 50_000,
+                clock_epoch: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            pull_receipt.nearest_ancestor_commit_oid.as_deref(),
+            Some("commit-ci-pushed-1")
+        );
+    }
+
+    #[test]
+    fn g005_q005_live_coord_promote_and_cancel_subscriber_drains_and_tombstones_last_interest() {
+        let (_state, coord) = submission_coordinator();
+        let coord = Arc::new(coord);
+        let (_live, source, manifest, descriptor) = source_fixture();
+        let worker = worker_offer(1, 0x101);
+        coord.admit_worker_session(&worker).unwrap();
+
+        let edge = coord.edge_subscriber();
+        let sub1 = edge
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(701, SubscriberKind::Speculative, 120),
+                1_000,
+                0,
+            )
+            .unwrap();
+        assert!(sub1.actor_created);
+        let key = sub1.action_key.clone();
+
+        // Promote speculative subscriber in place to Foreground without creating a new actor.
+        assert_eq!(
+            edge.promote_subscriber(&key, BuildOperationId(701), Some(80_000))
+                .unwrap(),
+            PromoteReceipt::Promoted
+        );
+
+        // Attach a second subscriber to the same action.
+        let sub2 = edge
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(702, SubscriberKind::ForegroundAgent, 210),
+                1_020,
+                0,
+            )
+            .unwrap();
+        assert!(!sub2.actor_created);
+
+        // Claim and begin dispatch on the worker.
+        let mut dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let _authority = dispatch.begin(&worker, 60_000).unwrap().clone();
+
+        // Cancel subscriber 701; subscriber 702 keeps the action and attempt alive.
+        assert_eq!(
+            edge.cancel_subscriber(&key, BuildOperationId(701)).unwrap(),
+            CancelReceipt::SharedWorkContinues { retained: 1 }
+        );
+        let actor_mid = coord.submitted_actor(&key).unwrap().unwrap();
+        assert!(actor_mid.active_generation().is_some());
+
+        // Cancel the last subscriber 702; active generation drains and is tombstoned in the store.
+        assert_eq!(
+            edge.cancel_subscriber(&key, BuildOperationId(702)).unwrap(),
+            CancelReceipt::LastInterestCancelledGeneration
+        );
+        let actor_after = coord.submitted_actor(&key).unwrap().unwrap();
+        assert!(actor_after.active_generation().is_none());
+        assert_eq!(
+            actor_after.slot(),
+            rabs_action::state_machines::PublicationSlotState::Absent
         );
     }
 }

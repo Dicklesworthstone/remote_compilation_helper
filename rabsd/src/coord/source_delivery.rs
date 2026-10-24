@@ -11,7 +11,11 @@ mod toolchain;
 
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
-use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, CargoHomeProjection};
+use rabs_sandbox::cargo_home::{
+    CARGO_HOME_SOURCE_VERSION, CargoHomeProjection, ISOLATED_CARGO_HOME_SOURCE_VERSION,
+    ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION,
+};
+use rabs_sandbox::generated_source::GeneratedSource;
 #[cfg(all(test, unix))]
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
@@ -78,7 +82,7 @@ fn manifest_value(manifest: &SourceManifest) -> Value {
         })).collect::<Vec<_>>()})
 }
 
-/// Decode only JSON shape; the worker shares the sandbox's registry-only
+/// Decode only JSON shape; the worker shares the sandbox's versioned cache
 /// projection policy. The original field remains unchanged in the saved request
 /// and its fingerprint. This validates intent, not Cargo resolution provenance.
 fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result<()> {
@@ -87,13 +91,21 @@ fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result
     };
     require(
         home.as_object().is_some_and(|object| object.len() == 2)
-            && home["version"] == CARGO_HOME_SOURCE_VERSION,
+            && (home["version"] == CARGO_HOME_SOURCE_VERSION
+                || home["version"] == ISOLATED_CARGO_HOME_SOURCE_VERSION
+                || home["version"] == ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION),
         "cargo_home requires a supported version and prefix",
     )?;
     let prefix = home["prefix"]
         .as_str()
         .ok_or_else(|| invalid("cargo_home prefix must be a string"))?;
-    CargoHomeProjection::new(prefix, manifest)?;
+    CargoHomeProjection::for_version(
+        home["version"]
+            .as_str()
+            .ok_or_else(|| invalid("cargo_home version must be a string"))?,
+        prefix,
+        manifest,
+    )?;
     Ok(())
 }
 
@@ -167,7 +179,7 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
 /// That mode may run compiler probes, never builds. Explicit vendor selection
 /// adds checked crates.io and locked Git directory sources. Other Cargo config
 /// and symlinks refuse; manifests and source replacements are not rewritten.
-/// Optional cargo_home selects a registry-only prefix in an explicitly selected
+/// Optional cargo_home selects an admitted cache prefix in an explicitly selected
 /// manifest; its version/prefix is preserved for worker-side private Cargo-home replay.
 ///
 /// The directory contains source/ and request.json. All selected source files
@@ -190,6 +202,40 @@ pub fn prepare_source_bundle(
     source_root: &Path,
     specification: &Value,
     destination: &Path,
+) -> io::Result<Value> {
+    prepare_source_bundle_inner(source_root, specification, destination, false)
+}
+
+/// Capture immutable inputs for a daemon job whose worker request ID is not yet
+/// allocated. The saved request remains explicit LOCAL allocation intent and is
+/// rejected by every execution-wire validator. Only the daemon's exclusive
+/// claimed owner may bind an actual ID, immediately before authenticated dispatch.
+///
+/// # Errors
+/// The same capture/placement errors as [`prepare_source_bundle`], or any
+/// specification that does not request exactly `request_id: "allocate"`.
+pub fn prepare_source_template(
+    source_root: &Path,
+    specification: &Value,
+    destination: &Path,
+) -> io::Result<Value> {
+    require(
+        specification["kind"] == "canonical-exec"
+            && specification["request_id"].as_str() == Some("allocate"),
+        "daemon source templates require explicit request allocation intent",
+    )?;
+    let mut probe = specification.clone();
+    // This zero exists only during the ordinary source/request validators. It
+    // is never written to request.json, returned as an identity, or dispatched.
+    probe["request_id"] = json!(0);
+    prepare_source_bundle_inner(source_root, &probe, destination, true)
+}
+
+fn prepare_source_bundle_inner(
+    source_root: &Path,
+    specification: &Value,
+    destination: &Path,
+    allocation_intent: bool,
 ) -> io::Result<Value> {
     let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
     require(
@@ -256,6 +302,26 @@ pub fn prepare_source_bundle(
         })
         .transpose()?;
     let mut upload = inputs.capture()?;
+    if let Some(context) = specification.get("dependency_context") {
+        require(
+            context["version"] == rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION,
+            "unsupported dependency execution context for source preparation",
+        )?;
+        require(
+            context["artifact_roots"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "dependency artifacts require the live keyed artifact observer",
+        )?;
+        require(
+            context.get("generated_root").is_none_or(Value::is_null),
+            "generated dependency inputs require the live Cargo output observer",
+        )?;
+        // Operator-prepared dependency leaves use the same package prefix as
+        // live Cargo actions. Arbitrary operator paths cannot stand in for the
+        // live observer's retained and keyed dependency artifact closure.
+        upload = upload.with_dependency_artifacts(Vec::new())?;
+    }
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -285,6 +351,24 @@ pub fn prepare_source_bundle(
     fields.remove("source_roots");
     fields.remove("cargo_source");
     fields.remove("toolchain_source");
+    if let Some(mut home) = inputs.cargo_home_projection() {
+        let prefix = home["prefix"]
+            .as_str()
+            .ok_or_else(|| invalid("prepared Cargo home prefix missing"))?;
+        let git_prefix = format!("{prefix}/git/db/");
+        if upload
+            .manifest
+            .files()
+            .iter()
+            .any(|file| file.path.starts_with(&git_prefix))
+        {
+            // Negotiate the stronger shape only when the captured bundle
+            // actually contains reconstructed Git objects. Registry-only
+            // requests retain their existing exact saved-operation version.
+            home["version"] = json!(ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION);
+        }
+        fields.insert("cargo_home".to_owned(), home);
+    }
     if let Some(prepared) = &toolchain {
         fields.remove("toolchain_backing");
         fields.insert(
@@ -304,6 +388,9 @@ pub fn prepare_source_bundle(
         upload = upload.with_toolchain(toolchain, &request)?;
     }
     upload.validate_request(&request)?;
+    if allocation_intent {
+        request["request_id"] = json!("allocate");
+    }
     let request_bytes = serde_json::to_vec(&request)?;
     let source = destination.join("source");
     let mut receiver = SourceReceiver::create(&source, upload.manifest.clone())?;
@@ -348,7 +435,7 @@ pub fn prepare_source_bundle(
     File::open(&destination)?.sync_all()?;
     File::open(&parent)?.sync_all()?;
     Ok(
-        json!({"kind":"prepared-source-bundle", "directory":destination,
+        json!({"kind":if allocation_intent {"prepared-source-template"} else {"prepared-source-bundle"}, "directory":destination,
         "source_root":source, "request_path":request_path, "request_id":request["request_id"],
         "request_sha256":hex(&Sha256::digest(&request_bytes)),
         "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
@@ -366,6 +453,14 @@ enum SourceLayout {
     Root(String),
     /// Each first path component names one root in the SAME captured image.
     Closure,
+    /// Original package plus separately verified compiler dependency artifacts.
+    /// Every retained byte belongs to the same source-transfer manifest.
+    Dependency {
+        root: String,
+        generated: Option<GeneratedSource>,
+        artifacts: Arc<std::collections::BTreeMap<String, Vec<u8>>>,
+        artifacts_selected: bool,
+    },
 }
 
 fn valid_closure_root(root: &str) -> bool {
@@ -487,12 +582,187 @@ impl SourceUpload {
         })
     }
 
+    /// Bundle one captured package with exact dependency artifacts retained by
+    /// the live action's filesystem observer. The caller must verify these bytes
+    /// against its keyed candidate inventory before selecting them and keep the
+    /// original-input witnesses through execution and installation.
+    ///
+    /// Package members are rooted at package/; dependency paths are exactly
+    /// dependencies/NNNN/basename. Both share the existing bounded, authenticated
+    /// source-files transfer, including its per-file reuse and seal verification.
+    /// This constructor never opens a mutable dependency path on the caller.
+    pub fn with_dependency_artifacts(
+        mut self,
+        artifacts: Vec<(String, Vec<u8>)>,
+    ) -> io::Result<Self> {
+        require(
+            self.toolchain.is_none(),
+            "dependency bundle must be selected before toolchain attachment",
+        )?;
+        let (root, generated, mut files) = match &self.layout {
+            SourceLayout::Root(root) => (
+                root.clone(),
+                None,
+                self.manifest
+                    .files()
+                    .iter()
+                    .cloned()
+                    .map(|mut file| {
+                        file.path = format!("package/{}", file.path);
+                        file
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            SourceLayout::Dependency {
+                root,
+                generated,
+                artifacts_selected: false,
+                ..
+            } => (
+                root.clone(),
+                generated.clone(),
+                self.manifest.files().to_vec(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "dependency artifacts require one unselected package bundle",
+                ));
+            }
+        };
+        require(
+            artifacts.len() <= MAX_SOURCE_FILES.saturating_sub(self.manifest.files().len()),
+            "dependency bundle exceeds aggregate file count",
+        )?;
+        let mut retained = std::collections::BTreeMap::new();
+        for (path, bytes) in artifacts {
+            let components: Vec<_> = path.split('/').collect();
+            require(
+                components.len() == 3
+                    && components[0] == "dependencies"
+                    && components[1].len() == 4
+                    && components[1].bytes().all(|byte| byte.is_ascii_digit())
+                    && components[1].parse::<usize>().is_ok_and(|index| {
+                        index < rabs_sandbox::dependency_context::MAX_DEPENDENCY_DIRS
+                    })
+                    && components[2].starts_with("lib")
+                    && (components[2].ends_with(".rmeta") || components[2].ends_with(".rlib")),
+                "dependency bundle contains an unsupported artifact path",
+            )?;
+            let file = SourceFile {
+                path: path.clone(),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(&bytes).into(),
+                executable: false,
+            };
+            require(
+                retained.insert(path, bytes).is_none(),
+                "dependency bundle repeats an artifact path",
+            )?;
+            files.push(file);
+        }
+        self.manifest = SourceManifest::new(files)?;
+        self.layout = SourceLayout::Dependency {
+            root,
+            generated,
+            artifacts: Arc::new(retained),
+            artifacts_selected: true,
+        };
+        Ok(self)
+    }
+
+    /// Include the complete captured Cargo OUT_DIR tree without reopening it.
+    /// The generated root and package must share the exact coherent snapshot
+    /// owner. Selection may precede or follow dependency artifacts, but may not
+    /// be repeated or occur after toolchain attachment. Empty generated roots
+    /// remain explicit selections in the dependency context, without fake files.
+    pub fn with_generated_snapshot(
+        mut self,
+        image: Arc<SealedSourceSnapshot>,
+        root: &str,
+        paths: &[String],
+    ) -> io::Result<Self> {
+        require(
+            self.toolchain.is_none(),
+            "generated source must be selected before toolchain attachment",
+        )?;
+        let generated = GeneratedSource::from_snapshot(image, root, paths)?;
+        require(
+            generated.shares_snapshot(&self.image),
+            "package and generated source must share one coherent snapshot",
+        )?;
+        let (package, artifacts, artifacts_selected, mut files) = match &self.layout {
+            SourceLayout::Root(package) => (
+                package.clone(),
+                Arc::new(std::collections::BTreeMap::new()),
+                false,
+                self.manifest
+                    .files()
+                    .iter()
+                    .cloned()
+                    .map(|mut file| {
+                        file.path = format!("package/{}", file.path);
+                        file
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            SourceLayout::Dependency {
+                root: package,
+                generated: None,
+                artifacts,
+                artifacts_selected,
+            } => (
+                package.clone(),
+                Arc::clone(artifacts),
+                *artifacts_selected,
+                self.manifest.files().to_vec(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "generated source requires one unselected package bundle",
+                ));
+            }
+        };
+        require(
+            generated.files().len() <= MAX_SOURCE_FILES.saturating_sub(files.len()),
+            "generated bundle exceeds aggregate file count",
+        )?;
+        files.extend_from_slice(generated.files());
+        self.manifest = SourceManifest::new(files)?;
+        self.layout = SourceLayout::Dependency {
+            root: package,
+            generated: Some(generated),
+            artifacts,
+            artifacts_selected,
+        };
+        Ok(self)
+    }
+
     fn file_bytes(&self, path: &str) -> io::Result<&[u8]> {
         let (root, relative) = match &self.layout {
             SourceLayout::Root(root) => (root.as_str(), path),
             SourceLayout::Closure => path
                 .split_once('/')
                 .ok_or_else(|| invalid("source closure member lacks its root"))?,
+            SourceLayout::Dependency {
+                root,
+                generated,
+                artifacts,
+                ..
+            } => {
+                if let Some(relative) = path.strip_prefix("package/") {
+                    (root.as_str(), relative)
+                } else if path.starts_with("generated/") {
+                    return generated
+                        .as_ref()
+                        .and_then(|source| source.file_bytes(path))
+                        .ok_or_else(|| invalid("retained generated source missing"));
+                } else {
+                    return artifacts
+                        .get(path)
+                        .map(Vec::as_slice)
+                        .ok_or_else(|| invalid("retained dependency artifact missing"));
+                }
+            }
         };
         self.image
             .file_bytes(root, relative)
@@ -532,6 +802,24 @@ impl SourceUpload {
         )?;
         self.validate_source_request(request)?;
         self.toolchain = Some(toolchain::ToolchainUpload::new(prepared, request)?);
+        self.validate_request(request)?;
+        Ok(self)
+    }
+
+    /// Reuse one retained compiler image across dependency actions. The owner
+    /// keeps its private backing alive through every upload. Range reads remain
+    /// anchored to the captured inventory and the worker verifies the seal.
+    pub fn with_shared_toolchain(
+        mut self,
+        prepared: Arc<PreparedToolchain>,
+        request: &Value,
+    ) -> io::Result<Self> {
+        require(
+            self.toolchain.is_none(),
+            "toolchain upload already attached",
+        )?;
+        self.validate_source_request(request)?;
+        self.toolchain = Some(toolchain::ToolchainUpload::from_shared(prepared, request)?);
         self.validate_request(request)?;
         Ok(self)
     }
@@ -605,6 +893,12 @@ impl SourceUpload {
             request_manifest(request)?.as_ref() == Some(&self.manifest),
             "captured source differs from the saved execution manifest",
         )?;
+        if let SourceLayout::Dependency { generated, .. } = &self.layout {
+            require(
+                generated.is_some() == request["dependency_context"]["generated_root"].is_string(),
+                "generated source selection differs from the execution context",
+            )?;
+        }
         let begin = self.begin_frame(request);
         require(
             serde_json::to_vec(&begin)?.len() <= MAX_JSON_RECORD,
@@ -686,12 +980,16 @@ impl SourceUpload {
         let missing = self.missing_files(&reply)?;
         // Four bounded chunks fit below the worker's eight-frame / 2 MiB
         // deferred-source limit, including maximum encoded paths and hashes.
-        // Batch across files too: tiny dependency inputs must not each cost a
-        // full round trip. Retain only expected acknowledgment descriptors,
-        // never another copy of the already sealed source payload.
-        let mut outstanding = Vec::with_capacity(SOURCE_WINDOW);
-        let acknowledge_batch = |peer: &mut P, outstanding: &mut Vec<(&str, u64)>| {
-            for (path, next) in outstanding.drain(..) {
+        // Keep the window full across files: one validated acknowledgment
+        // releases one slot, not the whole batch. Retain only exact ACK debts,
+        // never another copy of the already sealed source payload. A failure
+        // returns from this operation immediately, without retrying its tail.
+        let mut outstanding = std::collections::VecDeque::with_capacity(SOURCE_WINDOW);
+        let acknowledge_one =
+            |peer: &mut P, outstanding: &mut std::collections::VecDeque<(&str, u64)>| {
+                let &(path, next) = outstanding
+                    .front()
+                    .ok_or_else(|| invalid("source upload has no pending acknowledgment"))?;
                 let reply = peer.receive()?;
                 check(&reply, "source-chunk-accepted")?;
                 require(
@@ -699,9 +997,11 @@ impl SourceUpload {
                         && reply["next_offset"].as_u64() == Some(next),
                     "source acknowledgment does not cover the transmitted range",
                 )?;
-            }
-            Ok::<(), io::Error>(())
-        };
+                // An invalid or lost ACK must not return credit or permit
+                // another source chunk. Keep the debt through validation.
+                let _ = outstanding.pop_front();
+                Ok::<(), io::Error>(())
+            };
         for file in self.manifest.files() {
             if missing
                 .as_ref()
@@ -718,16 +1018,18 @@ impl SourceUpload {
                     "path":file.path, "offset":offset, "data_hex":hex(chunk),
                     "chunk_sha256":hex(&Sha256::digest(chunk))}),
                 )?;
-                outstanding.push((file.path.as_str(), next));
+                outstanding.push_back((file.path.as_str(), next));
                 if outstanding.len() == SOURCE_WINDOW {
-                    acknowledge_batch(peer, &mut outstanding)?;
+                    acknowledge_one(peer, &mut outstanding)?;
                 }
             }
         }
         // No seal, ownership transfer or execution can precede acknowledgment
-        // of EVERY transmitted chunk, including the final partial batch. Any
+        // of EVERY transmitted chunk, including the remaining window. Any
         // failed write, malformed reply or deadline aborts without retrying.
-        acknowledge_batch(peer, &mut outstanding)?;
+        while !outstanding.is_empty() {
+            acknowledge_one(peer, &mut outstanding)?;
+        }
         // Even a completely warm projection needs this exact final seal. A
         // missing-file hint by itself grants neither execution nor publication.
         peer.send(&json!({"kind":"source-seal", "request_id":id, "manifest_sha256":identity}))?;
@@ -776,6 +1078,12 @@ impl<'a, P: WorkerPeer + ?Sized> SourcePeer<'a, P> {
 }
 
 impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.inner.checkpoint()
+    }
+    fn artifact_byte_cache(&self) -> Option<&super::worker_delivery::ArtifactByteCache> {
+        self.inner.artifact_byte_cache()
+    }
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         self.inner.send(frame)
     }
@@ -800,6 +1108,13 @@ mod tests {
 
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
+
+    #[test]
+    fn unresolved_cargo_plans_are_refused_before_execution_or_resume() {
+        let request = json!({"cargo_source":{"manifest":"Cargo.toml"}});
+        let error = request_manifest(&request).unwrap_err();
+        assert!(error.to_string().contains("--worker-prepare"));
+    }
 
     fn fixture(root: &std::path::Path) -> (SourceUpload, Value, Vec<u8>) {
         std::fs::create_dir(root.join("src")).unwrap();
@@ -826,6 +1141,336 @@ mod tests {
         (upload, request, bytes)
     }
 
+    #[test]
+    fn dependency_bundle_transfers_retained_package_and_exact_metadata_closure() {
+        let root = tempfile::tempdir().unwrap();
+        let (package, mut request, source_bytes) = fixture(root.path());
+        let metadata: Vec<_> = (0..MAX_SOURCE_CHUNK + 29)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let archive = b"!<arch>\nexact archive input".to_vec();
+        let upload = package
+            .clone()
+            .with_dependency_artifacts(vec![
+                ("dependencies/0000/libdirect.rmeta".into(), metadata.clone()),
+                (
+                    "dependencies/0002/libtransitive.rlib".into(),
+                    archive.clone(),
+                ),
+            ])
+            .unwrap();
+        request["source_manifest"] = upload.wire_manifest();
+        upload.validate_request(&request).unwrap();
+        // Later writes cannot change already selected source or artifact bytes.
+        std::fs::write(root.path().join("src/lib.rs"), b"changed after capture").unwrap();
+        let mut peer = ReceiverPeer::new();
+        peer.prefilled
+            .insert("package/src/lib.rs".into(), source_bytes.clone());
+        peer.prefilled.insert(
+            "dependencies/0002/libtransitive.rlib".into(),
+            archive.clone(),
+        );
+        peer.missing = Some(json!(["dependencies/0000/libdirect.rmeta"]));
+        upload.transmit(&mut peer, &request, false).unwrap();
+        let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
+        assert_eq!(
+            std::fs::read(received.join("package/src/lib.rs")).unwrap(),
+            source_bytes
+        );
+        assert_eq!(std::fs::read(received.join("package/empty")).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(received.join("dependencies/0000/libdirect.rmeta")).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            std::fs::read(received.join("dependencies/0002/libtransitive.rlib")).unwrap(),
+            archive
+        );
+        assert!(!received.join("package/not-selected.private").exists());
+        let chunks: Vec<_> = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .collect();
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|frame| { frame["path"] == "dependencies/0000/libdirect.rmeta" })
+        );
+        assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
+        assert!(
+            peer.sent
+                .iter()
+                .all(|frame| frame["kind"] != "canonical-exec")
+        );
+        let changed = package
+            .with_dependency_artifacts(vec![
+                (
+                    "dependencies/0000/libdirect.rmeta".into(),
+                    b"other metadata".to_vec(),
+                ),
+                ("dependencies/0002/libtransitive.rlib".into(), archive),
+            ])
+            .unwrap();
+        assert_ne!(upload.manifest.digest(), changed.manifest.digest());
+        assert!(changed.validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn dependency_bundle_refuses_unmodeled_members_and_duplicate_names() {
+        let root = tempfile::tempdir().unwrap();
+        let (package, _, _) = fixture(root.path());
+        for path in [
+            "package/libdep.rmeta",
+            "dependencies/0000/libproc.so",
+            "dependencies/0000/libnative.a",
+            "dependencies/0000/nested/libdep.rmeta",
+            "dependencies/../libdep.rmeta",
+            "dependencies/0/libdep.rmeta",
+            "dependencies/0064/libdep.rmeta",
+        ] {
+            assert!(
+                package
+                    .clone()
+                    .with_dependency_artifacts(vec![(path.into(), b"data".to_vec())])
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            package
+                .clone()
+                .with_dependency_artifacts(vec![
+                    ("dependencies/0000/libdep.rmeta".into(), b"first".to_vec()),
+                    ("dependencies/0000/libdep.rmeta".into(), b"second".to_vec()),
+                ])
+                .is_err()
+        );
+        let leaf = package.with_dependency_artifacts(Vec::new()).unwrap();
+        assert!(
+            leaf.manifest
+                .files()
+                .iter()
+                .all(|file| file.path.starts_with("package/"))
+        );
+        assert!(leaf.with_dependency_artifacts(Vec::new()).is_err());
+    }
+
+    fn generated_fixture(root: &Path, populated: bool) -> Arc<SealedSourceSnapshot> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(root.join("package/src")).unwrap();
+        fs::create_dir_all(root.join("out")).unwrap();
+        fs::write(
+            root.join("package/src/lib.rs"),
+            b"include!(concat!(env!(\"OUT_DIR\"), \"/nested/generated.rs\"));\n",
+        )
+        .unwrap();
+        if populated {
+            fs::create_dir(root.join("out/nested")).unwrap();
+            fs::write(
+                root.join("out/nested/generated.rs"),
+                b"pub const GENERATED: u64 = 42;\n",
+            )
+            .unwrap();
+            let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK + 13)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            fs::write(root.join("out/data.bin"), bytes).unwrap();
+            fs::set_permissions(root.join("out/data.bin"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        Arc::new(
+            capture_sealed_source(
+                &[
+                    ("package".into(), root.join("package")),
+                    ("generated".into(), root.join("out")),
+                ],
+                false,
+                2,
+                300_000,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn generated_dependency_bundle_transfers_one_retained_snapshot_and_resumes_exactly() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let image = generated_fixture(root.path(), true);
+        let package =
+            SourceUpload::from_snapshot(Arc::clone(&image), "package", &["src/lib.rs".into()])
+                .unwrap();
+        let paths = ["nested/generated.rs".into(), "data.bin".into()];
+        let artifacts = vec![(
+            "dependencies/0000/libdep.rmeta".into(),
+            b"retained dependency metadata".to_vec(),
+        )];
+        let upload = package
+            .clone()
+            .with_generated_snapshot(Arc::clone(&image), "generated", &paths)
+            .unwrap()
+            .with_dependency_artifacts(artifacts.clone())
+            .unwrap();
+        let reverse_order = package
+            .with_dependency_artifacts(artifacts)
+            .unwrap()
+            .with_generated_snapshot(Arc::clone(&image), "generated", &paths)
+            .unwrap();
+        assert_eq!(upload.wire_manifest(), reverse_order.wire_manifest());
+        let request = json!({"kind":"canonical-exec", "request_id":7,
+            "program":"fixture", "toolchain_backing":"/tc",
+            "dependency_context":{"generated_root":"/cargo/build/pkg/out"},
+            "source_manifest":upload.wire_manifest()});
+        upload.validate_request(&request).unwrap();
+        let mut missing_context = request.clone();
+        missing_context["dependency_context"]["generated_root"] = Value::Null;
+        assert!(upload.validate_request(&missing_context).is_err());
+
+        fs::write(root.path().join("package/src/lib.rs"), b"changed package").unwrap();
+        fs::write(root.path().join("out/data.bin"), b"changed generated bytes").unwrap();
+        fs::write(root.path().join("out/new.rs"), b"not in captured tree").unwrap();
+        let mut peer = ReceiverPeer::new();
+        for file in upload.manifest.files() {
+            if file.path != "generated/data.bin" {
+                peer.prefilled.insert(
+                    file.path.clone(),
+                    upload.file_bytes(&file.path).unwrap().to_vec(),
+                );
+            }
+        }
+        peer.missing = Some(json!(["generated/data.bin"]));
+        upload.transmit(&mut peer, &request, false).unwrap();
+        let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
+        for file in upload.manifest.files() {
+            assert_eq!(
+                fs::read(received.join(&file.path)).unwrap(),
+                upload.file_bytes(&file.path).unwrap()
+            );
+            assert_eq!(
+                fs::metadata(received.join(&file.path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111
+                    != 0,
+                file.executable
+            );
+        }
+        assert!(!received.join("generated/new.rs").exists());
+        let chunks: Vec<_> = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .collect();
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|frame| frame["path"] == "generated/data.bin")
+        );
+        assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
+        let recaptured = Arc::new(
+            capture_sealed_source(
+                &[("saved".into(), received.to_path_buf())],
+                false,
+                2,
+                300_000,
+            )
+            .unwrap(),
+        );
+        let resumed = SourceUpload::for_request(recaptured, "saved", &request).unwrap();
+        assert_eq!(resumed.wire_manifest(), upload.wire_manifest());
+        for file in upload.manifest.files() {
+            assert_eq!(
+                resumed.file_bytes(&file.path).unwrap(),
+                upload.file_bytes(&file.path).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bundle_refuses_incoherent_or_repeated_source_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let image = generated_fixture(root.path(), true);
+        let package =
+            SourceUpload::from_snapshot(Arc::clone(&image), "package", &["src/lib.rs".into()])
+                .unwrap();
+        let paths = ["data.bin".into(), "nested/generated.rs".into()];
+        let separate = Arc::new(
+            capture_sealed_source(
+                &[("generated".into(), root.path().join("out"))],
+                false,
+                2,
+                300_000,
+            )
+            .unwrap(),
+        );
+        assert!(
+            package
+                .clone()
+                .with_generated_snapshot(separate, "generated", &paths)
+                .is_err()
+        );
+        assert!(
+            package
+                .clone()
+                .with_generated_snapshot(Arc::clone(&image), "missing", &paths)
+                .is_err()
+        );
+        assert!(
+            package
+                .clone()
+                .with_generated_snapshot(Arc::clone(&image), "generated", &paths[..1])
+                .is_err()
+        );
+        let selected = package
+            .with_generated_snapshot(Arc::clone(&image), "generated", &paths)
+            .unwrap();
+        assert!(
+            selected
+                .clone()
+                .with_generated_snapshot(image, "generated", &paths)
+                .is_err()
+        );
+        let selected = selected.with_dependency_artifacts(Vec::new()).unwrap();
+        assert!(selected.with_dependency_artifacts(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn empty_generated_bundle_keeps_mount_intent_without_inventing_manifest_files() {
+        let root = tempfile::tempdir().unwrap();
+        let image = generated_fixture(root.path(), false);
+        let package =
+            SourceUpload::from_snapshot(Arc::clone(&image), "package", &["src/lib.rs".into()])
+                .unwrap();
+        let plain = package
+            .clone()
+            .with_dependency_artifacts(Vec::new())
+            .unwrap();
+        let generated = package
+            .with_generated_snapshot(image, "generated", &[])
+            .unwrap()
+            .with_dependency_artifacts(Vec::new())
+            .unwrap();
+        assert_eq!(plain.wire_manifest(), generated.wire_manifest());
+        assert_eq!(generated.manifest.files().len(), 1);
+        let mut request = json!({"kind":"canonical-exec", "request_id":7,
+            "program":"fixture", "toolchain_backing":"/tc",
+            "source_manifest":generated.wire_manifest()});
+        plain.validate_request(&request).unwrap();
+        assert!(generated.validate_request(&request).is_err());
+        request["dependency_context"] = json!({"generated_root":"/cargo/build/pkg/out"});
+        generated.validate_request(&request).unwrap();
+        assert!(plain.validate_request(&request).is_err());
+        let mut peer = ReceiverPeer::new();
+        generated.transmit(&mut peer, &request, false).unwrap();
+        let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
+        assert!(received.join("package/src/lib.rs").is_file());
+        assert!(!received.join("generated").exists());
+    }
+
     struct ReceiverPeer {
         owner: tempfile::TempDir,
         receiver: Option<SourceReceiver>,
@@ -839,7 +1484,7 @@ mod tests {
     impl ReceiverPeer {
         fn new() -> Self {
             Self {
-                owner: tempfile::tempdir().unwrap(),
+                owner: crate::test_util::private_tempdir(),
                 receiver: None,
                 replies: VecDeque::new(),
                 sent: Vec::new(),
@@ -1152,6 +1797,43 @@ mod tests {
             "toolchain_backing":"/opt/rust-toolchain", "args":["src/lib.rs", "--crate-type", "lib"],
             "source_files":["src/lib.rs", "empty"], "timeout_ms":120000,
             "extension":{"keep":"exactly"}})
+    }
+
+    #[test]
+    fn daemon_template_retains_allocation_intent_and_exact_inputs_without_becoming_a_wire_request()
+    {
+        let checkout = tempfile::tempdir().unwrap();
+        let (_, _, bytes) = fixture(checkout.path());
+        let owner = tempfile::tempdir().unwrap();
+        let mut spec = preparation_specification();
+        spec["request_id"] = json!("allocate");
+        let directory = owner.path().join("template");
+        assert!(prepare_source_bundle(checkout.path(), &spec, &directory).is_err());
+        assert!(!directory.exists());
+        let prepared = prepare_source_template(checkout.path(), &spec, &directory).unwrap();
+        assert_eq!(prepared["kind"], "prepared-source-template");
+        assert_eq!(prepared["request_id"], "allocate");
+        let request_bytes = fs::read(directory.join("request.json")).unwrap();
+        let request: Value = serde_json::from_slice(&request_bytes).unwrap();
+        assert_eq!(request["request_id"], "allocate");
+        assert_eq!(request["args"], spec["args"]);
+        assert_eq!(request["extension"], spec["extension"]);
+        assert_eq!(
+            fs::read(directory.join("source/src/lib.rs")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            prepared["request_sha256"],
+            hex(&Sha256::digest(&request_bytes))
+        );
+        assert!(validate_request(&request).is_err());
+        let mut assigned = request;
+        assigned["request_id"] = json!(8001);
+        validate_request(&assigned).unwrap();
+        let next = owner.path().join("numeric-is-not-an-intent");
+        spec["request_id"] = json!(8001);
+        assert!(prepare_source_template(checkout.path(), &spec, &next).is_err());
+        assert!(!next.exists());
     }
 
     #[test]

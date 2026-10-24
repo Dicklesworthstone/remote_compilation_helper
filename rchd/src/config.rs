@@ -29,14 +29,23 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
 
     /// Health check interval in seconds.
+    ///
+    /// Not read: health probing runs on `HealthConfig`'s own schedule, so
+    /// setting this in daemon.toml changes nothing.
     #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
 
     /// Worker timeout before marking as unreachable.
+    ///
+    /// Not read: reachability comes from the circuit breaker and SSH
+    /// timeouts in config.toml, so setting this changes nothing.
     #[serde(default = "default_worker_timeout")]
     pub worker_timeout_secs: u64,
 
     /// Maximum concurrent jobs per worker slot.
+    ///
+    /// Not read: admission is one reservation per slot, so setting this
+    /// changes nothing.
     #[serde(default = "default_max_jobs_per_slot")]
     pub max_jobs_per_slot: u32,
 
@@ -53,12 +62,21 @@ pub struct DaemonConfig {
     pub cache_cleanup: CacheCleanupConfig,
 
     /// Stale per-job `.rch-target-*` directory reaper settings.
+    ///
+    /// Ignored since bd-28xs5: the reaper is configured from
+    /// `[remediation.pooled_target]` in config.toml (plus env overrides).
     #[serde(default)]
     pub stale_target_reap: StaleTargetReapConfig,
 
     /// Build queue settings.
     #[serde(default)]
     pub queue: QueueConfig,
+
+    /// Builds of one project a worker may run at once, each in its own mirror
+    /// (`<root>.rch-lane-<k>`), keyed by worker id (bd-sgvod). Unlisted
+    /// workers keep one lane. Each lane costs a full extra mirror on disk.
+    #[serde(default)]
+    pub project_lanes: std::collections::HashMap<String, u32>,
 }
 
 /// Configuration for build queueing when all workers are busy.
@@ -75,8 +93,10 @@ pub struct QueueConfig {
     #[serde(default = "default_max_queue_depth")]
     pub max_depth: usize,
 
-    /// Maximum time a build can wait in queue (seconds) before timing out.
-    /// Timed-out builds fall back to local execution.
+    /// Maximum time a compilation can wait in queue (seconds) before timing
+    /// out; a timed-out build falls back to local, or is refused where remote
+    /// is required. An `rch exec --job` request never falls back, so its own
+    /// longer wait is honoured up to 24 h (bd-decdd).
     #[serde(default = "default_queue_timeout")]
     pub timeout_secs: u64,
 }
@@ -111,6 +131,7 @@ impl Default for DaemonConfig {
             cache_cleanup: CacheCleanupConfig::default(),
             stale_target_reap: StaleTargetReapConfig::default(),
             queue: QueueConfig::default(),
+            project_lanes: std::collections::HashMap::new(),
         }
     }
 }
@@ -732,6 +753,16 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
     use tempfile::TempDir;
+
+    #[test]
+    fn daemon_config_reads_per_worker_project_lanes() {
+        // bd-sgvod
+        let config: DaemonConfig = toml::from_str("[project_lanes]\nhz3 = 3\nhz4 = 2\n").unwrap();
+        assert_eq!(config.project_lanes.get("hz3"), Some(&3));
+        assert_eq!(config.project_lanes.get("hz4"), Some(&2));
+        let defaults: DaemonConfig = toml::from_str("").unwrap();
+        assert!(defaults.project_lanes.is_empty());
+    }
 
     fn init_test_logging() {
         let _ = tracing_subscriber::fmt()

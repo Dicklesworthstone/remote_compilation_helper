@@ -15,6 +15,529 @@ not a certificate. The receipt explicitly records `transport_authenticated:false
 and `publication_authorized:false`. Failed TLS configurations must not be cleared
 or downgraded to make a fleet connection use this operator lane.
 
+## Run the live Cargo dependency worker
+
+The normal Cargo wrapper can send an eligible dependency compilation directly
+to an authenticated worker, publish its verified result, and install that
+current result after the wrapper acknowledges the exact output manifest. Build
+matching binaries from this checkout:
+
+```sh
+cargo build -p rabsd -p rabs-wkr -p rabs-wrap
+```
+
+Provision a mutual-TLS CA, a coordinator certificate valid for the worker's
+configured server name, and a worker client certificate. Obtain the worker's
+SPKI SHA-256 from that trusted certificate:
+
+```sh
+openssl x509 -in /credentials/worker.pem -pubkey -noout |
+  openssl pkey -pubin -outform DER |
+  openssl dgst -sha256
+```
+
+Start the normal daemon with the following environment. Replace the private
+listen address, credential paths and pin with your deployment values; the pin
+is exactly 64 lowercase hexadecimal characters, without the OpenSSL label.
+Use this socket and state directory for the Cargo launcher too.
+
+```sh
+install -d -m 700 "$HOME/.cache/rabs-leaf"
+RABS_STATE_DIR="$HOME/.cache/rabs-leaf" \
+RABS_SOCKET_PATH="$HOME/.cache/rabs-leaf/rabs.sock" \
+RABS_LIVE_DEPENDENCY=1 \
+RABS_COORD_TLS_CA=/credentials/ca.pem \
+RABS_COORD_TLS_CERT=/credentials/coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/coordinator.key \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_SPKI_SHA256 \
+  ./target/debug/rabsd
+```
+
+On the worker host, run the matching worker continuously. The address must
+reach the coordinator's configured listener, and the TLS server name must
+match its certificate:
+
+```sh
+RABS_WORKER_TLS_CA=/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/credentials/worker.pem \
+RABS_WORKER_TLS_KEY=/credentials/worker.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-worker" \
+  ./target/debug/rabs-wkr \
+    --coordinator coordinator.example.internal:7092 --worker-id leaf-worker
+```
+
+The daemon binds this listener when an eligible wrapper request has accepted
+remote execution. Keep the worker's reconnect loop running without `--once`;
+there is no idle connection queue on the listener. Preserve its
+durable state across reconnects and restarts.
+
+For a systemd worker, the fleet deployment script can install those same
+identity and journal settings alongside the worker's TLS credentials:
+
+```sh
+RABS_WORKER_TLS_CA=/local/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/local/credentials/worker.pem \
+RABS_WORKER_TLS_KEY=/local/credentials/worker.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_ID=leaf-worker \
+RABS_WORKER_STATE_DIR=/var/lib/rabs/leaf-worker \
+  ./scripts/rabs_fleet_deploy.sh worker-ssh-alias \
+    coordinator.example.internal:7092 ./target/daemon-release/rabs-wkr
+```
+
+The three PEM paths are **local**; the state directory is on the **remote**
+worker. The worker ID must match `RABS_DEPENDENCY_WORKER_ID` above. After
+activation, the script prints the public certificate SPKI SHA-256 to use for
+`RABS_DEPENDENCY_WORKER_SPKI_SHA256`. Successful service startup does not prove
+that the coordinator has accepted a worker session.
+
+`RABS_WORKER_ID` and `RABS_WORKER_STATE_DIR` are optional. On a fresh install,
+omitting them preserves the worker's short-hostname identity and default
+durable state layout. During an upgrade, omitted values are copied from the
+active managed service while holding the deployment lock. Supplied values
+replace only their respective settings. IDs use 1–128 ASCII letters, digits,
+dots, underscores or hyphens and start with a letter or digit. The state path
+must be absolute, printable ASCII and at most 4096 characters; spaces and
+shell punctuation are transferred literally. Keep an existing worker's state
+path and identity stable. Changing its journal directory to retry a build
+abandons the history that prevents a completed or uncertain request from
+executing twice. Missing prior settings refuse an upgrade before replacing
+the binary or restarting the service.
+
+For canonical whole-Cargo jobs, managed deployments also accept
+`RABS_WORKER_TARGET_CACHE_BYTES` (0–8589934592) and
+`RABS_WORKER_TARGET_CACHE_EPOCH`. A positive byte limit enables private target
+reuse. A nonempty epoch additionally retains completed seeds across worker
+restarts on an unchanged host runtime. The epoch is an operator-managed label:
+stop the worker and change the label before updating host tools, libraries or
+other runtime inputs. An omitted setting preserves its active managed value
+during upgrades; explicit `0` bytes disables reuse, and an explicitly empty
+epoch selects process-only retention. See [Cargo target state](rabs-target-state.md)
+for limits, ownership, and the runtime stability requirement.
+
+In another coordinator-side terminal, run ordinary Cargo through the live
+wrapper. Repeat the same worker selection here so launcher readiness verifies
+that the attached daemon has the requested remote capability:
+
+```sh
+RABS_STATE_DIR="$HOME/.cache/rabs-leaf" \
+RABS_SOCKET_PATH="$HOME/.cache/rabs-leaf/rabs.sock" \
+RABS_LIVE_DEPENDENCY=1 \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_SPKI_SHA256 \
+CARGO_RABS_DAEMON="$PWD/target/debug/rabsd" \
+CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
+  ./scripts/cargo-rabs --rabs-no-start --rabs-require-daemon \
+    check --locked --manifest-path /absolute/project/Cargo.toml
+```
+
+The first eligible request starts a complete toolchain capture in the
+background. A waiting wrapper receives `remote-toolchain-pending` and retries
+the same invocation within its existing preparation deadline; it can then
+execute remotely on that first build. Preparation grants no execution or
+installation authority. Callers that disable waiting, exhaust their wait
+budget or encounter a capture failure retain the existing local path before
+remote acceptance. Later requests use the retained compiler and sysroot only
+while their complete source witness still matches. Worker execution also
+requires the measured kernel, CPU, external loader libraries, loader cache,
+loader symlink topology and filesystem profile to match the coordinator.
+Both hosts need the supported Linux isolation environment; the worker needs
+working bubblewrap and user namespaces.
+
+The worker captures the selected external ELF libraries into an independently
+owned runtime snapshot before launching a dependency compiler. The namespace
+mounts a sparse read-only `/usr`, the captured `/etc/ld.so.cache` when present,
+and the exact observed loader aliases. Other host `/usr` contents and
+`/etc/alternatives` are absent. Snapshot ownership lasts through process-group
+cleanup and diagnostic drains, and the retained bytes are verified before
+execution and after cleanup. Writable output and HOME mounts cannot alias
+the runtime backing. The complete loader-cache bytes participate in the v2
+runtime identity, so even an unrelated host package change can conservatively
+require matching worker images or a new runtime observation.
+
+This narrows the metadata dependency execution environment; it does not admit
+arbitrary workspace code generation or build-script replay. Private proc and
+device views still exist, and arbitrary later dynamic loading, locale/NSS
+data, time and randomness are not a complete discovered input closure.
+
+The remote classes accept metadata-only dependency actions
+(`--emit=dep-info,metadata`) and pure Rust `lib`/`rlib` archive actions
+(`--emit=dep-info,link` with optional `metadata`), including explicit `--extern name=/path/lib*.rmeta`
+and `--extern name=/path/lib*.rlib` inputs. The key covers each direct extern
+and the complete candidate inventories of every dependency search directory,
+including metadata or archives rustc can discover through transitive
+dependencies. Changing any candidate's bytes or the directory membership
+invalidates that identity. The daemon captures and verifies those exact bytes
+after the wrapper accepts private execution, then retains them throughout
+transfer without reopening mutable target paths.
+
+A populated dependency search directory may be disjoint from the action's
+output directory or may be that same directory. In the shared case, the worker
+places each retained dependency file above its private writable output mount
+as a separate read-only bind. Bare toolchain externs, proc macros,
+native libraries and executable/shared-library linker output remain local. Build scripts themselves
+also continue to run locally.
+These limits apply to each compiler action; they do not prevent Cargo from
+continuing with other units.
+
+Both dependency classes may consume a previously completed Cargo build
+script's generated `OUT_DIR` tree. Admission binds the exact captured Cargo
+build-script output record, the original `OUT_DIR` path and every generated
+file, including an explicitly captured empty tree. A tree containing empty
+subdirectories stays on the local protocol because the current file transfer
+cannot reproduce those directories; a truly empty root is supported.
+Generated file contents or membership changes select a different key. The
+captured `rustc-env` directives must agree with the compiler environment. Every
+source or generated path reported by dep-info must belong to the captured
+input closure. This does not cache or replay
+the build script's execution.
+
+The worker keeps the original source, generated-input, output and toolchain
+path spellings and full compiler environment inside private mounts. The
+`dependency-exec-v7` context binds an explicit list of populated dependency
+roots to their first-use directory indices. A single sealed source transfer contains
+`package/<source-path>`, optional `generated/<generated-path>` and
+`dependencies/NNNN/<artifact-basename>`; only the declared package, generated
+and retained candidate files may appear. The worker verifies that inventory
+and mounts the generated tree and each disjoint populated dependency root
+read-only. A captured empty generated tree receives an exclusive empty
+backing. The generated root must match the original `OUT_DIR` environment
+value and cannot overlap source, output, dependency or toolchain roots.
+Generated input files never become returned compiler artifacts.
+For a shared input/output root, it rechecks the sealed input bytes and creates
+exclusive, empty mountpoint files in its owned output backing. A dependency
+name that collides with a declared output is refused before execution. The
+worker retains descriptors for both the inputs and their mountpoint files,
+verifies their ownership and identity before launch and after output capture,
+and excludes only those verified mountpoint files from the returned artifacts.
+Replacing or modifying them prevents successful capture. Empty dependency
+roots and loader parents receive private empty backings with only declared
+child mountpoints. The original target tree is never mounted.
+
+Cargo's `target/debug/deps` and `target/debug` loader search paths still require
+fresh bounded checks excluding loadable files, symlinks and hardware-capability
+subdirectories. A loader directory cannot be the generated root or lie inside
+it. Unsupported loader paths or changing source, generated input, build-script
+record, artifact, toolchain or runtime observations refuse remote admission
+or installation.
+The context also requires an explicit `execution_mode`: `metadata` retains the
+existing proc/device view, while `rlib` removes procfs and general devices and
+exposes only `/dev/null`. This closes assembler file reads that rustc dep-info
+does not record, including `.incbin`. Source, generated, dependency, toolchain
+and selected runtime files remain captured and read-only; output and temporary
+trees remain private. Archive keys bind exact original paths and environment
+instead of inheriting metadata-only layout projections. Native inputs,
+proc macros and unmodeled codegen outputs cannot enter this archive class.
+This profile does not establish arbitrary workspace or plugin hermeticity.
+
+Workers measure these profiles separately. Their hello advertises
+`dependency_execution_modes` containing only the supported `metadata` and/or
+`rlib` modes; the authenticated session grant selects the exact
+`dependency_execution_mode` in the request. Missing, unknown or mismatched
+modes refuse before admission, input upload or execution. The archive probe
+uses the same namespace setup as archive execution, including user, PID, IPC,
+UTS and network isolation, private temporary filesystems and `/dev/null`.
+The null device must be the Linux character device 1:3; a symlink, regular
+file or different device refuses both probing and namespace construction.
+A host that cannot mount procfs can still execute the measured archive profile.
+Metadata and whole-Cargo execution retain their full canonical isolation checks.
+Sealed-result recovery requires the original request fingerprint and retained
+bytes, without requiring the restarted host to support new execution.
+
+The launcher requires a daemon advertising `dependency-exec-v7`; old execution
+contexts cannot admit new work. Already sealed results from older contexts can
+still resume against their exact saved request fingerprint.
+
+A successful remote primary producer does not run a duplicate local compile.
+Publication and installation still check the exact request, outputs, current
+authority, release policy and negative verification/class holds. Subsequent
+cache replays retain the existing qualification and periodic sampling rules.
+Transport uncertainty cannot authorize a concurrent local retry.
+
+### Run independent dependency compilations on a worker pool
+
+Set `RABS_DEPENDENCY_WORKERS_JSON` to configure 1–32 individually pinned workers.
+Each entry has exactly `listen`, `worker_id` and `worker_spki_sha256` fields.
+Every listener, worker ID and certificate pin must be unique. The launcher
+accepts literal coordinator-side IPv4 or unscoped bracketed IPv6 addresses with
+fixed nonzero ports; each worker connects to its assigned coordinator port. The
+JSON is limited to 128 KiB. Worker IDs are nonempty UTF-8 strings of at most 1024 bytes
+without control characters; the fleet installer has the narrower ID rules
+documented above. Pins retain the 64 lowercase hexadecimal, nonzero format.
+Unknown or duplicate JSON fields, duplicate identities, and mixtures of pool
+and singleton settings are refused, including empty singleton variables.
+
+On the coordinator, prepare a separate state directory and export the pool
+selection. The two pins below are **examples**: replace them with the SPKI
+SHA-256 values obtained from each worker's trusted certificate using the
+OpenSSL command above. Replace the example listen address with the coordinator's
+actual private address.
+
+```sh
+unset RABS_DEPENDENCY_WORKER_LISTEN RABS_DEPENDENCY_WORKER_ID RABS_DEPENDENCY_WORKER_SPKI_SHA256
+install -d -m 700 "$HOME/.cache/rabs-pool"
+export RABS_STATE_DIR="$HOME/.cache/rabs-pool"
+export RABS_SOCKET_PATH="$HOME/.cache/rabs-pool/rabs.sock"
+export RABS_DEPENDENCY_WORKERS_JSON='[
+  {"listen":"192.0.2.10:7092","worker_id":"leaf-a","worker_spki_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  {"listen":"192.0.2.10:7093","worker_id":"leaf-b","worker_spki_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+]'
+```
+
+Run the matching worker on each worker host with its own certificate and durable
+journal directory. For `leaf-a`, use:
+
+```sh
+RABS_WORKER_TLS_CA=/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/credentials/leaf-a.pem \
+RABS_WORKER_TLS_KEY=/credentials/leaf-a.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-a" \
+RABS_WORKER_TOOLCHAIN_CACHE_BYTES=8589934592 \
+  ./target/debug/rabs-wkr \
+    --coordinator coordinator.example.internal:7092 --worker-id leaf-a
+```
+
+For `leaf-b`, use its certificate, key and journal directory and connect to the
+second port:
+
+```sh
+RABS_WORKER_TLS_CA=/credentials/ca.pem \
+RABS_WORKER_TLS_CERT=/credentials/leaf-b.pem \
+RABS_WORKER_TLS_KEY=/credentials/leaf-b.key \
+RABS_WORKER_TLS_SERVER_NAME=coordinator.example.internal \
+RABS_WORKER_STATE_DIR="$HOME/.cache/rabs-leaf-b" \
+RABS_WORKER_TOOLCHAIN_CACHE_BYTES=8589934592 \
+  ./target/debug/rabs-wkr \
+    --coordinator coordinator.example.internal:7093 --worker-id leaf-b
+```
+
+Each example allows up to 8 GiB of verified toolchain retention per worker,
+separate from source staging and private execution copies. Select a byte budget
+that fits the host's disk capacity. The first execution captures the toolchain;
+later jobs in the same worker process can reuse its verified bytes and avoid
+retransmission. Absence or zero disables this retention. See the
+[toolchain transfer and cache guide](#send-the-selected-toolchain-with-a-prepared-build)
+for size limits, cache validation and worker-restart behavior.
+
+Keep both worker reconnect loops running. In the coordinator shell with the
+exported pool configuration, start an ordinary Cargo check:
+
+```sh
+RABS_COORD_TLS_CA=/credentials/ca.pem \
+RABS_COORD_TLS_CERT=/credentials/coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/coordinator.key \
+CARGO_RABS_DAEMON="$PWD/target/debug/rabsd" \
+CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
+  ./scripts/cargo-rabs --rabs-require-daemon \
+    check --locked --manifest-path /absolute/project/Cargo.toml
+```
+
+This starts a live daemon if needed. Subsequent invocations retain the exported
+pool selection so the launcher checks the attached daemon's exact normalized
+configuration, including worker order, remote protocol 1 and
+`dependency-exec-v7`. The advertised `remote_dependency` object contains these
+protocol fields and a `workers` array in configured order. A singleton daemon
+does not satisfy a pool request, even when the pool contains that one worker.
+An existing daemon is never reconfigured or restarted to fit a new request;
+use a separate socket and state directory when changing the selection.
+
+Use `build --locked` in the same launcher command to accelerate eligible
+dependency archives during an ordinary Cargo build. Cargo continues to run
+the final executable link and unsupported compiler actions locally.
+
+Independent eligible metadata or archive actions can execute concurrently, with at most
+one admitted action per worker. Selection rotates across available slots, and
+each reservation remains held through execution, result capture and publication.
+Two requests for the same action cannot consume separate workers while the
+first dispatch is pending. When every slot is busy, the existing bounded
+wrapper wait and local path before remote acceptance still apply. A transport
+failure or uncertain result after dispatch never causes an automatic retry on
+another worker. Durable recovery remains bound to the selected worker's identity.
+
+The pool retains all source, toolchain, isolation and output checks described
+above. It expands concurrency for the supported metadata and closed archive classes;
+other codegen actions, native linking, proc macros and build-script
+execution retain their existing local path. `--rabs-require-daemon` guarantees
+matching daemon setup, not remote execution of every Cargo action. The original
+three-variable singleton configuration and its status fields remain supported.
+
+### Share a CPU budget between workers on the same host
+
+Separate worker processes can serve different coordinators or worker-pool slots
+while sharing one local execution budget. Configure every participating worker
+with the same private directory and fixed capacity:
+
+```sh
+install -d -m 700 "$HOME/.cache/rabs-host-budget"
+export RABS_WORKER_HOST_BUDGET_DIR="$HOME/.cache/rabs-host-budget"
+export RABS_WORKER_HOST_SLOTS=8
+```
+
+Start each worker with its own existing identity and state directory. The shared
+budget directory must be on a local filesystem with working OS file locks, have
+ordinary directory ancestors, and remain stable for the domain's lifetime.
+Both variables are required together. Capacity is an integer from 1 to 4096 and
+is persisted with the domain; another worker cannot reopen the same directory
+with a different capacity. Omitting both variables keeps the existing behavior.
+
+A request for `C` execution slots acquires all `C` shared credits immediately
+before spawning, after input and toolchain preparation. Cargo owns one implicit
+slot and its private FIFO receives only `C - 1` transferable tokens. Contention
+does not silently shrink the grant or change `NUM_JOBS`. Waiting remains bounded
+by the request deadline and observes cancellation. Transfers and source capture
+do not hold CPU credits. Live metadata-only rustc requests use a one-slot action
+grant and preserve their original keyed `NUM_JOBS` value.
+
+Canonical whole-Cargo requests can set `jobserver_grant` explicitly in their
+native request specification. For example, `"jobserver_grant": 2` under the
+eight-slot domain permits at most four such
+Cargo roots at once. A grant larger than the host capacity refuses. When omitted,
+the worker's existing machine-sized default still applies, so choose an explicit
+grant when the shared budget is smaller than the worker's reported capacity.
+
+Credits remain owned through process-group termination and diagnostic-stream
+draining. A normal completion or cancellation releases them only after cleanup
+proves no descendants remain. Each credit is durably marked before execution;
+worker crashes or uncertain cleanup leave those credits quarantined even after
+the OS unlocks the files. A missing PID is not evidence that descendants stopped.
+The initial implementation does not automatically clear quarantine: inspect and
+drain the affected execution before operator repair, and do not replace or reset
+the budget directory while any participating worker or descendant may remain.
+
+This bounds admitted cooperative execution across participating processes on
+one host. It is not a kernel CPU limit, cluster-wide fairness, or admission for
+workers configured with another directory or no shared budget.
+
+### Run the native wrapper-to-worker oracle
+
+After the build above, run the explicit integration fixture on a host with
+Linux isolation and OpenSSL:
+
+```sh
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test prepared_operation_live \
+    live_wrapper_remote_leaf_matches_stock_and_samples_replay \
+    -- --ignored --nocapture
+```
+
+The fixture starts the real wrapper, daemon, TLS worker and rustc. It compares
+every result's metadata, dep-info and diagnostics with stock rustc under the
+same Cargo-shaped invocation, uses durable worker receipts to distinguish
+remote production from cache replay, and checks later sampling and an
+environment-driven key change. Its first wrapper invocation must wait for the
+cold toolchain capture and finish on the worker; repeated local warmup builds
+do not satisfy the fixture.
+
+A second fixture lets actual Cargo choose the compiler arguments, working
+directory, jobserver and loader environment. It builds an entirely offline
+vendored registry graph: leaf, middle, top, then the primary consumer. Top
+depends directly only on middle but constructs a type defined in leaf and
+re-exported by middle, requiring rustc to resolve transitive metadata:
+
+```sh
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test prepared_operation_live \
+    actual_offline_cargo_check_uses_remote_dependency_dag_then_replays \
+    -- --ignored --nocapture
+```
+
+That case compares all eight metadata and dep-info outputs with stock Cargo at
+the same paths and follows Cargo's artifact messages to locate each result.
+It tracks each dependency's distinct action key, requires three actual remote
+qualification observations per dependency, and then requires a complete Cargo
+run serving all three from cache without advancing the worker's durable
+receipt. Terminal events are associated with the crate that admitted their
+action key; one crate's successful execution cannot stand in for another's.
+Toolchain warmup may let different nodes start qualification on different runs.
+
+With `dependency-exec-v7`, this DAG oracle can use shared or disjoint dependency
+and output directories. It performs no compiler-argument rewriting and never
+treats local fallback as evidence of remote admission. It selects the installed
+Cargo and its matching compiler explicitly; ordinary rustup-based Cargo use
+can select that compiler itself. Both integration fixtures are ignored by
+default and must be run on the supported host to establish execution evidence.
+Their presence alone does not assert a successful RABS remote run.
+
+The corresponding `cargo build` fixture exercises code generation and final
+linking with the same offline graph:
+
+```sh
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+RABS_TEST_WRAP_BIN="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test prepared_operation_live \
+    actual_offline_cargo_build_uses_remote_archives_then_links_and_replays \
+    -- --ignored --nocapture
+```
+
+It compares ten Cargo-selected archive, metadata and dep-info outputs with the
+stock build, links and executes the consumer (which must print `146`), requires
+three actual remote archive productions for each dependency, and verifies a
+later build uses all three cached dependencies without another worker receipt.
+It requires the measured archive profile, matching binaries and OpenSSL. Local
+fallback or the stock baseline alone cannot satisfy the remote assertions.
+
+A worker-level native fixture explicitly exercises a populated shared directory
+with both metadata and archive direct externs, transitive metadata resolution,
+and exact output capture:
+
+```sh
+cargo test -p rabs-wkr --test process_tree_linux \
+  real_dependency_rustc_reads_shared_output_metadata_dag -- --nocapture
+```
+
+That fixture compares the real worker rustc result with stock rustc using the
+same paths, arguments and complete dependency inventory. It also checks that
+retained inputs and mountpoint files do not become output artifacts. It needs
+the supported Linux isolation environment, including a private `/proc` mount;
+an unsupported-host skip does not establish remote execution evidence.
+
+A related native fixture adds generated Rust input under Cargo's loader
+parent while retaining the shared metadata and archive dependency directory:
+
+```sh
+cargo test -p rabs-wkr --test process_tree_linux \
+  real_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag \
+  -- --nocapture
+```
+
+It compares stock rustc and worker metadata, dep-info and JSON diagnostics at
+the same paths, and checks that generated input files are not returned as
+outputs. This fixture has not yet been run on the supported isolation host;
+the new test alone does not establish execution evidence.
+
+The archive variant runs the same shared dependency and generated-input shape
+through the worker's closed archive profile and compares all three outputs with
+stock rustc:
+
+```sh
+cargo test -p rabs-wkr --test process_tree_linux \
+  real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
+  -- --nocapture
+```
+
+The sandbox-level native regression separately exercises assembler inputs that
+do not appear in dep-info. It requires successful archive isolation rather than
+silently skipping on an unsupported host:
+
+```sh
+RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+  cargo test -p rabs-sandbox --lib \
+    real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
+    -- --ignored --nocapture
+```
+
+It compiles an archive containing captured `.incbin` bytes and refuses attempts
+to read host-only files, procfs or `/dev/urandom`. This proves the production
+sandbox boundary; the worker and live Cargo fixtures establish the broader
+remote execution and replay behavior when run successfully.
+
 ## Run one delivery
 
 Build the receiver and worker using the repository's pinned Rust toolchain:
@@ -404,6 +927,19 @@ request must contain a source manifest and an artifact declaration; an explicit
 intermediate files. The compiler command still supplies its exact arguments,
 canonical working directory, environment, and explicit toolchain selection.
 
+Canonical Cargo requests can additionally declare `"cargo":"cargo-json-v1"`
+inside `artifacts`, with `"unit":"cargo"`, `"tree":"tree-files-v1"` and an
+empty `files` minimum. This explicit contract requires the native Cargo program,
+`--message-format=json`, `/__rabs/out/cargo` as the target directory, and a
+compilation command (`build`, `check`, or `test --no-run`). Cargo's completed
+artifact report supplies the actual required filenames and executable modes.
+The worker validates them while capturing the complete tree; the coordinator
+checks them independently before acknowledgement and again during offline
+recovery. A success-looking marker without compiler artifacts is insufficient.
+The contract does not run tests, publish cache entries or change request identity.
+See [canonical Cargo](rabs-canonical-cargo.md) for supported frontend selections
+and report bounds. Endpoints without this contract reject the new field.
+
 With the TLS environment described below, run:
 
 ```sh
@@ -463,9 +999,36 @@ described above.
 
 ### Prepared builds in the running daemon
 
-The running `rabsd` can durably queue prepared builds, execute up to four jobs on
-independent workers, install verified outputs, and retain their status across
-client disconnects and daemon restarts. Set `RABS_COORD_TLS_CA`,
+The running `rabsd` can durably queue prepared builds, execute jobs on independent
+workers, install verified outputs, and retain their status across client
+disconnects and daemon restarts. Four jobs may run at once by default. Configure
+`prepared_concurrency` in the daemon's `[rabs]` table to use a larger worker pool:
+
+```toml
+[rabs]
+prepared_concurrency = 16
+```
+
+The supported range is 1–32. `RABS_PREPARED_CONCURRENCY=16` overrides the file
+setting for the daemon process. Restart the daemon to apply a change;
+`rabsd --check-config` reports the resolved setting. One validated limit controls
+the owned executor threads, active-job admission, local result recovery and
+retained live previews. Raising it allows independent workers to run more jobs
+at once; jobs that share a worker, key pin, listener or conflicting paths still
+serialize. The existing queue and retained-byte limits also apply. Choose a
+value that fits the coordinator's memory, transfer bandwidth and available
+workers.
+
+`rabsd --coord-status` reports the running service's `prepared_jobs` object:
+`available`, `concurrency`, `active`, `queued`, `accepting`, and
+`persistence_uncertain`. Active ownership includes cancellation and local result
+recovery until that owner finishes. Queued counts include jobs waiting for a
+result-recovery retry, so neither count promises that a specific worker is free.
+A busy or poisoned queue lock returns `available:false` with the configured
+limit and a detail instead of blocking status behind a filesystem transaction.
+An unavailable prepared-job service is reported as `null`.
+
+Set `RABS_COORD_TLS_CA`,
 `RABS_COORD_TLS_CERT`, and `RABS_COORD_TLS_KEY` on the daemon process before
 starting it. These are the same authenticated transport credentials described
 below. The job commands connect to that daemon through `RABS_SOCKET_PATH` (or
@@ -993,6 +1556,93 @@ to `delivery.json`, and syncs the directory again. Only then does it acknowledge
 diagnostics and artifacts. This requires local storage with working file and
 directory fsync semantics. Private receiver directories must not be concurrently
 modified by another local process; this is not a race-proof shared-directory API.
+
+### Reuse artifact bytes across authenticated deliveries
+
+An optional coordinator-local artifact cache can satisfy complete artifact files
+from earlier deliveries from the same authenticated worker. A new execution still
+runs, and the receiver still validates the current terminal result, request,
+artifact manifest, Cargo report and diagnostics. The cache supplies file bytes;
+it does not supply a result, compilation outcome or permission to publish.
+
+Configure the process that owns the authenticated connection:
+
+| Variable | Default | Contract |
+|----------|---------|----------|
+| `RABS_ARTIFACT_CACHE_DIR` | Disabled | Existing absolute parent directory, owned by the current user, with no group/other permissions or symlink ancestors |
+| `RABS_ARTIFACT_CACHE_BYTES` | `1073741824` | Decimal integer from `1` through `17179869184`; aggregate logical object and pending-copy bytes |
+| `RABS_ARTIFACT_CACHE_ENTRIES` | `4096` | Decimal integer from `1` through `65536`; aggregate objects and pending-copy entry |
+
+Only the dedicated `artifact-bytes-v1` child is managed. Create the parent
+explicitly outside captured inputs, retained bundles, deliveries and installed
+outputs. The application never creates or chmods that parent. For example,
+after configuring the existing coordinator TLS credentials:
+
+```sh
+mkdir -m 700 /absolute/rabs-artifact-cache
+RABS_ARTIFACT_CACHE_DIR=/absolute/rabs-artifact-cache \
+  rabsd --worker-build-tls 0.0.0.0:7091 fleet-worker <worker-spki-sha256> \
+    /absolute/bundles/build-42 /absolute/deliveries/build-42 /absolute/outputs/build-42
+```
+
+The same environment settings apply to `--worker-exec-tls`, source-backed
+prepared TLS builds and explicit result resume. `--resume-from` takes precedence
+and disables the byte cache for that operation, preserving its existing refusal
+of corrupt local prefixes. For daemon prepared jobs and
+live dependency execution, configure the daemon before startup; setting the
+variables only on a submitting client cannot reconfigure that running process.
+Acknowledgment-only reconciliation does not open the cache. Plaintext loopback
+delivery cannot consume or seed it.
+
+All three variables absent disables the cache. An empty/relative/traversing
+directory, malformed or out-of-range limit, or a limit supplied without the
+directory produces a configuration error before session grant, source upload or
+execution dispatch. A syntactically valid configuration whose storage cannot be
+opened privately emits one `artifact-byte-cache-unavailable` JSON setup
+diagnostic on stderr and continues through ordinary verified transfer.
+
+Cache identity includes the authenticated SPKI and worker name, then the
+artifact's complete SHA-256 and byte length. A new request or session can reuse
+matching bytes; a changed worker name or key cannot. The current manifest owns
+the destination path and executable mode. Cached objects are ordinary private
+files, and delivery copies receive independent inodes. Writes to an installed
+artifact therefore cannot alter the retained cache object.
+
+Every hit is copied and completely rehashed before the file is accepted. A
+corrupt, missing or inaccessible object is a miss, and the receiver downloads
+that file through its normal bounded range pipeline. Current diagnostics are
+always received and verified. Newly verified artifact bytes can populate the
+cache under the aggregate byte and entry bounds; an optional cache-storage
+failure can skip population without turning a successful delivery
+into a failure. Cache objects may survive restarts, but their presence alone is
+never trusted.
+
+Warm readers share a nonblocking read lease that prevents their objects from
+being evicted; an active exclusive writer can force a cold read or skip optional
+population. The limits cover logical payload bytes and entries, including
+incoming copies and retained readers; filesystem blocks and metadata consume
+additional space. Before optional population, free-space and inode checks reserve
+room for the remaining current artifacts and delivery receipt, accounting for
+filesystem allocation rounding, but cannot guarantee capacity against unrelated
+concurrent disk writers.
+
+The local copy and population loops check the same operation deadline and
+interruption state at each 64 KiB boundary. A cancellation, expired phase budget,
+or failed write to the actual delivery is propagated instead of being retried as
+a cache miss. Daemon cancellation after an observed terminal result retains its
+existing verified-delivery drain; explicit operator signals retain their existing
+abandon behavior. All required file checks, directory syncs, the current
+`delivery.json`, and worker acknowledgments still occur.
+
+The byte-cache tests run the real receiver and filesystem with controlled
+protocol peers. They check warm range elision, scope separation, corrupt-cache
+fallback, independent copies, bounded storage and interrupted copying. They do
+not constitute a native TLS/compiler performance measurement:
+
+```sh
+cargo test -p rabsd --lib coord::worker_delivery --locked
+cargo test -p rabsd --lib coord::secure_worker_delivery --locked
+```
 
 ## Failure and acknowledgment semantics
 

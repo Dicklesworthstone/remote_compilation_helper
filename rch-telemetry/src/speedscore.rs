@@ -7,8 +7,10 @@
 //! ## Design Philosophy
 //!
 //! Raw benchmark values vary by orders of magnitude (CPU in ops/sec, disk in MB/s,
-//! latency in ms). We normalize everything to a 0-100 scale before weighting,
-//! ensuring each component contributes proportionally to the final score.
+//! latency in ms). Reference-relative curves map them to 0-100 without clipping
+//! ordinary fast machines to the same score. Reference points are midpoints, not
+//! hardware limits. Only usable measurements participate in the weighted total;
+//! a failed or unmeasured component is not evidence of a slow worker.
 //!
 //! ## Weights
 //!
@@ -30,7 +32,7 @@ use crate::benchmarks::{
 
 /// Current version of the SpeedScore algorithm.
 /// Increment when calculation methodology changes to invalidate cached scores.
-pub const SPEEDSCORE_VERSION: u32 = 1;
+pub const SPEEDSCORE_VERSION: u32 = 2;
 
 /// Snapshot of system conditions at benchmark time.
 ///
@@ -64,7 +66,8 @@ pub struct SpeedScore {
     /// Compilation component score (0-100).
     pub compilation_score: f64,
 
-    /// Weights used for this calculation.
+    /// Effective weights used for this calculation. Unavailable components have
+    /// zero weight; all weights are zero when no usable weighted evidence exists.
     pub weights: SpeedScoreWeights,
 
     /// Timestamp when the score was calculated.
@@ -108,35 +111,33 @@ impl SpeedScore {
 
     /// Calculate SpeedScore with custom weights.
     pub fn calculate_with_weights(results: &BenchmarkResults, weights: &SpeedScoreWeights) -> Self {
+        // Some(default()) is how several failed/absent sub-benchmarks are
+        // represented. Do not give those records a share of the denominator.
+        let usable = results.usable();
+        let results = &usable;
         debug!(
             cpu_present = results.cpu.is_some(),
             memory_present = results.memory.is_some(),
             disk_present = results.disk.is_some(),
             network_present = results.network.is_some(),
             compilation_present = results.compilation.is_some(),
-            "Calculating SpeedScore from benchmark results"
+            "Calculating SpeedScore from usable benchmark results"
         );
 
-        // Normalize each component to 0-100
         let cpu_score = results.cpu.as_ref().map(normalize_cpu).unwrap_or(0.0);
-
         let memory_score = results.memory.as_ref().map(normalize_memory).unwrap_or(0.0);
-
         let disk_score = results.disk.as_ref().map(normalize_disk).unwrap_or(0.0);
-
         let network_score = results
             .network
             .as_ref()
             .map(normalize_network)
             .unwrap_or(0.0);
-
         let compilation_score = results
             .compilation
             .as_ref()
             .map(normalize_compilation)
             .unwrap_or(0.0);
 
-        // Calculate weighted total, adjusting weights for missing components
         let (total, effective_weights) = calculate_weighted_total(
             cpu_score,
             memory_score,
@@ -256,24 +257,41 @@ impl SpeedScoreWeights {
         }
     }
 
-    /// Validate that weights sum to 1.0 (within tolerance).
+    /// Validate finite, nonnegative weights that sum to 1.0 (within tolerance).
     pub fn is_valid(&self) -> bool {
-        let sum = self.cpu + self.memory + self.disk + self.network + self.compilation;
-        (sum - 1.0).abs() < 0.001
+        let values = self.as_array();
+        values.iter().all(|w| w.is_finite() && *w >= 0.0)
+            && (values.iter().sum::<f64>() - 1.0).abs() < 0.001
     }
 
-    /// Normalize weights to sum to 1.0.
+    /// Normalize finite positive weights to sum to 1.0.
+    /// Invalid weights are excluded; no usable weights falls back to defaults.
     pub fn normalize(&self) -> Self {
-        let sum = self.cpu + self.memory + self.disk + self.network + self.compilation;
-        if sum == 0.0 {
-            return Self::default();
+        let normalized = normalize_weights(self.as_array());
+        if normalized.iter().all(|w| *w == 0.0) {
+            Self::default()
+        } else {
+            Self::from_array(normalized)
         }
+    }
+
+    fn as_array(&self) -> [f64; 5] {
+        [
+            self.cpu,
+            self.memory,
+            self.disk,
+            self.network,
+            self.compilation,
+        ]
+    }
+
+    fn from_array(values: [f64; 5]) -> Self {
         Self {
-            cpu: self.cpu / sum,
-            memory: self.memory / sum,
-            disk: self.disk / sum,
-            network: self.network / sum,
-            compilation: self.compilation / sum,
+            cpu: values[0],
+            memory: values[1],
+            disk: values[2],
+            network: values[3],
+            compilation: values[4],
         }
     }
 }
@@ -358,167 +376,157 @@ impl BenchmarkResults {
         }
         count
     }
+
+    /// Preserve raw records for diagnostics, but use only measured evidence for
+    /// placement. Zero timings/throughputs are missing, not perfect latency or
+    /// failed-machine scores. A partial compound measurement is also excluded.
+    fn usable(&self) -> Self {
+        Self {
+            cpu: self
+                .cpu
+                .as_ref()
+                .filter(|r| positive_finite(r.ops_per_second))
+                .cloned(),
+            memory: self
+                .memory
+                .as_ref()
+                .filter(|r| {
+                    positive_finite(r.seq_bandwidth_gbps) && positive_finite(r.random_latency_ns)
+                })
+                .cloned(),
+            disk: self
+                .disk
+                .as_ref()
+                .filter(|r| {
+                    positive_finite(r.seq_read_mbps)
+                        && positive_finite(r.seq_write_mbps)
+                        && positive_finite(r.random_read_iops)
+                })
+                .cloned(),
+            network: self
+                .network
+                .as_ref()
+                .filter(|r| {
+                    positive_finite(r.upload_mbps)
+                        && positive_finite(r.download_mbps)
+                        && positive_finite(r.latency_ms)
+                })
+                .cloned(),
+            compilation: self
+                .compilation
+                .as_ref()
+                .filter(|r| r.release_build_ms > 0 || positive_finite(r.score))
+                .cloned(),
+        }
+    }
 }
 
 // ============================================================================
 // Normalization Functions
 // ============================================================================
 
-/// Reference points for normalization (calibrated for 2024-2026 hardware).
+/// Midpoints for the actual benchmark workloads, not advertised hardware limits.
+/// At a midpoint the score is 50; doubling throughput (or halving latency)
+/// scores 66.7. In particular, the single-thread memory loop is not a measure
+/// of aggregate DIMM bandwidth, and the reference crate often builds in <3 s.
 mod reference {
-    // CPU: ops_per_second
-    pub const CPU_LOW: f64 = 100_000.0; // Poor (old/slow hardware)
-    pub const CPU_HIGH: f64 = 10_000_000.0; // Excellent (fast modern hardware)
-
-    // Memory: bandwidth in GB/s
-    pub const MEMORY_LOW: f64 = 5.0; // DDR3 or slow
-    pub const MEMORY_HIGH: f64 = 100.0; // DDR5 high-end
-
-    // Disk: sequential throughput in MB/s
-    pub const DISK_SEQ_LOW: f64 = 100.0; // HDD
-    pub const DISK_SEQ_HIGH: f64 = 5000.0; // NVMe SSD
-
-    // Disk: random IOPS
-    pub const DISK_IOPS_LOW: f64 = 1000.0; // HDD
-    pub const DISK_IOPS_HIGH: f64 = 500_000.0; // NVMe SSD
-
-    // Network: throughput in Mbps
-    pub const NETWORK_LOW: f64 = 100.0; // 100 Mbps
-    pub const NETWORK_HIGH: f64 = 10_000.0; // 10 Gbps
-
-    // Network: latency in ms (inverted - lower is better)
-    pub const LATENCY_HIGH: f64 = 100.0; // Poor (high latency = low score)
-    pub const LATENCY_LOW: f64 = 1.0; // Excellent (low latency = high score)
-
-    // Compilation: release build time in ms (inverted - lower is better)
-    pub const COMPILE_SLOW: f64 = 30_000.0; // 30 seconds (slow)
-    pub const COMPILE_FAST: f64 = 3_000.0; // 3 seconds (fast)
+    pub const CPU_OPS: f64 = 250_000.0;
+    pub const MEMORY_GBPS: f64 = 4.0;
+    pub const MEMORY_LATENCY_NS: f64 = 100.0;
+    pub const DISK_MBPS: f64 = 1000.0;
+    pub const DISK_IOPS: f64 = 100_000.0;
+    pub const NETWORK_MBPS: f64 = 1000.0;
+    pub const NETWORK_LATENCY_MS: f64 = 10.0;
+    pub const COMPILE_MS: f64 = 3000.0;
+    pub const COMPILE_SCORE: f64 = 1000.0;
 }
 
-/// Normalize a value to 0-100 scale.
-///
-/// # Arguments
-/// * `value` - The raw benchmark value
-/// * `low_ref` - Value that maps to score 0 (poor performance)
-/// * `high_ref` - Value that maps to score 100 (excellent performance)
-/// * `higher_is_better` - If true, higher values = higher scores
+fn positive_finite(value: f64) -> bool {
+    value.is_finite() && value > 0.0
+}
+
+/// Smooth, bounded, monotone normalization. Divide before adding so even a
+/// finite f64::MAX measurement cannot overflow a value + reference expression.
+fn reference_score(value: f64, midpoint: f64, higher_is_better: bool) -> f64 {
+    if !positive_finite(value) || !positive_finite(midpoint) {
+        return 0.0;
+    }
+    let ratio = if higher_is_better {
+        midpoint / value
+    } else {
+        value / midpoint
+    };
+    100.0 / (1.0 + ratio)
+}
+
+/// Normalize a value to 0-100 scale using fixed endpoints.
+/// Retained for callers/tests of the endpoint convention, not worker scoring.
+#[cfg(test)]
 fn normalize(value: f64, low_ref: f64, high_ref: f64, higher_is_better: bool) -> f64 {
     if low_ref == high_ref {
-        return 50.0; // Avoid division by zero
+        return 50.0;
     }
-
     let normalized = if higher_is_better {
-        // Higher value = higher score
-        // low_ref maps to 0, high_ref maps to 100
         (value - low_ref) / (high_ref - low_ref)
     } else {
-        // Lower value = higher score
-        // low_ref (the bad high value) maps to 0
-        // high_ref (the good low value) maps to 100
         (low_ref - value) / (low_ref - high_ref)
     };
-
     (normalized * 100.0).clamp(0.0, 100.0)
 }
 
-/// Normalize CPU benchmark result to 0-100.
+/// Normalize CPU throughput, not the benchmark's differently-scaled composite
+/// score (whose matrix term saturated the old 2000-point ceiling everywhere).
 fn normalize_cpu(result: &CpuBenchmarkResult) -> f64 {
-    // Use the pre-calculated score and normalize it
-    // CPU benchmark score is already designed to be ~1000 for reference hardware
-    // Normalize to 0-100: 0 = score 0, 100 = score 2000
-    let score_normalized = normalize(result.score, 0.0, 2000.0, true);
-
-    // Also factor in ops_per_second for finer granularity
-    let ops_normalized = normalize(
-        result.ops_per_second,
-        reference::CPU_LOW,
-        reference::CPU_HIGH,
-        true,
-    );
-
-    // Combine: 70% from pre-calculated score, 30% from ops/sec
-    score_normalized * 0.7 + ops_normalized * 0.3
+    reference_score(result.ops_per_second, reference::CPU_OPS, true)
 }
 
-/// Normalize memory benchmark result to 0-100.
 fn normalize_memory(result: &MemoryBenchmarkResult) -> f64 {
-    // Bandwidth is the primary metric
-    let bandwidth_score = normalize(
-        result.seq_bandwidth_gbps,
-        reference::MEMORY_LOW,
-        reference::MEMORY_HIGH,
-        true,
-    );
-
-    // Random access latency (lower is better)
-    // Typical range: 50ns (excellent) to 200ns (poor)
-    let latency_score = normalize(result.random_latency_ns, 200.0, 50.0, false);
-
-    // Combine: 60% bandwidth, 40% latency
-    bandwidth_score * 0.6 + latency_score * 0.4
+    reference_score(result.seq_bandwidth_gbps, reference::MEMORY_GBPS, true) * 0.6
+        + reference_score(
+            result.random_latency_ns,
+            reference::MEMORY_LATENCY_NS,
+            false,
+        ) * 0.4
 }
 
-/// Normalize disk benchmark result to 0-100.
 fn normalize_disk(result: &DiskBenchmarkResult) -> f64 {
-    // Sequential read/write average
-    let seq_avg = (result.seq_read_mbps + result.seq_write_mbps) / 2.0;
-    let seq_score = normalize(
-        seq_avg,
-        reference::DISK_SEQ_LOW,
-        reference::DISK_SEQ_HIGH,
-        true,
-    );
-
-    // Random IOPS
-    let iops_score = normalize(
-        result.random_read_iops,
-        reference::DISK_IOPS_LOW,
-        reference::DISK_IOPS_HIGH,
-        true,
-    );
-
-    // Combine: 50% sequential, 50% random
-    seq_score * 0.5 + iops_score * 0.5
+    let sequential = (reference_score(result.seq_read_mbps, reference::DISK_MBPS, true)
+        + reference_score(result.seq_write_mbps, reference::DISK_MBPS, true))
+        / 2.0;
+    sequential * 0.5 + reference_score(result.random_read_iops, reference::DISK_IOPS, true) * 0.5
 }
 
-/// Normalize network benchmark result to 0-100.
 fn normalize_network(result: &NetworkBenchmarkResult) -> f64 {
-    // Throughput average (upload + download)
-    let throughput_avg = (result.upload_mbps + result.download_mbps) / 2.0;
-    let throughput_score = normalize(
-        throughput_avg,
-        reference::NETWORK_LOW,
-        reference::NETWORK_HIGH,
-        true,
-    );
-
-    // Latency (lower is better)
-    let latency_score = normalize(
-        result.latency_ms,
-        reference::LATENCY_HIGH,
-        reference::LATENCY_LOW,
-        false,
-    );
-
-    // Combine: 60% throughput, 40% latency
-    throughput_score * 0.6 + latency_score * 0.4
+    let throughput = (reference_score(result.upload_mbps, reference::NETWORK_MBPS, true)
+        + reference_score(result.download_mbps, reference::NETWORK_MBPS, true))
+        / 2.0;
+    throughput * 0.6
+        + reference_score(result.latency_ms, reference::NETWORK_LATENCY_MS, false) * 0.4
 }
 
-/// Normalize compilation benchmark result to 0-100.
 fn normalize_compilation(result: &CompilationBenchmarkResult) -> f64 {
-    // Release build time is the primary metric (lower is better)
     if result.release_build_ms == 0 {
-        // Use pre-calculated score if no release build data
-        return normalize(result.score, 0.0, 2000.0, true);
+        // Debug-only/incremental-only benchmark configurations still supply
+        // their measured composite score. A default failure has score == 0
+        // and is removed by usable(), rather than taking a share of the total.
+        return reference_score(result.score, reference::COMPILE_SCORE, true);
     }
+    reference_score(result.release_build_ms as f64, reference::COMPILE_MS, false)
+}
 
-    // Lower compile time = higher score
-    normalize(
-        result.release_build_ms as f64,
-        reference::COMPILE_SLOW,
-        reference::COMPILE_FAST,
-        false,
-    )
+/// Normalize only finite, positive weights, without overflowing their sum.
+fn normalize_weights(weights: [f64; 5]) -> [f64; 5] {
+    let max = weights
+        .iter()
+        .copied()
+        .filter(|w| positive_finite(*w))
+        .fold(0.0, f64::max);
+    if max == 0.0 {
+        return [0.0; 5];
+    }
+    let scaled = weights.map(|w| if positive_finite(w) { w / max } else { 0.0 });
+    let sum: f64 = scaled.iter().sum();
+    scaled.map(|w| w / sum)
 }
 
 /// Calculate weighted total with adjustment for missing components.
@@ -531,72 +539,37 @@ fn calculate_weighted_total(
     weights: &SpeedScoreWeights,
     results: &BenchmarkResults,
 ) -> (f64, SpeedScoreWeights) {
-    // Collect active weights
-    let mut active_weight_sum = 0.0;
-    let mut weighted_score_sum = 0.0;
-
-    if results.cpu.is_some() {
-        active_weight_sum += weights.cpu;
-        weighted_score_sum += cpu_score * weights.cpu;
-    }
-    if results.memory.is_some() {
-        active_weight_sum += weights.memory;
-        weighted_score_sum += memory_score * weights.memory;
-    }
-    if results.disk.is_some() {
-        active_weight_sum += weights.disk;
-        weighted_score_sum += disk_score * weights.disk;
-    }
-    if results.network.is_some() {
-        active_weight_sum += weights.network;
-        weighted_score_sum += network_score * weights.network;
-    }
-    if results.compilation.is_some() {
-        active_weight_sum += weights.compilation;
-        weighted_score_sum += compilation_score * weights.compilation;
-    }
-
-    // Calculate final score, normalizing by active weight sum
-    let total = if active_weight_sum > 0.0 {
-        weighted_score_sum / active_weight_sum * 100.0 / 100.0
-    } else {
-        0.0
-    };
-
-    // Return effective weights (normalized to active components)
-    let effective_weights = if active_weight_sum > 0.0 {
-        SpeedScoreWeights {
-            cpu: if results.cpu.is_some() {
-                weights.cpu / active_weight_sum
-            } else {
-                0.0
-            },
-            memory: if results.memory.is_some() {
-                weights.memory / active_weight_sum
-            } else {
-                0.0
-            },
-            disk: if results.disk.is_some() {
-                weights.disk / active_weight_sum
-            } else {
-                0.0
-            },
-            network: if results.network.is_some() {
-                weights.network / active_weight_sum
-            } else {
-                0.0
-            },
-            compilation: if results.compilation.is_some() {
-                weights.compilation / active_weight_sum
-            } else {
-                0.0
-            },
+    let present = [
+        results.cpu.is_some(),
+        results.memory.is_some(),
+        results.disk.is_some(),
+        results.network.is_some(),
+        results.compilation.is_some(),
+    ];
+    let mut active = weights.as_array();
+    for (weight, present) in active.iter_mut().zip(present) {
+        if !present {
+            *weight = 0.0;
         }
-    } else {
-        *weights
-    };
-
-    (total.clamp(0.0, 100.0), effective_weights)
+    }
+    let effective = normalize_weights(active);
+    let scores = [
+        cpu_score,
+        memory_score,
+        disk_score,
+        network_score,
+        compilation_score,
+    ];
+    let total: f64 = scores
+        .into_iter()
+        .zip(effective)
+        .filter(|(_, weight)| *weight > 0.0)
+        .map(|(score, weight)| score * weight)
+        .sum();
+    (
+        total.clamp(0.0, 100.0),
+        SpeedScoreWeights::from_array(effective),
+    )
 }
 
 /// Convenience function to calculate SpeedScore from benchmark results.
@@ -1099,7 +1072,7 @@ mod tests {
             ..Default::default()
         };
 
-        let expected = normalize(compilation.score, 0.0, 2000.0, true);
+        let expected = reference_score(compilation.score, reference::COMPILE_SCORE, true);
         let actual = normalize_compilation(&compilation);
 
         info!("RESULT: expected={:.4}, actual={:.4}", expected, actual);
@@ -1108,6 +1081,133 @@ mod tests {
         info!("VERIFY: Fallback to score when release_build_ms == 0");
 
         info!("TEST PASS: test_compilation_normalize_uses_score_when_release_missing");
+    }
+
+    #[test]
+    fn fleet_cpu_and_sub_three_second_compiles_do_not_saturate() {
+        let cpu = |ops| {
+            SpeedScore::calculate(&BenchmarkResults::new().with_cpu(CpuBenchmarkResult {
+                score: 50_000.0,
+                ops_per_second: ops,
+                ..Default::default()
+            }))
+            .cpu_score
+        };
+        // bd-uerk9: these throughputs previously both scored approximately 70.
+        assert!(cpu(423_898.0) - cpu(130_000.0) > 20.0);
+        assert!(cpu(423_898.0) < 100.0);
+
+        let compile = |ms| {
+            normalize_compilation(&CompilationBenchmarkResult {
+                release_build_ms: ms,
+                ..Default::default()
+            })
+        };
+        assert!(compile(1836) > compile(2500));
+        assert!(compile(2500) > compile(3000));
+        assert!(compile(1836) < 100.0);
+        assert_eq!(compile(3000), 50.0);
+    }
+
+    #[test]
+    fn memory_and_fast_disk_measurements_keep_their_ordering() {
+        let memory = |bandwidth| {
+            normalize_memory(&MemoryBenchmarkResult {
+                seq_bandwidth_gbps: bandwidth,
+                random_latency_ns: 100.0,
+                ..Default::default()
+            })
+        };
+        assert!(memory(4.0) > memory(2.0));
+        assert!(memory(2.0) > memory(1.0));
+
+        let disk = |throughput| {
+            normalize_disk(&DiskBenchmarkResult {
+                seq_read_mbps: throughput,
+                seq_write_mbps: throughput,
+                random_read_iops: 600_000.0,
+                ..Default::default()
+            })
+        };
+        assert!(disk(30_000.0) > disk(15_700.0));
+        assert!(disk(15_700.0) > disk(6000.0));
+        assert!(disk(30_000.0) < 100.0);
+    }
+
+    #[test]
+    fn failed_components_do_not_dilute_measured_evidence() {
+        let baseline = BenchmarkResults::new().with_cpu(placeholder_cpu());
+        let expected = SpeedScore::calculate(&baseline);
+        let with_failures = baseline
+            .with_memory(MemoryBenchmarkResult::default())
+            .with_disk(DiskBenchmarkResult::default())
+            .with_network(NetworkBenchmarkResult::default())
+            .with_compilation(CompilationBenchmarkResult::default());
+        let actual = SpeedScore::calculate(&with_failures);
+        assert_eq!(actual.total, expected.total);
+        assert_eq!(actual.weights.cpu, 1.0);
+        assert_eq!(actual.weights.network, 0.0);
+        assert_eq!(actual.weights.compilation, 0.0);
+        assert_eq!(actual.network_score, 0.0);
+        // Raw diagnostic records are not discarded by calculation.
+        assert!(with_failures.is_complete());
+    }
+
+    #[test]
+    fn malformed_measurements_are_missing_not_nan_or_perfect_scores() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let results = BenchmarkResults::new()
+                .with_cpu(CpuBenchmarkResult {
+                    score: 1000.0,
+                    ops_per_second: bad,
+                    ..Default::default()
+                })
+                .with_network(NetworkBenchmarkResult {
+                    upload_mbps: 500.0,
+                    download_mbps: 800.0,
+                    latency_ms: bad,
+                    ..Default::default()
+                });
+            let score = SpeedScore::calculate(&results);
+            assert_eq!(score.total, 0.0);
+            assert_eq!(total_weight_sum(score.weights), 0.0);
+            assert!(serde_json::to_string(&score).is_ok());
+        }
+    }
+
+    #[test]
+    fn custom_weights_cannot_overflow_or_turn_negative_evidence_positive() {
+        let results = BenchmarkResults::new()
+            .with_cpu(placeholder_cpu())
+            .with_memory(placeholder_memory());
+        let huge = SpeedScoreWeights {
+            cpu: f64::MAX,
+            memory: f64::MAX,
+            disk: f64::NAN,
+            network: -1.0,
+            compilation: f64::INFINITY,
+        };
+        assert!(!huge.is_valid());
+        assert!(huge.normalize().is_valid());
+        let score = SpeedScore::calculate_with_weights(&results, &huge);
+        assert!(score.total.is_finite());
+        assert_eq!(score.weights.cpu, 0.5);
+        assert_eq!(score.weights.memory, 0.5);
+        assert_eq!(score.total, (score.cpu_score + score.memory_score) / 2.0);
+        let empty =
+            SpeedScore::calculate_with_weights(&results, &SpeedScoreWeights::from_array([0.0; 5]));
+        assert_eq!(empty.total, 0.0);
+        assert_eq!(total_weight_sum(empty.weights), 0.0);
+    }
+
+    #[test]
+    fn version_one_scores_are_not_comparable_to_current_calibration() {
+        let old = SpeedScore {
+            version: 1,
+            ..Default::default()
+        };
+        assert!(old.is_outdated());
+        assert!(!SpeedScore::calculate(&BenchmarkResults::new()).is_outdated());
     }
 
     fn total_weight_sum(weights: SpeedScoreWeights) -> f64 {
@@ -1177,6 +1277,21 @@ mod tests {
         }
 
         #[test]
+        fn prop_reference_score_is_monotone(
+            value in 0.001f64..1.0e9f64,
+            factor in 1.0f64..10.0f64,
+        ) {
+            let before = reference_score(value, reference::CPU_OPS, true);
+            let after = reference_score(value * factor, reference::CPU_OPS, true);
+            prop_assert!(after >= before);
+            prop_assert!(after <= 100.0);
+            let slower = reference_score(value * factor, reference::COMPILE_MS, false);
+            let faster = reference_score(value, reference::COMPILE_MS, false);
+            prop_assert!(faster >= slower);
+            prop_assert!(slower >= 0.0);
+        }
+
+        #[test]
         fn prop_weighted_total_in_bounds(
             cpu_score in 0.0f64..100.0f64,
             memory_score in 0.0f64..100.0f64,
@@ -1224,7 +1339,8 @@ mod tests {
             prop_assert!(total <= 100.0);
 
             let sum = total_weight_sum(effective);
-            prop_assert!((sum - 1.0).abs() < 0.001);
+            let expected_sum = if results.component_count() == 0 { 0.0 } else { 1.0 };
+            prop_assert!((sum - expected_sum).abs() < 0.001);
             info!("TEST PASS: prop_weighted_total_in_bounds");
         }
     }

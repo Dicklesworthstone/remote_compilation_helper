@@ -9,6 +9,7 @@ mod batch;
 use crate::DaemonContext;
 use crate::api::{CancelAllBuildsResponse, CancelBuildResponse, CancelledBuildInfo};
 use crate::events::EventBus;
+use crate::workers::WorkerEndpointSnapshot;
 use rch_common::{
     BuildCancellationMetadata, BuildCancellationWorkerHealth, WorkerId, WorkerStatus,
 };
@@ -90,6 +91,9 @@ impl std::fmt::Display for CancellationState {
 pub struct CancellationRecord {
     pub build_id: u64,
     pub worker_id: String,
+    /// Immutable admitted coordinates; current inventory is not execution ownership.
+    #[serde(skip)]
+    worker_endpoint: Option<WorkerEndpointSnapshot>,
     pub state: CancellationState,
     pub reason: CancelReason,
     #[serde(skip)]
@@ -112,6 +116,10 @@ pub struct CancellationRecord {
     /// worker no longer has confirms that nothing runs under it.
     #[serde(skip)]
     pub abandoned_unlaunched: bool,
+    /// Current coordinates of `worker_id`, used only to ask an abandoned
+    /// legacy build's worker for its record (see [`legacy_probe_config`]).
+    #[serde(skip)]
+    legacy_probe_config: Option<rch_common::WorkerConfig>,
 }
 
 /// Silence far past every remote lifetime cap: the in-session watchdog (30
@@ -158,7 +166,7 @@ fn provably_abandoned_unlaunched(
 
 /// Whether this dispatcher's client lease for `wrapper` still owns worker
 /// source. An unreadable lease fails closed (treated as owning).
-fn client_lease_owns_source(wrapper: &str) -> bool {
+pub(crate) fn client_lease_owns_source(wrapper: &str) -> bool {
     let path =
         rch_common::job_identity::default_job_lease_directory().join(format!("{wrapper}.json"));
     match std::fs::read(&path) {
@@ -169,6 +177,24 @@ fn client_lease_owns_source(wrapper: &str) -> bool {
                 crate::api::lease_owns_unretired_source(&lease)
             }),
     }
+}
+
+/// Ownership snapshots written before admitted endpoints were recorded
+/// recover their builds without one, so the remote probe could never run and
+/// the stuck detector retried an abandoned build every tick, forever
+/// (bd-ilds6: two such builds held a slot each for 30h on one dispatcher,
+/// across a restart). Only such an abandoned build may ask its worker ID's
+/// current endpoint. That answer never becomes execution ownership: cleanup
+/// and feedback still see no endpoint.
+async fn legacy_probe_config(
+    ctx: &DaemonContext,
+    record: &CancellationRecord,
+) -> Option<rch_common::WorkerConfig> {
+    if record.worker_endpoint.is_some() || !record.abandoned_unlaunched {
+        return None;
+    }
+    let worker = ctx.pool.get(&WorkerId::new(&record.worker_id)).await?;
+    Some(worker.endpoint_snapshot().await.config)
 }
 
 /// A recycled PID proves that the original process has exited; it never
@@ -446,6 +472,7 @@ impl CancellationOrchestrator {
             let record = CancellationRecord {
                 build_id,
                 worker_id: build.worker_id,
+                worker_endpoint: build.worker_endpoint,
                 state: CancellationState::Requested,
                 reason,
                 requested_at: Instant::now(),
@@ -459,6 +486,7 @@ impl CancellationOrchestrator {
                 hook_process_identity: build.hook_process_identity.clone(),
                 abandoned_unlaunched,
                 remote_pgid_file: build.remote_pgid_file,
+                legacy_probe_config: None,
             };
             active.insert(build_id, record.clone());
             (
@@ -510,9 +538,11 @@ impl CancellationOrchestrator {
                 };
             }
             record.hook_pid = current.hook_pid;
+            record.worker_endpoint = current.worker_endpoint;
             record.remote_pgid_file = current.remote_pgid_file;
             record.hook_process_identity = current.hook_process_identity.clone();
             record.slots = current.slots;
+            record.legacy_probe_config = legacy_probe_config(&context, &record).await;
 
             owner.events.emit(
                 "cancellation_requested",
@@ -524,9 +554,7 @@ impl CancellationOrchestrator {
                     "force": force,
                 }),
             );
-            owner
-                .execute_cancellation(&context, &mut record, force)
-                .await;
+            owner.execute_cancellation(&mut record, force).await;
             // Keep finalization in this same task. Caller cancellation after
             // confirmation must not lose its slot-release/history owner.
             owner.run_cleanup(&context, &mut record).await;
@@ -587,12 +615,7 @@ impl CancellationOrchestrator {
     }
 
     /// One budget bounds all termination stages, including lock waits and force.
-    async fn execute_cancellation(
-        &self,
-        ctx: &DaemonContext,
-        record: &mut CancellationRecord,
-        force: bool,
-    ) {
+    async fn execute_cancellation(&self, record: &mut CancellationRecord, force: bool) {
         let deadline = Instant::now().checked_add(self.config.cleanup_timeout);
         if self.config.cleanup_timeout.is_zero() || deadline.is_none() {
             record.state = CancellationState::Failed;
@@ -602,7 +625,7 @@ impl CancellationOrchestrator {
         let deadline = deadline.expect("checked cancellation deadline");
         let timed_out = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            self.execute_cancellation_stages(ctx, record, force, deadline),
+            self.execute_cancellation_stages(record, force, deadline),
         )
         .await
         .is_err();
@@ -657,7 +680,6 @@ impl CancellationOrchestrator {
 
     async fn execute_cancellation_stages(
         &self,
-        ctx: &DaemonContext,
         record: &mut CancellationRecord,
         force: bool,
         deadline: Instant,
@@ -693,7 +715,7 @@ impl CancellationOrchestrator {
             if record.hook_pid > 0 {
                 self.send_verified_signal(record, true).await;
             }
-            let remote_stopped = !remote_required || self.try_remote_kill(ctx, record).await;
+            let remote_stopped = !remote_required || self.try_remote_kill(record).await;
             let local_stopped = wait_for_wrapper_exit(record, self.config.kill_timeout).await;
             record.state = cancellation_terminal_state(local_stopped, remote_stopped);
             return;
@@ -707,8 +729,7 @@ impl CancellationOrchestrator {
 
         let local_stopped = wait_for_wrapper_exit(record, self.config.grace_period).await;
         if local_stopped {
-            let remote_stopped =
-                !remote_required || self.attempt_remote_kill_stage(ctx, record).await;
+            let remote_stopped = !remote_required || self.attempt_remote_kill_stage(record).await;
             record.state = cancellation_terminal_state(true, remote_stopped);
             return;
         }
@@ -719,7 +740,7 @@ impl CancellationOrchestrator {
         }
 
         // Step 2: Terminate remote work, preserving its result through SIGKILL.
-        let remote_stopped = !remote_required || self.attempt_remote_kill_stage(ctx, record).await;
+        let remote_stopped = !remote_required || self.attempt_remote_kill_stage(record).await;
         if remote_stopped && wait_for_wrapper_exit(record, Duration::from_millis(500)).await {
             record.state = CancellationState::Completed;
             return;
@@ -750,11 +771,7 @@ impl CancellationOrchestrator {
         record.state = cancellation_terminal_state(local_stopped, remote_stopped);
     }
 
-    async fn attempt_remote_kill_stage(
-        &self,
-        ctx: &DaemonContext,
-        record: &mut CancellationRecord,
-    ) -> bool {
+    async fn attempt_remote_kill_stage(&self, record: &mut CancellationRecord) -> bool {
         if record.escalation_count >= self.config.max_escalations {
             return false;
         }
@@ -770,59 +787,36 @@ impl CancellationOrchestrator {
         );
 
         record.state = CancellationState::RemoteKillSent;
-        self.try_remote_kill(ctx, record).await
+        self.try_remote_kill(record).await
     }
 
     /// Attempt to kill the remote process on the worker via SSH.
-    async fn try_remote_kill(&self, ctx: &DaemonContext, record: &mut CancellationRecord) -> bool {
+    async fn try_remote_kill(&self, record: &mut CancellationRecord) -> bool {
         record.remote_kill_attempted = true;
 
-        // Look up worker config for SSH connection details.
-        let worker = match ctx.pool.get(&WorkerId::new(&record.worker_id)).await {
-            Some(w) => w,
-            None => {
-                debug!(
-                    "Worker {} not found for remote kill of build {}",
-                    record.worker_id, record.build_id
-                );
-                return false;
-            }
-        };
-
-        let config = worker.config.read().await;
-        let host = config.host.clone();
-        let user = config.user.clone();
-        let identity = config.identity_file.clone();
-        drop(config);
-
-        let remote_kill_script =
-            build_remote_kill_script(record.remote_pgid_file.as_deref(), record.build_id);
-        // `tokio::time::timeout(..., cmd.output())` drops the spawned ssh
-        // future when it fires. Without `kill_on_drop`, the local ssh
-        // process stays alive holding a socket until its own keepalive
-        // gives up — at exactly the moment we're trying to clean up after
-        // a stuck build. Force a SIGKILL on cancellation.
-        let mut ssh = tokio::process::Command::new("ssh");
-        ssh.args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "BatchMode=yes",
-            "-i",
-            &identity,
-        ]);
-        // A fresh connection per cancel: offering ssh-agent keys first
-        // locked dispatchers out of workers (bd-ebszo).
-        if let Some(opts) = rch_common::ssh::identities_only_args(&identity) {
-            ssh.args(opts);
+        // The answer is known without asking: see `remote_answer_can_confirm`.
+        // A build fenced by a lease that still owns worker source is
+        // re-cancelled every stuck-detector tick, and on css on 2026-10-13
+        // each tick spent an SSH round trip per such build just to run
+        // `exit 42` on the worker (~1,400 an hour to one production worker).
+        if !remote_answer_can_confirm(record) {
+            debug!(
+                build_id = record.build_id,
+                worker_id = %record.worker_id,
+                "No remote process-group record; skipping an SSH that cannot confirm (reservation retained)"
+            );
+            return false;
         }
-        ssh.arg(format!("{}@{}", user, host))
-            .arg(&remote_kill_script)
-            .kill_on_drop(true);
-        let ssh_result =
-            tokio::time::timeout(self.config.remote_kill_timeout, ssh.output()).await;
+
+        let Some(mut ssh) = build_remote_kill_command(record) else {
+            warn!(
+                build_id = record.build_id,
+                worker_id = %record.worker_id,
+                "Remote cancellation has no admitted endpoint; reservation retained"
+            );
+            return false;
+        };
+        let ssh_result = tokio::time::timeout(self.config.remote_kill_timeout, ssh.output()).await;
 
         match ssh_result {
             Ok(Ok(output)) => {
@@ -923,26 +917,47 @@ impl CancellationOrchestrator {
                     exit_code: 130,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: Some(cancellation),
                 },
             ) {
                 Ok(Some((state, _))) => {
                     history_ok = true;
-                    if let Some(worker) = ctx.pool.get(&WorkerId::new(&state.worker_id)).await {
-                        worker.release_slots(state.slots).await;
-                        record.slots_released = state.slots;
-                    }
-                    // An interrupted build leaves its partial pool behind (GH #81).
-                    ctx.worker_selector
-                        .record_remote_completion(
-                            &state.worker_id,
-                            &state.project_id,
-                            &state.command,
-                            130,
-                            state.remote_command_started(),
-                        )
+                    ctx.pool
+                        .release_slots(&WorkerId::new(&state.worker_id), state.slots)
                         .await;
+                    record.slots_released = state.slots;
+                    if let Some(endpoint) = state.worker_endpoint.as_ref()
+                        && let Some(worker) = ctx.pool.get(&endpoint.config.id).await
+                    {
+                        if matches!(
+                            record.reason,
+                            CancelReason::Timeout | CancelReason::StuckDetector
+                        ) && let Some(_endpoint_guard) =
+                            worker.lock_current_endpoint(endpoint).await
+                        {
+                            worker
+                                .record_failure(Some(format!(
+                                    "build cancelled by {}",
+                                    record.reason
+                                )))
+                                .await;
+                        }
+                        // A cancelled build's partial cache belongs to the
+                        // endpoint that ran it, including across an A -> B -> A
+                        // retarget. The selector takes its cache lock first.
+                        ctx.worker_selector
+                            .record_bound_remote_completion(
+                                &worker,
+                                endpoint,
+                                &state.project_id,
+                                &state.command,
+                                130,
+                                state.remote_command_started(),
+                            )
+                            .await;
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -953,15 +968,6 @@ impl CancellationOrchestrator {
                     record.state = CancellationState::Failed;
                     record.cleanup_ok = false;
                 }
-            }
-            if matches!(
-                record.reason,
-                CancelReason::Timeout | CancelReason::StuckDetector
-            ) && let Some(worker) = ctx.pool.get(&WorkerId::new(worker_id)).await
-            {
-                worker
-                    .record_failure(Some(format!("build cancelled by {}", record.reason)))
-                    .await;
             }
             if !cfg!(test) {
                 crate::metrics::dec_active_builds("remote");
@@ -1087,6 +1093,65 @@ impl CancellationOrchestrator {
 // sent to workers, including the process-table verification after signalling.
 const REMOTE_CANCELLATION_SCRIPT: &str = include_str!("cancellation_remote.sh");
 
+/// Build a cancellation transport from immutable admission evidence. Looking
+/// up today's worker ID here can send an old build's signal to a replacement,
+/// so [`legacy_probe_config`] coordinates only ask whether the record is gone
+/// and never signal.
+fn build_remote_kill_command(record: &CancellationRecord) -> Option<tokio::process::Command> {
+    let (config, admitted) = match record.worker_endpoint.as_ref() {
+        Some(endpoint) => (&endpoint.config, true),
+        None if record.abandoned_unlaunched => (record.legacy_probe_config.as_ref()?, false),
+        None => return None,
+    };
+    if config.id.as_str() != record.worker_id {
+        return None;
+    }
+    let mut ssh = tokio::process::Command::new("ssh");
+    ssh.args([
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "BatchMode=yes",
+        "-i",
+        &config.identity_file,
+    ]);
+    if let Some(options) = rch_common::ssh::identities_only_args(&config.identity_file) {
+        ssh.args(options);
+    }
+    let script = if admitted {
+        build_remote_kill_script(record.remote_pgid_file.as_deref(), record.build_id)
+    } else {
+        build_remote_record_probe_script(record.remote_pgid_file.as_deref(), record.build_id)
+    };
+    ssh.arg(format!("{}@{}", config.user, config.host))
+        .arg(script)
+        // The timeout owns this local SSH process even if the caller exits.
+        .kill_on_drop(true);
+    Some(ssh)
+}
+
+/// The absence check of `cancellation_remote.sh` without its signalling: a
+/// record still present behind unadmitted coordinates keeps the reservation.
+const REMOTE_RECORD_PROBE_SCRIPT: &str = r#"if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    printf 'RCH_REMOTE_RECORD_ABSENT_V1:%s\n' "$2"
+    exit 42
+fi
+exit 43
+"#;
+
+fn build_remote_record_probe_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
+    let Some(remote_pgid_file) = remote_pgid_file else {
+        return "exit 42".to_owned();
+    };
+    format!(
+        "sh -c {} sh {} {build_id}",
+        shell_escape::escape(std::borrow::Cow::Borrowed(REMOTE_RECORD_PROBE_SCRIPT)),
+        shell_escape::escape(std::borrow::Cow::Borrowed(remote_pgid_file)),
+    )
+}
+
 fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
     let Some(remote_pgid_file) = remote_pgid_file else {
         // Matching command text cannot prove that a build's descendants exited.
@@ -1103,6 +1168,14 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
         shell_escape::escape(std::borrow::Cow::Borrowed(protocol.as_str())),
         shell_escape::escape(std::borrow::Cow::Borrowed(remote_pgid_file)),
     )
+}
+
+/// Without a recorded process-group file both worker scripts are `exit 42`,
+/// which prints no receipt: no SSH answer can confirm a kill
+/// ([`remote_kill_confirmed`]) or prove the record absent
+/// ([`remote_record_absent`]), so the reservation is retained either way.
+fn remote_answer_can_confirm(record: &CancellationRecord) -> bool {
+    record.remote_pgid_file.is_some()
 }
 
 /// The worker no longer holds the build's process record (see
@@ -1316,7 +1389,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
+            admission_barrier: Arc::new(tokio::sync::RwLock::new(
+                crate::restart_admission::RestartAdmissionState::default(),
+            )),
         }
     }
 
@@ -1328,6 +1403,7 @@ mod tests {
         CancellationRecord {
             build_id: 42,
             worker_id: "w1".to_string(),
+            worker_endpoint: None,
             state,
             reason: CancelReason::User,
             requested_at: Instant::now(),
@@ -1341,7 +1417,31 @@ mod tests {
             hook_process_identity: None,
             remote_pgid_file: None,
             abandoned_unlaunched: false,
+            legacy_probe_config: None,
         }
+    }
+
+    #[test]
+    fn a_record_without_a_pgid_file_can_never_confirm_remotely() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut record = test_record(CancellationState::TermSent, 0, false);
+        record.remote_pgid_file = None;
+        assert!(!remote_answer_can_confirm(&record));
+        // Both worker scripts degrade to `exit 42`, which prints no receipt,
+        // so skipping the SSH cannot change the outcome.
+        assert_eq!(build_remote_kill_script(None, 42), "exit 42");
+        assert_eq!(build_remote_record_probe_script(None, 42), "exit 42");
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(42 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(!remote_kill_confirmed(&output, 42));
+        assert!(!remote_record_absent(&output, 42));
+
+        record.remote_pgid_file = Some("/tmp/rch/project/.rch-run/42.pgid".to_string());
+        assert!(remote_answer_can_confirm(&record));
     }
 
     #[test]
@@ -1436,6 +1536,80 @@ mod tests {
             "a lease still owning worker source keeps it"
         );
         assert!(provably_abandoned_unlaunched(&build, now, no_lease));
+    }
+
+    /// bd-ilds6: a build recovered from a pre-endpoint ownership snapshot has
+    /// no admitted coordinates, so the stuck detector retried it every tick,
+    /// forever. Once abandoned, its worker ID's current endpoint may prove
+    /// that the record is gone, but it is never sent the signalling protocol.
+    #[tokio::test]
+    async fn abandoned_legacy_build_probes_current_endpoint_for_absence_only() {
+        let pool = WorkerPool::new();
+        let current = rch_common::WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "current.example".into(),
+            user: "current-user".into(),
+            identity_file: "/current/key".into(),
+            ..rch_common::WorkerConfig::default()
+        };
+        pool.add_worker(current.clone()).await;
+        let ctx = make_test_context(pool, Arc::new(BuildHistory::new(10)));
+        let mut record = test_record(CancellationState::Requested, 0, false);
+        record.remote_pgid_file = Some("/tmp/rch-run/p/42.pgid".into());
+
+        // Not abandoned: unknown coordinates stay unknown.
+        assert!(legacy_probe_config(&ctx, &record).await.is_none());
+        record.legacy_probe_config = Some(current);
+        assert!(build_remote_kill_command(&record).is_none());
+
+        record.abandoned_unlaunched = true;
+        record.legacy_probe_config = legacy_probe_config(&ctx, &record).await;
+        let argv: Vec<_> = build_remote_kill_command(&record)
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(argv.windows(2).any(|args| args == ["-i", "/current/key"]));
+        assert_eq!(argv[argv.len() - 2], "current-user@current.example");
+        assert_eq!(
+            argv.last().unwrap(),
+            &build_remote_record_probe_script(Some("/tmp/rch-run/p/42.pgid"), 42)
+        );
+        assert!(!argv.last().unwrap().contains("rch_remote_cancel"));
+
+        // An ID no longer in inventory has nothing to ask, and coordinates
+        // resolved for another ID are never used.
+        record.worker_id = "gone".into();
+        assert!(legacy_probe_config(&ctx, &record).await.is_none());
+        assert!(build_remote_kill_command(&record).is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_record_probe_proves_absence_and_never_signals() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("group with 'quote $dollar;`tick`.pgid");
+        let probe = |path: std::path::PathBuf| async move {
+            // The worker's login shell runs the probe exactly as SSH passes it.
+            tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(build_remote_record_probe_script(path.to_str(), 42))
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await
+                .unwrap()
+        };
+        let absent = probe(path.clone()).await;
+        assert!(remote_record_absent(&absent, 42), "{absent:?}");
+        assert!(!remote_record_absent(&absent, 41));
+
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        let present = probe(path.clone()).await;
+        assert_eq!(present.status.code(), Some(43), "{present:?}");
+        assert!(present.stdout.is_empty());
+        assert!(!remote_record_absent(&present, 42));
+        assert!(!remote_kill_confirmed(&present, 42));
+        assert_eq!(build_remote_record_probe_script(None, 42), "exit 42");
     }
 
     #[test]
@@ -1573,15 +1747,28 @@ mod tests {
     async fn test_cancel_after_remote_execution_started_warms_cache_without_pin() {
         // GH #81: an interrupted build leaves its partial pool on the worker.
         let pool = WorkerPool::new();
+        pool.add_worker(rch_common::WorkerConfig {
+            id: WorkerId::new("worker-a"),
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&WorkerId::new("worker-a")).await.unwrap();
         let history = Arc::new(BuildHistory::new(100));
-        let started = history.start_active_build(
-            "proj".to_string(),
-            "worker-a".to_string(),
-            "cargo test".to_string(),
-            0,
-            0,
-            rch_common::BuildLocation::Remote,
-        );
+        let started = history
+            .try_start_active_build_with_waiter(
+                "proj".to_string(),
+                "worker-a".to_string(),
+                "cargo test".to_string(),
+                0,
+                None,
+                0,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
         history
             .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
                 build_id: started.id,
@@ -1595,14 +1782,21 @@ mod tests {
                 progress_percent: None,
             })
             .expect("heartbeat accepted");
-        let unsynced = history.start_active_build(
-            "unsynced".to_string(),
-            "worker-a".to_string(),
-            "cargo test".to_string(),
-            0,
-            0,
-            rch_common::BuildLocation::Remote,
-        );
+        let unsynced = history
+            .try_start_active_build_with_waiter(
+                "unsynced".to_string(),
+                "worker-a".to_string(),
+                "cargo test".to_string(),
+                0,
+                None,
+                0,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
         let ctx = make_test_context(pool, history.clone());
         let orch = CancellationOrchestrator::new(test_config(), test_events());
 
@@ -1623,6 +1817,195 @@ mod tests {
         assert_eq!(warmth("proj").await, 1.0);
         assert_eq!(warmth("unsynced").await, 0.0);
         assert_eq!(ctx.worker_selector.get_pinned_worker("proj").await, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_build_feedback_and_transport_follow_durable_endpoint_ownership() {
+        for change in [
+            "unchanged",
+            "retarget",
+            "aba",
+            "restart",
+            "removed",
+            "legacy",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("history.jsonl");
+            let original = rch_common::WorkerConfig {
+                id: WorkerId::new("owned-cancellation"),
+                host: "admitted.example".into(),
+                user: "admitted-user".into(),
+                identity_file: "/admitted/key with spaces".into(),
+                total_slots: 8,
+                ..rch_common::WorkerConfig::default()
+            };
+            let pool = WorkerPool::new();
+            pool.add_worker(original.clone()).await;
+            let mut worker = pool.get(&original.id).await.unwrap();
+            let history = Arc::new(BuildHistory::new(100).with_persistence(path.clone()));
+            let active = history
+                .try_start_active_build_with_waiter(
+                    "cancelled-project".into(),
+                    original.id.to_string(),
+                    "cargo test".into(),
+                    0,
+                    None,
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    if change == "legacy" {
+                        None
+                    } else {
+                        Some(worker.endpoint_snapshot().await)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            history
+                .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                    build_id: active.id,
+                    worker_id: original.id.clone(),
+                    hook_pid: None,
+                    local_wrapper_id: None,
+                    remote_pgid_file: Some("/admitted/owned group.pgid".into()),
+                    phase: rch_common::BuildHeartbeatPhase::Execute,
+                    detail: None,
+                    progress_counter: Some(1),
+                    progress_percent: None,
+                })
+                .unwrap();
+            let other = history.start_active_build(
+                "other-project".into(),
+                original.id.to_string(),
+                "cargo check".into(),
+                0,
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            assert!(worker.reserve_slots(3).await);
+            let mut ctx = make_test_context(pool, history);
+            if matches!(change, "retarget" | "aba") {
+                ctx.pool
+                    .add_worker(rch_common::WorkerConfig {
+                        host: "replacement.example".into(),
+                        user: "replacement-user".into(),
+                        identity_file: "/replacement/key".into(),
+                        ..original.clone()
+                    })
+                    .await;
+                if change == "aba" {
+                    ctx.pool.add_worker(original.clone()).await;
+                }
+            } else if matches!(change, "restart" | "removed") {
+                ctx.history = Arc::new(BuildHistory::load_from_file(&path, 100).unwrap());
+                ctx.pool = WorkerPool::new();
+                if change == "restart" {
+                    ctx.pool.add_worker(original.clone()).await;
+                    worker = ctx.pool.get(&original.id).await.unwrap();
+                }
+                for active in ctx.history.active_builds() {
+                    ctx.pool
+                        .restore_recovered_slots(&original.id, active.slots)
+                        .await
+                        .unwrap();
+                }
+            }
+            if change != "removed" {
+                worker
+                    .record_failure(Some("current endpoint evidence".into()))
+                    .await;
+            }
+            let owned = ctx.history.active_build(active.id).unwrap();
+            let mut record = test_record(CancellationState::Completed, 0, true);
+            record.build_id = owned.id;
+            record.worker_id = owned.worker_id;
+            record.worker_endpoint = owned.worker_endpoint;
+            record.remote_pgid_file = owned.remote_pgid_file;
+            record.reason = CancelReason::Timeout;
+            record.slots = 999;
+            record.slots_released = 0;
+            if change == "legacy" {
+                assert!(build_remote_kill_command(&record).is_none());
+            } else {
+                let command = build_remote_kill_command(&record).unwrap();
+                let argv: Vec<_> = command
+                    .as_std()
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    argv.windows(2)
+                        .any(|args| args == ["-i", "/admitted/key with spaces"])
+                );
+                assert_eq!(
+                    argv[argv.len() - 2],
+                    "admitted-user@admitted.example",
+                    "{change}"
+                );
+                assert_eq!(
+                    argv.last().unwrap(),
+                    &build_remote_kill_script(Some("/admitted/owned group.pgid"), active.id)
+                );
+                record.worker_id = "different-owner".into();
+                assert!(build_remote_kill_command(&record).is_none());
+                record.worker_id = original.id.to_string();
+            }
+            // Exercise the post-confirmation boundary; transport receipt and
+            // process exit are covered by the real SSH fixtures separately.
+            let orch = CancellationOrchestrator::new(test_config(), test_events());
+            orch.run_cleanup(&ctx, &mut record).await;
+            assert_eq!(
+                record.slots_released, 2,
+                "{change}: use exact durable owner slots"
+            );
+            if change == "removed" {
+                ctx.pool.add_worker(original.clone()).await;
+                worker = ctx.pool.get(&original.id).await.unwrap();
+            }
+            assert_eq!(worker.used_slots(), 1, "{change}");
+            let failures = worker.circuit_stats().await.consecutive_failures();
+            assert_eq!(
+                failures,
+                match change {
+                    "unchanged" => 2,
+                    "removed" => 0,
+                    _ => 1,
+                },
+                "{change}"
+            );
+            assert_eq!(
+                ctx.worker_selector
+                    .cache_warmth(
+                        original.id.as_str(),
+                        "cancelled-project",
+                        crate::selection::CacheUse::Test
+                    )
+                    .await,
+                if change == "unchanged" { 1.0 } else { 0.0 },
+                "{change}"
+            );
+            assert_eq!(
+                ctx.worker_selector
+                    .get_pinned_worker("cancelled-project")
+                    .await,
+                None
+            );
+            orch.run_cleanup(&ctx, &mut record).await;
+            assert_eq!(
+                worker.used_slots(),
+                1,
+                "{change}: duplicate cleanup released another build"
+            );
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_failures(),
+                failures,
+                "{change}: duplicate cleanup advanced circuit failure"
+            );
+            assert!(ctx.history.active_build(other.id).is_some());
+            assert!(ctx.history.active_build(active.id).is_none());
+            assert_eq!(ctx.history.recent(10).len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -1894,13 +2277,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancellation_attempts_remote_kill_when_local_hook_exits_with_pgid_file() {
-        let pool = WorkerPool::new();
-        let history = Arc::new(BuildHistory::new(100));
-        let ctx = make_test_context(pool, history);
         let orch = CancellationOrchestrator::new(test_config(), test_events());
         let mut record = CancellationRecord {
             build_id: 42,
             worker_id: "missing-worker".to_string(),
+            worker_endpoint: None,
             state: CancellationState::Requested,
             reason: CancelReason::User,
             requested_at: Instant::now(),
@@ -1914,9 +2295,10 @@ mod tests {
             hook_process_identity: None,
             remote_pgid_file: None,
             abandoned_unlaunched: false,
+            legacy_probe_config: None,
         };
 
-        orch.execute_cancellation(&ctx, &mut record, false).await;
+        orch.execute_cancellation(&mut record, false).await;
 
         assert_eq!(record.state, CancellationState::Failed);
         assert!(!record.cleanup_ok);
@@ -1931,13 +2313,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancellation_without_remote_work_preserves_term_only_fast_path() {
-        let pool = WorkerPool::new();
-        let history = Arc::new(BuildHistory::new(100));
-        let ctx = make_test_context(pool, history);
         let orch = CancellationOrchestrator::new(test_config(), test_events());
         let mut record = CancellationRecord {
             build_id: 43,
             worker_id: "missing-worker".to_string(),
+            worker_endpoint: None,
             state: CancellationState::Requested,
             reason: CancelReason::User,
             requested_at: Instant::now(),
@@ -1951,9 +2331,10 @@ mod tests {
             hook_process_identity: None,
             remote_pgid_file: None,
             abandoned_unlaunched: false,
+            legacy_probe_config: None,
         };
 
-        orch.execute_cancellation(&ctx, &mut record, false).await;
+        orch.execute_cancellation(&mut record, false).await;
 
         assert_eq!(record.state, CancellationState::Completed);
         assert!(!record.remote_kill_attempted);
@@ -2068,13 +2449,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_safety_overall_deadline_bounds_remote_lock_waits_even_when_forced() {
+    async fn legacy_cancellation_never_uses_replacement_config_even_when_forced() {
         let pool = WorkerPool::new();
         let config = rch_common::WorkerConfig::default();
         let id = config.id.clone();
         pool.add_worker(config).await;
         let worker = pool.get(&id).await.unwrap();
-        let ctx = make_test_context(pool, Arc::new(BuildHistory::new(100)));
         let orch = CancellationOrchestrator::new(
             CancellationConfig {
                 cleanup_timeout: Duration::from_millis(40),
@@ -2084,7 +2464,8 @@ mod tests {
             test_events(),
         );
         for force in [false, true] {
-            // Hold the real worker lock: the remote stage cannot reach spawn.
+            // The legacy build has no admitted endpoint. Even a current pool
+            // entry cannot supply that missing historical identity.
             let lock = worker.config.write().await;
             let mut record = test_record(CancellationState::Requested, 0, false);
             record.worker_id = id.to_string();
@@ -2092,10 +2473,10 @@ mod tests {
             record.slots_released = 0;
             tokio::time::timeout(
                 Duration::from_secs(1),
-                orch.execute_cancellation(&ctx, &mut record, force),
+                orch.execute_cancellation(&mut record, force),
             )
             .await
-            .expect("overall deadline must cancel the blocked remote stage");
+            .expect("unknown endpoint must not consult a locked replacement");
             assert_eq!(record.state, CancellationState::Failed);
             assert!(!record.cleanup_ok);
             assert!(record.remote_kill_attempted);
@@ -2139,7 +2520,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_safety_escalation_limit_does_not_fake_success() {
-        let ctx = make_test_context(WorkerPool::new(), Arc::new(BuildHistory::new(100)));
         let orch = CancellationOrchestrator::new(
             CancellationConfig {
                 max_escalations: 0,
@@ -2150,7 +2530,7 @@ mod tests {
         let mut record = test_record(CancellationState::Requested, 0, false);
         record.hook_pid = 0;
         record.slots_released = 0;
-        orch.execute_cancellation(&ctx, &mut record, false).await;
+        orch.execute_cancellation(&mut record, false).await;
         assert_eq!(record.state, CancellationState::Failed);
         assert_eq!(record.escalation_count, 0);
         assert!(!record.remote_kill_attempted);
@@ -2328,17 +2708,24 @@ mod tests {
                 .unwrap();
                 let config = rch_common::WorkerConfig::default();
                 let worker_id = config.id.clone();
+                let admitted_worker = crate::workers::WorkerState::new(config.clone());
                 let history = BuildHistory::new(100).with_persistence(history_path.clone());
                 let wrapper_id = format!("recovery-{scenario}");
-                let target = history.start_active_build_with_wrapper(
-                    "recover-target".into(),
-                    worker_id.to_string(),
-                    "cargo test".into(),
-                    wrapper_pid,
-                    Some(wrapper_id.clone()),
-                    1,
-                    rch_common::BuildLocation::Remote,
-                );
+                let target = history
+                    .try_start_active_build_with_waiter(
+                        "recover-target".into(),
+                        worker_id.to_string(),
+                        "cargo test".into(),
+                        wrapper_pid,
+                        Some(wrapper_id.clone()),
+                        1,
+                        rch_common::BuildLocation::Remote,
+                        None,
+                        crate::disk_pressure::DiskHeadroomAdmission::default(),
+                        Some(admitted_worker.endpoint_snapshot().await),
+                    )
+                    .unwrap()
+                    .unwrap();
                 let other = history.start_active_build_with_wrapper(
                     "unrelated-target".into(),
                     worker_id.to_string(),
@@ -2546,6 +2933,21 @@ exec /bin/sh -c "$payload"
         }
     }
 
+    /// The bounded census runs `ps` in its own shell under a timeout
+    /// (14aea498), so a `ps()` function never reaches it. Install the fake as
+    /// an executable on PATH, written by the fixture shell itself so this
+    /// test process never holds its write descriptor (bd-p7auy). `$OBS` is
+    /// the fixture shell, which the census requires to see as its observer.
+    fn fake_ps_on_path(dir: &std::path::Path, body: &str) -> String {
+        let bin = dir.join("fake-ps-bin");
+        let bin = shell_escape::escape(bin.to_str().unwrap().into()).into_owned();
+        format!(
+            "mkdir -p {bin} && cat > {bin}/ps.tmp <<'RCH_FAKE_PS'\n#!/bin/sh\n{body}\nRCH_FAKE_PS\n\
+             chmod 700 {bin}/ps.tmp && mv -f {bin}/ps.tmp {bin}/ps || exit 99\n\
+             OBS=$$; PATH={bin}:$PATH; export OBS PATH\n"
+        )
+    }
+
     async fn remote_cancel_probe_fixture(
         path: &std::path::Path,
         prefix: &str,
@@ -2658,23 +3060,43 @@ exec /bin/sh -c "$payload"
         // Execute the production shell source with only OS failures injected.
         // All kill calls are inert; sleep is shortened for deterministic faults.
         for (probe, expected) in [
-            ("ps() { return 1; };", 44),
-            ("ps() { :; };", 44),
-            ("ps() { printf 'not a process table\\n'; };", 44),
-            ("ps() { printf '10 10 S\\n'; };", 44),
-            ("ps() { printf '%s 123 S\\n' \"$$\"; };", 44),
-            ("ps() { printf '%s 99 S\\n100 123 R\\n' \"$$\"; };", 43),
+            ("exit 1", 44),
+            (":", 44),
+            ("printf 'not a process table\\n'", 44),
+            // The thread census is pid, lwp, pgid, stat, nlwp (be002dc0).
+            ("printf '10 10 10 S 1\\n'", 44),
+            ("printf '%s %s 123 S 1\\n' \"$OBS\" \"$OBS\"", 44),
             (
-                "ps() { printf '%s 99 S\\n100 123 Z\\n101 123 S\\n' \"$$\"; };",
+                "printf '%s %s 99 S 1\\n100 100 123 R 1\\n' \"$OBS\" \"$OBS\"",
                 43,
             ),
-            ("ps() { printf '%s 99 S\\n100 123 Z\\n' \"$$\"; };", 0),
-            ("ps() { printf '%s 99 S\\n' \"$$\"; };", 0),
+            (
+                "printf '%s %s 99 S 1\\n100 100 123 Z 1\\n101 101 123 S 1\\n' \"$OBS\" \"$OBS\"",
+                43,
+            ),
+            (
+                "printf '%s %s 99 S 1\\n100 100 123 Z 1\\n' \"$OBS\" \"$OBS\"",
+                0,
+            ),
+            ("printf '%s %s 99 S 1\\n' \"$OBS\" \"$OBS\"", 0),
         ] {
-            let prefix = format!("kill() {{ return 0; }}; sleep() {{ :; }}; {probe}");
+            let prefix = format!(
+                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                fake_ps_on_path(&root, probe)
+            );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
-            assert_eq!(output.status.code(), Some(expected), "{probe}: {output:?}");
-            assert_eq!(remote_kill_confirmed(&output, 42), expected == 0);
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(output.status.code(), Some(expected), "{probe}: {output:?}");
+                assert_eq!(remote_kill_confirmed(&output, 42), expected == 0);
+            }
+            // The protocol reads its record with GNU `stat -c` and procfs, so
+            // elsewhere it stops before observing and must never confirm.
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = expected;
+                assert!(!remote_kill_confirmed(&output, 42), "{probe}: {output:?}");
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -2694,8 +3116,13 @@ exec /bin/sh -c "$payload"
             // signals and observations are injected: the reported survivor
             // must keep cancellation unconfirmed after bounded escalation.
             let prefix = format!(
-                "kill() {{ return 0; }}; sleep() {{ :; }}; \
-                 ps() {{ printf '%s 1 S\\n{pgid} {pgid} S\\n' \"$$\"; }};"
+                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                fake_ps_on_path(
+                    &root,
+                    &format!(
+                        "printf '%s %s 1 S 1\\n{pgid} {pgid} {pgid} S 1\\n' \"$OBS\" \"$OBS\""
+                    )
+                )
             );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
             assert_eq!(output.status.code(), Some(45), "{output:?}");
@@ -2727,23 +3154,29 @@ exec /bin/sh -c "$payload"
         let prior_start = start.parse::<u64>().unwrap().checked_add(1).unwrap();
         let root = tempfile::tempdir().unwrap().keep();
         let path = root.join("identity.pgid");
-        for (case, record) in [
-            ("wrong-build", remote_cancel_record(41, pgid)),
+        // Since 812d6a97 a record from another boot is judged by boot evidence
+        // before any live check: the zero UUID is not valid evidence (44,
+        // unavailable). A valid prior boot settles as gone; remote_reboot_recovery.py
+        // covers that. Either way the reused occupant is never signalled.
+        for (case, record, expected) in [
+            ("wrong-build", remote_cancel_record(41, pgid), 43),
             (
                 "wrong-boot",
                 format!("RCH_REMOTE_PROCESS_V1:42:{other_boot}:{pgid}:{start}\n"),
+                44,
             ),
             (
                 // Model a reused leader PID with a different recorded start;
                 // the current PID occupant is a real controlled sentinel.
                 "reused-leader-start",
                 format!("RCH_REMOTE_PROCESS_V1:42:{boot}:{pgid}:{prior_start}\n"),
+                43,
             ),
-            ("legacy-live-group", format!("{pgid}\n")),
+            ("legacy-live-group", format!("{pgid}\n"), 43),
         ] {
             std::fs::write(&path, &record).unwrap();
             let output = remote_cancel_probe_fixture(&path, "").await;
-            assert_eq!(output.status.code(), Some(43), "{case}: {output:?}");
+            assert_eq!(output.status.code(), Some(expected), "{case}: {output:?}");
             assert!(
                 output.stdout.is_empty(),
                 "{case}: false cancellation receipt"
@@ -2882,39 +3315,105 @@ exec /bin/sh -c "$payload"
         const CHILD_ROOT: &str = "RCH_REMOTE_CANCEL_TEST_ROOT";
         if let Some(root) = std::env::var_os(CHILD_ROOT).map(std::path::PathBuf::from) {
             let pool = WorkerPool::new();
-            let config = rch_common::WorkerConfig::default();
+            let config = rch_common::WorkerConfig {
+                host: "admitted.example".into(),
+                user: "admitted-user".into(),
+                identity_file: "/admitted/key with spaces".into(),
+                ..rch_common::WorkerConfig::default()
+            };
             let id = config.id.clone();
-            pool.add_worker(config).await;
+            pool.add_worker(config.clone()).await;
             let worker = pool.get(&id).await.unwrap();
             assert!(worker.reserve_slots(3).await);
             let history = Arc::new(BuildHistory::new(100));
-            let active = history.start_active_build(
-                "receipt".to_owned(),
-                id.to_string(),
-                "cargo test".to_owned(),
-                0,
-                1,
-                rch_common::BuildLocation::Remote,
-            );
+            let active = history
+                .try_start_active_build_with_waiter(
+                    "receipt".to_owned(),
+                    id.to_string(),
+                    "cargo test".to_owned(),
+                    0,
+                    None,
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            // Running ownership remains on the original host after this ID
+            // points elsewhere; the replacement keeps its other reservations.
+            pool.add_worker(rch_common::WorkerConfig {
+                host: "replacement.example".into(),
+                user: "replacement-user".into(),
+                identity_file: "/replacement/key".into(),
+                ..config.clone()
+            })
+            .await;
             std::fs::write(root.join("build-id"), active.id.to_string()).unwrap();
             let ctx = make_test_context(pool, history.clone());
-            let orch = CancellationOrchestrator::new(test_config(), test_events());
+            // A loaded Mac took over 1 s to run the fake ssh for "confirmed".
+            let orch = CancellationOrchestrator::new(
+                CancellationConfig {
+                    remote_kill_timeout: Duration::from_secs(10),
+                    ..test_config()
+                },
+                test_events(),
+            );
             for mode in [
                 "empty",
                 "truncated",
                 "wrong-id",
                 "duplicate",
                 "failed",
+                "hang",
                 "confirmed",
             ] {
                 std::fs::write(root.join("mode"), mode).unwrap();
                 let mut record = test_record(CancellationState::Requested, 0, false);
                 record.build_id = active.id;
                 record.worker_id = id.to_string();
+                record.worker_endpoint = active.worker_endpoint.clone();
                 record.hook_pid = 0;
                 record.slots_released = 0;
                 record.remote_pgid_file = Some("/test/owned-group.pgid".to_owned());
-                orch.execute_cancellation(&ctx, &mut record, true).await;
+                if mode == "hang" {
+                    let bounded = CancellationOrchestrator::new(
+                        CancellationConfig {
+                            cleanup_timeout: Duration::from_secs(1),
+                            remote_kill_timeout: Duration::from_secs(60),
+                            ..test_config()
+                        },
+                        test_events(),
+                    );
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        bounded.execute_cancellation(&mut record, true),
+                    )
+                    .await
+                    .expect("overall deadline must bound a hanging admitted transport");
+                } else {
+                    orch.execute_cancellation(&mut record, true).await;
+                }
+                let argv = std::fs::read_to_string(root.join("ssh-argv")).unwrap();
+                let argv: Vec<_> = argv.lines().collect();
+                assert!(
+                    argv.windows(2)
+                        .any(|args| args == ["-i", "/admitted/key with spaces"])
+                );
+                assert!(argv.contains(&"admitted-user@admitted.example"));
+                assert!(!argv.contains(&"replacement-user@replacement.example"));
+                if mode == "hang" {
+                    let pid = std::fs::read_to_string(root.join("hanging-ssh-pid"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    assert!(
+                        wait_for_process_exit(pid, Duration::from_secs(2)).await,
+                        "deadline abandoned the owned SSH process"
+                    );
+                }
                 orch.run_cleanup(&ctx, &mut record).await;
                 if mode == "confirmed" {
                     assert_eq!(record.state, CancellationState::Completed);
@@ -2943,14 +3442,19 @@ exec /bin/sh -c "$payload"
         std::fs::write(
             &ssh,
             r#"#!/bin/sh
+# First, before any other spawn: a short deadline on a loaded host can stop
+# this process before the slower commands below run.
+printf '%s\n' "$$" > "$RCH_REMOTE_CANCEL_TEST_ROOT/hanging-ssh-pid"
 id=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/build-id") || exit 99
 mode=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/mode") || exit 99
+printf '%s\n' "$@" > "$RCH_REMOTE_CANCEL_TEST_ROOT/ssh-argv"
 case "$mode" in
   empty) exit 0;;
   truncated) printf 'RCH_REMOTE_CANCELLED_V1:%s' "$id";;
   wrong-id) printf 'RCH_REMOTE_CANCELLED_V1:0\n';;
   duplicate) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id" "$id";;
   failed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; exit 255;;
+  hang) exec /bin/sleep 60;;
   confirmed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
   *) exit 99;;
 esac
@@ -3017,8 +3521,8 @@ esac
                     },
                     test_events(),
                 );
-                // Zero budget blocks in failure reporting; nonzero budget
-                // blocks in termination. Neither case can reach a real SSH.
+                // Legacy ownership has no admitted remote address. It fails
+                // closed, then blocks only while capturing diagnostic health.
                 let lock = worker.config.write().await;
                 let caller_owner = orch.clone();
                 let caller_context = ctx.clone();
@@ -3035,8 +3539,8 @@ esac
                     .await;
                 assert_eq!(duplicate.status, "cancelling");
                 assert_eq!(duplicate.slots_released, 0);
-                // Keep the lock past the stage deadline, preventing an SSH
-                // spawn even if this test is running on a configured host.
+                // Keep cleanup pending past the termination budget so a
+                // caller's cancellation cannot abandon the owned attempt.
                 tokio::time::sleep(budget + Duration::from_millis(30)).await;
                 drop(lock);
                 wait_for_cancellation_attempts(&orch, 0).await;

@@ -1,0 +1,145 @@
+name: Source ownership admission
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/source-admission.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  admission:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # This preparation run only stores reviewed blobs. It cannot commit or
+    # move refs. Publication replaces this step and permission with read-only CI.
+    permissions:
+      contents: write
+    env:
+      CARGO_NET_RETRY: 2
+      CARGO_HTTP_TIMEOUT: 30
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare the exact reviewed issue 105 candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/admission-evidence"
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'admission-evidence'
+          bases = {
+              'rch/src/hook/ssh.rs': '01b80e1f3bc2e0201538dab81b8b63d276d1dfba',
+              'rch/src/hook/transfer_orchestration.rs': '3772f91b06d83c8c0b01a60cebea6c5c32ca8c37',
+              'rch/src/hook/source_claim_registry.sh': 'd39b910e0545cc3f279a79ddedda3916b9ced6dd',
+              'scripts/test_source_claim_registry.py': 'f7c53ef96f765516a657b1505362694e38bc76a8',
+          }
+          for path, sha in bases.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if actual != sha:
+                  raise RuntimeError(f'{path} changed: {actual}; refusing stale patch')
+              destination = evidence / 'baseline' / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              destination.write_bytes(pathlib.Path(path).read_bytes())
+          def blob(sha):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}",
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  data = base64.b64decode(json.load(response)['content'])
+              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              if actual != sha:
+                  raise RuntimeError('candidate blob digest mismatch')
+              return data
+          patch = evidence / 'reviewed.patch'
+          patch.write_bytes(blob('a53c90cfcb440262b986ab198330c930c25ad4b9'))
+          subprocess.run(['git', 'apply', '--recount', '--check', '--whitespace=error-all', str(patch)], check=True)
+          subprocess.run(['git', 'apply', '--recount', '--whitespace=error-all', str(patch)], check=True)
+          with open('rch/src/hook/source_admission.rs', 'xb') as out:
+              out.write(blob('488fb2e0742be9157821cd436a1702ec06f36d65'))
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          (evidence / 'baseline.json').write_text(json.dumps(bases, indent=2) + '\n')
+          PY
+      - name: Exercise actual source registry exclusion and recovery
+        run: |
+          set -euo pipefail
+          sh -n rch/src/hook/source_claim_registry.sh
+          python3 scripts/test_source_claim_registry.py -v 2>&1 | tee "$RUNNER_TEMP/admission-evidence/registry.log"
+          python3 scripts/tests/test_source_claim_registry.py -v 2>&1 | tee "$RUNNER_TEMP/admission-evidence/registry-compat.log"
+      - name: Select pinned Rust and format reviewed changes
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          rustfmt +"$channel" --edition 2024 --config skip_children=true rch/src/hook/ssh.rs rch/src/hook/transfer_orchestration.rs rch/src/hook/source_admission.rs
+          git diff --check
+      - name: Store prepared source blobs without modifying any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess, urllib.request
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'admission-evidence'
+          paths = ['rch/src/hook/ssh.rs', 'rch/src/hook/transfer_orchestration.rs',
+                   'rch/src/hook/source_admission.rs', 'rch/src/hook/source_claim_registry.sh',
+                   'scripts/test_source_claim_registry.py']
+          entries = []
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs",
+                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode()}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  sha = json.load(response)['sha']
+              if sha != subprocess.check_output(['git', 'hash-object', path], text=True).strip():
+                  raise RuntimeError('prepared source digest mismatch')
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+              destination = evidence / 'candidate' / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              destination.write_bytes(data)
+          report = {'base': os.environ['GITHUB_SHA'], 'files': entries,
+                    'validation': 'real registry tests and pinned formatting passed; Rust integration checks follow'}
+          (evidence / 'prepared.json').write_text(json.dumps(report, indent=2) + '\n')
+          (evidence / 'candidate.diff').write_bytes(subprocess.check_output(['git', 'diff']))
+          print(json.dumps(report, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-admission-prepared-${{ github.sha }}
+          path: ${{ runner.temp }}/admission-evidence
+          retention-days: 7
+      - name: Check the genuine client and execute admission regressions
+        run: |
+          set -euo pipefail
+          cargo check --locked -p rch --bin rch 2>&1 | tee "$RUNNER_TEMP/admission-evidence/check.log"
+          cargo test --locked -p rch --bin rch source_admission_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/admission-evidence/admission-tests.log"
+          cargo test --locked -p rch --bin rch durable_source_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/admission-evidence/durable-tests.log"
+          cargo test --locked -p rch --bin rch worker_projects_topology -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/admission-evidence/topology-tests.log"
+          cargo clippy --locked -p rch --bin rch -- -D warnings 2>&1 | tee "$RUNNER_TEMP/admission-evidence/clippy.log"
+      - name: Workspace validation
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/admission-evidence/workspace-check.log"
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/admission-evidence/workspace-clippy.log"
+          cargo fmt --check 2>&1 | tee "$RUNNER_TEMP/admission-evidence/workspace-fmt.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-admission-results-${{ github.sha }}
+          path: ${{ runner.temp }}/admission-evidence
+          retention-days: 7

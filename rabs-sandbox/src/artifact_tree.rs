@@ -155,6 +155,30 @@ mod linux {
         ) -> io::Result<Self> {
             checkpoint(stopped)?;
             validate_tree_names(required.iter().map(String::as_str))?;
+            Self::scan_with_required(root, required, max_bytes, stopped)
+        }
+
+        /// Inventory a private, quiescent tree without declaring successful
+        /// compiler outputs. Cargo may retain useful completed dependencies
+        /// after another unit fails; that state is only a seed for a later
+        /// private Cargo execution, never a successful artifact offer.
+        /// The complete nonempty tree still satisfies every ordinary path,
+        /// byte, entry, hard-link and mutation check.
+        pub fn scan_complete(
+            root: &Path,
+            max_bytes: u64,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<Self> {
+            Self::scan_with_required(root, &BTreeSet::new(), max_bytes, stopped)
+        }
+
+        fn scan_with_required(
+            root: &Path,
+            required: &BTreeSet<String>,
+            max_bytes: u64,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<Self> {
+            checkpoint(stopped)?;
             let directory = File::from(openat2(
                 CWD,
                 root,
@@ -280,6 +304,32 @@ mod linux {
             self.files.keys().map(String::as_str)
         }
 
+        /// Inventoried directories, including the empty name for the root.
+        /// Private Cargo target clones preserve empty OUT_DIRs as well as files;
+        /// the artifact transport continues to describe only regular files.
+        pub fn directory_names(&self) -> impl Iterator<Item = &str> {
+            self.directories.keys().map(String::as_str)
+        }
+
+        /// Open a directory through the same anchored, no-follow inventory.
+        /// The descriptor may be used to preserve its original timestamp in a
+        /// separate private clone, never to change an immutable shared object.
+        pub fn open_directory(&self, name: &str) -> io::Result<File> {
+            let expected = self
+                .directories
+                .get(name)
+                .ok_or_else(|| invalid("unknown tree directory"))?;
+            let directory = if name.is_empty() {
+                self.root.try_clone()?
+            } else {
+                self.open(name, OFlags::RDONLY | OFlags::DIRECTORY)?
+            };
+            if &Stamp::of(&directory.metadata()?) != expected {
+                return Err(invalid("artifact directory changed during capture"));
+            }
+            Ok(directory)
+        }
+
         /// Counts each exported alias's bytes because each is copied independently.
         #[must_use]
         pub const fn total_bytes(&self) -> u64 {
@@ -376,10 +426,18 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn private() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn inventory_admits_only_closed_internal_hardlinks() {
         use std::io::Read;
-        let root = tempfile::tempdir().unwrap();
+        let root = private();
         std::fs::create_dir(root.path().join("deps")).unwrap();
         std::fs::write(root.path().join("deps/app-hash"), b"binary\0\xff").unwrap();
         std::fs::hard_link(root.path().join("deps/app-hash"), root.path().join("app")).unwrap();
@@ -397,7 +455,7 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"binary\0\xff");
-        let outside = tempfile::tempdir().unwrap();
+        let outside = private();
         std::fs::hard_link(root.path().join("app"), outside.path().join("alias")).unwrap();
         assert!(inventory.verify(&|| false).is_err());
         assert!(TreeInventory::scan(root.path(), &required, 100, &|| false).is_err());
@@ -405,17 +463,44 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn complete_private_inventory_does_not_relax_successful_artifact_requirements() {
+        let root = private();
+        assert!(TreeInventory::scan_complete(root.path(), 100, &|| false).is_err());
+        std::fs::create_dir(root.path().join("deps")).unwrap();
+        std::fs::write(root.path().join("deps/finished.rlib"), b"dependency").unwrap();
+        let required = BTreeSet::from(["missing-final-binary".to_owned()]);
+        assert!(TreeInventory::scan(root.path(), &required, 100, &|| false).is_err());
+        assert!(TreeInventory::scan(root.path(), &BTreeSet::new(), 100, &|| false).is_err());
+        let inventory = TreeInventory::scan_complete(root.path(), 100, &|| false).unwrap();
+        assert_eq!(
+            inventory.names().collect::<Vec<_>>(),
+            ["deps/finished.rlib"]
+        );
+        assert!(TreeInventory::scan_complete(root.path(), 1, &|| false).is_err());
+        assert!(TreeInventory::scan_complete(root.path(), 100, &|| true).is_err());
+        let outside = private();
+        std::fs::hard_link(
+            root.path().join("deps/finished.rlib"),
+            outside.path().join("alias"),
+        )
+        .unwrap();
+        assert!(inventory.verify(&|| false).is_err());
+        assert!(TreeInventory::scan_complete(root.path(), 100, &|| false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn missing_oversized_cancelled_and_nonregular_trees_refuse() {
         use std::os::unix::{fs::symlink, net::UnixListener};
         let required = BTreeSet::from(["app".to_owned()]);
-        let root = tempfile::tempdir().unwrap();
+        let root = private();
         assert!(TreeInventory::scan(root.path(), &required, 10, &|| false).is_err());
         std::fs::write(root.path().join("app"), b"12345").unwrap();
         assert!(TreeInventory::scan(root.path(), &required, 4, &|| false).is_err());
         assert!(TreeInventory::scan(root.path(), &required, 10, &|| true).is_err());
         let _socket = UnixListener::bind(root.path().join("socket")).unwrap();
         assert!(TreeInventory::scan(root.path(), &required, 10, &|| false).is_err());
-        let links = tempfile::tempdir().unwrap();
+        let links = private();
         symlink(root.path().join("app"), links.path().join("app")).unwrap();
         assert!(TreeInventory::scan(links.path(), &required, 10, &|| false).is_err());
     }
@@ -425,7 +510,7 @@ mod tests {
     fn mutation_replacement_and_new_entries_invalidate_inventory() {
         let required = BTreeSet::from(["app".to_owned()]);
         for case in 0..3 {
-            let root = tempfile::tempdir().unwrap();
+            let root = private();
             std::fs::write(root.path().join("app"), b"first").unwrap();
             let inventory = TreeInventory::scan(root.path(), &required, 100, &|| false).unwrap();
             let file = inventory.open_file("app").unwrap();

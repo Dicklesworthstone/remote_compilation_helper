@@ -353,6 +353,18 @@ fn source_claim_roots(authority_roots: &[String]) -> anyhow::Result<(String, Str
     Ok((roots, digest))
 }
 
+/// Reject an unusable intent before its durable journal can strand recovery.
+/// Use the same identity and closure checks as remote acquisition; no path
+/// normalization or new ownership authority is introduced here.
+pub(super) fn validate_source_authority_intent(
+    authority_roots: &[String],
+    identity: &str,
+) -> anyhow::Result<()> {
+    validate_source_identity(identity)?;
+    source_claim_roots(authority_roots)?;
+    Ok(())
+}
+
 fn source_registry_setup(registry: &str) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     format!(
@@ -589,6 +601,34 @@ pub(super) async fn remote_source_authority_was_released(
         b"released" => Ok(true),
         b"pending" => Ok(false),
         _ => anyhow::bail!("invalid durable source release response"),
+    }
+}
+
+/// Reconcile an exact cancellation receipt for a dead job (bd-ey7fr). Like
+/// the release probe, this grants no source read or mutation authority.
+pub(super) async fn remote_source_intent_was_cancelled(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<bool> {
+    let command =
+        source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "cancelled")?;
+    let output = run_offload_ssh_command_with_stdin(
+        worker,
+        "sh -s",
+        command.as_bytes(),
+        Duration::from_secs(15),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot reconcile durable source cancellation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    match output.stdout.as_slice() {
+        b"cancelled" => Ok(true),
+        b"pending" => Ok(false),
+        _ => anyhow::bail!("invalid durable source cancellation response"),
     }
 }
 
@@ -1083,6 +1123,7 @@ async fn finish_source_authority_lock_acquisition(
         };
         tokio::try_join!(write_bootstrap, read_ready)
     };
+    let mut timed_out = false;
     let failure = match timeout(wait_timeout, acquisition).await {
         Ok(Ok(((), 0))) => Some(format!(
             "source-authority lock on {} exited before acquisition",
@@ -1105,10 +1146,13 @@ async fn finish_source_authority_lock_acquisition(
             "failed writing source-authority lock bootstrap or reading readiness on {}: {err}",
             guard.worker_id
         )),
-        Err(_) => Some(format!(
-            "timed out waiting {:?} for source-authority locks on {}",
-            wait_timeout, guard.worker_id
-        )),
+        Err(_) => {
+            timed_out = true;
+            Some(format!(
+                "timed out waiting {:?} for source-authority locks on {}",
+                wait_timeout, guard.worker_id
+            ))
+        }
     };
     if let Some(failure) = failure {
         drop(stdin);
@@ -1126,7 +1170,17 @@ async fn finish_source_authority_lock_acquisition(
         } else {
             String::new()
         };
-        anyhow::bail!("{failure}; stderr={stderr}");
+        let message = format!("{failure}; stderr={stderr}");
+        // Another owner still holds a lock in this closure (bd-p3kuz).
+        let error = if timed_out {
+            anyhow::Error::new(crate::transfer::SourceAuthorityBusy(message))
+        } else {
+            anyhow::anyhow!(message)
+        };
+        return Err(match source_claim_write_fault(&guard.worker_id, &stderr) {
+            Some(fault) => error.context(fault),
+            None => error,
+        });
     }
 
     guard.stdin = Some(stdin);
@@ -1135,6 +1189,32 @@ async fn finish_source_authority_lock_acquisition(
         MAX_SOURCE_LOCK_OUTPUT_BYTES,
     )));
     Ok(guard)
+}
+
+/// The worker's source registry could not persist a record (bd-5ojmb): a
+/// full disk, or an exhausted tmpfs quota as on fmd's /tmp. Report it as the
+/// worker's storage fault on the registry's filesystem, so the release
+/// quarantines the worker until recovery probes measure headroom there,
+/// instead of leaving it selectable for builds that fail at source admission.
+fn source_claim_write_fault(
+    worker_id: &WorkerId,
+    stderr: &str,
+) -> Option<crate::transfer::RemoteUploadDiskFull> {
+    let mut roots: Vec<String> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("RCH_SOURCE_CLAIM_WRITE_FAILED "))
+        .filter_map(|path| {
+            let parent = std::path::Path::new(path.trim()).parent()?;
+            (parent.is_absolute() && parent != std::path::Path::new("/"))
+                .then(|| parent.to_string_lossy().into_owned())
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    (!roots.is_empty()).then(|| crate::transfer::RemoteUploadDiskFull {
+        worker_id: worker_id.to_string(),
+        roots,
+    })
 }
 
 pub(super) fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
@@ -1197,6 +1277,9 @@ async fn run_offload_ssh_command_with_optional_stdin(
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    // The per-file verifier after the rsync barrier also requires clean stderr.
+    // Change only client INFO logging; preserve remote stderr and auth failures.
+    crate::transfer::source_content_barrier::configure_ssh_command(cmd.as_std_mut());
     cmd.arg("-o").arg(format!(
         "ConnectTimeout={}",
         timeout_duration.as_secs().max(1)
@@ -1296,41 +1379,39 @@ fn build_remote_shell_command(platform: WorkerPlatform, remote_cmd: &str) -> Str
     format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
 }
 
-/// Isolated Git overlays live beneath the configured worker staging base,
-/// not beneath the controller's canonical source root. Keep the controller
-/// policy for ordinary mirrors and validate every isolated destination before
-/// any remote topology command can create or repair a path.
+/// Isolated Git overlays and source-content receipt trees live beneath the
+/// configured worker staging base. Keep the controller policy for ordinary
+/// mirrors and validate every isolated destination before any remote topology
+/// command can create or repair a path.
 pub(super) fn remote_preflight_topology_policy(
     controller_policy: &PathTopologyPolicy,
     clean_overlay: bool,
+    source_content_receipt: bool,
     remote_base: &str,
     dispatch_closure_roots: &[PathBuf],
 ) -> anyhow::Result<PathTopologyPolicy> {
-    if !clean_overlay {
+    if !clean_overlay && !source_content_receipt {
         return Ok(controller_policy.clone());
     }
 
     let remote_base = rch_common::types::validate_remote_base(remote_base)
-        .map_err(|error| anyhow::anyhow!("invalid clean-overlay staging base: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("invalid isolated staging base: {error}"))?;
     if remote_base.chars().any(char::is_control) || remote_base.contains('\\') {
-        anyhow::bail!("clean-overlay staging base contains an invalid path character");
+        anyhow::bail!("isolated staging base contains an invalid path character");
     }
     let staging_root = PathBuf::from(remote_base);
     if dispatch_closure_roots.is_empty() {
-        anyhow::bail!("clean-overlay staging preflight requires a planned source root");
+        anyhow::bail!("isolated staging preflight requires a planned source root");
     }
     for root in dispatch_closure_roots {
-        let literal = root.to_str().ok_or_else(|| {
-            anyhow::anyhow!("clean-overlay source destination is not a UTF-8 path")
-        })?;
+        let literal = root
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("isolated source destination is not a UTF-8 path"))?;
         if literal.chars().any(char::is_control)
             || literal.contains('\\')
             || literal.split('/').any(|part| part == "." || part == "..")
         {
-            anyhow::bail!(
-                "invalid clean-overlay source destination: {}",
-                root.display()
-            );
+            anyhow::bail!("invalid isolated source destination: {}", root.display());
         }
         let relative = root.strip_prefix(&staging_root).ok().filter(|relative| {
             !relative.as_os_str().is_empty()
@@ -1340,13 +1421,13 @@ pub(super) fn remote_preflight_topology_policy(
         });
         if relative.is_none() {
             anyhow::bail!(
-                "clean-overlay source destination {} is not a strict descendant of staging base {}",
+                "isolated source destination {} is not a strict descendant of staging base {}",
                 root.display(),
                 staging_root.display()
             );
         }
     }
-    // No worker-global alias is required for an invocation-owned archive.
+    // No worker-global alias is required for an invocation-owned source tree.
     Ok(PathTopologyPolicy::new(staging_root.clone(), staging_root))
 }
 
@@ -1761,6 +1842,35 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
 
+    #[test]
+    fn claim_write_failure_is_a_storage_fault_on_the_registry_filesystem() {
+        let worker = WorkerId::new("ovh-a");
+        // As observed on fmd: the tmpfs quota for the worker user was full.
+        let stderr = "rch-source-registry: 74: printf: printf: I/O error\n\
+                      RCH_SOURCE_CLAIM_WRITE_FAILED /tmp/rch-source-authority-locks/claims-v1/.record-write.WpovmeJjGe\n\
+                      RCH: durable source ownership: cannot persist source cancellation";
+        let fault = source_claim_write_fault(&worker, stderr).unwrap();
+        assert_eq!(fault.worker_id, "ovh-a");
+        assert_eq!(fault.roots, ["/tmp/rch-source-authority-locks/claims-v1"]);
+        let error = anyhow::anyhow!("source-authority lock on ovh-a exited before acquisition")
+            .context(fault)
+            .context("source preparation failed");
+        assert!(crate::transfer::find_remote_upload_disk_full(&error).is_some());
+        // Other refusals, a quoted marker, and relative or bare paths are not faults.
+        for stderr in [
+            "RCH: durable source ownership: unfinished overlapping source owner",
+            "note: RCH_SOURCE_CLAIM_WRITE_FAILED /tmp/x/y",
+            "RCH_SOURCE_CLAIM_WRITE_FAILED relative/file",
+            "RCH_SOURCE_CLAIM_WRITE_FAILED /file",
+            "",
+        ] {
+            assert!(
+                source_claim_write_fault(&worker, stderr).is_none(),
+                "{stderr}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_worker_ownership_repair_streams_large_closure() {
@@ -2084,6 +2194,18 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     }
 
     #[cfg(target_os = "linux")]
+    fn source_lock_test_dir() -> PathBuf {
+        // RCH places TMPDIR inside its exclusively held source snapshot.
+        // These tests acquire real hierarchical source locks, so their
+        // independent repositories must be outside that enclosing grant.
+        tempfile::Builder::new()
+            .prefix("rch-source-lock-test-")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep()
+    }
+
+    #[cfg(target_os = "linux")]
     async fn claim_test_source_closure(roots: &[String]) -> RemoteSourceAuthorityLock {
         let locks = source_authority_lock_plan(roots, true).unwrap();
         let script = build_remote_source_authority_lock_cmd(
@@ -2324,6 +2446,69 @@ printf 'legacy identity escaped its fence\n' > "$marker"
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn durable_source_registry_repairs_empty_legacy_cancellation_as_unowned() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (content, digest) = source_claim_roots(&roots).unwrap();
+        // rch <= 2.1.16 left exactly this when its cancellation redirect hit
+        // ENOSPC: the record was created and never written.
+        let cancelling = registry.join(format!("ad02.{digest}.cancelling"));
+        std::fs::write(&cancelling, b"").unwrap();
+        let acquire = test_source_intent(&registry, &roots, "ad02", "acquire").await;
+        assert_eq!(acquire.status.code(), Some(73));
+        assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
+        let other_roots = vec![directory.path().join("other").display().to_string()];
+        let mismatched = test_source_intent(&registry, &other_roots, "ad02", "cancel").await;
+        assert_eq!(mismatched.status.code(), Some(73));
+        assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
+        for _ in 0..2 {
+            let output = test_source_intent(&registry, &roots, "ad02", "cancel").await;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"unowned");
+        }
+        let cancelled = registry
+            .join("cancelled")
+            .join(format!("ad02.{digest}.claim"));
+        assert_eq!(std::fs::read(cancelled).unwrap(), content.as_bytes());
+        assert!(!cancelling.exists());
+        let late = test_source_intent(&registry, &roots, "ad02", "acquire").await;
+        assert_eq!(late.status.code(), Some(73));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_keeps_empty_cancellation_beside_a_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (content, digest) = source_claim_roots(&roots).unwrap();
+        // An active grant means ownership is real: the empty record is not
+        // provably the never-granted legacy case, so it must still refuse.
+        let active = registry.join(format!("ad03.{digest}.claim"));
+        let cancelling = registry.join(format!("ad03.{digest}.cancelling"));
+        std::fs::write(&active, content.as_bytes()).unwrap();
+        std::fs::write(&cancelling, b"").unwrap();
+        let output = test_source_intent(&registry, &roots, "ad03", "cancel").await;
+        assert_eq!(output.status.code(), Some(73));
+        assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
+        assert_eq!(std::fs::read(&active).unwrap(), content.as_bytes());
+        assert!(
+            !registry
+                .join("cancelled")
+                .join(format!("ad03.{digest}.claim"))
+                .exists()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn durable_source_registry_write_failure_keeps_partial_bytes_private() {
         for limit in [0, 1] {
             let directory = tempfile::tempdir().unwrap();
@@ -2428,7 +2613,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[tokio::test]
     async fn durable_source_holder_loss_preserves_snapshot_until_surviving_activity_drains() {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let parent = directory.join("parent with ' quotes; $cash");
         let nested = parent.join("nested");
@@ -2539,10 +2724,102 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         }
     }
 
+    /// The registry runs under the WORKER's `sh`. macOS workers have bash 3.2
+    /// there (a bare `pattern)` inside `$(...)` is a parse error), BSD awk
+    /// (no NUL in strings) and BSD realpath/mv, so every source-claimed build
+    /// to a Mac worker was refused at the registry (2026-10-13).
+    #[test]
+    fn source_registry_script_parses_under_the_system_sh() {
+        let script = format!(
+            "{}\n{}",
+            rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+            SOURCE_CLAIM_REGISTRY,
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_source_registry_lifecycle_runs_on_the_workers_userland() {
+        let gnu_realpath = ["realpath -m /", "grealpath -m /"].iter().any(|probe| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("{probe} >/dev/null 2>&1")])
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        let flock = std::process::Command::new("sh")
+            .args(["-c", "command -v flock >/dev/null"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !gnu_realpath || !flock {
+            eprintln!("skipping: needs flock and GNU realpath (grealpath on macOS)");
+            return;
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("rch-source-registry-portable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let registry = directory.path().join("registry");
+        let root = directory.path().join("source");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(directory.path().join("other")).unwrap();
+        let roots = |path: &Path| vec![path.display().to_string()];
+        let run = |path: PathBuf, identity: String, operation: &'static str| {
+            let registry = registry.clone();
+            async move {
+                let command = source_intent_command(
+                    registry.to_str().unwrap(),
+                    &roots(&path),
+                    &identity,
+                    operation,
+                )
+                .unwrap();
+                Command::new("sh")
+                    .args(["-c", &command])
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap()
+            }
+        };
+        let id = || uuid::Uuid::new_v4().simple().to_string();
+        let owner = id();
+        let ok = |output: &Output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        ok(&run(root.clone(), owner.clone(), "acquire").await);
+        let overlapping = run(root.join("sub"), id(), "acquire").await;
+        assert!(!overlapping.status.success());
+        assert!(
+            String::from_utf8_lossy(&overlapping.stderr).contains("overlapping source owner"),
+            "{}",
+            String::from_utf8_lossy(&overlapping.stderr)
+        );
+        ok(&run(directory.path().join("other"), id(), "acquire").await);
+        ok(&run(root.clone(), owner.clone(), "recover").await);
+        ok(&run(root.clone(), owner, "release").await);
+        ok(&run(root.join("sub"), id(), "acquire").await);
+        // Cancelling an intent that never acquired leaves an unowned tombstone.
+        ok(&run(directory.path().join("never"), id(), "cancel").await);
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_intent_cancel_fences_absent_and_late_claims() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let roots = vec![directory.join("source").display().to_string()];
         let identity = uuid::Uuid::new_v4().simple().to_string();
@@ -2593,7 +2870,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[tokio::test]
     async fn durable_source_activity_serializes_surviving_writer_before_compiler() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let root = directory.join("source");
         std::fs::create_dir_all(&root).unwrap();
@@ -2683,7 +2960,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[tokio::test]
     async fn durable_source_cancellation_blocks_overlapping_writers_through_cleanup() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let parent = directory.join("parent");
         let nested = parent.join("nested");
@@ -2760,8 +3037,55 @@ printf 'legacy identity escaped its fence\n' > "$marker"
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn durable_source_cancellation_receipt_is_reported_read_only_for_its_exact_roots() {
+        // bd-ey7fr: recovery settles a dead job whose grant was cancelled
+        // after execution, instead of retrying a refused reattach forever.
+        let directory = source_lock_test_dir();
+        let registry = directory.join("registry");
+        let source = directory.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let roots = vec![source.display().to_string()];
+        let other = vec![directory.join("other").display().to_string()];
+        let probe = async |roots: &[String]| {
+            test_source_intent(&registry, roots, "ac01", "cancelled").await
+        };
+        let unclaimed = probe(&roots).await;
+        assert!(unclaimed.status.success());
+        assert_eq!(unclaimed.stdout, b"pending");
+        let mut owner = claim_test_durable_source_closure(&registry, &roots, "ac01", "acquire")
+            .await
+            .unwrap();
+        drop(owner.stdin.take());
+        owner.child.as_mut().unwrap().wait().await.unwrap();
+        drop(owner);
+        assert_eq!(probe(&roots).await.stdout, b"pending");
+        let cancellation = test_source_intent(&registry, &roots, "ac01", "cancel").await;
+        assert_eq!(cancellation.stdout, b"owned");
+        assert_eq!(probe(&roots).await.stdout, b"pending");
+        assert!(
+            test_source_intent(&registry, &roots, "ac01", "finish-cancel")
+                .await
+                .status
+                .success()
+        );
+        let cancelled = probe(&roots).await;
+        assert!(cancelled.status.success());
+        assert_eq!(cancelled.stdout, b"cancelled");
+        assert!(
+            claim_test_durable_source_closure(&registry, &roots, "ac01", "recover")
+                .await
+                .is_err()
+        );
+        assert_eq!(probe(&roots).await.stdout, b"cancelled");
+        let mismatched = probe(&other).await;
+        assert!(!mismatched.status.success());
+        assert!(String::from_utf8_lossy(&mismatched.stderr).contains("source claim roots changed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn durable_source_siblings_and_exact_pending_recovery_preserve_authority() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let left = vec![directory.join("left").display().to_string()];
         let right = vec![directory.join("right").display().to_string()];
@@ -2802,7 +3126,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_claims_fence_worker_path_aliases_after_holder_loss() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let real = directory.join("physical");
         std::fs::create_dir_all(real.join("nested")).unwrap();
@@ -2839,7 +3163,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn explicit_topology_setup_waits_for_sources_and_cancellation_fences_late_retarget() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         for (index, job_uses_alias) in [false, true].into_iter().enumerate() {
             let fixture = directory.join(format!("topology-{index}"));
@@ -2939,7 +3263,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         use super::super::dependency_closure::build_sync_closure_plan;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let parent = dir.join("repository");
         let nested = parent.join("standalone");
         std::fs::create_dir_all(nested.join("src")).unwrap();
@@ -3060,7 +3384,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_authority_hierarchy_disjoint_siblings_proceed_concurrently() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let first_root = dir.join("left");
         let second_root = dir.join("right");
         std::fs::create_dir_all(&first_root).unwrap();
@@ -3102,7 +3426,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             guard.release().await.unwrap();
             output.stdout
         }
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let parent = dir.join("a");
         let nested = parent.join("child");
         let sibling = dir.join("z");
@@ -3459,7 +3783,12 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[test]
     fn source_authority_lock_is_held_until_owner_stdin_closes() {
         let _guard = test_guard!();
-        let (mut first, first_ready) = spawn_local_source_lock("/tmp", "FIRST_READY");
+        // Production locks are hashed regular files (source_authority_lock_path);
+        // the GNU holder refuses a directory, so never lock a root directly.
+        let locks = tempfile::tempdir().unwrap();
+        let lock = locks.path().join("authority.lock");
+        let lock = lock.to_string_lossy();
+        let (mut first, first_ready) = spawn_local_source_lock(&lock, "FIRST_READY");
         assert_eq!(
             first_ready
                 .recv_timeout(Duration::from_secs(2))
@@ -3469,7 +3798,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "FIRST_READY"
         );
 
-        let (mut second, second_ready) = spawn_local_source_lock("/tmp", "SECOND_READY");
+        let (mut second, second_ready) = spawn_local_source_lock(&lock, "SECOND_READY");
         assert!(
             matches!(
                 second_ready.recv_timeout(Duration::from_millis(200)),
@@ -3615,7 +3944,11 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             .await;
             let error = match result {
                 Ok(_) => panic!("invalid holder must fail acquisition"),
-                Err(error) => error.to_string(),
+                Err(error) => {
+                    // Only a wait that outlived its deadline is a busy source.
+                    assert!(!crate::transfer::source_authority_busy(&error));
+                    error.to_string()
+                }
             };
             assert!(error.contains(expected), "{error}");
             assert!(error.contains("lock refused"), "{error}");
@@ -3657,7 +3990,11 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         .await;
         let error = match result {
             Ok(_) => panic!("combined write/readiness deadline must not reset"),
-            Err(error) => error.to_string(),
+            Err(error) => {
+                // bd-p3kuz: the release must tell rchd the source was held.
+                assert!(crate::transfer::source_authority_busy(&error));
+                error.to_string()
+            }
         };
         assert!(error.contains("timed out waiting"), "{error}");
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
@@ -3731,10 +4068,13 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[test]
     fn disjoint_source_authorities_do_not_serialize() {
         let _guard = test_guard!();
-        let current_dir = std::env::current_dir().expect("current directory");
-        let current_dir = current_dir.to_string_lossy().to_string();
-        let (mut first, first_ready) = spawn_local_source_lock("/tmp", "TMP_READY");
-        let (mut second, second_ready) = spawn_local_source_lock(&current_dir, "REPO_READY");
+        let locks = tempfile::tempdir().unwrap();
+        let tmp_lock = locks.path().join("tmp.lock");
+        let repo_lock = locks.path().join("repo.lock");
+        let (mut first, first_ready) =
+            spawn_local_source_lock(&tmp_lock.to_string_lossy(), "TMP_READY");
+        let (mut second, second_ready) =
+            spawn_local_source_lock(&repo_lock.to_string_lossy(), "REPO_READY");
 
         assert_eq!(
             first_ready
@@ -3809,19 +4149,29 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     }
 
     #[test]
-    fn clean_overlay_staging_maps_worker_paths_without_changing_controller_policy() {
+    fn isolated_staging_maps_worker_paths_without_changing_controller_policy() {
         let controller = PathTopologyPolicy::default();
         let base = "/Users/jemanuel/.cache/rch-release";
         let roots = vec![PathBuf::from(format!("{base}/asupersync/job-1"))];
-        let staged = remote_preflight_topology_policy(&controller, true, base, &roots)
+        for (clean_overlay, source_content_receipt) in [(true, false), (false, true), (true, true)]
+        {
+            let staged = remote_preflight_topology_policy(
+                &controller,
+                clean_overlay,
+                source_content_receipt,
+                base,
+                &roots,
+            )
             .expect("Mac staging path is independent of Linux controller source path");
-        assert_eq!(staged.canonical_root(), Path::new(base));
-        assert_eq!(staged.alias_root(), staged.canonical_root());
-        assert_eq!(controller.canonical_root(), Path::new("/data/projects"));
-        assert_eq!(controller.alias_root(), Path::new("/dp"));
+            assert_eq!(staged.canonical_root(), Path::new(base));
+            assert_eq!(staged.alias_root(), staged.canonical_root());
+            assert_eq!(controller.canonical_root(), Path::new("/data/projects"));
+            assert_eq!(controller.alias_root(), Path::new("/dp"));
+        }
 
         let ordinary = remote_preflight_topology_policy(
             &controller,
+            false,
             false,
             base,
             &[PathBuf::from("/data/projects/asupersync")],
@@ -3832,110 +4182,138 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     }
 
     #[test]
-    fn clean_overlay_staging_refuses_every_destination_outside_the_exact_base() {
+    fn isolated_staging_refuses_every_destination_outside_the_exact_base() {
         let controller = PathTopologyPolicy::default();
         let base = "/Users/jemanuel/.cache/rch-release";
         let valid = PathBuf::from(format!("{base}/asupersync/job-1"));
-        for invalid in [
-            base.to_string(),
-            format!("{base}-peer/asupersync/job-1"),
-            format!("{base}/../peer/job-1"),
-            format!("{base}/asupersync/../../peer"),
-            format!("{base}/./asupersync/job-1"),
-            format!("{base}/asupersync/evil\npath"),
-            format!("{base}/asupersync\\peer"),
-            "/data/projects/asupersync".to_string(),
-            "asupersync/job-1".to_string(),
-        ] {
-            let roots = vec![valid.clone(), PathBuf::from(&invalid)];
-            assert!(
-                remote_preflight_topology_policy(&controller, true, base, &roots).is_err(),
-                "a valid first root must not hide invalid destination {invalid:?}"
-            );
-        }
-        assert!(remote_preflight_topology_policy(&controller, true, base, &[]).is_err());
-        for invalid_base in [
-            "/",
-            "/tmp",
-            "relative/base",
-            "/tmp/rch/../peer",
-            "/tmp/rch\n",
-        ] {
+        for (clean_overlay, source_content_receipt) in [(true, false), (false, true), (true, true)]
+        {
+            for invalid in [
+                base.to_string(),
+                format!("{base}-peer/asupersync/job-1"),
+                format!("{base}/../peer/job-1"),
+                format!("{base}/asupersync/../../peer"),
+                format!("{base}/./asupersync/job-1"),
+                format!("{base}/asupersync/evil\npath"),
+                format!("{base}/asupersync\\peer"),
+                "/data/projects/asupersync".to_string(),
+                "asupersync/job-1".to_string(),
+            ] {
+                let roots = vec![valid.clone(), PathBuf::from(&invalid)];
+                assert!(
+                    remote_preflight_topology_policy(
+                        &controller,
+                        clean_overlay,
+                        source_content_receipt,
+                        base,
+                        &roots,
+                    )
+                    .is_err(),
+                    "a valid first root must not hide invalid destination {invalid:?}"
+                );
+            }
             assert!(
                 remote_preflight_topology_policy(
                     &controller,
-                    true,
-                    invalid_base,
-                    std::slice::from_ref(&valid),
+                    clean_overlay,
+                    source_content_receipt,
+                    base,
+                    &[],
                 )
-                .is_err(),
-                "invalid staging base {invalid_base:?} must refuse before any remote command"
+                .is_err()
             );
+            for invalid_base in [
+                "/",
+                "/tmp",
+                "relative/base",
+                "/tmp/rch/../peer",
+                "/tmp/rch\n",
+            ] {
+                assert!(
+                    remote_preflight_topology_policy(
+                        &controller,
+                        clean_overlay,
+                        source_content_receipt,
+                        invalid_base,
+                        std::slice::from_ref(&valid),
+                    )
+                    .is_err(),
+                    "invalid staging base {invalid_base:?} must refuse before any remote command"
+                );
+            }
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn clean_overlay_staging_preflight_creates_only_its_base_without_an_alias() {
+    fn isolated_staging_preflight_creates_only_its_base_without_an_alias() {
         let _guard = test_guard!();
-        let raw = tempfile::tempdir().expect("owned topology fixture");
-        let fixture = raw.path().canonicalize().expect("physical fixture path");
-        let controller_root = fixture.join("controller-projects");
-        let controller_alias = fixture.join("controller-alias");
-        // Both controller paths are intentionally unusable as worker topology.
-        // The old preflight would refuse this regular-file canonical root.
-        std::fs::write(&controller_root, b"controller source must stay untouched")
-            .expect("controller sentinel");
-        std::fs::write(&controller_alias, b"peer alias must stay untouched")
-            .expect("peer alias sentinel");
-        let controller = PathTopologyPolicy::new(controller_root.clone(), controller_alias.clone());
-        let staging_base = fixture.join("worker staging");
-        let source_root = staging_base.join("asupersync/job-1");
-        let staged = remote_preflight_topology_policy(
-            &controller,
-            true,
-            staging_base.to_str().expect("UTF-8 fixture path"),
-            std::slice::from_ref(&source_root),
-        )
-        .expect("valid isolated staging topology");
-        let command = build_worker_projects_topology_cmd(&staged, true);
-        for _ in 0..2 {
-            let output = std::process::Command::new("sh")
-                .args(["-c", &command])
-                .output()
-                .expect("execute actual topology shell command");
-            assert!(
-                output.status.success(),
-                "staging preflight failed: status={:?}, stdout={}, stderr={}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("RCH_TOPOLOGY_OK"));
-            assert!(staging_base.is_dir());
-            assert!(
-                !staging_base.is_symlink(),
-                "alias==canonical stays a directory"
-            );
-            assert!(
-                !source_root.exists(),
-                "preflight only prepares the staging base"
-            );
-            assert_eq!(
-                std::fs::read(&controller_root).expect("controller sentinel survives"),
-                b"controller source must stay untouched"
-            );
-            assert_eq!(
-                std::fs::read(&controller_alias).expect("peer alias sentinel survives"),
-                b"peer alias must stay untouched"
-            );
-            assert_eq!(
-                std::fs::read_dir(&fixture)
-                    .expect("fixture entries")
-                    .count(),
-                3,
-                "preflight must not create another alias or touch a peer tree"
-            );
+        for (clean_overlay, source_content_receipt) in [(true, false), (false, true), (true, true)]
+        {
+            let raw = tempfile::tempdir().expect("owned topology fixture");
+            let fixture = raw.path().canonicalize().expect("physical fixture path");
+            let controller_root = fixture.join("controller-projects");
+            let controller_alias = fixture.join("controller-alias");
+            // Both controller paths are intentionally unusable as worker topology.
+            // The old preflight would refuse this regular-file canonical root.
+            std::fs::write(&controller_root, b"controller source must stay untouched")
+                .expect("controller sentinel");
+            std::fs::write(&controller_alias, b"peer alias must stay untouched")
+                .expect("peer alias sentinel");
+            let controller =
+                PathTopologyPolicy::new(controller_root.clone(), controller_alias.clone());
+            let staging_base = fixture.join("worker staging");
+            let source_roots = [
+                staging_base.join("asupersync/job-1"),
+                staging_base.join("asupersync/dependency-1"),
+            ];
+            let staged = remote_preflight_topology_policy(
+                &controller,
+                clean_overlay,
+                source_content_receipt,
+                staging_base.to_str().expect("UTF-8 fixture path"),
+                &source_roots,
+            )
+            .expect("valid isolated staging topology");
+            let command = build_worker_projects_topology_cmd(&staged, true);
+            for _ in 0..2 {
+                let output = std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .output()
+                    .expect("execute actual topology shell command");
+                assert!(
+                    output.status.success(),
+                    "staging preflight failed: status={:?}, stdout={}, stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("RCH_TOPOLOGY_OK"));
+                assert!(staging_base.is_dir());
+                assert!(
+                    !staging_base.is_symlink(),
+                    "alias==canonical stays a directory"
+                );
+                assert!(
+                    source_roots.iter().all(|root| !root.exists()),
+                    "preflight only prepares the staging base"
+                );
+                assert_eq!(
+                    std::fs::read(&controller_root).expect("controller sentinel survives"),
+                    b"controller source must stay untouched"
+                );
+                assert_eq!(
+                    std::fs::read(&controller_alias).expect("peer alias sentinel survives"),
+                    b"peer alias must stay untouched"
+                );
+                assert_eq!(
+                    std::fs::read_dir(&fixture)
+                        .expect("fixture entries")
+                        .count(),
+                    3,
+                    "preflight must not create another alias or touch a peer tree"
+                );
+            }
         }
     }
 

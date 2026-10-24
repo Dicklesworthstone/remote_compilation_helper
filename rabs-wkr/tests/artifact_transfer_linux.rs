@@ -56,7 +56,7 @@ fn connect_worker() -> (OwnedChild, BufReader<TcpStream>, TcpStream) {
             "artifact-test",
             "--once",
         ])
-        .env("RABS_WORKER_STATE_DIR", state.path())
+        .env("RABS_WORKER_STATE_DIR", state.path().join("state"))
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -120,6 +120,64 @@ fn toolchain() -> PathBuf {
         .and_then(Path::parent)
         .expect("toolchain/bin/cargo")
         .to_path_buf()
+}
+
+fn link_or_copy(src: &Path, dst: &Path) {
+    if std::fs::hard_link(src, dst).is_err() {
+        std::fs::copy(src, dst).unwrap();
+    }
+}
+
+fn stage_minimal_rustc(host_toolchain: &Path) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let staged = tempfile::Builder::new()
+        .prefix("rabs-art-rustc-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let root = staged.path();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    let rustc_src = host_toolchain.join("bin/rustc");
+    link_or_copy(&rustc_src, &root.join("bin/rustc"));
+
+    let vv = Command::new(&rustc_src)
+        .arg("-vV")
+        .output()
+        .expect("rustc -vV");
+    let vv_str = String::from_utf8_lossy(&vv.stdout);
+    let host_triple = vv_str
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("host triple in rustc -vV")
+        .trim();
+
+    for entry in std::fs::read_dir(host_toolchain.join("lib")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if (name_str.starts_with("librustc_driver-") || name_str.starts_with("libLLVM"))
+            && entry.file_type().unwrap().is_file()
+        {
+            link_or_copy(&entry.path(), &root.join("lib").join(&name));
+        }
+    }
+
+    let rel_target_lib = format!("lib/rustlib/{host_triple}/lib");
+    std::fs::create_dir_all(root.join(&rel_target_lib)).unwrap();
+    for entry in std::fs::read_dir(host_toolchain.join(&rel_target_lib)).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.ends_with(".rmeta")
+            && !name_str.starts_with("libtest-")
+            && !name_str.starts_with("libproc_macro-")
+            && entry.file_type().unwrap().is_file()
+        {
+            link_or_copy(&entry.path(), &root.join(&rel_target_lib).join(&name));
+        }
+    }
+    staged
 }
 
 fn decode_hex(text: &str) -> Vec<u8> {
@@ -231,6 +289,7 @@ fn canonical_compile_returns_usable_rlib_rmeta_and_dep_info_before_acknowledged_
     )
     .unwrap();
     let toolchain = toolchain();
+    let staged_toolchain = stage_minimal_rustc(&toolchain);
     let (mut worker, mut reader, mut writer) = connect_worker();
     send(
         &mut writer,
@@ -239,12 +298,12 @@ fn canonical_compile_returns_usable_rlib_rmeta_and_dep_info_before_acknowledged_
     // The individual --emit=kind=path outputs are explicit. The worker must
     // not rewrite argv or guess a Cargo output set from the crate name.
     let request = json!({
-        "kind": "canonical-exec", "request_id": 42, "timeout_ms": 60000,
+        "kind": "canonical-exec", "request_id": 42, "timeout_ms": 120000,
         "program": "/__rabs/toolchain/bin/rustc",
         "args": ["--edition=2024", "--crate-name", "artifact_demo", "--crate-type=rlib",
             "/__rabs/workspace/lib.rs",
             "--emit=link=/__rabs/out/dep/libartifact_demo.rlib,metadata=/__rabs/out/dep/libartifact_demo.rmeta,dep-info=/__rabs/out/dep/artifact_demo.d"],
-        "toolchain_backing": toolchain, "workspace_backing": source.path(),
+        "toolchain_backing": staged_toolchain.path(), "workspace_backing": source.path(),
         "artifacts": {"unit": "dep", "files": ["libartifact_demo.rmeta", "artifact_demo.d", "libartifact_demo.rlib"]}
     });
     send(&mut writer, &request);
@@ -488,10 +547,18 @@ printf runtime > "$HOME/runtime.txt"
 test "$(cat "$HOME/runtime.txt")" = runtime
 printf 'exact input\n' > /__rabs/out/dep/result.txt
 "#;
+    let empty_toolchain = {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .prefix("rabs-art-sh-tc-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    };
     send(
         &mut writer,
         &json!({"kind":"canonical-exec", "request_id":42, "timeout_ms":30000,
-        "program":"sh", "args":["-c",script], "toolchain_backing":toolchain(),
+        "program":"sh", "args":["-c",script], "toolchain_backing":empty_toolchain.path(),
         "source_manifest":source_manifest, "jobserver_grant":1,
         "artifacts":{"unit":"dep", "files":["result.txt"]}}),
     );

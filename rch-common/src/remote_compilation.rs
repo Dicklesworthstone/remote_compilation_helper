@@ -10,7 +10,7 @@
 //! 6. Comparing binary hashes to verify correctness
 
 use crate::binary_hash::{
-    BinaryHashResult, CanaryVerdict, binary_contains_marker, classify_canary, compute_binary_hash,
+    BinaryHashResult, CanaryVerdict, classify_returned_canary, compute_binary_hash,
 };
 use crate::gc_roots::{remote_cargo_home_base_prelude, remote_cargo_home_expr};
 use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
@@ -298,9 +298,13 @@ impl RemoteCompilationTest {
         // identical* toolchain is a genuine miscompile. Toolchain parity is not
         // probed in this path, so a mismatch with the marker present resolves to
         // advisory drift (PASS) rather than a false failure.
-        let marker_present =
-            binary_contains_marker(&remote_binary_path, &test_marker).unwrap_or(true);
-        let verdict = classify_canary(&local_hash, &remote_hash, marker_present, None);
+        let verdict = classify_returned_canary(
+            &remote_binary_path,
+            &test_marker,
+            &local_hash,
+            &remote_hash,
+            None,
+        )?;
         let success = verdict.passed();
         let total_ms = start.elapsed().as_millis() as u64;
 
@@ -749,6 +753,82 @@ mod tests {
     use crate::test_guard;
     use crate::testing::{TestLogger, TestPhase};
     use crate::types::WorkerId;
+
+    #[test]
+    fn returned_canary_requires_readable_nonempty_marker_and_preserves_drift_policy() {
+        use std::io::Write;
+
+        // Marker/classifier integration only, not compiled-worker proof.
+        let retained = tempfile::tempdir().unwrap().keep();
+        let present = retained.join("marker-present.bin");
+        let absent = retained.join("marker-absent.bin");
+        let missing = retained.join("never-created.bin");
+        let directory = retained.join("not-a-binary");
+        let marker = "rch-returned-canary-test-marker";
+        let present_bytes = format!("prefix\0{marker}\0suffix").into_bytes();
+        let absent_bytes = b"prefix\0different-marker\0suffix";
+        std::fs::File::create_new(&present)
+            .unwrap()
+            .write_all(&present_bytes)
+            .unwrap();
+        std::fs::File::create_new(&absent)
+            .unwrap()
+            .write_all(absent_bytes)
+            .unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        let local = BinaryHashResult {
+            full_hash: "supplied-local-full-hash".to_owned(),
+            code_hash: "supplied-local-code-hash".to_owned(),
+            text_section_size: 100,
+            is_debug: false,
+        };
+        for drift in [false, true] {
+            let mut remote = local.clone();
+            if drift {
+                remote.full_hash = "supplied-remote-full-hash".to_owned();
+                remote.code_hash = "supplied-remote-code-hash".to_owned();
+            }
+            let verdict =
+                classify_returned_canary(&present, marker, &local, &remote, None).unwrap();
+            assert_eq!(
+                verdict,
+                if drift {
+                    CanaryVerdict::ToolchainDrift
+                } else {
+                    CanaryVerdict::Reproduced
+                }
+            );
+            assert!(verdict.passed());
+            assert_eq!(verdict.is_advisory(), drift);
+
+            let verdict = classify_returned_canary(&absent, marker, &local, &remote, None).unwrap();
+            assert_eq!(verdict, CanaryVerdict::MissingMarker);
+            assert!(!verdict.passed());
+
+            for artifact in [&missing, &directory] {
+                let error =
+                    classify_returned_canary(artifact, marker, &local, &remote, None).unwrap_err();
+                assert!(format!("{error:#}").contains("Failed to verify returned canary identity"));
+                assert!(format!("{error:#}").contains("Failed to read binary"));
+                let cause = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .expect("the real artifact read error must remain in the chain");
+                if artifact == &missing {
+                    assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+                }
+            }
+            let error = classify_returned_canary(&present, "", &local, &remote, None).unwrap_err();
+            assert!(error.to_string().contains("empty identity marker"));
+        }
+        assert_eq!(std::fs::read(&present).unwrap(), present_bytes);
+        assert_eq!(std::fs::read(&absent).unwrap(), absent_bytes);
+        assert!(!missing.exists());
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(retained).unwrap().count(), 3);
+    }
 
     #[test]
     fn resolve_cargo_binary_prefers_override_then_rustup_then_path() {

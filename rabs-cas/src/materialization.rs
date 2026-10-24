@@ -39,6 +39,9 @@
 //! - mtime adjustments apply only to private materializations (the
 //!   mode carries the permission).
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod staged;
+
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,7 +91,7 @@ pub fn publish_new_directory(staging: &Path, destination: &Path) -> std::io::Res
         let target = destination.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "output directory needs a name",
+                "destination directory needs a name",
             )
         })?;
         if !std::fs::symlink_metadata(staging)?.is_dir() {
@@ -372,6 +375,29 @@ fn copy_verified(
     mode: MaterializationMode,
     prepare_metadata: &impl Fn(&std::fs::File) -> std::io::Result<()>,
 ) -> Result<(u64, bool), MaterializeError> {
+    copy_verified_with_cloner(
+        source,
+        object,
+        key,
+        parent,
+        destination,
+        mode,
+        prepare_metadata,
+        try_verified_reflink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_verified_with_cloner(
+    source: &str,
+    object: &TypedDigest,
+    key: &str,
+    parent: &Path,
+    destination: &Path,
+    mode: MaterializationMode,
+    prepare_metadata: &impl Fn(&std::fs::File) -> std::io::Result<()>,
+    cloner: impl Fn(&std::fs::File, &std::fs::File, &Path) -> bool,
+) -> Result<(u64, bool), MaterializeError> {
     let mut input = open_cas_copy(source)?;
     let staging = staging_path(parent, destination);
     let mut output = std::fs::OpenOptions::new()
@@ -380,12 +406,13 @@ fn copy_verified(
         .create_new(true)
         .open(&staging)
         .map_err(io_err("create-staging"))?;
-    let reflinked = mode == MaterializationMode::VerifiedCowReflink
-        && try_verified_reflink(&input, &output, parent);
+    let reflinked =
+        mode == MaterializationMode::VerifiedCowReflink && cloner(&input, &output, parent);
     let prepare = if reflinked {
         // Hash the actual private clone, not a potentially changing source.
         output
-            .try_clone()
+            .rewind()
+            .and_then(|()| output.try_clone())
             .map(|clone| input = clone)
             .map_err(io_err("read-cloned-staging"))
     } else {
@@ -1027,6 +1054,372 @@ pub fn plan_notification_replay(
         }
     }
     Ok(stream)
+}
+
+// ---------------------------------------------------------------------
+// H012 & H023: Scoped quarantine flows + periodic scrub & location repair
+// (invariants I15/I33; risk R51).
+// ---------------------------------------------------------------------
+
+use crate::metadata_store::QuarantineScope;
+
+/// Decision-receipt kind recorded when a location or logical object is
+/// verified-repaired (required before [`RabsMetadataStore::release_quarantine_with_receipt`]).
+pub const REPAIR_RECEIPT_KIND: &str = "rabs-quarantine-repair-v1";
+
+/// Decision-receipt kind recorded when a location or logical object enters
+/// quarantine or escalates during scrub/materialization.
+pub const QUARANTINE_RECEIPT_KIND: &str = "rabs-quarantine-v1";
+
+/// One durable row from the `quarantines` table (H012 / R004).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineRow {
+    /// Quarantine scope (`Location < LogicalObject < ActionEntry`).
+    pub scope: QuarantineScope,
+    /// Quarantined subject (store path, object digest key, or action digest key).
+    pub subject: String,
+    /// Recorded quarantine reason.
+    pub reason: String,
+}
+
+/// Outcome of quarantining a corrupt physical location (H012; risk R51).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineEscalationOutcome {
+    /// At least one other healthy replica exists: only the bad physical location
+    /// is quarantined; the logical object and dependent action entries remain valid.
+    LocationIsolated {
+        /// Object digest key.
+        object_key: String,
+        /// The quarantined store path.
+        quarantined_path: String,
+        /// Number of remaining non-quarantined replicas for this object.
+        remaining_healthy_locations: usize,
+    },
+    /// Every replica is corrupt or no healthy replica remains: escalates to
+    /// [`QuarantineScope::LogicalObject`].
+    EscalatedToLogicalObject {
+        /// Object digest key.
+        object_key: String,
+        /// The quarantined store path that triggered escalation.
+        quarantined_path: String,
+    },
+}
+
+/// Report emitted by [`scrub_and_repair_locations`] (bead H023; R004 `verify`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScrubReport {
+    /// Total non-quarantined raw locations inspected.
+    pub scanned_locations: usize,
+    /// Locations whose on-disk bytes matched their declared object digest.
+    pub healthy_locations: usize,
+    /// Locations that failed scrub and were quarantined (`QuarantineScope::Location`).
+    pub quarantined_locations: Vec<String>,
+    /// Quarantined locations that were repaired from a verified alternate replica
+    /// and released with a durable repair receipt.
+    pub repaired_locations: Vec<String>,
+    /// Logical objects (`domain:hex`) escalated to `QuarantineScope::LogicalObject`
+    /// because all replicas failed verification.
+    pub escalated_logical_objects: Vec<String>,
+}
+
+/// List durable quarantine rows, optionally filtered by [`QuarantineScope`].
+///
+/// # Errors
+/// Store errors from querying `quarantines`.
+pub fn list_quarantines(
+    store: &mut dyn RabsMetadataStore,
+    scope_filter: Option<QuarantineScope>,
+) -> Result<Vec<QuarantineRow>, StoreError> {
+    let rows = match scope_filter {
+        Some(scope) => store.query(
+            "SELECT scope, subject, reason FROM quarantines \
+             WHERE scope = ?1 ORDER BY scope, subject",
+            &[SqlValue::Text(scope.as_str().to_owned())],
+        )?,
+        None => store.query(
+            "SELECT scope, subject, reason FROM quarantines ORDER BY scope, subject",
+            &[],
+        )?,
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let [
+            SqlValue::Text(scope_str),
+            SqlValue::Text(subject),
+            SqlValue::Text(reason),
+        ] = row.as_slice()
+        else {
+            return Err(StoreError::Corruption("quarantines row shape".to_owned()));
+        };
+        let scope = QuarantineScope::from_str_name(scope_str).ok_or_else(|| {
+            StoreError::Corruption(format!("unknown quarantine scope {scope_str}"))
+        })?;
+        out.push(QuarantineRow {
+            scope,
+            subject: subject.clone(),
+            reason: reason.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Inspect one quarantine entry by `(scope, subject)`.
+///
+/// # Errors
+/// Store errors from querying `quarantines`.
+pub fn inspect_quarantine(
+    store: &mut dyn RabsMetadataStore,
+    scope: QuarantineScope,
+    subject: &str,
+) -> Result<Option<QuarantineRow>, StoreError> {
+    let rows = store.query(
+        "SELECT reason FROM quarantines WHERE scope = ?1 AND subject = ?2 LIMIT 1",
+        &[
+            SqlValue::Text(scope.as_str().to_owned()),
+            SqlValue::Text(subject.to_owned()),
+        ],
+    )?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let [SqlValue::Text(reason)] = first.as_slice() else {
+        return Err(StoreError::Corruption(
+            "quarantines reason shape".to_owned(),
+        ));
+    };
+    Ok(Some(QuarantineRow {
+        scope,
+        subject: subject.to_owned(),
+        reason: reason.clone(),
+    }))
+}
+
+/// Record a verified repair receipt in `decision_receipts` authorizing subsequent
+/// quarantine release via [`RabsMetadataStore::release_quarantine_with_receipt`].
+///
+/// # Errors
+/// Store errors from persisting the receipt.
+pub fn record_verified_repair_receipt(
+    store: &mut dyn RabsMetadataStore,
+    subject: &str,
+    repair_receipt_id: &str,
+    detail: &str,
+    seq: u64,
+) -> Result<(), StoreError> {
+    if repair_receipt_id.trim().is_empty() {
+        return Err(StoreError::QuarantineRequiresRepair);
+    }
+    store.record_decision_receipt(REPAIR_RECEIPT_KIND, subject, seq, repair_receipt_id, detail)
+}
+
+/// Compute the `ATP_OBJECT_CONTENT_DOMAIN` digest key of an on-disk regular file.
+fn verify_file_matches_object_key(path: &str, expected_object_key: &str) -> bool {
+    let Ok(mut file) = open_cas_copy(path) else {
+        return false;
+    };
+    let mut writer = StreamingObjectWriter::new(DigestRequest::default(), None);
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if writer.write(&buf[..n]).is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    let Ok(set) = writer.finish() else {
+        return false;
+    };
+    digest_key(&set.atp_content_id) == expected_object_key
+}
+
+/// Quarantine a corrupt physical location (`QuarantineScope::Location`) and
+/// escalate to `QuarantineScope::LogicalObject` ONLY when no other verified
+/// replica of `object` remains (H012; risk R51).
+///
+/// # Errors
+/// Store errors from updating location/quarantine/receipt rows.
+pub fn quarantine_corrupt_location(
+    store: &mut dyn RabsMetadataStore,
+    object: &TypedDigest,
+    bad_path: &str,
+    reason: &str,
+    seq: u64,
+) -> Result<QuarantineEscalationOutcome, StoreError> {
+    let object_key = digest_key(object);
+    store.set_location_quarantined(object, bad_path, true)?;
+    store.add_quarantine(QuarantineScope::Location, bad_path, reason)?;
+    store.record_decision_receipt(
+        QUARANTINE_RECEIPT_KIND,
+        bad_path,
+        seq,
+        "quarantine-location",
+        reason,
+    )?;
+
+    // Check remaining non-quarantined locations and verify their bytes on disk.
+    let remaining_locations = store.object_locations(object)?;
+    let healthy_count = remaining_locations
+        .iter()
+        .filter(|(path, encoding, _)| {
+            encoding == RAW_PROFILE_V1
+                && path != bad_path
+                && verify_file_matches_object_key(path, &object_key)
+        })
+        .count();
+
+    if healthy_count > 0 {
+        Ok(QuarantineEscalationOutcome::LocationIsolated {
+            object_key,
+            quarantined_path: bad_path.to_owned(),
+            remaining_healthy_locations: healthy_count,
+        })
+    } else {
+        store.add_quarantine(QuarantineScope::LogicalObject, &object_key, reason)?;
+        store.record_decision_receipt(
+            QUARANTINE_RECEIPT_KIND,
+            &object_key,
+            seq,
+            "escalate-logical-object",
+            reason,
+        )?;
+        Ok(QuarantineEscalationOutcome::EscalatedToLogicalObject {
+            object_key,
+            quarantined_path: bad_path.to_owned(),
+        })
+    }
+}
+
+/// Periodic scrub and location-repair workflow (bead H023):
+///
+/// 1. Scans all recorded locations via `reconciliation_scan()`.
+/// 2. Verifies each non-quarantined `raw-v1` file against its `object_key`.
+/// 3. Any corrupt/unreadable location is quarantined under `QuarantineScope::Location`
+///    (and `object_locations.quarantined = 1`) with an incident receipt.
+/// 4. If a healthy verified replica exists for the same `object_key`, repairs the
+///    corrupt location atomically from the verified replica, records a
+///    [`REPAIR_RECEIPT_KIND`] receipt, and releases the location quarantine.
+/// 5. If no healthy replica exists, escalates to `QuarantineScope::LogicalObject`.
+///
+/// # Errors
+/// Store errors from scanning or updating metadata.
+pub fn scrub_and_repair_locations(
+    store: &mut dyn RabsMetadataStore,
+    seq: u64,
+) -> Result<ScrubReport, StoreError> {
+    let rows = store.reconciliation_scan()?;
+    let mut report = ScrubReport::default();
+
+    // Group non-quarantined locations by object_key so we can cross-check replicas.
+    let mut by_object: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        if !row.quarantined {
+            by_object
+                .entry(row.object_key)
+                .or_default()
+                .push(row.store_path);
+        }
+    }
+
+    let mut receipt_seq = seq.max(1);
+    for (object_key, paths) in by_object {
+        let mut healthy_paths = Vec::new();
+        let mut corrupt_paths = Vec::new();
+        for path in &paths {
+            report.scanned_locations += 1;
+            if verify_file_matches_object_key(path, &object_key) {
+                report.healthy_locations += 1;
+                healthy_paths.push(path.clone());
+            } else {
+                corrupt_paths.push(path.clone());
+            }
+        }
+
+        if corrupt_paths.is_empty() {
+            continue;
+        }
+
+        for bad_path in &corrupt_paths {
+            store.query(
+                "UPDATE object_locations SET quarantined = 1 WHERE object_key = ?1 AND store_path = ?2",
+                &[
+                    SqlValue::Text(object_key.clone()),
+                    SqlValue::Text(bad_path.clone()),
+                ],
+            )?;
+            store.add_quarantine(
+                QuarantineScope::Location,
+                bad_path,
+                "scrub-checksum-mismatch",
+            )?;
+            store.record_decision_receipt(
+                QUARANTINE_RECEIPT_KIND,
+                bad_path,
+                receipt_seq,
+                "quarantine-location",
+                "scrub-checksum-mismatch",
+            )?;
+            receipt_seq = receipt_seq.saturating_add(1);
+            report.quarantined_locations.push(bad_path.clone());
+        }
+
+        if let Some(donor) = healthy_paths.first() {
+            // Repair each corrupt location from the verified donor replica.
+            for bad_path in &corrupt_paths {
+                let bad_dest = Path::new(bad_path);
+                let Some(parent) = bad_dest.parent() else {
+                    continue;
+                };
+                let staging = staging_path(parent, bad_dest);
+                if std::fs::copy(donor, &staging).is_ok()
+                    && verify_file_matches_object_key(&staging.to_string_lossy(), &object_key)
+                    && std::fs::rename(&staging, bad_dest).is_ok()
+                {
+                    let repair_id = format!("scrub-repair-{receipt_seq}");
+                    record_verified_repair_receipt(
+                        store,
+                        bad_path,
+                        &repair_id,
+                        &format!("repaired from verified replica {donor}"),
+                        receipt_seq,
+                    )?;
+                    receipt_seq = receipt_seq.saturating_add(1);
+                    store.release_quarantine_with_receipt(
+                        QuarantineScope::Location,
+                        bad_path,
+                        &repair_id,
+                        receipt_seq,
+                    )?;
+                    receipt_seq = receipt_seq.saturating_add(1);
+                    report.repaired_locations.push(bad_path.clone());
+                } else {
+                    let _ = std::fs::remove_file(&staging);
+                }
+            }
+        } else {
+            // All replicas of this object are corrupt: escalate to LogicalObject.
+            store.add_quarantine(
+                QuarantineScope::LogicalObject,
+                &object_key,
+                "scrub-all-replicas-corrupt",
+            )?;
+            store.record_decision_receipt(
+                QUARANTINE_RECEIPT_KIND,
+                &object_key,
+                receipt_seq,
+                "escalate-logical-object",
+                "scrub-all-replicas-corrupt",
+            )?;
+            receipt_seq = receipt_seq.saturating_add(1);
+            report.escalated_logical_objects.push(object_key);
+        }
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -2376,5 +2769,326 @@ mod tests {
             assert_eq!(emitted, stored);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn h017_reflink_clone_branch_verifies_cloned_staging_and_isolates_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"cow-cloned-artifact-payload".repeat(256);
+        let source = dir.path().join("source.rlib");
+        let target = dir.path().join("target.rlib");
+        fs::write(&source, &bytes).unwrap();
+        let before = fs::metadata(&source).unwrap();
+        let object = crate::digest_set::digest_set(&bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+
+        // Exercise the `reflinked == true` branch deterministically via `copy_verified_with_cloner`.
+        let (written, reflinked) = copy_verified_with_cloner(
+            source.to_str().unwrap(),
+            &object,
+            &digest_key(&object),
+            dir.path(),
+            &target,
+            MaterializationMode::VerifiedCowReflink,
+            &|_| Ok(()),
+            |mut src_file, mut dst_file, _parent| {
+                src_file.rewind().unwrap();
+                std::io::copy(&mut src_file, &mut dst_file).unwrap() == bytes.len() as u64
+            },
+        )
+        .expect("verified CoW clone branch must succeed");
+        assert!(reflinked);
+        assert_eq!(written, bytes.len() as u64);
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+
+        // Mutating the materialized target never mutates the CAS source.
+        fs::write(&target, b"mutated target").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&source).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+
+        // If the clone produces corrupt bytes, the `reflinked == true` branch catches the digest mismatch
+        // and leaves the destination untouched.
+        let untouched = dir.path().join("untouched.rlib");
+        let mismatch = copy_verified_with_cloner(
+            source.to_str().unwrap(),
+            &object,
+            &digest_key(&object),
+            dir.path(),
+            &untouched,
+            MaterializationMode::VerifiedCowReflink,
+            &|_| Ok(()),
+            |_src_file, mut dst_file, _parent| {
+                std::io::Write::write_all(&mut dst_file, b"corrupt-cloned-bytes").is_ok()
+            },
+        );
+        assert!(matches!(
+            mismatch,
+            Err(MaterializeError::ContentMismatch { .. })
+        ));
+        assert!(!untouched.exists());
+    }
+
+    #[test]
+    fn h012_t017_location_quarantine_preserves_logical_and_action_validity_when_healthy_replica_exists()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"replicated cas artifact bytes";
+        let (mut store, _layout, object) = store_with_object(dir.path(), bytes);
+        let obj_key = digest_key(&object);
+        let primary_path = store.object_locations(&object).unwrap()[0].0.clone();
+
+        // Add a second verified replica on disk.
+        let replica_b = dir.path().join("replica-b.raw");
+        fs::write(&replica_b, bytes).unwrap();
+        let replica_b_str = replica_b.to_string_lossy().into_owned();
+        store
+            .add_location(&object, &replica_b_str, Some(2), RAW_PROFILE_V1, true)
+            .unwrap();
+
+        // Corrupt replica A on disk.
+        fs::write(&primary_path, b"corrupted replica A").unwrap();
+
+        // Quarantining corrupt replica A isolates the location without escalating to LogicalObject!
+        let outcome = quarantine_corrupt_location(
+            &mut store,
+            &object,
+            &primary_path,
+            "bit-rot-on-disk-a",
+            10,
+        )
+        .expect("quarantine_corrupt_location");
+        assert_eq!(
+            outcome,
+            QuarantineEscalationOutcome::LocationIsolated {
+                object_key: obj_key.clone(),
+                quarantined_path: primary_path.clone(),
+                remaining_healthy_locations: 1,
+            }
+        );
+        assert!(
+            inspect_quarantine(&mut store, QuarantineScope::Location, &primary_path)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            inspect_quarantine(&mut store, QuarantineScope::LogicalObject, &obj_key)
+                .unwrap()
+                .is_none(),
+            "valid alternate replica must prevent logical-object over-quarantine (R51)"
+        );
+
+        // Materialization succeeds immediately from healthy replica B!
+        let dest = dir.path().join("materialized-from-b.rlib");
+        let written =
+            materialize_object(&mut store, &object, &dest, MaterializationMode::PrivateCopy)
+                .expect("must materialize from healthy replica B");
+        assert_eq!(written, bytes.len() as u64);
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+
+        // Release without a verified repair receipt is refused.
+        assert_eq!(
+            store.release_quarantine_with_receipt(
+                QuarantineScope::Location,
+                &primary_path,
+                "forged-receipt",
+                11,
+            ),
+            Err(StoreError::QuarantineRequiresRepair)
+        );
+
+        // Now corrupt replica B too: quarantining replica B escalates to LogicalObject!
+        fs::write(&replica_b, b"corrupted replica B").unwrap();
+        let escalated = quarantine_corrupt_location(
+            &mut store,
+            &object,
+            &replica_b_str,
+            "bit-rot-on-disk-b",
+            12,
+        )
+        .expect("escalate when all replicas corrupt");
+        assert_eq!(
+            escalated,
+            QuarantineEscalationOutcome::EscalatedToLogicalObject {
+                object_key: obj_key.clone(),
+                quarantined_path: replica_b_str,
+            }
+        );
+        assert!(
+            inspect_quarantine(&mut store, QuarantineScope::LogicalObject, &obj_key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn h023_periodic_scrub_detects_seeded_corruption_repairs_from_verified_replica_and_emits_receipt()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"scrubbable-and-repairable-artifact";
+        let (mut store, _layout, object) = store_with_object(dir.path(), bytes);
+        let obj_key = digest_key(&object);
+        let primary_path = store.object_locations(&object).unwrap()[0].0.clone();
+
+        // Add a second replica and corrupt the primary replica.
+        let replica_b = dir.path().join("healthy-donor.raw");
+        fs::write(&replica_b, bytes).unwrap();
+        let replica_b_str = replica_b.to_string_lossy().into_owned();
+        store
+            .add_location(&object, &replica_b_str, Some(1), RAW_PROFILE_V1, true)
+            .unwrap();
+        fs::write(&primary_path, b"corrupted-by-bit-rot").unwrap();
+
+        // Run H023 periodic scrub & location repair.
+        let report = scrub_and_repair_locations(&mut store, 100).expect("scrub");
+        assert_eq!(report.scanned_locations, 2);
+        assert_eq!(report.healthy_locations, 1);
+        assert_eq!(report.quarantined_locations, vec![primary_path.clone()]);
+        assert_eq!(report.repaired_locations, vec![primary_path.clone()]);
+        assert!(report.escalated_logical_objects.is_empty());
+
+        // Primary replica on disk is now repaired back to exact bytes and its quarantine is released!
+        assert_eq!(fs::read(&primary_path).unwrap(), bytes);
+        assert!(
+            inspect_quarantine(&mut store, QuarantineScope::Location, &primary_path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            inspect_quarantine(&mut store, QuarantineScope::LogicalObject, &obj_key)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn t006_disk_full_never_exposes_partial_result_and_preserves_committed_cas() {
+        use crate::blob_store::{DurabilityPolicy, PutError, PutLimits, put_if_absent};
+        use crate::gc::{ActiveProtections, GcMode, GcWorld, execute_gc, plan_gc};
+        use crate::serving_state::{
+            FailureRefusal, TerminalOutcome, classify_deterministic_failure,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, layout, committed_object) =
+            store_with_object(dir.path(), b"committed-baseline-bytes");
+        let committed_key = digest_key(&committed_object);
+
+        // 1. Simulate ENOSPC / disk full mid-stream during put_if_absent of a new object.
+        struct DiskFullReader {
+            emitted: usize,
+        }
+        impl std::io::Read for DiskFullReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.emitted == 0 {
+                    let prefix = b"partial-staging-bytes";
+                    buf[..prefix.len()].copy_from_slice(prefix);
+                    self.emitted += prefix.len();
+                    Ok(prefix.len())
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                }
+            }
+        }
+
+        let failing_declared = crate::digest_set::digest_set(
+            b"intended-complete-object",
+            DigestRequest::default(),
+            None,
+        )
+        .unwrap()
+        .atp_content_id;
+        let mut reader = DiskFullReader { emitted: 0 };
+        let put_res = put_if_absent(
+            &layout,
+            &mut store,
+            &failing_declared,
+            &mut reader,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        );
+        assert!(
+            matches!(
+                &put_res,
+                Err(PutError::Io {
+                    step: "read-source" | "stream-to-staging",
+                    error,
+                }) if error.contains("storage") || error.contains("space")
+            ),
+            "disk-full write must fail explicitly without publishing: {put_res:?}"
+        );
+
+        // 2. No partial object is published or indexed; staging directory has no leftover temp files.
+        assert!(
+            store
+                .object_locations(&failing_declared)
+                .unwrap()
+                .is_empty()
+        );
+        let staging_leftovers: Vec<_> = fs::read_dir(layout.root().join("staging"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            staging_leftovers.is_empty(),
+            "incomplete staging must be cleaned up on disk-full failure"
+        );
+
+        // 3. Committed CAS remains intact and materializable.
+        let dest = dir.path().join("recovered.rlib");
+        materialize_object(
+            &mut store,
+            &committed_object,
+            &dest,
+            MaterializationMode::PrivateCopy,
+        )
+        .expect("committed CAS must remain intact after disk-full write");
+        assert_eq!(fs::read(&dest).unwrap(), b"committed-baseline-bytes");
+
+        // 4. Safe GC reclaim under disk pressure preserves active-build objects while reclaiming cold ones.
+        let cold_bytes = b"cold-evictable-object";
+        let cold_obj = crate::digest_set::digest_set(cold_bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let mut cold_reader = &cold_bytes[..];
+        put_if_absent(
+            &layout,
+            &mut store,
+            &cold_obj,
+            &mut cold_reader,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        let world = GcWorld {
+            protections: ActiveProtections {
+                active_builds: std::collections::BTreeSet::from([committed_key.clone()]),
+                ..ActiveProtections::default()
+            },
+            reclaim_budget: 16,
+            ..GcWorld::default()
+        };
+        let plan = plan_gc(&mut store, &world, GcMode::Emergency, 1).unwrap();
+        assert_eq!(plan.reclaim.len(), 1);
+        assert_eq!(plan.reclaim[0].object_key, digest_key(&cold_obj));
+        let receipt = execute_gc(&mut store, &plan).unwrap();
+        assert_eq!(receipt.reclaimed.len(), 1);
+        assert_eq!(store.object_locations(&committed_object).unwrap().len(), 1);
+
+        // 5. Disk-full / transport failure is NEVER misclassified as a deterministic compile failure (R28).
+        assert_eq!(
+            classify_deterministic_failure(
+                TerminalOutcome::TransportFailed,
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
+            Err(FailureRefusal::NotDeterministic("transport-failure"))
+        );
     }
 }

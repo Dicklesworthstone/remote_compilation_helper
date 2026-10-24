@@ -9,13 +9,22 @@
 //! again. Failed directories are retained, never repaired in place or deleted.
 //! Explicit resume may copy local prefixes, but verifies the complete new files.
 
+mod byte_cache;
+mod ranges;
 mod reuse;
+pub use byte_cache::{
+    ArtifactByteCache, ArtifactCachePeer, DEFAULT_ARTIFACT_CACHE_BYTES,
+    DEFAULT_ARTIFACT_CACHE_ENTRIES, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
+};
+use ranges::download;
 pub use reuse::{ResumePeer, ResumeSource};
 
 use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
     validate_tree_names,
 };
+use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
+use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode};
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -55,6 +64,46 @@ impl DeliveryMode {
     }
 }
 
+/// A dependency profile changes the worker's filesystem authority. Select it
+/// only from this exact request and an explicit worker advertisement, before
+/// disk creation, authentication grants or input upload. Recovery retrieves a
+/// sealed result and must not require the restarted worker to execute it again.
+pub(crate) fn negotiated_dependency_mode(
+    hello: &Value,
+    request: &Value,
+    mode: DeliveryMode,
+) -> io::Result<Option<DependencyExecutionMode>> {
+    if mode == DeliveryMode::Resume {
+        return Ok(None);
+    }
+    let Some(context) = request.get("dependency_context") else {
+        return Ok(None);
+    };
+    require(
+        context["version"] == DEPENDENCY_CONTEXT_VERSION
+            && hello["dependency_contexts"]
+                .as_array()
+                .is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|version| version == DEPENDENCY_CONTEXT_VERSION)
+                }),
+        "worker lacks the required dependency execution context",
+    )?;
+    let selected = match context.get("execution_mode").and_then(Value::as_str) {
+        Some("metadata") => DependencyExecutionMode::Metadata,
+        Some("rlib") => DependencyExecutionMode::Rlib,
+        _ => return Err(invalid("unsupported dependency execution mode")),
+    };
+    require(
+        hello["dependency_execution_modes"]
+            .as_array()
+            .is_some_and(|modes| modes.iter().any(|mode| mode == selected.as_str())),
+        "worker lacks the required measured dependency execution mode",
+    )?;
+    Ok(Some(selected))
+}
+
 const RESULT_RETENTION: &str = "durable-result-v1";
 
 /// Evidence supplied by a trusted transport adapter AFTER session admission.
@@ -91,6 +140,18 @@ pub trait WorkerPeer {
     /// accepted only for result resume and still require complete-file hashing.
     fn resume_source(&self) -> Option<&ResumeSource> {
         None
+    }
+
+    /// Optional local byte reuse after the current authenticated result and
+    /// diagnostics pass validation. This never supplies an execution result.
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        None
+    }
+
+    /// Honor absolute transfer deadlines and operator cancellation during local
+    /// work too. Cache copies must not bypass a transport's send/receive checks.
+    fn checkpoint(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -240,6 +301,7 @@ struct Declaration {
     unit: String,
     names: BTreeSet<String>,
     tree: bool,
+    private_incremental: Option<Vec<String>>,
 }
 
 fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
@@ -251,10 +313,12 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         Some(value) if value.as_str() == Some(TREE_FILES_VERSION) => true,
         Some(_) => return Err(invalid("unsupported artifact tree declaration")),
     };
+    let cargo = cargo_artifacts::requested(request)?;
+    let private_incremental = cargo_artifacts::private_incremental_roots(request)?;
     require(
         value
             .as_object()
-            .is_some_and(|v| v.len() == if tree { 3 } else { 2 }),
+            .is_some_and(|v| v.len() == 2 + usize::from(tree) + usize::from(cargo.is_some())),
         "invalid artifact declaration",
     )?;
     let unit = text(value, "unit")?;
@@ -272,7 +336,10 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         .get("files")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("artifact files"))?;
-    require(!files.is_empty() && files.len() <= 128, "artifact count")?;
+    require(
+        (cargo.is_some() || !files.is_empty()) && files.len() <= 128,
+        "artifact count",
+    )?;
     let mut names = BTreeSet::new();
     for file in files {
         let name = file.as_str().ok_or_else(|| invalid("artifact name"))?;
@@ -290,13 +357,14 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
             parent = path.parent();
         }
     }
-    if tree {
+    if tree && !names.is_empty() {
         validate_tree_names(names.iter().map(String::as_str))?;
     }
     Ok(Some(Declaration {
         unit: unit.to_owned(),
         names,
         tree,
+        private_incremental,
     }))
 }
 
@@ -504,6 +572,14 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
         require(rows.len() == expected.names.len(), "artifact set mismatch")?;
         expected.names.clone()
     };
+    if let Some(roots) = &expected.private_incremental {
+        require(
+            names
+                .iter()
+                .all(|name| !cargo_artifacts::is_private_incremental_file(roots, name)),
+            "worker offered private incremental state as a Cargo artifact",
+        )?;
+    }
     let mut files = Vec::new();
     let mut total = 0_u64;
     let mut hasher = Sha256::new();
@@ -566,6 +642,43 @@ pub(crate) fn verified_artifact_names(
         .into_iter()
         .map(|file| file.name)
         .collect())
+}
+
+/// Check Cargo's independently delivered stdout against the verified complete
+/// artifact manifest before accepting live delivery or restoring a retained one.
+/// A build-finished record alone never substitutes for actual compiler outputs.
+pub(crate) fn verify_cargo_artifacts(
+    request: &Value,
+    artifacts: &Value,
+    stdout: impl std::io::Read,
+) -> io::Result<()> {
+    let Some(mode) = cargo_artifacts::requested(request)? else {
+        return Ok(());
+    };
+    verified_artifact_names(request, artifacts)?;
+    let report = CargoArtifactReport::read(stdout, "/__rabs/out/cargo", mode)?;
+    if let Some(roots) = cargo_artifacts::private_incremental_roots(request)? {
+        require(
+            report
+                .files()
+                .all(|name| !cargo_artifacts::is_private_incremental_file(&roots, name)),
+            "Cargo reported an output inside private incremental state",
+        )?;
+    }
+    let files = artifacts["files"]
+        .as_array()
+        .ok_or_else(|| invalid("Cargo artifact manifest"))?
+        .iter()
+        .map(|row| {
+            Ok((
+                text(row, "name")?,
+                row["executable"]
+                    .as_bool()
+                    .ok_or_else(|| invalid("Cargo artifact executable mode"))?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    report.validate_outputs(files)
 }
 
 /// Create each implied directory exactly once in a new, caller-owned output
@@ -635,7 +748,9 @@ fn receive_with_clock(
 }
 fn create_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    // Retain this original inode for optional artifact-byte cache seeding after
+    // verification; no pathname reopen or hardlink may substitute its contents.
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -660,121 +775,6 @@ fn sync_tree_directories(root: &Path) -> io::Result<()> {
         }
     }
     File::open(root)?.sync_all()
-}
-
-fn download(
-    peer: &mut impl WorkerPeer,
-    worker: &str,
-    id: u64,
-    item: &Item,
-    manifest_hash: Option<&str>,
-    path: &Path,
-) -> io::Result<()> {
-    const RANGE_WINDOW: usize = 4;
-    let artifact = manifest_hash.is_some();
-    let mut file = create_file(path)?;
-    let mut hasher = Sha256::new();
-    let mut offset = match peer.resume_source() {
-        Some(source) => source.copy_prefix(
-            if artifact { "artifacts" } else { "diagnostics" },
-            &item.name,
-            item.len,
-            &mut file,
-            &mut hasher,
-        )?,
-        None => 0,
-    };
-    // Empty files retain the ordinary zero-length range check. A complete
-    // nonempty prefix skips range I/O, never the complete-file hash below.
-    // Keep at most four ordinary range requests in flight. The worker serves
-    // ordered immutable ranges; no new wire operation or speculative bytes are
-    // needed. Drain each batch before writing more requests, and retain the
-    // existing transport's one absolute transfer deadline throughout.
-    let mut requested = offset;
-    let mut outstanding = 0_usize;
-    while offset < item.len || item.len == 0 {
-        if outstanding == 0 {
-            for _ in 0..RANGE_WINDOW {
-                let mut request = json!({"kind":if artifact {"artifact-read"} else {"output-read"},
-                    "request_id":id,"offset":requested,"max_bytes":CHUNK_BYTES});
-                request[if artifact { "name" } else { "stream" }] = json!(item.name);
-                // A partial write aborts the whole operation. Never retry the
-                // batch or fall back to execution when its outcome is unknown.
-                peer.send(&request)?;
-                outstanding += 1;
-                requested += (item.len - requested).min(CHUNK_BYTES as u64);
-                if requested == item.len {
-                    break;
-                }
-            }
-        }
-        let chunk = receive(peer, worker)?;
-        require(
-            text(&chunk, "kind")?
-                == if artifact {
-                    "artifact-chunk"
-                } else {
-                    "output-chunk"
-                },
-            "expected byte chunk",
-        )?;
-        require(
-            number(&chunk, "request_id")? == id
-                && text(&chunk, if artifact { "name" } else { "stream" })? == item.name
-                && number(&chunk, "offset")? == offset
-                && number(&chunk, "total_bytes")? == item.len
-                && digest(&chunk, "sha256")? == item.sha256,
-            "chunk identity mismatch",
-        )?;
-        if let Some(hash) = manifest_hash {
-            require(
-                digest(&chunk, "manifest_sha256")? == hash
-                    && chunk.get("executable").and_then(Value::as_bool) == Some(item.executable),
-                "chunk manifest/mode mismatch",
-            )?;
-        }
-        let count = (item.len - offset).min(CHUNK_BYTES as u64) as usize;
-        let encoded = text(&chunk, "data_hex")?;
-        require(
-            is_hex(encoded, count * 2),
-            "chunk encoding or length mismatch",
-        )?;
-        let mut bytes = Vec::with_capacity(count);
-        for pair in encoded.as_bytes().as_chunks::<2>().0 {
-            let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
-            bytes.push(digit(pair[0]) * 16 + digit(pair[1]));
-        }
-        let next = offset + count as u64; // bounded by declared length, never unchecked peer arithmetic
-        require(
-            number(&chunk, "next_offset")? == next
-                && chunk.get("eof").and_then(Value::as_bool) == Some(next == item.len)
-                && digest(&chunk, "chunk_sha256")? == hash(&bytes),
-            "chunk range or digest mismatch",
-        )?;
-        file.write_all(&bytes)?;
-        hasher.update(&bytes);
-        offset = next;
-        outstanding -= 1;
-        if offset == item.len {
-            break;
-        }
-    }
-    let actual: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    require(actual == item.sha256, "complete file digest mismatch")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(if item.executable {
-            0o700
-        } else {
-            0o600
-        }))?;
-    }
-    file.sync_all()
 }
 
 fn acknowledge(
@@ -868,8 +868,11 @@ pub fn receive_operation(
                 .and_then(Value::as_array)
                 .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(value)))
         };
+        let dependency_mode = negotiated_dependency_mode(&hello, request, mode)?;
+        let require_canonical =
+            mode == DeliveryMode::Execute && dependency_mode != Some(DependencyExecutionMode::Rlib);
         require(
-            hello.get("canonical").and_then(Value::as_bool) == Some(true)
+            (!require_canonical || hello.get("canonical").and_then(Value::as_bool) == Some(true))
                 && number(&hello, "slots")? > 0
                 && number(&hello, "boot_generation")? > 0
                 && supports("recovery_protocols", "request-journal-v1")
@@ -939,6 +942,10 @@ pub fn receive_operation(
         create_directory(&destination.join("diagnostics"))?;
         create_directory(&destination.join("artifacts"))?;
         let mut ack = json!({"kind":"session-ok","output_transfer":"ranges-v1","recovery_protocol":"request-journal-v1"});
+        if let Some(mode) = dependency_mode {
+            ack["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
+            ack["dependency_execution_mode"] = json!(mode.as_str());
+        }
         if expected.is_some() {
             ack["artifact_transfer"] = json!("files-v1");
         }
@@ -1073,22 +1080,25 @@ pub fn receive_operation(
             None,
             &destination.join("diagnostics/stderr"),
         )?;
+        if artifacts.is_some() {
+            verify_cargo_artifacts(
+                request,
+                &result["artifact_manifest"],
+                File::open(destination.join("diagnostics/stdout"))?,
+            )?;
+        }
         if let Some(manifest) = &artifacts {
             create_artifact_directories(
                 &destination.join("artifacts"),
                 manifest.files.iter().map(|file| file.name.as_str()),
             )?;
-            for file in &manifest.files {
-                let path = destination.join("artifacts").join(&file.name);
-                download(
-                    peer,
-                    expected_worker,
-                    id,
-                    file,
-                    Some(&manifest.sha256),
-                    &path,
-                )?;
-            }
+            ranges::download_artifacts(
+                peer,
+                expected_worker,
+                id,
+                manifest,
+                &destination.join("artifacts"),
+            )?;
         }
         sync_tree_directories(destination)?;
         // Sync parent ancestry too: a power loss must not erase a newly linked
@@ -1173,6 +1183,9 @@ pub fn receive_operation(
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod byte_cache_tests;
+    mod cross_file_range_tests;
+    mod range_pipeline_tests;
     mod tree_tests;
 
     use super::*;
@@ -1183,6 +1196,7 @@ mod tests {
         sent: Vec<Value>,
         destination: PathBuf,
         fail_send: Option<&'static str>,
+        expected_stdout: Vec<u8>,
     }
     impl WorkerPeer for Script {
         fn send(&mut self, frame: &Value) -> io::Result<()> {
@@ -1194,7 +1208,7 @@ mod tests {
                 assert_eq!(receipt["kind"], "verified-worker-delivery");
                 assert_eq!(
                     std::fs::read(self.destination.join("diagnostics/stdout"))?,
-                    b"diagnostic\0\xff"
+                    self.expected_stdout
                 );
             }
             if frame["kind"].as_str() == self.fail_send {
@@ -1234,6 +1248,7 @@ mod tests {
             destination: destination.to_path_buf(),
             sent: vec![],
             fail_send: None,
+            expected_stdout: output.to_vec(),
             replies: VecDeque::from([
                 json!({"kind":"worker-hello","worker_id":"worker","canonical":true,"slots":4,
                 "boot_generation":1,"incarnation":"00000000000000000000000000000001","request_high_water":null,
@@ -1605,6 +1620,8 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let dest = parent.path().join("resumed");
         let mut peer = resumable(&dest);
+        peer.replies[0]["canonical"] = json!(false);
+        peer.replies[0]["dependency_execution_modes"] = json!([]);
         let delivery =
             receive_operation(&mut peer, &request(), "worker", &dest, DeliveryMode::Resume)
                 .unwrap();
@@ -2027,6 +2044,85 @@ mod tests {
     }
 
     #[test]
+    fn archive_delivery_negotiates_its_profile_without_requiring_proc_mounts() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        let mut request = request();
+        request["dependency_context"] = json!({
+            "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"rlib"
+        });
+        let mut peer = fixture(&destination);
+        peer.replies[0]["canonical"] = json!(false);
+        peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+        peer.replies[0]["dependency_execution_modes"] = json!(["rlib"]);
+        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(
+            peer.sent[0]["dependency_context"],
+            DEPENDENCY_CONTEXT_VERSION
+        );
+        assert_eq!(peer.sent[0]["dependency_execution_mode"], "rlib");
+        assert_eq!(peer.sent[1], request);
+    }
+
+    #[test]
+    fn missing_or_wrong_archive_capability_refuses_before_disk_or_dispatch() {
+        for advertised in [
+            None,
+            Some(Value::Null),
+            Some(json!("rlib")),
+            Some(json!([])),
+            Some(json!(["metadata"])),
+            Some(json!([{"mode":"rlib"}])),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut request = request();
+            request["dependency_context"] = json!({
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"rlib"
+            });
+            let mut peer = fixture(&destination);
+            peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            if let Some(value) = advertised {
+                peer.replies[0]["dependency_execution_modes"] = value;
+            }
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run);
+            assert!(
+                failure
+                    .detail
+                    .contains("measured dependency execution mode")
+            );
+            assert!(peer.sent.is_empty());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn archive_capability_cannot_authorize_metadata_or_whole_command_execution() {
+        for dependency in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut request = request();
+            if dependency {
+                request["dependency_context"] = json!({
+                    "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
+                });
+            }
+            let mut peer = fixture(&destination);
+            peer.replies[0]["canonical"] = json!(false);
+            peer.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run);
+            assert!(peer.sent.is_empty());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
     fn toolchain_binding_requires_worker_support_before_any_upload_or_dispatch() {
         use super::super::source_delivery::SourcePeer;
         let source = tempfile::tempdir().unwrap();
@@ -2182,7 +2278,8 @@ mod tests {
         use super::super::source_delivery::SourcePeer;
 
         let source = tempfile::tempdir().unwrap();
-        let (upload, mut request) = source_request(source.path());
+        let (upload, request) = source_request(source.path());
+        let mut request = request;
         request["command_context"] = explicit_context();
         for supported in [false, true] {
             let parent = tempfile::tempdir().unwrap();
@@ -2209,8 +2306,8 @@ mod tests {
                 );
             } else {
                 assert!(!result.unwrap_err().execution_may_have_run);
-                assert!(peer.sent.is_empty());
                 assert!(!destination.exists());
+                assert!(peer.sent.is_empty());
             }
         }
     }
@@ -2224,6 +2321,7 @@ mod tests {
         let mut request = request();
         request["command_context"] = explicit_context();
         let mut peer = resumable(&destination);
+        peer.replies[0]["canonical"] = json!(false);
         assert!(peer.replies[0].get("command_contexts").is_none());
         let delivery = receive_operation(
             &mut peer,
@@ -2264,7 +2362,7 @@ mod tests {
     }
 
     fn heartbeat() -> Value {
-        json!({"kind":"heartbeat", "worker_id":"worker", "active_request_id":7})
+        json!({"kind":"heartbeat", "worker_id":"worker","active_request_id":7})
     }
 
     #[test]

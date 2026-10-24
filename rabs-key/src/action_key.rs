@@ -19,7 +19,8 @@
 
 use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
 use rabs_protocol::input_evidence::{
-    ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType,
+    ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, NegativeDependency,
+    NegativeDependencySet,
 };
 use rabs_protocol::result_identity::{DigestAlgorithm, ObjectId, TypedDigest};
 
@@ -28,6 +29,9 @@ use crate::typed_digest::{DOMAIN_ACTION_KEY, compute};
 
 /// Positive input component domain, shared with descriptor schema vocabulary.
 pub const DOMAIN_ACTION_INPUT_MANIFEST: &str = "rabs.inputs.v1";
+
+/// Negative dependency component domain, shared with descriptor schema vocabulary.
+pub const DOMAIN_NEGATIVE_DEPENDENCY_SET: &str = "rabs.negdeps.v1";
 
 /// A manifest cannot be assigned a canonical input-component identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +60,28 @@ impl std::fmt::Display for InputManifestError {
 }
 
 impl std::error::Error for InputManifestError {}
+
+/// A negative-dependency set cannot be assigned a canonical component identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeDependencyError {
+    /// The schema has no encoder in this version.
+    UnsupportedSchema {
+        /// The unsupported version supplied by the caller.
+        found: u32,
+    },
+}
+
+impl std::fmt::Display for NegativeDependencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchema { found } => {
+                write!(f, "unsupported negative dependency schema {found}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NegativeDependencyError {}
 
 fn input_object_encoding(object: &ObjectId) -> Vec<u8> {
     let mut enc = CanonicalEncoder::new();
@@ -138,6 +164,77 @@ pub fn action_input_manifest_digest(
         enc.bytes(object);
     });
     Ok(compute(DOMAIN_ACTION_INPUT_MANIFEST, &enc.finish()))
+}
+
+fn negative_dependency_encoding(dep: &NegativeDependency) -> Vec<u8> {
+    let mut enc = CanonicalEncoder::new();
+    match dep {
+        NegativeDependency::FailedOpen { virtual_path } => {
+            enc.u32(1).bytes(virtual_path.as_bytes());
+        }
+        NegativeDependency::MissingPath { virtual_path } => {
+            enc.u32(2).bytes(virtual_path.as_bytes());
+        }
+        NegativeDependency::GlobResult { pattern, matches } => {
+            let mut sorted_matches: Vec<_> = matches.iter().collect();
+            sorted_matches.sort_unstable();
+            sorted_matches.dedup();
+            enc.u32(3)
+                .bytes(pattern.as_bytes())
+                .seq(&sorted_matches, |enc, entry| {
+                    enc.bytes(entry.as_bytes());
+                });
+        }
+        NegativeDependency::PathLookupMiss {
+            tool,
+            probed_absent,
+        } => {
+            // Probed-absent PATH directories preserve probe order (an earlier
+            // PATH candidate shadowing a later one is order-sensitive).
+            enc.u32(4)
+                .bytes(tool.as_bytes())
+                .seq(probed_absent, |enc, dir| {
+                    enc.bytes(dir.as_bytes());
+                });
+        }
+        NegativeDependency::MissingSymlinkTarget { symlink, target } => {
+            enc.u32(5)
+                .bytes(symlink.as_bytes())
+                .bytes(target.as_bytes());
+        }
+    }
+    enc.finish()
+}
+
+/// Digest the negative-dependency set as an action-key component (`E020`/`F020`).
+///
+/// Entries are canonicalized as a set (sorted and deduplicated by canonical
+/// encoding), while ordered sub-sequences (`PathLookupMiss::probed_absent`)
+/// preserve their probe order and unordered sub-sets (`GlobResult::matches`)
+/// are sorted and deduplicated.
+pub fn negative_dependency_set_digest(
+    set: &NegativeDependencySet,
+) -> Result<TypedDigest, NegativeDependencyError> {
+    let NegativeDependencySet {
+        schema_version,
+        entries,
+    } = set;
+    if *schema_version != INPUT_EVIDENCE_SCHEMA_VERSION {
+        return Err(NegativeDependencyError::UnsupportedSchema {
+            found: *schema_version,
+        });
+    }
+    let mut encoded_entries: Vec<Vec<u8>> =
+        entries.iter().map(negative_dependency_encoding).collect();
+    encoded_entries.sort_unstable();
+    encoded_entries.dedup();
+
+    let mut enc = CanonicalEncoder::new();
+    enc.u32(*schema_version)
+        .seq(&encoded_entries, |enc, entry| {
+            enc.bytes(entry);
+        });
+    Ok(compute(DOMAIN_NEGATIVE_DEPENDENCY_SET, &enc.finish()))
 }
 
 /// Stable canonical tag for each action class (wire-stable; NOT the Rust
@@ -500,5 +597,183 @@ mod tests {
             assert!(!c.name.is_empty());
             assert_eq!(c.digest.bytes.len(), 32);
         }
+    }
+
+    #[test]
+    fn negative_dependency_set_digest_is_set_invariant_and_preserves_path_probe_order() {
+        let base = NegativeDependencySet {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            entries: vec![
+                NegativeDependency::FailedOpen {
+                    virtual_path: RawBytes::new(b"/__rabs/workspace/optional.toml".to_vec()),
+                },
+                NegativeDependency::GlobResult {
+                    pattern: RawBytes::new(b"/__rabs/workspace/src/*.rs".to_vec()),
+                    matches: vec![
+                        RawBytes::new(b"/__rabs/workspace/src/b.rs".to_vec()),
+                        RawBytes::new(b"/__rabs/workspace/src/a.rs".to_vec()),
+                    ],
+                },
+                NegativeDependency::PathLookupMiss {
+                    tool: RawBytes::new(b"clang".to_vec()),
+                    probed_absent: vec![
+                        RawBytes::new(b"/__rabs/toolchain/bin".to_vec()),
+                        RawBytes::new(b"/usr/local/bin".to_vec()),
+                    ],
+                },
+            ],
+        };
+        let mut permuted = base.clone();
+        permuted.entries.reverse();
+        if let NegativeDependency::GlobResult { matches, .. } = &mut permuted.entries[1] {
+            matches.reverse();
+            matches.push(matches[0].clone());
+        }
+        let d_base = negative_dependency_set_digest(&base).unwrap();
+        let d_perm = negative_dependency_set_digest(&permuted).unwrap();
+        assert_eq!(d_base.domain, DOMAIN_NEGATIVE_DEPENDENCY_SET);
+        assert_eq!(d_base, d_perm);
+
+        // Reordering PATH probe order IS a semantic change.
+        let mut path_reordered = base.clone();
+        if let NegativeDependency::PathLookupMiss { probed_absent, .. } =
+            &mut path_reordered.entries[2]
+        {
+            probed_absent.reverse();
+        }
+        assert_ne!(
+            d_base,
+            negative_dependency_set_digest(&path_reordered).unwrap(),
+            "PATH probe order is semantic and must change negative_dependency_set_digest"
+        );
+    }
+
+    #[test]
+    fn f020_negative_dependency_and_env_absence_four_family_mutations_change_action_key() {
+        use crate::environment::{EnvDisposition, PathToolEntry, PresentedEnvironment};
+
+        let base_inputs = input_manifest();
+        let base_negdeps = NegativeDependencySet {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            entries: vec![
+                NegativeDependency::FailedOpen {
+                    virtual_path: RawBytes::new(b"/workspace/optional_cfg.rs".to_vec()),
+                },
+                NegativeDependency::GlobResult {
+                    pattern: RawBytes::new(b"/workspace/plugins/*.rs".to_vec()),
+                    matches: vec![RawBytes::new(b"/workspace/plugins/alpha.rs".to_vec())],
+                },
+                NegativeDependency::PathLookupMiss {
+                    tool: RawBytes::new(b"cc".to_vec()),
+                    probed_absent: vec![
+                        RawBytes::new(b"/opt/custom/bin".to_vec()),
+                        RawBytes::new(b"/usr/local/bin".to_vec()),
+                    ],
+                },
+            ],
+        };
+        let base_env = PresentedEnvironment {
+            variables: vec![
+                (
+                    b"RUSTFLAGS".to_vec(),
+                    EnvDisposition::SemanticHashed(b"-Copt-level=2".to_vec()),
+                ),
+                (b"RUSTC_BOOTSTRAP".to_vec(), EnvDisposition::ScrubbedAbsent),
+            ],
+            path_manifest: vec![PathToolEntry::Resolved {
+                name: "cc".into(),
+                binary_digest: d("rabs.toolchain-object.v1", 0x41),
+            }],
+        };
+
+        let build_desc = |inputs: &ActionInputManifest,
+                          negdeps: &NegativeDependencySet,
+                          env: &PresentedEnvironment| {
+            let mut desc = descriptor();
+            desc.action_inputs = action_input_manifest_digest(inputs).unwrap();
+            desc.negative_dependencies = negative_dependency_set_digest(negdeps).unwrap();
+            desc.environment = env.dataset_digest().unwrap();
+            desc
+        };
+
+        let base_desc = build_desc(&base_inputs, &base_negdeps, &base_env);
+        let base_key = compute_action_key(&base_desc);
+
+        // Family 1: Newly created file satisfying a previously failed open (R57).
+        let mut f1_inputs = base_inputs.clone();
+        f1_inputs.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(b"/workspace/optional_cfg.rs".to_vec()),
+            object: ObjectId(d("rabs.object.v1", 0x99)),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        let mut f1_negdeps = base_negdeps.clone();
+        f1_negdeps.entries.retain(|e| {
+            !matches!(
+                e,
+                NegativeDependency::FailedOpen { virtual_path }
+                    if virtual_path.as_bytes() == b"/workspace/optional_cfg.rs"
+            )
+        });
+        let f1_desc = build_desc(&f1_inputs, &f1_negdeps, &base_env);
+        let f1_key = compute_action_key(&f1_desc);
+        assert_ne!(
+            f1_desc.negative_dependencies,
+            base_desc.negative_dependencies
+        );
+        assert_ne!(f1_desc.action_inputs, base_desc.action_inputs);
+        assert_ne!(f1_key.final_key, base_key.final_key);
+
+        // Family 2: Directory listing / glob result change when a new file appears.
+        let mut f2_inputs = base_inputs.clone();
+        f2_inputs.directory_enumerations[0]
+            .entries
+            .push(RawBytes::new(b"newly_added.rs".to_vec()));
+        let mut f2_negdeps = base_negdeps.clone();
+        if let NegativeDependency::GlobResult { matches, .. } = &mut f2_negdeps.entries[1] {
+            matches.push(RawBytes::new(b"/workspace/plugins/beta.rs".to_vec()));
+        }
+        let f2_desc = build_desc(&f2_inputs, &f2_negdeps, &base_env);
+        let f2_key = compute_action_key(&f2_desc);
+        assert_ne!(
+            f2_desc.negative_dependencies,
+            base_desc.negative_dependencies
+        );
+        assert_ne!(f2_desc.action_inputs, base_desc.action_inputs);
+        assert_ne!(f2_key.final_key, base_key.final_key);
+
+        // Family 3: Earlier-PATH directory gains a shadowing executable (`cc`).
+        let mut f3_negdeps = base_negdeps.clone();
+        if let NegativeDependency::PathLookupMiss { probed_absent, .. } = &mut f3_negdeps.entries[2]
+        {
+            // `/opt/custom/bin` now has `cc`, so no earlier directory missed!
+            probed_absent.clear();
+        }
+        let mut f3_env = base_env.clone();
+        f3_env.path_manifest = vec![PathToolEntry::Resolved {
+            name: "cc".into(),
+            binary_digest: d("rabs.toolchain-object.v1", 0x42),
+        }];
+        let f3_desc = build_desc(&base_inputs, &f3_negdeps, &f3_env);
+        let f3_key = compute_action_key(&f3_desc);
+        assert_ne!(
+            f3_desc.negative_dependencies,
+            base_desc.negative_dependencies
+        );
+        assert_ne!(f3_desc.environment, base_desc.environment);
+        assert_ne!(f3_key.final_key, base_key.final_key);
+
+        // Family 4: Separately modeled absent environment value (F006/F027).
+        let mut f4_env = base_env.clone();
+        f4_env.variables.retain(|(k, _)| k != b"RUSTC_BOOTSTRAP");
+        let f4_desc = build_desc(&base_inputs, &base_negdeps, &f4_env);
+        let f4_key = compute_action_key(&f4_desc);
+        assert_eq!(
+            f4_desc.negative_dependencies, base_desc.negative_dependencies,
+            "F027 single-owner law: env absence never touches filesystem negative_dependencies"
+        );
+        assert_ne!(f4_desc.environment, base_desc.environment);
+        assert_ne!(f4_key.final_key, base_key.final_key);
     }
 }

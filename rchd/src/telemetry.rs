@@ -1,7 +1,7 @@
 //! Telemetry storage and polling for worker metrics.
 
 use crate::events::EventBus;
-use crate::workers::{AdminIntent, WorkerPool, WorkerState};
+use crate::workers::{AdminIntent, WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use directories::ProjectDirs;
@@ -22,10 +22,33 @@ use tracing::{debug, info, warn};
 
 const TEST_RUN_MEMORY_CAPACITY: usize = 200;
 
+struct StoredTelemetry {
+    received: ReceivedTelemetry,
+    endpoint: Option<WorkerEndpointSnapshot>,
+}
+
+impl StoredTelemetry {
+    fn belongs_to(&self, endpoint: &WorkerEndpointSnapshot) -> bool {
+        let Some(bound) = &self.endpoint else {
+            // Existing push/piggyback payloads carry no endpoint identity. They
+            // remain useful for the original endpoint, but cannot prove that a
+            // replacement is fresh or healthy after this worker ID is retargeted.
+            return endpoint.generation == 0;
+        };
+        bound.generation == endpoint.generation
+            && bound.config.id == endpoint.config.id
+            && bound.config.host == endpoint.config.host
+            && bound.config.user == endpoint.config.user
+            && bound.config.identity_file == endpoint.config.identity_file
+            && rch_common::declared_os(&bound.config.tags)
+                == rch_common::declared_os(&endpoint.config.tags)
+    }
+}
+
 /// In-memory telemetry store with time-based eviction.
 pub struct TelemetryStore {
     retention: ChronoDuration,
-    recent: RwLock<HashMap<String, VecDeque<ReceivedTelemetry>>>,
+    recent: RwLock<HashMap<String, VecDeque<StoredTelemetry>>>,
     test_runs: RwLock<VecDeque<TestRunRecord>>,
     storage: Option<Arc<TelemetryStorage>>,
     event_bus: Option<EventBus>,
@@ -67,6 +90,26 @@ impl TelemetryStore {
     /// Stores the telemetry, persists to SQLite (if configured), and emits
     /// a "telemetry:update" event for WebSocket subscribers (if configured).
     pub fn ingest(&self, telemetry: WorkerTelemetry, source: TelemetrySource) {
+        self.ingest_inner(telemetry, source, None);
+    }
+
+    /// Record telemetry collected from an exact endpoint. The caller retains
+    /// its current-endpoint guard until this publication completes.
+    pub(crate) fn ingest_for_endpoint(
+        &self,
+        telemetry: WorkerTelemetry,
+        source: TelemetrySource,
+        endpoint: &WorkerEndpointSnapshot,
+    ) {
+        self.ingest_inner(telemetry, source, Some(endpoint.clone()));
+    }
+
+    fn ingest_inner(
+        &self,
+        telemetry: WorkerTelemetry,
+        source: TelemetrySource,
+        endpoint: Option<WorkerEndpointSnapshot>,
+    ) {
         let received = ReceivedTelemetry::new(telemetry, source);
         let worker_id = received.telemetry.worker_id.clone();
 
@@ -75,7 +118,7 @@ impl TelemetryStore {
 
         let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
         let entries = recent.entry(worker_id).or_default();
-        entries.push_back(received);
+        entries.push_back(StoredTelemetry { received, endpoint });
 
         self.evict_old(entries);
 
@@ -86,7 +129,7 @@ impl TelemetryStore {
 
         if let Some(storage) = self.storage.as_ref() {
             let storage = Arc::clone(storage);
-            let telemetry = entries.back().map(|e| e.telemetry.clone());
+            let telemetry = entries.back().map(|e| e.received.telemetry.clone());
             if let Some(telemetry) = telemetry {
                 task::spawn(async move {
                     let result =
@@ -106,7 +149,23 @@ impl TelemetryStore {
         let recent = self.recent.read().unwrap_or_else(|e| e.into_inner());
         recent
             .get(worker_id)
-            .and_then(|entries| entries.back().cloned())
+            .and_then(|entries| entries.back().map(|entry| entry.received.clone()))
+    }
+
+    /// Latest evidence that belongs to the endpoint being evaluated. Historical
+    /// samples stay available to diagnostics, but never qualify a replacement.
+    pub(crate) fn latest_for_endpoint(
+        &self,
+        endpoint: &WorkerEndpointSnapshot,
+    ) -> Option<ReceivedTelemetry> {
+        let recent = self.recent.read().unwrap_or_else(|e| e.into_inner());
+        recent.get(endpoint.config.id.as_str()).and_then(|entries| {
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry.belongs_to(endpoint))
+                .map(|entry| entry.received.clone())
+        })
     }
 
     /// Get the most recent telemetry for all workers.
@@ -114,7 +173,7 @@ impl TelemetryStore {
         let recent = self.recent.read().unwrap_or_else(|e| e.into_inner());
         recent
             .values()
-            .filter_map(|entries| entries.back().cloned())
+            .filter_map(|entries| entries.back().map(|entry| entry.received.clone()))
             .collect()
     }
 
@@ -217,11 +276,11 @@ impl TelemetryStore {
         .await?
     }
 
-    fn evict_old(&self, entries: &mut VecDeque<ReceivedTelemetry>) {
+    fn evict_old(&self, entries: &mut VecDeque<StoredTelemetry>) {
         let cutoff = Utc::now() - self.retention;
         while entries
             .front()
-            .map(|entry| entry.received_at < cutoff)
+            .map(|entry| entry.received.received_at < cutoff)
             .unwrap_or(false)
         {
             entries.pop_front();
@@ -439,9 +498,9 @@ impl TelemetryPoller {
             return false;
         }
 
-        let worker_id = worker.config.read().await.id.clone();
-        if let Some(last_received) = self.store.last_received_at(worker_id.as_str()) {
-            let since = Utc::now() - last_received;
+        let endpoint = worker.endpoint_snapshot().await;
+        if let Some(latest) = self.store.latest_for_endpoint(&endpoint) {
+            let since = Utc::now() - latest.received_at;
             if since.to_std().unwrap_or_default() < self.config.skip_after {
                 return false;
             }
@@ -454,23 +513,22 @@ impl TelemetryPoller {
 /// Collect telemetry from a worker via SSH.
 ///
 /// Executes `rch-telemetry collect` on the remote worker and parses the result.
-/// Thin wrapper preserving the historical 2-arg signature (used by the on-demand
-/// API poll path, which has no shared pool available). Background poll cycles use
-/// [`collect_telemetry_from_worker_pooled`] to reuse a warm ControlMaster.
-pub async fn collect_telemetry_from_worker(
+/// Returns the endpoint used by the on-demand API so publication can reject a
+/// result whose worker ID was retargeted while SSH was in flight.
+pub(crate) async fn collect_telemetry_from_worker(
     worker: &WorkerState,
     ssh_timeout: Duration,
-) -> anyhow::Result<WorkerTelemetry> {
+) -> anyhow::Result<(WorkerEndpointSnapshot, WorkerTelemetry)> {
     collect_telemetry_from_worker_pooled(worker, ssh_timeout, None).await
 }
 
 /// Collect telemetry from a worker via SSH, optionally reusing a shared SSH
 /// connection pool (warm ControlMaster) when `ssh_pool` is `Some`.
-pub async fn collect_telemetry_from_worker_pooled(
+pub(crate) async fn collect_telemetry_from_worker_pooled(
     worker: &WorkerState,
     ssh_timeout: Duration,
     ssh_pool: Option<Arc<rch_common::SshPool>>,
-) -> anyhow::Result<WorkerTelemetry> {
+) -> anyhow::Result<(WorkerEndpointSnapshot, WorkerTelemetry)> {
     // Snapshot the worker config and RELEASE the lock before any SSH work.
     // Holding `worker.config` across the (up to `ssh_timeout`) SSH round-trip
     // blocks writers — and any reader queued behind a pending writer, including
@@ -478,10 +536,17 @@ pub async fn collect_telemetry_from_worker_pooled(
     // poll burst that surfaced as multi-second "worker_selection latency
     // exceeded panic threshold" stalls. Cloning + dropping the guard here keeps
     // selection lock-free while telemetry SSH is in flight.
-    let worker_config = {
-        let config = worker.config.read().await;
-        config.clone()
-    };
+    let endpoint = worker.endpoint_snapshot().await;
+    let telemetry =
+        collect_telemetry_for_endpoint(endpoint.config.clone(), ssh_timeout, ssh_pool).await?;
+    Ok((endpoint, telemetry))
+}
+
+async fn collect_telemetry_for_endpoint(
+    worker_config: rch_common::WorkerConfig,
+    ssh_timeout: Duration,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
+) -> anyhow::Result<WorkerTelemetry> {
     let worker_id = worker_config.id.clone();
     // Worker IDs come from operator-supplied config (workers.toml), not from
     // a trusted source — a stray quote, semicolon, or `$()` would otherwise
@@ -593,23 +658,50 @@ async fn poll_worker(
     config: TelemetryPollerConfig,
     ssh_pool: Option<Arc<rch_common::SshPool>>,
 ) -> bool {
-    let worker_id = worker.config.read().await.id.clone();
-    let per_attempt = poll_hard_timeout(config.ssh_timeout);
     let transport: &'static str = if ssh_pool.is_some() {
         "pooled-ssh"
     } else {
         "throwaway-ssh"
     };
+    let ssh_timeout = config.ssh_timeout;
+    poll_worker_with(worker, store, config, transport, move |endpoint| {
+        collect_telemetry_for_endpoint(endpoint, ssh_timeout, ssh_pool.clone())
+    })
+    .await
+}
+
+async fn poll_worker_with<F, Fut>(
+    worker: Arc<WorkerState>,
+    store: Arc<TelemetryStore>,
+    config: TelemetryPollerConfig,
+    transport: &'static str,
+    mut collect: F,
+) -> bool
+where
+    F: FnMut(rch_common::WorkerConfig) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<WorkerTelemetry>>,
+{
+    // Every retry belongs to this exact endpoint generation. A reload must
+    // neither mix old failures with a new host nor admit late old telemetry.
+    let endpoint = worker.endpoint_snapshot().await;
+    let worker_id = &endpoint.config.id;
+    let per_attempt = poll_hard_timeout(config.ssh_timeout);
     let mut failures: Vec<PollAttemptFailure> = Vec::new();
 
     for attempt in 1..=TELEMETRY_POLL_ATTEMPTS {
+        if worker.lock_current_endpoint(&endpoint).await.is_none() {
+            return false;
+        }
         let started = std::time::Instant::now();
-        match tokio::time::timeout(
-            per_attempt,
-            collect_telemetry_from_worker_pooled(&worker, config.ssh_timeout, ssh_pool.clone()),
-        )
-        .await
-        {
+        let outcome = tokio::time::timeout(per_attempt, collect(endpoint.config.clone())).await;
+        let Some(endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+            debug!(
+                worker = worker_id.as_str(),
+                "Discarding telemetry from replaced endpoint"
+            );
+            return false;
+        };
+        match outcome {
             Ok(Ok(telemetry)) => {
                 debug!(
                     worker = worker_id.as_str(),
@@ -618,8 +710,8 @@ async fn poll_worker(
                     memory = %telemetry.memory.used_percent,
                     "Telemetry collected via SSH"
                 );
-                store.ingest(telemetry, TelemetrySource::SshPoll);
-                record_poll_command_outcome(&worker, &worker_id, true, &config.circuit).await;
+                store.ingest_for_endpoint(telemetry, TelemetrySource::SshPoll, &endpoint);
+                record_poll_command_outcome(&worker, worker_id, true, &config.circuit).await;
                 return true;
             }
             Ok(Err(e)) => failures.push(PollAttemptFailure {
@@ -637,18 +729,22 @@ async fn poll_worker(
                 error: format!("hard timeout after {per_attempt:?}"),
             }),
         }
+        drop(endpoint_guard);
         if attempt < TELEMETRY_POLL_ATTEMPTS {
             tokio::time::sleep(TELEMETRY_RETRY_BACKOFF).await;
         }
     }
 
+    let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+        return false;
+    };
     warn!(
         worker = worker_id.as_str(),
         attempts = TELEMETRY_POLL_ATTEMPTS,
         "Telemetry poll failed: {}",
         render_poll_failures(&failures)
     );
-    record_poll_command_outcome(&worker, &worker_id, false, &config.circuit).await;
+    record_poll_command_outcome(&worker, worker_id, false, &config.circuit).await;
     false
 }
 
@@ -796,7 +892,7 @@ mod tests {
         {
             let mut recent = store.recent.write().unwrap();
             let entries = recent.get_mut("w1").expect("missing worker entry");
-            entries[0].received_at = Utc::now() - ChronoDuration::seconds(120);
+            entries[0].received.received_at = Utc::now() - ChronoDuration::seconds(120);
         }
 
         store.ingest(make_telemetry("w1", 30.0, 40.0), TelemetrySource::SshPoll);
@@ -804,7 +900,7 @@ mod tests {
         let recent = store.recent.read().unwrap();
         let entries = recent.get("w1").expect("missing worker entry");
         assert_eq!(entries.len(), 1);
-        assert!((entries[0].telemetry.cpu.overall_percent - 30.0).abs() < f64::EPSILON);
+        assert!((entries[0].received.telemetry.cpu.overall_percent - 30.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1089,7 +1185,7 @@ mod tests {
         {
             let mut recent = store.recent.write().unwrap();
             let entries = recent.get_mut("w1").unwrap();
-            entries[0].received_at = Utc::now() - ChronoDuration::seconds(60);
+            entries[0].received.received_at = Utc::now() - ChronoDuration::seconds(60);
         }
 
         // Ingest another entry - should trigger eviction
@@ -1123,6 +1219,118 @@ mod tests {
             priority: 50,
             tags: vec![],
             tools: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn late_poll_results_cannot_replace_new_endpoint_telemetry_or_circuit_evidence() {
+        for success in [false, true] {
+            for return_to_original in [false, true] {
+                let original = create_worker_config("retargeted-telemetry");
+                let worker = Arc::new(WorkerState::new(original.clone()));
+                let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+                let started = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let task = {
+                    let worker = worker.clone();
+                    let store = store.clone();
+                    let started = started.clone();
+                    let release = release.clone();
+                    tokio::spawn(async move {
+                        poll_worker_with(
+                            worker,
+                            store,
+                            TelemetryPollerConfig::default(),
+                            "suspended-test-transport",
+                            move |endpoint| {
+                                let started = started.clone();
+                                let release = release.clone();
+                                async move {
+                                    assert_eq!(endpoint.host, "localhost");
+                                    started.notify_one();
+                                    release.notified().await;
+                                    if success {
+                                        Ok(make_telemetry(endpoint.id.as_str(), 99.0, 99.0))
+                                    } else {
+                                        Err(anyhow::anyhow!("old endpoint failed"))
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                    })
+                };
+                tokio::time::timeout(Duration::from_secs(1), started.notified())
+                    .await
+                    .expect("poll must enter transport");
+                let mut replacement = original.clone();
+                replacement.host = "replacement.host".to_string();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    assert!(worker.update_config(replacement).await);
+                    if return_to_original {
+                        assert!(worker.update_config(original).await);
+                    }
+                })
+                .await
+                .expect("telemetry I/O must not hold the configuration lock");
+
+                // Evidence produced by the replacement must survive a late
+                // old success just as it survives a late old failure.
+                let circuit = rch_common::CircuitBreakerConfig::default();
+                worker.record_command_outcome(false, &circuit).await;
+                store.ingest(
+                    make_telemetry("retargeted-telemetry", 42.0, 42.0),
+                    TelemetrySource::SshPoll,
+                );
+                release.notify_one();
+                assert!(
+                    !tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .expect("stale poll must stop without retrying the old endpoint")
+                        .unwrap()
+                );
+                assert_eq!(
+                    worker.circuit_stats().await.consecutive_command_failures(),
+                    1
+                );
+                assert_eq!(
+                    store
+                        .latest("retargeted-telemetry")
+                        .unwrap()
+                        .telemetry
+                        .cpu
+                        .overall_percent,
+                    42.0
+                );
+
+                assert!(
+                    poll_worker_with(
+                        worker.clone(),
+                        store.clone(),
+                        TelemetryPollerConfig::default(),
+                        "fresh-test-transport",
+                        |endpoint| std::future::ready(Ok(make_telemetry(
+                            endpoint.id.as_str(),
+                            10.0,
+                            10.0
+                        ))),
+                    )
+                    .await
+                );
+                assert_eq!(
+                    worker.circuit_stats().await.consecutive_command_failures(),
+                    0
+                );
+                assert_eq!(
+                    store
+                        .latest("retargeted-telemetry")
+                        .unwrap()
+                        .telemetry
+                        .cpu
+                        .overall_percent,
+                    10.0
+                );
+            }
         }
     }
 
@@ -1254,6 +1462,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_telemetry_cannot_suppress_replacement_polling_or_rebind_after_aba() {
+        for originally_bound in [false, true] {
+            for return_to_original in [false, true] {
+                let pool = WorkerPool::new();
+                let original = create_worker_config("cached-before-retarget");
+                pool.add_worker(original.clone()).await;
+                let worker = pool.get(&original.id).await.unwrap();
+                let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+                let poller =
+                    TelemetryPoller::new(pool, store.clone(), TelemetryPollerConfig::default());
+                let before = worker.endpoint_snapshot().await;
+                let old_sample = make_telemetry(original.id.as_str(), 99.0, 99.0);
+                if originally_bound {
+                    store.ingest_for_endpoint(old_sample, TelemetrySource::SshPoll, &before);
+                } else {
+                    store.ingest(old_sample, TelemetrySource::Piggyback);
+                }
+                assert!(!poller.should_poll_worker(&worker).await);
+
+                let mut replacement = original.clone();
+                replacement.host = "replacement.host".to_string();
+                assert!(worker.update_config(replacement).await);
+                if return_to_original {
+                    assert!(worker.update_config(original.clone()).await);
+                }
+                let current = worker.endpoint_snapshot().await;
+                assert!(
+                    store.latest(original.id.as_str()).is_some(),
+                    "history is retained"
+                );
+                assert!(store.latest_for_endpoint(&current).is_none());
+                assert!(poller.should_poll_worker(&worker).await);
+
+                // An ID-only push arriving after the reload cannot manufacture
+                // evidence for the replacement, even if its receipt is recent.
+                store.ingest(
+                    make_telemetry(original.id.as_str(), 98.0, 98.0),
+                    TelemetrySource::Piggyback,
+                );
+                assert!(store.latest_for_endpoint(&current).is_none());
+                assert!(poller.should_poll_worker(&worker).await);
+
+                assert!(
+                    poll_worker_with(
+                        worker.clone(),
+                        store.clone(),
+                        TelemetryPollerConfig::default(),
+                        "fresh-bound-transport",
+                        |endpoint| {
+                            std::future::ready(Ok(make_telemetry(endpoint.id.as_str(), 10.0, 10.0)))
+                        },
+                    )
+                    .await
+                );
+                assert!(!poller.should_poll_worker(&worker).await);
+                store.ingest(
+                    make_telemetry(original.id.as_str(), 97.0, 97.0),
+                    TelemetrySource::Piggyback,
+                );
+                assert_eq!(
+                    store
+                        .latest_for_endpoint(&current)
+                        .unwrap()
+                        .telemetry
+                        .cpu
+                        .overall_percent,
+                    10.0,
+                    "unbound pushes must not mask the valid bound observation"
+                );
+
+                let mut capacity_only = current.config.clone();
+                capacity_only.total_slots += 1;
+                assert!(!worker.update_config(capacity_only).await);
+                assert!(!poller.should_poll_worker(&worker).await);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_poll_once_empty_pool() {
         use crate::workers::WorkerPool;
 
@@ -1306,7 +1593,7 @@ mod tests {
             let mut recent = store.recent.write().unwrap();
             let entries = recent.get_mut("w1").unwrap();
             for entry in entries.iter_mut() {
-                entry.received_at = Utc::now() - ChronoDuration::seconds(120);
+                entry.received.received_at = Utc::now() - ChronoDuration::seconds(120);
             }
         }
 
@@ -1317,7 +1604,7 @@ mod tests {
         let entries = recent.get("w1").unwrap();
         // Only the newest should remain
         assert_eq!(entries.len(), 1);
-        assert!((entries[0].telemetry.cpu.overall_percent - 50.0).abs() < f64::EPSILON);
+        assert!((entries[0].received.telemetry.cpu.overall_percent - 50.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

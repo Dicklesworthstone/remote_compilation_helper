@@ -1,8 +1,9 @@
 //! Windows/non-Unix stub hook implementation.
 //!
 //! RCH's daemon communication currently uses Unix domain sockets. On non-Unix
-//! platforms we compile a fail-open stub so the CLI can build and the hook
-//! never blocks local execution.
+//! platforms the passive hook remains fail-open. Explicit `rch exec` is
+//! different: an unsupported transport cannot waive remote-only or no-fallback
+//! policy and silently start a local build.
 
 use crate::error::PlatformError;
 use rch_common::{
@@ -43,10 +44,10 @@ pub async fn run_hook() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Execute a compilation command locally.
+/// Execute locally only when the caller and configuration permit it.
 ///
-/// On non-Unix platforms we do not support daemon-based offloading, so `rch exec`
-/// simply runs the provided command via the local shell.
+/// Non-Unix clients do not support daemon-based offloading. Every refusal below
+/// precedes local shell creation; this does not change the passive hook policy.
 pub async fn run_exec(
     base: Option<String>,
     dependency_bases: Vec<String>,
@@ -56,9 +57,20 @@ pub async fn run_exec(
     source_content_receipt: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
+    required_tools: Vec<String>,
+    exact_worker: Option<WorkerId>,
+    caller_requires_remote: bool,
     command_parts: Vec<String>,
     _out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
+    if exact_worker.is_some() {
+        anyhow::bail!("--worker remote admission requires the Unix daemon transport");
+    }
+    if caller_requires_remote {
+        anyhow::bail!(
+            "--require-remote: remote execution requires the Unix daemon transport; no local command was started"
+        );
+    }
     if clean_overlay
         || base.is_some()
         || !dependency_bases.is_empty()
@@ -79,17 +91,48 @@ pub async fn run_exec(
     if !result_dirs.is_empty() {
         anyhow::bail!("--result-dir requires the Unix rsync transport");
     }
+    if !required_tools.is_empty() {
+        anyhow::bail!("--require-tool requires the Unix daemon transport");
+    }
     let command = command_parts.join(" ");
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
     }
 
-    let status = std::process::Command::new("cmd") // ubs:ignore — explicit user-requested local exec; selected-source modes refuse above.
+    let require_remote = exec_policy_env("RCH_REQUIRE_REMOTE")?;
+    let force_remote = exec_policy_env("RCH_FORCE_REMOTE")?;
+    // Loading configuration is mandatory here. A parse/read failure cannot
+    // establish that a configured no-local-fallback policy permits execution.
+    let config = crate::config::load_config()?;
+    let reason = rch_common::exec_policy::unavailable_remote_fallback(
+        &command,
+        &config,
+        require_remote.as_deref(),
+        force_remote.as_deref(),
+    )
+    .map_err(|reason| {
+        anyhow::anyhow!(
+            "{reason}: remote execution requires the Unix daemon transport; no local command was started"
+        )
+    })?;
+    eprintln!("[RCH] local ({reason}; Unix daemon transport unavailable)");
+
+    let status = std::process::Command::new("cmd") // ubs:ignore — explicit local execution permitted by the policy above.
         .arg("/C")
         .arg(&command)
         .status()?;
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+fn exec_policy_env(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} is not valid Unicode; execution policy is unknown")
+        }
+    }
 }
 
 /// Query the daemon for a worker.
@@ -113,6 +156,14 @@ pub(crate) async fn query_daemon(
     _job_mode: bool,
     _required_tools: &[String],
 ) -> anyhow::Result<SelectionResponse> {
+    Err(PlatformError::UnixSocketUnsupported)?
+}
+
+/// Query the versioned read-only admission-preview route.
+pub(crate) async fn query_admission_preview(
+    _socket_path: &str,
+    _request: &rch_common::admission_preview::PreviewRequest,
+) -> anyhow::Result<rch_common::admission_preview::PreviewResponse> {
     Err(PlatformError::UnixSocketUnsupported)?
 }
 

@@ -39,6 +39,7 @@
 //! module and stays private.
 
 pub(super) mod cargo_bins;
+pub(super) mod clean_overlay;
 pub(super) mod direct_compiler;
 
 use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};
@@ -123,16 +124,18 @@ pub(super) fn get_artifact_patterns(
         | Some(CompilationKind::Make)
         | Some(CompilationKind::CmakeBuild)
         | Some(CompilationKind::Ninja)
-        | Some(CompilationKind::Meson) => default_c_cpp_artifact_patterns(),
+        | Some(CompilationKind::Meson) => {
+            let mut patterns = default_c_cpp_artifact_patterns();
+            clean_overlay::exclude_source_archive(&mut patterns);
+            patterns
+        }
         // Nix outputs live in the worker's `/nix/store` behind a `result`
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
         Some(CompilationKind::NixBuild) => Vec::new(),
-        // Go and TypeScript kinds are stream-only by construction: the classifier
-        // only accepts the non-emitting forms (`go build` without `-o`, `go test`,
-        // `go vet`, `tsc --noEmit`), so there is no output file to bring home and
-        // the exit status is the payload. Emitting forms are declined in
-        // classify_go/classify_tsc and run locally. Falling through to the
+        // Explicit Go builds were selected by direct_compiler above. Other Go
+        // and TS commands stream their results; unsupported emitting forms
+        // are declined by their classifiers. Falling through to the
         // `_ => default_rust_artifact_patterns()` catch-all would sync back
         // `target/**` — the wrong tree entirely.
         Some(CompilationKind::GoBuild)
@@ -437,6 +440,7 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         // Zig cross-build produces a real binary under target/<triple>/ that the
         // caller needs locally, so a failed sync-back is a build failure.
         | Some(CompilationKind::CargoZigbuild)
+        | Some(CompilationKind::GoBuild)
         | Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
         | Some(CompilationKind::Clang)
@@ -458,9 +462,7 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         // Jobs are arbitrary admitted commands: no artifact contract exists in
         // this phase, so a sync-back miss can never fail a job.
         | Some(CompilationKind::Job)
-        // Go/TS: only non-emitting forms are ever offloaded (see classify_go /
-        // classify_tsc), so there is no required local artifact.
-        | Some(CompilationKind::GoBuild)
+        // Go tests/vet and TS typechecks have no selected local artifact.
         | Some(CompilationKind::GoTest)
         | Some(CompilationKind::GoVet)
         | Some(CompilationKind::Tsc) => false,
@@ -820,7 +822,9 @@ mod profile_artifact_tests {
                 false,
             ),
         ] {
-            let root = tempfile::tempdir().unwrap().keep();
+            // Cargo reports artifact paths under its canonical cwd; on macOS
+            // the temp dir is reached through the /var -> /private/var link.
+            let root = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
             let source = root.join("source project");
             let local_project = root.join("local project");
             std::fs::create_dir_all(source.join("src")).unwrap();

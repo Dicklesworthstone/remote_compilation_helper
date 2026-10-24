@@ -66,34 +66,46 @@ pub fn is_toolchain_available(toolchain: &str) -> Result<bool> {
         }
     }
 
+    probe_toolchain(toolchain)
+}
+
+/// Verify a runnable compiler without consulting the availability cache.
+/// Installation must use this path: the installer's successful exit is not
+/// evidence that `rustup run <toolchain> rustc` can actually execute.
+fn probe_toolchain(toolchain: &str) -> Result<bool> {
     // Query rustup
     debug!("Checking toolchain {} via rustup", toolchain);
     let output = Command::new("rustup")
         .args(["run", toolchain, "rustc", "--version"])
-        .output()?;
+        .output();
 
-    let available = output.status.success();
+    let available = output.as_ref().is_ok_and(|output| output.status.success());
 
-    // Update cache if available (skip caching if lock is poisoned)
-    if available {
-        match TOOLCHAIN_CACHE.write() {
-            Ok(mut cache) => {
+    // Only a successful compiler probe can populate availability. A failed
+    // fresh probe also invalidates an earlier positive observation.
+    match TOOLCHAIN_CACHE.write() {
+        Ok(mut cache) => {
+            if available {
                 let set = cache.get_or_insert_with(HashSet::new);
                 set.insert(toolchain.to_string());
                 debug!("Cached toolchain {} as available", toolchain);
+            } else if let Some(set) = cache.as_mut() {
+                set.remove(toolchain);
             }
-            Err(_) => {
-                debug!("Toolchain cache poisoned, skipping cache update");
-            }
+        }
+        Err(_) => {
+            debug!("Toolchain cache poisoned, skipping cache update");
         }
     }
 
-    Ok(available)
+    output.map(|_| available).map_err(ToolchainError::Io)
 }
 
 /// Install a toolchain via rustup using minimal profile.
 ///
 /// Uses `--profile minimal` to reduce installation size and time.
+/// Success additionally requires a fresh compiler probe; never cache an
+/// installer exit code as proof of a usable toolchain.
 pub fn install_toolchain(toolchain: &str) -> Result<()> {
     info!("Installing toolchain {} via rustup", toolchain);
 
@@ -102,19 +114,16 @@ pub fn install_toolchain(toolchain: &str) -> Result<()> {
         .output()?;
 
     if output.status.success() {
-        info!("Successfully installed toolchain {}", toolchain);
-
-        // Update cache (skip if lock is poisoned - cache is just an optimization)
-        match TOOLCHAIN_CACHE.write() {
-            Ok(mut cache) => {
-                let set = cache.get_or_insert_with(HashSet::new);
-                set.insert(toolchain.to_string());
-            }
-            Err(_) => {
-                debug!("Toolchain cache poisoned, skipping cache update after install");
-            }
+        if !probe_toolchain(toolchain)? {
+            return Err(ToolchainError::InstallFailed(format!(
+                "Toolchain {} not available after installation",
+                toolchain
+            )));
         }
-
+        info!(
+            "Successfully installed and verified toolchain {}",
+            toolchain
+        );
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -132,10 +141,11 @@ pub fn install_toolchain(toolchain: &str) -> Result<()> {
 /// 2. If not available, install via rustup with minimal profile
 /// 3. Return Ok(()) if toolchain is now usable
 ///
-/// # Fail-Open Behavior
+/// # Failure Boundary
 ///
-/// On installation failure, this returns an error but callers should consider
-/// falling back to local execution rather than blocking the agent.
+/// On failure, the worker must not execute the command with a different
+/// compiler. Report the error to the dispatcher, which owns any retry or
+/// local-fallback decision and must preserve the requested toolchain.
 pub fn ensure_toolchain(toolchain: &ToolchainInfo) -> Result<()> {
     let tc_str = toolchain.rustup_toolchain();
     info!(
@@ -155,20 +165,9 @@ pub fn ensure_toolchain(toolchain: &ToolchainInfo) -> Result<()> {
         return Ok(());
     }
 
-    // Install the toolchain
+    // Installation includes a fresh, cache-bypassing compiler probe.
     info!("Toolchain {} not found, installing...", tc_str);
-    install_toolchain(&tc_str)?;
-
-    // Verify installation
-    if is_toolchain_available(&tc_str)? {
-        info!("Toolchain {} is now available", tc_str);
-        Ok(())
-    } else {
-        Err(ToolchainError::InstallFailed(format!(
-            "Toolchain {} not available after installation",
-            tc_str
-        )))
-    }
+    install_toolchain(&tc_str)
 }
 
 /// Clear the toolchain cache.
@@ -836,13 +835,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_path_on_toolchain_error() {
+    fn test_toolchain_error_preserves_failure_diagnostic() {
         let _guard = test_guard!();
-        // Simulate the fallback decision path when toolchain fails
-        // In the actual code, this triggers execution without toolchain wrapping
+        // This checks diagnostics only. The worker CLI execution boundary is
+        // exercised by tests/toolchain_execution.rs, never by default fallback.
         let result: Result<()> = Err(ToolchainError::InstallFailed("test".to_string()));
 
-        // On error, the caller should fall back to default execution
         match result {
             Ok(()) => panic!("Expected error"),
             Err(e) => {

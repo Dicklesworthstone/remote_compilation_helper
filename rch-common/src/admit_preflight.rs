@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
 use crate::patterns::{
-    CompilationKind, classify_command, classify_command_detailed, is_cargo_xwin_build,
-    split_shell_commands,
+    CompilationKind, cargo_xwin_compilation_kind, classify_command, classify_command_detailed,
+    normalize_command, split_shell_commands, split_wrapper_word, unquote_literal_option_word,
 };
 
 /// The decisive recommendation `rch admit` returns.
@@ -70,8 +70,8 @@ pub struct RequiredCapabilities {
     pub needs_targets: Vec<String>,
     /// Explicit toolchain overrides (`cargo +nightly-…`).
     pub needs_toolchains: Vec<String>,
-    /// Host OS the worker must run, when a requested `--target` triple implies
-    /// one (e.g. `*-pc-windows-msvc` → `windows`). `None` for the ordinary
+    /// Host OS the worker must run, when a native tool or requested `--target`
+    /// triple implies one (e.g. `xcodebuild` → `darwin`). `None` for the ordinary
     /// native build, which stays schedulable on any worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_os: Option<String>,
@@ -202,8 +202,23 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
         // exactly as for a plain `cargo build --target ...`.
         req.needs_zig = matches!(kind, CompilationKind::CargoZigbuild);
     }
+    // The xwin matcher validates the entire normalized suffix before admitting
+    // quoted option words. Scan that same suffix so an env/wrapper payload cannot
+    // introduce a target and a quoted --target= option cannot lose its requirement.
+    let xwin = cargo_xwin_compilation_kind(command).is_some();
+    let normalized = xwin.then(|| normalize_command(command));
+    let token_command = normalized.as_deref().unwrap_or(command);
     // Scan tokens for `--target <triple>` / `--target=<triple>` and `+toolchain`.
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let tokens: Vec<&str> = token_command
+        .split_whitespace()
+        .map(|token| {
+            if xwin {
+                unquote_literal_option_word(token)
+            } else {
+                token
+            }
+        })
+        .collect();
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i];
@@ -237,7 +252,7 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
 /// the SDK can reside on Linux. Keep native constraints for ordinary Cargo and
 /// for targets the selected cross-build tool does not support here.
 fn host_bound_targets(command: &str, targets: &[String]) -> Vec<String> {
-    let cross_msvc = is_cargo_xwin_build(command);
+    let cross_msvc = cargo_xwin_compilation_kind(command).is_some();
     let cross_darwin = classify_command(command).kind == Some(CompilationKind::CargoZigbuild);
     targets
         .iter()
@@ -265,14 +280,37 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
             triples.extend(host_bound_targets(part, &required.needs_targets));
         }
     }
-    os_from_target_triples(&triples)
+    os_from_command_and_targets(command, &triples)
+}
+
+/// Native Apple tools need a Darwin host even in explicit job mode, where the
+/// compilation classifier deliberately does not recognize them. Only inspect
+/// the invoked command word, never an argument mentioning a tool. Opaque shell
+/// scripts are not inferred: callers must invoke the Apple tool directly.
+fn os_from_command_and_targets(command: &str, triples: &[String]) -> Option<String> {
+    let native_hosts = split_shell_commands(command)
+        .into_iter()
+        .filter_map(|part| {
+            let normalized = normalize_command(part);
+            let (word, _) = split_wrapper_word(&normalized)?;
+            match word.rsplit('/').next()? {
+                "xcodebuild" | "xcrun" => Some("darwin"),
+                _ => None,
+            }
+        });
+    unique_host_os(
+        triples
+            .iter()
+            .filter_map(|triple| target_host_os(triple))
+            .chain(native_hosts),
+    )
 }
 
 /// The host OS a set of `--target` triples demands, when they agree on one.
 ///
 /// Only a triple naming an OS the worker must *be* counts. `x86_64-pc-windows-msvc`
 /// ordinarily links against the native MSVC toolchain, so it yields `windows`;
-/// explicit cargo-xwin builds remove their MSVC targets before this step.
+/// explicit cargo-xwin compilations remove their MSVC targets before this step.
 /// Every `*-apple-*` target (darwin, ios, tvos, watchos, visionos)
 /// needs the macOS SDK, so it yields `darwin`. `x86_64-pc-windows-gnu` and
 /// `wasm32-unknown-unknown` cross-compile happily from Linux and yield nothing.
@@ -282,16 +320,23 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
 /// OSes cannot succeed on any single worker regardless, and returning `None`
 /// keeps that no worse than it is today rather than inventing a new refusal.
 fn os_from_target_triples(triples: &[String]) -> Option<String> {
+    unique_host_os(triples.iter().filter_map(|triple| target_host_os(triple)))
+}
+
+fn target_host_os(triple: &str) -> Option<&'static str> {
+    let lower = triple.to_ascii_lowercase();
+    if lower.contains("-windows-msvc") {
+        Some("windows")
+    } else if lower.contains("-apple-") {
+        Some("darwin")
+    } else {
+        None
+    }
+}
+
+fn unique_host_os(hosts: impl IntoIterator<Item = &'static str>) -> Option<String> {
     let mut required: Option<String> = None;
-    for triple in triples {
-        let lower = triple.to_ascii_lowercase();
-        let os = if lower.contains("-windows-msvc") {
-            "windows"
-        } else if lower.contains("-apple-") {
-            "darwin"
-        } else {
-            continue;
-        };
+    for os in hosts {
         match &required {
             Some(existing) if existing != os => return None,
             Some(_) => {}
@@ -349,7 +394,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
     required.needs_toolchains.dedup();
     // Recomputed over the merged target set: a compound command whose parts
     // disagree on the required OS must not inherit one part's answer.
-    required.needs_os = os_from_target_triples(&host_targets);
+    required.needs_os = os_from_command_and_targets(command, &host_targets);
 
     let base_recommendation = if is_compilation {
         AdmitRecommendation::Offload
@@ -386,6 +431,16 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
 }
 
 impl AdmitPreflight {
+    /// Add explicit compiler capabilities without bypassing classification or
+    /// replacing the command's existing Rust/target/toolchain requirements.
+    #[must_use]
+    pub fn with_required_tools(mut self, required_tools: Vec<String>) -> Self {
+        self.required.needs_tools.extend(required_tools);
+        self.required.needs_tools.sort();
+        self.required.needs_tools.dedup();
+        self
+    }
+
     /// Re-frame a preflight as a JOB-mode admission (`rch exec --job`).
     ///
     /// Job mode bypasses the compilation classifier rather than consulting it,
@@ -471,6 +526,34 @@ mod tests {
     };
 
     #[test]
+    fn compiler_tool_requirements_preserve_rust_target_and_classification() {
+        let original = preflight(
+            "cargo build --target x86_64-pc-windows-msvc --release",
+            true,
+        );
+        let observed = original.clone().with_required_tools(vec![
+            "cargo-xwin".into(),
+            "llvm-ar".into(),
+            "cargo-xwin".into(),
+        ]);
+        assert_eq!(observed.is_compilation, original.is_compilation);
+        assert_eq!(observed.family, original.family);
+        assert_eq!(observed.base_recommendation, original.base_recommendation);
+        assert_eq!(
+            observed.required.needs_targets,
+            original.required.needs_targets
+        );
+        assert_eq!(
+            observed.required.needs_toolchains,
+            original.required.needs_toolchains
+        );
+        assert!(observed.required.needs_cargo);
+        assert!(!observed.job_mode);
+        assert!(observed.proof_policy);
+        assert_eq!(observed.required.needs_tools, vec!["cargo-xwin", "llvm-ar"]);
+    }
+
+    #[test]
     fn job_mode_preflight_is_offload_eligible_whatever_the_classifier_said() {
         // THE point of the job-mode preflight: `exec --job` bypasses the
         // classifier, so a preflight that consulted it would answer `local`
@@ -546,29 +629,83 @@ mod tests {
     }
 
     #[test]
-    fn cargo_xwin_keeps_rust_target_requirements_without_a_native_windows_gate() {
-        for command in [
-            "cargo xwin build --target x86_64-pc-windows-msvc",
-            "cargo +nightly-2026-08-31 xwin build --target=aarch64-pc-windows-msvc",
-            "cargo-xwin xwin build --target x86_64-pc-windows-msvc",
+    fn cargo_xwin_keeps_rust_requirements_without_a_native_windows_gate() {
+        for (subcommand, family) in [
+            ("build", "cargo_build"),
+            ("check", "cargo_check"),
+            ("clippy", "cargo_clippy"),
         ] {
-            let result = preflight(command, true);
-            assert!(result.is_compilation, "{command}");
-            assert!(result.required.needs_cargo, "{command}");
-            assert_eq!(result.family.as_deref(), Some("cargo_build"));
-            assert_eq!(result.required.needs_targets.len(), 1);
-            assert!(result.required.needs_targets[0].contains("-windows-msvc"));
-            assert_eq!(result.required.needs_os, None);
-            assert_eq!(required_os_for_command(command), None);
+            for (prefix, toolchain) in [
+                ("cargo xwin", None),
+                ("cargo +nightly-2026-08-31 xwin", Some("nightly-2026-08-31")),
+                ("cargo-xwin", None),
+                ("cargo-xwin xwin", None),
+            ] {
+                for (target_argument, target) in [
+                    ("--target x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc"),
+                    (
+                        "--target=aarch64-pc-windows-msvc",
+                        "aarch64-pc-windows-msvc",
+                    ),
+                ] {
+                    let passthrough = if subcommand == "clippy" {
+                        " -- -D warnings"
+                    } else {
+                        ""
+                    };
+                    let command = format!(
+                        "{prefix} {subcommand} --locked --all-targets {target_argument}{passthrough}"
+                    );
+                    let result = preflight(&command, true);
+                    let expected_toolchains: Vec<String> = toolchain
+                        .into_iter()
+                        .map(|value| value.to_string())
+                        .collect();
+                    assert!(result.is_compilation, "{command}");
+                    assert!(result.required.needs_cargo, "{command}");
+                    assert_eq!(result.family.as_deref(), Some(family), "{command}");
+                    assert_eq!(
+                        result.required.needs_targets,
+                        vec![target.to_string()],
+                        "{command}"
+                    );
+                    assert_eq!(
+                        result.required.needs_toolchains, expected_toolchains,
+                        "{command}"
+                    );
+                    assert_eq!(result.required.needs_os, None, "{command}");
+                    assert_eq!(required_os_for_command(&command), None, "{command}");
+                    let requirement = result.required.to_requirement(1);
+                    assert!(requirement.needs_cargo, "{command}");
+                    assert_eq!(requirement.min_protocol, 1, "{command}");
+                    assert_eq!(
+                        requirement.needs_targets, result.required.needs_targets,
+                        "{command}"
+                    );
+                    assert_eq!(
+                        requirement.needs_toolchains, result.required.needs_toolchains,
+                        "{command}"
+                    );
+                    assert_eq!(requirement.needs_os, None, "{command}");
+                }
+            }
         }
     }
 
     #[test]
     fn cargo_xwin_does_not_relax_other_commands_or_apple_targets() {
         for command in [
+            "cargo check --target x86_64-pc-windows-msvc",
+            "cargo clippy --target x86_64-pc-windows-msvc -- -D warnings",
             "cargo xwin build --target x86_64-pc-windows-msvc && cargo build --target x86_64-pc-windows-msvc",
+            "cargo xwin check --target x86_64-pc-windows-msvc && cargo check --target x86_64-pc-windows-msvc",
+            "cargo xwin clippy --target x86_64-pc-windows-msvc && cargo clippy --target x86_64-pc-windows-msvc",
             "cargo --config xwin build --target x86_64-pc-windows-msvc",
+            "cargo --config xwin check --target x86_64-pc-windows-msvc",
+            "cargo --config xwin clippy --target x86_64-pc-windows-msvc",
             "cargo build --manifest-path cargo-xwin --target x86_64-pc-windows-msvc",
+            "cargo check --manifest-path 'cargo xwin check' --target x86_64-pc-windows-msvc",
+            "cargo clippy --config 'alias.cross=xwin' --target x86_64-pc-windows-msvc",
         ] {
             assert_eq!(
                 required_os_for_command(command).as_deref(),
@@ -583,7 +720,12 @@ mod tests {
         }
         for command in [
             "cargo xwin build --target aarch64-apple-darwin",
+            "cargo xwin check --target aarch64-apple-darwin",
+            "cargo xwin clippy --target aarch64-apple-darwin",
+            "cargo-xwin check --target aarch64-apple-darwin",
+            "cargo-xwin xwin clippy --target aarch64-apple-darwin",
             "cargo xwin build --target x86_64-pc-windows-msvc && cargo build --target aarch64-apple-darwin",
+            "cargo xwin check --target x86_64-pc-windows-msvc && cargo check --target aarch64-apple-darwin",
         ] {
             assert_eq!(
                 required_os_for_command(command).as_deref(),
@@ -678,6 +820,73 @@ mod tests {
                 "triple={triple}"
             );
         }
+    }
+
+    #[test]
+    fn native_apple_jobs_require_darwin_without_rust_target_flags() {
+        for command in [
+            "xcodebuild -version",
+            "/usr/bin/xcodebuild -project ios/App.xcodeproj -scheme App build",
+            "'xcodebuild' -scheme App test",
+            "'/Applications/Xcode Beta.app/Contents/Developer/usr/bin/xcodebuild' -version",
+            "env DEVELOPER_DIR='/Applications/Xcode Beta.app' xcodebuild -jobs 1 test",
+            "timeout 1200 xcodebuild -destination 'platform=macOS,variant=Mac Catalyst' test",
+            "xcrun --sdk iphoneos xcodebuild -scheme App build",
+            "/usr/bin/xcrun --find swift",
+            "cd ios && xcodebuild -scheme App build",
+        ] {
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            let job = preflight(command, true).as_job(Vec::new());
+            assert_eq!(
+                job.required.needs_os.as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            assert!(
+                job.required.needs_targets.is_empty(),
+                "not a Rust target: {command}"
+            );
+            assert!(!job.required.needs_cargo, "not a Cargo job: {command}");
+        }
+    }
+
+    #[test]
+    fn native_apple_job_inference_does_not_claim_mentions_or_opaque_scripts() {
+        for command in [
+            "echo xcodebuild -version",
+            "printf '%s' 'xcrun --sdk macosx'",
+            "br comments add bd-example 'xcodebuild -scheme App build'",
+            "env NOTE=xcodebuild bun test",
+            "env -u xcodebuild bun test",
+            "xcodebuild-wrapper -scheme App build",
+            "./check.sh --target aarch64-apple-darwin",
+            "bash -c 'echo xcodebuild'",
+            "bash -c 'xcodebuild -version'",
+            "'xcodebuild -version'",
+            "\"${TOOL}/xcodebuild\" -version",
+            "'unterminated/xcodebuild -version",
+        ] {
+            assert_eq!(required_os_for_command(command), None, "{command}");
+            assert_eq!(
+                preflight(command, true)
+                    .as_job(Vec::new())
+                    .required
+                    .needs_os,
+                None,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            required_os_for_command(
+                "xcodebuild build && cargo build --target x86_64-pc-windows-msvc"
+            ),
+            None,
+            "mixed native host requirements must not inherit just the Rust half"
+        );
     }
 
     #[test]

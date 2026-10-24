@@ -470,6 +470,11 @@ fn literal_cargo_tokens(
             anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
         }
     }
+    // A shell reads a trailing backslash as a line continuation, so the command
+    // it runs is not the argv the tokenizer below would return.
+    if escaped || quote.is_some() {
+        anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
+    }
     cargo_command_tokens_with_wrappers(command, allow_classified_wrappers)
 }
 
@@ -642,19 +647,19 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
         "managed Cargo build directory must be a nonempty path without control characters"
     );
     let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    let executable = Path::new(&tokens[cargo_index])
+        .file_name()
+        .and_then(|name| name.to_str());
+    let standalone_xwin = matches!(executable, Some("cargo-xwin" | "cargo-xwin.exe"));
     anyhow::ensure!(
-        matches!(
-            Path::new(&tokens[cargo_index])
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("cargo" | "cargo.exe")
-        ),
-        "managed clean-overlay build directory requires the Cargo executable"
+        standalone_xwin || matches!(executable, Some("cargo" | "cargo.exe")),
+        "managed clean-overlay build directory requires Cargo or an exact xwin build"
     );
     let mut index = cargo_index + 1;
-    if tokens
-        .get(index)
-        .is_some_and(|token| token.starts_with('+'))
+    if !standalone_xwin
+        && tokens
+            .get(index)
+            .is_some_and(|token| token.starts_with('+'))
     {
         index += 1;
     }
@@ -686,10 +691,23 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     let subcommand = tokens
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("missing Cargo subcommand"))?;
-    if subcommand == "fmt" {
+    let xwin = standalone_xwin || subcommand == "xwin";
+    if xwin {
+        anyhow::ensure!(
+            rch_common::patterns::is_cargo_xwin_build(command),
+            "managed xwin requires an exact classified xwin build"
+        );
+        if subcommand == "xwin" {
+            index += 1;
+        }
+    }
+    let subcommand = tokens
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("missing Cargo build subcommand"))?;
+    if !xwin && subcommand == "fmt" {
         return Ok(command.to_string());
     }
-    let packaging = matches!(subcommand.as_str(), "package" | "publish");
+    let packaging = !xwin && matches!(subcommand.as_str(), "package" | "publish");
     if packaging {
         // Apply the SAME authority check as classification, before inserting
         // any worker configuration. A dry-run token inside an option value,
@@ -739,6 +757,104 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     Ok(join_exec_command(&tokens))
 }
 
+/// Bind the owned closure's final artifacts to its granted pool using Cargo's
+/// actual CLI option, which takes precedence over environment and configuration.
+/// This is applied only to execution after the caller's output policy is saved.
+pub(super) fn bind_owned_cargo_target_dir(
+    command: &str,
+    managed_target: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        Path::new(managed_target).is_absolute()
+            && Path::new(managed_target).file_name().is_some()
+            && !managed_target.chars().any(char::is_control)
+            && !managed_target.contains('\\')
+            && !managed_target
+                .split('/')
+                .any(|part| part == "." || part == ".."),
+        "owned Cargo target must be an absolute literal pool path"
+    );
+    let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    anyhow::ensure!(
+        Path::new(&tokens[cargo_index])
+            .file_name()
+            .is_some_and(|name| name == "cargo" || name == "cargo.exe"),
+        "owned target binding requires the Cargo executable"
+    );
+    let mut index = cargo_index + 1;
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.starts_with('+'))
+    {
+        index += 1;
+    }
+    while let Some(token) = tokens.get(index) {
+        match token.as_str() {
+            "--config" | "--color" | "-Z" => {
+                anyhow::ensure!(
+                    tokens.get(index + 1).is_some_and(|value| value != "--"),
+                    "missing Cargo global option value"
+                );
+                index += 2;
+            }
+            "-v" | "-vv" | "-q" | "--verbose" | "--quiet" | "--locked" | "--offline"
+            | "--frozen" => index += 1,
+            value
+                if value.starts_with("--config=")
+                    || value.starts_with("--color=")
+                    || value.starts_with("-Z") && value.len() > 2 =>
+            {
+                index += 1
+            }
+            value if value.starts_with('-') => {
+                anyhow::bail!("unsupported owned Cargo global option: {value}")
+            }
+            _ => break,
+        }
+    }
+    let subcommand = tokens
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("missing Cargo subcommand"))?;
+    anyhow::ensure!(
+        matches!(
+            subcommand.as_str(),
+            "build"
+                | "b"
+                | "check"
+                | "c"
+                | "test"
+                | "t"
+                | "clippy"
+                | "doc"
+                | "d"
+                | "bench"
+                | "run"
+                | "r"
+                | "rustc"
+                | "rustdoc"
+                | "fix"
+                | "package"
+                | "publish"
+        ),
+        "unsupported Cargo subcommand for owned target binding: {subcommand}"
+    );
+    let end = tokens[index + 1..]
+        .iter()
+        .position(|token| token == "--")
+        .map_or(tokens.len(), |offset| index + 1 + offset);
+    anyhow::ensure!(
+        !tokens[index + 1..end]
+            .iter()
+            .any(|token| token == "--target-dir" || token.starts_with("--target-dir=")),
+        "owned Cargo target binding requires the caller's target selector to be absent"
+    );
+    tokens.splice(
+        end..end,
+        ["--target-dir".to_owned(), managed_target.to_owned()],
+    );
+    Ok(join_exec_command(&tokens))
+}
+
 /// Keep the caller's output contract separate from execution-only rewrites.
 /// In particular, injected TOML configuration contains shell quotes which the
 /// conservative package classifier must not interpret as publication authority.
@@ -784,6 +900,18 @@ pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Res
         "env.RCH_BUILD_SOURCE.value={}",
         toml::Value::String(stamp.to_owned())
     );
+    if cargo_subcommand_is_nextest(&tokens, cargo_index) {
+        // cargo-nextest deserializes each `--config` as a whole `[env]` entry,
+        // so a lone `force=true` has no `value` and nextest exits 96, and Cargo
+        // refuses the inline-table form. Bind the value alone and give Cargo's
+        // process environment the same stamp, which is all `force` overrides.
+        tokens.splice(end..end, ["--config".to_owned(), value]);
+        tokens.splice(
+            cargo_index..cargo_index,
+            ["env".to_owned(), format!("RCH_BUILD_SOURCE={stamp}")],
+        );
+        return Ok(join_exec_command(&tokens));
+    }
     tokens.splice(
         end..end,
         [
@@ -794,6 +922,26 @@ pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Res
         ],
     );
     Ok(join_exec_command(&tokens))
+}
+
+/// Same subcommand rule as the classifier: skip `+toolchain` and global flags,
+/// including the separate value of `--color`, `-Z`, `-C` and `--config`.
+fn cargo_subcommand_is_nextest(tokens: &[String], cargo_index: usize) -> bool {
+    const CARGO_VALUE_FLAGS: &[&str] = &["--color", "-Z", "-C", "--config"];
+    let mut rest = tokens.iter().skip(cargo_index + 1);
+    while let Some(token) = rest.next() {
+        if token.starts_with('+') {
+            continue;
+        }
+        if token.starts_with('-') {
+            if !token.contains('=') && CARGO_VALUE_FLAGS.contains(&token.as_str()) {
+                rest.next();
+            }
+            continue;
+        }
+        return token == "nextest";
+    }
+    false
 }
 
 /// Refuse unselected worker Cargo configuration immediately before Unix Cargo.
@@ -1051,7 +1199,92 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
 
 #[cfg(test)]
 mod managed_build_dir_tests {
-    use super::{managed_clean_overlay_cargo_build_dir, managed_clean_overlay_cargo_tokens};
+    use super::{
+        bind_owned_cargo_target_dir, managed_clean_overlay_cargo_build_dir,
+        managed_clean_overlay_cargo_tokens,
+    };
+
+    #[test]
+    fn owned_target_binding_preserves_wrappers_and_passthrough() {
+        let target = "/worker/pools/target with ' quotes";
+        for argv in [
+            vec![
+                "cargo",
+                "build",
+                "--config",
+                "build.target-dir=\"/unselected\"",
+            ],
+            vec![
+                "env",
+                "--",
+                "CARGO_TARGET_DIR=/unselected",
+                "cargo",
+                "+nightly",
+                "test",
+                "--",
+                "--target-dir=/test-payload",
+            ],
+            vec![
+                "time",
+                "-f",
+                "literal --target-dir",
+                "cargo",
+                "--color",
+                "never",
+                "clippy",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            vec![
+                "rustup",
+                "run",
+                "nightly",
+                "cargo",
+                "check",
+                "--all-targets",
+            ],
+        ] {
+            let command = shell_words::join(&argv);
+            let managed = managed_clean_overlay_cargo_build_dir(&command, target).unwrap();
+            let mut expected = shell_words::split(&managed).unwrap();
+            let (_, cargo_index) = managed_clean_overlay_cargo_tokens(&managed).unwrap();
+            let separator = expected[cargo_index + 1..]
+                .iter()
+                .position(|token| token == "--")
+                .map_or(expected.len(), |offset| cargo_index + 1 + offset);
+            expected.splice(
+                separator..separator,
+                ["--target-dir".to_owned(), target.to_owned()],
+            );
+            let bound = bind_owned_cargo_target_dir(&managed, target).unwrap();
+            assert_eq!(shell_words::split(&bound).unwrap(), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn owned_target_binding_refuses_unsupported_or_duplicate_output_authority() {
+        for command in [
+            "cargo fmt",
+            "cargo clean",
+            "cargo build --target-dir /unselected",
+            "cargo build --target-dir=/unselected",
+            "cargo -C /elsewhere build",
+            "cargo-xwin build",
+            "cargo build; echo changed",
+        ] {
+            assert!(
+                bind_owned_cargo_target_dir(command, "/worker/pool").is_err(),
+                "{command}"
+            );
+        }
+        for target in ["relative", "/", "/worker/../pool", "/worker/pool\nother"] {
+            assert!(
+                bind_owned_cargo_target_dir("cargo build", target).is_err(),
+                "{target:?}"
+            );
+        }
+    }
 
     /// Real Cargo verifies the extracted archive, not merely the working tree.
     /// The transfer below is local rsync fed by the production artifact policy;
@@ -1199,8 +1432,7 @@ mod managed_build_dir_tests {
             "verification must execute the build script from the extracted archive"
         );
 
-        let plan =
-            super::ManagedCargoCommand::new(command, Some(pool.to_str().unwrap())).unwrap();
+        let plan = super::ManagedCargoCommand::new(command, Some(pool.to_str().unwrap())).unwrap();
         let patterns = get_custom_target_artifact_patterns(
             Some(rch_common::CompilationKind::CargoBuild),
             Some(plan.policy_command()),
@@ -1215,7 +1447,24 @@ mod managed_build_dir_tests {
             .partition_staged_artifact_paths(&inventory, &patterns)
             .unwrap();
         let archive = PathBuf::from("package/managed_package_fixture-0.1.0.crate");
-        assert_eq!(selected, std::slice::from_ref(&archive));
+        // Cargo can retain its identical archive staging copy. The production
+        // policy deliberately retrieves tmp-crate archives for dry-run publish;
+        // keep that contract while rejecting every unrelated selected file.
+        let temporary_archive =
+            PathBuf::from("package/tmp-crate/managed_package_fixture-0.1.0.crate");
+        let mut expected = vec![archive.clone()];
+        if pool.join(&temporary_archive).is_file() {
+            assert_eq!(
+                fs::read(pool.join(&temporary_archive)).unwrap(),
+                fs::read(pool.join(&archive)).unwrap(),
+                "Cargo's staging archive must be byte-identical to its final archive"
+            );
+            expected.push(temporary_archive.clone());
+        }
+        expected.sort();
+        let mut selected_set = selected.clone();
+        selected_set.sort();
+        assert_eq!(selected_set, expected);
         let mut rsync = Command::new("/usr/bin/timeout") // ubs:ignore — copies only production-selected fixture archives, locally.
             .args([
                 "--kill-after=5",
@@ -1244,6 +1493,15 @@ mod managed_build_dir_tests {
         }
         let transferred = rsync.wait_with_output().unwrap();
         assert!(transferred.status.success(), "{transferred:?}");
+        for relative in &selected {
+            let original = fs::read(pool.join(relative)).unwrap();
+            let returned = fs::read(root.join("returned").join(relative)).unwrap();
+            assert_eq!(
+                blake3::hash(&returned),
+                blake3::hash(&original),
+                "returned archive bytes differ for {relative:?}"
+            );
+        }
         let original = fs::read(pool.join(&archive)).unwrap();
         let returned = fs::read(root.join("returned").join(&archive)).unwrap();
         assert_eq!(blake3::hash(&returned), blake3::hash(&original));
@@ -1266,11 +1524,8 @@ mod managed_build_dir_tests {
         // The worktree remains buildable, but the archive deliberately omits
         // the required input. Verification must fail, not silently build the
         // working tree or reuse artifacts from the earlier verified package.
-        fs::write(
-            root.join("src/lib.rs"),
-            b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n",
-        )
-        .unwrap();
+        let failing_source = b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n";
+        fs::write(root.join("src/lib.rs"), failing_source).unwrap();
         let check = run(
             "worktree",
             "cargo check --offline -j1",
@@ -1281,9 +1536,55 @@ mod managed_build_dir_tests {
         let failed = run("package-missing-input", command, &failed_pool);
         assert_eq!(failed.status.code(), Some(101), "{failed:?}");
         assert!(String::from_utf8_lossy(&failed.stderr).contains("worktree-only.txt"));
+        // Cargo promotes the staged archive only after verification succeeds.
+        // The failed package must retain the new source in staging without
+        // presenting it as a successfully verified final archive.
         assert!(
-            failed_pool.join(&archive).is_file(),
-            "failure must occur after archive creation"
+            failed_pool.join(&temporary_archive).is_file(),
+            "verification failure must occur after staging the archive"
+        );
+        assert!(
+            !failed_pool.join(&archive).exists(),
+            "failed verification must not promote a final archive"
+        );
+        let failed_archive = fs::read(failed_pool.join(&temporary_archive)).unwrap();
+        assert_ne!(
+            failed_archive, original,
+            "failed package must use the new source"
+        );
+        let mut members =
+            tar::Archive::new(flate2::read::GzDecoder::new(failed_archive.as_slice()));
+        let mut saw_failing_source = false;
+        let mut saw_packaged_input = false;
+        for entry in members.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            assert!(!path.ends_with("worktree-only.txt"));
+            if path == Path::new("managed_package_fixture-0.1.0/src/lib.rs") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes.as_slice(), &failing_source[..]);
+                saw_failing_source = true;
+            } else if path == Path::new("managed_package_fixture-0.1.0/packaged.txt") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"archive-owned input\n");
+                saw_packaged_input = true;
+            }
+        }
+        assert!(saw_failing_source && saw_packaged_input);
+        let mut failed_inventory = Vec::new();
+        files(&failed_pool, &failed_pool, &mut failed_inventory);
+        let failed_extracted = failed_pool.join("package/managed_package_fixture-0.1.0");
+        assert!(
+            failed_inventory.iter().any(|relative| {
+                relative
+                    .file_name()
+                    .is_some_and(|name| name == "rch-package-origin")
+                    && fs::read_to_string(failed_pool.join(relative)).unwrap()
+                        == failed_extracted.to_str().unwrap()
+            }),
+            "failed verification must execute the build script from the extracted archive"
         );
         assert_eq!(
             fs::read(root.join("worktree-only.txt")).unwrap(),
@@ -1381,7 +1682,10 @@ mod managed_build_dir_tests {
             .into_iter()
             .map(PathBuf::from),
         );
-        for command in ["cargo package --offline", "cargo publish --dry-run --locked"] {
+        for command in [
+            "cargo package --offline",
+            "cargo publish --dry-run --locked",
+        ] {
             for target in [None, Some("/worker/managed pool")] {
                 let plan = super::ManagedCargoCommand::new(command, target).unwrap();
                 let stamped =
@@ -1715,6 +2019,34 @@ mod managed_build_dir_tests {
         }
     }
 
+    #[test]
+    fn source_pair_cargo_tokens_rejects_unfinished_syntax_but_keeps_literal_backslash() {
+        for command in [
+            "cargo test --manifest-path unfinished\\",
+            "cargo test --manifest-path \"unfinished",
+            "cargo test --manifest-path 'unfinished",
+        ] {
+            assert!(
+                managed_clean_overlay_cargo_tokens(command).is_err(),
+                "{command:?}"
+            );
+        }
+        for command in [
+            r#"cargo test --manifest-path 'trailing\'"#,
+            r#"cargo test --manifest-path "trailing\\""#,
+        ] {
+            let (tokens, index) = managed_clean_overlay_cargo_tokens(command).unwrap();
+            assert_eq!(index, 0);
+            assert_eq!(
+                tokens,
+                ["cargo", "test", "--manifest-path", "trailing\\"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn source_pair_build_dir_real_cargo_overrides_file_env_and_cli() {
@@ -1964,6 +2296,109 @@ mod managed_build_dir_tests {
                 assert_eq!(config_index, expected.len(), "{command}: {bound}");
             }
         }
+    }
+
+    #[test]
+    fn build_source_stamp_binds_nextest_with_value_config_and_process_env() {
+        let stamp = format!("{}-dirty", "a".repeat(40));
+        for (command, expected) in [
+            (
+                "cargo nextest run --workspace",
+                "env RCH_BUILD_SOURCE={stamp} cargo nextest run --workspace --config {value}",
+            ),
+            (
+                "cargo +nightly nextest run -- --nocapture",
+                "env RCH_BUILD_SOURCE={stamp} cargo +nightly nextest run --config {value} -- --nocapture",
+            ),
+            (
+                "cargo --color never --locked nextest run",
+                "env RCH_BUILD_SOURCE={stamp} cargo --color never --locked nextest run --config {value}",
+            ),
+            (
+                "CARGO_TERM_COLOR=never cargo nextest run",
+                "env CARGO_TERM_COLOR=never env RCH_BUILD_SOURCE={stamp} cargo nextest run --config {value}",
+            ),
+            (
+                "rustup run nightly cargo nextest run",
+                "rustup run nightly env RCH_BUILD_SOURCE={stamp} cargo nextest run --config {value}",
+            ),
+        ] {
+            let value = format!(
+                "env.RCH_BUILD_SOURCE.value={}",
+                toml::Value::String(stamp.clone())
+            );
+            let expected: Vec<String> = expected
+                .split(' ')
+                .map(|token| token.replace("{stamp}", &stamp).replace("{value}", &value))
+                .collect();
+            let bound = super::bind_build_source_stamp(command, &stamp)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(shell_words::split(&bound).unwrap(), expected, "{command}");
+            assert!(!bound.contains("force"), "{command}: {bound}");
+        }
+        // Not nextest: a `nextest` package name or test filter keeps the cargo form.
+        for command in ["cargo test nextest", "cargo -C nextest build"] {
+            let bound = super::bind_build_source_stamp(command, &stamp).unwrap();
+            assert!(
+                bound.contains("env.RCH_BUILD_SOURCE.force=true") && !bound.starts_with("env "),
+                "{command}: {bound}"
+            );
+        }
+    }
+
+    /// The bound command must run under real cargo-nextest, which rejected the
+    /// former `--config env.RCH_BUILD_SOURCE.force=true` with exit 96 (bd-k90ud).
+    #[test]
+    fn build_source_stamp_real_nextest_accepts_bound_command() {
+        let cargo = std::path::PathBuf::from(env!("CARGO"));
+        let cargo_bin = cargo.parent().unwrap().to_path_buf();
+        let path = std::env::join_paths(std::iter::once(cargo_bin.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let cargo_home_bin = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cargo"))
+            })
+            .map(|home| home.join("bin"));
+        let has_nextest = std::env::split_paths(&path)
+            .chain(cargo_home_bin)
+            .any(|directory| directory.join("cargo-nextest").is_file());
+        if !has_nextest {
+            eprintln!("skipping: cargo-nextest is not installed");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='nextest_stamp_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/lib.rs"),
+            "#[test]\nfn stamp() {\n    assert_eq!(env!(\"RCH_BUILD_SOURCE\"), \"bound\");\n    \
+             assert_eq!(std::env::var(\"RCH_BUILD_SOURCE\").unwrap(), \"bound\");\n}\n",
+        )
+        .unwrap();
+        let bound = super::bind_build_source_stamp("cargo nextest run", "bound").unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &bound])
+            .current_dir(root.path())
+            .env("PATH", &path)
+            .env("CARGO_TARGET_DIR", root.path().join("target"))
+            .env("RCH_BUILD_SOURCE", "ambient")
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{bound}: {:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2252,6 +2687,45 @@ mod managed_build_dir_tests {
             "build-source real Cargo evidence retained at {}",
             root.display()
         );
+    }
+
+    #[test]
+    fn managed_xwin_build_preserves_plugin_argv_and_original_output_policy() {
+        for command in [
+            "cargo xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
+            "cargo +nightly xwin build --release '--target=aarch64-pc-windows-msvc' --bin cli",
+            "cargo-xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
+            "cargo-xwin xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
+        ] {
+            let managed = super::ManagedCargoCommand::new(command, Some("/managed/cache")).unwrap();
+            let original = shell_words::split(command).unwrap();
+            let actual = shell_words::split(managed.execution_command()).unwrap();
+            assert_eq!(&actual[..original.len()], original.as_slice(), "{command}");
+            assert_eq!(actual[original.len()], "--config");
+            assert_eq!(
+                actual[original.len() + 1],
+                "build.build-dir=\"/managed/cache\""
+            );
+            assert_eq!(actual.len(), original.len() + 2);
+            assert_eq!(managed.policy_command(), command);
+            assert!(rch_common::patterns::is_cargo_xwin_build(
+                managed.policy_command()
+            ));
+        }
+        for command in [
+            "cargo xwin check --bin cli",
+            "cargo xwin build --help",
+            "cargo xwin install cli",
+            "cargo-xwin +nightly build --bin cli",
+            "cargo-xwin xwin test --bin cli",
+            "cargo xwin build --build-dir=/unmanaged",
+            "cargo xwin build --bin cli; echo surprise",
+        ] {
+            assert!(
+                super::ManagedCargoCommand::new(command, Some("/managed/cache")).is_err(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

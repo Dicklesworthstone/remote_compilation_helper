@@ -40,6 +40,55 @@ fn configured_or_default_socket_path() -> PathBuf {
         .unwrap_or_else(|_| default_socket_path())
 }
 
+/// A daemon this environment cannot see because it listens on another
+/// environment's default socket (#69). `systemd --user` sets
+/// `XDG_RUNTIME_DIR` and an agent's tool shell often does not, so the two
+/// compute different defaults; the hook recovers such a daemon on its own,
+/// but `rch doctor` used to call it "not running" and `--fix` would start a
+/// second daemon with separate slot accounting.
+///
+/// Only a default-derived socket is second-guessed. An explicit
+/// `general.socket_path` (or `RCH_SOCKET_PATH`) is authoritative.
+#[cfg(unix)]
+fn live_daemon_on_another_default_socket(socket_path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let from_default = crate::config::load_config_with_sources()
+        .map(|loaded| {
+            Path::new(&loaded.config.general.socket_path) == socket_path
+                && matches!(
+                    loaded.sources.get("general.socket_path"),
+                    Some(rch_common::ConfigValueSource::Default)
+                )
+        })
+        .unwrap_or(false);
+    if !from_default {
+        return None;
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    crate::hook::alternate_default_sockets(socket_path, uid)
+        .into_iter()
+        .find(|candidate| {
+            std::fs::symlink_metadata(candidate)
+                .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == uid)
+                && daemon_socket_accepts_connections(candidate)
+        })
+}
+
+#[cfg(not(unix))]
+fn live_daemon_on_another_default_socket(_socket_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// The remedy for [`live_daemon_on_another_default_socket`]: pin the socket
+/// the daemon actually uses, which rchd and every client honor.
+fn pin_socket_command(socket: &Path) -> String {
+    format!(
+        "rch config set general.socket_path '{}'",
+        socket.display().to_string().replace('\'', r"'\''")
+    )
+}
+
 /// Maximum size of a config / settings file we'll read into memory.
 /// Bounds OOM risk if a hostile or corrupted file is gigabytes in size.
 /// Real RCH/Claude config files are well under 1 MB; 16 MB gives an
@@ -185,8 +234,8 @@ pub struct DoctorOptions {
 // how to consume, not against aliases of those same live constants.
 const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
     rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
-const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
-const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.1.0";
+const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.1.0";
 const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
 const EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
 
@@ -697,6 +746,8 @@ struct ReliabilityDoctorResponse {
     /// consumers can attribute the unreachability to a specific probe
     /// (e.g., "process_debt: daemon status unavailable"). (t05)
     daemon_unreachable_reasons: Vec<String>,
+    /// Fenced admission state from the same status snapshot used by diagnostics.
+    admission: Option<rch_common::RestartAdmissionResponse>,
     diagnostics: Vec<ReliabilityDiagnostic>,
     summary: ReliabilityDoctorSummary,
     remediation_plan: Vec<ReliabilityRemediationStep>,
@@ -890,6 +941,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     check_ssh_keys(&mut checks, ctx, &options, &mut fixes_applied);
     check_hooks(&mut checks, ctx, &options, &mut fixes_applied);
     check_daemon(&mut checks, ctx, &options, &mut fixes_applied);
+    let admission = check_admission_health(&mut checks, ctx).await;
     check_cancellation_health(&mut checks, ctx).await;
     check_workers(&mut checks, ctx, &options).await;
     check_telemetry_database(&mut checks, ctx, &options);
@@ -936,6 +988,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
                 checks,
                 summary,
                 fixes_applied,
+                admission: admission.as_ref().map(serde_json::to_value).transpose()?,
             },
         ));
     } else {
@@ -1368,6 +1421,15 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     if scope.runs_schema_probe(options.check_schemas) {
         diagnostics.extend(reliability_schema_compatibility_diagnostics());
     }
+    let admission = daemon_status
+        .as_ref()
+        .and_then(|status| status.admission.clone());
+    if let Some(diagnostic) = admission
+        .as_ref()
+        .and_then(reliability_admission_diagnostic)
+    {
+        diagnostics.push(diagnostic);
+    }
 
     let mode = if options.dry_run {
         ReliabilityDoctorMode::DryRun
@@ -1381,6 +1443,7 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     // the operator's intent so the executor previews instead of staying inert,
     // and JSON consumers can tell a fix-preview from a plain dry run.
     response.fix_requested = options.fix;
+    response.admission = admission;
     response
 }
 
@@ -2938,6 +3001,35 @@ fn push_opt_display<T: std::fmt::Display>(buf: &mut String, value: Option<T>) {
     }
 }
 
+fn reliability_admission_diagnostic(
+    admission: &rch_common::RestartAdmissionResponse,
+) -> Option<ReliabilityDiagnostic> {
+    admission.admission_closed.then(|| {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "daemon_admission",
+            if admission.ownership_failed {
+                ReliabilitySeverity::Critical
+            } else {
+                ReliabilitySeverity::Warning
+            },
+            "Daemon admission is closed; new remote builds cannot start",
+            ReliabilityReasonCode::DaemonAdmissionClosed,
+        )
+        .with_details(crate::status_types::admission_diagnostic_lines(admission).join("; "))
+        .with_remediation(
+            if admission.ownership_failed {
+                "rch daemon logs"
+            } else if admission.shutdown_committed {
+                "rch daemon admission status --json"
+            } else {
+                "rch daemon admission recover"
+            },
+            "rch daemon admission status --json",
+        )
+    })
+}
+
 fn reliability_process_debt_diagnostics(
     status: Option<&DaemonFullStatusResponse>,
 ) -> Vec<ReliabilityDiagnostic> {
@@ -3388,6 +3480,7 @@ fn build_reliability_doctor_response(
         scope: scope.as_strings(),
         daemon_unreachable,
         daemon_unreachable_reasons,
+        admission: None,
         diagnostics,
         summary,
         remediation_plan,
@@ -3768,7 +3861,15 @@ pub fn run_quick_check() -> QuickCheckResult {
     let mut errors = Vec::new();
 
     if !daemon_running {
-        warnings.push("Daemon is not running".to_string());
+        warnings.push(match live_daemon_on_another_default_socket(&socket_path) {
+            Some(daemon_socket) => format!(
+                "Daemon is running on {}, not on this environment's default {}; pin it with: {}",
+                daemon_socket.display(),
+                socket_path.display(),
+                pin_socket_command(&daemon_socket)
+            ),
+            None => "Daemon is not running".to_string(),
+        });
     }
     if worker_count == 0 {
         warnings.push("No workers configured".to_string());
@@ -4220,8 +4321,56 @@ fn check_configuration(
         checks.push(result);
     }
 
+    if let Ok(config) = crate::config::load_config() {
+        let result = transfer_exclude_defaults_result(&config.transfer);
+        print_check_result(&result, ctx);
+        checks.push(result);
+    }
+
     if !ctx.is_json() {
         println!();
+    }
+}
+
+/// A configured `[transfer] exclude_patterns` list replaces rch's built-in
+/// defaults, so defaults added later (agent session state in #109, secret
+/// files) never reach a host whose list predates them, and its uploads ship
+/// them to workers (bd-rqjaj). Warn with the omitted defaults by name, except
+/// those listed in `exclude_defaults_acknowledged`.
+fn transfer_exclude_defaults_result(transfer: &rch_common::TransferConfig) -> CheckResult {
+    let missing = transfer.unacknowledged_omitted_default_excludes();
+    if missing.is_empty() {
+        return CheckResult {
+            category: "configuration".to_string(),
+            name: "transfer_excludes".to_string(),
+            status: CheckStatus::Pass,
+            message: "Transfer excludes include every built-in default".to_string(),
+            details: None,
+            suggestion: None,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        };
+    }
+    CheckResult {
+        category: "configuration".to_string(),
+        name: "transfer_excludes".to_string(),
+        status: CheckStatus::Warning,
+        message: format!(
+            "Custom [transfer] exclude_patterns omits {} built-in default(s)",
+            missing.len()
+        ),
+        details: Some(missing.join(", ")),
+        suggestion: Some(
+            "A configured exclude_patterns list replaces rch's defaults, so these paths are \
+             uploaded to workers (agent state such as .ntm/, secrets such as .env). Add the \
+             ones you do not deliberately sync, remove the list to use the defaults, or list \
+             deliberate omissions in [transfer] exclude_defaults_acknowledged."
+                .to_string(),
+        ),
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
     }
 }
 
@@ -5255,6 +5404,11 @@ fn check_daemon(
     let socket_path = configured_or_default_socket_path();
     let socket_exists = socket_path.exists();
     let socket_live = socket_exists && daemon_socket_accepts_connections(&socket_path);
+    let elsewhere = if socket_live {
+        None
+    } else {
+        live_daemon_on_another_default_socket(&socket_path)
+    };
     let mut result = if socket_live {
         CheckResult {
             category: "daemon".to_string(),
@@ -5263,6 +5417,27 @@ fn check_daemon(
             message: "Daemon is accepting connections".to_string(),
             details: Some(socket_path.to_string_lossy().to_string()),
             suggestion: None,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }
+    } else if let Some(daemon_socket) = elsewhere {
+        // Running, just not where this environment looks. Never "fixable":
+        // starting a daemon here would run a second one (#69).
+        CheckResult {
+            category: "daemon".to_string(),
+            name: "daemon_socket".to_string(),
+            status: CheckStatus::Warning,
+            message: "Daemon is running on another environment's default socket".to_string(),
+            details: Some(format!(
+                "daemon listens on {}; this environment resolves {}",
+                daemon_socket.display(),
+                socket_path.display()
+            )),
+            suggestion: Some(format!(
+                "Pin one socket for every environment: {}",
+                pin_socket_command(&daemon_socket)
+            )),
             fixable: false,
             fix_applied: false,
             fix_message: None,
@@ -5494,6 +5669,86 @@ fn evaluate_cancellation_health(
         fix_applied: false,
         fix_message: None,
     }
+}
+
+fn evaluate_admission_health(admission: &rch_common::RestartAdmissionResponse) -> CheckResult {
+    CheckResult {
+        category: "daemon".into(),
+        name: "daemon_admission".into(),
+        status: if admission.ownership_failed {
+            CheckStatus::Fail
+        } else if admission.admission_closed {
+            CheckStatus::Warning
+        } else {
+            CheckStatus::Pass
+        },
+        message: if admission.ownership_failed {
+            "Build admission closed by a durable ownership failure".into()
+        } else if admission.shutdown_committed {
+            "Build admission closed for committed daemon shutdown".into()
+        } else if admission.admission_closed {
+            "Build admission paused by maintenance".into()
+        } else {
+            "Daemon confirms build admission is open".into()
+        },
+        details: Some(crate::status_types::admission_diagnostic_lines(admission).join("\n")),
+        suggestion: admission.admission_closed.then(|| {
+            if admission.ownership_failed {
+                "Repair the reported durable ownership storage error. The fault stays latched until process restart; verify automatic shutdown and recovery through the matching supervisor, then check the new daemon incarnation with `rch daemon admission status --json`.".into()
+            } else if admission.shutdown_committed {
+                "Wait for daemon exit/restart, then verify admission on the new daemon incarnation with `rch daemon admission status --json`.".into()
+            } else {
+                "Inspect `rch daemon admission status --json`; use `rch daemon admission recover` after the owner exits or its deadline expires.".into()
+            }
+        }),
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
+    }
+}
+
+async fn check_admission_health(
+    checks: &mut Vec<CheckResult>,
+    ctx: &OutputContext,
+) -> Option<rch_common::RestartAdmissionResponse> {
+    let socket_path = configured_or_default_socket_path();
+    let (check, admission) = if !socket_path.exists() {
+        (
+            CheckResult {
+                category: "daemon".into(),
+                name: "daemon_admission".into(),
+                status: CheckStatus::Skipped,
+                message: "Daemon socket not present; admission state is unknown".into(),
+                details: Some(socket_path.display().to_string()),
+                suggestion: Some("Start daemon with: rch daemon start".into()),
+                fixable: false,
+                fix_applied: false,
+                fix_message: None,
+            },
+            None,
+        )
+    } else {
+        match crate::commands::query_restart_admission().await {
+            Ok(admission) => (evaluate_admission_health(&admission), Some(admission)),
+            Err(error) => (
+                CheckResult {
+                    category: "daemon".into(),
+                    name: "daemon_admission".into(),
+                    status: CheckStatus::Warning,
+                    message: "Unable to verify daemon admission state".into(),
+                    details: Some(format!("{error:#}")),
+                    suggestion: Some("rch daemon admission status --json".into()),
+                    fixable: false,
+                    fix_applied: false,
+                    fix_message: None,
+                },
+                None,
+            ),
+        }
+    };
+    print_check_result(&check, ctx);
+    checks.push(check);
+    admission
 }
 
 async fn check_cancellation_health(checks: &mut Vec<CheckResult>, ctx: &OutputContext) {
@@ -6002,6 +6257,90 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    /// bd-rqjaj: a custom exclude list that predates newer defaults is named,
+    /// with the omitted patterns; the defaults themselves (or a superset) pass.
+    #[test]
+    fn transfer_exclude_defaults_check_names_omitted_defaults() {
+        let with_patterns = |patterns: Vec<String>| rch_common::TransferConfig {
+            exclude_patterns: patterns,
+            ..Default::default()
+        };
+        let defaults = rch_common::TransferConfig::default().exclude_patterns;
+        assert_eq!(
+            transfer_exclude_defaults_result(&with_patterns(defaults.clone())).status,
+            CheckStatus::Pass
+        );
+        let mut superset = defaults.clone();
+        superset.push("scratch/".to_string());
+        assert_eq!(
+            transfer_exclude_defaults_result(&with_patterns(superset)).status,
+            CheckStatus::Pass
+        );
+
+        // A pre-#109 fleet list: no agent-state or secret excludes.
+        let stale: Vec<String> = ["target/", "*.rlib", "node_modules/", ".beads/"]
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .collect();
+        let result = transfer_exclude_defaults_result(&with_patterns(stale));
+        assert_eq!(result.status, CheckStatus::Warning);
+        let details = result.details.unwrap();
+        for omitted in [".ntm/", ".beads-recovery/", ".env", "credentials.json"] {
+            assert!(
+                details.contains(omitted),
+                "{omitted} missing from {details}"
+            );
+        }
+        for present in ["target/", "node_modules/"] {
+            assert!(
+                !details.split(", ").any(|pattern| pattern == present),
+                "{present} is configured but reported: {details}"
+            );
+        }
+
+        // A deliberate omission (e.g. *.pem/*.key kept syncing for TLS test
+        // fixtures) is acknowledged and stays quiet; anything else still warns.
+        let mut acknowledged = with_patterns(defaults);
+        acknowledged
+            .exclude_patterns
+            .retain(|pattern| pattern != "*.pem" && pattern != "*.key");
+        acknowledged.exclude_defaults_acknowledged = vec!["*.pem".into(), "*.key".into()];
+        assert_eq!(
+            transfer_exclude_defaults_result(&acknowledged).status,
+            CheckStatus::Pass
+        );
+        acknowledged
+            .exclude_patterns
+            .retain(|pattern| pattern != ".env");
+        let result = transfer_exclude_defaults_result(&acknowledged);
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.details.as_deref(), Some(".env"));
+    }
+
+    /// #69: the remedy names the daemon's real socket, shell-quoted.
+    #[test]
+    fn pin_socket_command_quotes_the_daemon_socket() {
+        assert_eq!(
+            pin_socket_command(Path::new("/run/user/1000/rch.sock")),
+            "rch config set general.socket_path '/run/user/1000/rch.sock'"
+        );
+        assert_eq!(
+            pin_socket_command(Path::new("/home/o'neil/.cache/rch/rch.sock")),
+            r"rch config set general.socket_path '/home/o'\''neil/.cache/rch/rch.sock'"
+        );
+    }
+
+    /// #69: only a default-derived socket is second-guessed. A socket that is
+    /// not the configured default (an explicit pin or `RCH_SOCKET_PATH`)
+    /// never sends the doctor looking elsewhere.
+    #[test]
+    fn other_default_sockets_are_not_searched_for_an_explicit_socket() {
+        assert_eq!(
+            live_daemon_on_another_default_socket(Path::new("/nonexistent/explicit-rch.sock")),
+            None
+        );
+    }
+
     #[test]
     fn dispatcher_role_shim_check_is_read_only_and_preserves_findings() {
         use rch_common::BoxRole;
@@ -6151,6 +6490,89 @@ mod tests {
             "saved_time": null
         }))
         .expect("daemon status fixture should parse")
+    }
+
+    #[test]
+    fn doctor_distinguishes_maintenance_pause_from_a_durable_ownership_fault() {
+        let mut admission = crate::status_types::admission_test_snapshot(true);
+        let check = evaluate_admission_health(&admission);
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.details.as_ref().unwrap().contains("PID 4242"));
+        assert!(
+            check
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("20000 ms remaining")
+        );
+        assert!(
+            !check.fixable,
+            "doctor must not steal an active maintenance lease"
+        );
+        let diagnostic = reliability_admission_diagnostic(&admission).unwrap();
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::DaemonAdmissionClosed
+        );
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert!(auto_config_flip(diagnostic.code).is_none());
+
+        admission.shutdown_committed = true;
+        let check = evaluate_admission_health(&admission);
+        assert!(check.message.contains("committed daemon shutdown"));
+        assert!(
+            check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("new daemon incarnation")
+        );
+        assert!(
+            !check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("admission recover")
+        );
+        let diagnostic = reliability_admission_diagnostic(&admission).unwrap();
+        assert_eq!(
+            diagnostic.remediation_command.as_deref(),
+            Some("rch daemon admission status --json")
+        );
+        admission.shutdown_committed = false;
+
+        admission.maintenance_closed = false;
+        admission.maintenance_owner = None;
+        admission.ownership_failed = true;
+        admission.ownership_error = Some("ENOSPC: failed to persist durable owners".into());
+        let check = evaluate_admission_health(&admission);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("durable ownership failure"));
+        assert!(check.details.as_ref().unwrap().contains("ENOSPC"));
+        assert!(
+            check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("latched until process restart")
+        );
+        assert!(
+            check
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("matching supervisor")
+        );
+        let diagnostic = reliability_admission_diagnostic(&admission).unwrap();
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Critical);
+        assert_eq!(
+            diagnostic.remediation_command.as_deref(),
+            Some("rch daemon logs")
+        );
+
+        let open = crate::status_types::admission_test_snapshot(false);
+        assert_eq!(evaluate_admission_health(&open).status, CheckStatus::Pass);
+        assert!(reliability_admission_diagnostic(&open).is_none());
     }
 
     // ========================
@@ -7129,11 +7551,23 @@ mod tests {
         let diagnostics = reliability_schema_compatibility_diagnostics();
 
         assert_eq!(diagnostics.len(), 4);
-        for check_name in [
-            "doctor_reliability",
-            "status",
-            "repo_updater_contract",
-            "process_triage_contract",
+        // Each component has its own pin (#118 moved the reliability doctor
+        // and status schemas to 1.1.0); compare against that pin, not a
+        // shared literal.
+        for (check_name, expected) in [
+            (
+                "doctor_reliability",
+                EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION,
+            ),
+            ("status", EXPECTED_STATUS_SCHEMA_VERSION),
+            (
+                "repo_updater_contract",
+                EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION,
+            ),
+            (
+                "process_triage_contract",
+                EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION,
+            ),
         ] {
             let diagnostic = diagnostics
                 .iter()
@@ -7148,12 +7582,14 @@ mod tests {
 
             assert_eq!(diagnostic.severity, ReliabilitySeverity::Pass);
             assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaCompatible);
+            let suffix = format!(" expected={expected}");
             assert!(
                 diagnostic
                     .details
                     .as_deref()
-                    .is_some_and(|details| details.ends_with(" expected=1.0.0")),
-                "{check_name} should compare against this doctor's pinned expected schema version"
+                    .is_some_and(|details| details.ends_with(&suffix)),
+                "{check_name} should compare against this doctor's pinned expected schema version {expected}: {:?}",
+                diagnostic.details
             );
         }
     }
@@ -7915,7 +8351,8 @@ mod tests {
     fn test_doctor_response_serialization() {
         // TEST START: DoctorResponse full serialization
         let response = DoctorResponse {
-            schema_version: "1.0.0".to_string(),
+            schema_version: RELIABILITY_DOCTOR_SCHEMA_VERSION.to_string(),
+            admission: None,
             checks: vec![
                 CheckResult {
                     category: "prerequisites".to_string(),
@@ -7962,7 +8399,8 @@ mod tests {
     fn test_doctor_response_with_fixes() {
         // TEST START: DoctorResponse with applied fixes
         let response = DoctorResponse {
-            schema_version: "1.0.0".to_string(),
+            schema_version: RELIABILITY_DOCTOR_SCHEMA_VERSION.to_string(),
+            admission: None,
             checks: vec![],
             summary: DoctorSummary {
                 total: 1,

@@ -32,6 +32,7 @@ mod reclaim;
 mod reliability;
 mod reload;
 mod repo_convergence;
+mod restart_admission;
 mod selection;
 mod self_test;
 mod stale_target_reap;
@@ -243,7 +244,9 @@ pub(crate) fn test_daemon_context(pool: workers::WorkerPool) -> DaemonContext {
         bypass_store: None,
         admin_disable_store: None,
         workers_config_path: None,
-        admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
+        admission_barrier: Arc::new(tokio::sync::RwLock::new(
+            restart_admission::RestartAdmissionState::default(),
+        )),
     }
 }
 
@@ -304,7 +307,7 @@ pub struct DaemonContext {
     /// Stops new worker selection while a restart remediator proves quiescence.
     /// This is shared with the socket API so check-and-close admission occurs
     /// in the daemon rather than in a racy CLI preflight.
-    pub admission_barrier: Arc<RwLock<bool>>,
+    pub(crate) admission_barrier: Arc<RwLock<restart_admission::RestartAdmissionState>>,
 }
 
 /// Result of one bind attempt — distinguishes "socket is held by another
@@ -1003,6 +1006,28 @@ async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, grace: Du
     }
 }
 
+/// A committed shutdown can never reopen admission. Enforce process exit even
+/// if the runtime stalls before receiving its notification, cleanup hangs, or
+/// runtime teardown waits forever on blocking I/O. Normal process exit ends
+/// this detached thread; it must not be disarmed when the async body returns.
+pub(crate) fn arm_shutdown_watchdog() {
+    #[cfg(not(test))]
+    {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            let _watchdog = std::thread::Builder::new()
+                .name("rchd-shutdown-deadline".into())
+                .spawn(|| {
+                    std::thread::sleep(Duration::from_secs(30));
+                    // Do not log here: stderr or a tracing sink can itself be
+                    // the blocked resource that this watchdog must escape.
+                    std::process::exit(1);
+                })
+                .unwrap_or_else(|_| std::process::exit(1));
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = Cli::command().get_matches();
@@ -1029,6 +1054,19 @@ async fn main() -> Result<()> {
     let mut rch_config = config::load_rch_config()
         .context("could not resolve RCH configuration before binding the daemon socket")?;
     rch_config.self_healing = rch_config.self_healing.with_env_overrides();
+    // Before any worker is evaluated: placement, the monitor and the sweep
+    // all read this one disk policy (bd-xxck3).
+    let disk_policy = DiskPressurePolicyConfig::from_selection(&rch_config.selection);
+    if disk_policy.critical_free_ratio != DiskPressurePolicyConfig::default().critical_free_ratio
+        || disk_policy.critical_free_ratio_cap_gb.is_some()
+    {
+        info!(
+            critical_free_ratio = disk_policy.critical_free_ratio,
+            critical_free_ratio_cap_gb = ?disk_policy.critical_free_ratio_cap_gb,
+            "disk pressure policy overridden by [selection]"
+        );
+    }
+    DiskPressurePolicyConfig::install(disk_policy);
     let (socket, client_socket) =
         daemon_socket_for_startup(&matches, &rch_config.general.socket_path, |name| {
             std::env::var(name).ok()
@@ -1103,7 +1141,15 @@ async fn main() -> Result<()> {
 
     // Install the disk-slot policy before adding workers so later config reloads
     // inherit the same budget as workers present at startup.
+    // Workers start with unknown disk; hold them at zero slots until their
+    // first capacity probe (normally well under a minute), at most 2 min.
+    // Mock transport never reports disk, so it keeps the configured ceiling.
     let worker_pool = workers::WorkerPool::with_selection_config(&rch_config.selection);
+    let worker_pool = if rch_common::mock::is_mock_enabled() {
+        worker_pool
+    } else {
+        worker_pool.with_unmeasured_capacity_hold(std::time::Duration::from_secs(120))
+    };
     for worker_config in workers {
         info!(
             "Adding worker: {} ({}@{}, {} slots)",
@@ -1155,6 +1201,13 @@ async fn main() -> Result<()> {
             config::DaemonConfig::default()
         }
     };
+    if !daemon_config.project_lanes.is_empty() {
+        info!(
+            "Project lanes (bd-sgvod): {:?}",
+            daemon_config.project_lanes
+        );
+    }
+    worker_pool.set_project_lanes(daemon_config.project_lanes.clone());
 
     // Shared SSH connection pool for the daemon's per-worker background
     // subsystems (health, telemetry, cache cleanup, stale-target reap, reclaim,
@@ -1423,7 +1476,9 @@ async fn main() -> Result<()> {
         bypass_store: Some(bypass_store.clone()),
         admin_disable_store: Some(admin_disable_store.clone()),
         workers_config_path: cli.workers_config.clone(),
-        admission_barrier: Arc::new(RwLock::new(false)),
+        admission_barrier: Arc::new(RwLock::new(
+            restart_admission::RestartAdmissionState::default(),
+        )),
     };
 
     // Replay disk-fault intents saved atomically with terminal ownership
@@ -1501,8 +1556,9 @@ async fn main() -> Result<()> {
     let disk_pressure_monitor = DiskPressureMonitor::new(
         worker_pool.clone(),
         telemetry_store.clone(),
-        DiskPressurePolicyConfig::default(),
-    );
+        DiskPressurePolicyConfig::configured(),
+    )
+    .with_build_history(context.history.clone());
     let _disk_pressure_handle = disk_pressure_monitor.start();
     info!("Disk pressure monitor started");
 
@@ -1687,6 +1743,18 @@ async fn main() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     let mut connections = tokio::task::JoinSet::new();
 
+    // Recovery is independent of another CLI request arriving. Abrupt client
+    // death, lost responses, task cancellation and failed cleanup cannot leave
+    // a maintenance barrier closed beyond its monotonic lease deadline.
+    let maintenance_context = context.clone();
+    let maintenance_recovery_handle = tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            api::recover_restart_admission(&maintenance_context).await;
+        }
+    });
+
     // A failed durable-ownership write latches admission closed for the life
     // of the process (bd-20zhr): after an ENOSPC blip the daemon refused every
     // build until someone restarted it. A restart reloads the last durable
@@ -1744,7 +1812,7 @@ async fn main() -> Result<()> {
 
     // Main accept loop - platform-specific due to SIGHUP handling
     #[cfg(unix)]
-    {
+    let shutdown_reason = {
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -1770,17 +1838,14 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received");
-                    break;
+                    break "shutdown request";
                 }
                 _ = connections.join_next(), if !connections.is_empty() => {}
                 _ = sigint.recv() => {
-                    info!("SIGINT received, shutting down");
-                    break;
+                    break "SIGINT";
                 }
                 _ = sigterm.recv() => {
-                    info!("SIGTERM received, shutting down");
-                    break;
+                    break "SIGTERM";
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received, triggering configuration reload");
@@ -1829,10 +1894,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-    }
+    };
 
     #[cfg(not(unix))]
-    {
+    let shutdown_reason = {
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -1858,13 +1923,11 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received");
-                    break;
+                    break "shutdown request";
                 }
                 _ = connections.join_next(), if !connections.is_empty() => {}
                 _ = tokio::signal::ctrl_c() => {
-                    info!("Ctrl-C received, shutting down");
-                    break;
+                    break "Ctrl-C";
                 }
                 // Monitor background tasks for unexpected termination (panics)
                 result = async { metrics_handle.as_mut().unwrap().await }, if metrics_handle.is_some() => {
@@ -1885,7 +1948,19 @@ async fn main() -> Result<()> {
                 }
             }
         }
-    }
+    };
+
+    arm_shutdown_watchdog();
+
+    // Selection requests already accepted by the daemon must not start work
+    // after a signal or internal shutdown has committed process exit.
+    context.admission_barrier.write().await.begin_shutdown();
+    maintenance_recovery_handle.abort();
+    info!(
+        reason = shutdown_reason,
+        deadline_secs = 30,
+        "Daemon shutdown begun; failure to exit before the process deadline terminates with status 1"
+    );
 
     // The accept loop has stopped, so clients can no longer refresh heartbeats.
     // Stop cancellation before awaiting health probes: a slow probe must not
@@ -2438,7 +2513,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(RwLock::new(false)),
+            admission_barrier: Arc::new(RwLock::new(
+                restart_admission::RestartAdmissionState::default(),
+            )),
         };
 
         assert_eq!(context.socket_path, "/tmp/test.sock");
@@ -2493,7 +2570,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(RwLock::new(false)),
+            admission_barrier: Arc::new(RwLock::new(
+                restart_admission::RestartAdmissionState::default(),
+            )),
         };
 
         assert_eq!(context.pool.len(), 1);
@@ -2549,7 +2628,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(RwLock::new(false)),
+            admission_barrier: Arc::new(RwLock::new(
+                restart_admission::RestartAdmissionState::default(),
+            )),
         };
 
         assert_eq!(context.history.len(), 1);
@@ -2588,7 +2669,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(RwLock::new(false)),
+            admission_barrier: Arc::new(RwLock::new(
+                restart_admission::RestartAdmissionState::default(),
+            )),
         };
 
         // Clone the context
@@ -2647,7 +2730,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(RwLock::new(false)),
+            admission_barrier: Arc::new(RwLock::new(
+                restart_admission::RestartAdmissionState::default(),
+            )),
         };
 
         // Wait a small amount
@@ -2704,7 +2789,9 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
-            admission_barrier: Arc::new(RwLock::new(false)),
+            admission_barrier: Arc::new(RwLock::new(
+                restart_admission::RestartAdmissionState::default(),
+            )),
         };
 
         assert_eq!(context.pool.len(), 5);

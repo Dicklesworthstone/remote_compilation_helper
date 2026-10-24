@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonFullStatusResponse {
     pub daemon: DaemonInfoFromApi,
+    /// Authoritative admission state, including fencing and recovery evidence.
+    #[serde(default)]
+    pub admission: Option<rch_common::RestartAdmissionResponse>,
     pub workers: Vec<WorkerStatusFromApi>,
     pub active_builds: Vec<ActiveBuildFromApi>,
     #[serde(default)]
@@ -230,6 +233,10 @@ pub struct IssueFromApi {
     pub severity: String,
     pub summary: String,
     pub remediation: Option<String>,
+    /// Set when the issue concerns one worker rather than the daemon. Older
+    /// daemons omit it, so `serde(default)` keeps them parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
 }
 
 /// Alert information from API.
@@ -353,12 +360,20 @@ pub enum SystemPosture {
     Degraded,
     /// No workers are configured, healthy, or admissible for remote work.
     LocalOnly,
+    /// Daemon admission is closed, regardless of available worker capacity.
+    AdmissionClosed,
 }
 
 impl SystemPosture {
     /// Compute posture from daemon status response.
     pub fn from_status(status: &DaemonFullStatusResponse) -> Self {
-        if status.daemon.workers_total == 0
+        if status
+            .admission
+            .as_ref()
+            .is_some_and(|admission| admission.admission_closed)
+        {
+            Self::AdmissionClosed
+        } else if status.daemon.workers_total == 0
             || status.daemon.workers_healthy == 0
             || (!status.workers.is_empty() && remote_admissible_worker_count(&status.workers) == 0)
         {
@@ -378,6 +393,7 @@ impl SystemPosture {
             Self::RemoteReady => "remote-ready",
             Self::Degraded => "degraded",
             Self::LocalOnly => "local-only",
+            Self::AdmissionClosed => "admission-closed",
         }
     }
 
@@ -388,7 +404,116 @@ impl SystemPosture {
                 "Some workers unavailable or pressure-blocked, partial remote capability"
             }
             Self::LocalOnly => "No admissible remote workers available; builds cannot run remotely",
+            Self::AdmissionClosed => {
+                "Daemon admission is closed; new remote builds are waiting or refused"
+            }
         }
+    }
+}
+
+/// Explain the daemon's actual admission blocker without assuming that every
+/// closed barrier is a restart. Shared by status, doctor, and recovery output.
+pub(crate) fn admission_diagnostic_lines(
+    admission: &rch_common::RestartAdmissionResponse,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Admission: {}; daemon incarnation {}",
+        if admission.admission_closed {
+            "CLOSED"
+        } else {
+            "open"
+        },
+        admission.daemon_incarnation
+    )];
+    if let Some(owner) = &admission.maintenance_owner {
+        lines.push(format!(
+            "Maintenance: {} (PID {}, owner {}, generation {}, token {})",
+            owner.purpose, owner.pid, owner.owner_presence, owner.generation, owner.token
+        ));
+        if !admission.shutdown_committed {
+            lines.push(format!(
+                "Recovery deadline: {} Unix ms ({} ms remaining; bounded by the daemon's monotonic clock)",
+                owner.deadline_unix_ms, owner.remaining_ms
+            ));
+            lines.push("Recovery: rch daemon admission recover (only an absent or expired owner can be recovered)".into());
+        }
+        lines.push(format!("Process identity: {:?}", owner.process_identity));
+    }
+    if admission.ownership_failed {
+        lines.push(format!(
+            "Durable ownership failure: {}",
+            admission
+                .ownership_error
+                .as_deref()
+                .unwrap_or("daemon did not provide the storage error")
+        ));
+        lines.push("Repair the reported ownership storage error and inspect `rch daemon logs`. This fault is latched until daemon process restart; maintenance recovery and `rch daemon restart --force` cannot clear it.".into());
+        lines.push("The daemon requests automatic shutdown for a latched ownership fault. Verify its exit and open admission on a replacement; if no replacement starts, use the matching supervisor, or `rch daemon start` after the original process has exited. See the daemon-restart runbook's supervisor recovery procedure.".into());
+    }
+    if admission.shutdown_committed {
+        lines.push("Shutdown is committed; expiry and maintenance recovery cannot reopen admission. Wait for daemon exit/restart and verify admission on the new daemon incarnation.".into());
+    }
+    if !admission.active_build_ids.is_empty() || !admission.queued_build_ids.is_empty() {
+        lines.push(format!(
+            "Daemon workload: {} active builds, {} queued builds; inspect `rch queue`.",
+            admission.active_build_ids.len(),
+            admission.queued_build_ids.len()
+        ));
+    }
+    // The inexpensive snapshot nested in /status does not scan durable leases.
+    // An empty lease list therefore cannot establish that there are none.
+    if !admission.client_lease_ids.is_empty() {
+        lines.push(format!(
+            "Durable restart blockers: {} client leases reported; inspect `rch jobs`.",
+            admission.client_lease_ids.len()
+        ));
+    }
+    if let Some(error) = &admission.client_lease_scan_error {
+        lines.push(format!(
+            "Restart readiness unknown: durable client leases could not be inspected: {error}"
+        ));
+    }
+    if let Some(recovery) = &admission.last_recovery {
+        lines.push(format!(
+            "Last recovery: {} (PID {}, token {}, at {} Unix ms)",
+            recovery.reason, recovery.pid, recovery.token, recovery.recovered_unix_ms
+        ));
+    }
+    if let Some(message) = &admission.message {
+        lines.push(message.clone());
+    }
+    lines
+}
+
+#[cfg(test)]
+pub(crate) fn admission_test_snapshot(closed: bool) -> rch_common::RestartAdmissionResponse {
+    rch_common::RestartAdmissionResponse {
+        success: true,
+        status: if closed {
+            "maintenance_active"
+        } else {
+            "admission_open"
+        }
+        .into(),
+        daemon_incarnation: "e97bc294-4bc6-4c5c-a5e6-8c486398ec98".into(),
+        admission_closed: closed,
+        maintenance_closed: closed,
+        maintenance_owner: closed.then(|| rch_common::MaintenanceOwner {
+            token: "1d8233f0-9cad-40da-85f8-47c6c4cc3d22".into(),
+            pid: 4242,
+            process_identity: rch_common::process_identity::ProcessIdentity {
+                boot_id: "d942b936-8764-4926-ab0d-ee11d56e6d71".into(),
+                start: rch_common::process_identity::ProcessStart::Linux { ticks: 12345 },
+            },
+            purpose: "restart".into(),
+            generation: 3,
+            acquired_unix_ms: 10_000,
+            deadline_unix_ms: 40_000,
+            remaining_ms: 20_000,
+            owner_presence: "live".into(),
+        }),
+        restart_permitted: !closed,
+        ..Default::default()
     }
 }
 
@@ -1385,6 +1510,8 @@ mod tests {
             issue.remediation,
             Some("Check network connection".to_string())
         );
+        // Daemons older than the worker_id field still parse.
+        assert_eq!(issue.worker_id, None);
     }
 
     #[test]
@@ -1515,6 +1642,7 @@ mod tests {
         workers_healthy: usize,
     ) -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
+            admission: None,
             daemon: DaemonInfoFromApi {
                 pid: 1,
                 uptime_secs: 100,
@@ -1557,6 +1685,89 @@ mod tests {
     }
 
     #[test]
+    fn admission_closure_overrides_a_healthy_fleet_and_survives_json() {
+        let mut status = make_daemon_status(2, 2);
+        let mut admission = admission_test_snapshot(true);
+        admission.maintenance_owner.as_mut().unwrap().owner_presence = "unknown".into();
+        status.admission = Some(admission);
+        assert_eq!(
+            SystemPosture::from_status(&status),
+            SystemPosture::AdmissionClosed
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["admission"]["admission_closed"], true);
+        assert_eq!(
+            json["admission"]["maintenance_owner"]["owner_presence"],
+            "unknown"
+        );
+        assert_eq!(
+            json["admission"]["maintenance_owner"]["deadline_unix_ms"],
+            40_000
+        );
+        let parsed: DaemonFullStatusResponse = serde_json::from_value(json).unwrap();
+        let lines = admission_diagnostic_lines(parsed.admission.as_ref().unwrap()).join("\n");
+        assert!(lines.contains("owner unknown"));
+        assert!(lines.contains("generation 3"));
+        assert!(lines.contains("20000 ms remaining"));
+        assert!(lines.contains("rch daemon admission recover"));
+
+        let mut committed = admission_test_snapshot(true);
+        committed.shutdown_committed = true;
+        committed.maintenance_owner.as_mut().unwrap().remaining_ms = 0;
+        let lines = admission_diagnostic_lines(&committed).join("\n");
+        assert!(lines.contains("Shutdown is committed"));
+        assert!(lines.contains("new daemon incarnation"));
+        assert!(!lines.contains("Recovery deadline:"));
+        assert!(!lines.contains("rch daemon admission recover"));
+
+        let mut fault = admission_test_snapshot(false);
+        fault.admission_closed = true;
+        fault.ownership_failed = true;
+        fault.ownership_error = Some("No space left on device while persisting ownership".into());
+        status.admission = Some(fault);
+        assert_eq!(
+            SystemPosture::from_status(&status),
+            SystemPosture::AdmissionClosed
+        );
+        let lines = admission_diagnostic_lines(status.admission.as_ref().unwrap()).join("\n");
+        assert!(lines.contains("No space left on device"));
+        assert!(lines.contains("latched until daemon process restart"));
+        assert!(lines.contains("matching supervisor"));
+        assert!(!lines.contains("Maintenance:"));
+        status.admission.as_mut().unwrap().client_lease_scan_error =
+            Some("lease directory unreadable".into());
+        let lines = admission_diagnostic_lines(status.admission.as_ref().unwrap()).join("\n");
+        assert!(lines.contains("Restart readiness unknown"));
+        assert!(lines.contains("lease directory unreadable"));
+    }
+
+    #[test]
+    fn admission_diagnostics_do_not_treat_unscanned_leases_as_zero_blockers() {
+        let mut admission = admission_test_snapshot(true);
+        admission.active_build_ids = vec![41];
+        admission.queued_build_ids = vec![42];
+        admission.restart_permitted = false;
+
+        let lines = admission_diagnostic_lines(&admission).join("\n");
+        assert!(lines.contains("1 active builds, 1 queued builds"));
+        assert!(lines.contains("rch queue"));
+        assert!(!lines.contains("client leases"));
+        assert!(!lines.contains("restart permitted"));
+
+        admission.client_lease_ids = vec!["lease-43".into()];
+        let lines = admission_diagnostic_lines(&admission).join("\n");
+        assert!(lines.contains("1 client leases reported"));
+        assert!(lines.contains("rch jobs"));
+
+        admission.client_lease_ids.clear();
+        admission.client_lease_scan_error = Some("lease directory unreadable".into());
+        let lines = admission_diagnostic_lines(&admission).join("\n");
+        assert!(lines.contains("Restart readiness unknown"));
+        assert!(lines.contains("lease directory unreadable"));
+        assert!(!lines.contains("0 durable"));
+    }
+
+    #[test]
     fn test_system_posture_degraded() {
         let _guard = test_guard!();
         let status = make_daemon_status(3, 1);
@@ -1589,10 +1800,12 @@ mod tests {
         assert_eq!(SystemPosture::RemoteReady.label(), "remote-ready");
         assert_eq!(SystemPosture::Degraded.label(), "degraded");
         assert_eq!(SystemPosture::LocalOnly.label(), "local-only");
+        assert_eq!(SystemPosture::AdmissionClosed.label(), "admission-closed");
 
         assert!(!SystemPosture::RemoteReady.description().is_empty());
         assert!(!SystemPosture::Degraded.description().is_empty());
         assert!(!SystemPosture::LocalOnly.description().is_empty());
+        assert!(!SystemPosture::AdmissionClosed.description().is_empty());
     }
 
     #[test]
@@ -1602,6 +1815,7 @@ mod tests {
             SystemPosture::RemoteReady,
             SystemPosture::Degraded,
             SystemPosture::LocalOnly,
+            SystemPosture::AdmissionClosed,
         ] {
             let json = serde_json::to_string(&posture).unwrap();
             let deserialized: SystemPosture = serde_json::from_str(&json).unwrap();
@@ -2022,7 +2236,7 @@ mod tests {
     #[test]
     fn test_cli_status_schema_version_constant() {
         let _guard = test_guard!();
-        assert_eq!(STATUS_SCHEMA_VERSION, "1.0.0");
+        assert_eq!(STATUS_SCHEMA_VERSION, "1.1.0");
     }
 
     #[test]

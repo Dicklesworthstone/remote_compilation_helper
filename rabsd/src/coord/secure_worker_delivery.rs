@@ -16,8 +16,10 @@
 use super::delivery_ack::PendingAcknowledgment;
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
-    Delivery, DeliveryFailure, DeliveryMode, ResumePeer, ResumeSource, WorkerAuthentication,
-    WorkerPeer, receive_operation, transport_interrupted, validate_request, worker_transport_error,
+    ArtifactByteCache, DEFAULT_ARTIFACT_CACHE_BYTES, DEFAULT_ARTIFACT_CACHE_ENTRIES, Delivery,
+    DeliveryFailure, DeliveryMode, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
+    ResumePeer, ResumeSource, WorkerAuthentication, WorkerPeer, negotiated_dependency_mode,
+    receive_operation, transport_interrupted, validate_request, worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::Runtime;
@@ -26,12 +28,15 @@ use rabs_protocol::capability_tokens::{CapabilityKind, mint};
 use rabs_protocol::envelope::DEFAULT_LIMITS;
 use rabs_protocol::identity_store::{IdentityStore, TransportIdentity, TrustScope};
 use rabs_protocol::version_negotiation::{VersionHello, VersionRange};
+use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_protocol::worker_session::{CoordinatorSession, SessionPolicy, WorkerHelloClaims};
+use rabs_sandbox::dependency_context::DependencyExecutionMode;
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET;
 use serde_json::{Value, json};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,11 +49,125 @@ use admission::AdmittedWorkerSession;
 pub use admission::PinnedWorkerAdmission;
 pub use cancellation::OperationCancellation;
 
+/// A caller may bind an authenticated worker to its own live coordinator before
+/// any source bytes or execution request leave this process. The durable pin
+/// admission below is transport fencing, not action or publication authority.
+/// Returning an error prevents the session grant, upload and dispatch entirely.
+pub type WorkerAdmissionHook =
+    Box<dyn FnOnce(&WorkerSessionOffer) -> io::Result<()> + Send + 'static>;
+
+/// Negotiation tag for the dependency execution extension. Keeping the
+/// transport selector here lets older workers refuse safely before upload.
+pub(crate) use rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION;
+
 const ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFER_BUDGET: Duration = Duration::from_secs(5 * 60);
 const ACK_BUDGET: Duration = Duration::from_secs(10);
 const MAX_EXECUTION_MS: u64 = 30 * 60 * 1000;
 const RECORD_READ_BYTES: usize = 4096;
+
+#[derive(Debug)]
+struct ArtifactCacheConfiguration {
+    parent: PathBuf,
+    bytes: u64,
+    entries: usize,
+}
+
+/// Parse local policy without reading process state or touching storage. A
+/// supplied limit without a directory is a configuration error, not enablement.
+fn parse_artifact_cache_configuration(
+    directory: Option<&OsStr>,
+    bytes: Option<&OsStr>,
+    entries: Option<&OsStr>,
+) -> io::Result<Option<ArtifactCacheConfiguration>> {
+    let error = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let Some(directory) = directory else {
+        return if bytes.is_some() || entries.is_some() {
+            Err(error(
+                "RABS_ARTIFACT_CACHE_BYTES and RABS_ARTIFACT_CACHE_ENTRIES require RABS_ARTIFACT_CACHE_DIR",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let parent = Path::new(directory);
+    if directory.is_empty()
+        || directory.as_encoded_bytes().contains(&0)
+        || !parent.is_absolute()
+        || parent.file_name().is_none()
+        || !parent
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(error(
+            "RABS_ARTIFACT_CACHE_DIR must be a named absolute directory without parent traversal",
+        ));
+    }
+    let decimal = |name: &str, value: Option<&OsStr>, default: u64, maximum: u64| {
+        let Some(value) = value else {
+            return Ok(default);
+        };
+        value
+            .to_str()
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=maximum).contains(value))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a decimal integer between 1 and {maximum}"),
+                )
+            })
+    };
+    let bytes = decimal(
+        "RABS_ARTIFACT_CACHE_BYTES",
+        bytes,
+        DEFAULT_ARTIFACT_CACHE_BYTES,
+        MAX_ARTIFACT_CACHE_BYTES,
+    )?;
+    let entries = usize::try_from(decimal(
+        "RABS_ARTIFACT_CACHE_ENTRIES",
+        entries,
+        DEFAULT_ARTIFACT_CACHE_ENTRIES as u64,
+        MAX_ARTIFACT_CACHE_ENTRIES as u64,
+    )?)
+    .map_err(|_| error("RABS_ARTIFACT_CACHE_ENTRIES exceeds this platform's entry limit"))?;
+    Ok(Some(ArtifactCacheConfiguration {
+        parent: parent.to_path_buf(),
+        bytes,
+        entries,
+    }))
+}
+
+impl ArtifactCacheConfiguration {
+    fn open(&self) -> Option<Arc<ArtifactByteCache>> {
+        match ArtifactByteCache::open(&self.parent, self.bytes, self.entries) {
+            Ok(cache) => Some(Arc::new(cache)),
+            Err(error) => {
+                // One setup diagnostic per delivery. The existing parent is
+                // never created or chmodded; unavailable optional storage
+                // cannot prevent an otherwise valid verified transfer.
+                eprintln!(
+                    "{}",
+                    json!({"kind":"artifact-byte-cache-unavailable", "disposition":"cold", "detail":error.to_string()})
+                );
+                None
+            }
+        }
+    }
+}
+
+fn configured_artifact_byte_cache() -> io::Result<Option<Arc<ArtifactByteCache>>> {
+    let directory = std::env::var_os("RABS_ARTIFACT_CACHE_DIR");
+    let bytes = std::env::var_os("RABS_ARTIFACT_CACHE_BYTES");
+    let entries = std::env::var_os("RABS_ARTIFACT_CACHE_ENTRIES");
+    Ok(parse_artifact_cache_configuration(
+        directory.as_deref(),
+        bytes.as_deref(),
+        entries.as_deref(),
+    )?
+    .and_then(|configuration| configuration.open()))
+}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -144,6 +263,7 @@ struct AdmittedPeer<P> {
     proof: Option<WorkerAuthentication>,
     operation_sent: bool,
     source: Option<SourceUpload>,
+    on_admitted: Option<WorkerAdmissionHook>,
 }
 
 impl<P: WorkerPeer> AdmittedPeer<P> {
@@ -194,6 +314,7 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
             proof: None,
             operation_sent: false,
             source: None,
+            on_admitted: None,
         })
     }
 
@@ -211,15 +332,32 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
         self.source = Some(upload.clone());
         Ok(self)
     }
+
+    fn with_admission_hook(mut self, hook: Option<WorkerAdmissionHook>) -> Self {
+        self.on_admitted = hook;
+        self
+    }
 }
 
 impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.inner.checkpoint()
+    }
+
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        self.inner.artifact_byte_cache()
+    }
+
     fn negotiate(&mut self, hello: &Value, grant: &Value) -> io::Result<()> {
         require(
             self.hello_read && !self.negotiation_started,
             "session admission cannot be repeated",
         )?;
         self.negotiation_started = true; // a failed exchange never retries admission
+        require(
+            self.mode == DeliveryMode::Execute || self.on_admitted.is_none(),
+            "live worker admission hook requires new execution",
+        )?;
         let peer = hex(&self.identity.peer_id);
         require(
             hello["kind"] == "worker-hello" && hello["peer_id"].as_str() == Some(peer.as_str()),
@@ -246,6 +384,26 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 "resume requires negotiated durable result retention",
             )?;
         }
+        // Unknown request fields are compatible with older canonical workers.
+        // A dependency context changes mounts, argv and environment, so sending
+        // one without an explicit negotiated selection could execute different
+        // code. Refuse before the challenge, input upload or live action hook.
+        let dependency_mode =
+            negotiated_dependency_mode(hello, &self.expected_operation, self.mode)?;
+        require(
+            match (
+                grant.get("dependency_context"),
+                grant.get("dependency_execution_mode"),
+            ) {
+                (None, None) => true,
+                (Some(context), Some(mode)) => {
+                    context == DEPENDENCY_CONTEXT_VERSION
+                        && dependency_mode.is_some_and(|selected| mode == selected.as_str())
+                }
+                _ => false,
+            },
+            "dependency context was not authorized by this execution session",
+        )?;
         // Refuse an old worker before challenge, source upload or dispatch.
         // The ephemeral grant binds the unchanged journal request and this boot.
         let execution_lease = if self.mode == DeliveryMode::Execute {
@@ -320,7 +478,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 revoked_token_ids: &[],
                 current_seq: 1,
                 required_capability: CapabilityKind::ExecuteAction,
-                require_canonical: true,
+                require_canonical: self.mode == DeliveryMode::Execute
+                    && dependency_mode != Some(DependencyExecutionMode::Rlib),
                 limits: DEFAULT_LIMITS,
                 max_sequence_buffer: 1,
             },
@@ -344,7 +503,15 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 && response["token_id"].as_u64() == Some(token_id),
             "worker challenge response mismatch",
         )?;
-        self.session = Some(self.admission.admit(&self.identity, hello)?);
+        let session = self.admission.admit(&self.identity, hello)?;
+        if let Some(on_admitted) = self.on_admitted.take() {
+            // This is the only boundary that exposes the actual TLS-pinned,
+            // challenge-proven and durably fenced worker to a live action.
+            // On refusal, dropping the session releases transport admission;
+            // no grant, source upload or execution has been sent.
+            on_admitted(session.offer())?;
+        }
+        self.session = Some(session);
         grant["session_id"] = json!(session_id);
         grant["transport"] = json!(admitted.grant().transport_version);
         grant["application"] = json!(admitted.grant().application_version);
@@ -354,6 +521,10 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         grant["resume"] = json!("unsupported");
         if let Some(lease) = execution_lease {
             grant["execution_lease"] = lease;
+        }
+        if let Some(mode) = dependency_mode {
+            grant["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
+            grant["dependency_execution_mode"] = json!(mode.as_str());
         }
         if self.mode == DeliveryMode::Execute
             && hello["output_previews"]
@@ -539,6 +710,7 @@ struct RecordPeer<'a, S> {
     execution_budget: Duration,
     phase: Phase,
     failed: bool,
+    artifact_byte_cache: Option<Arc<ArtifactByteCache>>,
 }
 
 impl<'a, S> RecordPeer<'a, S> {
@@ -556,7 +728,13 @@ impl<'a, S> RecordPeer<'a, S> {
             execution_budget: Duration::from_millis(millis) + Duration::from_secs(60),
             phase: Phase::Admission,
             failed: false,
+            artifact_byte_cache: None,
         }
+    }
+
+    fn with_artifact_byte_cache(mut self, cache: Option<Arc<ArtifactByteCache>>) -> Self {
+        self.artifact_byte_cache = cache;
+        self
     }
 
     fn remaining(&self) -> io::Result<Duration> {
@@ -647,11 +825,21 @@ impl<'a, S> RecordPeer<'a, S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        let result = self.remaining().map(|_| ());
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        self.artifact_byte_cache.as_deref()
+    }
+
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         let bytes = self.outbound(frame)?;
         let budget = self.remaining()?;
         let stream = &mut self.stream;
-        let result = self.runtime.block_on(async {
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(self.runtime, async {
             asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
                 stream
                     .write_all(&bytes)
@@ -675,7 +863,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
         let budget = self.remaining()?;
         let stream = &mut self.stream;
         let buffered = &mut self.buffered;
-        let result = self.runtime.block_on(async {
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(self.runtime, async {
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 budget,
@@ -767,10 +955,13 @@ pub fn receive_authenticated_operation(
     }
     // Keep this private owner alive until the admitted peer and its transport
     // have both dropped. No caller can clone the consumed admission capability.
+    let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
-    let raw = interrupt::OperatorPeer::new(RecordPeer::new(runtime, peer.stream, request))
-        .map_err(&failure)?;
+    let raw = interrupt::OperatorPeer::new(
+        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache),
+    )
+    .map_err(&failure)?;
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
@@ -896,10 +1087,13 @@ pub fn receive_authenticated_source(
         )));
     }
     upload.validate_request(request).map_err(&failure)?;
+    let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
-    let raw = interrupt::OperatorPeer::new(RecordPeer::new(runtime, peer.stream, request))
-        .map_err(&failure)?;
+    let raw = interrupt::OperatorPeer::new(
+        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache),
+    )
+    .map_err(&failure)?;
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
@@ -966,6 +1160,38 @@ pub fn receive_authenticated_observed(
     cancellation: OperationCancellation,
     observer: Option<crate::coord::prepared_operation::PreviewObserver>,
 ) -> Result<Delivery, DeliveryFailure> {
+    receive_authenticated_with_admission(
+        runtime,
+        peer,
+        admission,
+        request,
+        destination,
+        mode,
+        upload,
+        resume_source,
+        cancellation,
+        observer,
+        None,
+    )
+}
+
+/// Extend authenticated delivery with the caller's live-action admission. The
+/// hook receives only authenticated identity evidence; it cannot write transport
+/// frames or grant publication. Existing operator delivery uses no hook.
+#[allow(clippy::too_many_arguments)]
+pub fn receive_authenticated_with_admission(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    admission: PinnedWorkerAdmission,
+    request: &Value,
+    destination: &Path,
+    mode: DeliveryMode,
+    upload: Option<&SourceUpload>,
+    resume_source: Option<&ResumeSource>,
+    cancellation: OperationCancellation,
+    observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+    on_admitted: Option<WorkerAdmissionHook>,
+) -> Result<Delivery, DeliveryFailure> {
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume,
@@ -977,6 +1203,11 @@ pub fn receive_authenticated_observed(
             "authenticated delivery requires a dedicated thread",
         )));
     }
+    require(
+        mode == DeliveryMode::Execute || on_admitted.is_none(),
+        "live worker admission hook requires new execution",
+    )
+    .map_err(&failure)?;
     require(
         upload.is_none() || (mode == DeliveryMode::Execute && resume_source.is_none()),
         "source upload cannot accompany result recovery",
@@ -995,8 +1226,9 @@ pub fn receive_authenticated_observed(
     }
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
+    let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let raw = interrupt::OperatorPeer::with_interrupts(
-        RecordPeer::new(runtime, peer.stream, request),
+        RecordPeer::new(runtime, peer.stream, request).with_artifact_byte_cache(cache),
         interrupt::OperationInterrupts::new(cancellation),
     )
     .with_preview_observer(if mode == DeliveryMode::Execute {
@@ -1013,7 +1245,8 @@ pub fn receive_authenticated_observed(
         mode,
         Arc::clone(&admission),
     )
-    .map_err(&failure)?;
+    .map_err(&failure)?
+    .with_admission_hook(on_admitted);
     if let Some(upload) = upload {
         admitted = admitted.with_source(upload).map_err(&failure)?;
     }
@@ -1034,6 +1267,160 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    #[test]
+    fn artifact_cache_configuration_is_explicit_and_uses_shared_core_limits() {
+        assert!(
+            parse_artifact_cache_configuration(None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        for (bytes, entries) in [(Some("1"), None), (None, Some("1")), (Some("1"), Some("1"))] {
+            let error = parse_artifact_cache_configuration(
+                None,
+                bytes.map(OsStr::new),
+                entries.map(OsStr::new),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("require RABS_ARTIFACT_CACHE_DIR")
+            );
+        }
+        let directory = OsStr::new("/private/rabs-artifacts");
+        let defaults = parse_artifact_cache_configuration(Some(directory), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(defaults.parent, Path::new(directory));
+        assert_eq!(defaults.bytes, DEFAULT_ARTIFACT_CACHE_BYTES);
+        assert_eq!(defaults.entries, DEFAULT_ARTIFACT_CACHE_ENTRIES);
+        for (bytes, entries) in [
+            (1, 1),
+            (MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES),
+        ] {
+            let bytes_value = bytes.to_string();
+            let entries_value = entries.to_string();
+            let parsed = parse_artifact_cache_configuration(
+                Some(directory),
+                Some(OsStr::new(&bytes_value)),
+                Some(OsStr::new(&entries_value)),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed.bytes, bytes);
+            assert_eq!(parsed.entries, entries);
+        }
+    }
+
+    #[test]
+    fn artifact_cache_configuration_refuses_malformed_paths_and_numeric_policy() {
+        for directory in [
+            "",
+            "relative/cache",
+            "/",
+            "/tmp/../cache",
+            "/tmp/cache\0suffix",
+        ] {
+            let error = parse_artifact_cache_configuration(Some(OsStr::new(directory)), None, None)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("RABS_ARTIFACT_CACHE_DIR"));
+        }
+        let directory = Some(OsStr::new("/private/rabs-artifacts"));
+        for value in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1GiB",
+            "1.5",
+            "18446744073709551616",
+        ] {
+            for (bytes, entries, name) in [
+                (Some(OsStr::new(value)), None, "RABS_ARTIFACT_CACHE_BYTES"),
+                (None, Some(OsStr::new(value)), "RABS_ARTIFACT_CACHE_ENTRIES"),
+            ] {
+                let error =
+                    parse_artifact_cache_configuration(directory, bytes, entries).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains(name), "{value:?}: {error}");
+            }
+        }
+        let too_many_bytes = (MAX_ARTIFACT_CACHE_BYTES + 1).to_string();
+        let too_many_entries = (MAX_ARTIFACT_CACHE_ENTRIES + 1).to_string();
+        assert!(
+            parse_artifact_cache_configuration(directory, Some(OsStr::new(&too_many_bytes)), None)
+                .is_err()
+        );
+        assert!(
+            parse_artifact_cache_configuration(
+                directory,
+                None,
+                Some(OsStr::new(&too_many_entries))
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_cache_configuration_refuses_non_utf8_limits_without_mutating_environment() {
+        use std::os::unix::ffi::OsStringExt;
+        let value = std::ffi::OsString::from_vec(vec![b'1', 0xff]);
+        let directory = Some(OsStr::new("/private/rabs-artifacts"));
+        assert!(parse_artifact_cache_configuration(directory, Some(&value), None).is_err());
+        assert!(parse_artifact_cache_configuration(directory, None, Some(&value)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_cache_storage_failure_is_cold_and_never_creates_or_chmods_a_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = root.path().join("missing");
+        let missing_config =
+            parse_artifact_cache_configuration(Some(missing.as_os_str()), None, None)
+                .unwrap()
+                .unwrap();
+        assert!(missing_config.open().is_none());
+        assert!(!missing.exists());
+
+        let public = root.path().join("public");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let public_config =
+            parse_artifact_cache_configuration(Some(public.as_os_str()), None, None)
+                .unwrap()
+                .unwrap();
+        assert!(public_config.open().is_none());
+        assert_eq!(
+            std::fs::metadata(&public).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&public).unwrap().count(), 0);
+
+        let configured =
+            parse_artifact_cache_configuration(Some(root.path().as_os_str()), None, None)
+                .unwrap()
+                .unwrap();
+        let cache = configured
+            .open()
+            .expect("ordinary private parent enables cache");
+        assert_eq!(cache.root(), root.path().join("artifact-bytes-v1"));
+        assert_eq!(
+            std::fs::metadata(cache.root())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
     #[derive(Default)]
     struct Script {
         state: Option<tempfile::TempDir>,
@@ -1041,9 +1428,18 @@ mod tests {
         sent: Vec<Value>,
         fail_execution: bool,
         interrupt_toolchain_ready: bool,
+        admission_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
     impl WorkerPeer for Script {
         fn send(&mut self, frame: &Value) -> io::Result<()> {
+            if frame["kind"] != "session-challenge"
+                && let Some(observed) = &self.admission_observed
+            {
+                assert!(
+                    observed.load(std::sync::atomic::Ordering::SeqCst),
+                    "grant, input transfer or execution preceded live admission"
+                );
+            }
             self.sent.push(frame.clone());
             if self.fail_execution
                 && matches!(
@@ -1358,6 +1754,30 @@ mod tests {
     }
 
     #[test]
+    fn result_recovery_cannot_mint_live_action_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let mut peer = peer_with_mode(recovery_hello(), response(), DeliveryMode::Resume)
+            .with_admission_hook(Some(Box::new(move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })));
+        let offered = peer.receive().unwrap();
+        let mut selected = grant();
+        selected["result_retention"] = json!("durable-result-v1");
+        let error = peer.negotiate(&offered, &selected).unwrap_err();
+        assert!(error.to_string().contains("requires new execution"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(peer.inner.sent.is_empty());
+        assert!(peer.authentication().is_none());
+        assert!(peer.send(&DeliveryMode::Resume.frame(&request())).is_err());
+        assert!(peer.send(&request()).is_err());
+        assert!(peer.inner.sent.is_empty());
+    }
+
+    #[test]
     fn resume_requires_retention_before_challenge_and_never_downgrades() {
         for missing_hello in [false, true] {
             let mut hello = recovery_hello();
@@ -1377,12 +1797,20 @@ mod tests {
 
     #[test]
     fn resume_binds_complete_request_and_burns_dispatch_before_partial_write() {
-        let mut peer = peer_with_mode(recovery_hello(), response(), DeliveryMode::Resume);
+        let mut offered = recovery_hello();
+        offered["canonical"] = json!(false);
+        offered["dependency_execution_modes"] = json!([]);
+        let mut peer = peer_with_mode(offered, response(), DeliveryMode::Resume);
         let hello = peer.receive().unwrap();
         let mut grant = grant();
         grant["result_retention"] = json!("durable-result-v1");
         peer.negotiate(&hello, &grant).unwrap();
         assert!(peer.inner.sent[1].get("execution_lease").is_none());
+        assert!(
+            peer.inner.sent[1]
+                .get("dependency_execution_mode")
+                .is_none()
+        );
         assert!(peer.send(&request()).is_err());
         let dispatch = DeliveryMode::Resume.frame(&request());
         for field in [
@@ -1607,6 +2035,152 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn live_admission_observes_the_actual_worker_before_grant_or_source_bytes() {
+        use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
+        use rabs_protocol::wire_time::PeerId;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request, mut script, _) = source_fixture(source.path());
+        let observed = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let actual = Arc::new(Mutex::new(None));
+        script.admission_observed = Some(Arc::clone(&observed));
+        let callback_observed = Arc::clone(&observed);
+        let callback_calls = Arc::clone(&calls);
+        let callback_actual = Arc::clone(&actual);
+        let mut peer = source_admission(script, &request)
+            .with_source(&upload)
+            .unwrap()
+            .with_admission_hook(Some(Box::new(move |offer| {
+                *callback_actual.lock().unwrap() = Some(offer.clone());
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                callback_observed.store(true, Ordering::SeqCst);
+                Ok(())
+            })));
+        let offered = peer.receive().unwrap();
+        peer.negotiate(&offered, &grant()).unwrap();
+        assert_eq!(
+            *actual.lock().unwrap(),
+            Some(WorkerSessionOffer {
+                worker_peer_id: PeerId(hex(&[1; 32])),
+                boot_generation: WorkerBootGeneration(2),
+                incarnation: WorkerIncarnationId(2),
+                reenrollment_proof: None,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(peer.authentication().is_some());
+        assert!(
+            peer.inner
+                .sent
+                .iter()
+                .any(|frame| frame["kind"] == "source-begin")
+        );
+        assert!(
+            !peer
+                .inner
+                .sent
+                .iter()
+                .any(|frame| frame["kind"] == "canonical-exec")
+        );
+        assert!(peer.negotiate(&offered, &grant()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        peer.send(&request).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_admission_refusal_never_uploads_or_dispatches_and_releases_transport_session() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request, script, _) = source_fixture(source.path());
+        let offered = script.replies[0].clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let mut peer = source_admission(script, &request)
+            .with_source(&upload)
+            .unwrap()
+            .with_admission_hook(Some(Box::new(move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("live action lease was superseded"))
+            })));
+        let delivery = tempfile::tempdir().unwrap();
+        let error = receive_operation(
+            &mut peer,
+            &request,
+            "worker",
+            &delivery.path().join("private-delivery"),
+            DeliveryMode::Execute,
+        )
+        .unwrap_err();
+        assert!(!error.execution_may_have_run);
+        assert!(!error.transport_interrupted);
+        assert!(error.detail.contains("live action lease was superseded"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(peer.authentication().is_none());
+        assert!(peer.send(&request).is_err());
+        assert_eq!(
+            peer.inner
+                .sent
+                .iter()
+                .map(|frame| frame["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["session-challenge"]
+        );
+        assert!(peer.negotiate(&offered, &grant()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The failed live action must not strand a durable transport session
+        // that prevents the next request from using this worker incarnation.
+        drop(peer.admission.admit(&peer.identity, &offered).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unproven_or_stale_worker_never_reaches_the_live_admission_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for case in 0..4 {
+            let source = tempfile::tempdir().unwrap();
+            let (upload, request, mut script, _) = source_fixture(source.path());
+            match case {
+                0 => script.replies[0]["peer_id"] = json!(hex(&[2; 32])),
+                1 => script.replies[1]["token_id"] = json!(999),
+                2 => script.replies[0]["source_transfers"] = json!([]),
+                _ => {}
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap()
+                .with_admission_hook(Some(Box::new(move |_| {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })));
+            if case == 3 {
+                let mut newer = recovery_hello();
+                newer["boot_generation"] = json!(4);
+                newer["incarnation"] = json!("00000000000000000000000000000004");
+                drop(peer.admission.admit(&peer.identity, &newer).unwrap());
+            }
+            let offered = peer.receive().unwrap();
+            assert!(peer.negotiate(&offered, &grant()).is_err(), "case {case}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "case {case}");
+            assert!(
+                peer.inner
+                    .sent
+                    .iter()
+                    .all(|frame| frame["kind"] == "session-challenge")
+            );
+            assert!(peer.send(&request).is_err());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn toolchain_fixture(root: &Path, warm: bool) -> (SourceUpload, Value, Script) {
         use super::super::worker_delivery::toolchain_identity_value;
@@ -1618,6 +2192,7 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt;
 
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (upload, mut request, mut script, _) = source_fixture(root);
         let original = root.join("compiler-input");
         std::fs::create_dir(&original).unwrap();
@@ -1671,6 +2246,156 @@ mod tests {
             request,
             script,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dependency_execution_requires_explicit_selection_before_live_admission_or_upload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for case in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, mut request, mut script) = toolchain_fixture(root.path(), false);
+            request["dependency_context"] = json!({
+                "version": DEPENDENCY_CONTEXT_VERSION,
+                "execution_mode":"metadata",
+                "source_root":"/ws", "cwd":"/ws", "toolchain_root":"/tc",
+                "compiler":"/tc/rustc", "out_dir":"/out", "env":[], "dependency_dirs":[],
+                "runtime_cohort_sha256":"ab".repeat(32)
+            });
+            request["program"] = json!("/tc/rustc");
+            request["artifacts"] = json!({"unit":"dep", "files":["a"]});
+            match case {
+                0 => {}
+                1 => script.replies[0]["dependency_contexts"] = json!(["dependency-exec-v0"]),
+                2 => {
+                    script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+                    request["dependency_context"]["version"] = json!("dependency-exec-v999");
+                }
+                _ => {
+                    script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+                    script.replies[0]["dependency_execution_modes"] = json!(["metadata"]);
+                }
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap()
+                .with_admission_hook(Some(Box::new(move |_| {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })));
+            let offered = peer.receive().unwrap();
+            let outcome = peer.negotiate(&offered, &grant());
+            if case < 3 {
+                assert!(outcome.is_err(), "case {case}");
+                assert!(peer.inner.sent.is_empty(), "case {case}");
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "case {case}");
+                assert!(peer.send(&request).is_err());
+            } else {
+                outcome.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(peer.inner.sent[1]["kind"], "session-ok");
+                assert_eq!(
+                    peer.inner.sent[1]["dependency_context"],
+                    DEPENDENCY_CONTEXT_VERSION
+                );
+                assert_eq!(peer.inner.sent[1]["dependency_execution_mode"], "metadata");
+                assert!(
+                    peer.inner
+                        .sent
+                        .iter()
+                        .any(|frame| frame["kind"] == "source-begin")
+                );
+                peer.send(&request).unwrap();
+                assert_eq!(peer.inner.sent.last().unwrap(), &request);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_only_worker_admission_requires_the_exact_measured_profile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (requested, advertised, canonical, accepted) in [
+            ("rlib", json!(["rlib"]), false, true),
+            ("metadata", json!(["metadata"]), false, false),
+            ("rlib", json!(["metadata"]), true, false),
+            ("metadata", json!(["rlib"]), true, false),
+            ("future", json!(["future"]), true, false),
+            ("rlib", Value::Null, false, false),
+            ("rlib", json!("rlib"), false, false),
+            ("rlib", json!(["metadata", "rlib"]), true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, mut request, mut script) = toolchain_fixture(root.path(), false);
+            request["dependency_context"] = json!({
+                "version":DEPENDENCY_CONTEXT_VERSION, "execution_mode":requested,
+                "source_root":"/ws", "cwd":"/ws", "toolchain_root":"/tc",
+                "compiler":"/tc/rustc", "out_dir":"/out", "env":[], "dependency_dirs":[],
+                "runtime_cohort_sha256":"ab".repeat(32)
+            });
+            request["program"] = json!("/tc/rustc");
+            request["artifacts"] = json!({"unit":"dep", "files":["a"]});
+            script.replies[0]["canonical"] = json!(canonical);
+            script.replies[0]["dependency_contexts"] = json!([DEPENDENCY_CONTEXT_VERSION]);
+            script.replies[0]["dependency_execution_modes"] = advertised.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap()
+                .with_admission_hook(Some(Box::new(move |_| {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })));
+            let offered = peer.receive().unwrap();
+            let outcome = peer.negotiate(&offered, &grant());
+            assert_eq!(
+                outcome.is_ok(),
+                accepted,
+                "requested={requested}, advertised={advertised}, canonical={canonical}: {outcome:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(accepted));
+            if accepted {
+                assert_eq!(peer.inner.sent[1]["dependency_execution_mode"], requested);
+                assert_eq!(
+                    peer.inner.sent[1]["dependency_context"],
+                    DEPENDENCY_CONTEXT_VERSION
+                );
+                peer.send(&request).unwrap();
+                assert_eq!(peer.inner.sent.last().unwrap(), &request);
+            } else {
+                assert!(
+                    peer.inner.sent.is_empty(),
+                    "refusal must precede challenge and upload"
+                );
+                assert!(peer.send(&request).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unsolicited_dependency_mode_grants_cannot_relax_canonical_admission() {
+        for selection in [
+            json!({"dependency_execution_mode":"rlib"}),
+            json!({"dependency_context":DEPENDENCY_CONTEXT_VERSION}),
+            json!({"dependency_context":DEPENDENCY_CONTEXT_VERSION,
+                   "dependency_execution_mode":"rlib"}),
+        ] {
+            let mut peer = peer(hello(), response());
+            let offered = peer.receive().unwrap();
+            let mut selected = grant();
+            selected
+                .as_object_mut()
+                .unwrap()
+                .extend(selection.as_object().unwrap().clone());
+            assert!(peer.negotiate(&offered, &selected).is_err());
+            assert!(peer.inner.sent.is_empty());
+            assert!(peer.send(&request()).is_err());
+        }
     }
 
     #[cfg(target_os = "linux")]

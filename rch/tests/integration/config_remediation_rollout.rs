@@ -37,6 +37,9 @@ fn run_config(config_dir: &Path, args: &[&str]) -> (bool, String) {
         .env_remove("RCH_JSON")
         .env_remove("RCH_OUTPUT_FORMAT")
         .env_remove("TOON_DEFAULT_FORMAT")
+        // Fleet hosts export placement policy; it outranks config files.
+        .env_remove("RCH_REQUIRE_REMOTE")
+        .env_remove("RCH_FORCE_REMOTE")
         .output()
         .expect("failed to run rch");
     (
@@ -56,6 +59,9 @@ fn run_config_in(config_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String)
         .env_remove("RCH_JSON")
         .env_remove("RCH_OUTPUT_FORMAT")
         .env_remove("TOON_DEFAULT_FORMAT")
+        // Fleet hosts export placement policy; it outranks config files.
+        .env_remove("RCH_REQUIRE_REMOTE")
+        .env_remove("RCH_FORCE_REMOTE")
         .output()
         .expect("failed to run rch");
     (

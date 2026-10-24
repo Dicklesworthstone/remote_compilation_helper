@@ -67,6 +67,286 @@ fn tree_fixture(destination: &Path, count: usize) -> (Script, BTreeMap<String, V
     (peer, bytes)
 }
 
+fn cargo_request() -> Value {
+    let mut request = request();
+    request["program"] = json!("/__rabs/toolchain/bin/cargo");
+    request["args"] = json!([
+        "check",
+        "--workspace",
+        "--message-format=json",
+        "--target-dir",
+        "/__rabs/out/cargo"
+    ]);
+    request["artifacts"] =
+        json!({"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":"cargo-json-v1"});
+    request
+}
+
+fn cargo_fixture(destination: &Path, report: &[u8]) -> Script {
+    let (mut peer, _) = tree_fixture(destination, 3);
+    peer.expected_stdout = report.to_vec();
+    peer.replies[1]["stdout_bytes"] = json!(report.len());
+    peer.replies[1]["stdout_sha256"] = json!(hash(report));
+    peer.replies[2] = chunk("stdout", report, false);
+    let manifest = &mut peer.replies[1]["artifact_manifest"];
+    manifest["unit"] = json!("cargo");
+    refresh_manifest(manifest);
+    let digest = manifest["manifest_sha256"].clone();
+    for frame in &mut peer.replies {
+        if frame["kind"] == "artifact-chunk" {
+            frame["manifest_sha256"] = digest.clone();
+        }
+    }
+    peer
+}
+
+fn private_incremental_cargo_request(test: bool) -> Value {
+    let mut request = cargo_request();
+    request["command_context"] = json!({"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+        "env":{"CARGO_INCREMENTAL":"1"}});
+    request["artifacts"]["cargo"] = json!(if test {
+        cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION
+    } else {
+        cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION
+    });
+    if test {
+        request["args"][0] = json!("test");
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend([json!("--"), json!("--profile=not-a-cargo-option")]);
+    }
+    request
+}
+
+#[test]
+fn private_incremental_cargo_delivery_and_recovery_preserve_native_test_semantics() {
+    for test in [false, true] {
+        let request = private_incremental_cargo_request(test);
+        let mut stdout = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/deps/f0001\"],\"executable\":null}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+        )
+        .to_owned();
+        if test {
+            stdout.push_str("{\"reason\":\"compiler-artifact\",\"filenames\":[\"/__rabs/out/cargo/debug/incremental/fake\"]}\n");
+            stdout.push_str("opaque test output without final newline");
+        }
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("incremental-delivery");
+        let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(
+            fs::read(destination.join("diagnostics/stdout")).unwrap(),
+            stdout.as_bytes()
+        );
+        let recovered =
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .unwrap()
+                .unwrap();
+        assert_eq!(recovered.receipt, delivery.receipt);
+        assert_eq!(delivery.receipt["publication_authorized"], false);
+    }
+}
+
+#[test]
+fn private_incremental_cargo_refuses_injected_and_reported_state_before_artifact_reads() {
+    let ordinary = concat!(
+        "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+        "\"filenames\":[\"/__rabs/out/cargo/deps/f0001\"],\"executable\":null}\n",
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+    );
+    for reported in [false, true] {
+        let request = private_incremental_cargo_request(false);
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("private-state-refused");
+        let stdout = if reported {
+            ordinary.replace("deps/f0001", "debug/incremental/pkg/state")
+        } else {
+            ordinary.to_owned()
+        };
+        let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+        if !reported {
+            let manifest = &mut peer.replies[1]["artifact_manifest"];
+            manifest["files"][0]["name"] = json!("debug/incremental/pkg/state");
+            refresh_manifest(manifest);
+            // This valid manifest is still accepted under the legacy complete
+            // tree contract. Only the explicit private projection refuses it.
+            assert!(verified_artifact_names(&cargo_request(), manifest).is_ok());
+        }
+        let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(
+            failure.detail.contains("private incremental state"),
+            "{}",
+            failure.detail
+        );
+        assert!(no_ack(&peer));
+        assert!(
+            !peer
+                .sent
+                .iter()
+                .any(|frame| frame["kind"] == "artifact-read")
+        );
+        assert!(!destination.join("delivery.json").exists());
+    }
+    let mut required = private_incremental_cargo_request(false);
+    required["artifacts"]["files"] = json!(["debug/incremental/pkg/state"]);
+    assert!(declaration(&required).is_err());
+}
+
+#[test]
+fn cargo_artifact_report_is_checked_before_ack_and_again_during_recovery() {
+    let owner = tempfile::tempdir().unwrap();
+    let destination = owner.path().join("cargo");
+    let stdout = concat!(
+        "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+        "\"filenames\":[\"/__rabs/out/cargo/deps/f0001\"],\"executable\":null}\n",
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+    );
+    let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+    let request = cargo_request();
+    let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+    assert!(delivery.acknowledgments_confirmed);
+    assert_eq!(
+        delivery.receipt["artifact_manifest"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap()
+            .is_some()
+    );
+
+    // Even an internally consistent retained hash cannot replace the required
+    // compiler-artifact records with a success-looking marker during recovery.
+    let mut receipt = delivery.receipt;
+    let missing = b"{\"reason\":\"build-finished\",\"success\":true}\n";
+    fs::write(destination.join("diagnostics/stdout"), missing).unwrap();
+    receipt["stdout_bytes"] = json!(missing.len());
+    receipt["stdout_sha256"] = json!(hash(missing));
+    receipt["total_bytes"] = json!(
+        receipt["total_bytes"].as_u64().unwrap() - stdout.len() as u64 + missing.len() as u64
+    );
+    fs::write(
+        destination.join("delivery.json"),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+    let failure =
+        recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap_err();
+    assert!(failure.detail.contains("real non-build-script target"));
+    assert!(failure.execution_may_have_run);
+}
+
+#[test]
+fn missing_cargo_outputs_or_incomplete_reports_never_acknowledge_success() {
+    for (index, report) in [
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+        concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/missing.rmeta\"],\"executable\":null}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n"
+        ),
+        concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/deps/f0001\"],\"executable\":null}\n"
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join(format!("refused-{index}"));
+        let mut peer = cargo_fixture(&destination, report.as_bytes());
+        let failure =
+            receive_execution(&mut peer, &cargo_request(), "worker", &destination).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(no_ack(&peer));
+        assert!(!destination.join("delivery.json").exists());
+        assert!(
+            !peer
+                .sent
+                .iter()
+                .any(|frame| frame["kind"] == "artifact-read")
+        );
+    }
+}
+
+#[test]
+fn cargo_test_delivery_recovery_preserves_opaque_harness_output_and_final_status() {
+    let mut request = cargo_request();
+    request["args"][0] = json!("test");
+    request["args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("--"), json!("--nocapture")]);
+    request["artifacts"]["cargo"] = json!("cargo-test-json-v1");
+    let stdout = concat!(
+        "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"test\"]},",
+        "\"filenames\":[\"/__rabs/out/cargo/a\"],\"executable\":\"/__rabs/out/cargo/a\"}\n",
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+        "{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/test-stdout\"]}\n",
+        "{\"reason\":\"build-finished\",\"success\":false}\n",
+        "unparsed test stdout without a final newline",
+    );
+    for exit_code in [0, 101] {
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("tests");
+        let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+        if exit_code != 0 {
+            peer.replies[1]["exit_code"] = json!(exit_code);
+            peer.replies[1]["artifact_manifest"] = Value::Null;
+            peer.replies[1]["artifact_ack_required"] = json!(false);
+            peer.replies.truncate(4);
+            peer.replies.push_back(
+                json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
+            );
+        }
+        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(peer.replies.is_empty());
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(delivery.receipt["exit_code"], exit_code);
+        assert_eq!(
+            fs::read(destination.join("diagnostics/stdout")).unwrap(),
+            stdout.as_bytes()
+        );
+        assert_eq!(
+            delivery.receipt["artifact_manifest"].is_null(),
+            exit_code != 0
+        );
+        let recovered =
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .unwrap()
+                .unwrap();
+        assert_eq!(recovered.receipt, delivery.receipt);
+        assert_eq!(recovered.receipt["publication_authorized"], false);
+        assert!(
+            !peer
+                .sent
+                .iter()
+                .any(|frame| exit_code != 0 && frame["kind"] == "artifact-ack")
+        );
+    }
+
+    let owner = tempfile::tempdir().unwrap();
+    let destination = owner.path().join("contradictory-failure");
+    let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+    peer.replies[1]["exit_code"] = json!(101);
+    let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+    assert!(failure.detail.contains("failed-execution artifacts"));
+    assert!(
+        no_ack(&peer),
+        "a test failure cannot offer successful artifacts"
+    );
+}
+
 #[test]
 fn tree_delivery_verifies_every_file_before_ack_and_preserves_exact_request() {
     for lose_ack in [false, true] {

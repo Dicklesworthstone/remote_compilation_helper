@@ -12,7 +12,7 @@ mod agents;
 mod config;
 mod config_doctor;
 mod config_init;
-mod daemon;
+pub(crate) mod daemon;
 mod helpers;
 mod hook;
 mod init;
@@ -43,7 +43,11 @@ pub use hook::{hook_install, hook_status, hook_test, hook_uninstall};
 pub use shim::{shim_install, shim_status, shim_uninstall};
 
 // Re-export status/diagnostics commands for backward compatibility
-pub use status::{admit, check, diagnose, self_test, status_overview};
+pub(crate) use status::query_restart_admission;
+pub use status::{
+    admit, check, daemon_admission_recover, daemon_admission_status, diagnose, self_test,
+    status_overview,
+};
 
 // Re-export queue/cancel commands for backward compatibility
 pub use queue::{cancel_build, queue_status};
@@ -599,6 +603,7 @@ mod tests {
             running: true,
             socket_path: "/tmp/rch.sock".to_string(),
             uptime_seconds: Some(3600),
+            admission: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(json["running"].as_bool().unwrap());
@@ -613,6 +618,7 @@ mod tests {
             running: false,
             socket_path: "/tmp/rch.sock".to_string(),
             uptime_seconds: None,
+            admission: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(!json["running"].as_bool().unwrap());
@@ -650,6 +656,7 @@ mod tests {
                 confidence_threshold: 0.85,
                 min_local_time_ms: 2000,
                 remote_speedup_threshold: 1.2,
+                local_slots: 0,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,
@@ -661,6 +668,8 @@ mod tests {
                 remote_build_jobs: "auto".to_string(),
             },
             transfer: ConfigTransferSection {
+                retrieval_staging_dir: None,
+                retrieval_min_free_bytes: 0,
                 compression_level: 3,
                 exclude_patterns: vec!["target/".to_string()],
                 remote_base: "/tmp/rch".to_string(),
@@ -678,6 +687,7 @@ mod tests {
             },
             environment: ConfigEnvironmentSection {
                 allowlist: vec!["RUSTFLAGS".to_string()],
+                forward_cargo_profile_settings: true,
             },
             circuit: ConfigCircuitSection {
                 failure_threshold: 3,
@@ -697,11 +707,18 @@ mod tests {
                 auto_start_cooldown_secs: 30,
                 auto_start_timeout_secs: 3,
             },
+            layer0: rch_common::types::Layer0Config {
+                enabled: true,
+                debug_line_tables_only: true,
+                ..Default::default()
+            },
             sources: vec!["~/.config/rch/config.toml".to_string()],
             value_sources: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(json["general"]["enabled"].as_bool().unwrap());
+        assert!(json["layer0"]["debug_line_tables_only"].as_bool().unwrap());
+        assert!(!json["layer0"]["release_lto_thin"].as_bool().unwrap());
         assert_eq!(json["compilation"]["confidence_threshold"], 0.85);
         assert_eq!(json["compilation"]["build_timeout_sec"], 300);
         assert_eq!(json["compilation"]["external_timeout_enabled"], true);
@@ -890,6 +907,7 @@ mod tests {
             capabilities_warnings: Vec::new(),
             worker_selection: None,
             placement: rch_common::resolve_placement(|_| None),
+            speed_gate: None,
             dry_run: None,
         };
 
@@ -928,6 +946,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::NoAdmissibleWorkers("insufficient_slots=1".to_string()),
             diagnostics: None,
+            inventory: None,
         };
 
         let json = serde_json::to_value(&worker_selection).unwrap();
@@ -1210,6 +1229,8 @@ mod tests {
             slots_available: 4,
             speed_score: 1.5,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         };
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,
@@ -1217,6 +1238,7 @@ mod tests {
             worker: Some(worker),
             reason: SelectionReason::Success,
             diagnostics: None,
+            inventory: None,
         };
         let summary = build_dry_run_summary(
             true,
@@ -1243,6 +1265,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
             diagnostics: None,
+            inventory: None,
         };
         let summary = build_dry_run_summary(
             true,
@@ -1330,6 +1353,7 @@ mod tests {
                     reason_codes: vec!["pressure.critical".to_string()],
                 }],
             }),
+            inventory: None,
         };
         let dry_run = build_dry_run_summary(
             true,
@@ -1369,6 +1393,7 @@ mod tests {
             capabilities_warnings: Vec::new(),
             worker_selection: Some(worker_selection),
             placement: rch_common::resolve_placement(|_| None),
+            speed_gate: None,
             dry_run: Some(dry_run),
         };
 

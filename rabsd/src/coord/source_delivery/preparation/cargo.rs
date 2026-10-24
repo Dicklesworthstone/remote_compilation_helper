@@ -6,14 +6,16 @@
 //! build scripts, include! inputs, and optional/target dependencies retain their
 //! relative layout. No descriptor, cache authority, or compiler result is minted.
 
+mod git;
+mod registry;
 mod vendor;
 
-use super::super::{SourceUpload, invalid, require};
 use rabs_asupersync::process_groups::{GroupSignal, ManagedProcessGroup};
 use rabs_asupersync::region_tree::Attribution;
-use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
-use rabs_sandbox::source_transfer::MAX_SOURCE_FILES;
-use serde_json::Value;
+use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot, capture_sealed_source};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, MAX_SOURCE_FILES};
+use registry::RegistryCache;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -27,10 +29,23 @@ const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PACKAGES: usize = 1024;
 
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn require(condition: bool, message: &str) -> io::Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(invalid(message))
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct CargoSource {
     manifest: String,
     vendor: Option<String>,
+    cargo_home_source: Option<PathBuf>,
 }
 
 impl CargoSource {
@@ -38,11 +53,11 @@ impl CargoSource {
         require(
             value.as_object().is_some_and(|fields| {
                 fields.contains_key("manifest")
-                    && fields
-                        .keys()
-                        .all(|key| matches!(key.as_str(), "manifest" | "vendor"))
+                    && fields.keys().all(|key| {
+                        matches!(key.as_str(), "manifest" | "vendor" | "cargo_home_source")
+                    })
             }),
-            "cargo_source requires manifest and optional vendor",
+            "cargo_source requires manifest and optional vendor or cargo_home_source",
         )?;
         let manifest = value["manifest"]
             .as_str()
@@ -69,9 +84,18 @@ impl CargoSource {
                 Ok::<_, io::Error>(directory.to_owned())
             })
             .transpose()?;
+        let cargo_home_source = value
+            .get("cargo_home_source")
+            .map(registry::approved_home)
+            .transpose()?;
+        require(
+            vendor.is_none() || cargo_home_source.is_none(),
+            "cargo_source vendor and cargo_home_source are mutually exclusive",
+        )?;
         Ok(Self {
             manifest: manifest.to_owned(),
             vendor,
+            cargo_home_source,
         })
     }
 
@@ -79,13 +103,41 @@ impl CargoSource {
         &self.manifest
     }
 
-    pub(super) fn prepare(&self, image: Arc<SealedSourceSnapshot>) -> io::Result<SourceUpload> {
+    pub(super) fn cargo_home_projection(&self) -> Option<Value> {
+        self.cargo_home_source.as_ref().map(|_| {
+            json!({"version":rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION,
+                "prefix":registry::CACHE_PREFIX})
+        })
+    }
+
+    pub(super) fn validate_cache_boundary(&self, source: &Path) -> io::Result<()> {
+        if let Some(home) = &self.cargo_home_source {
+            let source = fs::canonicalize(source)?;
+            require(
+                !source.starts_with(home) && !home.starts_with(&source),
+                "cargo_home_source must be separate from the approved source anchor",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return retained input bytes and their explicit selection. The coordinator
+    /// constructs and validates the transport projection from this same image.
+    pub(super) fn prepare(
+        &self,
+        image: Arc<SealedSourceSnapshot>,
+    ) -> io::Result<(Arc<SealedSourceSnapshot>, Vec<String>)> {
         let vendor = self
             .vendor
             .as_deref()
             .map(|directory| VendoredSources::verify(&image, &self.manifest, directory))
             .transpose()?;
-        let files = validate_capture(&image, &self.manifest, vendor.as_ref())?;
+        let files = validate_capture(
+            &image,
+            &self.manifest,
+            vendor.as_ref(),
+            self.cargo_home_source.is_some(),
+        )?;
         // Planning starts only after a complete paired capture. Cargo never sees
         // a mutable original checkout or a mixture of pre/post-mutation files.
         let planning = tempfile::Builder::new()
@@ -117,14 +169,36 @@ impl CargoSource {
         fs::create_dir(&home)?;
         let cargo_home = planning_root.join("cargo-home");
         fs::create_dir(&cargo_home)?;
-        let mut command = Command::new(cargo);
-        command
-            .env_clear()
-            .current_dir(
-                root.join(&self.manifest)
+        let registry = self
+            .cargo_home_source
+            .as_ref()
+            .map(|approved| {
+                let mut locate =
+                    planning_command(&cargo, &rustc, &root, &self.manifest, &planning_root)?;
+                locate
+                    .args(["locate-project", "--workspace", "--message-format=json"])
+                    .arg("--manifest-path")
+                    .arg(root.join(&self.manifest));
+                let located: Value = serde_json::from_slice(&bounded_command(
+                    locate,
+                    &planning_root,
+                    METADATA_TIMEOUT,
+                    OUTPUT_LIMIT,
+                )?)
+                .map_err(|_| invalid("invalid Cargo workspace location"))?;
+                let workspace_manifest = captured_metadata_path(&image, &root, &located["root"])?;
+                let lock = workspace_manifest
                     .parent()
-                    .ok_or_else(|| invalid("Cargo manifest parent"))?,
-            )
+                    .ok_or_else(|| invalid("Cargo workspace manifest parent"))?
+                    .join("Cargo.lock")
+                    .strip_prefix(&root)
+                    .map_err(|_| invalid("Cargo workspace lock escapes captured source"))?
+                    .to_path_buf();
+                RegistryCache::capture(&image, &lock, approved, &cargo_home)
+            })
+            .transpose()?;
+        let mut command = planning_command(&cargo, &rustc, &root, &self.manifest, &planning_root)?;
+        command
             .args([
                 "metadata",
                 "--format-version=1",
@@ -133,29 +207,91 @@ impl CargoSource {
                 "--all-features",
             ])
             .arg("--manifest-path")
-            .arg(root.join(&self.manifest))
-            .env("HOME", home)
-            .env("CARGO_HOME", cargo_home)
-            .env("RUSTC", rustc)
-            .env("CARGO_TARGET_DIR", planning_root.join("target"));
-        for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
+            .arg(root.join(&self.manifest));
         let output = bounded_command(command, &planning_root, METADATA_TIMEOUT, OUTPUT_LIMIT)?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|error| invalid(&format!("invalid Cargo metadata JSON: {error}")))?;
-        validate_metadata(&image, &root, &self.manifest, &metadata, vendor.as_ref())?;
+        validate_metadata(
+            &image,
+            &root,
+            &self.manifest,
+            &metadata,
+            vendor.as_ref(),
+            registry
+                .as_ref()
+                .map(|registry| (registry, cargo_home.as_path())),
+        )?;
         verify_planning_bytes(&image, &root, &files)?;
-        SourceUpload::from_snapshot(image, "workspace", &files)
+        if let Some(registry) = registry {
+            let mut selected = files;
+            selected.extend(
+                registry
+                    .materialize(&root.join(registry::CACHE_PREFIX))?
+                    .into_iter()
+                    .map(|path| format!("{}/{path}", registry::CACHE_PREFIX)),
+            );
+            // Planning and byte comparison are complete; the private copy now
+            // owns the derived inputs. Release the original retained maps before
+            // paired recapture so a full cache does not require a third copy in
+            // memory merely to construct the final transfer image.
+            drop(registry);
+            drop(image);
+            let derived = Arc::new(
+                capture_sealed_source(
+                    &[("workspace".to_owned(), root)],
+                    false,
+                    2,
+                    MAX_SOURCE_BYTES,
+                )
+                .map_err(|error| {
+                    invalid(&format!("retained Cargo cache capture refused: {error:?}"))
+                })?,
+            );
+            // This new image is derived solely from the retained source and
+            // checksum-bound cache bytes. It is input delivery, not a resealed
+            // authoritative action descriptor or a cache-publication claim.
+            Ok((derived, selected))
+        } else {
+            Ok((image, files))
+        }
     }
+}
+
+fn planning_command(
+    cargo: &Path,
+    rustc: &Path,
+    root: &Path,
+    manifest: &str,
+    planning: &Path,
+) -> io::Result<Command> {
+    let mut command = Command::new(cargo);
+    command
+        .env_clear()
+        .current_dir(
+            root.join(manifest)
+                .parent()
+                .ok_or_else(|| invalid("Cargo manifest parent"))?,
+        )
+        .env("HOME", planning.join("home"))
+        .env("CARGO_HOME", planning.join("cargo-home"))
+        .env("RUSTC", rustc)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("CARGO_TARGET_DIR", planning.join("target"));
+    for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    Ok(command)
 }
 
 fn validate_capture(
     image: &SealedSourceSnapshot,
     manifest: &str,
     vendor: Option<&VendoredSources>,
+    cached_registry: bool,
 ) -> io::Result<Vec<String>> {
     let captured = image
         .manifest("workspace")
@@ -163,15 +299,16 @@ fn validate_capture(
     let mut files = Vec::new();
     for (path, kind) in &captured.members {
         require(
+            !cached_registry
+                || (path != registry::CACHE_PREFIX
+                    && !path.starts_with(&format!("{}/", registry::CACHE_PREFIX))),
+            "approved source collides with the reserved rabs-cargo-home directory",
+        )?;
+        require(
             !matches!(kind, MemberKind::Symlink { .. }),
             "automatic Cargo source preparation does not support symlinks",
         )?;
         if matches!(kind, MemberKind::Regular { .. }) {
-            require(
-                !is_cargo_config(Path::new(path))
-                    || vendor.is_some_and(|vendor| vendor.allows_config(path)),
-                "Cargo config requires the explicitly validated vendor source-replacement mode",
-            )?;
             files.push(path.clone());
             require(
                 files.len() <= MAX_SOURCE_FILES,
@@ -182,6 +319,34 @@ fn validate_capture(
             // not independent workspace roots for the planning command.
             if vendor.is_some_and(|vendor| vendor.contains(path)) {
                 continue;
+            }
+            if is_cargo_config(Path::new(path)) {
+                if let Some(vendor) = vendor {
+                    // The vendor adapter validates its one source-replacement
+                    // config, including the shared compiler settings below.
+                    require(
+                        vendor.allows_config(path),
+                        "vendor preparation does not admit another Cargo config layer",
+                    )?;
+                } else {
+                    let bytes = image
+                        .file_bytes("workspace", path)
+                        .filter(|bytes| bytes.len() <= OUTPUT_LIMIT as usize)
+                        .ok_or_else(|| invalid("missing or oversized captured Cargo config"))?;
+                    let text = std::str::from_utf8(bytes)
+                        .map_err(|_| invalid("captured Cargo config is not UTF-8"))?;
+                    let value = toml::from_str(text)
+                        .map_err(|_| invalid("malformed captured Cargo config"))?;
+                    let base = Path::new(path)
+                        .parent()
+                        .and_then(Path::parent)
+                        .ok_or_else(|| invalid("invalid captured Cargo config path"))?;
+                    if cached_registry {
+                        registry::validate_cargo_config(&value, base)?;
+                    } else {
+                        validate_cargo_config(&value, base, false)?;
+                    }
+                }
             }
             if Path::new(path)
                 .file_name()
@@ -197,11 +362,12 @@ fn validate_capture(
                 let value: toml::Value = toml::from_str(text).map_err(|error| {
                     invalid(&format!("captured Cargo manifest {path}: {error}"))
                 })?;
-                validate_manifest_paths(
+                validate_manifest_paths_with_cache(
                     Path::new(path).parent().unwrap_or(Path::new("")),
                     &value,
                     vendor.map(|vendor| &vendor.sources),
                     false,
+                    cached_registry,
                 )?;
             }
             if Path::new(path)
@@ -220,6 +386,8 @@ fn validate_capture(
                 })?;
                 if let Some(vendor) = vendor {
                     vendor.validate_lock_sources(&lock)?;
+                } else if cached_registry {
+                    registry::validate_lock_sources(&lock)?;
                 } else if let Some(packages) = lock.get("package").and_then(toml::Value::as_array) {
                     require(
                         packages
@@ -247,6 +415,469 @@ fn is_cargo_config(path: &Path) -> bool {
             .is_some_and(|name| name == ".cargo")
 }
 
+/// Admit captured compiler configuration without delegating command, input or
+/// output ownership to it. These bytes remain unchanged in both the planning
+/// copy and the worker upload; Cargo owns config layering and flag precedence.
+/// Source replacements need the vendor adapter's separate closure validation.
+fn validate_cargo_config(value: &toml::Value, base: &Path, vendor_sources: bool) -> io::Result<()> {
+    let top = value
+        .as_table()
+        .ok_or_else(|| invalid("captured Cargo config must be a table"))?;
+    for (section, value) in top {
+        match section.as_str() {
+            "source" | "registries" if vendor_sources => {}
+            "env" => validate_config_environment(value, base)?,
+            "profile" => validate_cargo_profiles(value)?,
+            "build" => {
+                let build = value
+                    .as_table()
+                    .ok_or_else(|| invalid("Cargo build config must be a table"))?;
+                for (name, value) in build {
+                    require(
+                        matches!(name.as_str(), "rustflags" | "rustdocflags"),
+                        "captured Cargo build config supports only rustflags and rustdocflags",
+                    )?;
+                    validate_compiler_flags(value)?;
+                }
+            }
+            "target" => {
+                let targets = value
+                    .as_table()
+                    .filter(|targets| targets.len() <= 64)
+                    .ok_or_else(|| invalid("Cargo target config must be a bounded table"))?;
+                for (target, value) in targets {
+                    // Named triples and Cargo's cfg selectors are not file
+                    // paths. Cargo, rather than a second cfg parser, resolves
+                    // and merges matching selectors in its ordinary order.
+                    let named = !target.is_empty()
+                        && target.len() <= 128
+                        && target
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte));
+                    let conditional = target.starts_with("cfg(")
+                        && target.ends_with(')')
+                        && target.len() <= 1024
+                        && !target.chars().any(char::is_control);
+                    require(
+                        named || conditional,
+                        "Cargo target config requires a named triple or cfg selector",
+                    )?;
+                    let fields = value
+                        .as_table()
+                        .ok_or_else(|| invalid("Cargo target settings must be a table"))?;
+                    for (name, value) in fields {
+                        require(
+                            name == "rustflags",
+                            "captured Cargo target config supports only rustflags",
+                        )?;
+                        validate_compiler_flags(value)?;
+                    }
+                }
+            }
+            "llvm-cov" => {
+                // Stock Cargo does not consume this tool's exclude globs.
+                // Retain this repository's existing metadata without treating
+                // arbitrary unknown tables as permission to configure Cargo.
+                let fields = value
+                    .as_table()
+                    .ok_or_else(|| invalid("llvm-cov metadata must be a table"))?;
+                for (name, value) in fields {
+                    require(name == "exclude", "unsupported llvm-cov metadata")?;
+                    let patterns = value
+                        .as_array()
+                        .filter(|patterns| patterns.len() <= 256)
+                        .ok_or_else(|| invalid("llvm-cov exclude must be a bounded array"))?;
+                    for pattern in patterns {
+                        require(
+                            pattern.as_str().is_some_and(|pattern| {
+                                pattern.len() <= 4096 && !pattern.chars().any(char::is_control)
+                            }),
+                            "llvm-cov exclude entries must be bounded strings",
+                        )?;
+                    }
+                }
+            }
+            _ => return Err(invalid("unsupported captured Cargo configuration section")),
+        }
+    }
+    Ok(())
+}
+
+fn cargo_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
+/// Profiles are compiler settings, not authority to select another compiler or
+/// read arbitrary paths. Keep the tables intact so Cargo merges workspace and
+/// config profiles, resolves inheritance, and applies package/build overrides.
+fn validate_cargo_profiles(value: &toml::Value) -> io::Result<()> {
+    let profiles = value
+        .as_table()
+        .filter(|profiles| profiles.len() <= 64)
+        .ok_or_else(|| invalid("Cargo profiles must be a bounded table"))?;
+    for (name, settings) in profiles {
+        require(
+            cargo_profile_name(name),
+            "captured Cargo profile names must be bounded literal names",
+        )?;
+        validate_profile_settings(settings, false)?;
+    }
+    Ok(())
+}
+
+fn validate_profile_settings(value: &toml::Value, overridden: bool) -> io::Result<()> {
+    let settings = value
+        .as_table()
+        .filter(|settings| settings.len() <= 16)
+        .ok_or_else(|| invalid("Cargo profile settings must be a bounded table"))?;
+    for (name, value) in settings {
+        let accepted = match name.as_str() {
+            "inherits" if !overridden => value.as_str().is_some_and(cargo_profile_name),
+            "build-override" if !overridden => {
+                validate_profile_settings(value, true)?;
+                true
+            }
+            "package" if !overridden => {
+                let packages = value
+                    .as_table()
+                    .filter(|packages| packages.len() <= 128)
+                    .ok_or_else(|| invalid("Cargo package profile overrides must be bounded"))?;
+                for (selector, settings) in packages {
+                    // These keys are Cargo package-ID selectors (including *),
+                    // never paths to be opened by the preparation layer.
+                    require(
+                        !selector.is_empty()
+                            && selector.len() <= 256
+                            && !selector.chars().any(char::is_control),
+                        "Cargo profile package selectors must be bounded literals",
+                    )?;
+                    validate_profile_settings(settings, true)?;
+                }
+                true
+            }
+            "opt-level" => {
+                value
+                    .as_integer()
+                    .is_some_and(|value| (0..=3).contains(&value))
+                    || value
+                        .as_str()
+                        .is_some_and(|value| matches!(value, "s" | "z"))
+            }
+            "debug" => {
+                value.is_bool()
+                    || value
+                        .as_integer()
+                        .is_some_and(|value| (0..=2).contains(&value))
+                    || value.as_str().is_some_and(|value| {
+                        matches!(
+                            value,
+                            "none"
+                                | "limited"
+                                | "full"
+                                | "line-tables-only"
+                                | "line-directives-only"
+                        )
+                    })
+            }
+            "split-debuginfo" => value
+                .as_str()
+                .is_some_and(|value| matches!(value, "off" | "packed" | "unpacked")),
+            "strip" => {
+                value.is_bool()
+                    || value
+                        .as_str()
+                        .is_some_and(|value| matches!(value, "none" | "debuginfo" | "symbols"))
+            }
+            "debug-assertions" | "overflow-checks" => value.is_bool(),
+            "lto" if !overridden => {
+                value.is_bool()
+                    || value
+                        .as_str()
+                        .is_some_and(|value| matches!(value, "thin" | "fat" | "off"))
+            }
+            "panic" if !overridden => value
+                .as_str()
+                .is_some_and(|value| matches!(value, "abort" | "unwind")),
+            // Cargo owns the setting's precedence. The canonical frontend
+            // supplies an explicit CARGO_INCREMENTAL policy, and enabled state
+            // remains inside the worker's complete private target tree.
+            "incremental" => value.is_bool(),
+            "codegen-units" => value
+                .as_integer()
+                .is_some_and(|value| (1..=4096).contains(&value)),
+            "rpath" if !overridden => value.is_bool(),
+            _ => false,
+        };
+        require(
+            accepted,
+            "unsupported or invalid captured Cargo profile setting",
+        )?;
+    }
+    Ok(())
+}
+
+/// Keep Cargo's environment table in the captured config, including its merge,
+/// force and config-relative semantics. This only validates the input boundary:
+/// neither the metadata probe nor the worker receives rewritten config bytes.
+/// In particular, resolving a relative value here must not bake the temporary
+/// planning directory into the request; Cargo resolves it again in its actual
+/// canonical workspace before launching the compiler or a build script.
+fn validate_config_environment(value: &toml::Value, base: &Path) -> io::Result<()> {
+    use rabs_sandbox::process_context::{CommandContext, MAX_COMMAND_ENV_ENTRIES};
+
+    let entries = value
+        .as_table()
+        .filter(|entries| entries.len() <= MAX_COMMAND_ENV_ENTRIES)
+        .ok_or_else(|| invalid("Cargo env config must be a bounded table"))?;
+    let mut environment = Vec::with_capacity(entries.len());
+    for (name, setting) in entries {
+        // Match the canonical frontend's application-environment boundary.
+        // The common CommandContext validator below also owns the pinned base
+        // environment and identifier/value/count/aggregate byte limits.
+        require(
+            !matches!(
+                name.as_str(),
+                "CARGO" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "GLIBC_TUNABLES"
+            ) && ![
+                "CARGO_", "RUSTUP_", "RUSTC_", "RUSTDOC_", "CLIPPY_", "RABS_", "RCH_", "LD_",
+                "DYLD_", "GIT_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)),
+            "Cargo env config cannot replace worker, compiler or preparation controls",
+        )?;
+        let (text, relative) = if let Some(text) = setting.as_str() {
+            (text, false)
+        } else {
+            let fields = setting
+                .as_table()
+                .ok_or_else(|| invalid("Cargo env entry requires a string or value table"))?;
+            require(
+                fields
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "value" | "force" | "relative")),
+                "Cargo env entry has an unsupported field",
+            )?;
+            for flag in ["force", "relative"] {
+                require(
+                    fields.get(flag).is_none_or(toml::Value::is_bool),
+                    "Cargo env force and relative flags must be booleans",
+                )?;
+            }
+            (
+                fields
+                    .get("value")
+                    .and_then(toml::Value::as_str)
+                    .ok_or_else(|| invalid("Cargo env entry requires a string value"))?,
+                fields
+                    .get("relative")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false),
+            )
+        };
+        let bounded = if relative {
+            // Empty relative values designate the config's base directory.
+            // All source members, including symlinks, are checked separately.
+            contained_relative(base, if text.is_empty() { "." } else { text })?;
+            let path = Path::new(rabs_sandbox::layout::WORKSPACE)
+                .join(base)
+                .join(text);
+            let path = path
+                .to_str()
+                .ok_or_else(|| invalid("Cargo env path must be UTF-8"))?;
+            require(
+                path.len() <= 4096,
+                "Cargo env relative path exceeds its bound",
+            )?;
+            path.to_owned()
+        } else {
+            text.to_owned()
+        };
+        environment.push((name.clone(), bounded));
+    }
+    CommandContext::new(rabs_sandbox::layout::WORKSPACE, environment).map_err(|_| {
+        invalid("Cargo env config has an invalid or reserved name or exceeds its limits")
+    })?;
+    Ok(())
+}
+
+fn compiler_flag_arguments(value: &toml::Value) -> io::Result<Vec<&str>> {
+    // Cargo splits string-form flags on whitespace; it does not shell-parse
+    // them. Array elements retain their exact argument boundaries, including
+    // spaces inside a cfg expression. Never normalize or rewrite either form.
+    let flags = match value {
+        toml::Value::String(text) if text.len() <= 16 * 1024 => {
+            text.split_whitespace().collect::<Vec<_>>()
+        }
+        toml::Value::Array(values) if values.len() <= 256 => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo compiler flag arrays require strings"))
+            })
+            .collect::<io::Result<Vec<_>>>()?,
+        _ => {
+            return Err(invalid(
+                "Cargo compiler flags require a bounded string or array",
+            ));
+        }
+    };
+    require(
+        flags.len() <= 256
+            && flags.iter().map(|flag| flag.len()).sum::<usize>() <= 16 * 1024
+            && flags.iter().all(|flag| {
+                !flag.is_empty() && flag.len() <= 4096 && !flag.chars().any(char::is_control)
+            }),
+        "captured Cargo compiler flags exceed their bounds",
+    )?;
+    Ok(flags)
+}
+
+fn validate_compiler_flags(value: &toml::Value) -> io::Result<()> {
+    let flags = compiler_flag_arguments(value)?;
+    let mut flags = flags.into_iter();
+    while let Some(flag) = flags.next() {
+        if matches!(flag, "-g" | "-O") {
+            continue;
+        }
+        let (option, value) = if matches!(
+            flag,
+            "--cfg"
+                | "--check-cfg"
+                | "-A"
+                | "--allow"
+                | "-W"
+                | "--warn"
+                | "-D"
+                | "--deny"
+                | "-F"
+                | "--forbid"
+                | "-C"
+                | "--codegen"
+                | "-Z"
+        ) {
+            (
+                flag,
+                flags
+                    .next()
+                    .ok_or_else(|| invalid("Cargo compiler flag lacks its value"))?,
+            )
+        } else if let Some((option, value)) = flag.split_once('=')
+            && option.starts_with("--")
+        {
+            (option, value)
+        } else if let Some(option) = ["-A", "-W", "-D", "-F", "-C", "-Z"]
+            .into_iter()
+            .find(|option| flag.starts_with(option))
+        {
+            (option, &flag[option.len()..])
+        } else {
+            return Err(invalid("unsupported captured Cargo compiler flag"));
+        };
+        require(
+            !value.is_empty() && !value.starts_with(['-', '@']),
+            "invalid captured Cargo compiler flag value",
+        )?;
+        match option {
+            "--cfg" | "--check-cfg" => {}
+            "-A" | "--allow" | "-W" | "--warn" | "-D" | "--deny" | "-F" | "--forbid" => {
+                require(
+                    value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_:-".contains(&byte)),
+                    "captured Cargo lint flags require a literal lint name",
+                )?;
+            }
+            "-C" | "--codegen" => validate_scalar_codegen(value)?,
+            "-Z" => {
+                require(
+                    value.strip_prefix("threads=").is_some_and(positive_count),
+                    "captured Cargo unstable flags support only explicit bounded threads",
+                )?;
+            }
+            _ => return Err(invalid("unsupported captured Cargo compiler option")),
+        }
+    }
+    Ok(())
+}
+
+fn positive_count(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u32>()
+            .is_ok_and(|value| (1..=4096).contains(&value))
+}
+
+fn validate_scalar_codegen(value: &str) -> io::Result<()> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| invalid("captured Cargo codegen flags require explicit values"))?;
+    let boolean = || {
+        matches!(
+            value,
+            "y" | "yes" | "on" | "true" | "n" | "no" | "off" | "false"
+        )
+    };
+    let accepted = match name {
+        "opt-level" => matches!(value, "0" | "1" | "2" | "3" | "s" | "z"),
+        "debuginfo" => matches!(
+            value,
+            "0" | "1"
+                | "2"
+                | "none"
+                | "limited"
+                | "full"
+                | "line-tables-only"
+                | "line-directives-only"
+        ),
+        "debug-assertions"
+        | "overflow-checks"
+        | "embed-bitcode"
+        | "force-frame-pointers"
+        | "force-unwind-tables" => boolean(),
+        "codegen-units" => positive_count(value),
+        "panic" => matches!(value, "abort" | "unwind"),
+        "lto" => matches!(value, "thin" | "fat") || boolean(),
+        "strip" => matches!(value, "none" | "debuginfo" | "symbols"),
+        "split-debuginfo" => matches!(value, "off" | "packed" | "unpacked"),
+        "code-model" => matches!(value, "tiny" | "small" | "kernel" | "medium" | "large"),
+        "relocation-model" => matches!(
+            value,
+            "static" | "pic" | "pie" | "dynamic-no-pic" | "ropi" | "rwpi" | "ropi-rwpi" | "default"
+        ),
+        "target-cpu" => codegen_target_name(value),
+        "target-feature" => {
+            value.split(',').count() <= 128
+                && value.split(',').all(|feature| {
+                    feature
+                        .strip_prefix(['+', '-'])
+                        .is_some_and(codegen_target_name)
+                })
+        }
+        _ => false,
+    };
+    require(
+        accepted,
+        "unsupported or non-scalar captured Cargo codegen option",
+    )
+}
+
+fn codegen_target_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
 // This is a containment preflight, not a second dependency resolver. Cargo owns
 // graph resolution; checking path-bearing manifest fields before it runs prevents
 // Cargo from opening absolute/escaping local dependencies outside the copy.
@@ -255,6 +886,16 @@ fn validate_manifest_paths(
     value: &toml::Value,
     sources: Option<&SourceReplacements>,
     vendored_git: bool,
+) -> io::Result<()> {
+    validate_manifest_paths_with_cache(base, value, sources, vendored_git, false)
+}
+
+fn validate_manifest_paths_with_cache(
+    base: &Path,
+    value: &toml::Value,
+    sources: Option<&SourceReplacements>,
+    vendored_git: bool,
+    cached_git: bool,
 ) -> io::Result<()> {
     for field in ["package", "project"] {
         if let Some(package) = value.get(field) {
@@ -302,14 +943,14 @@ fn validate_manifest_paths(
             }
         }
     }
-    validate_dependency_sections(base, value, sources, vendored_git)?;
+    validate_dependency_sections(base, value, sources, vendored_git, cached_git)?;
     if let Some(targets) = value.get("target").and_then(toml::Value::as_table) {
         for target in targets.values() {
-            validate_dependency_sections(base, target, sources, vendored_git)?;
+            validate_dependency_sections(base, target, sources, vendored_git, cached_git)?;
         }
     }
     if let Some(workspace) = value.get("workspace") {
-        validate_dependency_sections(base, workspace, sources, vendored_git)?;
+        validate_dependency_sections(base, workspace, sources, vendored_git, cached_git)?;
         for field in ["members", "default-members", "exclude"] {
             if let Some(paths) = workspace.get(field).and_then(toml::Value::as_array) {
                 for path in paths {
@@ -333,11 +974,11 @@ fn validate_manifest_paths(
     }
     if let Some(patches) = value.get("patch").and_then(toml::Value::as_table) {
         for dependencies in patches.values() {
-            validate_dependencies(base, dependencies, sources, vendored_git)?;
+            validate_dependencies(base, dependencies, sources, vendored_git, cached_git)?;
         }
     }
     if let Some(replacements) = value.get("replace") {
-        validate_dependencies(base, replacements, sources, vendored_git)?;
+        validate_dependencies(base, replacements, sources, vendored_git, cached_git)?;
     }
     Ok(())
 }
@@ -354,6 +995,7 @@ fn validate_dependency_sections(
     value: &toml::Value,
     sources: Option<&SourceReplacements>,
     vendored_git: bool,
+    cached_git: bool,
 ) -> io::Result<()> {
     for field in [
         "dependencies",
@@ -363,7 +1005,7 @@ fn validate_dependency_sections(
         "build_dependencies",
     ] {
         if let Some(dependencies) = value.get(field) {
-            validate_dependencies(base, dependencies, sources, vendored_git)?;
+            validate_dependencies(base, dependencies, sources, vendored_git, cached_git)?;
         }
     }
     Ok(())
@@ -374,21 +1016,32 @@ fn validate_dependencies(
     value: &toml::Value,
     sources: Option<&SourceReplacements>,
     vendored_git: bool,
+    cached_git: bool,
 ) -> io::Result<()> {
     if let Some(dependencies) = value.as_table() {
         for dependency in dependencies.values() {
             if let Some(fields) = dependency.as_table() {
                 if fields.contains_key("registry") || fields.contains_key("registry-index") {
-                    sources
-                        .ok_or_else(|| invalid("alternate registry dependencies require an explicitly verified vendor source"))?
-                        .check_registry_dependency(fields)?;
+                    if let Some(sources) = sources {
+                        sources.check_registry_dependency(fields)?;
+                    } else {
+                        require(
+                            cached_git,
+                            "alternate registry dependencies require a verified vendor source or approved Cargo home",
+                        )?;
+                        registry::validate_dependency(fields)?;
+                    }
                 }
                 if fields.contains_key("git") {
-                    sources
-                        .ok_or_else(|| {
-                            invalid("Git dependencies require an explicitly verified vendor source")
-                        })?
-                        .check_dependency(fields)?;
+                    if let Some(sources) = sources {
+                        sources.check_dependency(fields)?;
+                    } else {
+                        require(
+                            cached_git,
+                            "Git dependencies require an explicitly verified vendor source or approved Cargo home",
+                        )?;
+                        git::validate_dependency(fields)?;
+                    }
                 }
                 // Cargo keeps original sibling paths in vendored Git manifests,
                 // but resolves those dependencies from that Git source's directory
@@ -467,7 +1120,7 @@ fn local_tool(name: &str, scratch: &Path) -> io::Result<PathBuf> {
         let explicit = PathBuf::from(explicit);
         require(
             explicit.is_absolute(),
-            "explicit CARGO/RUSTC must name an absolute local executable",
+            "explicit planning tools must name absolute local executables",
         )?;
         explicit
     } else {
@@ -552,18 +1205,35 @@ impl Drop for OwnedGroup {
 }
 
 fn bounded_command(
+    command: Command,
+    scratch: &Path,
+    timeout: Duration,
+    limit: u64,
+) -> io::Result<Vec<u8>> {
+    bounded_command_with_input(command, scratch, timeout, limit, None)
+}
+
+fn bounded_command_with_input(
     mut command: Command,
     scratch: &Path,
     timeout: Duration,
     limit: u64,
+    input: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     let logs = tempfile::Builder::new()
         .prefix("metadata-output-")
         .tempdir_in(scratch)?;
     let stdout = logs.path().join("stdout");
     let stderr = logs.path().join("stderr");
+    let stdin = if let Some(input) = input {
+        let path = logs.path().join("stdin");
+        fs::write(&path, input)?;
+        Stdio::from(File::open(path)?)
+    } else {
+        Stdio::null()
+    };
     command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(File::create(&stdout)?)
         .stderr(File::create(&stderr)?);
     let mut owned = OwnedGroup {
@@ -651,6 +1321,7 @@ fn validate_metadata(
     manifest: &str,
     value: &Value,
     vendor: Option<&VendoredSources>,
+    registry: Option<(&RegistryCache, &Path)>,
 ) -> io::Result<()> {
     require(value["version"] == 1, "unsupported Cargo metadata format")?;
     let workspace = Path::new(
@@ -676,6 +1347,9 @@ fn validate_metadata(
     let locked = vendor
         .map(|vendor| vendor.bind_lock(image, &lock))
         .transpose()?;
+    if let Some((registry, _)) = registry {
+        registry.check_lock(&lock)?;
+    }
     let packages = value["packages"]
         .as_array()
         .filter(|packages| !packages.is_empty() && packages.len() <= MAX_PACKAGES)
@@ -685,6 +1359,8 @@ fn validate_metadata(
     for package in packages {
         if let (Some(vendor), Some(locked)) = (vendor, locked.as_ref()) {
             vendor.check_package(root, package, locked)?;
+        } else if let Some((registry, home)) = registry {
+            registry.check_package(home, package)?;
         } else {
             require(
                 package.get("source").is_some_and(Value::is_null),
@@ -695,15 +1371,25 @@ fn validate_metadata(
             .as_str()
             .ok_or_else(|| invalid("Cargo package identity missing"))?;
         require(ids.insert(id), "duplicate Cargo package identity")?;
-        let path = captured_metadata_path(image, root, &package["manifest_path"])?;
-        selected |= path == root.join(manifest);
+        let external = package
+            .get("source")
+            .is_some_and(|source| !source.is_null());
+        if registry.is_none() || !external {
+            let path = captured_metadata_path(image, root, &package["manifest_path"])?;
+            selected |= path == root.join(manifest);
+        }
         let targets = package["targets"]
             .as_array()
             .filter(|targets| !targets.is_empty())
             .ok_or_else(|| invalid("Cargo package has no target graph"))?;
-        for target in targets {
-            captured_metadata_path(image, root, &target["src_path"])?;
+        if registry.is_none() || !external {
+            for target in targets {
+                captured_metadata_path(image, root, &target["src_path"])?;
+            }
         }
+    }
+    if let Some((registry, home)) = registry {
+        registry.verify_git_checkouts(home, packages)?;
     }
     // A virtual workspace manifest is not itself a package but is an exact
     // captured Cargo input and must be the metadata workspace's manifest.
@@ -781,6 +1467,445 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn captured_compiler_config_preserves_common_flags_and_cargo_target_selectors() {
+        for text in [
+            "[build]\nrustflags=['-Z','threads=4']\nrustdocflags=['-Dwarnings']\n[llvm-cov]\nexclude=['*/tests/*','*/benches/*','*/examples/*']\n",
+            "[build]\nrustflags='--cfg rabs_fixture -Copt-level=2 --deny=warnings'\n",
+            "[build]\nrustflags=['--cfg', 'label=\"two words\"', '--check-cfg=cfg(label, values(\"two words\"))']\n",
+            "[target.x86_64-unknown-linux-gnu]\nrustflags=['-C','panic=abort']\n[target.'cfg(unix)']\nrustflags=['--cfg=on_unix', '-Zthreads=4']\n",
+            "[build]\nrustflags=[]\nrustdocflags=''\n",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            let original = value.clone();
+            validate_cargo_config(&value, Path::new(""), false).unwrap();
+            assert_eq!(value, original, "validation must not rewrite Cargo intent");
+        }
+    }
+
+    #[test]
+    fn captured_profiles_preserve_inheritance_and_package_and_build_overrides() {
+        let value: toml::Value = toml::from_str(
+            r#"
+                [profile.dev]
+                debug = "line-tables-only"
+                incremental = true
+                [profile.ci]
+                inherits = "release"
+                opt-level = 2
+                debug = 1
+                split-debuginfo = "off"
+                strip = "debuginfo"
+                debug-assertions = true
+                overflow-checks = false
+                lto = "thin"
+                panic = "unwind"
+                incremental = false
+                codegen-units = 1
+                rpath = false
+                [profile.ci.build-override]
+                opt-level = 0
+                debug = false
+                debug-assertions = true
+                incremental = true
+                [profile.ci.package."*"]
+                opt-level = "s"
+                [profile.ci.package."some-crate:2.1.0"]
+                opt-level = "z"
+                debug = "full"
+                strip = true
+                incremental = false
+                [profile.release-lto]
+                inherits = "ci"
+                lto = true
+                [profile.1stage]
+                lto = "off"
+            "#,
+        )
+        .unwrap();
+        let original = value.clone();
+        for vendor in [false, true] {
+            validate_cargo_config(&value, Path::new("app"), vendor).unwrap();
+        }
+        assert_eq!(
+            value, original,
+            "Cargo must own profile merging and selection"
+        );
+        let profiles: std::collections::BTreeMap<_, _> = (0..64)
+            .map(|index| (format!("p{index}"), json!({"debug":false})))
+            .collect();
+        let value = toml::Value::try_from(json!({"profile":profiles})).unwrap();
+        validate_cargo_config(&value, Path::new(""), false).unwrap();
+        let value = toml::Value::try_from(json!({"profile":{"p".repeat(64):{}}})).unwrap();
+        validate_cargo_config(&value, Path::new(""), false).unwrap();
+    }
+
+    #[test]
+    fn captured_profiles_reject_unbounded_names_types_and_execution_controls() {
+        for text in [
+            "profile='bad'",
+            "[profile]\nci='bad'",
+            "[profile.ci]\ninherits='../release'",
+            "[profile.ci]\ninherits=1",
+            "[profile.ci]\nopt-level=4",
+            "[profile.ci]\nopt-level='3'",
+            "[profile.ci]\ndebug=3",
+            "[profile.ci]\ndebug='unknown'",
+            "[profile.ci]\nsplit-debuginfo=true",
+            "[profile.ci]\nstrip='outside'",
+            "[profile.ci]\ndebug-assertions='false'",
+            "[profile.ci]\noverflow-checks=0",
+            "[profile.ci]\nlto='plugin'",
+            "[profile.ci]\npanic='outside'",
+            "[profile.ci]\ncodegen-units=0",
+            "[profile.ci]\ncodegen-units=4097",
+            "[profile.ci]\ncodegen-units=1.0",
+            "[profile.ci]\nrpath='outside'",
+            "[profile.ci]\nincremental='true'",
+            "[profile.ci]\nincremental=1",
+            "[profile.ci]\nincremental='/outside/cache'",
+            "[profile.ci]\ndir-name='../outside'",
+            "[profile.ci]\ncodegen-backend='/outside/backend.so'",
+            "[profile.ci]\nrustflags=['--sysroot=/outside']",
+            "[profile.ci]\ntrim-paths='all'",
+            "[profile.ci]\nbuild-override=false",
+            "[profile.ci]\npackage=['some-crate']",
+            "[profile.ci.package]\nsome-crate='bad'",
+            "[profile.ci.package.some-crate]\ninherits='release'",
+            "[profile.ci.package.some-crate]\npackage={nested={opt-level=1}}",
+            "[profile.ci.package.some-crate]\nbuild-override={opt-level=1}",
+            "[profile.ci.build-override]\nlto=true",
+            "[profile.ci.build-override]\npanic='abort'",
+            "[profile.ci.build-override]\nrpath=true",
+            "[profile.ci.build-override]\nincremental={enabled=true}",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            assert!(
+                validate_cargo_config(&value, Path::new(""), false).is_err(),
+                "{text}"
+            );
+        }
+        for name in ["", "_ci", "../ci", "ci/x", "ci\\x", "ci x", "ci\n", "ci雪"] {
+            let value = toml::Value::try_from(json!({"profile":{name:{}}})).unwrap();
+            assert!(
+                validate_cargo_config(&value, Path::new(""), false).is_err(),
+                "{name:?}"
+            );
+        }
+        let profiles: std::collections::BTreeMap<_, _> = (0..65)
+            .map(|index| (format!("p{index}"), json!({})))
+            .collect();
+        let packages: std::collections::BTreeMap<_, _> = (0..129)
+            .map(|index| (format!("crate{index}"), json!({})))
+            .collect();
+        for value in [
+            json!({"profile":{"p".repeat(65):{}}}),
+            json!({"profile":profiles}),
+            json!({"profile":{"ci":{"package":packages}}}),
+            json!({"profile":{"ci":{"package":{"":{}}}}}),
+            json!({"profile":{"ci":{"package":{"x".repeat(257):{}}}}}),
+            json!({"profile":{"ci":{"package":{"a\nb":{}}}}}),
+        ] {
+            let value = toml::Value::try_from(value).unwrap();
+            assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+        }
+    }
+
+    #[test]
+    fn captured_codegen_accepts_bounded_cpu_features_and_scalar_platform_settings() {
+        for value in [
+            "target-cpu=generic",
+            "target-cpu=native",
+            "target-cpu=x86-64-v3",
+            "target-cpu=cortex-a76",
+            "target-feature=+sse4.2,-avx2,+crt-static",
+            "target-feature=+neon,-neon,+neon",
+            "code-model=small",
+            "code-model=large",
+            "relocation-model=pic",
+            "relocation-model=static",
+            "relocation-model=default",
+            "split-debuginfo=packed",
+            "split-debuginfo=unpacked",
+            "split-debuginfo=off",
+            "force-unwind-tables=yes",
+            "force-unwind-tables=false",
+        ] {
+            let flags = toml::Value::Array(vec!["-C".into(), value.into()]);
+            validate_compiler_flags(&flags).unwrap();
+        }
+        for value in [
+            "target-cpu=",
+            "target-cpu=/outside",
+            "target-cpu=../outside",
+            "target-cpu=@response",
+            "target-cpu=x86;command",
+            "target-cpu=x86 native",
+            "target-feature=",
+            "target-feature=sse4.2",
+            "target-feature=+",
+            "target-feature=+sse4.2,",
+            "target-feature=,+sse4.2",
+            "target-feature=++neon",
+            "target-feature=+avx2,-@outside",
+            "target-feature=+avx2,-feature/value",
+            "code-model=outside",
+            "relocation-model=/outside",
+            "split-debuginfo=yes",
+            "force-unwind-tables=1",
+        ] {
+            let flags = toml::Value::Array(vec!["-C".into(), value.into()]);
+            assert!(validate_compiler_flags(&flags).is_err(), "{value}");
+        }
+        for value in [
+            format!("target-cpu={}", "x".repeat(129)),
+            format!("target-feature=+{}", "x".repeat(129)),
+            format!("target-feature={}", vec!["+neon"; 129].join(",")),
+        ] {
+            assert!(validate_scalar_codegen(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn captured_environment_preserves_cargo_defaults_force_and_relative_values() {
+        let value: toml::Value = toml::from_str(
+            r#"
+                [env]
+                APP_VERSION = "1.2.3"
+                EMPTY = ""
+                LABEL = { value = "two words\n雪", force = true }
+                DEFAULT = { value = "fallback", force = false, relative = false }
+                ASSET = { value = "../shared/data.txt", relative = true }
+                ROOT = { value = "", relative = true }
+            "#,
+        )
+        .unwrap();
+        let original = value.clone();
+        for vendor in [false, true] {
+            validate_cargo_config(&value, Path::new("app"), vendor).unwrap();
+        }
+        assert_eq!(
+            value, original,
+            "Cargo must receive the original config bytes"
+        );
+        assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+    }
+
+    #[test]
+    fn captured_environment_cannot_escape_its_config_origin_or_override_controls() {
+        for path in [
+            "../outside",
+            "a/../../outside",
+            "/outside",
+            "C:/outside",
+            "a\\b",
+            "a\n",
+        ] {
+            let value = toml::Value::try_from(json!({
+                "env": {"APP_PATH": {"value":path,"relative":true}}
+            }))
+            .unwrap();
+            assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "MAKEFLAGS",
+            "MFLAGS",
+            "NUM_JOBS",
+            "CARGO",
+            "RUSTC",
+            "RUSTDOC",
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "GLIBC_TUNABLES",
+            "CARGO_TARGET_DIR",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTUP_HOME",
+            "RUSTC_WRAPPER",
+            "RUSTDOCFLAGS",
+            "CLIPPY_ARGS",
+            "RABS_BUILD_DEPTH",
+            "RCH_BYPASS",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_SSH_COMMAND",
+        ] {
+            for setting in [
+                json!("private-value-must-not-appear"),
+                json!({"value":"private-value-must-not-appear","force":true}),
+            ] {
+                let value = toml::Value::try_from(json!({"env":{name:setting}})).unwrap();
+                let error = validate_cargo_config(&value, Path::new(""), false).unwrap_err();
+                assert!(!error.to_string().contains("private-value-must-not-appear"));
+            }
+        }
+    }
+
+    #[test]
+    fn captured_environment_rejects_malformed_or_unbounded_values() {
+        for text in [
+            "env='bad'",
+            "[env]\nAPP=3",
+            "[env]\nAPP={force=true}",
+            "[env]\nAPP={value=3}",
+            "[env]\nAPP={value='ok',force='true'}",
+            "[env]\nAPP={value='ok',relative=1}",
+            "[env]\nAPP={value='ok',unknown=true}",
+            "[env]\n'bad-name'='ok'",
+            "[env]\n'1APP'='ok'",
+            "[env]\n''='ok'",
+            "[env]\nAPP='\u{0}'",
+        ] {
+            // TOML itself rejects NUL; the native environment validator also
+            // rejects it when a typed value is constructed directly below.
+            if let Ok(value) = toml::from_str(text) {
+                assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+            }
+        }
+        for entries in [
+            json!({"APP":"\u{0}"}),
+            json!({"APP":"x".repeat(64 * 1024 + 1)}),
+            json!({"ONE":"x".repeat(64 * 1024),"TWO":"y".repeat(64 * 1024)}),
+            json!({"APP":{"value":"x".repeat(4096),"relative":true}}),
+            json!({"x".repeat(257):"value"}),
+        ] {
+            let value = toml::Value::try_from(json!({"env":entries})).unwrap();
+            assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+        }
+        let entries: std::collections::BTreeMap<_, _> = (0..257)
+            .map(|index| (format!("APP_{index}"), "value"))
+            .collect();
+        let value = toml::Value::try_from(json!({"env":entries})).unwrap();
+        assert!(validate_cargo_config(&value, Path::new(""), false).is_err());
+    }
+
+    #[test]
+    fn compiler_flag_strings_follow_cargo_whitespace_not_shell_quoting() {
+        let value = toml::Value::String("--cfg 'label=two words'".into());
+        assert_eq!(
+            compiler_flag_arguments(&value).unwrap(),
+            ["--cfg", "'label=two", "words'"]
+        );
+        assert!(validate_compiler_flags(&value).is_err());
+        let value = toml::Value::Array(vec![
+            toml::Value::String("--cfg".into()),
+            toml::Value::String("label=\"two words\"".into()),
+        ]);
+        validate_compiler_flags(&value).unwrap();
+        assert_eq!(
+            compiler_flag_arguments(&value).unwrap()[1],
+            "label=\"two words\""
+        );
+    }
+
+    #[test]
+    fn captured_config_cannot_replace_tools_inputs_outputs_or_execution_policy() {
+        for text in [
+            "[build]\nrustc='outside-rustc'",
+            "[build]\nrustc-wrapper='outside-wrapper'",
+            "[build]\nrustc-workspace-wrapper='outside-wrapper'",
+            "[build]\nrustdoc='outside-rustdoc'",
+            "[build]\ntarget-dir='../outside'",
+            "[build]\nbuild-dir='../outside'",
+            "[build]\ntarget='../outside.json'",
+            "[build]\njobs=999",
+            "[build]\nincremental=true",
+            "[env]\nRUSTC_WRAPPER={value='outside',force=true}",
+            "[alias]\nbuild='!outside'",
+            "[unstable]\nbuild-std=true",
+            "[source.crates-io]\nreplace-with='outside'",
+            "[registries.other]\nindex='file:///outside'",
+            "[target.x86_64-unknown-linux-gnu]\nlinker='outside-linker'",
+            "[target.'cfg(unix)']\nrunner=['outside-runner']",
+            "[target.x86_64-unknown-linux-gnu.native]\nrustc-link-search=['/outside']",
+            "[target.'../outside.json']\nrustflags=['-Dwarnings']",
+            "[llvm-cov]\nunknown-command='outside'",
+        ] {
+            let value: toml::Value = toml::from_str(text).unwrap();
+            assert!(
+                validate_cargo_config(&value, Path::new(""), false).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_flags_refuse_path_effects_response_files_and_unmodeled_modes() {
+        for flags in [
+            vec!["@/outside/flags"],
+            vec!["--sysroot", "/outside"],
+            vec!["-L", "native=/outside"],
+            vec!["--extern=dep=/outside/libdep.rmeta"],
+            vec!["--out-dir=/outside"],
+            vec!["--emit=metadata=/outside/result"],
+            vec!["--error-format=human"],
+            vec!["-Clinker=/outside/linker"],
+            vec!["-Clink-arg=@/outside/response"],
+            vec!["-Cincremental=/outside"],
+            vec!["-Csave-temps=yes"],
+            vec!["-Cextra-filename=owned"],
+            vec!["-Cllvm-args=-load=/outside/plugin.so"],
+            vec!["-Zcodegen-backend=/outside/backend.so"],
+            vec!["-Zunstable-options"],
+            vec!["-Zthreads"],
+            vec!["-Zthreads=0"],
+            vec!["-Zthreads=4097"],
+            vec!["-Zthreads=4294967296"],
+            vec!["--cfg", "--sysroot=/outside"],
+            vec!["-C"],
+            vec!["-D", "@/outside"],
+            vec!["--cfg", "contains\nnewline"],
+            vec!["--unknown=value"],
+        ] {
+            let value = toml::Value::Array(flags.iter().map(|flag| (*flag).into()).collect());
+            assert!(validate_compiler_flags(&value).is_err(), "{flags:?}");
+        }
+        for flags in [
+            vec!["-g", "-O", "-Coverflow-checks=yes", "-Cdebug-assertions=no"],
+            vec!["-C", "codegen-units=1", "--codegen=embed-bitcode=false"],
+            vec![
+                "-Cdebuginfo=line-tables-only",
+                "-Cstrip=symbols",
+                "-Clto=thin",
+            ],
+            vec!["-Adead_code", "--warn=clippy::all", "-F", "unsafe-code"],
+        ] {
+            let value = toml::Value::Array(flags.iter().map(|flag| (*flag).into()).collect());
+            validate_compiler_flags(&value).unwrap();
+        }
+    }
+
+    #[test]
+    fn captured_config_rejects_wrong_types_and_excessive_flag_payloads() {
+        for text in [
+            "build='bad'",
+            "[build]\nrustflags=7",
+            "[build]\nrustflags=['--cfg',true]",
+            "[target]\nx86_64-unknown-linux-gnu='bad'",
+            "[llvm-cov]\nexclude='not-an-array'",
+            "[llvm-cov]\nexclude=[42]",
+        ] {
+            assert!(
+                validate_cargo_config(&toml::from_str(text).unwrap(), Path::new(""), false)
+                    .is_err(),
+                "{text}"
+            );
+        }
+        for value in [
+            toml::Value::String(" ".repeat(16 * 1024 + 1)),
+            toml::Value::Array(vec![toml::Value::String("-g".into()); 257]),
+            toml::Value::Array(vec![toml::Value::String("--cfg=long".repeat(4096))]),
+        ] {
+            assert!(validate_compiler_flags(&value).is_err());
+        }
+    }
+
+    #[test]
     fn declaration_and_manifest_paths_cannot_escape_the_approved_anchor() {
         for manifest in [
             "/Cargo.toml",
@@ -847,7 +1972,7 @@ mod tests {
             1024,
         )
         .unwrap();
-        let files = validate_capture(&image, "Cargo.toml", None).unwrap();
+        let files = validate_capture(&image, "Cargo.toml", None, false).unwrap();
         let copy = tempfile::tempdir().unwrap();
         image.materialize_into(&copy.path().join("image")).unwrap();
         let root = copy.path().join("image/workspace");
@@ -903,13 +2028,6 @@ mod tests {
             bounded_command(valid, scratch.path(), Duration::from_secs(5), 1024).unwrap(),
             b"bounded"
         );
-    }
-
-    #[test]
-    fn unresolved_cargo_plans_are_refused_before_execution_or_resume() {
-        let request = json!({"cargo_source":{"manifest":"Cargo.toml"}});
-        let error = super::super::super::request_manifest(&request).unwrap_err();
-        assert!(error.to_string().contains("--worker-prepare"));
     }
 
     #[test]

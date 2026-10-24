@@ -21,7 +21,8 @@ use super::command_parsing::{
 };
 use super::daemon_ipc::{
     DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS, DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS,
-    daemon_response_timeout_for, queue_when_busy_enabled_from, urlencoding_encode,
+    DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS, daemon_response_timeout_for,
+    queue_when_busy_enabled_from, urlencoding_encode,
 };
 use super::dependency_closure::{
     DEPENDENCY_PREFLIGHT_CODE_MISSING, DEPENDENCY_PREFLIGHT_CODE_STALE,
@@ -34,6 +35,7 @@ use super::dependency_closure::{
     parse_dependency_preflight_probe_output, synced_dependency_preflight_checks,
     verify_remote_dependency_manifests,
 };
+use super::fallback_selection::WorkerCapacitySnapshot;
 use super::progress_reporting::BuildHeartbeatLoop;
 use super::repo_updater::{
     auto_tune_repo_updater_contract, build_repo_sync_idempotency_key_for_command,
@@ -1315,6 +1317,15 @@ impl CanonicalTempDir {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    /// A test that points the process cwd here must leave the directory in
+    /// place: a child process another test spawns meanwhile inherits that
+    /// cwd, and once the directory is gone rsync fails with "getcwd(): No
+    /// such file or directory" (the recovery-staging flake in the 2.1.30 and
+    /// 2.1.32 gates).
+    fn keep_after_test(&mut self) {
+        self._dir.disable_cleanup(true);
+    }
 }
 
 /// Create a platform-portable tempdir and a matching `PathTopologyPolicy`
@@ -1613,6 +1624,41 @@ fn test_parse_test_threads_variants() {
 }
 
 #[test]
+fn test_go_classification_drives_reservations_and_test_kind() {
+    let _guard = test_guard!();
+    let config = rch_common::CompilationConfig {
+        build_slots: 12,
+        test_slots: 8,
+        check_slots: 4,
+        ..Default::default()
+    };
+    for (verb, kind, default, is_test) in [
+        // Go builds offload only with an explicit output file (go_build_output).
+        ("build -o bin/app", CompilationKind::GoBuild, 12, false),
+        ("test", CompilationKind::GoTest, 8, true),
+        ("vet", CompilationKind::GoVet, 4, false),
+    ] {
+        if kind == CompilationKind::GoBuild && !cfg!(unix) {
+            continue;
+        }
+        for (command, expected) in [
+            (format!("go {verb} ./..."), default),
+            (format!("go {verb} -p 2 ./..."), 2),
+        ] {
+            let classification = classify_command(&command);
+            assert!(classification.is_compilation, "{command}");
+            assert_eq!(classification.kind, Some(kind), "{command}");
+            assert_eq!(is_test_kind(classification.kind), is_test, "{command}");
+            assert_eq!(
+                estimate_cores_for_command(classification.kind, &command, &config),
+                expected,
+                "{command}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_estimate_cores_for_command() {
     let _guard = test_guard!();
     let config = rch_common::CompilationConfig {
@@ -1687,6 +1733,204 @@ fn test_estimate_cores_for_command() {
 // =========================================================================
 // Classification + threshold interaction tests
 // =========================================================================
+
+#[test]
+fn test_cargo_xwin_quoted_options_preserve_classification_and_admission() {
+    use rch_common::admit_preflight::{preflight, required_os_for_command};
+    use rch_common::patterns::cargo_xwin_compilation_kind;
+
+    let _guard = test_guard!();
+    for (subcommand, kind, family) in [
+        ("build", CompilationKind::CargoBuild, "cargo_build"),
+        ("check", CompilationKind::CargoCheck, "cargo_check"),
+        ("clippy", CompilationKind::CargoClippy, "cargo_clippy"),
+    ] {
+        for (prefix, toolchain) in [
+            (vec!["cargo", "--config=build.jobs=2", "xwin"], None),
+            (
+                vec![
+                    "cargo",
+                    "+nightly-2026-08-31",
+                    "--config=build.jobs=2",
+                    "xwin",
+                ],
+                Some("nightly-2026-08-31"),
+            ),
+            (vec!["cargo-xwin"], None),
+            (vec!["cargo-xwin", "xwin"], None),
+            (
+                vec![
+                    "env",
+                    "RCH_XWIN_NOTE=placeholder --target=aarch64-apple-darwin",
+                    "cargo",
+                    "--config=build.jobs=2",
+                    "xwin",
+                ],
+                None,
+            ),
+        ] {
+            for (target, expected_os) in [
+                ("x86_64-pc-windows-msvc", None),
+                ("aarch64-pc-windows-msvc", None),
+                ("aarch64-apple-darwin", Some("darwin")),
+            ] {
+                let target_argument = format!("--target={target}");
+                let mut argv = prefix.clone();
+                argv.extend([
+                    subcommand,
+                    "--config=build.jobs=2",
+                    "--locked",
+                    "--all-targets",
+                    target_argument.as_str(),
+                ]);
+                if subcommand == "clippy" {
+                    argv.extend(["--", "-D", "warnings"]);
+                }
+                let command = shell_words::join(&argv);
+                assert!(command.contains("'--config=build.jobs=2'"), "{command}");
+                assert!(
+                    command.contains(&format!("'{target_argument}'")),
+                    "{command}"
+                );
+                assert_eq!(
+                    cargo_xwin_compilation_kind(&command),
+                    Some(kind),
+                    "{command}"
+                );
+                let classification = classify_command(&command);
+                assert!(classification.is_compilation, "{command}");
+                assert_eq!(classification.kind, Some(kind), "{command}");
+
+                let result = preflight(&command, true);
+                let expected_toolchains: Vec<String> = toolchain
+                    .into_iter()
+                    .map(|value| value.to_string())
+                    .collect();
+                assert!(result.is_compilation, "{command}");
+                assert_eq!(result.family.as_deref(), Some(family), "{command}");
+                assert!(result.required.needs_cargo, "{command}");
+                assert_eq!(
+                    result.required.needs_targets,
+                    vec![target.to_string()],
+                    "{command}"
+                );
+                assert_eq!(
+                    result.required.needs_toolchains, expected_toolchains,
+                    "{command}"
+                );
+                assert_eq!(
+                    result.required.needs_os.as_deref(),
+                    expected_os,
+                    "{command}"
+                );
+                assert_eq!(
+                    required_os_for_command(&command).as_deref(),
+                    expected_os,
+                    "{command}"
+                );
+                let requirement = result.required.to_requirement(1);
+                assert!(requirement.needs_cargo, "{command}");
+                assert_eq!(
+                    requirement.needs_targets, result.required.needs_targets,
+                    "{command}"
+                );
+                assert_eq!(
+                    requirement.needs_toolchains, result.required.needs_toolchains,
+                    "{command}"
+                );
+                assert_eq!(requirement.needs_os.as_deref(), expected_os, "{command}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cargo_xwin_quoted_mentions_and_nonliteral_options_do_not_authorize_offload() {
+    use rch_common::admit_preflight::{preflight, required_os_for_command};
+    use rch_common::patterns::cargo_xwin_compilation_kind;
+
+    let _guard = test_guard!();
+    for (subcommand, kind) in [
+        ("build", CompilationKind::CargoBuild),
+        ("check", CompilationKind::CargoCheck),
+        ("clippy", CompilationKind::CargoClippy),
+    ] {
+        for argv in [
+            vec![
+                "cargo",
+                "--config=xwin",
+                subcommand,
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+            vec![
+                "cargo",
+                "--config",
+                "xwin",
+                subcommand,
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+            vec![
+                "cargo",
+                subcommand,
+                "--manifest-path",
+                "cargo xwin check",
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+        ] {
+            let command = shell_words::join(&argv);
+            assert_eq!(cargo_xwin_compilation_kind(&command), None, "{command}");
+            assert_eq!(classify_command(&command).kind, Some(kind), "{command}");
+            assert_eq!(
+                preflight(&command, true).required.needs_os.as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+            assert_eq!(
+                required_os_for_command(&command).as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+        }
+    }
+    for command in [
+        "cargo 'xwin' check '--target=x86_64-pc-windows-msvc'",
+        "cargo xwin 'check' '--target=x86_64-pc-windows-msvc'",
+        "cargo-xwin 'xwin' clippy '--target=x86_64-pc-windows-msvc'",
+        "cargo-xwin 'clippy' '--target=x86_64-pc-windows-msvc'",
+        "'cargo-xwin' check '--target=x86_64-pc-windows-msvc'",
+        "cargo xwin check '--help'",
+        "cargo xwin check --config='build.jobs=2'",
+    ] {
+        assert_eq!(cargo_xwin_compilation_kind(command), None, "{command}");
+        assert!(!classify_command(command).is_compilation, "{command}");
+    }
+    for value in [
+        "two words",
+        "a\"b",
+        "a'b",
+        r"a\b",
+        "$value",
+        "`value`",
+        "a;b",
+        "a|b",
+        "a&b",
+        "<value>",
+        "(value)",
+        "{a,b}",
+        "*",
+        "[value]",
+        "#value",
+        "~value",
+    ] {
+        let option = format!("--config={value}");
+        let command = shell_words::join(["cargo", "xwin", "check", option.as_str()]);
+        assert_eq!(cargo_xwin_compilation_kind(&command), None, "{command}");
+        assert!(!classify_command(&command).is_compilation, "{command}");
+    }
+}
 
 #[test]
 fn test_classification_confidence_levels() {
@@ -1877,7 +2121,7 @@ fn test_extract_project_name_honors_custom_policy() {
     if let Some(prev) = prev_cwd {
         let _ = std::env::set_current_dir(prev);
     }
-    let _ = fs::remove_dir_all(&tmp);
+    // Leave `tmp` in place: see `CanonicalTempDir::keep_after_test`.
 
     // The project name must be based on the configured root's subdir,
     // and crucially must not equal "unknown" (the fallback when
@@ -1923,6 +2167,8 @@ fn test_selected_worker_to_config() {
         slots_available: 8,
         speed_score: 75.5,
         declared_os: None,
+        project_lane: 0,
+        disk_budget: None,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -2053,6 +2299,68 @@ fn test_selected_worker_must_belong_to_requested_set() {
     ));
 }
 
+#[test]
+fn exact_exec_worker_overrides_preferences_and_retries_cannot_escape() {
+    let _guard = test_guard!();
+    let inherited = vec![
+        WorkerId::new("project-worker"),
+        WorkerId::new("environment-worker"),
+    ];
+    let mut inherited_reads = 0;
+    let pinned = exec_worker_preferences(Some(WorkerId::new("native-worker")), || {
+        inherited_reads += 1;
+        inherited.clone()
+    });
+    assert_eq!(
+        inherited_reads, 0,
+        "an explicit pin must not read merged preferences"
+    );
+    assert_eq!(pinned, vec![WorkerId::new("native-worker")]);
+    assert!(selected_worker_is_requested(
+        &WorkerId::new("native-worker"),
+        &pinned
+    ));
+    assert!(!selected_worker_is_requested(
+        &WorkerId::new("project-worker"),
+        &pinned
+    ));
+    assert!(!selected_worker_is_requested(
+        &WorkerId::new("environment-worker"),
+        &pinned
+    ));
+    assert_eq!(
+        exec_worker_preferences(None, || inherited.clone()),
+        inherited
+    );
+    // The same original singleton feeds the capacity retry picker. These are
+    // policy inputs, not a live worker/reservation or compilation receipt.
+    let snapshots = vec![
+        WorkerCapacitySnapshot {
+            id: WorkerId::new("project-worker"),
+            healthy: true,
+            pressure_critical: false,
+            free_slots: 64,
+            total_slots: 64,
+            speed_score: 100.0,
+            memory_pressure: None,
+        },
+        WorkerCapacitySnapshot {
+            id: WorkerId::new("native-worker"),
+            healthy: true,
+            pressure_critical: false,
+            free_slots: 4,
+            total_slots: 4,
+            speed_score: 50.0,
+            memory_pressure: None,
+        },
+    ];
+    assert_eq!(
+        pick_bigger_worker(&snapshots, &[], &pinned),
+        Some(WorkerId::new("native-worker"))
+    );
+    assert!(pick_bigger_worker(&snapshots, &[WorkerId::new("native-worker")], &pinned).is_none());
+}
+
 // =========================================================================
 // Mock daemon socket tests
 // =========================================================================
@@ -2086,6 +2394,8 @@ async fn test_daemon_query_missing_socket() {
 fn queued_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
     let writer = DurableLeaseWriter {
         path,
+        #[cfg(unix)]
+        recovery_ownership: None,
         lease: Arc::new(std::sync::Mutex::new(DurableJobLease::new(
             JobIdentity::new_local(),
             std::process::id(),
@@ -2101,6 +2411,297 @@ fn queued_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
     writer
 }
 
+#[test]
+fn compiler_admission_reference_binds_one_durable_attempt_without_rounding() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let journal = retained.join("lease.json");
+    let writer = queued_selection_test_lease(journal.clone());
+    let wrapper = writer.wrapper_id();
+    let worker = WorkerId::new("attempt-worker-fixture");
+    let build = 9_007_199_254_740_993_u64;
+    let before = std::fs::read(&journal).unwrap();
+    for invalid_build in [0, 1_u64 << 63, u64::MAX] {
+        assert!(writer.admit(invalid_build, &worker).is_err());
+        assert!(
+            writer
+                .admission_reference(&wrapper, invalid_build, &worker)
+                .is_err()
+        );
+    }
+    for invalid_worker in ["", " \t"] {
+        assert!(writer.admit(build, &WorkerId::new(invalid_worker)).is_err());
+    }
+    assert_eq!(std::fs::read(&journal).unwrap(), before);
+    assert_eq!(
+        absolute_lease_path(PathBuf::from("relative-journal.json")).unwrap(),
+        std::env::current_dir()
+            .unwrap()
+            .join("relative-journal.json")
+    );
+    assert_eq!(absolute_lease_path(journal.clone()).unwrap(), journal);
+    assert!(
+        writer
+            .admission_reference(&wrapper, build, &worker)
+            .is_err()
+    );
+    writer.admit(build, &worker).unwrap();
+    let reference = writer
+        .admission_reference(&wrapper, build, &worker)
+        .unwrap();
+    let value = serde_json::to_value(&reference).unwrap();
+    assert_eq!(value["remote_build_id"], "9007199254740993");
+    assert_eq!(value["local_wrapper_id"], wrapper);
+    assert_eq!(value["worker_id"], worker.as_str());
+    assert_eq!(value["journal_path"], journal.to_str().unwrap());
+    assert_eq!(value["terminal_acknowledged"], false);
+    let persisted: DurableJobLease =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(persisted.identity.remote_build_id, Some(build));
+    assert_eq!(persisted.worker_id.as_deref(), Some(worker.as_str()));
+    assert!(
+        writer
+            .admission_reference("other-wrapper", build, &worker)
+            .is_err()
+    );
+    assert!(
+        writer
+            .admission_reference(&wrapper, build + 1, &worker)
+            .is_err()
+    );
+    assert!(
+        writer
+            .admission_reference(&wrapper, build, &WorkerId::new("other-worker"))
+            .is_err()
+    );
+    writer.record_exit(0).unwrap();
+    let intent = writer.begin_retry_selection(true).unwrap();
+    assert!(
+        writer
+            .admission_reference(&wrapper, build, &worker)
+            .is_err()
+    );
+    writer.restore_after_unadmitted_retry(intent).unwrap();
+    assert!(
+        !writer
+            .admission_reference(&wrapper, build, &worker)
+            .unwrap()
+            .terminal_acknowledged
+    );
+    assert!(
+        writer
+            .admission_reference(&wrapper, build + 1, &worker)
+            .is_err()
+    );
+    writer.acknowledge_terminal().unwrap();
+    assert!(
+        writer
+            .admission_reference(&wrapper, build, &worker)
+            .unwrap()
+            .terminal_acknowledged
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut invalid_path = writer.clone();
+        invalid_path.path = retained.join(std::ffi::OsString::from_vec(vec![0xff]));
+        assert!(
+            invalid_path
+                .admission_reference(&wrapper, build, &worker)
+                .is_err()
+        );
+    }
+    // Real retained journal I/O with supplied fixture identity, not a live
+    // worker, SDK, reservation or compilation proof.
+    assert!(journal.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+#[cfg_attr(target_vendor = "apple", allow(unused_imports, unused_variables))]
+fn recovery_journal_reader_keeps_large_receipts_and_rejects_redirected_entries() {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let journal = retained.join("valid.json");
+    let writer = queued_selection_test_lease(journal.clone());
+    writer
+        .set_recovery(serde_json::json!({"retained_fixture": "x".repeat(2 * 1024 * 1024)}))
+        .unwrap();
+    let original = std::fs::read(&journal).unwrap();
+    let wrapper = writer.wrapper_id();
+    let read = DurableLeaseWriter::read_journal(&journal, &wrapper).unwrap();
+    assert_eq!(read, writer.snapshot());
+    assert!(DurableLeaseWriter::read_journal(&journal, "different-wrapper").is_err());
+    let link = retained.join("linked.json");
+    std::os::unix::fs::symlink(&journal, &link).unwrap();
+    assert!(DurableLeaseWriter::read_journal(&link, &wrapper).is_err());
+    let linked_directory = retained.join("linked-directory");
+    std::os::unix::fs::symlink(&retained, &linked_directory).unwrap();
+    assert!(
+        DurableLeaseWriter::read_journal(&linked_directory.join("valid.json"), &wrapper).is_err()
+    );
+    let wrong_schema = retained.join("wrong-schema.json");
+    let mut changed = read;
+    changed.schema_version = 2;
+    std::fs::write(&wrong_schema, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(DurableLeaseWriter::read_journal(&wrong_schema, &wrapper).is_err());
+    let directory =
+        rustix::fs::open(&retained, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+    #[cfg(not(target_vendor = "apple"))]
+    rustix::fs::mkfifoat(directory.as_fd(), c"fifo.json", Mode::RUSR | Mode::WUSR).unwrap();
+    let fifo = retained.join("fifo.json");
+    // rustix has no mkfifoat on Apple targets and this crate forbids unsafe
+    // code, so make the FIFO by path; `directory` is open on `retained`.
+    #[cfg(target_vendor = "apple")]
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let fifo_read = fifo.clone();
+    let reader = std::thread::spawn(move || {
+        sender
+            .send(DurableLeaseWriter::read_journal(&fifo_read, &wrapper))
+            .unwrap();
+    });
+    let error = receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("recovery journal read blocked on a FIFO with no writer")
+        .unwrap_err();
+    reader.join().unwrap();
+    assert!(format!("{error:#}").contains("journal is not a regular file"));
+    assert!(
+        std::fs::symlink_metadata(fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert_eq!(std::fs::read(&journal).unwrap(), original);
+    assert_eq!(std::fs::read_link(link).unwrap(), journal);
+    // Actual retained file I/O and supplied journal identity only; no daemon,
+    // owner takeover, compiler execution, SDK or native qualification.
+}
+
+#[test]
+fn terminal_job_report_uses_one_current_admission_and_observed_exit() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("job.json"));
+    let wrapper = writer.wrapper_id();
+    assert!(
+        writer
+            .terminal_job_report(&wrapper, "completed", None)
+            .is_err()
+    );
+    let build = 9_007_199_254_740_993_u64;
+    let worker = WorkerId::new("recovery-worker-fixture");
+    writer.admit(build, &worker).unwrap();
+    writer.record_exit(102).unwrap();
+    assert!(
+        writer
+            .terminal_job_report(&wrapper, "recovered", Some(102))
+            .is_err()
+    );
+    writer.acknowledge_terminal().unwrap();
+    let report = writer
+        .terminal_job_report(&wrapper, "recovered", Some(102))
+        .unwrap();
+    assert_eq!(report["identity"]["remote_build_id"], build);
+    assert_eq!(report["admission"]["remote_build_id"], "9007199254740993");
+    assert_eq!(report["admission"]["worker_id"], worker.as_str());
+    assert_eq!(report["admission"]["terminal_acknowledged"], true);
+    assert_eq!(report["exit_code"], 102);
+    assert_eq!(
+        report["admission"]["local_wrapper_id"],
+        report["identity"]["local_wrapper_id"]
+    );
+    assert!(
+        writer
+            .terminal_job_report(&wrapper, "recovered", Some(0))
+            .is_err()
+    );
+    assert!(
+        writer
+            .terminal_job_report("other-wrapper", "completed", None)
+            .is_err()
+    );
+    assert!(
+        writer
+            .terminal_job_report(&wrapper, "active", None)
+            .is_err()
+    );
+    let unadmitted = queued_selection_test_lease(retained.join("unadmitted.json"));
+    let unadmitted_wrapper = unadmitted.wrapper_id();
+    unadmitted.record_exit(EXIT_BUILD_ERROR).unwrap();
+    unadmitted.acknowledge_terminal().unwrap();
+    let no_admission = unadmitted
+        .terminal_job_report(&unadmitted_wrapper, "completed", Some(EXIT_BUILD_ERROR))
+        .unwrap();
+    assert!(no_admission["admission"].is_null());
+    assert!(no_admission["identity"]["remote_build_id"].is_null());
+    let missing_exit = queued_selection_test_lease(retained.join("missing-exit.json"));
+    let missing_bytes = std::fs::read(&missing_exit.path).unwrap();
+    assert!(missing_exit.acknowledge_terminal().is_err());
+    assert_eq!(std::fs::read(&missing_exit.path).unwrap(), missing_bytes);
+    // Retain the old malformed-journal reader negative without allowing the
+    // actual writer to create that state. This is a supplied legacy fixture.
+    let mut legacy = missing_exit.snapshot();
+    legacy.acknowledge_terminal(1);
+    let legacy_path = retained.join("legacy-unknown-exit.json");
+    std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let legacy_writer = DurableLeaseWriter {
+        lease: Arc::new(std::sync::Mutex::new(
+            DurableLeaseWriter::read_journal(&legacy_path, &legacy.identity.local_wrapper_id)
+                .unwrap(),
+        )),
+        path: legacy_path,
+        #[cfg(unix)]
+        recovery_ownership: None,
+    };
+    assert!(
+        legacy_writer
+            .terminal_job_report(&missing_exit.wrapper_id(), "completed", None)
+            .is_err()
+    );
+    for admitted in [true, false] {
+        let mut incomplete = writer.snapshot();
+        if admitted {
+            incomplete.worker_id = None;
+        } else {
+            incomplete.identity.remote_build_id = None;
+        }
+        let invalid = DurableLeaseWriter {
+            path: retained.join("incomplete-admission-fixture.json"),
+            #[cfg(unix)]
+            recovery_ownership: None,
+            lease: Arc::new(std::sync::Mutex::new(incomplete)),
+        };
+        assert!(
+            invalid
+                .terminal_job_report(&wrapper, "completed", None)
+                .is_err()
+        );
+    }
+    let original = std::fs::read(&writer.path).unwrap();
+    assert_eq!(
+        writer
+            .terminal_job_report(&wrapper, "recovered", Some(102))
+            .unwrap(),
+        report
+    );
+    assert_eq!(std::fs::read(&writer.path).unwrap(), original);
+    // Supplied fixture identity/terminal journal are not an actual reservation
+    // or replayed original ExecResultEnvelope, SDK or returned-artifact proof.
+}
+
 fn retry_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
     let writer = queued_selection_test_lease(path);
     writer.admit(41, &WorkerId::new("previous-worker")).unwrap();
@@ -2113,6 +2714,122 @@ fn retry_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
         .unwrap();
     writer.record_exit(137).unwrap();
     writer
+}
+
+#[test]
+fn terminal_acknowledgement_requires_an_observed_result_and_preserves_its_final_value() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for exit in [0, EXIT_BUILD_ERROR, 102, 130] {
+        let writer = queued_selection_test_lease(retained.join(format!("exit-{exit}.json")));
+        let pending = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        assert!(writer.acknowledge_terminal().is_err());
+        assert_eq!(writer.snapshot(), pending);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        writer.record_exit(exit).unwrap();
+        writer.acknowledge_terminal().unwrap();
+        let terminal = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        assert!(terminal.terminal_acknowledged);
+        assert_eq!(terminal.exit_code, Some(exit));
+        writer.record_exit(exit).unwrap();
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        assert!(writer.record_exit(exit + 1).is_err());
+        assert_eq!(writer.snapshot(), terminal);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    }
+    // Actual retained writer I/O with supplied result values, no daemon,
+    // compiler execution or performance/native qualification.
+}
+
+#[test]
+fn daemon_completion_cannot_replace_known_command_or_delivery_results() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("known-command.json"));
+    writer.admit(42, &WorkerId::new("worker-fixture")).unwrap();
+    writer.record_exit(102).unwrap();
+    let observed = writer.snapshot();
+    let bytes = std::fs::read(&writer.path).unwrap();
+    assert!(
+        writer
+            .acknowledge_observed_completion(&observed, 0)
+            .is_err()
+    );
+    assert_eq!(writer.snapshot(), observed);
+    assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    writer
+        .acknowledge_observed_completion(&observed, 102)
+        .unwrap();
+    assert_eq!(writer.snapshot().exit_code, Some(102));
+    assert!(writer.snapshot().terminal_acknowledged);
+
+    let delivery = queued_selection_test_lease(retained.join("known-delivery.json"));
+    delivery
+        .admit(43, &WorkerId::new("worker-fixture"))
+        .unwrap();
+    // These are explicitly distinct facts: compiler/daemon success and a
+    // failed artifact delivery. Retirement cannot make either one the other.
+    delivery
+        .set_recovery(serde_json::json!({
+            "returned": 102, "retired": true, "daemon_exit_code": 0,
+        }))
+        .unwrap();
+    let observed = delivery.snapshot();
+    let bytes = std::fs::read(&delivery.path).unwrap();
+    assert!(
+        delivery
+            .acknowledge_observed_completion(&observed, 0)
+            .is_err()
+    );
+    assert_eq!(delivery.snapshot(), observed);
+    assert_eq!(std::fs::read(&delivery.path).unwrap(), bytes);
+    delivery.record_exit(0).unwrap();
+    let wrong_result = delivery.snapshot();
+    let wrong_bytes = std::fs::read(&delivery.path).unwrap();
+    assert!(delivery.acknowledge_terminal().is_err());
+    assert_eq!(delivery.snapshot(), wrong_result);
+    assert_eq!(std::fs::read(&delivery.path).unwrap(), wrong_bytes);
+    delivery.record_exit(102).unwrap();
+    delivery.acknowledge_terminal().unwrap();
+    let terminal = delivery.snapshot();
+    assert_eq!(terminal.exit_code, Some(102));
+    assert!(terminal.terminal_acknowledged);
+    assert_eq!(terminal.recovery.unwrap()["daemon_exit_code"], 0);
+
+    let receipt = queued_selection_test_lease(retained.join("retired-receipt.json"));
+    receipt.admit(44, &WorkerId::new("worker-fixture")).unwrap();
+    receipt
+        .set_recovery(serde_json::json!({
+            "returned": 130, "retired": true, "daemon_exit_code": 0,
+        }))
+        .unwrap();
+    assert!(receipt.snapshot().exit_code.is_none());
+    receipt.acknowledge_terminal().unwrap();
+    let terminal = receipt.snapshot();
+    let disk: DurableJobLease =
+        serde_json::from_slice(&std::fs::read(&receipt.path).unwrap()).unwrap();
+    assert_eq!(disk, terminal);
+    assert_eq!(terminal.exit_code, Some(130));
+    assert!(terminal.terminal_acknowledged);
+    assert_eq!(terminal.recovery.unwrap()["daemon_exit_code"], 0);
+
+    let unfinished = queued_selection_test_lease(retained.join("unfinished-receipt.json"));
+    for recipe in [
+        serde_json::json!({"returned": 130, "retired": false}),
+        serde_json::json!({"retired": true}),
+        serde_json::json!({"returned": i64::from(i32::MAX) + 1, "retired": true}),
+    ] {
+        unfinished.set_recovery(recipe).unwrap();
+        let before = unfinished.snapshot();
+        let bytes = std::fs::read(&unfinished.path).unwrap();
+        assert!(unfinished.acknowledge_terminal().is_err());
+        assert_eq!(unfinished.snapshot(), before);
+        assert_eq!(std::fs::read(&unfinished.path).unwrap(), bytes);
+    }
+    // Supplied delivery/daemon facts test the real transactional writer only;
+    // they are not live service, source-release or SDK observations.
 }
 
 fn read_retry_lease(writer: &DurableLeaseWriter) -> DurableJobLease {
@@ -2252,6 +2969,8 @@ async fn retry_selection_selected_response_stays_pending_until_new_admission() {
                 slots_available: 4,
                 speed_score: 90.0,
                 declared_os: None,
+                project_lane: 0,
+                disk_budget: None,
             }),
             build_id: Some(42),
             reason: SelectionReason::Success,
@@ -2305,6 +3024,52 @@ async fn retry_selection_cancelled_response_requires_explicit_terminal_receipt()
     assert!(disk.identity.remote_build_id.is_none() && disk.worker_id.is_none());
     assert!(writer.heartbeat("selection_unconfirmed").is_err());
     assert_eq!(read_retry_lease(&writer), disk);
+}
+
+#[test]
+fn a_selection_refusal_retires_only_an_unadmitted_lease() {
+    use rch_common::job_identity::JobLifecycleState;
+
+    let directory = tempfile::tempdir().unwrap();
+    let writer = queued_selection_test_lease(directory.path().join("lease.json"));
+    writer.confirm_failed_before_admission().unwrap();
+    let disk = read_retry_lease(&writer);
+    assert_eq!(disk.state, JobLifecycleState::FailedBeforeAdmission);
+    assert!(disk.state.is_terminal() && disk.terminal_acknowledged);
+    assert_eq!(disk.phase, "failed_before_admission");
+    assert!(disk.exit_code.is_none(), "no remote command ran");
+    assert!(disk.identity.remote_build_id.is_none() && disk.worker_id.is_none());
+    assert!(writer.heartbeat("admission").is_err());
+    assert!(writer.confirm_failed_before_admission().is_err());
+    assert!(writer.confirm_selection_cancelled().is_err());
+    assert_eq!(read_retry_lease(&writer), disk);
+
+    let admitted = queued_selection_test_lease(directory.path().join("admitted.json"));
+    admitted
+        .admit(42, &WorkerId::new("admitted-worker"))
+        .unwrap();
+    let before = read_retry_lease(&admitted);
+    assert!(admitted.confirm_failed_before_admission().is_err());
+    assert_eq!(read_retry_lease(&admitted), before);
+}
+
+#[tokio::test]
+async fn a_refused_retry_selection_keeps_the_previous_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let response = dispatch_retry_selection(&writer, true, async || {
+        Ok(SelectionResponse {
+            reason: SelectionReason::SelectionError("queue_timeout".into()),
+            ..retry_unassigned_response()
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.worker.is_none());
+    assert!(writer.confirm_failed_before_admission().is_err());
+    assert_eq!(read_retry_lease(&writer), previous);
 }
 
 #[test]
@@ -2424,6 +3189,8 @@ async fn retry_selection_failed_intent_publication_does_not_dispatch_or_change_m
     // original journal available to establish that no state was lost.
     let blocked = DurableLeaseWriter {
         path: directory.path().to_path_buf(),
+        #[cfg(unix)]
+        recovery_ownership: None,
         lease: writer.lease.clone(),
     };
     let result = dispatch_retry_selection(&blocked, true, async || {
@@ -2484,16 +3251,25 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
     let _guard = test_guard!();
     let directory = tempfile::Builder::new()
         .prefix("rch-retry-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let socket = directory.path().join("selected.sock");
+        .tempdir()
+        .unwrap()
+        .keep();
+    let socket = directory.join("selected.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let mut config = rch_common::RchConfig::default();
-    config.general.socket_path = directory.path().join("wrong.sock").display().to_string();
+    config.general.socket_path = directory.join("wrong.sock").display().to_string();
     let _config_guard = ConfigOverrideGuard::set(config);
-    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let writer = retry_selection_test_lease(directory.join("lease.json"));
     let previous = writer.snapshot();
     let server_writer = writer.clone();
+    // A Rust admission deliberately refuses a missing caller toolchain before
+    // dispatch. Bind one explicitly so this fixture reaches the retry socket.
+    let toolchain = ToolchainInfo::new(
+        "nightly",
+        Some("2026-10-07".into()),
+        "fixture toolchain identity",
+    );
+    let server_toolchain = toolchain.clone();
     let status = serde_json::json!({
         "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-endpoint", "socket_path": socket,
             "started_at": "2026-10-07T00:00:00Z", "workers_total": 1, "workers_healthy": 1,
@@ -2505,7 +3281,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
         "stats": {"total_builds": 0, "success_count": 0, "failure_count": 0,
             "remote_count": 0, "local_count": 0, "avg_duration_ms": 0}
     });
-    let server = tokio::spawn(async move {
+    let server = async move {
         for attempt in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut output) = stream.into_split();
@@ -2517,7 +3293,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 status.to_string()
             } else {
                 assert_retry_pending(&server_writer, &previous);
-                assert!(request.starts_with("GET /select-worker/disk-budget?"));
+                assert!(request.starts_with("GET /select-verified-tools/disk-budget?"));
                 for parameter in [
                     "&cores=3",
                     "&disk_headroom_gib=12",
@@ -2536,6 +3312,9 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 assert!(
                     request.contains(&format!("&local_wrapper_id={}", server_writer.wrapper_id()))
                 );
+                let encoded_toolchain =
+                    urlencoding_encode(&serde_json::to_string(&server_toolchain).unwrap());
+                assert!(request.contains(&format!("&toolchain={encoded_toolchain}")));
                 assert!(!request.contains("&wait=1"));
                 serde_json::to_string(&SelectionResponse {
                     reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
@@ -2549,16 +3328,15 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 .unwrap();
             output.shutdown().await.unwrap();
         }
-    });
-    let response = timeout(
-        Duration::from_secs(3),
+    };
+    let client = async {
         try_retry_on_bigger_worker(
             socket.to_str().unwrap(),
             "job-project",
             3,
             12,
             "git status",
-            None,
+            Some(&toolchain),
             RequiredRuntime::Rust,
             CommandPriority::Normal,
             &[WorkerId::new("previous-worker")],
@@ -2568,13 +3346,15 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             &writer,
             true,
             &HookReporter::new(OutputVisibility::None),
-        ),
-    )
+        )
+        .await
+    };
+    let (response, ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(client, server)
+    })
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
-    server.await.unwrap();
+    let response = response.unwrap().unwrap();
     assert!(selection_cancelled_before_start(&response.0));
     assert_eq!(response.1, WorkerId::new("next-worker"));
     assert_eq!(read_retry_lease(&writer).phase, "selection_pending");
@@ -2590,23 +3370,32 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
         "HTTP/1.0 503 Unavailable\r\n\r\n{}",
         "HTTP/1.0 200 OK\r\n", // Truncated HTTP headers.
     ] {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let socket = tmp.path().join("daemon.sock");
+        let retained = tempfile::tempdir().unwrap().keep();
+        let socket = retained.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = TokioBufReader::new(reader);
-            let mut request = String::new();
-            reader.read_line(&mut request).await.unwrap();
-            writer.write_all(wire_response.as_bytes()).await.unwrap();
-            writer.shutdown().await.unwrap();
-            request
-        });
-        let lease = queued_selection_test_lease(tmp.path().join("lease.json"));
+        let resumes_lost_reply = wire_response.is_empty();
+        let server = async move {
+            let mut requests = Vec::new();
+            // A lost original reply now permits exactly one identity-preserving
+            // resume. Model an older daemon rejecting that endpoint promptly;
+            // all complete invalid replies still allow no resume at all.
+            for reply in std::iter::once(wire_response)
+                .chain(resumes_lost_reply.then_some("HTTP/1.0 404 Not Found\r\n\r\n{}"))
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = TokioBufReader::new(reader);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                writer.write_all(reply.as_bytes()).await.unwrap();
+                writer.shutdown().await.unwrap();
+                requests.push(request);
+            }
+            requests
+        };
+        let lease = queued_selection_test_lease(retained.join("lease.json"));
         let wrapper = lease.wrapper_id();
-        let error = timeout(
-            Duration::from_secs(2),
+        let client = async {
             query_daemon(
                 socket.to_str().unwrap(),
                 "queued",
@@ -2623,14 +3412,27 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
                 &[],
                 false,
                 &[],
-            ),
-        )
+            )
+            .await
+        };
+        let (result, requests) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server)
+        })
         .await
-        .unwrap()
-        .unwrap_err();
-        let request = server.await.unwrap();
+        .unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(requests.len(), if resumes_lost_reply { 2 } else { 1 });
+        let request = &requests[0];
         assert!(request.contains("&wait=1"));
         assert!(request.contains(&format!("local_wrapper_id={wrapper}")));
+        if resumes_lost_reply {
+            let query = request.strip_prefix("GET /select-worker?").unwrap();
+            assert_eq!(
+                requests[1],
+                format!("GET /select-worker/resume-queued?{query}"),
+                "resume changes only the endpoint, never identity or constraints"
+            );
+        }
         assert!(
             error
                 .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
@@ -2739,6 +3541,8 @@ async fn test_daemon_query_protocol() {
                 slots_available: 16,
                 speed_score: 95.0,
                 declared_os: None,
+                project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -2827,6 +3631,8 @@ async fn test_daemon_query_sends_preferred_workers() {
                 slots_available: 16,
                 speed_score: 95.0,
                 declared_os: None,
+                project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -2913,6 +3719,8 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
                     slots_available: 6,
                     speed_score: 90.0,
                     declared_os: None,
+                    project_lane: 0,
+                    disk_budget: None,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(42),
@@ -3016,6 +3824,8 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
                     slots_available: 6,
                     speed_score: 90.0,
                     declared_os: None,
+                    project_lane: 0,
+                    disk_budget: None,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(43),
@@ -3098,7 +3908,7 @@ async fn test_daemon_query_wait_parameters() {
     let _ = std::fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path).expect("Failed to create test socket");
-    let expected_wait_timeout_secs = daemon_response_timeout_for(true, None, None)
+    let expected_wait_timeout_secs = daemon_response_timeout_for(true, false, None, None)
         .as_secs()
         .saturating_sub(1)
         .max(1);
@@ -3131,6 +3941,8 @@ async fn test_daemon_query_wait_parameters() {
                 slots_available: 16,
                 speed_score: 95.0,
                 declared_os: None,
+                project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -3212,6 +4024,8 @@ async fn test_daemon_query_url_encoding() {
                 slots_available: 1,
                 speed_score: 1.0,
                 declared_os: None,
+                project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -3337,6 +4151,8 @@ async fn test_process_hook_remote_success_mocked() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -3417,6 +4233,8 @@ async fn test_force_local_allows_even_when_remote_available() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -3485,6 +4303,8 @@ async fn test_force_remote_bypasses_confidence_threshold() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -3672,6 +4492,8 @@ async fn test_process_hook_remote_nonzero_exit_uses_transparent_interception() {
             slots_available: 8,
             speed_score: 90.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -3723,6 +4545,8 @@ fn test_worker_config_from_selected_worker() {
         slots_available: 32,
         speed_score: 88.8,
         declared_os: None,
+        project_lane: 0,
+        disk_budget: None,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -4182,6 +5006,98 @@ fn test_exit_code_constants() {
 }
 
 #[test]
+fn cargo_profile_forwarding_binds_settings_and_preserves_shell_precedence() {
+    let environment = rch_common::types::EnvironmentConfig::default();
+    let layer0 = vec![("CARGO_PROFILE_TEST_DEBUG".to_owned(), "1".to_owned())];
+    let settings = vec![
+        ("CARGO_PROFILE_TEST_DEBUG".to_owned(), "0".to_owned()),
+        ("CARGO_INCREMENTAL".to_owned(), "0".to_owned()),
+    ];
+    for command in [
+        "cargo test --workspace",
+        "make check",
+        "./project-test-wrapper",
+    ] {
+        let bound = bind_cargo_profile_command(command, &environment, &layer0, settings.clone());
+        assert_eq!(
+            bound,
+            bind_cargo_profile_command(
+                command,
+                &environment,
+                &layer0,
+                settings.clone().into_iter().rev()
+            )
+        );
+        assert_ne!(
+            bound,
+            bind_cargo_profile_command(
+                command,
+                &environment,
+                &layer0,
+                [("CARGO_PROFILE_TEST_DEBUG".to_owned(), "2".to_owned())]
+            )
+        );
+        assert_ne!(bound, command);
+    }
+    for (command, expected) in [
+        (r#"sh -c 'printf "%s" "$CARGO_PROFILE_TEST_DEBUG"'"#, "0"),
+        (
+            r#"CARGO_PROFILE_TEST_DEBUG=2 sh -c 'printf "%s" "$CARGO_PROFILE_TEST_DEBUG"'"#,
+            "2",
+        ),
+        (
+            r#"env -u CARGO_PROFILE_TEST_DEBUG sh -c 'printf "%s" "${CARGO_PROFILE_TEST_DEBUG-unset}"'"#,
+            "unset",
+        ),
+        (
+            r#"env -i sh -c 'printf "%s" "${CARGO_PROFILE_TEST_DEBUG-unset}"'"#,
+            "unset",
+        ),
+    ] {
+        let bound = bind_cargo_profile_command(command, &environment, &layer0, settings.clone());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &bound])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{bound}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{bound}"
+        );
+    }
+    let disabled = rch_common::types::EnvironmentConfig {
+        allowlist: Vec::new(),
+        forward_cargo_profile_settings: false,
+    };
+    assert_eq!(
+        bind_cargo_profile_command("cargo test", &disabled, &[], settings.clone()),
+        "cargo test"
+    );
+    let explicit = rch_common::types::EnvironmentConfig {
+        allowlist: vec!["CARGO_PROFILE_TEST_DEBUG".to_owned()],
+        ..disabled
+    };
+    assert_eq!(
+        bind_cargo_profile_command("cargo test", &explicit, &[], settings),
+        "CARGO_PROFILE_TEST_DEBUG=0 cargo test"
+    );
+    assert_eq!(
+        bind_cargo_profile_command(
+            "cargo test",
+            &environment,
+            &[],
+            [(
+                "CARGO_PROFILE_TEST_DEBUG".to_owned(),
+                "$(touch unsafe)".to_owned()
+            )]
+        ),
+        "cargo test"
+    );
+}
+
+#[test]
 fn test_remote_pipeline_failure_policy_ssh_timeout_fails_closed() {
     let _guard = test_guard!();
     let error = anyhow::anyhow!("SSH command timed out after 1800s");
@@ -4429,12 +5345,12 @@ fn source_upload_disk_release_requires_the_selected_worker_and_confirmed_ownersh
         })
         .context("source preparation failed before remote command execution");
     let result = Err(error);
-    let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
-    assert!(worker_fault && disk_fault);
-    assert_eq!(roots, ["/source-volume/project"]);
+    let faults = remote_release_faults(&result, &worker);
+    assert!(faults.worker_fault && faults.worker_disk_full && !faults.live_checkout_refused);
+    assert_eq!(faults.worker_disk_roots, ["/source-volume/project"]);
     assert_eq!(
         remote_release_faults(&result, &WorkerId::new("other-worker")),
-        (false, false, &[] as &[String])
+        daemon_ipc::ReleaseFaults::default()
     );
     let result = result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
     assert_eq!(
@@ -4443,7 +5359,7 @@ fn source_upload_disk_release_requires_the_selected_worker_and_confirmed_ownersh
     );
     assert_eq!(
         remote_release_faults(&result, &worker),
-        (false, false, &[] as &[String])
+        daemon_ipc::ReleaseFaults::default()
     );
     assert!(is_remote_execution_unconfirmed(
         result.as_ref().unwrap_err()
@@ -4461,7 +5377,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
     .into());
     assert_eq!(
         remote_release_faults(&result, &worker),
-        (false, false, &[] as &[String])
+        daemon_ipc::ReleaseFaults::default()
     );
     // Existing remote-command evidence still follows its actual exit status.
     for exit_code in [0, 101] {
@@ -4473,11 +5389,139 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
             timing: Default::default(),
             result_dirs: Vec::new(),
             disk_roots: vec!["/build-volume/target".into()],
+            disk_peak_output_bytes: None,
+            cargo_stdout: None,
         });
-        let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
-        assert_eq!(worker_fault, exit_code != 0);
-        assert_eq!(disk_fault, exit_code != 0);
-        assert_eq!(roots, ["/build-volume/target"]);
+        let faults = remote_release_faults(&result, &worker);
+        assert_eq!(faults.worker_fault, exit_code != 0);
+        assert_eq!(faults.worker_disk_full, exit_code != 0);
+        assert_eq!(faults.worker_disk_roots, ["/build-volume/target"]);
+    }
+}
+
+#[test]
+fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
+    // bd-fbtws: the receiver guard's refusal, as rsync reports it.
+    let worker = WorkerId::new("dual-role");
+    let refusal = "RCH_SYNC_LIVE_CHECKOUT_REFUSED: /data/projects/app (live checkout); use an isolated source mirror\n\
+                   rsync: connection unexpectedly closed (0 bytes received so far) [sender]\n\
+                   rsync error: unexplained error (code 73) at io.c(232) [sender=3.4.1]\n";
+    assert!(
+        !rch_common::ssh_utils::is_retryable_transport_error_text(refusal),
+        "a deterministic refusal must not be retried as a transport drop"
+    );
+    let sync_failed = |stderr: &str| -> anyhow::Error {
+        TransferError::SyncFailed {
+            reason: "rsync failed".into(),
+            exit_code: Some(73),
+            stderr: stderr.into(),
+        }
+        .into()
+    };
+    let result = Err(sync_failed(refusal).context("source sync failed"));
+    let faults = remote_release_faults(&result, &worker);
+    assert!(faults.live_checkout_refused);
+    assert!(!faults.worker_fault && !faults.worker_disk_full);
+    // Ownership loss after the refusal still releases nothing.
+    let unconfirmed =
+        result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
+    assert!(!remote_release_faults(&unconfirmed, &worker).live_checkout_refused);
+    // The marker inside a sentence, or in a build's own output, is not a refusal.
+    let quoted = Err(sync_failed(
+        "error: saw RCH_SYNC_LIVE_CHECKOUT_REFUSED: in a log\n",
+    ));
+    assert!(!remote_release_faults(&quoted, &worker).live_checkout_refused);
+    let build = Ok(remote_result::RemoteExecutionResult {
+        deadline_triggered: false,
+        exit_code: 101,
+        stderr: refusal.into(),
+        duration_ms: 10,
+        timing: Default::default(),
+        result_dirs: Vec::new(),
+        disk_roots: Vec::new(),
+        disk_peak_output_bytes: None,
+        cargo_stdout: None,
+    });
+    assert!(!remote_release_faults(&build, &worker).live_checkout_refused);
+
+    // The pre-sync destination safety check refuses before rsync runs: the
+    // same marker must reach the release through any context layers.
+    let checked = |stderr: &str| -> anyhow::Result<remote_result::RemoteExecutionResult> {
+        Err(crate::transfer::destination_check_refusal(
+            format!(
+                "source destination safety check refused on dual-role (status Some(73)): {stderr}"
+            ),
+            stderr,
+        )
+        .context("remote execution failed"))
+    };
+    assert!(remote_release_faults(&checked(refusal), &worker).live_checkout_refused);
+    assert!(
+        !remote_release_faults(
+            &checked("error: saw RCH_SYNC_LIVE_CHECKOUT_REFUSED: in a log"),
+            &worker
+        )
+        .live_checkout_refused
+    );
+    assert!(!remote_release_faults(&checked("Permission denied"), &worker).live_checkout_refused);
+}
+
+#[test]
+fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
+    let worker = WorkerId::new("hz3");
+    for started in [false, true] {
+        for reason in ["admission", "growth", "free_floor", "monitor_unavailable"] {
+            let failure = crate::transfer::RemoteBuildDiskBudgetExceeded {
+                worker_id: worker.as_str().into(),
+                roots: vec!["/build-volume/target".into()],
+                reason: reason.into(),
+                started,
+                free_bytes: 12 * rch_common::BuildDiskBudget::GIB,
+                growth_bytes: 21 * rch_common::BuildDiskBudget::GIB,
+                max_growth_bytes: 20 * rch_common::BuildDiskBudget::GIB,
+                min_free_bytes: 13 * rch_common::BuildDiskBudget::GIB,
+                peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                detail: "guard stopped before ENOSPC".into(),
+            };
+            let error = anyhow::Error::new(failure.clone());
+            assert_eq!(
+                classify_remote_pipeline_failure(&error),
+                if started {
+                    RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+                } else {
+                    RemotePipelineFailurePolicy::AllowLocalFallback
+                }
+            );
+            assert_eq!(
+                remote_failure_exit_code(&error),
+                if started { 137 } else { 120 }
+            );
+            assert!(remote_pipeline_failure_summary(&worker, &error).contains("RCH-E330"));
+            let result = Err(error);
+            let faults = remote_release_faults(&result, &worker);
+            assert!(faults.worker_fault);
+            assert_eq!(faults.worker_disk_full, reason == "free_floor");
+            assert_eq!(faults.disk_peak_output_bytes, failure.peak_output_bytes);
+            assert_eq!(
+                remote_release_faults(&result, &WorkerId::new("other-worker")),
+                daemon_ipc::ReleaseFaults::default()
+            );
+
+            let error =
+                anyhow::Error::new(failure).context(crate::transfer::RemoteExecutionUnconfirmed);
+            assert_eq!(remote_failure_exit_code(&error), EXIT_BUILD_ERROR);
+            assert_eq!(
+                classify_remote_pipeline_failure(&error),
+                RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+            );
+            assert!(
+                remote_pipeline_failure_summary(&worker, &error).contains("completion unconfirmed")
+            );
+            assert_eq!(
+                remote_release_faults(&Err(error), &worker),
+                daemon_ipc::ReleaseFaults::default()
+            );
+        }
     }
 }
 
@@ -7192,13 +8236,16 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         slots_available: 1,
         speed_score: 1.0,
         declared_os: Some("windows".to_string()),
+        project_lane: 0,
+        disk_budget: None,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
-    let result = execute_remote_compilation(
+    let result = Box::pin(execute_remote_compilation(
         &worker,
         "cargo check",
         TransferConfig::default(),
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7216,7 +8263,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
     assert!(result.unwrap_err().to_string().contains("require the Unix"));
     let heartbeat = received_rx.try_recv().expect("heartbeat before rejection");
@@ -7298,7 +8345,8 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
     // topology policy. Pin the cwd to a tempdir and build a policy that
     // recognises it so the test runs anywhere (including CI runners with
     // no `/data/projects`).
-    let (temp_dir, policy) = topology_tempdir();
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
     let custom_target_dir_path = project_dir.join(".rch-test-target-cache");
@@ -7315,14 +8363,17 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         slots_available: 8,
         speed_score: 90.0,
         declared_os: None,
+        project_lane: 0,
+        disk_budget: None,
     };
 
     let reporter = HookReporter::new(OutputVisibility::None);
-    let result = execute_remote_compilation(
+    let result = Box::pin(execute_remote_compilation(
         &worker,
         "cargo build",
         TransferConfig::default(),
         Vec::new(),
+        true,
         Some(PathBuf::from(&custom_target_dir)),
         &rch_common::CompilationConfig::default(),
         None,
@@ -7340,7 +8391,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     // Restore cwd before any assertion so a failure doesn't poison other tests.
@@ -7408,7 +8459,8 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     let _overrides = TestOverridesGuard::set(&socket_path, MockConfig::default(), rsync_config);
     mock::clear_global_invocations();
 
-    let (temp_dir, policy) = topology_tempdir();
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
     let prev_cwd = std::env::current_dir().ok();
@@ -7421,6 +8473,8 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         slots_available: 8,
         speed_score: 90.0,
         declared_os: None,
+        project_lane: 0,
+        disk_budget: None,
     };
     let transfer_config = TransferConfig {
         sync_timeout_ms: Some(1_000),
@@ -7435,11 +8489,12 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     };
     let reporter = HookReporter::new(OutputVisibility::Summary);
 
-    let result = execute_remote_compilation(
+    let result = Box::pin(execute_remote_compilation(
         &worker,
         "cargo check",
         transfer_config,
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7457,7 +8512,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     if let Some(prev) = prev_cwd {
@@ -7492,6 +8547,166 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     );
 }
 
+/// bd-hoxgn: the pack never overrides a profile setting the project declares
+/// in its workspace root manifest or in `.cargo/config.toml` under that root.
+#[test]
+fn test_layer0_pack_respects_profile_settings_the_project_declares() {
+    let all = rch_common::types::Layer0Config {
+        enabled: true,
+        release_lto_thin: true,
+        release_codegen_units_1: true,
+        debug_line_tables_only: true,
+    };
+    let keys = |dir: &Path| -> Vec<String> {
+        layer0_env_for_lane(&all, false, Some(dir))
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    };
+    let every = [
+        "CARGO_PROFILE_RELEASE_LTO",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_TEST_DEBUG",
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let member = root.join("crates/member");
+    std::fs::create_dir_all(member.join(".cargo")).unwrap();
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\n[profile.dev]\ndebug = 2\n",
+    )
+    .unwrap();
+    // No workspace: the member is its own root, and its dev debug also
+    // covers test, which inherits dev.
+    assert_eq!(keys(&member), every[..2]);
+
+    // With a workspace root, only the root's profiles count.
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/member\"]\n[profile.test]\ndebug = 0\n",
+    )
+    .unwrap();
+    assert_eq!(keys(&member), every[..3]);
+
+    // A `.cargo/config.toml` inside the tree counts too.
+    std::fs::write(
+        member.join(".cargo/config.toml"),
+        "[profile.release]\nlto = \"fat\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        keys(&member),
+        [
+            "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+            "CARGO_PROFILE_DEV_DEBUG"
+        ]
+    );
+
+    // Nothing declared: every enabled knob applies.
+    let bare = tempfile::tempdir().unwrap();
+    assert_eq!(keys(bare.path()), every);
+    assert!(layer0_env_for_lane(&all, true, Some(bare.path())).is_empty());
+}
+
+/// bd-hoxgn: the Layer 0 pack must reach the command that actually runs. It
+/// used to be attached only to workspace-metadata roots, which never execute,
+/// so an enabled `[layer0]` changed nothing for an ordinary project.
+#[tokio::test]
+#[serial(mock_global)]
+async fn test_layer0_pack_reaches_the_executed_remote_command() {
+    let _lock = test_lock().lock().await;
+    let _guard = test_guard!();
+    let socket_path = format!(
+        "/tmp/rch_test_layer0_exec_{}_{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos()
+    );
+    let _overrides = TestOverridesGuard::set(
+        &socket_path,
+        MockConfig::default(),
+        MockRsyncConfig::success(),
+    );
+    mock::clear_global_invocations();
+
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
+    let project_dir = temp_dir.path().join("remote_compilation_helper");
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    let prev_cwd = std::env::current_dir().ok();
+    std::env::set_current_dir(&project_dir).expect("cd into project dir");
+
+    let worker = SelectedWorker {
+        id: rch_common::WorkerId::new("mock-worker"),
+        host: "mock.host.local".to_string(),
+        user: "mockuser".to_string(),
+        identity_file: "~/.ssh/mock_key".to_string(),
+        slots_available: 8,
+        speed_score: 90.0,
+        declared_os: None,
+        project_lane: 0,
+        disk_budget: None,
+    };
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let layer0 = rch_common::types::Layer0Config {
+        enabled: true,
+        debug_line_tables_only: true,
+        ..rch_common::types::Layer0Config::default()
+    };
+    assert!(layer0_env_for_lane(&layer0, true, None).is_empty());
+    let layer0_env = layer0_env_for_lane(&layer0, false, None);
+    let result = Box::pin(execute_remote_compilation(
+        &worker,
+        "cargo test",
+        TransferConfig::default(),
+        Vec::new(),
+        true,
+        None,
+        &rch_common::CompilationConfig::default(),
+        None,
+        Some(CompilationKind::CargoTest),
+        &reporter,
+        &socket_path,
+        ColorMode::Auto,
+        None,
+        None,
+        None,
+        &policy,
+        None,
+        false,
+        &[],
+        &layer0_env,
+        rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+        None,
+    ))
+    .await;
+    if let Some(prev) = prev_cwd {
+        let _ = std::env::set_current_dir(prev);
+    }
+
+    let execution = result.expect("remote execution should succeed in mock mode");
+    assert_eq!(execution.exit_code, 0);
+    let ssh_logs = mock::global_ssh_invocations_snapshot();
+    let execute_command = ssh_logs
+        .iter()
+        .find(|entry| entry.phase == mock::Phase::Execute)
+        .and_then(|entry| entry.command.as_deref())
+        .expect("execute command should be recorded");
+    for assignment in [
+        "CARGO_PROFILE_DEV_DEBUG='line-tables-only'",
+        "CARGO_PROFILE_TEST_DEBUG='line-tables-only'",
+    ] {
+        assert!(
+            execute_command.contains(assignment),
+            "expected {assignment} on the executed command, got {execute_command}"
+        );
+    }
+}
+
 /// Issue #19 Fix 1: a SUCCESSFUL remote compile whose artifacts fail to sync
 /// back must NOT report exit 0 for an artifact-producing kind — the local
 /// build is incomplete, so the hook returns a non-zero, build-failure-class
@@ -7521,7 +8736,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
     );
     mock::clear_global_invocations();
 
-    let (temp_dir, policy) = topology_tempdir();
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
 
@@ -7536,15 +8752,20 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         slots_available: 8,
         speed_score: 90.0,
         declared_os: None,
+        project_lane: 0,
+        disk_budget: None,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
 
     // Artifact-producing kind (cargo build): a failed sync-back is FATAL.
-    let build = execute_remote_compilation(
+    // Keep both large awaited compilation futures out of this test's state
+    // machine; qualification must still run with the default test-thread stack.
+    let build = Box::pin(execute_remote_compilation(
         &worker,
         "cargo build",
         TransferConfig::default(),
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7562,17 +8783,18 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     // Test kind (cargo test): output streamed, no required artifact — the
     // remote exit code (0) is preserved despite the same artifact failure.
     mock::clear_global_invocations();
-    let test_run = execute_remote_compilation(
+    let test_run = Box::pin(execute_remote_compilation(
         &worker,
         "cargo test",
         TransferConfig::default(),
         Vec::new(),
+        true,
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7590,7 +8812,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     if let Some(prev) = prev_cwd {
@@ -7861,6 +9083,8 @@ async fn test_cargo_test_remote_build_failure() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -7923,6 +9147,8 @@ async fn test_cargo_test_with_filter() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -7985,6 +9211,8 @@ async fn test_cargo_test_with_test_threads() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -8052,6 +9280,8 @@ async fn test_cargo_test_signal_killed() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -8119,6 +9349,8 @@ async fn test_cargo_test_signal_killed_with_toolchain_path_does_not_fallback_loc
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -8180,6 +9412,8 @@ async fn test_cargo_test_toolchain_fallback() {
             slots_available: 8,
             speed_score: 85.0,
             declared_os: None,
+            project_lane: 0,
+            disk_budget: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -9542,24 +10776,37 @@ fn test_queue_when_busy_enabled_parser() {
 fn test_daemon_response_timeout_defaults_and_overrides() {
     let _guard = test_guard!();
     assert_eq!(
-        daemon_response_timeout_for(false, None, None),
+        daemon_response_timeout_for(false, false, None, None),
         Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, None, None),
+        daemon_response_timeout_for(true, false, None, None),
         Duration::from_secs(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, None, Some("900")),
+        daemon_response_timeout_for(true, false, None, Some("900")),
         Duration::from_secs(900)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, Some("45"), Some("900")),
+        daemon_response_timeout_for(true, false, Some("45"), Some("900")),
         Duration::from_secs(45)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, Some("invalid"), Some("invalid")),
+        daemon_response_timeout_for(true, false, Some("invalid"), Some("invalid")),
         Duration::from_secs(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS)
+    );
+    // bd-decdd: a job waits for admission instead of timing out into a refusal.
+    assert_eq!(
+        daemon_response_timeout_for(true, true, None, None),
+        Duration::from_secs(DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS)
+    );
+    assert_eq!(
+        daemon_response_timeout_for(true, true, None, Some("900")),
+        Duration::from_secs(900)
+    );
+    assert_eq!(
+        daemon_response_timeout_for(false, true, None, None),
+        Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
     );
 }
 
@@ -9691,6 +10938,7 @@ fn test_build_socket_failure_incident_records_reason_and_mismatch() {
         "demo-project",
         "cargo build --release",
         false,
+        true,
         1_700_000_000_000,
     );
     assert_eq!(
@@ -9838,6 +11086,125 @@ fn test_local_fallback_incident_records_reason_and_redacts_command() {
 }
 
 #[test]
+fn remote_failure_local_policy_honours_require_remote_and_allow_local_fallback() {
+    // #114: the one decision every remote-failure exit in `run_exec` uses.
+    use super::RemoteFailureLocalPolicy as Policy;
+    for (require_remote, allow_local_fallback, expected) in [
+        (false, true, Policy::RunLocal),
+        (false, false, Policy::RefuseFallbackDisabled),
+        // Remote-required wins, so its typed (retryable) refusal is reported.
+        (true, true, Policy::RefuseRemoteRequired),
+        (true, false, Policy::RefuseRemoteRequired),
+    ] {
+        assert_eq!(
+            super::remote_failure_local_policy(require_remote, allow_local_fallback),
+            expected,
+            "require_remote={require_remote} allow_local_fallback={allow_local_fallback}"
+        );
+    }
+}
+
+#[test]
+fn disabled_local_fallback_refusal_incident_records_the_config_gate() {
+    // #114: a refusal by `compilation.allow_local_fallback = false` must be
+    // visible in the ledger as a refusal, not as an allowed local fallback.
+    let event = super::build_disabled_local_fallback_incident(
+        "GITHUB_TOKEN=ghp_supersecretvalue123456 cargo test -p app",
+        "dependency preflight failed: missing source_entrypoint crates/build/Cargo.toml",
+        1_700_000_000_020,
+        Some("w1: preflight evidence"),
+    );
+    assert_eq!(
+        event.reason_code,
+        rch_common::IncidentReasonCode::ProofRefusal
+    );
+    assert_eq!(event.reason_code.code(), "RCH-I012");
+    assert_eq!(event.selected_mode, rch_common::SelectedMode::Local);
+    assert!(!event.local_fallback_allowed);
+    assert_eq!(
+        event.details.get("policy").map(String::as_str),
+        Some("compilation.allow_local_fallback=false")
+    );
+    assert_eq!(
+        event.details.get("reason").map(String::as_str),
+        Some("dependency preflight failed: missing source_entrypoint crates/build/Cargo.toml")
+    );
+    assert_eq!(
+        event.details.get("error").map(String::as_str),
+        Some("w1: preflight evidence")
+    );
+    // Config gate, not proof mode / RCH_REQUIRE_REMOTE.
+    assert!(!event.control.strict_remote_policy);
+    assert!(!event.command_fingerprint.contains("supersecretvalue"));
+}
+
+#[test]
+fn socket_failure_incident_reports_local_fallback_disabled_by_config() {
+    // #114: the RCH-I010 record must not claim a local fallback is allowed
+    // when `compilation.allow_local_fallback = false` forbids it.
+    for (strict_remote, allow_local_fallback, expected) in [
+        (false, true, true),
+        (false, false, false),
+        (true, true, false),
+        (true, false, false),
+    ] {
+        let event = super::build_socket_failure_incident(
+            super::SocketFailureKind::Refused,
+            None,
+            "demo",
+            "cargo check",
+            strict_remote,
+            allow_local_fallback,
+            1_700_000_000_021,
+        );
+        assert_eq!(
+            event.local_fallback_allowed, expected,
+            "strict_remote={strict_remote} allow_local_fallback={allow_local_fallback}"
+        );
+        assert_eq!(event.control.strict_remote_policy, strict_remote);
+    }
+}
+
+#[test]
+fn run_exec_routes_every_local_exit_after_remote_placement_through_the_gate() {
+    // #114: once `run_exec` has started remote placement (the durable lease
+    // exists), any way out that could run the command on the orchestrator
+    // must go through `exit_with_gated_local_fallback`, which honours both
+    // remote-required mode and `compilation.allow_local_fallback = false`.
+    // The deliberate policy-local exits (non-compilation, config, force_local
+    // / disabled / allowlist, topology, speed gate) all precede the lease.
+    // This guards against a new remote-failure branch calling an ungated
+    // helper; the gate's own behaviour is covered by the tests above and the
+    // binary-level `rch exec` tests.
+    let source = include_str!("../hook.rs");
+    let start = source
+        .find("pub async fn run_exec(")
+        .expect("run_exec in hook.rs");
+    let body = &source[start..];
+    let end = body
+        .find("\nstruct HookReporter")
+        .expect("run_exec is followed by HookReporter");
+    let body = &body[..end];
+    let placement = body
+        .find("DurableLeaseWriter::create(")
+        .expect("run_exec creates the durable lease before selection");
+    let after_placement = &body[placement..];
+    for ungated in [
+        "exit_with_local_fallback(",
+        "exit_with_local_fallback_recording(",
+        "exit_with_local_run(",
+        "local_fallback_command(",
+        "local_fallback_command_for_policy(",
+    ] {
+        assert!(
+            !after_placement.contains(ungated),
+            "run_exec calls `{ungated}` after remote placement began; route it through exit_with_gated_local_fallback"
+        );
+    }
+    assert!(after_placement.contains("exit_with_gated_local_fallback("));
+}
+
+#[test]
 fn test_socket_failure_incident_durably_appends_to_ledger() {
     // End-to-end durable record: build the incident the hook emits, append
     // it to a temp ledger, and read it back — proving the structured
@@ -9849,6 +11216,7 @@ fn test_socket_failure_incident_durably_appends_to_ledger() {
         None,
         "demo",
         "cargo check",
+        true,
         true,
         1_700_000_000_003,
     );
@@ -10420,6 +11788,46 @@ async fn test_spawn_blocking_performance_budget() {
 }
 
 // ── Multi-root sync manifest & partial failure tests (bd-vvmd.2.3 AC5) ──
+
+#[test]
+fn test_source_intent_topology_root_has_no_trailing_separator() {
+    let _guard = test_guard!();
+    let (directory, policy) = topology_tempdir();
+    let project_root = directory.path().to_path_buf();
+    let plan = build_sync_closure_plan(
+        std::slice::from_ref(&project_root),
+        &project_root,
+        "topology-root-hash",
+        &policy,
+    );
+    assert_eq!(plan.len(), 1);
+    assert!(plan[0].is_primary);
+    assert_eq!(
+        plan[0].remote_root,
+        policy.canonical_root().to_str().unwrap()
+    );
+    let target = format!("{}/.rch-target", plan[0].remote_root);
+    assert_eq!(
+        target,
+        policy
+            .canonical_root()
+            .join(".rch-target")
+            .to_str()
+            .unwrap()
+    );
+
+    // A child still maps beneath the same root, rather than losing its suffix.
+    let child = project_root.join("nested");
+    std::fs::create_dir(&child).unwrap();
+    let child_plan = build_sync_closure_plan(
+        std::slice::from_ref(&child),
+        &child,
+        "topology-child-hash",
+        &policy,
+    );
+    assert_eq!(child_plan.len(), 1);
+    assert_eq!(child_plan[0].remote_root, child.to_str().unwrap());
+}
 
 #[test]
 fn test_build_sync_closure_manifest_deterministic_entries() {
@@ -11933,4 +13341,229 @@ async fn fast_passthrough_answers_only_what_process_hook_plainly_allows() {
         );
     }
     assert!(!super::fast_passthrough_allows("{not json"));
+}
+
+#[tokio::test]
+async fn a_finished_restart_admission_wait_hands_the_lease_back_to_admission() {
+    // After a drain the wrapper queues in the daemon without heartbeating, so
+    // the lease must not stay labelled "restart_admission_wait" (2.1.20 css
+    // rollout: 16 queued wrappers kept that phase).
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        for closed in [true, false] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut request = String::new();
+            TokioBufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert!(request.starts_with("GET /restart-admission"), "{request}");
+            writer
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\n\r\n{{\"admission_closed\":{closed}}}").as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let lease = queued_selection_test_lease(retained.join("lease.json"));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        await_restart_admission(
+            socket.to_str().unwrap(),
+            &lease,
+            &HookReporter::new(OutputVisibility::None),
+        ),
+    )
+    .await
+    .expect("one closed poll must finish")
+    .expect("wait ownership must be durable");
+    server.await.unwrap();
+    assert_eq!(outcome, RestartAdmissionWait::Open);
+    let snapshot = lease.snapshot();
+    assert_eq!(snapshot.phase, "admission");
+    assert!(
+        snapshot.heartbeat_unix_ms > 0,
+        "the hand-back is a heartbeat"
+    );
+}
+
+#[tokio::test]
+async fn restart_admission_wait_publication_failure_prevents_the_first_probe() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let lease_dir = retained.join("leases");
+    std::fs::create_dir(&lease_dir).unwrap();
+    let lease = queued_selection_test_lease(lease_dir.join("lease.json"));
+    let before = lease.snapshot();
+    // Preserve the real journal, but make its publication pathname unusable.
+    // This fails even when tests run as root; it does not rely on permissions.
+    let preserved = retained.join("preserved-leases");
+    std::fs::rename(&lease_dir, &preserved).unwrap();
+    std::fs::write(&lease_dir, b"not a directory").unwrap();
+    assert!(
+        await_restart_admission(
+            socket.to_str().unwrap(),
+            &lease,
+            &HookReporter::new(OutputVisibility::None),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(lease.snapshot(), before);
+    let durable: DurableJobLease =
+        serde_json::from_slice(&std::fs::read(preserved.join("lease.json")).unwrap()).unwrap();
+    assert_eq!(durable, before);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn restart_admission_open_probe_cannot_bypass_a_failed_durable_phase_handoff() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let lease_dir = retained.join("leases");
+    std::fs::create_dir(&lease_dir).unwrap();
+    let lease = queued_selection_test_lease(lease_dir.join("lease.json"));
+    let preserved = retained.join("preserved-leases");
+    let server_preserved = preserved.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut request = String::new();
+        TokioBufReader::new(reader)
+            .read_line(&mut request)
+            .await
+            .unwrap();
+        assert!(request.starts_with("GET /restart-admission"));
+        std::fs::rename(&lease_dir, &server_preserved).unwrap();
+        std::fs::write(&lease_dir, b"not a directory").unwrap();
+        writer
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"admission_closed\":false}")
+            .await
+            .unwrap();
+    });
+    let result = await_restart_admission(
+        socket.to_str().unwrap(),
+        &lease,
+        &HookReporter::new(OutputVisibility::None),
+    )
+    .await;
+    server.await.unwrap();
+    assert!(
+        result.is_err(),
+        "IPC readiness cannot replace durable phase publication"
+    );
+    let durable: DurableJobLease =
+        serde_json::from_slice(&std::fs::read(preserved.join("lease.json")).unwrap()).unwrap();
+    assert_eq!(durable.phase, "restart_admission_wait");
+    assert_eq!(lease.snapshot(), durable);
+    assert!(durable.identity.remote_build_id.is_none() && durable.worker_id.is_none());
+}
+
+#[tokio::test]
+async fn an_interrupted_restart_admission_probe_keeps_only_preadmission_wait_ownership() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let lease = queued_selection_test_lease(retained.join("lease.json"));
+    let waiting_lease = lease.clone();
+    let waiting = tokio::spawn(async move {
+        await_restart_admission(
+            socket.to_str().unwrap(),
+            &waiting_lease,
+            &HookReporter::new(OutputVisibility::None),
+        )
+        .await
+    });
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("hook must issue its first admission probe")
+        .unwrap();
+    let mut request = String::new();
+    let mut reader = TokioBufReader::new(stream);
+    reader.read_line(&mut request).await.unwrap();
+    assert!(request.starts_with("GET /restart-admission"));
+    let observed = read_retry_lease(&lease);
+    assert_eq!(observed.phase, "restart_admission_wait");
+    assert!(observed.identity.remote_build_id.is_none());
+    assert!(observed.worker_id.is_none() && observed.recovery.is_none());
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert_eq!(read_retry_lease(&lease), observed);
+    assert!(
+        !observed.terminal_acknowledged,
+        "interruption is not completion evidence"
+    );
+}
+
+#[test]
+fn restart_wait_cannot_conceal_active_or_uncertain_source_ownership() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    for scenario in ["admitted", "source", "pending", "unconfirmed", "terminal"] {
+        let lease = queued_selection_test_lease(retained.join(format!("{scenario}.json")));
+        match scenario {
+            "admitted" => lease.admit(42, &WorkerId::new("builder")).unwrap(),
+            "source" => lease
+                .set_recovery(serde_json::json!({"source_released": false}))
+                .unwrap(),
+            "pending" => lease.heartbeat("selection_pending").unwrap(),
+            "unconfirmed" => lease.heartbeat("selection_unconfirmed").unwrap(),
+            "terminal" => lease.confirm_failed_before_admission().unwrap(),
+            _ => unreachable!(),
+        }
+        let before = read_retry_lease(&lease);
+        assert!(lease.begin_restart_admission_wait().is_err(), "{scenario}");
+        assert_eq!(read_retry_lease(&lease), before, "{scenario}");
+    }
+}
+
+#[test]
+fn refused_restart_preadmission_wait_retires_the_lease_without_a_remote_exit() {
+    let retained = tempfile::tempdir().unwrap().keep();
+    let lease = queued_selection_test_lease(retained.join("lease.json"));
+    lease.begin_restart_admission_wait().unwrap();
+    lease.confirm_failed_before_admission().unwrap();
+    let terminal = read_retry_lease(&lease);
+    assert_eq!(
+        terminal.state,
+        rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission
+    );
+    assert!(terminal.terminal_acknowledged);
+    assert!(terminal.exit_code.is_none());
+    assert!(terminal.identity.remote_build_id.is_none());
+    assert!(lease.begin_restart_admission_wait().is_err());
+}
+
+#[test]
+fn only_the_daemon_restart_barrier_refusal_triggers_an_admission_wait() {
+    // bd-5pmwm: a refusal issued while a restart holds admission closed is
+    // re-queried after the barrier reopens; every other refusal keeps its
+    // normal handling.
+    let refusal = |reason: &str| SelectionResponse {
+        worker: None,
+        reason: SelectionReason::SelectionError(reason.into()),
+        build_id: None,
+        diagnostics: None,
+    };
+    assert!(is_restart_barrier_refusal(&refusal(
+        "restart_admission_barrier_active"
+    )));
+    assert!(!is_restart_barrier_refusal(&refusal(
+        "job_cancelled_before_start"
+    )));
+    assert!(!is_restart_barrier_refusal(&SelectionResponse {
+        worker: None,
+        reason: SelectionReason::AllWorkersBusy,
+        build_id: None,
+        diagnostics: None,
+    }));
 }

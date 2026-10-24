@@ -163,6 +163,23 @@ impl FleetProgress {
         }
     }
 
+    /// Mark a worker as skipped for a reason an operator should see, e.g. a
+    /// worker whose platform this controller has no binary for (bd-ztpbq).
+    /// Like [`Self::worker_failed`], the reason is also logged and, when the
+    /// progress bar is hidden (installer/CI/captured output), printed to stderr.
+    pub async fn worker_skipped_with_notice(&self, worker_id: &str, reason: &str) {
+        tracing::info!(
+            target: "rch::fleet::deploy",
+            worker = %worker_id,
+            reason = %reason,
+            "fleet deploy: worker leg skipped",
+        );
+        if !self.visible {
+            eprintln!("[RCH] fleet deploy: worker {worker_id} skipped — {reason}");
+        }
+        self.worker_skipped(worker_id, reason).await;
+    }
+
     /// Mark a worker as failed.
     ///
     /// The per-worker failure reason renders on an indicatif progress bar that is

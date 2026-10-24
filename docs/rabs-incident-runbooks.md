@@ -183,3 +183,144 @@ evidence bundle, recovery path, and a regression-test requirement
 - **Recover:** converge the top fragmenter; re-measure.
 - **Regression:** the fleet corpus report tracks the category —
   regression shows up as the waste number climbing back.
+
+---
+
+# RABS Section 173 Required Documentation Set (bead R013)
+
+- **Governed Schema Fingerprint:** `0x1a61e5bd8ad2cfb5`
+- **Evidence Vocabulary:** `OBSERVED` | `VERIFIED` | `PARTIAL` | `REPORTED` | `TARGET` | `HYPOTHESIS` | `OPEN` | `BLOCKED` | `DEFERRED` | `REJECTED`
+
+## doc-01-architecture-overview
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.local-wrapper@1`, `rabs.application@1`, `atp.transport@0`
+- **Profile Boundary:** Single-trust-domain fleet (local wrapper, local edge daemon `rabsd`, coordinator, remote workers `rabs-wkr`).
+- **Non-Claim Boundary:** `DEFERRED` cross-organization untrusted multi-tenant federation; `NON-CLAIM` zero-overhead local builds when daemon is unreachable (fail-open bounded to `<5ms`).
+- **Operator Surfaces:** `rch rabs status`, `rch rabs doctor`, `rch why`
+
+## doc-02-action-key-contract
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.action-key@1`, `rabs.action-family-key@1`, `rabs.action-key-breakdown@1`, `rabs.dependency-projection@1`, `rabs.observed-input-recipe@1`
+- **Profile Boundary:** SHA-256 domain-separated (`rabs.action-key.sha256.v1`) canonical descriptors over byte-exact inputs, rustc compiler identity, and `v1` exact-artifact dependency projection.
+- **Non-Claim Boundary:** `REJECTED` path-sensitive raw host strings in portable keys; `OPEN` semantic export-surface `.rmeta` projection until corpus equivalence gates pass.
+- **Operator Surfaces:** `rch why action`, `rch why miss`, `rch rabs action show`
+
+## doc-03-canonical-execroot-contract
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.build-path-semantic-policy@1`
+- **Profile Boundary:** Canonical `/rabs/execroot/{work,out,deps,sysroot,tmp}` layout on Linux user/mount namespaces with deterministic `-ffile-prefix-map` / `--remap-path-prefix`.
+- **Non-Claim Boundary:** `PARTIAL` macOS host-sandbox path-remapped fallback when Linux namespace isolation is unavailable; `NON-CLAIM` bit-identical paths for `SubscriberPathPreserving` local lanes.
+- **Operator Surfaces:** `rch rabs doctor`, `rch why volatile`, `incident_bundle`
+
+## doc-04-sandbox-policy-matrix
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.sandbox-semantic-policy@1`, `rabs.isolation-profile@1`, `rabs.source-capture-policy@1`
+- **Profile Boundary:** Per-`ActionClass` hermetic sandbox enforcement (`StrictHermeticLinux`, `StrictHermeticVm`, `HostSandboxAudit`, `DependencyImmutableFastPath`, `VolatileLocal`) with network disabled by default and `.gitignore` never treated as a security boundary.
+- **Non-Claim Boundary:** `BLOCKED` serving from `VolatileLocal` or `HostSandboxAudit` without matching trust policy; `NON-CLAIM` kernel-level containment on unprivileged non-Linux hosts without VM helper.
+- **Operator Surfaces:** `rch rabs doctor`, `rch why action`, `incident_bundle`
+
+## doc-05-rabs-atp-protocol-specification
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.local-wrapper@1`, `rabs.application@1`, `atp.transport@0`, `rabs.reason-codes@1`
+- **Profile Boundary:** Length-framed canonical codecs, explicit `ATP/0` transport and `RABS/1` application negotiation, 0-RTT idempotent-only replay guard, and dedicated control-reserve / saturation latency gate.
+- **Non-Claim Boundary:** `REJECTED` implicit protocol downgrade or unauthenticated 0-RTT state mutation; `HYPOTHESIS` cross-WAN congestion superiority before shadow soak completion.
+- **Operator Surfaces:** `rch rabs protocol compatibility`, `rch rabs doctor`, `incident_bundle`
+
+## doc-06-object-cas-format-and-gc-policy
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.object-manifest@1`, `rabs.artifact-bundle@1`, `rabs.chunking-profile@1`, `rabs.pack-format@1`, `rabs.metadata-store@1`
+- **Profile Boundary:** Acyclic bounded tree manifests, content-defined chunking, deterministic small-object packs, two-phase `PreparedResultOffered` -> `ActionResultCommitted` publication, and pin/lease-respecting GC watermark sweeps.
+- **Non-Claim Boundary:** `NON-CLAIM` serving unverified or partially closed blobs; `REPORTED` pack compaction ratios depend on workload crate graph shape.
+- **Operator Surfaces:** `rch rabs object stat`, `rch rabs gc plan`, `rch rabs quarantine list`
+
+## doc-07-cancellation-and-obligation-contract
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.metadata-store@1`, `rabs.local-wrapper@1`
+- **Profile Boundary:** Reference-counted subscriber interests, quiescent last-subscriber drain, process-group/cgroup kill escalation (`SIGTERM` -> `SIGKILL`), and zero leaked obligations across every await point.
+- **Non-Claim Boundary:** `NON-CLAIM` instant teardown of unkillable kernel D-state I/O; `VERIFIED` attempt fencing ensures late outputs after cancellation are tombstoned.
+- **Operator Surfaces:** `rch rabs operation show`, `rch rabs worker reconcile`, `incident_bundle`
+
+## doc-08-trust-provenance-policy
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.metadata-store@1`, `rabs.artifact-bundle@1`
+- **Companion Document:** `docs/rabs-trust-model-v1.md`
+- **Profile Boundary:** Single administrative trust domain (V1), Ed25519 worker identity pinning, `Tier0`–`Tier5` trust evidence tiers, and non-shareable secret-tainted output quarantine.
+- **Non-Claim Boundary:** `DEFERRED` cross-domain peer cache sharing; `REJECTED` promotion of `Tier0`/`Tier1` records into shared remote serving without re-execution.
+- **Operator Surfaces:** `rch rabs quarantine inspect`, `rch why action`, `incident_bundle`
+
+## doc-09-worker-admission-policy
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.isolation-profile@1`, `rabs.application@1`
+- **Profile Boundary:** Cryptographic identity handshake, toolchain digest equivalence, target-CPU/microarchitecture feature guard, PSI/disk headroom admission, and monotonic `WorkerBootGeneration` / `WorkerIncarnationId` fencing.
+- **Non-Claim Boundary:** `NON-CLAIM` scheduling onto workers with drifted schema fingerprints or unprobed sandbox capabilities.
+- **Operator Surfaces:** `rch rabs doctor`, `rch why worker`, `rch rabs worker reconcile`
+
+## doc-10-wrapper-cargo-compatibility-matrix
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.local-wrapper@1`, `rabs.invocation-record@1`
+- **Companion Document:** `docs/rabs-canonical-cargo.md`
+- **Profile Boundary:** `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` interception, Cargo JSON diagnostic + early `.rmeta` pipelining notification, jobserver token hygiene, and `cargo check`/`build`/`test`/`clippy`/`nextest` classification.
+- **Non-Claim Boundary:** `PARTIAL` proc-macro host dylib cross-compilation caching; `BYPASSED` interactive/watch invocations execute locally by design.
+- **Operator Surfaces:** `rch rabs doctor`, `rch why miss`, `rch why rebuild`
+
+## doc-11-rollout-and-rollback-guide
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.application@1`, `rabs.metadata-store@1`
+- **Profile Boundary:** 14 independently scoped feature modes (`off` through `require-remote`), canary coordinator/worker cohort routing low-risk `RustcDependencyCompile` actions first, and one-command rollback (`execute_one_command_rollback`).
+- **Non-Claim Boundary:** `REJECTED` rollback past the coordinator's N-1 protocol compatibility floor without draining in-flight work.
+- **Operator Surfaces:** `rch rabs mode`, `rch rabs shadow-report`, `rch rabs status`
+
+## doc-12-incident-runbooks
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.reason-codes@1`, `rabs.metadata-store@1`
+- **Companion Document:** `docs/rabs-incident-runbooks.md`
+- **Profile Boundary:** All 13 incident classes (`IncorrectResultDivergence` through `HitRateFragmentation`) with detection signal, automatic containment, operator commands, redaction-safe evidence bundle, recovery path, and regression-test closure gate.
+- **Non-Claim Boundary:** `NON-CLAIM` automatic containment for `HitRateFragmentation` (efficiency incident only; serving remains sound).
+- **Operator Surfaces:** `incident_bundle`, `rch rabs quarantine list`, `rch why`
+
+## doc-13-benchmark-methodology
+
+- **Standing:** `OBSERVED`
+- **Schemas:** `rabs.invocation-record@1`, `rabs.reason-codes@1`
+- **Companion Document:** `benchmarks/GATE_LEDGER.md`
+- **Profile Boundary:** Nearest-rank p50/p95/p99 integer latency percentiles, warm/cold/noop/leaf-edit/branch-switch scenarios, served-fraction permille accounting (`>900` permille long-run target), and live incumbent vs candidate comparison in the same invocation.
+- **Non-Claim Boundary:** `TARGET` `>90%` fleet `rustc` served fraction is `ReportedNotGated` until the Phase 5 / M16 frontier review; self-speedups are maintenance, never release wins.
+- **Operator Surfaces:** `rch rabs benchmark replay`, `rch rabs shadow-report`, `rch why slow`
+
+## doc-14-agent-command-palette
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.reason-codes@1`, `rabs.action-key-breakdown@1`
+- **Profile Boundary:** Bounded JSON/TOON machine-readable outputs on stdout with diagnostics on stderr across `rch why {action,crate,miss,rebuild,worker,volatile,slow}` and `rch rabs {status,doctor,mode,replay,shadow-report,action,operation,object,quarantine,gc,worker,cache,advise,benchmark,protocol}`.
+- **Non-Claim Boundary:** `NON-CLAIM` unredacted environment/secret values in agent-visible JSON or TOON payloads.
+- **Operator Surfaces:** `rch why`, `rch rabs status`, `rch rabs advise`
+
+## doc-15-developer-contribution-guide
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.action-key@1`, `rabs.local-wrapper@1`, `rabs.application@1`, `rabs.metadata-store@1`, `rabs.object-manifest@1`, `rabs.sandbox-semantic-policy@1`
+- **Profile Boundary:** Crate dependency-direction DAG (`rabs-protocol` leaf without Tokio/Asupersync/FS effects), `#![forbid(unsafe_code)]`, cold-namespace schema epoch bumps, and mandatory coverage-ledger + documentation currency checks in CI.
+- **Non-Claim Boundary:** `REJECTED` compatibility shims, unversioned wire changes, or schema registry edits without matching documentation updates.
+- **Operator Surfaces:** `rch rabs doctor`, `rch rabs protocol compatibility`
+
+## doc-16-unsafe-boundary-ledger-and-review-guide
+
+- **Standing:** `VERIFIED`
+- **Schemas:** `rabs.sandbox-semantic-policy@1`, `rabs.isolation-profile@1`
+- **Companion Document:** `docs/rabs-unsafe-boundary-ledger.md`
+- **Profile Boundary:** Zero inline `unsafe` in RABS libraries; every privilege/namespace/seccomp/tracing boundary is isolated to audited helper binaries tracked with 6 required facets in `docs/rabs-unsafe-boundary-ledger.md`.
+- **Non-Claim Boundary:** `BLOCKED` shipping any privileged helper binary whose path is absent from `docs/rabs-unsafe-boundary-ledger.md` or lacks fuzz/review metadata.
+- **Operator Surfaces:** `rch rabs doctor`, `incident_bundle`
+

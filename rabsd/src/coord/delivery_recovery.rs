@@ -8,7 +8,7 @@
 
 use super::worker_delivery::{
     Delivery, DeliveryFailure, MAX_DELIVERY_BYTES, MAX_FRAME_BYTES, validate_request,
-    verified_artifact_names,
+    verified_artifact_names, verify_cargo_artifacts,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -374,10 +374,14 @@ pub fn install_delivery_outputs(
             Err(error) => return Err(error),
         }
         let parent = destination.parent().expect("named absolute destination");
-        let staging = tempfile::Builder::new()
-            .prefix(".rabs-output-staging-")
-            .tempdir_in(parent)?
-            .keep();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".rabs-output-staging-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let staging = builder.tempdir_in(parent)?.keep();
         let names = verified_artifact_names(request, &delivery.receipt["artifact_manifest"])?;
         super::worker_delivery::create_artifact_directories(
             &staging,
@@ -576,6 +580,13 @@ pub fn recover_existing_delivery(
         verify_tree(destination, &files)?;
         for (relative, file) in files {
             verify_file(&destination.join(relative), &file)?;
+        }
+        if exit == Some(0) && stop.is_null() && request.get("artifacts").is_some() {
+            verify_cargo_artifacts(
+                request,
+                &receipt["artifact_manifest"],
+                File::open(destination.join("diagnostics/stdout"))?,
+            )?;
         }
         // A process may have died after marker rename but before directory
         // fsync. Re-establish that barrier before reporting a durable result.

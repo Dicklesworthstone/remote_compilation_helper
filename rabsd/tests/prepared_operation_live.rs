@@ -2,12 +2,12 @@
 //!
 //! The ordinary tests hold an actual TLS listener without connecting a worker:
 //! they exercise queue ownership, cancellation and crash recovery, not compiler
-//! execution. The explicit canonical-host test runs the real worker and rustc.
+//! execution. The explicit canonical-host tests run the real worker and rustc.
 //! Unsupported Unix sockets or missing OpenSSL fail, rather than become a pass.
 #![cfg(target_os = "linux")]
 
 use rabs_asupersync::worker_transport::TlsFiles;
-use rabsd::coord::source_delivery::prepare_source_bundle;
+use rabsd::coord::source_delivery::{prepare_source_bundle, prepare_source_template};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::fs::{self, File};
@@ -17,6 +17,11 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "prepared_operation_live/dependency_worker.rs"]
+mod dependency_worker;
+#[path = "prepared_operation_live/live_dependency_worker.rs"]
+mod live_dependency_worker;
 
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 
@@ -258,6 +263,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let owner = tempfile::tempdir().unwrap();
+        fs::set_permissions(owner.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let certificates = Certificates::new(&owner.path().join("credentials"));
         Self {
             owner,
@@ -285,11 +291,13 @@ impl Fixture {
     }
 
     fn daemon(&self) -> Process {
-        let mut daemon = Process::spawn(
-            self.owner.path(),
-            &self.next_name("daemon"),
-            &mut self.command(),
-        );
+        self.daemon_with_environment(&[])
+    }
+
+    fn daemon_with_environment(&self, environment: &[(String, String)]) -> Process {
+        let mut command = self.command();
+        command.envs(environment.iter().map(|(name, value)| (name, value)));
+        let mut daemon = Process::spawn(self.owner.path(), &self.next_name("daemon"), &mut command);
         let socket = self.owner.path().join("daemon.sock");
         let until = Instant::now() + Duration::from_secs(15);
         loop {
@@ -387,6 +395,10 @@ impl Fixture {
     }
 
     fn prepare(&self, number: u64, native: bool) -> Job {
+        self.prepare_with_allocation(number, native, false)
+    }
+
+    fn prepare_with_allocation(&self, number: u64, native: bool, allocated: bool) -> Job {
         let source = self.owner.path().join(format!("source-{number}"));
         fs::create_dir(&source).unwrap();
         fs::write(
@@ -442,14 +454,359 @@ impl Fixture {
             delivery: self.owner.path().join(format!("delivery-{number}")),
             output: self.owner.path().join(format!("output-{number}")),
         };
-        let request = json!({"kind":"canonical-exec", "request_id":number, "program":program, "args":args,
+        let mut request = json!({"kind":"canonical-exec", "request_id":number, "program":program, "args":args,
             "toolchain_source":toolchain, "toolchain_backing":toolchain, "source_files":["lib.rs"],
             "timeout_ms":90000, "jobserver_grant":1,
             "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace", "env":{"PREPARED_LABEL":"native-Δ"}},
             "artifacts":{"unit":"build", "files":[artifact]}});
-        prepare_source_bundle(&source, &request, &job.bundle).unwrap();
+        if allocated {
+            request["request_id"] = json!("allocate");
+            prepare_source_template(&source, &request, &job.bundle).unwrap();
+        } else {
+            prepare_source_bundle(&source, &request, &job.bundle).unwrap();
+        }
         job
     }
+
+    /// Exercise native source/toolchain capture and daemon admission without
+    /// connecting a worker. These bytes are explicitly not a compiler fixture.
+    fn start_allocated_build(&self, number: u64) -> (Job, Process) {
+        self.start_allocated_build_with_pool(number, None)
+    }
+
+    fn start_allocated_build_with_pool(&self, number: u64, pool: Option<&Path>) -> (Job, Process) {
+        let source = self.owner.path().join(format!("allocated-source-{number}"));
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("input.txt"), b"retained allocation fixture\n").unwrap();
+        let toolchain = self
+            .owner
+            .path()
+            .join(format!("allocated-toolchain-{number}"));
+        fs::create_dir_all(toolchain.join("bin")).unwrap();
+        let executable = toolchain.join("bin/fixture");
+        fs::write(&executable, b"#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let specification = self.owner.path().join(format!("allocation-{number}.json"));
+        fs::write(
+            &specification,
+            serde_json::to_vec(&json!({
+                "kind":"canonical-exec", "request_id":"allocate",
+                "program":"/__rabs/toolchain/bin/fixture", "args":[],
+                "toolchain_source":toolchain, "source_files":["input.txt"],
+                "timeout_ms":90000, "jobserver_grant":1,
+                "artifacts":{"unit":"build", "files":["result.bin"]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let job = Job {
+            id: format!("{number:032x}"),
+            worker: "prepared-worker".into(),
+            bundle: self.owner.path().join(format!("allocated-bundle-{number}")),
+            delivery: self
+                .owner
+                .path()
+                .join(format!("allocated-delivery-{number}")),
+            output: self.owner.path().join(format!("allocated-output-{number}")),
+        };
+        let mut cmd = self.command();
+        cmd.args(["--job-build", "--prepare-from"])
+            .arg(source)
+            .arg(specification)
+            .arg(&job.id);
+        if let Some(pool) = pool {
+            cmd.arg("--worker-pool").arg(pool);
+        } else {
+            cmd.arg("127.0.0.1:0")
+                .arg(&job.worker)
+                .arg(self.certificates.pin());
+        }
+        cmd.arg(&job.bundle).arg(&job.delivery).arg(&job.output);
+        let client = Process::spawn(self.owner.path(), &self.next_name("job-build"), &mut cmd);
+        (job, client)
+    }
+
+    fn wait_for_submission(&self, job: &Job, client: &mut Process) -> Value {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (status, reply) = self.cli(&["--job-status".into(), job.id.clone()]);
+            if status.success() {
+                assert_eq!(reply["kind"], "prepared-operation");
+                assert_eq!(reply["operation"]["id"], job.id);
+                return reply["operation"].clone();
+            }
+            assert_eq!(reply["kind"], "prepared-operation-error");
+            assert!(
+                client.child.try_wait().unwrap().is_none(),
+                "job-build exited before admission: {}",
+                String::from_utf8_lossy(&read_log(&client.stderr))
+            );
+            assert!(
+                Instant::now() < until,
+                "job-build did not submit its retained inputs: {}",
+                String::from_utf8_lossy(&read_log(&client.stderr))
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn configured_daemon_runs_eight_owned_tls_listeners_and_reuses_released_capacity() {
+    // Real daemon, public CLI and TLS listener owners; no worker connects and
+    // these fixtures do not claim compiler execution or cache publication.
+    let fixture = Fixture::new();
+    let mut daemon =
+        fixture.daemon_with_environment(&[("RABS_PREPARED_CONCURRENCY".into(), "8".into())]);
+    let mut jobs = Vec::new();
+    for number in 1..=9 {
+        let mut job = fixture.prepare_with_allocation(number, false, true);
+        job.worker = format!("capacity-worker-{number}");
+        let mut submission = fixture.submission(&job);
+        submission[0] = "--job-submit-allocated".into();
+        submission[4] = format!("{number:064x}");
+        fixture.operation(&submission);
+        jobs.push(job);
+    }
+    let mut listeners = std::collections::BTreeSet::new();
+    for job in &jobs[..8] {
+        let running = fixture.wait_for(job, Duration::from_secs(15), |status| {
+            status["state"] == "running" && status["listen_address"].is_string()
+        });
+        listeners.insert(running["listen_address"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(
+        listeners.len(),
+        8,
+        "every owned slot has a distinct real listener"
+    );
+    let queued = fixture.status(&jobs[8]);
+    assert_eq!(queued["state"], "queued");
+    assert_eq!(queued["attempt"], 0);
+    assert!(queued["request_id"].is_null());
+    let capacity = || {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            // This client uses its ordinary default configuration. The reply
+            // must describe the daemon's actual eight-slot store.
+            let (status, value) = fixture.cli(&["--coord-status".into()]);
+            assert!(status.success(), "{value}");
+            assert_eq!(value["kind"], "coord-status");
+            if value["prepared_jobs"]["available"] == true {
+                return value["prepared_jobs"].clone();
+            }
+            assert!(
+                Instant::now() < until,
+                "capacity status stayed unavailable: {value}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert_eq!(
+        capacity(),
+        json!({
+            "available":true, "concurrency":8, "active":8, "queued":1,
+            "accepting":true, "persistence_uncertain":false,
+        })
+    );
+    fixture.operation(&["--job-cancel".into(), jobs[0].id.clone()]);
+    fixture.wait_for(&jobs[0], Duration::from_secs(15), |status| {
+        status["state"] == "cancelled"
+    });
+    let running = fixture.wait_for(&jobs[8], Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert_eq!(running["request_sha256"], queued["request_sha256"]);
+    assert_eq!(running["worker"], queued["worker"]);
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 0));
+    assert_eq!(capacity()["active"], 8);
+    assert_eq!(capacity()["queued"], 0);
+    daemon.terminate();
+}
+
+#[test]
+fn pooled_cli_builds_use_idle_workers_and_keep_placement_after_client_and_daemon_loss() {
+    // This exercises real capture, native clients, the daemon UDS API and TLS
+    // listener ownership. No worker is connected and no compiler is executed.
+    let fixture = Fixture::new();
+    let blocker = fixture.prepare(1, false);
+    let mut daemon = fixture.daemon();
+    fixture.operation(&fixture.submission(&blocker));
+    let busy = fixture.wait_for(&blocker, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = available.local_addr().unwrap().to_string();
+    let workers = json!([
+        {"address":busy["listen_address"], "worker":blocker.worker,
+         "worker_spki_sha256":fixture.certificates.pin()},
+        {"address":address, "worker":"pool-second", "worker_spki_sha256":"22".repeat(32)}
+    ]);
+    let pool = fixture.owner.path().join("pool.json");
+    fs::write(&pool, serde_json::to_vec(&workers).unwrap()).unwrap();
+    drop(available);
+
+    let (second, mut second_client) = fixture.start_allocated_build_with_pool(103, Some(&pool));
+    fixture.wait_for_submission(&second, &mut second_client);
+    let running = fixture.wait_for(&second, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert_eq!(running["worker"], "pool-second");
+    assert_eq!(running["address"], address);
+    assert_eq!(running["listen_address"], address);
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 0));
+    assert_eq!(fixture.status(&blocker)["state"], "running");
+
+    // Both candidates now have one running job. Stable input order queues the
+    // next build on the first worker without allocating another worker ID.
+    let (queued, mut queued_client) = fixture.start_allocated_build_with_pool(104, Some(&pool));
+    let before = fixture.wait_for_submission(&queued, &mut queued_client);
+    assert_eq!(before["state"], "queued");
+    assert_eq!(before["worker"], blocker.worker);
+    assert!(before["request_id"].is_null());
+    queued_client.crash();
+    let submit = vec![
+        "--job-submit-pool".into(),
+        queued.id.clone(),
+        pool.to_str().unwrap().into(),
+        queued.bundle.to_str().unwrap().into(),
+        queued.delivery.to_str().unwrap().into(),
+        queued.output.to_str().unwrap().into(),
+    ];
+    let retry = fixture.operation(&submit);
+    assert_eq!(retry["state"], "queued");
+    assert_eq!(retry["worker"], before["worker"]);
+    assert_eq!(retry["request_sha256"], before["request_sha256"]);
+    let reversed = json!([workers[1], workers[0]]);
+    fs::write(&pool, serde_json::to_vec(&reversed).unwrap()).unwrap();
+    let (status, reply) = fixture.cli(&submit);
+    assert!(!status.success());
+    assert_eq!(reply["kind"], "prepared-operation-error");
+    fs::write(&pool, serde_json::to_vec(&workers).unwrap()).unwrap();
+
+    daemon.crash();
+    assert!(!second_client.wait(Duration::from_secs(15)).success());
+    let mut restarted = fixture.daemon();
+    let uncertain = fixture.status(&second);
+    assert_eq!(uncertain["state"], "uncertain");
+    for field in [
+        "worker",
+        "worker_spki_sha256",
+        "address",
+        "request_id",
+        "request_sha256",
+        "attempt",
+    ] {
+        assert_eq!(uncertain[field], running[field], "{field}");
+    }
+    let retained = fixture.operation(&submit);
+    assert_eq!(retained["state"], "queued");
+    assert_eq!(retained["worker"], before["worker"]);
+    assert!(retained["request_id"].is_null());
+    let cancelled = fixture.operation(&["--job-cancel".into(), queued.id.clone()]);
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(cancelled["execution_may_have_run"], false);
+    assert!(!queued.delivery.exists() && !queued.output.exists());
+    restarted.terminate();
+}
+
+#[test]
+fn allocated_cli_jobs_wait_without_ids_and_survive_the_waiting_client() {
+    let fixture = Fixture::new();
+    let blocker = fixture.prepare(1, false);
+    let mut daemon = fixture.daemon();
+    fixture.operation(&fixture.submission(&blocker));
+    fixture.wait_for(&blocker, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+
+    let (job, mut client) = fixture.start_allocated_build(101);
+    let queued = fixture.wait_for_submission(&job, &mut client);
+    assert_eq!(queued["state"], "queued");
+    assert!(queued["request_id"].is_null());
+    assert_eq!(queued["execution_may_have_run"], false);
+    let template = fs::read(job.bundle.join("request.json")).unwrap();
+    let intent: Value = serde_json::from_slice(&template).unwrap();
+    assert_eq!(intent["request_id"], "allocate");
+    assert!(!job.delivery.exists());
+    assert!(!job.output.exists());
+
+    client.crash();
+    assert_eq!(fixture.status(&job)["state"], "queued");
+    let mut retained_submission = fixture.submission(&job);
+    retained_submission[0] = "--job-submit-allocated".into();
+    let confirmed = fixture.operation(&retained_submission);
+    assert_eq!(confirmed["state"], "queued");
+    assert_eq!(confirmed["request_sha256"], queued["request_sha256"]);
+    assert!(confirmed["request_id"].is_null());
+    fixture.operation(&["--job-cancel".into(), blocker.id.clone()]);
+    let running = fixture.wait_for(&job, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 1));
+    assert_eq!(running["request_sha256"], queued["request_sha256"]);
+    assert_eq!(fs::read(job.bundle.join("request.json")).unwrap(), template);
+    let confirmed = fixture.operation(&retained_submission);
+    assert_eq!(confirmed["state"], "running");
+    assert_eq!(confirmed["request_id"], running["request_id"]);
+    assert_eq!(confirmed["attempt"], running["attempt"]);
+
+    fixture.operation(&["--job-cancel".into(), job.id.clone()]);
+    let cancelled = fixture.wait_for(&job, Duration::from_secs(15), |status| {
+        status["state"] == "cancelled"
+    });
+    assert_eq!(cancelled["request_id"], running["request_id"]);
+    assert_eq!(cancelled["execution_may_have_run"], false);
+    assert_eq!(cancelled["outputs_installed"], false);
+    let mut command = fixture.command();
+    command.args(["--job-wait", &job.id, "5"]);
+    let mut wait = Process::spawn(fixture.owner.path(), "allocated-wait", &mut command);
+    assert_eq!(wait.wait(Duration::from_secs(10)).code(), Some(130));
+    assert!(read_log(&wait.stdout).is_empty());
+    assert!(!job.delivery.exists());
+    assert!(!job.output.exists());
+    daemon.terminate();
+}
+
+#[test]
+fn allocated_cli_job_keeps_its_bound_request_after_daemon_restart() {
+    let fixture = Fixture::new();
+    let mut daemon = fixture.daemon();
+    let (job, mut client) = fixture.start_allocated_build(102);
+    fixture.wait_for_submission(&job, &mut client);
+    let running = fixture.wait_for(&job, Duration::from_secs(15), |status| {
+        status["state"] == "running" && status["listen_address"].is_string()
+    });
+    assert!(running["request_id"].as_u64().is_some_and(|id| id > 0));
+    let template = fs::read(job.bundle.join("request.json")).unwrap();
+    daemon.crash();
+    assert!(!client.wait(Duration::from_secs(15)).success());
+    assert!(read_log(&client.stdout).is_empty());
+
+    let mut restarted = fixture.daemon();
+    let recovered = fixture.status(&job);
+    assert_eq!(recovered["state"], "uncertain");
+    assert_eq!(recovered["execution_may_have_run"], true);
+    assert_eq!(recovered["request_id"], running["request_id"]);
+    assert_eq!(recovered["request_sha256"], running["request_sha256"]);
+    assert_eq!(recovered["attempt"], running["attempt"]);
+    assert_eq!(fs::read(job.bundle.join("request.json")).unwrap(), template);
+    let mut command = fixture.command();
+    command.args(["--job-wait", &job.id, "5"]);
+    let mut wait = Process::spawn(
+        fixture.owner.path(),
+        "uncertain-allocated-wait",
+        &mut command,
+    );
+    assert!(!wait.wait(Duration::from_secs(10)).success());
+    assert!(read_log(&wait.stdout).is_empty());
+    let after_wait = fixture.status(&job);
+    assert_eq!(after_wait["state"], "uncertain");
+    assert_eq!(after_wait["request_id"], recovered["request_id"]);
+    assert_eq!(after_wait["attempt"], recovered["attempt"]);
+    assert!(!job.delivery.exists());
+    assert!(!job.output.exists());
+    restarted.terminate();
 }
 
 #[test]
@@ -579,6 +936,16 @@ fn killed_daemon_preserves_uncertainty_and_never_redispatches_on_restart() {
 #[test]
 #[ignore = "requires canonical-capable Linux and matching RABS_TEST_WORKER_BIN; runs the actual worker and installed rustc"]
 fn daemon_prepared_job_compiles_over_native_tls_and_reuses_the_verified_completion() {
+    native_tls_prepared_job(false);
+}
+
+#[test]
+#[ignore = "requires canonical-capable Linux and matching RABS_TEST_WORKER_BIN; runs the actual worker and installed rustc"]
+fn daemon_allocated_job_compiles_over_native_tls_and_reuses_the_verified_completion() {
+    native_tls_prepared_job(true);
+}
+
+fn native_tls_prepared_job(allocated: bool) {
     let missing =
         rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical();
     assert!(
@@ -590,10 +957,18 @@ fn daemon_prepared_job_compiles_over_native_tls_and_reuses_the_verified_completi
     );
     assert!(worker.is_absolute() && worker.is_file());
     let fixture = Fixture::new();
-    let job = fixture.prepare(4, true);
+    let job = fixture.prepare_with_allocation(4, true, allocated);
     let request = fs::read(job.bundle.join("request.json")).unwrap();
+    let mut submission = fixture.submission(&job);
+    if allocated {
+        submission[0] = "--job-submit-allocated".into();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request).unwrap()["request_id"],
+            "allocate"
+        );
+    }
     let mut daemon = fixture.daemon();
-    fixture.operation(&fixture.submission(&job));
+    fixture.operation(&submission);
     let running = fixture.wait_for(&job, Duration::from_secs(15), |status| {
         status["state"] == "running" && status["listen_address"].is_string()
     });
@@ -641,17 +1016,13 @@ fn daemon_prepared_job_compiles_over_native_tls_and_reuses_the_verified_completi
     let verified: Value = serde_json::from_slice(&receipt).unwrap();
     assert_eq!(verified["transport_authenticated"], true);
     assert_eq!(verified["worker_spki_sha256"], fixture.certificates.pin());
-    assert_eq!(
-        fixture.operation(&fixture.submission(&job))["state"],
-        "completed"
-    );
+    assert_eq!(verified["request_id"], running["request_id"]);
+    assert_eq!(completed["request_id"], running["request_id"]);
+    assert_eq!(fixture.operation(&submission)["state"], "completed");
     daemon.terminate();
     let mut restarted = fixture.daemon();
     assert_eq!(fixture.status(&job)["state"], "completed");
-    assert_eq!(
-        fixture.operation(&fixture.submission(&job))["state"],
-        "completed"
-    );
+    assert_eq!(fixture.operation(&submission)["state"], "completed");
     assert_eq!(fs::read(job.bundle.join("request.json")).unwrap(), request);
     assert_eq!(
         fs::read(job.delivery.join("delivery.json")).unwrap(),

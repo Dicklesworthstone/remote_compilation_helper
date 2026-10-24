@@ -12,7 +12,8 @@
 //! and only names in the newly validated result are considered for reuse.
 
 use super::{
-    CHUNK_BYTES, MAX_DELIVERY_BYTES, WorkerAuthentication, WorkerPeer, invalid, require, safe_name,
+    ArtifactByteCache, CHUNK_BYTES, MAX_DELIVERY_BYTES, WorkerAuthentication, WorkerPeer, invalid,
+    require, safe_name,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -258,6 +259,12 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for ResumePeer<'_, P> {
     fn resume_source(&self) -> Option<&ResumeSource> {
         Some(self.source)
     }
+    fn artifact_byte_cache(&self) -> Option<&ArtifactByteCache> {
+        self.inner.artifact_byte_cache()
+    }
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.inner.checkpoint()
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -466,10 +473,7 @@ mod delivery_tests {
                         .unwrap();
                     let offset = frame["offset"].as_u64().unwrap();
                     if artifact && self.fail_artifact_at.is_some_and(|limit| offset >= limit) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionReset,
-                            "injected interrupted artifact",
-                        ));
+                        return Ok(());
                     }
                     let bytes: &[u8] = match (artifact, name) {
                         (true, "a") => &self.artifact,
@@ -519,9 +523,16 @@ mod delivery_tests {
         }
         fn receive(&mut self) -> io::Result<Value> {
             self.receive_count += 1;
-            self.replies
-                .pop_front()
-                .ok_or_else(|| invalid("missing fixture reply"))
+            self.replies.pop_front().ok_or_else(|| {
+                if self.fail_artifact_at.is_some() {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "injected interrupted artifact",
+                    )
+                } else {
+                    invalid("missing fixture reply")
+                }
+            })
         }
     }
 

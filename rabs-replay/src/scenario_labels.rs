@@ -278,6 +278,159 @@ pub fn select_sessions<'a>(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// C018 (R87): Degraded compile-storm benchmark under UncoordinatedLocalFallback
+// ---------------------------------------------------------------------------
+
+use rabs_protocol::local_protocol::{
+    EmergencyLimiterDecision, FallbackAction, HostLocalEmergencyLimiter,
+    UNCOORDINATED_LOCAL_FALLBACK_LABEL, UncoordinatedFallbackTelemetry,
+};
+
+/// Degraded compile-storm benchmark report when edge/coordinator are unavailable
+/// and wrappers fail open en masse (bead C018; risk R87).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedStormBenchmark {
+    /// Explicit fallback mode telemetry label (`"UncoordinatedLocalFallback"`).
+    pub mode_label: &'static str,
+    /// Number of fallback Cargo roots in the storm session.
+    pub fallback_roots: usize,
+    /// Host CPU core count used to compute workstation saturation.
+    pub host_cpu_cores: u32,
+    /// Peak concurrent local Cargo roots without a host-local limiter.
+    pub unthrottled_peak_overlap: u32,
+    /// Unthrottled workstation saturation in permille (`peak_overlap * 1000 / host_cpu_cores`).
+    pub unthrottled_saturation_permille: u32,
+    /// Effective peak concurrent local Cargo roots when the optional limiter is engaged.
+    pub effective_peak_local_roots: u32,
+    /// Effective workstation saturation in permille with the optional limiter engaged.
+    pub effective_saturation_permille: u32,
+    /// Maximum safety-path delay (microseconds) introduced across all fallback roots.
+    pub max_safety_path_delay_us: u64,
+    /// Per-root `UncoordinatedLocalFallback` telemetry records emitted during the storm.
+    pub telemetry: Vec<UncoordinatedFallbackTelemetry>,
+}
+
+/// Run the degraded compile-storm benchmark (`R87`) over a storm session's records (bead C018).
+///
+/// Measures unthrottled workstation saturation when wrappers fail open en masse,
+/// optionally engages a pre-existing [`HostLocalEmergencyLimiter`] without ever
+/// exceeding `safety_latency_budget_us`, and labels every fallback invocation
+/// `UncoordinatedLocalFallback`.
+#[must_use]
+pub fn run_degraded_storm_benchmark(
+    records: &[SessionRecord],
+    host_cpu_cores: u32,
+    optional_limiter: Option<HostLocalEmergencyLimiter>,
+) -> DegradedStormBenchmark {
+    let cores = host_cpu_cores.max(1);
+    let unthrottled_peak_overlap = peak_overlap(records);
+    let unthrottled_saturation_permille = unthrottled_peak_overlap
+        .saturating_mul(1_000)
+        .checked_div(cores)
+        .unwrap_or(0);
+
+    // Track active local roots across arrival order when the optional host-local
+    // emergency limiter is consulted within its safety latency bound.
+    let mut sorted: Vec<(usize, SessionRecord)> = records.iter().copied().enumerate().collect();
+    sorted.sort_by_key(|(_, r)| r.recorded_at_unix_ms);
+
+    let mut active_end_times_ms: Vec<u64> = Vec::new();
+    let mut effective_peak_local_roots: u32 = 0;
+    let mut max_safety_path_delay_us: u64 = 0;
+    let mut telemetry = Vec::with_capacity(records.len());
+
+    for (idx, rec) in sorted {
+        active_end_times_ms.retain(|&end_ms| end_ms > rec.recorded_at_unix_ms);
+        let current_active = u32::try_from(active_end_times_ms.len()).unwrap_or(u32::MAX);
+
+        let decision = match optional_limiter {
+            None => EmergencyLimiterDecision::NotConfigured,
+            Some(limiter) => {
+                // Estimate wait in microseconds until the earliest active root finishes,
+                // capped by a fast local slot check when within budget.
+                let earliest_free_wait_us =
+                    active_end_times_ms
+                        .iter()
+                        .copied()
+                        .min()
+                        .map_or(0, |earliest_end| {
+                            earliest_end
+                                .saturating_sub(rec.recorded_at_unix_ms)
+                                .saturating_mul(1_000)
+                        });
+                limiter.evaluate(current_active, earliest_free_wait_us)
+            }
+        };
+
+        let delay_us = decision.safety_path_delay_us();
+        max_safety_path_delay_us = max_safety_path_delay_us.max(delay_us);
+
+        let running_after = match decision {
+            EmergencyLimiterDecision::QueuedWithinSafetyBudget {
+                max_concurrent_local_roots,
+                ..
+            } => max_concurrent_local_roots,
+            EmergencyLimiterDecision::NotConfigured
+            | EmergencyLimiterDecision::PermitGranted { .. }
+            | EmergencyLimiterDecision::BypassedForSafetyBound { .. } => {
+                current_active.saturating_add(1)
+            }
+        };
+        if !matches!(
+            decision,
+            EmergencyLimiterDecision::QueuedWithinSafetyBudget { .. }
+        ) {
+            active_end_times_ms.push(
+                rec.recorded_at_unix_ms
+                    .saturating_add(rec.duration_ms.max(1)),
+            );
+        }
+        effective_peak_local_roots = effective_peak_local_roots.max(running_after);
+
+        telemetry.push(UncoordinatedFallbackTelemetry::new(
+            (idx as u128) + 1,
+            FallbackAction::RunOriginalSeamless,
+            decision,
+        ));
+    }
+
+    let effective_saturation_permille = effective_peak_local_roots
+        .saturating_mul(1_000)
+        .checked_div(cores)
+        .unwrap_or(0);
+
+    DegradedStormBenchmark {
+        mode_label: UNCOORDINATED_LOCAL_FALLBACK_LABEL,
+        fallback_roots: records.len(),
+        host_cpu_cores: cores,
+        unthrottled_peak_overlap,
+        unthrottled_saturation_permille,
+        effective_peak_local_roots,
+        effective_saturation_permille,
+        max_safety_path_delay_us,
+        telemetry,
+    }
+}
+
+/// Emit the stable machine-readable NDJSON line for [`DegradedStormBenchmark`] (bead C018).
+#[must_use]
+pub fn degraded_storm_to_ndjson(bench: &DegradedStormBenchmark) -> String {
+    serde_json::json!({
+        "schema": "rabs.degraded-storm-benchmark",
+        "schema_version": 1,
+        "mode": bench.mode_label,
+        "fallback_roots": bench.fallback_roots,
+        "host_cpu_cores": bench.host_cpu_cores,
+        "unthrottled_peak_overlap": bench.unthrottled_peak_overlap,
+        "unthrottled_saturation_permille": bench.unthrottled_saturation_permille,
+        "effective_peak_local_roots": bench.effective_peak_local_roots,
+        "effective_saturation_permille": bench.effective_saturation_permille,
+        "max_safety_path_delay_us": bench.max_safety_path_delay_us,
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +604,51 @@ mod tests {
             ScenarioLabel::Ci,
             ScenarioLabel::Ide,
         ];
+    }
+
+    #[test]
+    fn c018_degraded_storm_benchmark_labels_uncoordinated_fallback_and_measures_saturation() {
+        // 16 concurrent fallback Cargo roots on an 8-core workstation:
+        // first 4 finish within 1ms (1000us, within 2000us safety budget) when others arrive.
+        let records = vec![
+            record(1, 1_000, 1),
+            record(2, 1_000, 1),
+            record(3, 1_000, 1),
+            record(4, 1_000, 1),
+            record(5, 1_000, 50),
+            record(6, 1_000, 50),
+            record(7, 1_000, 50),
+            record(8, 1_000, 50),
+        ];
+        let unthrottled = run_degraded_storm_benchmark(&records, 4, None);
+        assert_eq!(unthrottled.mode_label, "UncoordinatedLocalFallback");
+        assert_eq!(unthrottled.unthrottled_peak_overlap, 8);
+        assert_eq!(unthrottled.unthrottled_saturation_permille, 2_000);
+        assert_eq!(unthrottled.effective_peak_local_roots, 8);
+        assert_eq!(unthrottled.max_safety_path_delay_us, 0);
+        assert!(
+            unthrottled
+                .telemetry
+                .iter()
+                .all(|t| t.mode_label == "UncoordinatedLocalFallback")
+        );
+
+        let limiter = HostLocalEmergencyLimiter {
+            max_concurrent_local_roots: 4,
+            safety_latency_budget_us: 2_000,
+        };
+        let limited = run_degraded_storm_benchmark(&records, 4, Some(limiter));
+        assert_eq!(limited.mode_label, "UncoordinatedLocalFallback");
+        assert_eq!(limited.unthrottled_peak_overlap, 8);
+        assert_eq!(limited.effective_peak_local_roots, 4);
+        assert_eq!(limited.effective_saturation_permille, 1_000);
+        assert!(limited.max_safety_path_delay_us <= 2_000);
+
+        let ndjson = degraded_storm_to_ndjson(&limited);
+        let parsed: serde_json::Value = serde_json::from_str(&ndjson).unwrap();
+        assert_eq!(parsed["schema"], "rabs.degraded-storm-benchmark");
+        assert_eq!(parsed["mode"], "UncoordinatedLocalFallback");
+        assert_eq!(parsed["unthrottled_saturation_permille"], 2_000);
+        assert_eq!(parsed["effective_saturation_permille"], 1_000);
     }
 }

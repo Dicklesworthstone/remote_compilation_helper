@@ -41,6 +41,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
 
+fn parse_exec_worker(value: &str) -> std::result::Result<rch_common::WorkerId, String> {
+    if value.is_empty()
+        || value.contains(',')
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(
+            "--worker requires one nonempty worker ID, without whitespace or commas".into(),
+        );
+    }
+    Ok(rch_common::WorkerId::new(value))
+}
+
+fn parse_required_tool(value: &str) -> std::result::Result<String, String> {
+    rch_common::tool_requirement::validate(value)?;
+    Ok(value.to_owned())
+}
+
+#[cfg(test)]
+mod exact_runtime_cli_tests;
+
 #[derive(Parser)]
 #[command(name = "rch")]
 #[command(
@@ -556,9 +576,14 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         /// workload preflights as offload-eligible rather than `local`.
         #[arg(long)]
         job: bool,
-        /// Named tool the job requires a worker to have verified. Repeatable;
-        /// requires --job. Read-only here — nothing is synced or reserved.
-        #[arg(long, value_name = "NAME", requires = "job")]
+        /// Verified named tool, or exact node@VERSION / bun@VERSION requirement.
+        /// Repeatable. Read-only here — nothing is synced or reserved.
+        #[arg(
+            long,
+            visible_alias = "require-toolchain",
+            value_name = "NAME_OR_RUNTIME@VERSION",
+            value_parser = parse_required_tool
+        )]
         require_tool: Vec<String>,
         /// Command to preflight (quote or pass as multiple args)
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
@@ -616,9 +641,20 @@ USAGE:
         /// heartbeat/release rails, syncs no artifacts back, and its remote
         /// exit status surfaces verbatim (no toolchain/worker-env rerun
         /// heuristics). The PreToolUse hook never sets this flag.
+        // The whole clean-overlay family is listed, not just --clean-overlay:
+        // clap stops enforcing `requires = "clean_overlay"` once --job conflicts
+        // it away, so `--job --base X --no-overlay` parsed and then died as an
+        // internal error (bd-ythy6).
         #[arg(
             long,
-            conflicts_with_all = ["clean_overlay", "source_content_receipt"]
+            conflicts_with_all = [
+                "clean_overlay",
+                "source_content_receipt",
+                "base",
+                "dependency_base",
+                "overlay_path",
+                "no_overlay",
+            ]
         )]
         job: bool,
         /// Repository-relative directory to sync back from the worker after
@@ -629,19 +665,34 @@ USAGE:
         /// loudly (exit 102) regardless of the job's own exit status.
         #[arg(long, value_name = "DIR", requires = "job")]
         result_dir: Vec<PathBuf>,
-        /// Require a worker that has VERIFIED this operator-declared tool
-        /// (`[[workers]] tools = [{ name = "...", command = [...] }]`).
-        /// Repeatable; requires --job.
+        /// Require a verified named tool or exact node@VERSION / bun@VERSION.
+        /// Plain names refer to operator-declared worker tool probes.
+        /// Repeatable for compilation or jobs; all requirements must match.
+        /// Requires remote execution, with eligibility checked before reservation.
         ///
-        /// The gate runs before any slot is reserved, and it is evidence-based:
-        /// the worker must have run the declared probe successfully. A name no
-        /// worker has verified — including a typo — admits no worker at all,
-        /// because a silently dropped requirement would route the job to a
-        /// machine that cannot run it, and job mode returns the remote exit
-        /// status verbatim, so that failure is indistinguishable from the
-        /// job's own.
-        #[arg(long, value_name = "NAME", requires = "job")]
+        /// Runtime versions must be complete MAJOR.MINOR.PATCH identities
+        /// (optional prerelease/build suffix), not ranges or aliases. They are
+        /// matched against worker-reported capabilities, never named-tool labels.
+        /// This does not install runtimes, override version managers, or attest
+        /// the executable a job later chooses. Unknown versions admit no worker.
+        #[arg(
+            long,
+            visible_alias = "require-toolchain",
+            value_name = "NAME_OR_RUNTIME@VERSION",
+            value_parser = parse_required_tool
+        )]
         require_tool: Vec<String>,
+        /// Execute on this exact worker; overrides environment/project preferences.
+        /// Refuses local execution or a different worker when unavailable.
+        #[arg(long, value_name = "ID", value_parser = parse_exec_worker)]
+        worker: Option<rch_common::WorkerId>,
+        /// Run on a remote worker or refuse; never execute this command locally.
+        /// The per-invocation form of RCH_REQUIRE_REMOTE=1, and like --worker it
+        /// also outranks config that would run the command locally (force_local,
+        /// a disabled offload, the execution allowlist). A non-compilation
+        /// command is refused (RCH-E301) unless --job admits it to a worker.
+        #[arg(long)]
+        require_remote: bool,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -1225,6 +1276,11 @@ enum DaemonAction {
     },
     /// Show daemon status
     Status,
+    /// Inspect build admission or recover an abandoned maintenance operation
+    Admission {
+        #[command(subcommand)]
+        action: DaemonAdmissionAction,
+    },
     /// Tail daemon logs
     Logs {
         /// Number of lines to show
@@ -1243,10 +1299,19 @@ impl DaemonAction {
             DaemonAction::Stop { .. } => "stop",
             DaemonAction::Restart { .. } => "restart",
             DaemonAction::Status => "status",
+            DaemonAction::Admission { .. } => "admission",
             DaemonAction::Logs { .. } => "logs",
             DaemonAction::Reload => "reload",
         }
     }
+}
+
+#[derive(Subcommand)]
+enum DaemonAdmissionAction {
+    /// Show the admission barrier, maintenance owner, and recovery deadline
+    Status,
+    /// Recover only an absent or expired owner, then verify admission is open
+    Recover,
 }
 
 #[derive(Subcommand)]
@@ -2035,13 +2100,57 @@ fn main() {
         .block_on(async_main());
 }
 
+/// A failed load report was delivered in full; do not append an error document.
+#[derive(Debug, thiserror::Error)]
+#[error("storm-control invariants failed: {held}/{total} held")]
+struct LoadStormReportFailure {
+    held: usize,
+    total: usize,
+}
+
+fn load_storm_report_delivered(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LoadStormReportFailure>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<LoadStormReportFailure>().is_some())
+}
+
+fn output_delivery_failed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<commands::jobs::JobOutputFailure>()
+        .is_some()
+        || matches!(
+            error.downcast_ref::<ui::context::OutputError>(),
+            Some(ui::context::OutputError::Delivery(_))
+        )
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<commands::jobs::JobOutputFailure>()
+                .is_some()
+                || matches!(
+                    cause.downcast_ref::<ui::context::OutputError>(),
+                    Some(ui::context::OutputError::Delivery(_))
+                )
+        })
+}
+
 async fn async_main() {
+    use std::io::Write;
+
     let args: Vec<OsString> = env::args_os().collect();
     let wants_machine_output = top_level_machine_output_requested(&args);
 
     if let Err(error) = run(args).await {
         if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
             std::process::exit(exit.0);
+        }
+        if output_delivery_failed(&error) || load_storm_report_delivered(&error) {
+            // A structured document may be partial, or the failed load report
+            // was already delivered in full. Never append an error envelope.
+            // Even a closed stderr must not turn this delivery failure into
+            // a panic or a successful exit.
+            let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
+            std::process::exit(1);
         }
         if let Some(failure) = error.downcast_ref::<GcFailure>() {
             if wants_machine_output {
@@ -2051,23 +2160,43 @@ async fn async_main() {
                     ..Default::default()
                 });
                 if let Err(render_error) = ctx.json(&failure.response()) {
-                    eprintln!("Failed to serialize GC report: {render_error}");
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "Failed to serialize GC report: {render_error}"
+                    );
                 }
             } else {
-                eprintln!("Error: {failure}");
+                let _ = writeln!(std::io::stderr().lock(), "Error: {failure}");
             }
         } else if wants_machine_output {
             let response: ApiResponse<()> =
                 ApiResponse::err(top_level_command_label(), top_level_api_error(&error));
             match serde_json::to_string_pretty(&response) {
-                Ok(json) => println!("{json}"),
+                Ok(json) => {
+                    // This error envelope may be only partly delivered. A
+                    // closed pipe must preserve exit 1 without panicking or
+                    // attempting another stdout document.
+                    let rendered = {
+                        let mut output = std::io::stdout().lock();
+                        writeln!(output, "{json}").and_then(|_| output.flush())
+                    };
+                    if let Err(render_error) = rendered {
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "Failed to write JSON error response: {render_error}"
+                        );
+                    }
+                }
                 Err(serialize_error) => {
-                    eprintln!("Error: {error:#}");
-                    eprintln!("Failed to serialize JSON error response: {serialize_error}");
+                    let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "Failed to serialize JSON error response: {serialize_error}"
+                    );
                 }
             }
         } else {
-            eprintln!("Error: {error:#}");
+            let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
         }
         std::process::exit(1);
     }
@@ -2310,6 +2439,19 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                         min_seq_lag,
                     },
             } => commands::rabs_gc::run_doctor(cas_root, min_seq_lag, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::Verify { cas_root },
+            } => commands::rabs_gc::run_verify(cas_root, &ctx).await,
+            Commands::Rabs {
+                action:
+                    commands::rabs_gc::RabsCommand::Locate {
+                        object_key,
+                        cas_root,
+                    },
+            } => commands::rabs_gc::run_locate(object_key, cas_root, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::Quarantine { action },
+            } => commands::rabs_gc::run_quarantine(action, &ctx).await,
             Commands::Why { action } => commands::why::run(action, &ctx).await,
             Commands::Rabs {
                 action:
@@ -2319,6 +2461,9 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                         allow_namespace,
                     },
             } => commands::rabs_gc::run_inventory(cas_root, l2_root, allow_namespace, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::ReleaseVerdict { action },
+            } => commands::rabs_gc::run_release_verdict(action, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Gc {
@@ -2346,6 +2491,8 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 job,
                 result_dir,
                 require_tool,
+                worker,
+                require_remote,
                 command,
             } => {
                 hook::run_exec(
@@ -2358,6 +2505,8 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     job,
                     result_dir,
                     require_tool,
+                    worker,
+                    require_remote,
                     command,
                     &ctx,
                 )
@@ -3542,8 +3691,9 @@ fn policies() -> Vec<PolicyCapability> {
                     .to_string(),
             reason_code: Some("RCH-I012".to_string()),
             next_action:
-                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>`; a refusal surfaces \
-                 RCH-I012 instead of silently running locally."
+                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>` or, for one call, \
+                 `rch exec --require-remote -- <build cmd>`; a refusal surfaces RCH-I012 instead \
+                 of silently running locally."
                     .to_string(),
         },
         PolicyCapability {
@@ -3941,6 +4091,10 @@ async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> 
         DaemonAction::Status => {
             commands::daemon_status(ctx).await?;
         }
+        DaemonAction::Admission { action } => match action {
+            DaemonAdmissionAction::Status => commands::daemon_admission_status(ctx).await?,
+            DaemonAdmissionAction::Recover => commands::daemon_admission_recover(ctx).await?,
+        },
         DaemonAction::Logs { lines } => {
             commands::daemon_logs(lines, ctx)?;
         }
@@ -6386,32 +6540,46 @@ async fn handle_fleet(action: FleetAction, ctx: &OutputContext) -> Result<()> {
 /// installed `rch` could ever find. Now it resolves the URL and opens it.
 fn handle_web(url: Option<String>, no_open: bool, ctx: &OutputContext) -> Result<()> {
     let url = resolve_dashboard_url(url)?;
-    let api = format!("{}/api/fleet?view=help", url.trim_end_matches('/'));
+    let api = dashboard_agent_endpoint(&url)?;
 
+    // A launch failure must precede the success document, otherwise the
+    // top-level error handler would append a second document to stdout.
+    if !no_open {
+        open_browser(&url)?;
+    }
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "web",
             serde_json::json!({
                 "url": url,
                 "agent_endpoint": api,
                 "opened": !no_open,
             }),
-        ));
+        ))?;
     } else {
         ctx.info(&format!("Fleet dashboard: {url}"));
         ctx.info(&format!("Agent endpoint:  {api}   (help needs no key)"));
-    }
-    if !no_open {
-        open_browser(&url)?;
     }
     Ok(())
 }
 
 /// `--url`, then `RCH_DASHBOARD_URL`, then `[dashboard] url` in config.toml.
 fn resolve_dashboard_url(flag: Option<String>) -> Result<String> {
+    // A higher-priority URL needs no configuration read or default creation.
+    // Validate it through the same precedence rule, including invalid values.
+    if flag.as_deref().is_some_and(|url| !url.trim().is_empty()) {
+        return resolve_dashboard_url_from(flag, None, None);
+    }
+    let environment = std::env::var("RCH_DASHBOARD_URL").ok();
+    if environment
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        return resolve_dashboard_url_from(flag, environment, None);
+    }
     resolve_dashboard_url_from(
         flag,
-        std::env::var("RCH_DASHBOARD_URL").ok(),
+        environment,
         config::load_config().ok().and_then(|c| c.dashboard.url),
     )
 }
@@ -6435,26 +6603,50 @@ fn resolve_dashboard_url_from(
     }
 }
 
+/// Append the agent API to the dashboard path, replacing its UI query/fragment.
+/// String concatenation would otherwise place the suffix inside those fields.
+fn dashboard_agent_endpoint(url: &str) -> Result<String> {
+    let mut endpoint =
+        reqwest::Url::parse(url).map_err(|_| error::WebError::InvalidDashboardUrl {
+            url: url.to_owned(),
+        })?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+        return Err(error::WebError::InvalidDashboardUrl {
+            url: url.to_owned(),
+        }
+        .into());
+    }
+    let path = format!("{}/api/fleet", endpoint.path().trim_end_matches('/'));
+    endpoint.set_path(&path);
+    endpoint.set_query(Some("view=help"));
+    endpoint.set_fragment(None);
+    Ok(endpoint.to_string())
+}
+
 /// Open a URL in the default browser
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(url).spawn()?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     {
-        // Try xdg-open first, then fall back to common browsers
-        let result = std::process::Command::new("xdg-open").arg(url).spawn();
-
-        if result.is_err() {
-            // Try common browsers
-            for browser in &["firefox", "chromium", "chromium-browser", "google-chrome"] {
-                if std::process::Command::new(browser).arg(url).spawn().is_ok() {
-                    break;
-                }
+        use anyhow::Context as _;
+        // Preserve the existing fallback order, but never acknowledge a launch
+        // if every real executable failed to start.
+        let mut last_error = match std::process::Command::new("xdg-open").arg(url).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        for browser in &["firefox", "chromium", "chromium-browser", "google-chrome"] {
+            match std::process::Command::new(browser).arg(url).spawn() {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = error,
             }
         }
+        Err(last_error).context("Could not start a dashboard browser launcher")
     }
 
     #[cfg(target_os = "windows")]
@@ -6462,9 +6654,13 @@ fn open_browser(url: &str) -> Result<()> {
         std::process::Command::new("cmd")
             .args(&["/C", "start", "", url])
             .spawn()?;
+        Ok(())
     }
 
-    Ok(())
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("Opening the dashboard browser is unsupported on this platform")
+    }
 }
 
 // =============================================================================
@@ -6475,6 +6671,69 @@ fn open_browser(url: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn delivered_load_failure_keeps_typed_identity_without_message_matching() {
+        let error = anyhow::Error::new(LoadStormReportFailure { held: 2, total: 5 })
+            .context("load caller context");
+        assert!(load_storm_report_delivered(&error));
+        assert!(!output_delivery_failed(&error));
+        assert!(format!("{error:#}").contains("storm-control invariants failed: 2/5 held"));
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("load report caller")]
+        struct CallerFailure(#[source] LoadStormReportFailure);
+
+        let wrapped =
+            anyhow::Error::new(CallerFailure(LoadStormReportFailure { held: 1, total: 5 }));
+        assert!(load_storm_report_delivered(&wrapped));
+        assert!(!output_delivery_failed(&wrapped));
+
+        let unrelated = anyhow::anyhow!("storm-control invariants failed: 2/5 held");
+        assert!(!load_storm_report_delivered(&unrelated));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_delivery_classification_retains_real_error_identity_through_context() {
+        use std::collections::BTreeMap;
+        use std::os::unix::net::UnixStream;
+
+        let (socket, peer) = UnixStream::pair().unwrap();
+        socket
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        drop(peer);
+        let ctx = OutputContext::with_writers(
+            OutputConfig {
+                force_mode: Some(ui::context::OutputMode::Json),
+                color: ui::context::ColorChoice::Never,
+                ..Default::default()
+            },
+            ui::OutputWriter::new(socket, false),
+            ui::OutputWriter::stderr(),
+        );
+        let failure = ctx
+            .json(&serde_json::json!({"status": "observed"}))
+            .unwrap_err();
+        let error = anyhow::Error::new(failure).context("outer caller context");
+        assert!(output_delivery_failed(&error));
+        assert!(format!("{error:#}").contains("structured output could not be delivered"));
+
+        let invalid = BTreeMap::from([(vec![1_u8, 2], "unsupported key")]);
+        let failure = ctx.json(&invalid).unwrap_err();
+        assert!(matches!(&failure, ui::context::OutputError::Encoding(_)));
+        let error = anyhow::Error::new(failure).context("encoding caller context");
+        assert!(!output_delivery_failed(&error));
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let absent = retained.join("missing-input.json");
+        let failure = std::fs::File::open(&absent).unwrap_err();
+        assert_eq!(failure.kind(), std::io::ErrorKind::NotFound);
+        let error = anyhow::Error::new(failure).context("input file context");
+        assert!(!output_delivery_failed(&error));
+        assert!(!absent.exists());
+    }
 
     #[test]
     fn reliability_metrics_leave_hook_and_nonreporting_modes_uninstrumented() {
@@ -6938,6 +7197,8 @@ mod tests {
                 job,
                 result_dir,
                 require_tool: _,
+                worker: _,
+                require_remote: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -6984,6 +7245,8 @@ mod tests {
                 job,
                 result_dir,
                 require_tool: _,
+                worker: _,
+                require_remote: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -7028,6 +7291,7 @@ mod tests {
             .expect("exec subcommand");
         let help = exec.render_long_help().to_string();
         for flag in [
+            "--worker",
             "--base",
             "--clean-overlay",
             "--overlay-path",
@@ -7037,6 +7301,101 @@ mod tests {
             "--result-dir",
         ] {
             assert!(help.contains(flag), "exec help missing {flag}: {help}");
+        }
+    }
+
+    #[test]
+    fn explicit_tools_remain_compiler_requirements_without_job_bypass() {
+        let _guard = test_guard!();
+        for verb in ["exec", "admit"] {
+            let cli = Cli::try_parse_from([
+                "rch",
+                verb,
+                "--require-tool",
+                "cargo-xwin",
+                "--require-tool",
+                "llvm-ar",
+                "--",
+                "cargo",
+                "xwin",
+                "build",
+                "--release",
+            ])
+            .unwrap();
+            match cli.command {
+                Some(Commands::Exec {
+                    require_tool, job, ..
+                })
+                | Some(Commands::Admit {
+                    require_tool, job, ..
+                }) => {
+                    assert!(!job);
+                    assert_eq!(require_tool, vec!["cargo-xwin", "llvm-ar"]);
+                }
+                _ => fail_expected("Expected normal compiler requirements"),
+            }
+            for name in ["", "tool one", "one,two", "tool=value", "tool\n"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "rch",
+                        verb,
+                        "--require-tool",
+                        name,
+                        "--",
+                        "cargo",
+                        "build",
+                    ])
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_parses_exact_exec_worker_for_native_compilation() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--worker",
+            "native-worker",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--no-overlay",
+            "--",
+            "cargo",
+            "build",
+            "--release",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                worker,
+                clean_overlay,
+                no_overlay,
+                command,
+                job,
+                ..
+            }) => {
+                assert_eq!(worker, Some(rch_common::WorkerId::new("native-worker")));
+                assert!(clean_overlay && no_overlay);
+                assert!(!job);
+                assert_eq!(command, vec!["cargo", "build", "--release"]);
+            }
+            _ => fail_expected("Expected exact-worker native compilation"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_empty_or_multiple_exec_worker_ids() {
+        let _guard = test_guard!();
+        for worker in ["", " ", "one,two", "one two", "one\ntwo", "worker\0"] {
+            assert!(
+                Cli::try_parse_from(["rch", "exec", "--worker", worker, "--", "cargo", "build",])
+                    .is_err(),
+                "accepted malformed worker {worker:?}"
+            );
         }
     }
 
@@ -7096,6 +7455,34 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_exec_require_remote_flag() {
+        let _guard = test_guard!();
+        let parsed = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::Exec {
+                require_remote,
+                job,
+                command,
+                ..
+            }) => (require_remote, job, command),
+            _ => panic!("expected Commands::Exec for {args:?}"), // ubs:ignore — test assertion for an unexpected parser result.
+        };
+        assert_eq!(
+            parsed(&["rch", "exec", "--", "true"]),
+            (false, false, vec!["true".to_string()])
+        );
+        assert_eq!(
+            parsed(&["rch", "exec", "--require-remote", "--", "true"]),
+            (true, false, vec!["true".to_string()])
+        );
+        // With --job the non-compilation command runs on a worker or fails;
+        // the flag is redundant there but accepted.
+        assert_eq!(
+            parsed(&["rch", "exec", "--job", "--require-remote", "--", "true"]),
+            (true, true, vec!["true".to_string()])
+        );
+    }
+
+    #[test]
     fn cli_parses_exec_job_flag() {
         let _guard = test_guard!();
         let cli =
@@ -7142,6 +7529,51 @@ mod tests {
             "pytest",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_job_with_clean_overlay_family_flags() {
+        let _guard = test_guard!();
+        // bd-ythy6: without --clean-overlay these used to parse, because clap
+        // drops a `requires` whose target conflicts with a present arg, and
+        // then failed at run time as RCH-E504 "internal state". The conflict
+        // error's usage line must not suggest the rejected flags either.
+        for flags in [
+            &["--base", "HEAD", "--no-overlay"][..],
+            &["--base", "HEAD"][..],
+            &["--no-overlay"][..],
+            &["--overlay-path", "src/lib.rs"][..],
+            &["--dependency-base", "../dep=HEAD"][..],
+            &["--base", "HEAD", "--clean-overlay", "--no-overlay"][..],
+        ] {
+            let mut args = vec!["rch", "exec", "--job"];
+            args.extend_from_slice(flags);
+            args.extend_from_slice(&["--", "pytest"]);
+            let result = Cli::try_parse_from(&args);
+            assert!(result.is_err(), "{flags:?} must be refused with --job");
+            let Err(err) = result else { continue };
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flags:?}"
+            );
+            let usage = err.render().to_string();
+            let usage = usage
+                .lines()
+                .find(|line| line.contains("Usage:"))
+                .unwrap_or_default();
+            for rejected in [
+                "--base",
+                "--clean-overlay",
+                "--no-overlay",
+                "--overlay-path",
+            ] {
+                assert!(
+                    !(usage.contains("--job") && usage.contains(rejected)),
+                    "{flags:?}: usage suggests --job with {rejected}: {usage}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -9306,6 +9738,23 @@ mod tests {
         assert!(cli.json);
     }
 
+    #[test]
+    fn daemon_admission_diagnostics_and_safe_recovery_have_machine_output() {
+        for action in ["status", "recover"] {
+            let cli =
+                Cli::try_parse_from(["rch", "daemon", "admission", action, "--json"]).unwrap();
+            assert!(cli.json);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Daemon {
+                    action: DaemonAction::Admission { .. }
+                })
+            ));
+        }
+        assert!(Cli::try_parse_from(["rch", "daemon", "admission", "recover", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["rch", "daemon", "admission", "release"]).is_err());
+    }
+
     // -------------------------------------------------------------------------
     // Error Case Tests
     // -------------------------------------------------------------------------
@@ -9554,6 +10003,117 @@ mod tests {
             ),
             "expected WebError::NoDashboardUrl, got {err:?}"
         );
+    }
+
+    #[test]
+    fn dashboard_agent_endpoint_preserves_path_and_replaces_ui_query_and_fragment() {
+        for (url, expected) in [
+            (
+                "https://dashboard.example.invalid",
+                "https://dashboard.example.invalid/api/fleet?view=help",
+            ),
+            (
+                "https://dashboard.example.invalid/fleet/?tab=workers#selection",
+                "https://dashboard.example.invalid/fleet/api/fleet?view=help",
+            ),
+            (
+                "https://dashboard.example.invalid/?tab=workers#selection",
+                "https://dashboard.example.invalid/api/fleet?view=help",
+            ),
+            (
+                "https://dashboard.example.invalid/team%20α/?view=old#selection",
+                "https://dashboard.example.invalid/team%20%CE%B1/api/fleet?view=help",
+            ),
+            (
+                "http://[::1]:8080/fleet?tab=workers#selection",
+                "http://[::1]:8080/fleet/api/fleet?view=help",
+            ),
+        ] {
+            assert_eq!(dashboard_agent_endpoint(url).unwrap(), expected, "{url}");
+        }
+        for url in [
+            "https://",
+            "http://[::1",
+            "https://dashboard.example.invalid:99999",
+            "ftp://dashboard.example.invalid/fleet",
+        ] {
+            let error = dashboard_agent_endpoint(url).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<error::WebError>(),
+                Some(error::WebError::InvalidDashboardUrl { url: rejected }) if rejected == url
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn web_no_open_delivers_formats_and_propagates_real_output_failures() {
+        use std::os::unix::net::UnixStream;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let url = "https://dashboard.example.invalid/fleet/";
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            for closed in [false, true] {
+                let path = retained.join(format!("{format:?}-{closed}.output"));
+                let stdout = if closed {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    ui::OutputWriter::new(socket, false)
+                } else {
+                    ui::OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false)
+                };
+                let ctx = OutputContext::with_writers(
+                    OutputConfig {
+                        force_mode: Some(ui::context::OutputMode::Json),
+                        color: ui::context::ColorChoice::Never,
+                        format,
+                        ..Default::default()
+                    },
+                    stdout,
+                    ui::OutputWriter::stderr(),
+                );
+                // The explicit URL resolves without reading user configuration;
+                // no-open exercises the actual reporter without a browser launch.
+                let result = handle_web(Some(url.into()), true, &ctx);
+                if closed {
+                    let error = result.unwrap_err();
+                    assert!(output_delivery_failed(&error));
+                    assert!(matches!(
+                        error.downcast_ref::<ui::context::OutputError>(),
+                        Some(ui::context::OutputError::Delivery(cause))
+                            if cause.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                    assert!(!path.exists());
+                } else {
+                    result.unwrap();
+                    let bytes = std::fs::read(path).unwrap();
+                    let report = if format == OutputFormat::Toon {
+                        serde_json::from_str::<serde_json::Value>(
+                            &toon_rust::toon_to_json(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                    };
+                    assert_eq!(report["api_version"], "1.0");
+                    assert_eq!(report["command"], "web");
+                    assert_eq!(report["success"], true);
+                    assert!(report["error"].is_null());
+                    assert_eq!(
+                        report["data"],
+                        serde_json::json!({
+                            "url": url,
+                            "agent_endpoint": "https://dashboard.example.invalid/fleet/api/fleet?view=help",
+                            "opened": false,
+                        })
+                    );
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(retained).unwrap().count(), 2);
     }
 
     // -------------------------------------------------------------------------

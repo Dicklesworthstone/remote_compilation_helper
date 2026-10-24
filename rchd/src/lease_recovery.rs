@@ -11,9 +11,12 @@
 //! Source retirement can precede the daemon handoff: those unacknowledged
 //! journals still need recovery, even though no worker filesystem work remains.
 
-use crate::api::{is_process_alive, lease_blocks_restart, lease_owns_unretired_source};
+#[cfg(test)]
+use crate::api::is_process_alive;
+use crate::api::{lease_blocks_restart, lease_owns_unretired_source};
 use crate::events::EventBus;
 use rch_common::job_identity::{DurableJobLease, default_job_lease_directory};
+use rch_common::process_identity::{OwnerPresence, owner_presence};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -65,6 +68,18 @@ fn retired_delivery(lease: &DurableJobLease) -> Option<i32> {
         .and_then(|code| i32::try_from(code).ok())
 }
 
+/// Matches rchd's stuck-build hard cap (`should_remediate`) and the client's
+/// `DAEMON_ABSENCE_MIN_AGE_MS` threshold (bd-ey7fr).
+const DAEMON_ABSENCE_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn abandoned_without_recovery(lease: &DurableJobLease, now_unix_ms: u64) -> bool {
+    lease.recovery.is_none()
+        && lease.identity.remote_build_id.is_some_and(|id| id > 0)
+        && lease.worker_id.as_deref().is_some_and(|id| !id.is_empty())
+        && lease.heartbeat_unix_ms > 0
+        && now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DAEMON_ABSENCE_MIN_AGE_MS
+}
+
 /// A successful CLI exit can mean only that a live wrapper was asked to resume.
 /// Count recovery as complete only after reading the original journal back.
 fn verify_recovery_completion(
@@ -81,18 +96,41 @@ fn verify_recovery_completion(
     {
         return Err("recovery journal identity changed; completion not confirmed".into());
     }
+    if before.recovery.is_none() && after.recovery.is_none() {
+        if before.heartbeat_unix_ms == 0
+            || !after.terminal_acknowledged
+            || after.state != rch_common::job_identity::JobLifecycleState::Finished
+            || after.exit_code.is_none()
+            || before
+                .exit_code
+                .is_some_and(|observed| Some(observed) != after.exit_code)
+        {
+            return Err(
+                "recovery command exited without durable daemon/delivery acknowledgement".into(),
+            );
+        }
+        return Ok(());
+    }
     let daemon_exit = after.recovery.as_ref().and_then(|recipe| {
         recipe["daemon_exit_code"]
             .as_i64()
             .and_then(|code| i32::try_from(code).ok())
     });
+    // A long-dead build the daemon no longer knew held no reservation; the
+    // client accepts that absence only after the 24h stuck cap (bd-ey7fr).
+    let daemon_record_absent = after
+        .recovery
+        .as_ref()
+        .is_some_and(|recipe| recipe["daemon_record_absent"].as_bool() == Some(true));
     if !after.terminal_acknowledged
         || after.state != rch_common::job_identity::JobLifecycleState::Finished
         || retired_delivery(after).is_none()
         || retired_delivery(after) != after.exit_code
-        || daemon_exit.is_none()
+        || (daemon_exit.is_none() && !daemon_record_absent)
     {
-        return Err("recovery command exited without durable daemon/delivery acknowledgement".into());
+        return Err(
+            "recovery command exited without durable daemon/delivery acknowledgement".into(),
+        );
     }
     Ok(())
 }
@@ -102,8 +140,8 @@ fn read_lease(lease_dir: &Path, wrapper_id: &str) -> Result<DurableJobLease, Str
     let suffix = wrapper_id
         .strip_prefix(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
         .ok_or_else(|| "invalid recovery wrapper id".to_owned())?;
-    let uuid = uuid::Uuid::parse_str(suffix)
-        .map_err(|_| "invalid recovery wrapper id".to_owned())?;
+    let uuid =
+        uuid::Uuid::parse_str(suffix).map_err(|_| "invalid recovery wrapper id".to_owned())?;
     if uuid.to_string() != suffix {
         return Err("noncanonical recovery wrapper id".into());
     }
@@ -136,7 +174,7 @@ struct RecoveryCandidate {
 fn recoverable_candidates(
     lease_dir: &Path,
     now_unix_ms: u64,
-    alive: impl Fn(u32) -> bool,
+    presence: impl Fn(&DurableJobLease) -> OwnerPresence,
 ) -> Vec<RecoveryCandidate> {
     let Ok(entries) = std::fs::read_dir(lease_dir) else {
         return Vec::new();
@@ -154,8 +192,10 @@ fn recoverable_candidates(
         .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
         .filter(|lease| {
             !lease.terminal_acknowledged
-                && (lease_owns_unretired_source(lease) || retired_delivery(lease).is_some())
-                && !lease_blocks_restart(lease, now_unix_ms, || alive(lease.wrapper_pid))
+                && (lease_owns_unretired_source(lease)
+                    || retired_delivery(lease).is_some()
+                    || abandoned_without_recovery(lease, now_unix_ms))
+                && !lease_blocks_restart(lease, now_unix_ms, || presence(lease))
         })
         .filter_map(|lease| {
             Some(RecoveryCandidate {
@@ -203,7 +243,8 @@ impl Backoff {
     /// Forget leases that are no longer candidates (recovered, or reaped).
     fn retain(&mut self, candidates: &[String]) {
         let candidates: HashSet<&str> = candidates.iter().map(String::as_str).collect();
-        self.failures.retain(|id, _| candidates.contains(id.as_str()));
+        self.failures
+            .retain(|id, _| candidates.contains(id.as_str()));
     }
 }
 
@@ -244,7 +285,10 @@ impl RecoveryQueue {
                     })
             });
             let Some(next) = next else { break };
-            let candidate = self.pending.remove(next).expect("selected pending recovery");
+            let candidate = self
+                .pending
+                .remove(next)
+                .expect("selected pending recovery");
             let task = self.tasks.spawn(run(candidate.clone()));
             self.running.insert(task.id(), candidate);
             self.starts_remaining -= 1;
@@ -315,7 +359,9 @@ pub(crate) fn start(events: EventBus, socket: PathBuf) -> tokio::task::JoinHandl
                     }
                     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
                     match tokio::task::spawn_blocking(move || {
-                        recoverable_candidates(&default_job_lease_directory(), now, is_process_alive)
+                        recoverable_candidates(&default_job_lease_directory(), now, |lease| {
+                            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+                        })
                     }).await {
                         Ok(candidates) => queue.refresh(candidates),
                         Err(error) => warn!(%error, "Lease recovery scan failed; retaining in-flight tasks"),
@@ -452,15 +498,52 @@ mod tests {
     use super::*;
     use rch_common::job_identity::JobIdentity;
 
+    /// A fake `rch` for recovery: a hard link to one shim written once per
+    /// process, whose behavior is the data file `body` beside the link.
+    /// Writing a fresh executable and exec'ing it at once fails with ETXTBSY
+    /// when a concurrent test forks while the write fd is open (the child holds
+    /// a copy until it execs); see `launchd_singleton_tests` in main.rs.
+    #[cfg(unix)]
+    fn fake_rch(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        static SHIM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let shim = SHIM.get_or_init(|| {
+            let shim = tempfile::tempdir().unwrap().keep().join("rch-shim");
+            std::fs::write(
+                &shim,
+                "#!/bin/sh\nexec /bin/sh \"$(dirname \"$0\")/body\" \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+            shim
+        });
+        std::fs::write(dir.join("body"), body).unwrap();
+        let child = dir.join("rch");
+        if !child.exists() {
+            std::fs::hard_link(shim, &child).unwrap();
+        }
+        child
+    }
+
     fn recoverable_lease_ids(
         directory: &Path,
         now: u64,
         alive: impl Fn(u32) -> bool,
     ) -> Vec<String> {
-        recoverable_candidates(directory, now, alive)
-            .into_iter()
-            .map(|candidate| candidate.wrapper_id)
-            .collect()
+        recoverable_candidates(directory, now, |lease| {
+            if lease.wrapper_pid == 0 {
+                // The legacy test probe cannot establish ownership when no
+                // PID was recorded. Model the production tri-state result.
+                OwnerPresence::Unknown
+            } else if alive(lease.wrapper_pid) {
+                OwnerPresence::Live
+            } else {
+                OwnerPresence::Absent
+            }
+        })
+        .into_iter()
+        .map(|candidate| candidate.wrapper_id)
+        .collect()
     }
 
     fn candidate(id: &str, worker: &str) -> RecoveryCandidate {
@@ -475,8 +558,12 @@ mod tests {
     #[tokio::test]
     async fn recovery_queue_limits_global_and_per_worker_concurrency_across_scans() {
         let candidates = vec![
-            candidate("a1", "a"), candidate("a2", "a"), candidate("b1", "b"),
-            candidate("c1", "c"), candidate("d1", "d"), candidate("e1", "e"),
+            candidate("a1", "a"),
+            candidate("a2", "a"),
+            candidate("b1", "b"),
+            candidate("c1", "c"),
+            candidate("d1", "d"),
+            candidate("e1", "e"),
         ];
         let mut queue = RecoveryQueue::default();
         queue.refresh(candidates.clone());
@@ -487,7 +574,9 @@ mod tests {
         assert_eq!(queue.starts_remaining, 0);
         // A fresh scan cannot duplicate running wrappers or allocate more lanes.
         queue.refresh(candidates);
-        queue.start_ready(Instant::now(), |_| async { Err("exceeded in-flight cap".into()) });
+        queue.start_ready(Instant::now(), |_| async {
+            Err("exceeded in-flight cap".into())
+        });
         assert_eq!(queue.running.len(), MAX_RECOVERIES_PER_CYCLE);
         queue.tasks.shutdown().await;
     }
@@ -509,8 +598,11 @@ mod tests {
         queue.start_ready(Instant::now(), run);
         assert_eq!(queue.running.len(), 2);
         for expected in ["first", "second"] {
-            let (job, result) = tokio::time::timeout(Duration::from_secs(2), queue.next_completed())
-                .await.unwrap().unwrap();
+            let (job, result) =
+                tokio::time::timeout(Duration::from_secs(2), queue.next_completed())
+                    .await
+                    .unwrap()
+                    .unwrap();
             result.unwrap();
             assert_eq!(job.wrapper_id, expected);
             assert!(queue.running.values().any(|job| job.wrapper_id == "slow"));
@@ -534,7 +626,10 @@ mod tests {
         assert!(result.unwrap_err().contains("recovery task failed"));
         assert!(queue.running.is_empty());
         assert!(!queue.backoff.ready("panic", Instant::now()));
-        queue.refresh(vec![candidate("panic", "worker"), candidate("next", "worker")]);
+        queue.refresh(vec![
+            candidate("panic", "worker"),
+            candidate("next", "worker"),
+        ]);
         queue.start_ready(Instant::now(), |job| async move {
             assert_eq!(job.wrapper_id, "next", "failed wrapper bypassed backoff");
             Ok(())
@@ -544,7 +639,9 @@ mod tests {
 
     #[tokio::test]
     async fn fast_recoveries_do_not_bypass_the_per_scan_start_budget() {
-        let candidates: Vec<_> = (0..6).map(|index| candidate(&format!("job-{index}"), "worker")).collect();
+        let candidates: Vec<_> = (0..6)
+            .map(|index| candidate(&format!("job-{index}"), "worker"))
+            .collect();
         let mut queue = RecoveryQueue::default();
         queue.refresh(candidates.clone());
         for _ in 0..MAX_RECOVERIES_PER_CYCLE {
@@ -552,10 +649,17 @@ mod tests {
             assert_eq!(queue.running.len(), 1);
             queue.next_completed().await.unwrap().1.unwrap();
         }
-        queue.start_ready(Instant::now(), |_| async { Err("exceeded per-scan start budget".into()) });
+        queue.start_ready(Instant::now(), |_| async {
+            Err("exceeded per-scan start budget".into())
+        });
         assert!(queue.running.is_empty());
         assert_eq!(queue.pending.len(), 2);
-        queue.refresh(candidates.into_iter().skip(MAX_RECOVERIES_PER_CYCLE).collect());
+        queue.refresh(
+            candidates
+                .into_iter()
+                .skip(MAX_RECOVERIES_PER_CYCLE)
+                .collect(),
+        );
         queue.start_ready(Instant::now(), |_| async { Ok(()) });
         assert_eq!(queue.next_completed().await.unwrap().0.wrapper_id, "job-4");
     }
@@ -568,7 +672,9 @@ mod tests {
         queue.start_ready(Instant::now(), |_| async { Ok(()) });
         queue.refresh(vec![job]);
         queue.next_completed().await.unwrap().1.unwrap();
-        queue.start_ready(Instant::now(), |_| async { Err("replayed a completed scan snapshot".into()) });
+        queue.start_ready(Instant::now(), |_| async {
+            Err("replayed a completed scan snapshot".into())
+        });
         assert!(queue.pending.is_empty());
         assert!(queue.running.is_empty());
     }
@@ -588,7 +694,9 @@ mod tests {
             sender.shutdown().await.unwrap();
         };
         let consumer = drain_recovery_stderr(&mut receiver, &mut tail);
-        let ((), drained) = tokio::time::timeout(Duration::from_secs(10), async {
+        // Only a hang guard: 2 MiB through a 128-byte pipe is ~16k wakeups,
+        // which exceeded 10 s on a Mac at load 64.
+        let ((), drained) = tokio::time::timeout(Duration::from_secs(60), async {
             tokio::join!(producer, consumer)
         })
         .await
@@ -710,7 +818,8 @@ mod tests {
         ];
         for (_name, lease) in &leases {
             std::fs::write(
-                dir.path().join(format!("{}.json", lease.identity.local_wrapper_id)),
+                dir.path()
+                    .join(format!("{}.json", lease.identity.local_wrapper_id)),
                 serde_json::to_vec(lease).unwrap(),
             )
             .unwrap();
@@ -726,6 +835,30 @@ mod tests {
     fn missing_lease_directory_has_no_candidates() {
         let dir = tempfile::tempdir().unwrap();
         assert!(recoverable_lease_ids(&dir.path().join("absent"), 0, |_| false).is_empty());
+    }
+
+    #[test]
+    fn uncertain_ownership_never_authorizes_source_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let candidate = lease(
+            now - 60 * 60 * 1000,
+            4242,
+            serde_json::json!({"source_roots":["/p"],"retired":false}),
+        );
+        std::fs::write(
+            dir.path()
+                .join(format!("{}.json", candidate.identity.local_wrapper_id)),
+            serde_json::to_vec(&candidate).unwrap(),
+        )
+        .unwrap();
+
+        for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
+            assert!(recoverable_candidates(dir.path(), now, |_| presence).is_empty());
+        }
+        let recovered = recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].wrapper_id, candidate.identity.local_wrapper_id);
     }
 
     #[test]
@@ -778,13 +911,23 @@ mod tests {
         let unknown = handoff_lease(stale, 0, 102);
         let acknowledged = completed_lease(&handoff_lease(stale, 11, 102), 102, 130);
         for (_name, candidate) in [
-            ("pending", &pending), ("live", &live), ("fresh", &fresh),
-            ("unknown", &unknown), ("acknowledged", &acknowledged),
+            ("pending", &pending),
+            ("live", &live),
+            ("fresh", &fresh),
+            ("unknown", &unknown),
+            ("acknowledged", &acknowledged),
         ] {
-            std::fs::write(dir.path().join(format!("{}.json", candidate.identity.local_wrapper_id)), serde_json::to_vec(candidate).unwrap()).unwrap();
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", candidate.identity.local_wrapper_id)),
+                serde_json::to_vec(candidate).unwrap(),
+            )
+            .unwrap();
         }
-        assert_eq!(recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
-            std::slice::from_ref(&pending.identity.local_wrapper_id));
+        assert_eq!(
+            recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
+            std::slice::from_ref(&pending.identity.local_wrapper_id)
+        );
     }
 
     #[test]
@@ -820,6 +963,13 @@ mod tests {
         let mut no_daemon_receipt = complete.clone();
         no_daemon_receipt.recovery.as_mut().unwrap()["daemon_exit_code"] = serde_json::Value::Null;
         assert!(verify_recovery_completion(&before, &no_daemon_receipt).is_err());
+        // bd-ey7fr: a long-dead build the daemon no longer knew settles on
+        // the client's recorded absence instead of a terminal receipt.
+        let mut forgotten = no_daemon_receipt.clone();
+        forgotten.recovery.as_mut().unwrap()["daemon_record_absent"] = serde_json::json!(true);
+        verify_recovery_completion(&before, &forgotten).unwrap();
+        forgotten.recovery.as_mut().unwrap()["daemon_record_absent"] = serde_json::json!("true");
+        assert!(verify_recovery_completion(&before, &forgotten).is_err());
         let mut false_success = complete.clone();
         false_success.exit_code = Some(0);
         assert!(verify_recovery_completion(&before, &false_success).is_err());
@@ -839,7 +989,11 @@ mod tests {
         let now_ms = 100 * 60 * 60 * 1000;
         let pending = handoff_lease(now_ms - 30 * 60 * 1000, 11, 102);
         let id = &pending.identity.local_wrapper_id;
-        std::fs::write(dir.path().join(format!("{id}.json")), serde_json::to_vec(&pending).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{id}.json")),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
         let now = Instant::now();
         let mut backoff = Backoff::default();
         backoff.record_failure(id, now);
@@ -851,16 +1005,21 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn child_exit_zero_without_journal_completion_is_not_auto_recovery_success() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let pending = handoff_lease(0, 11, 102);
         let id = &pending.identity.local_wrapper_id;
         let path = dir.path().join(format!("{id}.json"));
         std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-        let child = dir.path().join("rch");
-        std::fs::write(&child, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = recover_in(&child, &dir.path().join("unused.sock"), dir.path(), id, None).await.unwrap_err();
+        let child = fake_rch(dir.path(), "exit 0\n");
+        let error = recover_in(
+            &child,
+            &dir.path().join("unused.sock"),
+            dir.path(),
+            id,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("without durable daemon/delivery acknowledgement"));
         assert_eq!(read_lease(dir.path(), id).unwrap(), pending);
 
@@ -869,37 +1028,75 @@ mod tests {
         std::fs::write(&receipt, serde_json::to_vec(&complete).unwrap()).unwrap();
         // The test-owned child simulates writing the final durable journal;
         // the daemon must inspect that journal rather than its exit alone.
-        std::fs::write(&child, format!("#!/bin/sh\ncp -- {} {}\n",
-            shell_escape::escape(receipt.to_str().unwrap().into()),
-            shell_escape::escape(path.to_str().unwrap().into()))).unwrap();
-        recover_in(&child, &dir.path().join("unused.sock"), dir.path(), id, None).await.unwrap();
+        fake_rch(
+            dir.path(),
+            &format!(
+                "cp -- {} {}\n",
+                shell_escape::escape(receipt.to_str().unwrap().into()),
+                shell_escape::escape(path.to_str().unwrap().into())
+            ),
+        );
+        recover_in(
+            &child,
+            &dir.path().join("unused.sock"),
+            dir.path(),
+            id,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn recovery_scan_uses_canonical_regular_journals_and_oldest_owner_first() {
-        let dir = tempfile::tempdir().unwrap();
+        // The socket fixture's path must fit sockaddr_un (104 bytes on macOS,
+        // where the default TMPDIR alone is ~49).
+        let dir = tempfile::Builder::new()
+            .prefix("rch-lease-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let now = 100 * 60 * 60 * 1000;
         let oldest = handoff_lease(0, 11, 102);
         let newer = handoff_lease(now - 30 * 60 * 1000, 11, 102);
         for lease in [&oldest, &newer] {
-            std::fs::write(dir.path().join(format!("{}.json", lease.identity.local_wrapper_id)),
-                serde_json::to_vec(lease).unwrap()).unwrap();
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", lease.identity.local_wrapper_id)),
+                serde_json::to_vec(lease).unwrap(),
+            )
+            .unwrap();
         }
-        let original = dir.path().join(format!("{}.json", oldest.identity.local_wrapper_id));
+        let original = dir
+            .path()
+            .join(format!("{}.json", oldest.identity.local_wrapper_id));
         let alias = format!("{}.json", JobIdentity::new_local().local_wrapper_id);
         std::os::unix::fs::symlink(&original, dir.path().join(alias)).unwrap();
-        std::fs::write(dir.path().join("not-a-wrapper.json"), std::fs::read(&original).unwrap()).unwrap();
-        let socket = dir.path().join(format!("{}.json", JobIdentity::new_local().local_wrapper_id));
+        std::fs::write(
+            dir.path().join("not-a-wrapper.json"),
+            std::fs::read(&original).unwrap(),
+        )
+        .unwrap();
+        let socket = dir.path().join(format!(
+            "{}.json",
+            JobIdentity::new_local().local_wrapper_id
+        ));
         let _listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
         let mut unknown_schema = handoff_lease(0, 11, 102);
         unknown_schema.schema_version = 2;
         std::fs::write(
-            dir.path().join(format!("{}.json", unknown_schema.identity.local_wrapper_id)),
+            dir.path()
+                .join(format!("{}.json", unknown_schema.identity.local_wrapper_id)),
             serde_json::to_vec(&unknown_schema).unwrap(),
-        ).unwrap();
-        assert_eq!(recoverable_lease_ids(dir.path(), now, |_| false),
-            [oldest.identity.local_wrapper_id, newer.identity.local_wrapper_id]);
+        )
+        .unwrap();
+        assert_eq!(
+            recoverable_lease_ids(dir.path(), now, |_| false),
+            [
+                oldest.identity.local_wrapper_id,
+                newer.identity.local_wrapper_id
+            ]
+        );
     }
 
     #[tokio::test]
@@ -915,10 +1112,61 @@ mod tests {
             candidate.build_id = build;
             let error = recover_in(
                 &dir.path().join("client-that-must-not-start"),
-                &dir.path().join("unused.sock"), dir.path(), id, Some(&candidate),
-            ).await.unwrap_err();
-            assert!(error.contains("admission changed after scanning"), "{error}");
+                &dir.path().join("unused.sock"),
+                dir.path(),
+                id,
+                Some(&candidate),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.contains("admission changed after scanning"),
+                "{error}"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), journal);
         }
+    }
+
+    #[test]
+    fn recipeless_dead_leases_become_recoverable_after_24h_and_verify_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let twenty_four_hours_ago = now - DAEMON_ABSENCE_MIN_AGE_MS;
+        let too_young = twenty_four_hours_ago + 1;
+
+        let mut mature = lease(twenty_four_hours_ago, 11, serde_json::Value::Null);
+        mature.recovery = None;
+        let mut young = lease(too_young, 11, serde_json::Value::Null);
+        young.recovery = None;
+        let mut live_owner = lease(twenty_four_hours_ago, 22, serde_json::Value::Null);
+        live_owner.recovery = None;
+
+        for candidate in [&mature, &young, &live_owner] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", candidate.identity.local_wrapper_id)),
+                serde_json::to_vec(candidate).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
+            std::slice::from_ref(&mature.identity.local_wrapper_id)
+        );
+
+        assert!(verify_recovery_completion(&mature, &mature).is_err());
+        let mut settled = mature.clone();
+        settled.exit_code = Some(102);
+        settled.acknowledge_terminal(now);
+        verify_recovery_completion(&mature, &settled).unwrap();
+
+        let mut with_observed_exit = mature.clone();
+        with_observed_exit.exit_code = Some(101);
+        let mut mismatched_exit = settled.clone();
+        mismatched_exit.exit_code = Some(102);
+        assert!(verify_recovery_completion(&with_observed_exit, &mismatched_exit).is_err());
+        let mut matching_exit = settled;
+        matching_exit.exit_code = Some(101);
+        verify_recovery_completion(&with_observed_exit, &matching_exit).unwrap();
     }
 }

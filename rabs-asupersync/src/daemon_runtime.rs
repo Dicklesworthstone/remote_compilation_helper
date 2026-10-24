@@ -280,6 +280,23 @@ async fn subsystem_body(
     }
 }
 
+/// Drive a top-level future on a standalone current-thread runtime outside any
+/// active `asupersync` task.
+///
+/// # Panics
+/// Panics if `Cx::current().is_some()`, enforcing the nested-runtime
+/// prohibition dynamically as well as statically.
+pub fn block_on_top_level<F: std::future::Future>(
+    runtime: &asupersync::runtime::Runtime,
+    future: F,
+) -> F::Output {
+    assert!(
+        Cx::current().is_none(),
+        "nested runtime entry is forbidden inside an active asupersync task"
+    );
+    runtime.block_on(future)
+}
+
 /// Boot the runtime island, run the subsystem regions, shut down
 /// cleanly, and return the receipt generated from the accounting.
 pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonError> {

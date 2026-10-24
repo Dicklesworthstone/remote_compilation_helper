@@ -1,6 +1,6 @@
-//! Fleet/cache/latency dashboard panels (bead R007; plan §105).
+//! Fleet/cache/latency dashboard panels (bead R007, `bd-cl8mf`; plan §6, §105).
 //!
-//! The eight panels the plan names, as typed data models built from
+//! The panels the plan names, as typed data models built from
 //! metric inputs by deterministic integer math (nearest-rank
 //! percentiles, permille rates — no floats):
 //!
@@ -8,6 +8,9 @@
 //! - user-visible latency distribution (p50/p95/p99);
 //! - cache effectiveness + miss causes (by stable reason code,
 //!   ranked);
+//! - served-fraction telemetry (`bd-cl8mf`: `rustc` invocations served
+//!   rather than executed from [`DecisionReceipt`]s, long-run `> 90%`
+//!   goal, reported rather than gated until the M16 frontier review);
 //! - top expensive/repeated crates (bounded, sorted);
 //! - action critical paths (bounded, from the I015 estimates);
 //! - transfer/CAS health (dedup ratio in permille);
@@ -15,6 +18,175 @@
 //! - determinism/verification status.
 //!
 //! Empty inputs produce honest zeros, never invented numbers.
+
+use crate::decision_receipt::{CacheLookupDecision, DecisionReceipt};
+use crate::descriptor::ActionClass;
+
+/// Long-run §6 goal for fleet `rustc` invocations served rather than
+/// executed (`> 90%` = strictly greater than `900` permille in warm,
+/// converged workloads).
+pub const LONG_RUN_SERVED_GOAL_PERMILLE: u32 = 900;
+
+/// Governance standing of the §6 served-fraction metric (`bd-cl8mf`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServedFractionStanding {
+    /// Reported on dashboards from [`DecisionReceipt`]s, not a blocking
+    /// release gate until the Phase 5 / M16 frontier review.
+    #[default]
+    ReportedNotGated,
+}
+
+/// Per-action-class served vs executed breakdown from [`DecisionReceipt`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassServedBreakdown {
+    /// Semantic action class.
+    pub action_class: ActionClass,
+    /// Receipts in this class with [`CacheLookupDecision::Hit`].
+    pub served: u64,
+    /// Receipts in this class that executed or were refused cache lookup.
+    pub executed_or_refused: u64,
+    /// Served fraction in permille (`served * 1000 / total`).
+    pub served_permille: u32,
+}
+
+/// Served-fraction telemetry panel computed from [`DecisionReceipt`]s (`bd-cl8mf`).
+///
+/// Tracks both the §6 headline metric ("Fleet `rustc` invocations served
+/// rather than executed", excluding capability probes and non-`rustc` classes
+/// via [`ActionClass::is_rustc_compile`]) and the all-receipts total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedFractionTelemetry {
+    /// Total decision receipts inspected across all action classes.
+    pub total_receipts: u64,
+    /// Total receipts served from cache across all action classes.
+    pub total_served: u64,
+    /// Served rate across all action classes (permille).
+    pub total_served_permille: u32,
+    /// Cacheable `rustc` compile receipts inspected (`ActionClass::is_rustc_compile`).
+    pub rustc_receipts: u64,
+    /// Cacheable `rustc` compile receipts served from cache (`Hit`).
+    pub rustc_served: u64,
+    /// Cacheable `rustc` compile receipts executed or refused (`Miss` / `Refused`).
+    pub rustc_executed: u64,
+    /// Fleet `rustc` invocations served rate in permille (`0..=1000`).
+    pub rustc_served_permille: u32,
+    /// Long-run §6 target threshold in permille (`900` = 90%).
+    pub goal_permille: u32,
+    /// Whether the observed `rustc` served fraction strictly exceeds the
+    /// long-run `> 90%` goal (`rustc_served * 10 > rustc_receipts * 9`).
+    pub meets_long_run_goal: bool,
+    /// Governance standing (`ReportedNotGated` until the M16 frontier review).
+    pub standing: ServedFractionStanding,
+    /// Per-class breakdown sorted deterministically by [`ActionClass`].
+    pub by_class: Vec<ClassServedBreakdown>,
+}
+
+impl Default for ServedFractionTelemetry {
+    fn default() -> Self {
+        Self {
+            total_receipts: 0,
+            total_served: 0,
+            total_served_permille: 0,
+            rustc_receipts: 0,
+            rustc_served: 0,
+            rustc_executed: 0,
+            rustc_served_permille: 0,
+            goal_permille: LONG_RUN_SERVED_GOAL_PERMILLE,
+            meets_long_run_goal: false,
+            standing: ServedFractionStanding::ReportedNotGated,
+            by_class: Vec::new(),
+        }
+    }
+}
+
+/// Compute [`ServedFractionTelemetry`] deterministically from a slice of
+/// [`DecisionReceipt`]s (`bd-cl8mf`).
+#[must_use]
+pub fn served_fraction_from_receipts(receipts: &[DecisionReceipt]) -> ServedFractionTelemetry {
+    let mut total_receipts = 0_u64;
+    let mut total_served = 0_u64;
+    let mut rustc_receipts = 0_u64;
+    let mut rustc_served = 0_u64;
+    let mut rustc_executed = 0_u64;
+    let mut per_class: Vec<(ActionClass, u64, u64)> = Vec::new();
+
+    for receipt in receipts {
+        total_receipts += 1;
+        let is_hit = matches!(receipt.cache_lookup, CacheLookupDecision::Hit);
+        if is_hit {
+            total_served += 1;
+        }
+        if receipt.invocation_class.is_rustc_compile() {
+            rustc_receipts += 1;
+            if is_hit {
+                rustc_served += 1;
+            } else {
+                rustc_executed += 1;
+            }
+        }
+        match per_class
+            .iter_mut()
+            .find(|(c, _, _)| *c == receipt.invocation_class)
+        {
+            Some((_, served, exec)) => {
+                if is_hit {
+                    *served += 1;
+                } else {
+                    *exec += 1;
+                }
+            }
+            None => {
+                let (s, e) = if is_hit { (1, 0) } else { (0, 1) };
+                per_class.push((receipt.invocation_class, s, e));
+            }
+        }
+    }
+
+    per_class.sort_by_key(|(class, _, _)| *class);
+    let by_class = per_class
+        .into_iter()
+        .map(|(action_class, served, executed_or_refused)| {
+            let class_total = served + executed_or_refused;
+            let served_permille =
+                u32::try_from((served * 1_000).checked_div(class_total).unwrap_or(0)).unwrap_or(0);
+            ClassServedBreakdown {
+                action_class,
+                served,
+                executed_or_refused,
+                served_permille,
+            }
+        })
+        .collect();
+
+    let total_served_permille = u32::try_from(
+        (total_served * 1_000)
+            .checked_div(total_receipts)
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let rustc_served_permille = u32::try_from(
+        (rustc_served * 1_000)
+            .checked_div(rustc_receipts)
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let meets_long_run_goal = rustc_receipts > 0
+        && (rustc_served * 1_000) > rustc_receipts * u64::from(LONG_RUN_SERVED_GOAL_PERMILLE);
+
+    ServedFractionTelemetry {
+        total_receipts,
+        total_served,
+        total_served_permille,
+        rustc_receipts,
+        rustc_served,
+        rustc_executed,
+        rustc_served_permille,
+        goal_permille: LONG_RUN_SERVED_GOAL_PERMILLE,
+        meets_long_run_goal,
+        standing: ServedFractionStanding::ReportedNotGated,
+        by_class,
+    }
+}
 
 /// Worker posture states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +275,448 @@ pub struct VerificationPanel {
     pub divergences: u64,
 }
 
+/// Terminal provenance disposition of one speculative action run (bead Q009; plan §78, §97).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculationRunOutcome {
+    /// Speculation completed before foreground demand or pressure and saved foreground latency.
+    SavedCompleted,
+    /// Speculation was joined or promoted by a foreground subscriber in flight without restart.
+    PromotedToForeground,
+    /// Speculation was cancelled mid-flight under hard pressure (wasted execution/transfer/storage).
+    CancelledUnderPressure,
+    /// Speculation completed or expired without ever serving a foreground subscriber (wasted work).
+    WastedUnused,
+    /// Speculative admission was shed at the soft/hard brownout gate before starting (zero cost).
+    AdmissionRefusedBrownout,
+}
+
+/// Provenance accounting record for one speculative action run feeding the ROI dashboard (bead Q009).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculationRunRecord {
+    /// Terminal provenance disposition of the speculative run.
+    pub outcome: SpeculationRunOutcome,
+    /// Foreground wall-clock latency saved by this run (ms); 0 when wasted/cancelled/refused.
+    pub saved_foreground_latency_ms: u64,
+    /// Execution time spent by this speculative attempt (ms).
+    pub execution_cost_ms: u64,
+    /// Network/IPC transfer bytes consumed by this speculative attempt.
+    pub transfer_cost_bytes: u64,
+    /// CAS/staging storage bytes consumed by this speculative attempt.
+    pub storage_cost_bytes: u64,
+}
+
+/// Speculation ROI dashboard panel (bead Q009; plan §78, §97, §164, R16).
+///
+/// Accounts for saved foreground latency vs wasted execution/transfer/storage
+/// cost and promoted/cancelled/wasted/saved counts from provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeculationRoiPanel {
+    /// Speculative runs promoted to foreground interest in flight.
+    pub promoted: u64,
+    /// Speculative runs cancelled mid-flight under pressure.
+    pub cancelled: u64,
+    /// Total wasted speculative runs (`CancelledUnderPressure` + `WastedUnused`).
+    pub wasted: u64,
+    /// Total saved speculative runs (`SavedCompleted` + `PromotedToForeground`).
+    pub saved: u64,
+    /// Speculative admissions refused at the brownout gate before execution.
+    pub admissions_refused: u64,
+    /// Total foreground latency saved across saved/promoted runs (ms).
+    pub saved_foreground_latency_ms: u64,
+    /// Nearest-rank p50 of saved foreground latency across executed speculative runs (ms).
+    pub saved_p50_ms: u64,
+    /// Nearest-rank p95 of saved foreground latency across executed speculative runs (ms).
+    pub saved_p95_ms: u64,
+    /// Total execution time spent across all executed speculative runs (ms).
+    pub total_execution_cost_ms: u64,
+    /// Execution time spent on cancelled or unused speculative runs (ms).
+    pub wasted_execution_cost_ms: u64,
+    /// Transfer bytes spent on cancelled or unused speculative runs.
+    pub wasted_transfer_cost_bytes: u64,
+    /// Storage bytes spent on cancelled or unused speculative runs.
+    pub wasted_storage_cost_bytes: u64,
+    /// Net latency minus wasted execution cost (`saved_foreground_latency_ms - wasted_execution_cost_ms`).
+    pub net_saved_minus_wasted_exec_ms: i64,
+    /// Useful speculative work rate in permille (`saved * 1000 / (saved + wasted)`).
+    pub useful_work_permille: u32,
+    /// Whether speculation delivered strictly positive p95 value and positive net ROI (feeds Q010).
+    pub positive_p95_value: bool,
+}
+
+/// Compute [`SpeculationRoiPanel`] deterministically from provenance run records (bead Q009).
+#[must_use]
+pub fn build_speculation_roi(runs: &[SpeculationRunRecord]) -> SpeculationRoiPanel {
+    let mut promoted = 0_u64;
+    let mut cancelled = 0_u64;
+    let mut wasted = 0_u64;
+    let mut saved = 0_u64;
+    let mut admissions_refused = 0_u64;
+    let mut saved_foreground_latency_ms = 0_u64;
+    let mut total_execution_cost_ms = 0_u64;
+    let mut wasted_execution_cost_ms = 0_u64;
+    let mut wasted_transfer_cost_bytes = 0_u64;
+    let mut wasted_storage_cost_bytes = 0_u64;
+    let mut net_samples_ms: Vec<i64> = Vec::new();
+
+    for run in runs {
+        match run.outcome {
+            SpeculationRunOutcome::SavedCompleted => {
+                saved += 1;
+                saved_foreground_latency_ms =
+                    saved_foreground_latency_ms.saturating_add(run.saved_foreground_latency_ms);
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                net_samples_ms
+                    .push(i64::try_from(run.saved_foreground_latency_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::PromotedToForeground => {
+                promoted += 1;
+                saved += 1;
+                saved_foreground_latency_ms =
+                    saved_foreground_latency_ms.saturating_add(run.saved_foreground_latency_ms);
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                net_samples_ms
+                    .push(i64::try_from(run.saved_foreground_latency_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::CancelledUnderPressure => {
+                cancelled += 1;
+                wasted += 1;
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_execution_cost_ms =
+                    wasted_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_transfer_cost_bytes =
+                    wasted_transfer_cost_bytes.saturating_add(run.transfer_cost_bytes);
+                wasted_storage_cost_bytes =
+                    wasted_storage_cost_bytes.saturating_add(run.storage_cost_bytes);
+                net_samples_ms.push(-i64::try_from(run.execution_cost_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::WastedUnused => {
+                wasted += 1;
+                total_execution_cost_ms =
+                    total_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_execution_cost_ms =
+                    wasted_execution_cost_ms.saturating_add(run.execution_cost_ms);
+                wasted_transfer_cost_bytes =
+                    wasted_transfer_cost_bytes.saturating_add(run.transfer_cost_bytes);
+                wasted_storage_cost_bytes =
+                    wasted_storage_cost_bytes.saturating_add(run.storage_cost_bytes);
+                net_samples_ms.push(-i64::try_from(run.execution_cost_ms).unwrap_or(i64::MAX));
+            }
+            SpeculationRunOutcome::AdmissionRefusedBrownout => {
+                admissions_refused += 1;
+            }
+        }
+    }
+
+    let mut saved_samples: Vec<u64> =
+        runs.iter()
+            .filter(|r| !matches!(r.outcome, SpeculationRunOutcome::AdmissionRefusedBrownout))
+            .map(|r| match r.outcome {
+                SpeculationRunOutcome::SavedCompleted
+                | SpeculationRunOutcome::PromotedToForeground => r.saved_foreground_latency_ms,
+                SpeculationRunOutcome::CancelledUnderPressure
+                | SpeculationRunOutcome::WastedUnused => 0,
+                SpeculationRunOutcome::AdmissionRefusedBrownout => 0,
+            })
+            .collect();
+    saved_samples.sort_unstable();
+    let saved_p50_ms = percentile(&saved_samples, 50);
+    let saved_p95_ms = percentile(&saved_samples, 95);
+
+    net_samples_ms.sort_unstable();
+    // Lower-tail (5th percentile, i.e. 95% of executed speculative runs do at least this well)
+    // and net ROI check for Q010 gating.
+    let executed_total = saved + wasted;
+    let useful_work_permille =
+        u32::try_from((saved * 1_000).checked_div(executed_total).unwrap_or(0)).unwrap_or(0);
+    let net_saved_minus_wasted_exec_ms = i64::try_from(saved_foreground_latency_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::try_from(wasted_execution_cost_ms).unwrap_or(i64::MAX));
+    let positive_p95_value =
+        saved_p95_ms > 0 && net_saved_minus_wasted_exec_ms > 0 && useful_work_permille >= 500;
+
+    SpeculationRoiPanel {
+        promoted,
+        cancelled,
+        wasted,
+        saved,
+        admissions_refused,
+        saved_foreground_latency_ms,
+        saved_p50_ms,
+        saved_p95_ms,
+        total_execution_cost_ms,
+        wasted_execution_cost_ms,
+        wasted_transfer_cost_bytes,
+        wasted_storage_cost_bytes,
+        net_saved_minus_wasted_exec_ms,
+        useful_work_permille,
+        positive_p95_value,
+    }
+}
+
+/// Rollout posture for default-on speculation (bead Q010; plan §143, §164, Epic Q).
+///
+/// Speculation ships `DefaultOff` until the ROI dashboard proves positive net
+/// saved foreground latency and strictly improved foreground p95 latency
+/// without pressure regressions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpeculationDefaultOnPosture {
+    /// Speculation ships default-off; automatic default-on speculation is refused.
+    #[default]
+    DefaultOff,
+    /// Positive net ROI, positive p95 value, improved foreground p95, and zero
+    /// pressure regressions have been proven; default-on speculation is permitted.
+    DefaultOn,
+}
+
+impl SpeculationDefaultOnPosture {
+    /// Whether default-on speculation admission is permitted.
+    #[must_use]
+    pub const fn permits_default_on(self) -> bool {
+        matches!(self, Self::DefaultOn)
+    }
+
+    /// Stable machine token for decision receipts and operator dashboards.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::DefaultOff => "default-off-gated",
+            Self::DefaultOn => "default-on-authorized",
+        }
+    }
+}
+
+/// Specific reason why default-on speculation remains gated off (bead Q010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeculationGateBlockReason {
+    /// No speculative runs have executed yet (`saved + wasted == 0`).
+    NoExecutedSpeculationRuns,
+    /// Net saved foreground latency minus wasted execution cost is non-positive.
+    NonPositiveNetSavedLatency {
+        /// Net saved latency minus wasted execution cost (ms).
+        net_saved_minus_wasted_exec_ms: i64,
+    },
+    /// Speculation ROI panel does not show positive p95 value (`saved_p95_ms == 0`
+    /// or `useful_work_permille < 500`).
+    NonPositiveSpeculationP95Value {
+        /// Nearest-rank p95 of saved foreground latency (ms).
+        saved_p95_ms: u64,
+        /// Useful speculative work rate in permille.
+        useful_work_permille: u32,
+    },
+    /// Missing baseline or speculative foreground latency samples to prove p95 improvement.
+    MissingForegroundLatencyEvidence {
+        /// Number of baseline foreground latency samples.
+        baseline_samples: usize,
+        /// Number of foreground latency samples with speculation active.
+        candidate_samples: usize,
+    },
+    /// Foreground p95 latency with speculation is not strictly better than baseline p95.
+    ForegroundP95NotImproved {
+        /// Baseline foreground p95 latency without speculation (ms).
+        baseline_p95_ms: u64,
+        /// Foreground p95 latency with speculation (ms).
+        with_speculation_p95_ms: u64,
+    },
+    /// One or more pressure regressions occurred while speculation was active.
+    PressureRegressionDetected {
+        /// Number of pressure regressions recorded.
+        pressure_regressions: u64,
+    },
+}
+
+impl SpeculationGateBlockReason {
+    /// Stable machine code for decision receipts and audit logs.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NoExecutedSpeculationRuns => "no_executed_speculation_runs",
+            Self::NonPositiveNetSavedLatency { .. } => "non_positive_net_saved_latency",
+            Self::NonPositiveSpeculationP95Value { .. } => "non_positive_speculation_p95_value",
+            Self::MissingForegroundLatencyEvidence { .. } => "missing_foreground_latency_evidence",
+            Self::ForegroundP95NotImproved { .. } => "foreground_p95_not_improved",
+            Self::PressureRegressionDetected { .. } => "pressure_regression_detected",
+        }
+    }
+}
+
+/// Inputs to the default-on speculation rollout gate (bead Q010).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeculationDefaultOnGateInput {
+    /// Speculation ROI dashboard panel computed from provenance runs (Q009).
+    pub roi: SpeculationRoiPanel,
+    /// Baseline foreground wall-clock latencies without speculation (ms).
+    pub baseline_foreground_latencies_ms: Vec<u64>,
+    /// Foreground wall-clock latencies with speculation active (ms).
+    pub with_speculation_foreground_latencies_ms: Vec<u64>,
+    /// Pressure regressions observed while speculation was active (must be 0).
+    pub pressure_regressions: u64,
+}
+
+/// Auditable decision record produced by the default-on speculation gate (bead Q010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculationDefaultOnDecisionRecord {
+    /// Resulting default-on speculation posture (`DefaultOff` or `DefaultOn`).
+    pub posture: SpeculationDefaultOnPosture,
+    /// Whether default-on speculation is permitted (`posture == DefaultOn`).
+    pub default_on_permitted: bool,
+    /// Snapshot of the [`SpeculationRoiPanel`] evaluated by the gate.
+    pub roi: SpeculationRoiPanel,
+    /// Baseline foreground p95 latency without speculation (ms).
+    pub baseline_foreground_p95_ms: u64,
+    /// Foreground p95 latency with speculation (ms).
+    pub with_speculation_foreground_p95_ms: u64,
+    /// Foreground p95 latency improvement (`baseline_p95 - with_speculation_p95`, ms).
+    pub foreground_p95_improvement_ms: i64,
+    /// Pressure regressions observed in the evaluation window.
+    pub pressure_regressions: u64,
+    /// Ordered list of blocking reasons when `posture == DefaultOff` (empty when `DefaultOn`).
+    pub block_reasons: Vec<SpeculationGateBlockReason>,
+}
+
+impl SpeculationDefaultOnDecisionRecord {
+    /// Whether default-on speculation is permitted by this decision record.
+    #[must_use]
+    pub const fn permits_default_on(&self) -> bool {
+        self.default_on_permitted
+    }
+
+    /// Stable decision token for durable `decision_receipts` rows.
+    #[must_use]
+    pub const fn decision_token(&self) -> &'static str {
+        self.posture.token()
+    }
+
+    /// Deterministic reason string suitable for durable `decision_receipts` storage.
+    #[must_use]
+    pub fn reason_summary(&self) -> String {
+        if self.block_reasons.is_empty() {
+            format!(
+                "authorized:net_saved_ms={},saved_p95_ms={},fg_p95_baseline_ms={},fg_p95_spec_ms={},fg_p95_gain_ms={},pressure_regressions=0",
+                self.roi.net_saved_minus_wasted_exec_ms,
+                self.roi.saved_p95_ms,
+                self.baseline_foreground_p95_ms,
+                self.with_speculation_foreground_p95_ms,
+                self.foreground_p95_improvement_ms,
+            )
+        } else {
+            let codes: Vec<&str> = self
+                .block_reasons
+                .iter()
+                .map(SpeculationGateBlockReason::code)
+                .collect();
+            format!(
+                "gated_off:{}:net_saved_ms={},saved_p95_ms={},fg_p95_baseline_ms={},fg_p95_spec_ms={},pressure_regressions={}",
+                codes.join("+"),
+                self.roi.net_saved_minus_wasted_exec_ms,
+                self.roi.saved_p95_ms,
+                self.baseline_foreground_p95_ms,
+                self.with_speculation_foreground_p95_ms,
+                self.pressure_regressions,
+            )
+        }
+    }
+
+    /// Machine-readable NDJSON decision record line for audit logs and CI artefacts.
+    #[must_use]
+    pub fn to_ndjson_line(&self) -> String {
+        let codes: Vec<String> = self
+            .block_reasons
+            .iter()
+            .map(|r| format!("\"{}\"", r.code()))
+            .collect();
+        format!(
+            "{{\"schema\":\"rabs.speculation_default_on_decision.v1\",\"posture\":\"{}\",\"default_on_permitted\":{},\"net_saved_minus_wasted_exec_ms\":{},\"saved_p95_ms\":{},\"useful_work_permille\":{},\"positive_p95_value\":{},\"baseline_foreground_p95_ms\":{},\"with_speculation_foreground_p95_ms\":{},\"foreground_p95_improvement_ms\":{},\"pressure_regressions\":{},\"block_reasons\":[{}]}}",
+            self.decision_token(),
+            self.default_on_permitted,
+            self.roi.net_saved_minus_wasted_exec_ms,
+            self.roi.saved_p95_ms,
+            self.roi.useful_work_permille,
+            self.roi.positive_p95_value,
+            self.baseline_foreground_p95_ms,
+            self.with_speculation_foreground_p95_ms,
+            self.foreground_p95_improvement_ms,
+            self.pressure_regressions,
+            codes.join(","),
+        )
+    }
+}
+
+/// Evaluate whether default-on speculation may be enabled from the ROI dashboard,
+/// foreground p95 latency comparison, and pressure-regression counter (bead Q010).
+#[must_use]
+pub fn evaluate_speculation_default_on_gate(
+    input: &SpeculationDefaultOnGateInput,
+) -> SpeculationDefaultOnDecisionRecord {
+    let mut block_reasons = Vec::new();
+    let executed_runs = input.roi.saved.saturating_add(input.roi.wasted);
+    if executed_runs == 0 {
+        block_reasons.push(SpeculationGateBlockReason::NoExecutedSpeculationRuns);
+    }
+    if input.roi.net_saved_minus_wasted_exec_ms <= 0 {
+        block_reasons.push(SpeculationGateBlockReason::NonPositiveNetSavedLatency {
+            net_saved_minus_wasted_exec_ms: input.roi.net_saved_minus_wasted_exec_ms,
+        });
+    }
+    if !input.roi.positive_p95_value {
+        block_reasons.push(SpeculationGateBlockReason::NonPositiveSpeculationP95Value {
+            saved_p95_ms: input.roi.saved_p95_ms,
+            useful_work_permille: input.roi.useful_work_permille,
+        });
+    }
+
+    let mut baseline_sorted = input.baseline_foreground_latencies_ms.clone();
+    baseline_sorted.sort_unstable();
+    let mut candidate_sorted = input.with_speculation_foreground_latencies_ms.clone();
+    candidate_sorted.sort_unstable();
+
+    let baseline_foreground_p95_ms = percentile(&baseline_sorted, 95);
+    let with_speculation_foreground_p95_ms = percentile(&candidate_sorted, 95);
+    let foreground_p95_improvement_ms = i64::try_from(baseline_foreground_p95_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::try_from(with_speculation_foreground_p95_ms).unwrap_or(i64::MAX));
+
+    if baseline_sorted.is_empty() || candidate_sorted.is_empty() {
+        block_reasons.push(
+            SpeculationGateBlockReason::MissingForegroundLatencyEvidence {
+                baseline_samples: baseline_sorted.len(),
+                candidate_samples: candidate_sorted.len(),
+            },
+        );
+    } else if with_speculation_foreground_p95_ms >= baseline_foreground_p95_ms {
+        block_reasons.push(SpeculationGateBlockReason::ForegroundP95NotImproved {
+            baseline_p95_ms: baseline_foreground_p95_ms,
+            with_speculation_p95_ms: with_speculation_foreground_p95_ms,
+        });
+    }
+
+    if input.pressure_regressions > 0 {
+        block_reasons.push(SpeculationGateBlockReason::PressureRegressionDetected {
+            pressure_regressions: input.pressure_regressions,
+        });
+    }
+
+    let default_on_permitted = block_reasons.is_empty();
+    let posture = if default_on_permitted {
+        SpeculationDefaultOnPosture::DefaultOn
+    } else {
+        SpeculationDefaultOnPosture::DefaultOff
+    };
+
+    SpeculationDefaultOnDecisionRecord {
+        posture,
+        default_on_permitted,
+        roi: input.roi.clone(),
+        baseline_foreground_p95_ms,
+        with_speculation_foreground_p95_ms,
+        foreground_p95_improvement_ms,
+        pressure_regressions: input.pressure_regressions,
+        block_reasons,
+    }
+}
+
 /// The dashboard: every panel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Dashboard {
@@ -112,6 +726,8 @@ pub struct Dashboard {
     pub latency: LatencyPanel,
     /// Cache effectiveness.
     pub cache: CachePanel,
+    /// Served-fraction telemetry from [`DecisionReceipt`]s (`bd-cl8mf`).
+    pub served_fraction: ServedFractionTelemetry,
     /// Top crates (bounded to 10, sorted by total ms).
     pub top_crates: Vec<CrateRow>,
     /// Top critical paths (bounded to 10): (target label, chain ms).
@@ -122,6 +738,8 @@ pub struct Dashboard {
     pub storage: StoragePanel,
     /// Verification status.
     pub verification: VerificationPanel,
+    /// Speculation ROI accounting (bead Q009).
+    pub speculation_roi: SpeculationRoiPanel,
 }
 
 /// Nearest-rank percentile over sorted samples.
@@ -142,6 +760,8 @@ pub struct MetricInputs {
     pub latencies_ms: Vec<u64>,
     /// Cache lookups: `Ok(())` hit, `Err(reason)` miss.
     pub lookups: Vec<Result<(), &'static str>>,
+    /// Decision receipts feeding served-fraction telemetry (`bd-cl8mf`).
+    pub receipts: Vec<DecisionReceipt>,
     /// Per-crate (name, ms, compiles).
     pub crates: Vec<(String, u64, u64)>,
     /// Critical paths: (label, chain ms).
@@ -152,6 +772,8 @@ pub struct MetricInputs {
     pub storage: (u64, u64, u64),
     /// Verification (runs, passed, divergences).
     pub verification: (u64, u64, u64),
+    /// Provenance speculation run records feeding [`SpeculationRoiPanel`] (bead Q009).
+    pub speculation_runs: Vec<SpeculationRunRecord>,
 }
 
 /// Build every panel from the inputs.
@@ -201,6 +823,7 @@ pub fn build(inputs: &MetricInputs) -> Dashboard {
         }
     }
     causes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let served_fraction = served_fraction_from_receipts(&inputs.receipts);
     // Top crates, bounded and sorted.
     let mut top_crates: Vec<CrateRow> = inputs
         .crates
@@ -231,6 +854,7 @@ pub fn build(inputs: &MetricInputs) -> Dashboard {
             hit_rate_permille,
             miss_causes: causes,
         },
+        served_fraction,
         top_crates,
         critical_paths,
         transfer: TransferPanel {
@@ -248,12 +872,61 @@ pub fn build(inputs: &MetricInputs) -> Dashboard {
             passed: inputs.verification.1,
             divergences: inputs.verification.2,
         },
+        speculation_roi: build_speculation_roi(&inputs.speculation_runs),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision_receipt::{
+        PublicationDecision, RECEIPT_SCHEMA_VERSION, ReceiptStore, SingleflightDecision,
+        VerificationDecision,
+    };
+    use crate::result_identity::{DigestAlgorithm, TypedDigest};
+    use std::path::Path;
+
+    fn sample_digest(tag: u8) -> TypedDigest {
+        TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: "rabs.object.v1",
+            bytes: [tag; 32],
+        }
+    }
+
+    fn receipt_with(
+        request_id: u64,
+        invocation_class: ActionClass,
+        cache_lookup: CacheLookupDecision,
+    ) -> DecisionReceipt {
+        DecisionReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            request_id,
+            invocation_class,
+            key_breakdown_digest: sample_digest(1),
+            snapshot_root: sample_digest(2),
+            closure_object_count: 10,
+            cache_lookup,
+            singleflight: SingleflightDecision::Leader,
+            subscriber_count: 1,
+            worker_candidates: Vec::new(),
+            selected_worker: Some(1),
+            selection_reasons: vec!["BEST_HEALTH"],
+            transfer_objects: 0,
+            transfer_bytes_estimate: 0,
+            priority_class_tag: 1,
+            budget_ms: 10_000,
+            attempt_authority: sample_digest(3),
+            lifecycle_events: Vec::new(),
+            provisional_events: Vec::new(),
+            verification: VerificationDecision::NotRequired,
+            publication: PublicationDecision::Published,
+            latency_ms: 25,
+            cpu_ms: 20,
+            fallback_reason: None,
+            non_claims: Vec::new(),
+        }
+    }
 
     fn fixture_fleet() -> MetricInputs {
         MetricInputs {
@@ -272,6 +945,33 @@ mod tests {
                 Err("WHY_KEY_COMPONENT_CHANGED"),
                 Err("CACHE_REFUSED_BENCHMARK_OBSERVATION"),
             ],
+            receipts: vec![
+                receipt_with(
+                    1,
+                    ActionClass::RustcDependencyCompile,
+                    CacheLookupDecision::Hit,
+                ),
+                receipt_with(
+                    2,
+                    ActionClass::RustcDependencyCompile,
+                    CacheLookupDecision::Hit,
+                ),
+                receipt_with(
+                    3,
+                    ActionClass::RustcWorkspaceCompile,
+                    CacheLookupDecision::Hit,
+                ),
+                receipt_with(
+                    4,
+                    ActionClass::RustcWorkspaceCompile,
+                    CacheLookupDecision::Miss,
+                ),
+                receipt_with(
+                    5,
+                    ActionClass::ToolchainProbe,
+                    CacheLookupDecision::Refused("PROBE_PASSTHROUGH"),
+                ),
+            ],
             crates: vec![
                 ("serde".into(), 40_000, 12),
                 ("tokio".into(), 90_000, 3),
@@ -281,6 +981,7 @@ mod tests {
             transfer: (10_000_000, 2_500_000),
             storage: (4_000_000_000, 120, 2),
             verification: (500, 499, 1),
+            speculation_runs: Vec::new(),
         }
     }
 
@@ -310,6 +1011,25 @@ mod tests {
             ],
             "miss causes ranked by count with stable codes"
         );
+        // Served-fraction telemetry from decision receipts (bd-cl8mf):
+        // 4 rustc compile receipts (3 Hit, 1 Miss) = 750 permille;
+        // ToolchainProbe is excluded from the rustc denominator but counted in total_receipts (3/5 = 600 permille).
+        assert_eq!(dash.served_fraction.total_receipts, 5);
+        assert_eq!(dash.served_fraction.total_served, 3);
+        assert_eq!(dash.served_fraction.total_served_permille, 600);
+        assert_eq!(dash.served_fraction.rustc_receipts, 4);
+        assert_eq!(dash.served_fraction.rustc_served, 3);
+        assert_eq!(dash.served_fraction.rustc_executed, 1);
+        assert_eq!(dash.served_fraction.rustc_served_permille, 750);
+        assert_eq!(
+            dash.served_fraction.goal_permille,
+            LONG_RUN_SERVED_GOAL_PERMILLE
+        );
+        assert!(!dash.served_fraction.meets_long_run_goal);
+        assert_eq!(
+            dash.served_fraction.standing,
+            ServedFractionStanding::ReportedNotGated
+        );
         // Top crates by total ms, not by compile count.
         assert_eq!(dash.top_crates[0].name, "tokio");
         assert_eq!(dash.top_crates[1].name, "serde");
@@ -329,8 +1049,174 @@ mod tests {
         assert_eq!(dash.latency.p99_ms, 0);
         assert_eq!(dash.cache.hit_rate_permille, 0);
         assert!(dash.cache.miss_causes.is_empty());
+        assert_eq!(dash.served_fraction.total_receipts, 0);
+        assert_eq!(dash.served_fraction.rustc_receipts, 0);
+        assert_eq!(dash.served_fraction.rustc_served_permille, 0);
+        assert!(!dash.served_fraction.meets_long_run_goal);
+        assert_eq!(
+            dash.served_fraction.standing,
+            ServedFractionStanding::ReportedNotGated
+        );
+        assert!(dash.served_fraction.by_class.is_empty());
         assert!(dash.top_crates.is_empty());
         assert_eq!(dash.transfer.dedup_savings_permille, 0);
+    }
+
+    #[test]
+    fn served_fraction_from_receipt_store_enforces_strict_90_percent_goal() {
+        let mut store = ReceiptStore::default();
+        // 9 hits + 1 miss = 900 permille (exactly 90.0%, NOT "> 90%").
+        for id in 1..=9 {
+            store
+                .append(receipt_with(
+                    id,
+                    ActionClass::RustcDependencyCompile,
+                    CacheLookupDecision::Hit,
+                ))
+                .expect("valid v1 receipt");
+        }
+        store
+            .append(receipt_with(
+                10,
+                ActionClass::RustcWorkspaceCompile,
+                CacheLookupDecision::Miss,
+            ))
+            .expect("valid v1 receipt");
+
+        let exact_90 = served_fraction_from_receipts(store.as_slice());
+        assert_eq!(exact_90.rustc_served_permille, 900);
+        assert!(
+            !exact_90.meets_long_run_goal,
+            "sec6 specifies '> 90%', so 900 permille does not yet cross the threshold"
+        );
+
+        // Add one more served rustc compile -> 10/11 = 909 permille (> 90%).
+        store
+            .append(receipt_with(
+                11,
+                ActionClass::ClippyCompile,
+                CacheLookupDecision::Hit,
+            ))
+            .expect("valid v1 receipt");
+        let above_90 = served_fraction_from_receipts(store.as_slice());
+        assert_eq!(above_90.rustc_receipts, 11);
+        assert_eq!(above_90.rustc_served, 10);
+        assert_eq!(above_90.rustc_served_permille, 909);
+        assert!(above_90.meets_long_run_goal);
+        assert_eq!(above_90.standing, ServedFractionStanding::ReportedNotGated);
+        assert_eq!(above_90.by_class.len(), 3);
+    }
+
+    #[test]
+    fn gate_ledger_covers_every_section_6_target() {
+        // bd-cl8mf rule: "benchmarks/GATE_LEDGER.md: one row per sec6 target
+        // with status ENFORCING/PENDING(phase), owning gate bead, last result,
+        // evidence link... a target absent from the ledger is a defect."
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let master_plan = std::fs::read_to_string(
+            repo_root.join("COMPREHENSIVE_MASTER_PLAN_FOR_RABS_ASUPERSYNC_NATIVE.md"),
+        )
+        .expect("read master plan");
+        let ledger = std::fs::read_to_string(repo_root.join("benchmarks/GATE_LEDGER.md"))
+            .expect("read benchmarks/GATE_LEDGER.md");
+
+        // Extract every target metric from §6 of the master plan.
+        let sec6 = master_plan
+            .split("## 6. Quantitative product targets")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## 7.").next())
+            .expect("locate §6 in master plan");
+        let sec6_metrics: Vec<&str> = sec6
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if !trimmed.starts_with('|') {
+                    return None;
+                }
+                let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
+                if cols.len() < 3 {
+                    return None;
+                }
+                let metric = cols[1];
+                if metric.is_empty() || metric == "Metric" || metric.starts_with("---") {
+                    return None;
+                }
+                Some(metric)
+            })
+            .collect();
+        assert_eq!(
+            sec6_metrics.len(),
+            11,
+            "expected 11 §6 quantitative targets in master plan"
+        );
+
+        // Parse rows from benchmarks/GATE_LEDGER.md.
+        let mut ledger_rows: Vec<(String, String, String, String, String)> = Vec::new();
+        for line in ledger.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('|') {
+                continue;
+            }
+            let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
+            if cols.len() < 7 {
+                continue;
+            }
+            let metric = cols[1];
+            if metric.is_empty() || metric == "Metric" || metric.starts_with("---") {
+                continue;
+            }
+            let status = cols[3].trim_matches('`');
+            let owning_bead = cols[4];
+            let last_result = cols[5];
+            let evidence = cols[6];
+            assert!(
+                status == "ENFORCING"
+                    || (status.starts_with("PENDING(Phase ") && status.ends_with(')')),
+                "invalid status `{status}` for metric `{metric}` in GATE_LEDGER.md"
+            );
+            assert!(
+                !owning_bead.is_empty(),
+                "missing owning gate bead for `{metric}` in GATE_LEDGER.md"
+            );
+            assert!(
+                !last_result.is_empty(),
+                "missing last result for `{metric}` in GATE_LEDGER.md"
+            );
+            assert!(
+                evidence.contains("]("),
+                "missing markdown evidence link for `{metric}` in GATE_LEDGER.md"
+            );
+            for segment in evidence.split("](").skip(1) {
+                let rel_link = segment.split(')').next().unwrap_or("");
+                let resolved = repo_root.join("benchmarks").join(rel_link);
+                assert!(
+                    resolved.exists(),
+                    "evidence link `{rel_link}` for `{metric}` does not exist at {}",
+                    resolved.display()
+                );
+            }
+            ledger_rows.push((
+                metric.to_string(),
+                status.to_string(),
+                owning_bead.to_string(),
+                last_result.to_string(),
+                evidence.to_string(),
+            ));
+        }
+
+        for expected in &sec6_metrics {
+            assert!(
+                ledger_rows.iter().any(|(m, _, _, _, _)| m == expected),
+                "§6 target `{expected}` is absent from benchmarks/GATE_LEDGER.md (defect per bd-cl8mf)"
+            );
+        }
+        assert_eq!(
+            ledger_rows.len(),
+            sec6_metrics.len(),
+            "GATE_LEDGER.md must have exactly one row per §6 target"
+        );
     }
 
     #[test]
@@ -358,5 +1244,182 @@ mod tests {
         assert_eq!(percentile(&[7], 50), 7);
         assert_eq!(percentile(&[1, 2, 3, 4], 50), 2);
         assert_eq!(percentile(&[1, 2, 3, 4], 99), 4);
+    }
+
+    #[test]
+    fn q009_speculation_roi_dashboard_accounts_saved_promoted_cancelled_wasted() {
+        let inputs = MetricInputs {
+            speculation_runs: vec![
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::SavedCompleted,
+                    saved_foreground_latency_ms: 420,
+                    execution_cost_ms: 420,
+                    transfer_cost_bytes: 16_384,
+                    storage_cost_bytes: 32_768,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::PromotedToForeground,
+                    saved_foreground_latency_ms: 280,
+                    execution_cost_ms: 500,
+                    transfer_cost_bytes: 8_192,
+                    storage_cost_bytes: 16_384,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::CancelledUnderPressure,
+                    saved_foreground_latency_ms: 0,
+                    execution_cost_ms: 90,
+                    transfer_cost_bytes: 4_096,
+                    storage_cost_bytes: 2_048,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::WastedUnused,
+                    saved_foreground_latency_ms: 0,
+                    execution_cost_ms: 60,
+                    transfer_cost_bytes: 1_024,
+                    storage_cost_bytes: 1_024,
+                },
+                SpeculationRunRecord {
+                    outcome: SpeculationRunOutcome::AdmissionRefusedBrownout,
+                    saved_foreground_latency_ms: 0,
+                    execution_cost_ms: 0,
+                    transfer_cost_bytes: 0,
+                    storage_cost_bytes: 0,
+                },
+            ],
+            ..MetricInputs::default()
+        };
+        let dash = build(&inputs);
+        let roi = &dash.speculation_roi;
+        assert_eq!(roi.promoted, 1);
+        assert_eq!(roi.cancelled, 1);
+        assert_eq!(roi.wasted, 2);
+        assert_eq!(roi.saved, 2);
+        assert_eq!(roi.admissions_refused, 1);
+        assert_eq!(roi.saved_foreground_latency_ms, 700);
+        assert_eq!(roi.total_execution_cost_ms, 1070);
+        assert_eq!(roi.wasted_execution_cost_ms, 150);
+        assert_eq!(roi.wasted_transfer_cost_bytes, 5_120);
+        assert_eq!(roi.wasted_storage_cost_bytes, 3_072);
+        assert_eq!(roi.net_saved_minus_wasted_exec_ms, 550);
+        assert_eq!(roi.useful_work_permille, 500);
+        assert_eq!(roi.saved_p95_ms, 420);
+        assert!(roi.positive_p95_value);
+    }
+
+    #[test]
+    fn q010_default_on_speculation_gated_on_positive_p95_and_no_pressure_regressions() {
+        assert_eq!(
+            SpeculationDefaultOnPosture::default(),
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+
+        let empty_decision =
+            evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput::default());
+        assert_eq!(
+            empty_decision.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!empty_decision.permits_default_on());
+        assert_eq!(empty_decision.decision_token(), "default-off-gated");
+        assert!(
+            empty_decision
+                .block_reasons
+                .contains(&SpeculationGateBlockReason::NoExecutedSpeculationRuns)
+        );
+
+        let positive_roi = build_speculation_roi(&[
+            SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::SavedCompleted,
+                saved_foreground_latency_ms: 450,
+                execution_cost_ms: 450,
+                transfer_cost_bytes: 8_192,
+                storage_cost_bytes: 16_384,
+            },
+            SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::PromotedToForeground,
+                saved_foreground_latency_ms: 300,
+                execution_cost_ms: 400,
+                transfer_cost_bytes: 8_192,
+                storage_cost_bytes: 16_384,
+            },
+            SpeculationRunRecord {
+                outcome: SpeculationRunOutcome::WastedUnused,
+                saved_foreground_latency_ms: 0,
+                execution_cost_ms: 100,
+                transfer_cost_bytes: 2_048,
+                storage_cost_bytes: 2_048,
+            },
+        ]);
+        assert!(positive_roi.positive_p95_value);
+
+        // Authorized when ROI is positive, foreground p95 strictly improves, and pressure_regressions == 0.
+        let authorized = evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput {
+            roi: positive_roi.clone(),
+            baseline_foreground_latencies_ms: vec![600, 720, 880, 950],
+            with_speculation_foreground_latencies_ms: vec![210, 290, 410, 500],
+            pressure_regressions: 0,
+        });
+        assert_eq!(authorized.posture, SpeculationDefaultOnPosture::DefaultOn);
+        assert!(authorized.permits_default_on());
+        assert_eq!(authorized.decision_token(), "default-on-authorized");
+        assert_eq!(authorized.baseline_foreground_p95_ms, 950);
+        assert_eq!(authorized.with_speculation_foreground_p95_ms, 500);
+        assert_eq!(authorized.foreground_p95_improvement_ms, 450);
+        assert!(authorized.block_reasons.is_empty());
+        assert!(
+            authorized
+                .reason_summary()
+                .starts_with("authorized:net_saved_ms=650")
+        );
+        assert!(
+            authorized
+                .to_ndjson_line()
+                .contains("\"default_on_permitted\":true")
+        );
+
+        // Blocked when foreground p95 does not improve.
+        let unimproved_fg = evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput {
+            roi: positive_roi.clone(),
+            baseline_foreground_latencies_ms: vec![400, 480, 500],
+            with_speculation_foreground_latencies_ms: vec![410, 490, 500],
+            pressure_regressions: 0,
+        });
+        assert_eq!(
+            unimproved_fg.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!unimproved_fg.permits_default_on());
+        assert_eq!(
+            unimproved_fg.block_reasons,
+            vec![SpeculationGateBlockReason::ForegroundP95NotImproved {
+                baseline_p95_ms: 500,
+                with_speculation_p95_ms: 500,
+            }]
+        );
+
+        // Blocked when pressure regressions > 0 even if ROI and foreground p95 are positive.
+        let pressure_regressed =
+            evaluate_speculation_default_on_gate(&SpeculationDefaultOnGateInput {
+                roi: positive_roi,
+                baseline_foreground_latencies_ms: vec![600, 900],
+                with_speculation_foreground_latencies_ms: vec![250, 450],
+                pressure_regressions: 1,
+            });
+        assert_eq!(
+            pressure_regressed.posture,
+            SpeculationDefaultOnPosture::DefaultOff
+        );
+        assert!(!pressure_regressed.permits_default_on());
+        assert_eq!(
+            pressure_regressed.block_reasons,
+            vec![SpeculationGateBlockReason::PressureRegressionDetected {
+                pressure_regressions: 1,
+            }]
+        );
+        assert!(
+            pressure_regressed
+                .reason_summary()
+                .contains("pressure_regression_detected")
+        );
     }
 }

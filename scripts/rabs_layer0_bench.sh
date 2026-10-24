@@ -57,7 +57,10 @@ cargo_for() { # variant target_dir -- subcmd...
   if [ "$variant" = sccache ]; then
     wrapper=(env "RUSTC_WRAPPER=sccache" "SCCACHE_DIR=$SCRATCH/sccache-cache")
   fi
-  if [ "$variant" = layer0 ] && [ -n "$LAYER0_CONFIG" ]; then
+  if [ "$variant" = "current-rch" ]; then
+    CARGO_TARGET_DIR=$target CARGO_INCREMENTAL=0 \
+      rch exec -- cargo "$@" --manifest-path "$REPO_DIR/Cargo.toml"
+  elif [ "$variant" = layer0 ] && [ -n "$LAYER0_CONFIG" ]; then
     # Apply the pack as a config OVERLAY (file path form of --config)
     # without touching the repo tree.
     CARGO_TARGET_DIR=$target CARGO_INCREMENTAL=0 \
@@ -68,7 +71,7 @@ cargo_for() { # variant target_dir -- subcmd...
   fi
 }
 
-VARIANTS=${RABS_BENCH_VARIANTS:-"stock layer0"}
+VARIANTS=${RABS_BENCH_VARIANTS:-"stock layer0 sccache current-rch"}
 for VARIANT in $VARIANTS; do
   if [ "$VARIANT" = layer0 ] && [ -z "$LAYER0_CONFIG" ]; then
     echo "layer0 config not provided; skipping layer0 variant (recorded)" >&2
@@ -78,6 +81,11 @@ for VARIANT in $VARIANTS; do
   if [ "$VARIANT" = sccache ] && ! command -v sccache >/dev/null; then
     echo "sccache not on PATH; skipping sccache variant (recorded)" >&2
     emit sccache skipped 0 0 -1
+    continue
+  fi
+  if [ "$VARIANT" = "current-rch" ] && ! command -v rch >/dev/null; then
+    echo "rch not on PATH; skipping current-rch variant (recorded)" >&2
+    emit current-rch skipped 0 0 -1
     continue
   fi
   TARGET="$SCRATCH/target-$VARIANT"

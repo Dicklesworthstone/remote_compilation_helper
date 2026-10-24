@@ -1,4 +1,4 @@
-//! The real rabsd operator entry point, driven by a bounded scripted TCP worker.
+//! The real rabsd entry point, with scripted workers and retained deliveries.
 //! This tests receiver delivery, not compilation or authenticated fleet identity.
 #![cfg(unix)]
 
@@ -255,6 +255,155 @@ fn operator_process(root: &Path, args: &[String]) -> (ExitStatus, Vec<u8>, Vec<u
         std::fs::read(stdout).unwrap(),
         std::fs::read(stderr).unwrap(),
     )
+}
+
+#[test]
+fn build_replay_cli_recovers_exact_streams_and_native_status_without_reexecution() {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    use rabsd::coord::worker_delivery::{WorkerPeer, receive_execution};
+    use std::collections::VecDeque;
+
+    // A bounded scripted worker supplies fixture bytes to the production
+    // receiver. Only delivery, offline recovery, installation, and the real
+    // operator CLI are exercised. This is not compiler, sandbox, or fleet proof.
+    struct Peer {
+        replies: VecDeque<Value>,
+        sent: Vec<Value>,
+    }
+    impl WorkerPeer for Peer {
+        fn send(&mut self, frame: &Value) -> std::io::Result<()> {
+            self.sent.push(frame.clone());
+            Ok(())
+        }
+        fn receive(&mut self) -> std::io::Result<Value> {
+            self.replies
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("scripted delivery exhausted"))
+        }
+    }
+
+    let raw_stdout = b"test stdout\0\xff\n{\"reason\":\"build-finished\",\"success\":false}\n";
+    let raw_stderr = b"test stderr\0\xfe without a final newline";
+    for exit in [0, 101] {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("bundle");
+        let destination = root.path().join("delivery");
+        let output = root.path().join("installed");
+        std::fs::create_dir(&bundle).unwrap();
+        let manifest = SourceManifest::new(vec![SourceFile {
+            path: "lib.rs".into(),
+            len: 1,
+            sha256: Sha256::digest(b"x").into(),
+            executable: false,
+        }])
+        .unwrap();
+        let request = json!({"kind":"canonical-exec", "request_id":7,
+            "program":"fixture-only", "args":["lib.rs"], "toolchain_backing":"/tc",
+            "source_manifest":{"manifest_sha256":manifest.digest().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                "files":[{"path":"lib.rs", "bytes":1, "sha256":hash(b"x"), "executable":false}]},
+            "artifacts":{"unit":"dep", "files":["a"]}});
+        std::fs::write(
+            bundle.join("request.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let artifacts = json!({"unit":"dep", "files":[{"name":"a", "bytes":4,
+            "sha256":hash(b"A\0\xffB"), "executable":false}], "total_bytes":4,
+            "manifest_sha256":"548324c3a5c96511944c6ec6af94ee9bbb6683170bb0143f9d99cd192f80bfd6"});
+        let mut peer = Peer {
+            replies: VecDeque::from([
+                json!({"kind":"worker-hello", "worker_id":"fixture-worker", "canonical":true, "slots":1,
+                    "boot_generation":1, "incarnation":"00000000000000000000000000000001", "request_high_water":null,
+                    "recovery_protocols":["request-journal-v1"], "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"]}),
+                json!({"kind":"exec-result", "request_id":7, "executed":true, "exit_code":exit,
+                    "residual_group_members":0, "stop_reason":null, "output_transfer":"ranges-v1", "output_ack_required":true,
+                    "stdout_bytes":raw_stdout.len(), "stdout_sha256":hash(raw_stdout),
+                    "stderr_bytes":raw_stderr.len(), "stderr_sha256":hash(raw_stderr),
+                    "artifact_transfer":"files-v1", "artifact_ack_required":exit == 0,
+                    "artifact_manifest":if exit == 0 {artifacts} else {Value::Null}}),
+                chunk("stdout", raw_stdout, false),
+                chunk("stderr", raw_stderr, false),
+            ]),
+            sent: Vec::new(),
+        };
+        if exit == 0 {
+            peer.replies.push_back(chunk("a", b"A\0\xffB", true));
+        }
+        peer.replies.push_back(
+            json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
+        );
+        if exit == 0 {
+            peer.replies.push_back(
+                json!({"kind":"artifact-acknowledged", "request_id":7, "already_released":false}),
+            );
+        }
+        let delivery =
+            receive_execution(&mut peer, &request, "fixture-worker", &destination).unwrap();
+        assert!(peer.replies.is_empty());
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "canonical-exec")
+                .count(),
+            1
+        );
+
+        // No source tree exists, and the requested listen address is already
+        // occupied. A new upload, listener, or execution would make the native
+        // subprocess fail instead of returning the verified retained result.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        for (replay, resume) in [(false, false), (true, false), (true, true)] {
+            let mut args = vec!["--worker-build-loopback".to_owned()];
+            if replay {
+                args.push("--replay-diagnostics".into());
+            }
+            if resume {
+                args.push("--resume".into());
+            }
+            args.extend([
+                occupied.local_addr().unwrap().to_string(),
+                "fixture-worker".into(),
+                bundle.to_str().unwrap().into(),
+                destination.to_str().unwrap().into(),
+                output.to_str().unwrap().into(),
+            ]);
+            let (status, stdout, stderr) = operator_process(root.path(), &args);
+            assert_eq!(
+                status.code(),
+                Some(exit),
+                "replay={replay}, resume={resume}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            let report: Value = if replay {
+                assert_eq!(stdout, raw_stdout);
+                assert!(stderr.starts_with(raw_stderr));
+                serde_json::from_slice(&stderr[raw_stderr.len()..]).unwrap()
+            } else {
+                assert!(stderr.is_empty());
+                serde_json::from_slice(&stdout).unwrap()
+            };
+            assert_eq!(report["kind"], "worker-build");
+            assert_eq!(report["delivery"]["receipt"], delivery.receipt);
+            assert_eq!(report["installed_outputs"].is_null(), exit != 0);
+            assert_eq!(report["publication_authorized"], false);
+            assert_eq!(report["reexecute"], false);
+            assert_eq!(output.exists(), exit == 0);
+            if exit == 0 {
+                assert_eq!(std::fs::read(output.join("a")).unwrap(), b"A\0\xffB");
+            }
+            assert!(!bundle.join("source").exists());
+            assert_no_daemon(root.path());
+        }
+        assert_eq!(
+            std::fs::read(destination.join("diagnostics/stdout")).unwrap(),
+            raw_stdout
+        );
+        assert_eq!(
+            std::fs::read(destination.join("diagnostics/stderr")).unwrap(),
+            raw_stderr
+        );
+    }
 }
 
 fn preparation_fixture(root: &Path) -> Vec<String> {

@@ -6,15 +6,21 @@
 //! used to be permanent: hz3/hz4 sat disabled on five dispatchers for days
 //! after the orphan was gone. When the record carries evidence (build id and
 //! worker-side process record), this service re-runs the same kill probe the
-//! hook ran and re-enables the worker ONLY on a `verified_dead` verdict —
-//! the same evidence standard that would have avoided the quarantine in the
-//! first place. Still-alive, missing-record and channel failures keep it, and
-//! legacy or operator-reasoned disables are never touched.
+//! hook ran and re-enables the worker on a `verified_dead` verdict — the
+//! same evidence standard that would have avoided the quarantine in the first
+//! place. A worker-side record that stays absent for [`RECORD_ABSENT_GRACE`]
+//! also clears it: the cache sweep's orphan watchdog deletes a record only
+//! once its group is gone, a build's own completion and a reboot remove it
+//! too, and without a record nothing can ever re-probe (bd-sh0tr: vmi1156319
+//! sat disabled on csd for 41 h with no record left). Still-alive and channel
+//! failures keep it, and legacy or operator-reasoned disables are never
+//! touched.
 
 use crate::workers::WorkerPool;
 use rch_common::bypass_record::AdminDisableStore;
 use rch_common::orphan_quarantine::{
-    QuarantineEvidence, kill_probe_script, parse_quarantine_reason, probe_verified_dead,
+    QuarantineEvidence, kill_probe_script, parse_quarantine_reason, probe_record_absent,
+    probe_verified_dead,
 };
 use rch_common::ssh::{SshClient, SshOptions};
 use rch_common::{WorkerConfig, WorkerId};
@@ -27,6 +33,10 @@ use tracing::{debug, info, warn};
 /// How often quarantined workers with evidence are re-probed.
 pub const ORPHAN_QUARANTINE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a quarantine's worker-side record must have been absent before
+/// that absence clears it. Longer than the cache sweep's 240-minute orphan
+/// window, so a missing record is the watchdog's verdict, not a race.
+pub const RECORD_ABSENT_GRACE: Duration = Duration::from_secs(6 * 3600);
 
 /// Runs the kill probe on a worker. The seam between the decision loop and
 /// SSH; faked in tests.
@@ -95,20 +105,33 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
     /// One pass over the durable records; returns how many quarantines were
     /// cleared.
     pub async fn evaluate_once(&self) -> usize {
-        let candidates: Vec<(String, String, QuarantineEvidence)> = {
+        let candidates: Vec<(String, String, u64, QuarantineEvidence)> = {
             let store = self.store.lock().await;
             store
                 .all()
                 .into_iter()
                 .filter_map(|record| {
                     let reason = record.reason.as_deref()?;
-                    parse_quarantine_reason(reason)
-                        .map(|evidence| (record.worker_id.clone(), reason.to_owned(), evidence))
+                    parse_quarantine_reason(reason).map(|evidence| {
+                        (
+                            record.worker_id.clone(),
+                            reason.to_owned(),
+                            record.disabled_unix_ms,
+                            evidence,
+                        )
+                    })
                 })
                 .collect()
         };
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         let mut cleared = 0;
-        for (worker_id, reason, evidence) in candidates {
+        for (worker_id, reason, disabled_unix_ms, evidence) in candidates {
             let Some(worker) = self.pool.get(&WorkerId::new(&worker_id)).await else {
                 continue;
             };
@@ -120,10 +143,15 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
                 debug!(worker = %worker_id, "orphan quarantine probe channel failed; keeping");
                 continue;
             };
-            if !probe_verified_dead(&stdout) {
+            let quarantine_age = Duration::from_millis(now_ms.saturating_sub(disabled_unix_ms));
+            let verdict = if probe_verified_dead(&stdout) {
+                "recorded process group verified dead"
+            } else if probe_record_absent(&stdout) && quarantine_age >= RECORD_ABSENT_GRACE {
+                "worker-side process record absent past the grace period"
+            } else {
                 debug!(worker = %worker_id, "orphan process group not verified dead; keeping");
                 continue;
-            }
+            };
             // The operator may have replaced or removed the record while the
             // probe ran; only the exact record that was verified is cleared.
             let mut store = self.store.lock().await;
@@ -143,7 +171,8 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
             info!(
                 worker = %worker_id,
                 build_id = evidence.build_id,
-                "cleared E104 orphan quarantine: recorded process group verified dead"
+                quarantine_age_secs = quarantine_age.as_secs(),
+                "cleared E104 orphan quarantine: {verdict}"
             );
             cleared += 1;
         }
@@ -262,6 +291,49 @@ mod tests {
             assert_eq!(service.evaluate_once().await, 0, "{stdout:?}");
             assert!(store.lock().await.get("w1").is_some(), "{stdout:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_absent_record_clears_only_after_the_grace_period() {
+        // The fixture's record is from 1970: far past the grace period.
+        let (_dir, pool, store) = fixture(quarantine_reason(Some(&evidence()))).await;
+        let service = OrphanQuarantineService::new(
+            pool.clone(),
+            store.clone(),
+            prober(Some("RCH_E104_KILL=record_absent")),
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(service.evaluate_once().await, 1);
+        assert!(store.lock().await.get("w1").is_none());
+        let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
+        assert!(worker.disabled_reason().await.is_none());
+
+        // A fresh quarantine keeps its worker even with the record absent.
+        let (_dir, pool, store) = fixture(quarantine_reason(Some(&evidence()))).await;
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        store
+            .lock()
+            .await
+            .upsert(AdminDisableRecord {
+                worker_id: "w1".into(),
+                reason: Some(quarantine_reason(Some(&evidence()))),
+                disabled_unix_ms: now_ms,
+            })
+            .unwrap();
+        let service = OrphanQuarantineService::new(
+            pool,
+            store.clone(),
+            prober(Some("RCH_E104_KILL=record_absent")),
+            ORPHAN_QUARANTINE_CHECK_INTERVAL,
+        );
+        assert_eq!(service.evaluate_once().await, 0);
+        assert!(store.lock().await.get("w1").is_some());
     }
 
     #[tokio::test]

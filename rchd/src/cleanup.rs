@@ -6,8 +6,9 @@ use crate::{
 };
 use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, warn};
+
+mod remediation;
 
 const HEARTBEAT_STALE_SECS: u64 = 20;
 /// Silence from a LIVE hook that corroborates a progress stall. The hook beats every 5 s, but on
@@ -17,6 +18,15 @@ const HEARTBEAT_STALE_SECS: u64 = 20;
 /// `progress_age: 740` while this daemon's own log lagged the event by 12 s. A dead hook still
 /// needs only [`HEARTBEAT_STALE_SECS`].
 const LIVE_HOOK_HEARTBEAT_STALE_SECS: u64 = 120;
+/// The same corroboration in SyncDown or Finalize (#112). There the remote
+/// command has exited, so the worker is idle and the live hook is delivering a
+/// result that already succeeded. Publishing a large artifact set runs
+/// synchronously on the client's current-thread runtime and silences its
+/// heartbeat for minutes. Signalling it then frees no worker CPU and throws
+/// the result away, so only a much longer silence counts. A dead hook still
+/// needs only [`HEARTBEAT_STALE_SECS`], and a hung transfer is bounded by the
+/// client's own timeouts.
+const POST_EXECUTION_LIVE_HOOK_HEARTBEAT_STALE_SECS: u64 = 30 * 60;
 const PROGRESS_STALE_SECS: u64 = 90;
 const RECENT_PROGRESS_GRACE_SECS: u64 = 15;
 const MIN_BUILD_AGE_SECS: u64 = 30;
@@ -87,38 +97,27 @@ impl RecoveredQueueCleanup {
     }
 }
 
-/// No signal is sent. ESRCH proves absence. Linux's boot ID/start ticks also
-/// prove replacement; formatted `ps` timestamps on other platforms do not.
-/// Permission errors and missing identity are not death.
+/// No signal is sent. An absent (or reaped zombie) PID proves exit. The kernel
+/// birth identity (Linux boot ID/start ticks, Darwin boot ID/start
+/// microseconds) also proves replacement: on macOS a queued owner's PID is
+/// often reused while the row waits. Failed inspection and missing or
+/// unparseable identity are not death.
 fn recovered_queue_owner_gone(row: &QueuedBuildState) -> Option<&'static str> {
-    if !row.recovered || row.hook_pid <= 1 {
+    use rch_common::process_identity::{
+        OwnerPresence, ProcessIdentity, ProcessObservation, observe_process,
+    };
+
+    if !row.recovered || row.hook_pid <= 1 || i32::try_from(row.hook_pid).is_err() {
         return None;
     }
-    #[cfg(unix)]
-    {
-        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-
-        let pid = i32::try_from(row.hook_pid).ok()?;
-        match kill(Pid::from_raw(pid), None) {
-            Err(Errno::ESRCH) => Some("queued_owner_exited"),
-            Ok(()) | Err(Errno::EPERM) => {
-                #[cfg(target_os = "linux")]
-                {
-                    let recorded = row.hook_process_identity.as_deref()?;
-                    let observed = crate::history::process_identity(row.hook_pid)?;
-                    (observed != recorded).then_some("queued_owner_replaced")
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    None
-                }
-            }
-            Err(_) => None,
+    match observe_process(row.hook_pid) {
+        ProcessObservation::Absent => Some("queued_owner_exited"),
+        ProcessObservation::Unknown => None,
+        observed @ ProcessObservation::Present(_) => {
+            let recorded = ProcessIdentity::from_record(row.hook_process_identity.as_deref()?)?;
+            (recorded.presence(&observed) == OwnerPresence::Absent)
+                .then_some("queued_owner_replaced")
         }
-    }
-    #[cfg(not(unix))]
-    {
-        None
     }
 }
 
@@ -240,12 +239,20 @@ impl StuckEvidence {
     }
 }
 
+#[cfg(test)]
 fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
+    score_stuck_evidence_with(input, LIVE_HOOK_HEARTBEAT_STALE_SECS)
+}
+
+fn score_stuck_evidence_with(
+    input: StuckEvidenceInput,
+    live_hook_heartbeat_stale_secs: u64,
+) -> StuckEvidence {
     let heartbeat_stale = input.heartbeat_age_secs >= HEARTBEAT_STALE_SECS;
     let progress_stale = input.progress_age_secs >= PROGRESS_STALE_SECS;
     let progress_recent = input.progress_age_secs <= RECENT_PROGRESS_GRACE_SECS;
     let progress_stall_corroborated =
-        !input.hook_alive || input.heartbeat_age_secs >= LIVE_HOOK_HEARTBEAT_STALE_SECS;
+        !input.hook_alive || input.heartbeat_age_secs >= live_hook_heartbeat_stale_secs;
     let remediable_progress_stale = input.progress_stall_remediable_phase
         && progress_stale
         && !progress_recent
@@ -348,70 +355,59 @@ impl ActiveBuildCleanup {
 
     pub fn start(self) -> ActiveBuildCleanupTask {
         ActiveBuildCleanupTask {
-            task: tokio::spawn(async move {
-                let mut ticker = interval(Duration::from_secs(5));
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let mut observation = ObservationWindow::for_startup(Instant::now());
-                let mut recovered_queue = RecoveredQueueCleanup::default();
-                loop {
-                    ticker.tick().await;
-                    // This must also run when there are no active builds.
-                    recovered_queue.check(&self.context);
-                    self.check_active_builds_observed(&mut observation).await;
-                }
-            }),
+            task: tokio::spawn(remediation::run(self)),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     async fn check_active_builds(&self) {
         self.check_active_builds_observed(&mut ObservationWindow::default())
             .await;
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     async fn check_active_builds_observed(&self, observation: &mut ObservationWindow) {
+        // The long-running service owns retry state. Existing process tests
+        // drain one observation, using the same fresh-evidence admission check.
+        for planned in self.collect_active_builds_observed(observation) {
+            if let Some(build) = remediation::fresh_candidate(self, &planned, observation) {
+                self.context
+                    .cancellation
+                    .cancel_build(
+                        &self.context,
+                        build.id,
+                        crate::cancellation::CancelReason::StuckDetector,
+                        false,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Collect evidence without waiting for remote termination. Retry policy
+    /// must not stop this observer, queue retirement, or peer observations.
+    fn collect_active_builds_observed(
+        &self,
+        observation: &mut ObservationWindow,
+    ) -> Vec<crate::history::ActiveBuildState> {
         let triage_started = Instant::now();
         observation.recovering(triage_started);
         let active_builds = self.context.history.active_builds();
         if active_builds.is_empty() {
-            return;
+            return Vec::new();
         }
         let active_build_count = active_builds.len();
+        let mut candidates = Vec::new();
 
         for candidate in active_builds {
-            // Cancellation of a previous candidate can await remote I/O. Never
-            // reuse the sweep's old heartbeat snapshot after that await.
+            // History can advance during a sweep; observe the current row.
+            // Remediation rechecks it again before acquiring cancellation rights.
             let Some(build) = self.context.history.active_build(candidate.id) else {
                 continue;
             };
             let now = Instant::now();
             let recovering = observation.recovering_build(now, build.recovered);
-            let hook_alive = build.hook_pid == 0 || is_process_alive(build.hook_pid);
-            let heartbeat_age_secs = now
-                .checked_duration_since(build.last_heartbeat_mono)
-                .unwrap_or_default()
-                .as_secs();
-            let progress_age_secs = now
-                .checked_duration_since(build.last_progress_mono)
-                .unwrap_or_default()
-                .as_secs();
-            let build_age_secs = now
-                .checked_duration_since(build.started_at_mono)
-                .unwrap_or_default()
-                .as_secs();
-            let slots_owned = build.slots;
-            let has_worker_binding = !build.worker_id.is_empty();
-            let evidence = score_stuck_evidence(StuckEvidenceInput {
-                hook_alive,
-                progress_stall_remediable_phase: is_progress_stall_remediable_phase(
-                    &build.heartbeat_phase,
-                ),
-                heartbeat_age_secs,
-                progress_age_secs,
-                build_age_secs,
-                slots_owned,
-                has_worker_binding,
-            });
+            let evidence = build_stuck_evidence(&build, now);
             let _ = self.context.history.record_stuck_detector_snapshot(
                 build.id,
                 StuckDetectorSnapshot {
@@ -447,36 +443,7 @@ impl ActiveBuildCleanup {
                 continue;
             }
 
-            warn!(
-                build_id = build.id,
-                project_id = %build.project_id,
-                worker_id = %build.worker_id,
-                phase = ?build.heartbeat_phase,
-                hook_alive = evidence.hook_alive,
-                heartbeat_stale = evidence.heartbeat_stale,
-                progress_stale = evidence.progress_stale,
-                remediable_progress_stale = evidence.remediable_progress_stale,
-                hb_age = evidence.heartbeat_age_secs,
-                progress_age = evidence.progress_age_secs,
-                build_age = evidence.build_age_secs,
-                slots = evidence.slots_owned,
-                confidence = evidence.confidence,
-                decision = "cancel",
-                reason = "stuck_detector",
-                "Cleaning up build due to high-confidence stuck evidence"
-            );
-
-            // Delegate to CancellationOrchestrator for deterministic cleanup.
-            let _ = self
-                .context
-                .cancellation
-                .cancel_build(
-                    &self.context,
-                    build.id,
-                    crate::cancellation::CancelReason::StuckDetector,
-                    false,
-                )
-                .await;
+            candidates.push(build);
         }
 
         let elapsed_ms = duration_millis_u64(triage_started.elapsed());
@@ -494,6 +461,48 @@ impl ActiveBuildCleanup {
                 }),
             );
         }
+        candidates
+    }
+}
+
+fn build_stuck_evidence(build: &crate::history::ActiveBuildState, now: Instant) -> StuckEvidence {
+    let hook_alive = build.hook_pid == 0 || is_process_alive(build.hook_pid);
+    let heartbeat_age_secs = now
+        .checked_duration_since(build.last_heartbeat_mono)
+        .unwrap_or_default()
+        .as_secs();
+    let progress_age_secs = now
+        .checked_duration_since(build.last_progress_mono)
+        .unwrap_or_default()
+        .as_secs();
+    let build_age_secs = now
+        .checked_duration_since(build.started_at_mono)
+        .unwrap_or_default()
+        .as_secs();
+    let slots_owned = build.slots;
+    let has_worker_binding = !build.worker_id.is_empty();
+    score_stuck_evidence_with(
+        StuckEvidenceInput {
+            hook_alive,
+            progress_stall_remediable_phase: is_progress_stall_remediable_phase(
+                &build.heartbeat_phase,
+            ),
+            heartbeat_age_secs,
+            progress_age_secs,
+            build_age_secs,
+            slots_owned,
+            has_worker_binding,
+        },
+        live_hook_heartbeat_stale_secs(&build.heartbeat_phase),
+    )
+}
+
+fn live_hook_heartbeat_stale_secs(phase: &rch_common::BuildHeartbeatPhase) -> u64 {
+    match phase {
+        rch_common::BuildHeartbeatPhase::SyncDown | rch_common::BuildHeartbeatPhase::Finalize => {
+            POST_EXECUTION_LIVE_HOOK_HEARTBEAT_STALE_SECS
+        }
+        _ => LIVE_HOOK_HEARTBEAT_STALE_SECS,
     }
 }
 
@@ -639,15 +648,36 @@ mod tests {
                 "unknown is not dead"
             );
             // Model a different incarnation, not actual operating-system PID reuse.
-            #[cfg(target_os = "linux")]
-            {
-                let actual = crate::history::process_identity(owner.0.id()).unwrap();
-                row.hook_process_identity = Some(format!("{actual}-prior"));
-                assert_eq!(
-                    recovered_queue_owner_gone(&row),
-                    Some("queued_owner_replaced")
-                );
-            }
+            let actual = crate::history::process_identity(owner.0.id()).unwrap();
+            let mut prior = rch_common::process_identity::ProcessIdentity::from_record(&actual)
+                .expect("the daemon records a parseable birth identity");
+            prior.start = match prior.start {
+                rch_common::process_identity::ProcessStart::Linux { ticks } => {
+                    rch_common::process_identity::ProcessStart::Linux { ticks: ticks + 1 }
+                }
+                rch_common::process_identity::ProcessStart::Darwin {
+                    seconds,
+                    microseconds,
+                } => rch_common::process_identity::ProcessStart::Darwin {
+                    seconds: seconds + 1,
+                    microseconds,
+                },
+            };
+            row.hook_process_identity = prior.to_record();
+            assert_eq!(
+                recovered_queue_owner_gone(&row),
+                Some("queued_owner_replaced")
+            );
+            row.hook_process_identity = Some(format!("{actual}-prior"));
+            assert!(
+                recovered_queue_owner_gone(&row).is_none(),
+                "an unparseable record proves nothing"
+            );
+            row.hook_process_identity = Some(actual);
+            assert!(
+                recovered_queue_owner_gone(&row).is_none(),
+                "same incarnation"
+            );
             assert!(owner.0.try_wait().unwrap().is_none());
             for pid in [0, 1, u32::MAX] {
                 row.hook_pid = pid;
@@ -1046,6 +1076,41 @@ mod tests {
         crate::test_daemon_context(pool)
     }
 
+    /// Admit like production selection does: with the worker's endpoint, so
+    /// cancellation can target the admitted SSH coordinates (60ee09f).
+    #[cfg(target_os = "linux")]
+    async fn admit_remote_build(
+        context: &DaemonContext,
+        project: String,
+        worker: &str,
+        hook_pid: u32,
+        wrapper: Option<String>,
+    ) -> crate::history::ActiveBuildState {
+        let endpoint = context
+            .pool
+            .get(&rch_common::WorkerId::new(worker))
+            .await
+            .unwrap()
+            .endpoint_snapshot()
+            .await;
+        context
+            .history
+            .try_start_active_build_with_waiter(
+                project,
+                worker.into(),
+                "sleep 180".into(),
+                hook_pid,
+                wrapper,
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(endpoint),
+            )
+            .unwrap()
+            .unwrap()
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn restarted_observer_allows_reattachment_then_reaps_a_still_stale_job() {
@@ -1096,30 +1161,28 @@ mod tests {
             progress_counter: None,
             progress_percent: None,
         };
-        let builds: Vec<_> = jobs
-            .iter()
-            .enumerate()
-            .map(|(index, job)| {
-                std::fs::write(
-                    root.join(format!("{}.pgid", job.0.id())),
-                    job.0.id().to_string(),
-                )
-                .unwrap();
-                let build = context.history.start_active_build_with_wrapper(
-                    format!("restart-observer-{index}"),
-                    "restart-observer-worker".into(),
-                    "sleep 180".into(),
-                    job.0.id(),
-                    Some(format!("restart-wrapper-{index}")),
-                    1,
-                    rch_common::BuildLocation::Remote,
-                );
+        let mut builds = Vec::new();
+        for (index, job) in jobs.iter().enumerate() {
+            std::fs::write(
+                root.join(format!("{}.pgid", job.0.id())),
+                job.0.id().to_string(),
+            )
+            .unwrap();
+            let build = admit_remote_build(
+                &context,
+                format!("restart-observer-{index}"),
+                "restart-observer-worker",
+                job.0.id(),
+                Some(format!("restart-wrapper-{index}")),
+            )
+            .await;
+            builds.push(
                 context
                     .history
                     .record_build_heartbeat(heartbeat(&build))
-                    .unwrap()
-            })
-            .collect();
+                    .unwrap(),
+            );
+        }
 
         // Model downtime in durable timestamps, then use the production loader.
         // This is not a native kill/restart or an elapsed-time qualification.
@@ -1226,25 +1289,22 @@ mod tests {
             progress_counter: None,
             progress_percent: None,
         };
-        let builds: Vec<_> = jobs
-            .iter()
-            .enumerate()
-            .map(|(index, job)| {
-                let build = context.history.start_active_build(
-                    format!("observer-recovery-{index}"),
-                    "observer-worker".into(),
-                    "sleep 180".into(),
-                    job.0.id(),
-                    1,
-                    rch_common::BuildLocation::Remote,
-                );
-                context
-                    .history
-                    .record_build_heartbeat(heartbeat(build.id, job.0.id()))
-                    .unwrap();
-                context.history.active_build(build.id).unwrap()
-            })
-            .collect();
+        let mut builds = Vec::new();
+        for (index, job) in jobs.iter().enumerate() {
+            let build = admit_remote_build(
+                &context,
+                format!("observer-recovery-{index}"),
+                "observer-worker",
+                job.0.id(),
+                None,
+            )
+            .await;
+            context
+                .history
+                .record_build_heartbeat(heartbeat(build.id, job.0.id()))
+                .unwrap();
+            builds.push(context.history.active_build(build.id).unwrap());
+        }
         let mut observation = ObservationWindow::default();
         assert!(!observation.recovering(Instant::now()));
         // Real history uses std::time::Instant: age actual children and actual
@@ -1328,14 +1388,14 @@ mod tests {
         let context = cleanup_worker_context("shutdown-test-unbound-worker", 1).await;
         let pgid_file = root.join("shutdown.pgid");
         std::fs::write(&pgid_file, job.0.id().to_string()).unwrap();
-        let build = context.history.start_active_build(
+        let build = admit_remote_build(
+            &context,
             "shutdown-quiet-job".into(),
-            "shutdown-test-unbound-worker".into(),
-            "sleep 180".into(),
+            "shutdown-test-unbound-worker",
             job.0.id(),
-            1,
-            rch_common::BuildLocation::Remote,
-        );
+            None,
+        )
+        .await;
         context
             .history
             .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
@@ -1496,6 +1556,41 @@ mod tests {
         assert!(evidence.progress_stale);
         assert!(evidence.remediable_progress_stale);
         assert!(evidence.should_remediate());
+    }
+
+    #[test]
+    fn post_execution_phases_keep_a_silent_live_hook_delivering_a_result() {
+        let _guard = test_guard!();
+        // #112: a live hook publishing a successful build's artifacts in SyncDown
+        // went 120+ s without a heartbeat and was SIGTERMed.
+        let input = |hook_alive, heartbeat_age_secs| StuckEvidenceInput {
+            hook_alive,
+            progress_stall_remediable_phase: true,
+            heartbeat_age_secs,
+            progress_age_secs: heartbeat_age_secs,
+            build_age_secs: heartbeat_age_secs + 300,
+            slots_owned: 2,
+            has_worker_binding: true,
+        };
+        for phase in [BuildHeartbeatPhase::SyncDown, BuildHeartbeatPhase::Finalize] {
+            let limit = live_hook_heartbeat_stale_secs(&phase);
+            assert_eq!(limit, POST_EXECUTION_LIVE_HOOK_HEARTBEAT_STALE_SECS);
+            assert!(!score_stuck_evidence_with(input(true, 600), limit).should_remediate());
+            assert!(score_stuck_evidence_with(input(true, limit + 1), limit).should_remediate());
+            // A dead hook is still reaped on the short limit.
+            assert!(
+                score_stuck_evidence_with(input(false, HEARTBEAT_STALE_SECS + 100), limit)
+                    .should_remediate()
+            );
+        }
+        for phase in [BuildHeartbeatPhase::SyncUp, BuildHeartbeatPhase::Execute] {
+            let limit = live_hook_heartbeat_stale_secs(&phase);
+            assert_eq!(limit, LIVE_HOOK_HEARTBEAT_STALE_SECS);
+            assert!(
+                score_stuck_evidence_with(input(true, LIVE_HOOK_HEARTBEAT_STALE_SECS + 1), limit)
+                    .should_remediate()
+            );
+        }
     }
 
     #[test]

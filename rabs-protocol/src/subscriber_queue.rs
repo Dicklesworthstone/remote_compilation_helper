@@ -281,4 +281,170 @@ mod tests {
         assert_eq!(queue.memory_used(), 0);
         assert_eq!(queue.spill_used(), 0);
     }
+
+    #[test]
+    fn t028_slow_subscriber_signal_forwarding_and_fail_open_stampede_scenarios() {
+        use crate::local_protocol::{
+            EmergencyLimiterDecision, FallbackConfig, FallbackExecutionMode,
+            HostLocalEmergencyLimiter, SubscriberFrontierReport,
+            UNCOORDINATED_LOCAL_FALLBACK_LABEL, UncoordinatedFallbackTelemetry, decide_fallback,
+        };
+        use crate::subscriber_interest::{
+            CancellationTrigger, ChildTermination, DisconnectCause, RelayAction, WrapperFate,
+            WrapperSignal, map_cancellation, relay_child_termination,
+        };
+        use crate::wrapper_breaker::{
+            AttemptOutcome, BreakerPolicy, BreakerState, ConnectDecision, decide, on_outcome,
+        };
+
+        // 1. Slow-subscriber scenario (R94): 3 subscribers share an action; subscriber 1 stalls
+        //    until both memory and spill budgets exhaust and detaches cleanly without stalling
+        //    subscribers 2 and 3 or the shared action.
+        let tight = QueueBudgets {
+            memory_bytes: 40,
+            spill_bytes: 40,
+        };
+        let mut sub_slow = SubscriberQueue::new(tight);
+        let mut sub_fast_a = SubscriberQueue::new(tight);
+        let mut sub_fast_b = SubscriberQueue::new(tight);
+        let mut slow_detached_at = None;
+
+        for seq in 1..=10u64 {
+            let f = frame(seq, 20);
+            if slow_detached_at.is_none()
+                && matches!(
+                    sub_slow.enqueue(f.clone()),
+                    EnqueueOutcome::DetachSlowSubscriber { .. }
+                )
+            {
+                sub_slow.clear();
+                slow_detached_at = Some(seq);
+            }
+            assert_eq!(sub_fast_a.enqueue(f.clone()), EnqueueOutcome::InMemory);
+            assert_eq!(sub_fast_b.enqueue(f), EnqueueOutcome::InMemory);
+            assert_eq!(sub_fast_a.dequeue().unwrap().seq, seq);
+            assert_eq!(sub_fast_b.dequeue().unwrap().seq, seq);
+        }
+        assert_eq!(
+            slow_detached_at,
+            Some(5),
+            "slow subscriber detaches on 5th frame after exhausting 40B memory + 40B spill"
+        );
+        assert!(sub_slow.is_empty());
+
+        // 2. Signal-forwarding scenario (C016/C024): every catchable wrapper signal maps to
+        //    exact DisconnectCause::Signal + WrapperFate::DieBySignal with stock 128+N exit code,
+        //    and child signal termination relays via RestoreDefaultAndResignal on Unix.
+        for (sig, num, code) in [
+            (WrapperSignal::Hangup, 1, 129),
+            (WrapperSignal::Interrupt, 2, 130),
+            (WrapperSignal::Terminate, 15, 143),
+        ] {
+            assert_eq!(sig.number(), num);
+            assert_eq!(sig.observed_exit_code(), code);
+            assert_eq!(
+                map_cancellation(CancellationTrigger::Signal(sig)),
+                (DisconnectCause::Signal(sig), WrapperFate::DieBySignal(sig))
+            );
+            assert_eq!(
+                relay_child_termination(ChildTermination::Signaled { signal_number: num }, true),
+                RelayAction::RestoreDefaultAndResignal { signal_number: num }
+            );
+            assert_eq!(
+                relay_child_termination(ChildTermination::Signaled { signal_number: num }, false),
+                RelayAction::ExitWithConventionalCode(code)
+            );
+        }
+        assert_eq!(
+            map_cancellation(CancellationTrigger::ParentDeath),
+            (
+                DisconnectCause::ParentDeath,
+                WrapperFate::DieBySignal(WrapperSignal::Terminate)
+            )
+        );
+
+        // 3. Degraded fail-open stampede scenario (R87): 50 wrappers hit a dead edge.
+        //    - First 3 open the persisted circuit breaker; remaining 47 skip straight to local
+        //      (ConnectDecision::SkipToLocal, zero connect timeout overhead).
+        //    - HostLocalEmergencyLimiter caps concurrent local roots and never exceeds
+        //      safety_latency_budget_us (bypassing immediately when estimated wait > budget),
+        //      emitting explicit UncoordinatedLocalFallback telemetry records.
+        let breaker_policy = BreakerPolicy {
+            connect_timeout_ms: 25,
+            decision_timeout_ms: 50,
+            open_after_consecutive_failures: 3,
+            cooldown_ms: 5_000,
+        };
+        let limiter = HostLocalEmergencyLimiter {
+            max_concurrent_local_roots: 4,
+            safety_latency_budget_us: 500,
+        };
+        let mut breaker = BreakerState::fresh();
+        let mut skip_count = 0u32;
+        let mut active_local_roots = 0u32;
+        let mut bypassed_count = 0u32;
+
+        for idx in 0..50u32 {
+            let decision = decide(&breaker_policy, &breaker, 1_000 + u64::from(idx));
+            if matches!(decision, ConnectDecision::SkipToLocal) {
+                skip_count += 1;
+            } else {
+                breaker = on_outcome(
+                    &breaker_policy,
+                    &breaker,
+                    AttemptOutcome::Failed,
+                    1_000 + u64::from(idx),
+                );
+            }
+
+            let est_wait_us = u64::from(idx) * 50;
+            let lim_decision = limiter.evaluate(active_local_roots, est_wait_us);
+            if let EmergencyLimiterDecision::PermitGranted {
+                active_local_roots: next_roots,
+            } = lim_decision
+            {
+                active_local_roots = next_roots;
+            } else if matches!(
+                lim_decision,
+                EmergencyLimiterDecision::BypassedForSafetyBound { .. }
+            ) {
+                bypassed_count += 1;
+            }
+            assert!(
+                lim_decision.safety_path_delay_us() <= limiter.safety_latency_budget_us,
+                "safety path delay must never exceed budget"
+            );
+
+            let fallback_action = decide_fallback(
+                &SubscriberFrontierReport::default(),
+                &FallbackConfig::default(),
+                u128::from(idx),
+            );
+            let telemetry =
+                UncoordinatedFallbackTelemetry::new(u128::from(idx), fallback_action, lim_decision);
+            assert_eq!(
+                telemetry.mode,
+                FallbackExecutionMode::UncoordinatedLocalFallback
+            );
+            assert_eq!(telemetry.mode_label, UNCOORDINATED_LOCAL_FALLBACK_LABEL);
+            assert!(
+                telemetry
+                    .to_ndjson_line()
+                    .contains(UNCOORDINATED_LOCAL_FALLBACK_LABEL)
+            );
+        }
+
+        assert_eq!(
+            skip_count, 47,
+            "47 of 50 stampede wrappers skip connect timeout via open breaker"
+        );
+        assert_eq!(
+            active_local_roots, 4,
+            "host-local emergency limiter caps active local roots at 4"
+        );
+        assert!(
+            bypassed_count > 0,
+            "excess stampede arrivals bypass waiting when wait > safety budget"
+        );
+    }
 }

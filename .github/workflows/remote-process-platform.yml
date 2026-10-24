@@ -1,0 +1,66 @@
+name: Remote process platform identity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch-common/src/process_identity.rs'
+      - 'rch-common/src/remote_process.sh'
+      - 'rch-common/src/remote_scoped_launch.rs'
+      - 'rch-common/src/remote_scoped_launch.sh'
+      - 'rch-common/tests/remote_supervised_platform.py'
+      - 'rch-common/tests/remote_process_platform.py'
+      - 'rch-common/tests/remote_control_timeout.py'
+      - 'rch-wkr/src/main.rs'
+      - 'rch/src/transfer.rs'
+      - '.github/workflows/remote-process-platform.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-identity:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-06-06
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile native worker identity helper
+        run: cargo build --locked -p rch-wkr
+      - name: Exercise actual identity and full shell lifecycle
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          python3 rch-common/tests/remote_process_platform.py
+          RCH_TEST_SHELL=/bin/bash python3 rch-common/tests/remote_process_platform.py
+      - name: Exercise bounded probes and lifecycle without GNU timeout
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          python3 rch-common/tests/remote_control_timeout.py -v
+          RCH_TEST_SHELL=/bin/bash python3 rch-common/tests/remote_control_timeout.py -v
+      - name: Exercise the production owned-group supervisor on each platform
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          for shell in /bin/sh /bin/bash; do
+            RCH_TEST_SHELL="$shell" python3 rch-common/tests/remote_supervised_platform.py -v
+            RCH_TEST_NO_TIMEOUT=1 RCH_TEST_SHELL="$shell" python3 rch-common/tests/remote_supervised_platform.py -v
+          done
+      - name: Check shared native identity and Linux escalation
+        run: |
+          cargo test --locked -p rch-common process_identity
+          cargo test --locked -p rch-common --test remote_process_escalation
+      - name: Check workspace compilation, lints and formatting
+        run: |
+          cargo check --locked --workspace --all-targets
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo fmt --check

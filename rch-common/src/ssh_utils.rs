@@ -62,13 +62,36 @@ pub fn is_retryable_transport_error_text(message: &str) -> bool {
     // a transient stale ControlMaster socket (retryable), and the genuinely-fatal
     // missing-key case is already covered by "identity file"/"keyfile". Keeping
     // it as an unconditional fatal mis-classified a recoverable mux-socket drop.
+    // A dual-role worker's receiver refuses a sync into its live checkout
+    // before rsync starts, so rsync reports "connection unexpectedly closed".
+    // The refusal is deterministic (bd-fbtws); retrying only repeats it.
+    if message.contains("rch_sync_live_checkout_refused") {
+        return false;
+    }
     if message.contains("permission denied")
         || message.contains("host key verification failed")
-        || message.contains("could not resolve hostname")
         || message.contains("identity file")
         || message.contains("keyfile")
         || message.contains("invalid format")
         || message.contains("unknown option")
+    {
+        return false;
+    }
+
+    // OpenSSH prefixes BOTH EAI_AGAIN and permanent resolver failures with
+    // "could not resolve hostname". An unconditional refusal here made the
+    // transient DNS rule below unreachable for the real SSH diagnostic.
+    // Require the temporary reason on that same diagnostic, not elsewhere in
+    // a combined rsync log. A permanent/unknown lookup failure still vetoes
+    // retry even when a later line reports a broken pipe or a timeout.
+    if message.contains("name or service not known")
+        || message.contains("nodename nor servname provided")
+        || message.lines().any(|line| {
+            line.contains("could not resolve hostname")
+                && !line
+                    .trim_end()
+                    .ends_with(": temporary failure in name resolution")
+        })
     {
         return false;
     }
@@ -325,6 +348,65 @@ mod tests {
         assert!(!is_retryable_transport_error_text(
             "Identity file /nope/id_rsa not accessible: No such file or directory"
         ));
+    }
+
+    #[test]
+    fn temporary_dns_failures_retry_through_real_ssh_and_rsync_diagnostics() {
+        for message in [
+            "ssh: Could not resolve hostname worker: Temporary failure in name resolution",
+            "SSH: COULD NOT RESOLVE HOSTNAME WORKER: TEMPORARY FAILURE IN NAME RESOLUTION\r\n",
+            "failed to sync project: ssh: Could not resolve hostname worker: Temporary failure in name resolution",
+            "ssh: Could not resolve hostname worker: Temporary failure in name resolution\nrsync: connection unexpectedly closed (0 bytes received so far) [sender]",
+            "Temporary failure in name resolution",
+        ] {
+            assert!(is_retryable_transport_error_text(message), "{message}");
+        }
+        let error = anyhow::anyhow!(
+            "ssh: Could not resolve hostname worker: Temporary failure in name resolution"
+        )
+        .context("source sync failed")
+        .context("selected worker could not be reached");
+        assert!(is_retryable_transport_error(&error));
+    }
+
+    #[test]
+    fn permanent_or_ambiguous_dns_failures_never_inherit_a_retryable_suffix() {
+        for reason in [
+            "Name or service not known",
+            "nodename nor servname provided, or not known",
+            "unknown resolver failure",
+            "",
+        ] {
+            let message = format!(
+                "ssh: Could not resolve hostname worker: {reason}\n\
+                 rsync: connection unexpectedly closed\n\
+                 previous attempt: Temporary failure in name resolution"
+            );
+            assert!(!is_retryable_transport_error_text(&message), "{message}");
+        }
+        // A temporary result for a second lookup must not hide a permanent
+        // result in the same aggregated error (including an anyhow chain).
+        assert!(!is_retryable_transport_error_text(
+            "Could not resolve hostname first: Name or service not known: \
+             Could not resolve hostname second: Temporary failure in name resolution"
+        ));
+    }
+
+    #[test]
+    fn temporary_dns_never_overrides_authentication_or_configuration_refusals() {
+        for fatal in [
+            "Permission denied (publickey)",
+            "Host key verification failed",
+            "Identity file /missing not accessible",
+            "Cannot open keyfile",
+            "Invalid format",
+            "Unknown option",
+        ] {
+            let error = anyhow::anyhow!(fatal).context(
+                "ssh: Could not resolve hostname worker: Temporary failure in name resolution",
+            );
+            assert!(!is_retryable_transport_error(&error), "{fatal}");
+        }
     }
 
     #[test]

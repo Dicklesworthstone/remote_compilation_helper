@@ -202,6 +202,8 @@ pub enum ErrorCode {
     BuildArtifactForeignTarget,
     /// Cargo workspace inheritance failed under remote topology
     BuildCargoWorkspaceInheritance,
+    /// A worker stopped or refused a job to preserve its build disk budget.
+    BuildDiskBudgetExceeded,
 
     // -- Process Triage (E310-E319) --
     /// Process triage adapter binary unavailable or not installed
@@ -377,6 +379,7 @@ impl ErrorCode {
             Self::BuildArtifactSyncEmpty => 326,
             Self::BuildArtifactForeignTarget => 327,
             Self::BuildCargoWorkspaceInheritance => 329,
+            Self::BuildDiskBudgetExceeded => 330,
 
             // Process Triage (310-319)
             Self::ProcessTriageAdapterUnavailable => 310,
@@ -557,6 +560,7 @@ impl ErrorCode {
             Self::BuildCargoWorkspaceInheritance => {
                 "Cargo workspace inheritance failed under remote topology"
             }
+            Self::BuildDiskBudgetExceeded => "Remote build disk budget could not be maintained",
 
             // Process Triage
             Self::ProcessTriageAdapterUnavailable => {
@@ -961,6 +965,11 @@ impl ErrorCode {
                 "Isolate remote sync roots from unrelated outer Cargo workspaces",
                 "Check path dependency manifests for workspace-inherited fields",
             ],
+            Self::BuildDiskBudgetExceeded => &[
+                "Use a worker with enough free space for the project's output and protected reserve",
+                "Reduce artifact sizes with appropriate CARGO_PROFILE_* settings",
+                "Inspect the typed failure before retrying; a started job must not be replayed automatically",
+            ],
 
             // Process Triage
             Self::ProcessTriageAdapterUnavailable => &[
@@ -1302,6 +1311,7 @@ impl ErrorCode {
             Self::BuildArtifactSyncEmpty,
             Self::BuildArtifactForeignTarget,
             Self::BuildCargoWorkspaceInheritance,
+            Self::BuildDiskBudgetExceeded,
             // Process Triage
             Self::ProcessTriageAdapterUnavailable,
             Self::ProcessTriageDetectorUncertain,
@@ -1698,6 +1708,16 @@ mod tests {
         assert_eq!(ErrorCode::BuildCargoWorkspaceInheritance.code_number(), 329);
         assert_eq!(
             ErrorCode::BuildCargoWorkspaceInheritance.category(),
+            ErrorCategory::Build
+        );
+    }
+
+    #[test]
+    fn test_build_disk_budget_error_code_stable() {
+        assert_eq!(ErrorCode::BuildDiskBudgetExceeded.code_number(), 330);
+        assert_eq!(ErrorCode::BuildDiskBudgetExceeded.code_string(), "RCH-E330");
+        assert_eq!(
+            ErrorCode::BuildDiskBudgetExceeded.category(),
             ErrorCategory::Build
         );
     }

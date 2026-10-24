@@ -12,19 +12,25 @@
 //! Wire format: newline-delimited JSON, one request per line, 64 KiB bound.
 //! Malformed input never grants execution, publication, or fallback authority.
 //!
-//! Stale-socket takeover: never a blind unlink. If the socket path
-//! exists, LIVENESS-PROBE it (connect): a live daemon means this boot
-//! REFUSES (typed); only a probe-dead socket file (stale runtime state
-//! from a dead incarnation) is removed and taken over, and the takeover
-//! is logged.
+//! Endpoint ownership spans the listener AND every admitted session. A
+//! permanent endpoint lock, private namespace and exact socket generation
+//! fence takeover and teardown independently of the configured CAS root.
+//! Only an unchanged socket whose bounded connect was refused is retired;
+//! timeout, permissions, wrong type and replacement never prove death.
 
+mod backpressure;
+mod endpoint;
+mod frame_read;
 mod liveness;
+mod remote_dependency;
 mod rustc_outputs;
 mod rustc_request;
 
 use asupersync::cx::Cx;
-use asupersync::io::{AsyncReadExt, AsyncWriteExt};
-use asupersync::net::unix::{UnixListener, UnixStream};
+use asupersync::io::{AsyncWriteExt, BufReader};
+#[cfg(test)]
+use asupersync::net::unix::UnixListener;
+use asupersync::net::unix::UnixStream;
 use asupersync::signal::ShutdownReceiver;
 use liveness::{Limit, WorkError};
 use rabs_asupersync::daemon_runtime::SubsystemWork;
@@ -32,7 +38,6 @@ use rabs_protocol::socket_admission::{
     AdmissionPolicy, ConnectionEvidence, PeerCredentials, SocketMetadata, TokenContext, admit,
 };
 use rabs_protocol::version_negotiation::{Negotiation, VersionHello, VersionRange, negotiate};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -42,17 +47,25 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTIONS: usize = 128;
 pub const MAX_REQUESTS_PER_CONNECTION: usize = 64;
 const FRAME_IO_BUDGET: Duration = Duration::from_secs(5);
+/// One buffer survives every phase, including completion and capture ACK.
+/// The connection cap bounds total read-ahead storage to 2 MiB per listener.
+const FRAME_READ_BUFFER_BYTES: usize = 16 * 1024;
+type EdgeStream = BufReader<UnixStream>;
 const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
+/// Artifact installs, including accepted live hits. Reserve before asking a
+/// subscriber to wait, so fresh decisions cannot steal its installation slot.
+/// A bounded acknowledgment wait retains capacity, never a blocking thread.
 const MATERIALIZATION_WORKERS: usize = 2;
 const PREPARED_ADMISSION_WORKERS: usize = 2;
-/// Live dependency decisions and hit installs: a compiler is waiting on
-/// each. Saturation answers pass-through, never waits.
+/// Live dependency decisions: a compiler is waiting on each. Saturation
+/// before a decision may carry a bounded wrapper retry hint; no work is queued
+/// or capacity retained while that wrapper backs off.
 const LIVE_DECISION_WORKERS: usize = 8;
-/// Live dependency completions (harvest, durable uploads, publication).
-/// Nobody waits on these — the wrapper has already exited — so they get
-/// their own, larger lane instead of crowding out decisions (observed live
-/// under `cargo -j4`: a shared lane saturated and refused decisions).
+/// Live dependency completions (capture, durable uploads, publication).
+/// Wrappers retain their outputs until capture is acknowledged, but do not
+/// wait for publication. Keep this lane separate from decisions; no worker
+/// permit is held while awaiting the subscriber's acknowledgment.
 const LIVE_COMPLETION_WORKERS: usize = 8;
 /// How long an admitted local execution may run before its completion
 /// frame must arrive (the attempt lease is longer still).
@@ -67,9 +80,10 @@ struct EdgeLimits {
     prepared_admission: Limit,
     live: Limit,
     live_completion: Limit,
+    remote_execution: Limit,
 }
 impl EdgeLimits {
-    fn new() -> Self {
+    fn new(remote_workers: usize) -> Self {
         Self {
             sessions: Limit::new(MAX_CONNECTIONS),
             control: Limit::new(CONTROL_WORKERS),
@@ -78,6 +92,11 @@ impl EdgeLimits {
             prepared_admission: Limit::new(PREPARED_ADMISSION_WORKERS),
             live: Limit::new(LIVE_DECISION_WORKERS),
             live_completion: Limit::new(LIVE_COMPLETION_WORKERS),
+            // One owned execution lane per configured worker. Long compiler
+            // and transfer waits never occupy decisions or cache-hit installs.
+            remote_execution: Limit::new(
+                remote_workers.min(crate::coord::live_dependency::remote::MAX_DEPENDENCY_WORKERS),
+            ),
         }
     }
 }
@@ -123,13 +142,25 @@ pub struct EdgeServerConfig {
     pub live_dependency: Option<crate::coord::live_dependency::LiveDependencyLane>,
 }
 
-fn log_line(kind: &str, fields: &[(&str, &str)]) {
-    let mut line = format!("{{\"v\":1,\"kind\":\"{kind}\"");
+/// One NDJSON event on stderr. Values are JSON-encoded, so a reason that
+/// quotes a path or an OS error with backslashes or newlines stays one
+/// parseable line instead of silently dropping out of the decision trail.
+pub(crate) fn log_line(kind: &str, fields: &[(&str, &str)]) {
+    eprintln!("{}", render_log_line(kind, fields));
+}
+
+/// Field order is preserved (a `Map` would sort it) for human readers.
+fn render_log_line(kind: &str, fields: &[(&str, &str)]) -> String {
+    let mut line = format!("{{\"v\":1,\"kind\":{}", serde_json::Value::from(kind));
     for (key, value) in fields {
-        line.push_str(&format!(",\"{}\":\"{}\"", key, value.replace('"', "'")));
+        line.push_str(&format!(
+            ",{}:{}",
+            serde_json::Value::from(*key),
+            serde_json::Value::from(*value)
+        ));
     }
     line.push('}');
-    eprintln!("{line}");
+    line
 }
 
 /// Build the edge [`SubsystemWork`] for [`DaemonRunOptions`].
@@ -144,46 +175,18 @@ async fn serve(
     mut shutdown: ShutdownReceiver,
     config: EdgeServerConfig,
 ) -> Result<(), String> {
-    // Stale-socket takeover: liveness probe, never blind unlink.
-    if config.socket_path.exists() {
-        match UnixStream::connect(&config.socket_path).await {
-            Ok(_) => {
-                return Err(format!(
-                    "another rabsd is alive at {} — refusing to take over",
-                    config.socket_path.display()
-                ));
-            }
-            Err(_) => {
-                log_line(
-                    "rabsd-socket-takeover",
-                    &[("stale", &config.socket_path.display().to_string())],
-                );
-                std::fs::remove_file(&config.socket_path)
-                    .map_err(|e| format!("stale socket removal failed: {e}"))?;
-            }
-        }
-    }
-    if let Some(parent) = config.socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let listener = UnixListener::bind(&config.socket_path)
-        .await
-        .map_err(|e| format!("bind {}: {e}", config.socket_path.display()))?;
-    std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("socket chmod: {e}"))?;
-
-    // Admission evidence baseline: the socket we just created. The
-    // daemon's own uid is the socket owner's uid (we created it).
-    let socket_meta = std::fs::metadata(&config.socket_path).map_err(|e| e.to_string())?;
-    let expected_uid = socket_meta.uid();
+    let listener = endpoint::bind(&config.socket_path, FRAME_IO_BUDGET).await?;
+    // The endpoint owner just checked the exact bound inode, kernel UID and
+    // mode. Socket metadata never chooses a different user's admission policy.
+    let expected_uid = listener.owner_uid();
     let policy = AdmissionPolicy {
         expected_uid,
         require_token_on_unix: false,
         tcp_enabled: false,
     };
     let socket_evidence = SocketMetadata {
-        owner_uid: socket_meta.uid(),
-        mode: socket_meta.mode() & 0o777,
+        owner_uid: expected_uid,
+        mode: 0o600,
     };
     log_line(
         "rabsd-edge-listening",
@@ -206,9 +209,18 @@ async fn serve(
         live: config
             .live_dependency
             .clone()
-            .map(|lane| std::sync::Arc::new(rustc_request::LiveEdge::new(lane))),
+            .map(|lane| {
+                rustc_request::LiveEdge::configured(lane, &config.state_dir)
+                    .map(std::sync::Arc::new)
+            })
+            .transpose()?,
     };
-    let limits = EdgeLimits::new();
+    let limits = EdgeLimits::new(
+        services
+            .live
+            .as_ref()
+            .map_or(0, |live| live.remote_worker_count()),
+    );
     let acceptor = cx
         .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, services, limits))
         .map_err(|e| format!("acceptor spawn: {e:?}"))?;
@@ -216,15 +228,15 @@ async fn serve(
 
     shutdown.wait().await;
     acceptor.abort();
-    // The socket file is this incarnation's runtime state: remove it on
-    // clean shutdown so the next boot needs no takeover.
-    let _ = std::fs::remove_file(&config.socket_path);
+    // The acceptor and its admitted sessions retain endpoint ownership.
+    // Their final drop, after joined writers return, retires only the exact
+    // bound generation. Never unlink here while a session may still own work.
     Ok(())
 }
 
 async fn accept_loop(
     cx: Cx,
-    listener: UnixListener,
+    listener: endpoint::ListenerOwner,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     services: EdgeServices,
@@ -232,7 +244,7 @@ async fn accept_loop(
 ) {
     let mut connection_id: u64 = 0;
     loop {
-        match listener.accept().await {
+        match listener.listener.accept().await {
             Ok((stream, _addr)) => {
                 // Refuse before task allocation. Do not attempt a potentially
                 // blocking refusal write to a peer we have not admitted.
@@ -248,7 +260,12 @@ async fn accept_loop(
                 connection_id = id;
                 let services = services.clone();
                 let limits = limits.clone();
+                let endpoint_owner = std::sync::Arc::clone(&listener.owner);
                 let spawned = cx.spawn(move |cx| async move {
+                    // Outlives handle_connection, including cancellation that
+                    // drops its joined blocking-work owners. A replacement
+                    // daemon cannot acquire this endpoint during that cleanup.
+                    let _endpoint_owner = endpoint_owner;
                     if cx.checkpoint().is_ok() {
                         handle_connection(id, stream, policy, socket_evidence, services, limits)
                             .await;
@@ -276,54 +293,40 @@ async fn accept_loop(
 }
 
 /// One absolute budget covers the ENTIRE frame, not each trickled byte.
-async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Option<Vec<u8>> {
+async fn read_frame_with_budget(stream: &mut EdgeStream, budget: Duration) -> Option<Vec<u8>> {
     read_frame_bounded(stream, budget, MAX_FRAME_BYTES).await
 }
 
 /// [`read_frame_with_budget`] with an explicit frame bound, for the one
 /// frame kind (a live completion carrying its transcript) that may exceed
-/// the ordinary request bound.
+/// the ordinary request bound. Retain read-ahead across every protocol phase.
 async fn read_frame_bounded(
-    stream: &mut UnixStream,
+    stream: &mut EdgeStream,
     budget: Duration,
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
-    asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
-        let mut frame = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match stream.read(&mut byte).await {
-                Ok(0) => return None,
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        return Some(frame);
-                    }
-                    if frame.len() == max_bytes {
-                        return None;
-                    }
-                    frame.push(byte[0]);
-                }
-                Err(_) => return None,
-            }
-        }
-    })
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        budget,
+        frame_read::read_frame(stream, max_bytes),
+    )
     .await
     .ok()
     .flatten()
 }
 
 /// None means EOF, a truncated/oversized frame, or an exhausted read budget.
-async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+async fn read_frame(stream: &mut EdgeStream) -> Option<Vec<u8>> {
     read_frame_with_budget(stream, FRAME_IO_BUDGET).await
 }
 
-async fn write_frame(stream: &mut UnixStream, line: &str) -> bool {
+async fn write_frame(stream: &mut EdgeStream, line: &str) -> bool {
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(b'\n');
     asupersync::time::timeout(
         asupersync::time::wall_now(),
         FRAME_IO_BUDGET,
-        stream.write_all(&bytes),
+        stream.get_mut().write_all(&bytes),
     )
     .await
     .is_ok_and(|result| result.is_ok())
@@ -351,12 +354,13 @@ impl Drop for Flight {
 
 async fn handle_connection(
     id: u64,
-    mut stream: UnixStream,
+    stream: UnixStream,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     services: EdgeServices,
     limits: EdgeLimits,
 ) {
+    let mut stream = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, stream);
     let EdgeServices {
         shadow,
         coord,
@@ -365,7 +369,7 @@ async fn handle_connection(
     } = services;
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
-    let (peer_uid, peer_gid) = match stream.peer_cred() {
+    let (peer_uid, peer_gid) = match stream.get_ref().peer_cred() {
         Ok(cred) => (cred.uid, cred.gid),
         Err(error) => {
             log_line(
@@ -440,13 +444,26 @@ async fn handle_connection(
         };
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
-                status_on_lane(&limits.control, coord.clone()).await
+                let remote = live
+                    .as_ref()
+                    .and_then(|edge| edge.remote_configuration())
+                    .cloned();
+                status_on_lane(
+                    &limits.control,
+                    coord.clone(),
+                    live.is_some(),
+                    remote,
+                    prepared_operations.clone(),
+                )
+                .await
             }
             Ok(value)
                 if matches!(
                     value.get("kind").and_then(|k| k.as_str()),
                     Some(
                         "prepared-submit"
+                            | "prepared-submit-allocated"
+                            | "prepared-submit-pool"
                             | "prepared-status"
                             | "prepared-cancel"
                             | "prepared-resume"
@@ -461,7 +478,12 @@ async fn handle_connection(
                 // filesystem work. Neither may occupy the cancellation/status
                 // lane or the reactor while hashing a large delivered tree.
                 let lane = match value["kind"].as_str() {
-                    Some("prepared-submit" | "prepared-resume") => &limits.prepared_admission,
+                    Some(
+                        "prepared-submit"
+                        | "prepared-submit-allocated"
+                        | "prepared-submit-pool"
+                        | "prepared-resume",
+                    ) => &limits.prepared_admission,
                     Some("prepared-completion" | "prepared-recover-local") => {
                         &limits.materialization
                     }
@@ -507,16 +529,13 @@ async fn handle_connection(
                 serve_on_lane(&limits.materialization, coord.clone(), value).await
             }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("rustc-request") => {
+                let may_wait = value
+                    .get("wait_for_inflight")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
                 let decided = match &live {
                     Some(live) => {
-                        let live = std::sync::Arc::clone(live);
-                        match limits
-                            .live
-                            .spawn(move || rustc_request::decide(&live, &value))
-                        {
-                            Ok(mut work) => work.wait().await,
-                            Err(error) => Err(error),
-                        }
+                        backpressure::decide(&limits.live, std::sync::Arc::clone(live), value).await
                     }
                     None => Ok(rustc_request::shadow_observation(&value).map_or_else(
                         || {
@@ -554,7 +573,43 @@ async fn handle_connection(
                                 .to_owned(),
                         }
                     }
+                    Ok(rustc_request::Decided::Remote { reply, pending }) => {
+                        let Some(live) = live.clone() else {
+                            break;
+                        };
+                        match remote_dependency::complete_on_connection(
+                            &limits.remote_execution,
+                            &limits.materialization,
+                            live,
+                            pending,
+                            reply,
+                            may_wait,
+                            &mut stream,
+                        )
+                        .await
+                        {
+                            Some(reply) => reply,
+                            None => break,
+                        }
+                    }
                     Ok(rustc_request::Decided::Hit { reply, pending }) => {
+                        // Reserve the independent installation lane BEFORE
+                        // offering a hit. Once Cargo accepts, a fresh decision
+                        // burst cannot force a verified hit back to compilation.
+                        let Some(installation) = limits.materialization.acquire() else {
+                            // This preview owns no writer or compiler attempt.
+                            // Drop it before advertising a non-owning retry.
+                            drop(pending);
+                            if !write_frame(
+                                &mut stream,
+                                &backpressure::capacity_reply(may_wait, "materialization"),
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        };
                         // Nothing is written unless the subscriber commits to
                         // waiting for the install. A subscriber that already
                         // gave up (timeout, crash) never sees a late writer.
@@ -576,9 +631,9 @@ async fn handle_connection(
                         }
                         let live = live.clone();
                         let installed = match live {
-                            Some(live) => limits
-                                .live
-                                .spawn(move || rustc_request::install(&live, pending)),
+                            Some(live) => {
+                                installation.finish(move || rustc_request::install(&live, pending))
+                            }
                             None => break,
                         };
                         match installed {
@@ -613,22 +668,26 @@ async fn handle_connection(
                         } else {
                             None
                         };
-                        let live = live.clone();
-                        let settled = match (completion, live) {
-                            (Some(frame), Some(live)) => limits
-                                .live_completion
-                                .spawn(move || rustc_request::complete(&live, attempt, &frame)),
-                            (_, _) => limits.live_completion.spawn(move || {
+                        match (completion, live.clone()) {
+                            (Some(frame), Some(live)) => {
+                                rustc_request::complete_on_lane(
+                                    &limits.live_completion,
+                                    live,
+                                    attempt,
+                                    frame,
+                                    &mut stream,
+                                )
+                                .await
+                            }
+                            _ => match limits.live_completion.spawn(move || {
                                 drop(attempt);
                                 refusal("completion-lost", "")
-                            }),
-                        };
-                        match settled {
-                            Ok(mut work) => work
-                                .wait()
-                                .await
-                                .unwrap_or_else(|error| refusal("completion", &error.to_string())),
-                            Err(error) => refusal("completion", &error.to_string()),
+                            }) {
+                                Ok(mut work) => work.wait().await.unwrap_or_else(|error| {
+                                    refusal("completion", &error.to_string())
+                                }),
+                                Err(error) => refusal("completion", &error.to_string()),
+                            },
                         }
                     }
                     Err(error) => {
@@ -711,10 +770,53 @@ fn shadow_reply(
     (reply, joined)
 }
 
-async fn status_on_lane(lane: &Limit, coord: crate::coord::live::EdgeSubscriber) -> String {
+async fn status_on_lane(
+    lane: &Limit,
+    coord: crate::coord::live::EdgeSubscriber,
+    live_dependency: bool,
+    remote_dependency: Option<serde_json::Value>,
+    prepared_operations: Option<
+        std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>,
+    >,
+) -> String {
     // Status can consult release-policy storage and coordinator locks too.
     // Its own lane prevents both inline I/O and bulk-work admission starvation.
-    let result = match lane.spawn(move || coord.status_json()) {
+    // Report the attached edge's actual capability, not the configuration a
+    // new `rabsd --check-config` process would use. A healthy shadow daemon
+    // shares this socket protocol but cannot serve Cargo dependency hits.
+    let result = match lane.spawn(move || {
+        match serde_json::from_str::<serde_json::Value>(&coord.status_json()) {
+            Ok(serde_json::Value::Object(mut status)) => {
+                status.insert("live_dependency".to_owned(), live_dependency.into());
+                status.insert(
+                    "remote_dependency".to_owned(),
+                    remote_dependency.unwrap_or(serde_json::Value::Null),
+                );
+                status.insert(
+                    "prepared_jobs".to_owned(),
+                    prepared_operations.map_or(serde_json::Value::Null, |store| {
+                        match store.capacity_status() {
+                            Ok(capacity) => serde_json::json!({
+                                "available":true,
+                                "concurrency":capacity.concurrency,
+                                "active":capacity.active,
+                                "queued":capacity.queued,
+                                "accepting":capacity.accepting,
+                                "persistence_uncertain":capacity.persistence_uncertain,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "available":false,
+                                "concurrency":store.concurrency().get(),
+                                "detail":error.to_string(),
+                            }),
+                        }
+                    }),
+                );
+                serde_json::Value::Object(status).to_string()
+            }
+            _ => refusal("status-unavailable", "invalid coordinator status"),
+        }
+    }) {
         Ok(mut work) => work.wait().await,
         Err(error) => Err(error),
     };
@@ -756,7 +858,7 @@ fn prepared_reply(
     operations: Option<&std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
     request: &serde_json::Value,
 ) -> String {
-    use crate::coord::prepared_operation::PreparedOperationSpec;
+    use crate::coord::prepared_operation::{PreparedOperationSpec, PreparedPoolOperationSpec};
     use std::io;
     let operation_id = request.get("operation_id").or_else(|| {
         request
@@ -771,7 +873,9 @@ fn prepared_reply(
             .as_str()
             .ok_or_else(|| invalid("missing request kind"))?;
         let fields: &[&str] = match kind {
-            "prepared-submit" => &["kind", "operation"],
+            "prepared-submit" | "prepared-submit-allocated" | "prepared-submit-pool" => {
+                &["kind", "operation"]
+            }
             "prepared-status" | "prepared-cancel" => &["kind", "operation_id"],
             "prepared-completion" => &["kind", "operation_id", "request_sha256"],
             "prepared-preview" => &[
@@ -828,10 +932,19 @@ fn prepared_reply(
                 "reexecute":false,
             }));
         }
-        let status = if kind == "prepared-submit" {
+        let status = if kind == "prepared-submit-pool" {
+            let spec: PreparedPoolOperationSpec =
+                serde_json::from_value(request["operation"].clone())
+                    .map_err(|error| invalid(&format!("invalid prepared worker pool: {error}")))?;
+            operations.submit_allocated_pool(spec)?
+        } else if matches!(kind, "prepared-submit" | "prepared-submit-allocated") {
             let spec: PreparedOperationSpec = serde_json::from_value(request["operation"].clone())
                 .map_err(|error| invalid(&format!("invalid prepared operation: {error}")))?;
-            operations.submit(spec)?
+            if kind == "prepared-submit-allocated" {
+                operations.submit_allocated(spec)?
+            } else {
+                operations.submit(spec)?
+            }
         } else {
             let id = request["operation_id"]
                 .as_str()
@@ -1341,6 +1454,89 @@ mod edge_liveness_tests {
     use std::time::Instant;
 
     #[test]
+    fn log_lines_stay_one_parseable_json_object_for_any_reason_text() {
+        let reason = "facts-refused: \"C:\\tmp\\x\" line one\nline two\t\u{7}";
+        let line = render_log_line(
+            "rabsd-live-dependency",
+            &[("decision", "pass-through"), ("reason", reason)],
+        );
+        assert!(!line.contains('\n'), "{line}");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["v"], 1);
+        assert_eq!(value["kind"], "rabsd-live-dependency");
+        assert_eq!(value["decision"], "pass-through");
+        assert_eq!(value["reason"], reason);
+        // Field order is kept for people reading the raw stream.
+        assert!(line.find("\"decision\"").unwrap() < line.find("\"reason\"").unwrap());
+    }
+
+    #[test]
+    fn prepared_pool_admission_returns_one_saved_placement_and_rejects_changed_intent() {
+        use crate::coord::prepared_operation::PreparedOperationStore;
+        use crate::coord::source_delivery::prepare_source_template;
+        use serde_json::{Value, json};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let bundle = root.join("bundle");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("lib.rs"), b"pub fn value() {}\n").unwrap();
+        prepare_source_template(
+            &source,
+            &json!({
+                "kind":"canonical-exec", "request_id":"allocate",
+                "program":"/__rabs/toolchain/bin/rustc",
+                "toolchain_backing":"/opt/pool-edge-fixture",
+                "toolchain_identity":{
+                    "version":"toolchain-dataset-v1", "sha256":"ab".repeat(32),
+                    "files":1, "bytes":4,
+                },
+                "source_files":["lib.rs"], "args":["lib.rs"],
+                "artifacts":{"unit":"compile", "files":["libfixture.rmeta"]},
+                "timeout_ms":10000,
+            }),
+            &bundle,
+        )
+        .unwrap();
+        let store = PreparedOperationStore::open(&root.join("operations")).unwrap();
+        let workers = json!([
+            {"address":"127.0.0.1:31001", "worker":"one", "worker_spki_sha256":"ab".repeat(32)},
+            {"address":"127.0.0.1:31002", "worker":"two", "worker_spki_sha256":"cd".repeat(32)},
+        ]);
+        let request = |sequence: u64| {
+            json!({
+                "kind":"prepared-submit-pool", "operation":{
+                    "id":format!("{sequence:032x}"), "workers":workers,
+                    "bundle":bundle, "delivery":root.join(format!("delivery-{sequence}")),
+                    "output":root.join(format!("output-{sequence}")),
+                },
+            })
+        };
+        let query = |request: &Value| -> Value {
+            serde_json::from_str(&prepared_reply(Some(&store), request)).unwrap()
+        };
+        let first = query(&request(1));
+        assert_eq!(first["kind"], "prepared-operation");
+        assert_eq!(first["operation"]["worker"], "one");
+        assert_eq!(first["operation"]["request_id"], Value::Null);
+        assert_eq!(first["publication_authorized"], false);
+        assert_eq!(first["reexecute"], false);
+        assert_eq!(query(&request(2))["operation"]["worker"], "two");
+        assert_eq!(query(&request(1)), first);
+        let mut changed = request(1);
+        changed["operation"]["workers"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert_eq!(query(&changed)["kind"], "prepared-operation-error");
+        let mut unknown = request(3);
+        unknown["operation"]["workers"][0]["unapproved"] = json!(true);
+        assert_eq!(query(&unknown)["kind"], "prepared-operation-error");
+        assert!(store.status(&format!("{:032x}", 3)).unwrap().is_none());
+    }
+
+    #[test]
     fn prepared_preview_requires_exact_identity_attempt_and_cursor_fields() {
         use crate::coord::prepared_operation::PreparedOperationStore;
         use serde_json::{Value, json};
@@ -1439,12 +1635,15 @@ mod edge_liveness_tests {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("untouched");
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        let reply = runtime.block_on(serve_on_lane(
-            &lane,
-            coord.edge_subscriber(),
-            serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
-                "destination_root":destination.to_str().unwrap()}),
-        ));
+        let reply = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            serve_on_lane(
+                &lane,
+                coord.edge_subscriber(),
+                serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
+                    "destination_root":destination.to_str().unwrap()}),
+            ),
+        );
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["outcome"], "error");
         assert_eq!(reply["materialization_started"], false);
@@ -1505,8 +1704,10 @@ mod edge_liveness_tests {
             release.send(()).unwrap();
             holder.join().unwrap();
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
-            let reply: serde_json::Value =
-                serde_json::from_str(&runtime.block_on(request)).unwrap();
+            let reply: serde_json::Value = serde_json::from_str(
+                &rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, request),
+            )
+            .unwrap();
             assert_eq!(reply["kind"], "serve-result");
             assert_ne!(reply["outcome"], "served");
             assert!(!dir.path().join("outputs").exists());
@@ -1519,7 +1720,7 @@ mod edge_liveness_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edge.sock");
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
+        rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
             let listener = UnixListener::bind(&path).await.unwrap();
             let path = path.clone();
             let writer = std::thread::spawn(move || {
@@ -1531,7 +1732,8 @@ mod edge_liveness_tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             });
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, stream);
             let frame = read_frame_with_budget(&mut stream, Duration::from_millis(30)).await;
             assert!(frame.is_none());
             drop(stream);

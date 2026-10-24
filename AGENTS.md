@@ -1010,7 +1010,7 @@ git push                # Push to remote
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
+2. **Run quality gates** (if code changed or after any git merge/rebase) - Tests, linters, and a workspace-wide `cargo check --workspace --all-targets` (`bd-44q54`; per-crate checks do not catch cross-crate or duplicate-symbol merge collisions)
 3. **Update issue status** - Close finished work, update in-progress items
 4. **Sync beads** - `br sync --flush-only` to export to JSONL
 5. **Hand off** - Provide context for next session
@@ -1109,4 +1109,4 @@ serves that outcome and never becomes the product.
   just-say-no-to-process-porn-and-ceremony skill; ask the operator for it
   if you cannot resolve that reference.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "remote_compilation_helper-agent (+https://github.com/Dicklesworthstone/remote_compilation_helper)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

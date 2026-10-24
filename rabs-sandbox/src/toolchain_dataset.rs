@@ -60,6 +60,8 @@ pub struct PreparedToolchain {
     identity: ToolchainIdentity,
     #[cfg(target_os = "linux")]
     inventory: linux::Inventory,
+    #[cfg(target_os = "linux")]
+    source_inventory: Option<linux::Inventory>,
 }
 
 impl PreparedToolchain {
@@ -71,6 +73,38 @@ impl PreparedToolchain {
     #[must_use]
     pub const fn identity(&self) -> &ToolchainIdentity {
         &self.identity
+    }
+
+    /// Validate the complete original source generation without rereading bytes.
+    ///
+    /// A captured toolchain retains the source inventory that produced its
+    /// identity. This checks every original file, directory and symlink through
+    /// anchored descriptors, including entries outside rustc's selected sysroot
+    /// inventory. Added members, replaced inodes, rewritten bytes, mode changes
+    /// and retargeted aliases invalidate the witness; a later capture never
+    /// refreshes this one. Cost is proportional to entries, not toolchain bytes.
+    ///
+    /// This is a mutation witness, not a filesystem lock. Callers retaining a
+    /// source-to-dataset memo must check it before keying and again before using
+    /// a result. The exact source path is required. An open_toolchain owner
+    /// has no original-source witness and cannot establish this correspondence.
+    pub fn verify_source_unchanged(
+        &self,
+        source: &Path,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.source_inventory
+                .as_ref()
+                .ok_or_else(|| invalid("toolchain has no retained original-source witness"))?
+                .verify_source(source, &stopped)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source, stopped);
+            Err(unsupported())
+        }
     }
 
     /// Export the retained namespace in the same order used by its identity.
@@ -239,6 +273,7 @@ pub fn open_toolchain(
             root: root.to_owned(),
             identity,
             inventory,
+            source_inventory: None,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -615,6 +650,63 @@ mod linux {
             Ok(())
         }
 
+        pub(super) fn verify_source(
+            &self,
+            source: &Path,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<()> {
+            require(
+                source == self.root_path,
+                "toolchain source witness names another root",
+            )?;
+            self.verify(stopped)?;
+            // Stamp checks cover all regular bytes without reading them again.
+            // Keep link text explicit because it defines the exported alias
+            // closure, and finish with directory generations to cover negative
+            // membership observed before the file/link pass.
+            for (path, entry) in &self.entries {
+                if let Kind::Link(expected) = &entry.kind {
+                    checkpoint(stopped)?;
+                    let held = self.open(path, OFlags::PATH)?;
+                    require(
+                        Stamp::of(&held.metadata()?) == entry.stamp,
+                        "toolchain source alias changed before validation",
+                    )?;
+                    let target = readlinkat(&held, "", Vec::new())?;
+                    require(
+                        target.to_bytes() == expected.as_bytes()
+                            && Stamp::of(&held.metadata()?) == entry.stamp
+                            && Stamp::of(&self.open(path, OFlags::PATH)?.metadata()?)
+                                == entry.stamp,
+                        "toolchain source alias changed during validation",
+                    )?;
+                }
+            }
+            for (path, entry) in self.entries.iter().rev() {
+                if matches!(entry.kind, Kind::Directory) {
+                    checkpoint(stopped)?;
+                    let metadata = if path.is_empty() {
+                        self.root.metadata()?
+                    } else {
+                        self.open(path, OFlags::PATH)?.metadata()?
+                    };
+                    require(
+                        Stamp::of(&metadata) == entry.stamp,
+                        "toolchain source membership changed during validation",
+                    )?;
+                }
+            }
+            checkpoint(stopped)?;
+            let original = self
+                .entries
+                .get("")
+                .ok_or_else(|| invalid("missing toolchain root stamp"))?;
+            require(
+                Stamp::of(&fs::symlink_metadata(source)?) == original.stamp,
+                "toolchain source root changed during validation",
+            )
+        }
+
         pub(super) fn stream(
             &self,
             destination: Option<&Path>,
@@ -765,10 +857,12 @@ mod linux {
             "retained toolchain bytes differ from captured dataset",
         )?;
         retained.verify(stopped)?;
+        inventory.verify_source(source, stopped)?;
         Ok(PreparedToolchain {
             root: destination,
             identity,
             inventory: retained,
+            source_inventory: Some(inventory),
         })
     }
 }

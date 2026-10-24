@@ -10,11 +10,17 @@
 //! - **Release build time**: Full optimization pass performance
 //! - **Incremental build time**: Cached compilation performance
 //!
+//! Each phase owns a fresh private project and output tree; only incremental
+//! seeding and rebuilding share outputs. No phase runs `cargo clean`, inherits
+//! a shared Cargo target/build directory, or measures a compiler cache wrapper.
+//!
 //! The reference project is designed to be:
 //! - Small enough to complete in <30 seconds on slow hardware
 //! - Representative of real Rust patterns (generics, traits, macros)
 //! - Self-contained with no external dependencies
 //! - Deterministic in behavior
+
+mod context;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +31,8 @@ use std::process::Command;
 use std::time::Instant;
 use tempfile::TempDir;
 use tracing::{debug, info, warn};
+
+use context::BuildContext;
 
 /// Result of a compilation benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +49,7 @@ pub struct CompilationBenchmarkResult {
     pub duration_ms: u64,
     /// Timestamp when the benchmark was taken.
     pub timestamp: DateTime<Utc>,
-    /// Rustc version string.
+    /// Identity of the compiler used for every build, from `rustc -vV`.
     pub rustc_version: String,
 }
 
@@ -115,7 +123,7 @@ pub struct CompilationBenchmark {
     pub warmup: bool,
     /// Custom cargo path (None = use system cargo).
     pub cargo_path: Option<PathBuf>,
-    /// Custom rustc path (None = use system rustc).
+    /// Compiler/proxy to resolve once for both identity and actual builds.
     pub rustc_path: Option<PathBuf>,
 }
 
@@ -198,9 +206,16 @@ impl CompilationBenchmark {
 
     /// Run the compilation benchmark and return results.
     ///
-    /// This sets up a reference project, builds it in various modes,
-    /// and measures the compilation times.
+    /// All output directories are private. The selected compiler is resolved
+    /// before changing working directories, then used for every Cargo build.
     pub fn run(&self) -> Result<CompilationBenchmarkResult, CompilationBenchmarkError> {
+        if !self.run_debug && !self.run_release && !self.run_incremental {
+            return Err(CompilationBenchmarkError {
+                message: "At least one compilation phase must be enabled".to_owned(),
+                phase: "setup".to_owned(),
+                stderr: None,
+            });
+        }
         debug!(
             run_debug = self.run_debug,
             run_release = self.run_release,
@@ -210,73 +225,63 @@ impl CompilationBenchmark {
         );
 
         let overall_start = Instant::now();
+        let cargo = self.cargo_cmd();
+        let rustc = self.rustc_cmd();
+        let context = BuildContext::resolve(
+            Path::new(cargo.get_program()),
+            Path::new(rustc.get_program()),
+        )?;
+        debug!(rustc_version = %context.version, "Resolved benchmark compiler");
 
-        // Get rustc version
-        let rustc_version = self.get_rustc_version()?;
-        debug!(rustc_version = %rustc_version, "Detected rustc version");
-
-        // Create temp directory and setup project
         let temp_dir = TempDir::new().map_err(|e| CompilationBenchmarkError {
             message: format!("Failed to create temp directory: {}", e),
             phase: "setup".to_string(),
             stderr: None,
         })?;
+        let project = |phase: &str| setup_benchmark_project(&temp_dir.path().join(phase));
 
-        let project_dir = setup_benchmark_project(temp_dir.path())?;
-        debug!(project_dir = %project_dir.display(), "Project setup complete");
-
-        // Warmup run (not counted)
+        // Cold phases have separate projects AND target/build directories.
+        // Cleaning a reused target could delete unrelated worker artifacts
+        // inherited through CARGO_TARGET_DIR or Cargo's global configuration.
         if self.warmup {
-            debug!("Running warmup compilation");
-            let _ = self.timed_cargo_build(&project_dir, false, false);
-            self.cargo_clean(&project_dir)?;
+            let project_dir = project("warmup")?;
+            self.timed_cargo_build(&context, &project_dir, false, false)?;
         }
 
-        // Run debug build
         let debug_build_ms = if self.run_debug {
-            self.cargo_clean(&project_dir)?;
-            let ms = self.timed_cargo_build(&project_dir, false, false)?;
+            let project_dir = project("debug")?;
+            let ms = self.timed_cargo_build(&context, &project_dir, false, false)?;
             debug!(debug_build_ms = ms, "Debug build complete");
             ms
         } else {
             0
         };
 
-        // Run release build
         let release_build_ms = if self.run_release {
-            self.cargo_clean(&project_dir)?;
-            let ms = self.timed_cargo_build(&project_dir, true, false)?;
+            let project_dir = project("release")?;
+            let ms = self.timed_cargo_build(&context, &project_dir, true, false)?;
             debug!(release_build_ms = ms, "Release build complete");
             ms
         } else {
             0
         };
 
-        // Run incremental build
         let incremental_build_ms = if self.run_incremental {
-            // First do a full build with incremental enabled
-            self.cargo_clean(&project_dir)?;
-            self.timed_cargo_build(&project_dir, true, true)?;
-
-            // Touch a source file
+            let project_dir = project("incremental")?;
+            self.timed_cargo_build(&context, &project_dir, true, true)?;
             touch_source_file(&project_dir)?;
-
-            // Measure incremental rebuild
-            let ms = self.timed_cargo_build(&project_dir, true, true)?;
+            // Only this pair shares the seeded cache, never the warmup or
+            // release timing. The source change still requires recompilation.
+            let ms = self.timed_cargo_build(&context, &project_dir, true, true)?;
             debug!(incremental_build_ms = ms, "Incremental build complete");
             ms
         } else {
             0
         };
 
-        // Calculate score based primarily on release build time
-        // Reference: 10 seconds on reference hardware = 1000 score
         let score =
             calculate_compilation_score(debug_build_ms, release_build_ms, incremental_build_ms);
-
-        let duration = overall_start.elapsed();
-        let duration_ms = duration.as_millis() as u64;
-
+        let duration_ms = overall_start.elapsed().as_millis() as u64;
         let result = CompilationBenchmarkResult {
             score,
             debug_build_ms,
@@ -284,7 +289,7 @@ impl CompilationBenchmark {
             incremental_build_ms,
             duration_ms,
             timestamp: Utc::now(),
-            rustc_version,
+            rustc_version: context.version,
         };
 
         debug!(
@@ -295,7 +300,6 @@ impl CompilationBenchmark {
             duration_ms = result.duration_ms,
             "Compilation benchmark completed"
         );
-
         Ok(result)
     }
 
@@ -365,91 +369,22 @@ impl CompilationBenchmark {
         Ok(median_result)
     }
 
-    /// Get the rustc version string.
-    fn get_rustc_version(&self) -> Result<String, CompilationBenchmarkError> {
-        let output =
-            self.rustc_cmd()
-                .arg("--version")
-                .output()
-                .map_err(|e| CompilationBenchmarkError {
-                    message: format!("Failed to run rustc --version: {}", e),
-                    phase: "setup".to_string(),
-                    stderr: None,
-                })?;
-
-        if !output.status.success() {
-            return Err(CompilationBenchmarkError {
-                message: "rustc --version returned non-zero exit code".to_string(),
-                phase: "setup".to_string(),
-                stderr: Some(String::from_utf8_lossy(&output.stderr).to_string()),
-            });
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    /// Run cargo clean.
-    fn cargo_clean(&self, project_dir: &Path) -> Result<(), CompilationBenchmarkError> {
-        let output = self
-            .cargo_cmd()
-            .arg("clean")
-            .current_dir(project_dir)
-            .output()
-            .map_err(|e| CompilationBenchmarkError {
-                message: format!("Failed to run cargo clean: {}", e),
-                phase: "clean".to_string(),
-                stderr: None,
-            })?;
-
-        if !output.status.success() {
-            return Err(CompilationBenchmarkError {
-                message: "cargo clean failed".to_string(),
-                phase: "clean".to_string(),
-                stderr: Some(String::from_utf8_lossy(&output.stderr).to_string()),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Run cargo build and measure time.
+    /// Run a private Cargo build and measure time, excluding output inspection.
     fn timed_cargo_build(
         &self,
+        context: &BuildContext,
         project_dir: &Path,
         release: bool,
         incremental: bool,
     ) -> Result<u64, CompilationBenchmarkError> {
-        let phase = if release {
+        let phase = if incremental {
+            "incremental_build"
+        } else if release {
             "release_build"
         } else {
             "debug_build"
         };
-
-        let mut cmd = self.cargo_cmd();
-        cmd.arg("build").current_dir(project_dir);
-
-        if release {
-            cmd.arg("--release");
-        }
-
-        // Control incremental compilation
-        cmd.env("CARGO_INCREMENTAL", if incremental { "1" } else { "0" });
-
-        // Suppress color output for cleaner logs
-        cmd.env("CARGO_TERM_COLOR", "never");
-
-        // Bypass RCH's own cargo shim.
-        //
-        // On a worker, `cargo` on PATH is usually the RCH wrapper. Left alone it
-        // tries to *offload* this build to another worker and — under the
-        // remote-required policy — refuses to fall back to local, so the build
-        // fails and the compilation component (20% of the SpeedScore) is silently
-        // dropped from every score. That is self-defeating: the tool's benchmark
-        // is broken by the tool's own hook. This benchmark must always measure
-        // *local* compilation on the machine it is running on.
-        cmd.env("RCH_CARGO_WRAPPER_BYPASS", "1");
-        cmd.env("RCH_ENABLED", "0");
-
+        let mut cmd = context.command(project_dir, release, incremental)?;
         let start = Instant::now();
         let output = cmd.output().map_err(|e| CompilationBenchmarkError {
             message: format!("Failed to run cargo build: {}", e),
@@ -465,8 +400,17 @@ impl CompilationBenchmark {
                 stderr: Some(String::from_utf8_lossy(&output.stderr).to_string()),
             });
         }
-
-        Ok(duration.as_millis() as u64)
+        context
+            .verify_output(project_dir, release)
+            .map_err(|mut error| {
+                error.phase = phase.to_owned();
+                error
+            })?;
+        // Millisecond-resolution evidence must not label a completed, positive
+        // duration as missing. This is quantization, not a throughput multiplier.
+        Ok(u64::try_from(duration.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1))
     }
 }
 
@@ -631,6 +575,8 @@ version = "1.0.0"
 edition = "2021"
 
 # No external dependencies - self-contained benchmark
+# Do not join an ancestor workspace when TMPDIR is inside a checkout.
+[workspace]
 
 [profile.release]
 opt-level = 3
@@ -1490,6 +1436,7 @@ mod tests {
         assert!(cargo_content.contains("name = \"rch_benchmark\""));
         assert!(cargo_content.contains("edition = \"2021\""));
         assert!(cargo_content.contains("opt-level = 3"));
+        assert!(cargo_content.contains("[workspace]"));
 
         info!("VERIFY: Cargo.toml has expected content");
         info!("TEST PASS: test_cargo_toml_content");
@@ -1782,6 +1729,20 @@ mod tests {
     }
 
     #[test]
+    fn disabled_phases_do_not_probe_tools_or_report_a_measurement() {
+        let error = CompilationBenchmark::new()
+            .with_debug(false)
+            .with_release(false)
+            .with_incremental(false)
+            .with_cargo_path("/does-not-exist/cargo".into())
+            .with_rustc_path("/does-not-exist/rustc".into())
+            .run()
+            .unwrap_err();
+        assert_eq!(error.phase, "setup");
+        assert!(error.message.contains("At least one"));
+    }
+
+    #[test]
     fn test_touch_source_file() {
         init_test_logging();
         info!("TEST START: test_touch_source_file");
@@ -1818,171 +1779,73 @@ mod tests {
         info!("TEST PASS: test_touch_source_file_missing_main");
     }
 
-    // Integration tests that actually run cargo
-    // These are slower but verify the full benchmark works
-
+    // Explicitly selected real-toolchain tests fail on compiler errors or
+    // missing prerequisites. Neither condition is evidence of a passing run.
     #[test]
-    #[ignore] // Run with --ignored flag for full integration test
+    #[ignore = "requires real Cargo and rustc; compiles the reference workload"]
     fn test_full_compilation_benchmark() {
-        init_test_logging();
-        info!("TEST START: test_full_compilation_benchmark");
-
-        let benchmark = CompilationBenchmark::new()
-            .with_debug(true)
-            .with_release(true)
-            .with_incremental(true)
-            .with_warmup(false);
-
-        info!("INPUT: Full compilation benchmark");
-        let result = benchmark.run();
-
-        match result {
-            Ok(r) => {
-                info!(
-                    "RESULT: score={}, debug={}ms, release={}ms, incremental={}ms, rustc={}",
-                    r.score,
-                    r.debug_build_ms,
-                    r.release_build_ms,
-                    r.incremental_build_ms,
-                    r.rustc_version
-                );
-                assert!(r.score > 0.0);
-                assert!(r.debug_build_ms > 0);
-                assert!(r.release_build_ms > 0);
-                assert!(r.incremental_build_ms > 0);
-                assert!(!r.rustc_version.is_empty());
-                info!("VERIFY: All metrics positive and valid");
-            }
-            Err(e) => {
-                info!("RESULT: Benchmark failed: {}", e);
-                // Not a test failure - cargo might not be available
-            }
-        }
-
-        info!("TEST PASS: test_full_compilation_benchmark");
+        let result = CompilationBenchmark::new()
+            .with_warmup(false)
+            .run()
+            .unwrap();
+        assert!(result.score > 0.0);
+        assert!(result.debug_build_ms > 0);
+        assert!(result.release_build_ms > 0);
+        assert!(result.incremental_build_ms > 0);
+        assert!(!result.rustc_version.is_empty());
     }
 
     #[test]
-    #[ignore] // Run with --ignored flag for full integration test
+    #[ignore = "requires real Cargo and rustc; compiles the reference workload"]
     fn test_release_only_benchmark() {
-        init_test_logging();
-        info!("TEST START: test_release_only_benchmark");
-
-        let benchmark = CompilationBenchmark::new()
+        let result = CompilationBenchmark::new()
             .with_debug(false)
             .with_release(true)
             .with_incremental(false)
-            .with_warmup(false);
-
-        info!("INPUT: Release-only compilation benchmark");
-        let result = benchmark.run();
-
-        match result {
-            Ok(r) => {
-                info!(
-                    "RESULT: score={}, release={}ms, rustc={}",
-                    r.score, r.release_build_ms, r.rustc_version
-                );
-                assert!(r.score > 0.0);
-                assert_eq!(r.debug_build_ms, 0);
-                assert!(r.release_build_ms > 0);
-                assert_eq!(r.incremental_build_ms, 0);
-            }
-            Err(e) => {
-                info!("RESULT: Benchmark failed: {}", e);
-            }
-        }
-
-        info!("TEST PASS: test_release_only_benchmark");
+            .with_warmup(false)
+            .run()
+            .unwrap();
+        assert!(result.score > 0.0);
+        assert_eq!(result.debug_build_ms, 0);
+        assert!(result.release_build_ms > 0);
+        assert_eq!(result.incremental_build_ms, 0);
     }
 
     #[test]
+    #[ignore = "requires real Cargo and rustc; uses the same isolated production command"]
     fn test_project_compiles_syntax_check() {
-        init_test_logging();
-        info!("TEST START: test_project_compiles_syntax_check");
-
-        // Verify the source code is valid Rust syntax by checking it compiles
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let project_dir =
-            setup_benchmark_project(temp_dir.path()).expect("Failed to setup project");
-
-        // Just verify cargo check works (faster than full build)
-        let output = Command::new("cargo")
-            .arg("check")
-            .current_dir(&project_dir)
-            .env("CARGO_TERM_COLOR", "never")
-            .output();
-
-        match output {
-            Ok(o) => {
-                if o.status.success() {
-                    info!("RESULT: cargo check passed");
-                } else {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    info!("RESULT: cargo check failed: {}", stderr);
-                    // This is expected if cargo is not available
-                }
-            }
-            Err(e) => {
-                info!("RESULT: Could not run cargo: {}", e);
-                // Not a failure - cargo might not be available
-            }
-        }
-
-        info!("TEST PASS: test_project_compiles_syntax_check");
+        let temp_dir = TempDir::new().unwrap();
+        let project = setup_benchmark_project(temp_dir.path()).unwrap();
+        let context = BuildContext::resolve(Path::new("cargo"), Path::new("rustc")).unwrap();
+        let output = context
+            .command(&project, false, false)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        context.verify_output(&project, false).unwrap();
     }
 
     #[test]
-    #[ignore] // Run with --ignored flag for full integration test
+    #[ignore = "requires real Cargo and rustc; compares repeated compilation runs"]
     fn test_benchmark_stability() {
-        init_test_logging();
-        info!("TEST START: test_benchmark_stability");
-
-        // Use debug-only build for faster test
         let benchmark = CompilationBenchmark::new()
             .with_debug(true)
             .with_release(false)
             .with_incremental(false)
             .with_warmup(true);
-
-        info!("INPUT: run_compilation_benchmark_stable() (3 runs + warmup)");
-        let result = match benchmark.run_stable(3) {
-            Ok(r) => r,
-            Err(e) => {
-                info!("Skipping test - cargo not available: {}", e);
-                return;
-            }
-        };
-        info!("RESULT: stable score = {}", result.score);
-
-        // Run again to check variance
-        let result2 = match benchmark.run_stable(3) {
-            Ok(r) => r,
-            Err(e) => {
-                info!("Skipping test - cargo not available: {}", e);
-                return;
-            }
-        };
+        let result = benchmark.run_stable(3).unwrap();
+        let result2 = benchmark.run_stable(3).unwrap();
         let variance = if result.score > 0.0 {
             ((result.score - result2.score) / result.score).abs()
         } else {
             0.0
         };
-        info!(
-            "RESULT: second run score = {}, variance = {:.2}%",
-            result2.score,
-            variance * 100.0
-        );
-
-        // Allow up to 100% variance in tests (CI and concurrent tests can be noisy).
-        // Production target is <10% but test environments vary significantly
-        // due to concurrent processes, CPU throttling, and shared runners.
+        // Preserve the existing noise threshold; this is not fleet qualification.
         assert!(variance < 1.0);
-        info!(
-            "VERIFY: Benchmark variance {:.2}% is within acceptable range",
-            variance * 100.0
-        );
-
-        info!("TEST PASS: test_benchmark_stability");
     }
 }

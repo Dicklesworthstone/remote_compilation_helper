@@ -1913,6 +1913,7 @@ struct ManifestDocument {
     package_name: Option<String>,
     has_workspace: bool,
     workspace_members: Vec<String>,
+    workspace_excludes: Vec<String>,
     workspace_dependency_names: BTreeSet<String>,
     workspace_path_dependencies: BTreeMap<String, String>,
     patch_path_dependencies: BTreeMap<String, String>,
@@ -1960,6 +1961,7 @@ fn resolve_from_manifest_fallback(
     let workspace_member_manifests = expand_workspace_members(
         &entry_root,
         &entry_manifest.workspace_members,
+        &entry_manifest.workspace_excludes,
         entry_manifest_path,
     )?;
     let workspace_member_set = workspace_member_manifests
@@ -2039,6 +2041,7 @@ fn resolve_materialization_from_manifests(
     let workspace_member_manifests = expand_workspace_members(
         &entry_root,
         &entry_manifest.workspace_members,
+        &entry_manifest.workspace_excludes,
         entry_manifest_path,
     )?;
     let workspace_member_set = workspace_member_manifests
@@ -2614,19 +2617,22 @@ fn read_manifest_document(
         .and_then(toml::Value::as_str)
         .map(ToOwned::to_owned);
     let has_workspace = table.contains_key("workspace");
-    let workspace_members = table
-        .get("workspace")
-        .and_then(toml::Value::as_table)
-        .and_then(|workspace| workspace.get("members"))
-        .and_then(toml::Value::as_array)
-        .map(|members| {
-            members
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let workspace = table.get("workspace").and_then(toml::Value::as_table);
+    let workspace_strings = |key: &str| {
+        workspace
+            .and_then(|workspace| workspace.get(key))
+            .and_then(toml::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let workspace_members = workspace_strings("members");
+    let workspace_excludes = workspace_strings("exclude");
     let workspace_dependencies = table
         .get("workspace")
         .and_then(toml::Value::as_table)
@@ -2695,6 +2701,7 @@ fn read_manifest_document(
         package_name,
         has_workspace,
         workspace_members,
+        workspace_excludes,
         workspace_dependency_names,
         workspace_path_dependencies,
         patch_path_dependencies,
@@ -2772,11 +2779,41 @@ fn collect_patch_path_dependencies(patch_table: &toml::value::Table) -> BTreeMap
     dependencies
 }
 
+fn workspace_manifest_candidate(candidate: PathBuf) -> PathBuf {
+    if candidate
+        .file_name()
+        .is_some_and(|file_name| file_name == "Cargo.toml")
+    {
+        candidate
+    } else {
+        candidate.join("Cargo.toml")
+    }
+}
+
 fn expand_workspace_members(
     workspace_root: &Path,
     members: &[String],
+    excludes: &[String],
     manifest_path: &Path,
 ) -> Result<Vec<PathBuf>, CargoPathDependencyError> {
+    // Cargo applies workspace.exclude to the package paths produced by member
+    // expansion. Filter at the corresponding manifest identity BEFORE
+    // requiring Cargo.toml: an intentionally excluded helper directory may be
+    // empty or contain arbitrary non-package files. Exact package matching is
+    // important — excluding "crates/dev-tools" must not suppress an explicit
+    // member "crates/dev-tools/probe".
+    let mut excluded_manifests = BTreeSet::new();
+    for exclude in excludes {
+        let expanded_paths = expand_member_pattern(workspace_root, exclude).map_err(|error| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::ManifestParseFailure,
+                format!("failed to expand workspace exclude '{exclude}': {error}"),
+            )
+            .with_manifest_path(manifest_path)
+        })?;
+        excluded_manifests.extend(expanded_paths.into_iter().map(workspace_manifest_candidate));
+    }
+
     let mut manifests = BTreeSet::new();
     for member in members {
         let expanded_paths = expand_member_pattern(workspace_root, member).map_err(|error| {
@@ -2787,14 +2824,10 @@ fn expand_workspace_members(
             .with_manifest_path(manifest_path)
         })?;
         for candidate in expanded_paths {
-            let manifest_candidate = if candidate
-                .file_name()
-                .is_some_and(|file_name| file_name == "Cargo.toml")
-            {
-                candidate
-            } else {
-                candidate.join("Cargo.toml")
-            };
+            let manifest_candidate = workspace_manifest_candidate(candidate);
+            if excluded_manifests.contains(&manifest_candidate) {
+                continue;
+            }
             if !manifest_candidate.is_file() {
                 return Err(CargoPathDependencyError::new(
                     CargoPathDependencyErrorKind::MissingPathDependency,
@@ -3462,6 +3495,84 @@ mod tests {
         format!(
             "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{dependencies}"
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_exclude_filters_glob_member_but_keeps_explicit_nested_member() {
+        let fixture = TopologyFixture::new("workspace-exclude");
+        let workspace = fixture.canonical_root.join("workspace-exclude-project");
+        let app = workspace.join("crates/app");
+        let helper = workspace.join("crates/dev-tools");
+        let probe = helper.join("probe");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&probe).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nresolver='2'\nmembers=['crates/*','crates/dev-tools/probe']\nexclude=['crates/dev-tools']\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname='app'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            probe.join("Cargo.toml"),
+            "[package]\nname='probe'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+
+        let manifest = workspace.join("Cargo.toml");
+        let policy = fixture.policy();
+        let expected = BTreeSet::from([app.canonicalize().unwrap(), probe.canonicalize().unwrap()]);
+
+        let graph = resolve_from_manifest_fallback(&manifest, &policy).unwrap();
+        assert_eq!(
+            graph.root_packages.into_iter().collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert!(
+            !graph
+                .packages
+                .iter()
+                .any(|package| package.package_root == helper),
+            "excluded glob candidate must not become a package"
+        );
+
+        let closure = resolve_materialization_from_manifests(&manifest, &policy).unwrap();
+        assert_eq!(
+            closure.root_packages.into_iter().collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert!(
+            !closure
+                .packages
+                .iter()
+                .any(|package| package.package_root == helper),
+            "materialization closure must apply the same workspace exclusion"
+        );
+
+        // Exclusion is not a blanket permission to ignore malformed glob
+        // members. A different matched directory with no Cargo.toml must
+        // retain the existing fail-closed missing-manifest result.
+        let missing = workspace.join("crates/not-a-package");
+        fs::create_dir_all(&missing).unwrap();
+        let error = resolve_from_manifest_fallback(&manifest, &policy).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::MissingPathDependency
+        );
+        // The error names the canonical path (macOS tempdirs live under the
+        // /var -> /private/var symlink).
+        let missing_manifest = missing.canonicalize().unwrap().join("Cargo.toml");
+        assert!(
+            error
+                .dependency_path()
+                .is_some_and(|path| path == missing_manifest),
+            "{:?}",
+            error.dependency_path()
+        );
     }
 
     #[cfg(unix)]

@@ -21,7 +21,7 @@
 use crate::history::BuildHistory;
 use rch_common::{BuildLocation, WorkerId};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -376,6 +376,193 @@ impl HeadroomEstimator {
         let ratio = effective_free / required;
         (ratio / 2.0).clamp(0.0, 1.0)
     }
+}
+
+// =========================================================================
+// Learned build footprints (bd-wv746)
+// =========================================================================
+
+/// Samples retained per project and command, including its high-water marks.
+const FOOTPRINT_SAMPLES: usize = 8;
+/// A footprint older than this no longer describes the project.
+const FOOTPRINT_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+/// Growth below this is measurement noise (free space is sampled in whole GiB).
+const FOOTPRINT_MIN_GROWTH_GIB: f64 = 1.0;
+
+/// Exact command options and profile settings affect output size. A small
+/// package check must not establish the budget for a full workspace test.
+pub fn footprint_key(project_id: &str, command: &str) -> String {
+    serde_json::to_string(&(2_u8, footprint_project(project_id), command.trim()))
+        .expect("string tuple serializes")
+}
+
+/// Clean-overlay ownership is per invocation, but its project evidence must
+/// survive the next invocation. Strip only the suffix the hook generates.
+fn footprint_project(project_id: &str) -> &str {
+    if let Some((project, nonce)) = project_id.rsplit_once("::clean-overlay::")
+        && !project.is_empty()
+        && nonce.len() == 16
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        project
+    } else {
+        project_id
+    }
+}
+
+pub fn family_footprint_key(project_id: &str, command: &str) -> String {
+    let kind = rch_common::classify_command(command)
+        .kind
+        .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
+    serde_json::to_string(&(2_u8, footprint_project(project_id), "family", kind))
+        .expect("string tuple serializes")
+}
+
+/// Old free-filesystem deltas can raise a budget, but never prove a small one.
+pub fn legacy_footprint_key(project_id: &str, command: &str) -> String {
+    let kind = rch_common::classify_command(command)
+        .kind
+        .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
+    format!("{}\u{1f}{kind}", footprint_project(project_id))
+}
+
+pub fn cold_build_footprint_gib(command: &str) -> Option<f64> {
+    rch_common::BuildDiskBudget::cold_growth_gib(command).map(f64::from)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+struct FootprintSample {
+    growth_gib: f64,
+    observed_unix: i64,
+    /// Only an attributed total peak output measurement on a successful build
+    /// can establish a requirement below the conservative cold estimate.
+    #[serde(default)]
+    complete: bool,
+}
+
+impl FootprintSample {
+    fn valid_at(&self, now_unix: i64) -> bool {
+        self.growth_gib.is_finite()
+            && self.growth_gib >= FOOTPRINT_MIN_GROWTH_GIB
+            && (0..=FOOTPRINT_MAX_AGE_SECS).contains(&now_unix.saturating_sub(self.observed_unix))
+    }
+}
+
+/// Recent output measurements and conservative lower bounds from worker df.
+/// Partial builds, shared-filesystem cleanup, and warm incremental deltas do
+/// not establish a complete footprint. Retain the high-water marks so repeated
+/// small builds cannot erase evidence of a larger output pool.
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+pub struct FootprintBook {
+    #[serde(default)]
+    entries: HashMap<String, VecDeque<FootprintSample>>,
+}
+
+impl FootprintBook {
+    /// Load a persisted book. A missing or unreadable file is an empty book:
+    /// admission then uses conservative cold requirements.
+    pub fn load(path: &std::path::Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                tracing::warn!(path = %path.display(), %error, "ignoring unreadable footprint book");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Persist with write-then-rename so a crash leaves the old book intact.
+    pub fn persist(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let staged = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&staged, serde_json::to_vec(self)?)?;
+        std::fs::rename(&staged, path)
+    }
+
+    /// Record one observed growth. Returns whether the book changed.
+    pub fn record(&mut self, key: &str, growth_gib: f64, now_unix: i64, complete: bool) -> bool {
+        if !growth_gib.is_finite() || growth_gib < FOOTPRINT_MIN_GROWTH_GIB {
+            return false;
+        }
+        let samples = self.entries.entry(key.to_string()).or_default();
+        samples.retain(|sample| sample.valid_at(now_unix));
+        samples.push_back(FootprintSample {
+            growth_gib,
+            observed_unix: now_unix,
+            complete,
+        });
+        if samples.len() > FOOTPRINT_SAMPLES {
+            let high_water = samples
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.growth_gib.total_cmp(&b.growth_gib))
+                .map(|(index, _)| index);
+            let complete_high_water = samples
+                .iter()
+                .enumerate()
+                .filter(|(_, sample)| sample.complete)
+                .max_by(|(_, a), (_, b)| a.growth_gib.total_cmp(&b.growth_gib))
+                .map(|(index, _)| index);
+            // One linear pass also bounds an oversized persisted window; do
+            // not repeatedly shift its queue while holding the history lock.
+            let excess = samples.len() - FOOTPRINT_SAMPLES;
+            let mut removed = 0;
+            let mut index = 0;
+            samples.retain(|_| {
+                let keep = Some(index) == high_water
+                    || Some(index) == complete_high_water
+                    || removed == excess;
+                index += 1;
+                if !keep {
+                    removed += 1;
+                }
+                keep
+            });
+        }
+        true
+    }
+
+    /// The largest unexpired growth for this key. The maximum (not the mean)
+    /// is deliberate: an incremental rebuild grows a warm pool by little, but
+    /// the next placement may land on a worker without that pool.
+    pub fn estimate_gib(&self, key: &str, now_unix: i64) -> Option<f64> {
+        self.entries
+            .get(key)?
+            .iter()
+            .filter(|sample| sample.valid_at(now_unix))
+            .map(|sample| sample.growth_gib)
+            .reduce(f64::max)
+    }
+
+    pub fn admission_estimate_gib(&self, key: &str, now_unix: i64, cold_gib: f64) -> Option<f64> {
+        let high_water = self.estimate_gib(key, now_unix)?;
+        let complete = self
+            .entries
+            .get(key)?
+            .iter()
+            .any(|sample| sample.complete && sample.valid_at(now_unix));
+        Some(if complete {
+            high_water
+        } else {
+            high_water.max(cold_gib)
+        })
+    }
+
+    /// Drop expired samples and empty keys.
+    pub fn prune(&mut self, now_unix: i64) {
+        for samples in self.entries.values_mut() {
+            samples.retain(|sample| sample.valid_at(now_unix));
+        }
+        self.entries.retain(|_, samples| !samples.is_empty());
+    }
+}
+
+/// Per-job growth allowance; the worker's reserve floor is accounted separately.
+pub fn footprint_requirement_gib(footprint_gib: f64) -> f64 {
+    f64::from(rch_common::BuildDiskBudget::growth_budget_gib(
+        footprint_gib,
+    ))
 }
 
 // =========================================================================
@@ -825,5 +1012,168 @@ mod tests {
 
         let summary = estimator.reservation_summary().await;
         assert_eq!(summary.len(), 2);
+    }
+
+    // =====================================================================
+    // Learned footprint tests (bd-wv746)
+    // =====================================================================
+
+    #[test]
+    fn footprint_key_separates_options_profiles_and_projects() {
+        let test = footprint_key("fgdb", "cargo test --all-features");
+        assert_ne!(test, footprint_key("fgdb", "cargo test -p core"));
+        assert_ne!(test, footprint_key("fgdb", "cargo check --workspace"));
+        assert_ne!(test, footprint_key("other", "cargo test --all-features"));
+        assert_ne!(
+            footprint_key("fgdb", "echo hi"),
+            footprint_key("fgdb", "ls -la")
+        );
+        assert_ne!(
+            footprint_key("fgdb", "cargo test"),
+            footprint_key("fgdb", "CARGO_PROFILE_TEST_DEBUG=0 cargo test")
+        );
+        assert_ne!(
+            footprint_key("fgdb", "cargo test --profile release"),
+            footprint_key("fgdb", "cargo test")
+        );
+        assert_eq!(
+            family_footprint_key("fgdb", "cargo test --all-features"),
+            family_footprint_key("fgdb", "cargo test -p core")
+        );
+    }
+
+    #[test]
+    fn footprint_project_shares_only_generated_clean_overlay_nonces() {
+        let key = footprint_key("frankennumpy", "cargo test --workspace");
+        for suffix in ["0123456789abcdef", "fedcba9876543210"] {
+            assert_eq!(
+                key,
+                footprint_key(
+                    &format!("frankennumpy::clean-overlay::{suffix}"),
+                    "cargo test --workspace"
+                )
+            );
+        }
+        for project in [
+            "other::clean-overlay::0123456789abcdef",
+            "frankennumpy::clean-overlay::short",
+            "frankennumpy::clean-overlay::0123456789abcdeg",
+            "frankennumpy::clean-overlay::0123456789ABCDEf",
+            "frankennumpy::clean-overlay::0123456789abcdef-extra",
+        ] {
+            assert_ne!(key, footprint_key(project, "cargo test --workspace"));
+        }
+    }
+
+    #[test]
+    fn footprint_estimate_is_the_largest_unexpired_sample() {
+        let mut book = FootprintBook::default();
+        let now = 1_800_000_000;
+        assert_eq!(book.estimate_gib("k", now), None);
+        // Sub-GiB growth is noise in whole-GiB probes; non-finite is junk.
+        assert!(!book.record("k", 0.5, now, false));
+        assert!(!book.record("k", f64::NAN, now, false));
+        assert!(!book.record("k", f64::INFINITY, now, false));
+        assert_eq!(book.estimate_gib("k", now), None);
+
+        assert!(book.record("k", 64.0, now - FOOTPRINT_MAX_AGE_SECS - 1, true));
+        assert_eq!(
+            book.estimate_gib("k", now - FOOTPRINT_MAX_AGE_SECS),
+            Some(64.0)
+        );
+        assert!(book.record("k", 3.0, now, true));
+        assert!(book.record("k", 12.0, now, true));
+        // The 64 GiB sample expired; a warm 3 GiB rebuild does not hide 12.
+        assert_eq!(book.estimate_gib("k", now), Some(12.0));
+        assert_eq!(book.estimate_gib("k", now - FOOTPRINT_MAX_AGE_SECS), None);
+
+        book.prune(now);
+        assert_eq!(book.entries["k"].len(), 2);
+        book.prune(now + 2 * FOOTPRINT_MAX_AGE_SECS);
+        assert!(book.entries.is_empty());
+    }
+
+    #[test]
+    fn footprint_book_keeps_a_bounded_window_without_losing_high_water() {
+        let mut book = FootprintBook::default();
+        let now = 1_800_000_000;
+        book.record("k", 100.0, now, false);
+        book.record("k", 21.0, now, true);
+        for growth in 0..(4 * FOOTPRINT_SAMPLES) {
+            book.record("k", 2.0 + (growth % 3) as f64, now + growth as i64, true);
+        }
+        assert_eq!(book.entries["k"].len(), FOOTPRINT_SAMPLES);
+        // Neither repeated small builds nor a partial large build can erase
+        // the cold pool high-water mark or the strongest complete measurement.
+        assert_eq!(book.estimate_gib("k", now + 100), Some(100.0));
+        assert!(
+            book.entries["k"]
+                .iter()
+                .any(|sample| sample.complete && sample.growth_gib == 21.0)
+        );
+    }
+
+    #[test]
+    fn footprint_book_round_trips_and_tolerates_corruption() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("history.footprints.json");
+        assert!(FootprintBook::load(&path).entries.is_empty());
+
+        let mut book = FootprintBook::default();
+        book.record("k", 40.0, 1_800_000_000, true);
+        book.persist(&path).unwrap();
+        let loaded = FootprintBook::load(&path);
+        assert_eq!(loaded.estimate_gib("k", 1_800_000_000), Some(40.0));
+
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(FootprintBook::load(&path).entries.is_empty());
+    }
+
+    #[test]
+    fn incomplete_expired_future_and_invalid_samples_cannot_lower_cold_estimates() {
+        let now = 1_800_000_000;
+        let mut book = FootprintBook::default();
+        book.record("partial", 2.0, now, false);
+        assert_eq!(
+            book.admission_estimate_gib("partial", now, 24.0),
+            Some(24.0)
+        );
+        book.record("partial", 3.0, now, true);
+        assert_eq!(book.admission_estimate_gib("partial", now, 24.0), Some(3.0));
+        book.record("large", 21.0, now, true);
+        book.record("large", 2.0, now, true);
+        assert_eq!(book.admission_estimate_gib("large", now, 24.0), Some(21.0));
+        for (key, growth, observed) in [
+            ("future", 2.0, now + 1),
+            ("expired", 2.0, now - FOOTPRINT_MAX_AGE_SECS - 1),
+            ("negative", -1.0, now),
+            ("zero", 0.0, now),
+            ("nan", f64::NAN, now),
+        ] {
+            // Simulate malformed persisted data without going through record's
+            // validation. Neither deserialization nor a true flag grants trust.
+            book.entries.insert(
+                key.into(),
+                VecDeque::from([FootprintSample {
+                    growth_gib: growth,
+                    observed_unix: observed,
+                    complete: true,
+                }]),
+            );
+            assert_eq!(book.admission_estimate_gib(key, now, 24.0), None);
+        }
+        let old: FootprintBook = serde_json::from_str(
+            r#"{"entries":{"legacy":[{"growth_gib":2.0,"observed_unix":1800000000}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.admission_estimate_gib("legacy", now, 24.0), Some(24.0));
+    }
+
+    #[test]
+    fn footprint_requirement_adds_a_margin() {
+        assert_eq!(footprint_requirement_gib(21.0), 27.0);
+        assert_eq!(footprint_requirement_gib(2.0), 4.0);
+        assert_eq!(footprint_requirement_gib(64.0), 80.0);
+        assert_eq!(footprint_requirement_gib(f64::NAN), f64::from(u32::MAX));
     }
 }

@@ -2250,6 +2250,165 @@ fn source_error(error: &SnapshotError) -> CargoResolutionRefusal {
     CargoResolutionRefusal::DependencySourceInvalid(format!("{error:?}"))
 }
 
+/// Typed-digest domain for a workspace-mutation receipt (`E026`, risk `R77`).
+pub const DOMAIN_WORKSPACE_MUTATION_RECEIPT: &str = "rabs.workspace-mutation-receipt.v1";
+
+/// One bounded workspace file mutation captured in a private writable overlay (`E026`, `R77`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFileMutation {
+    /// Workspace-relative canonical path (`"Cargo.lock"` or `"Cargo.toml"`).
+    pub relative_path: String,
+    /// Precondition SHA-256 of the file in the requesting worktree when the command
+    /// started (`None` if the file did not yet exist, e.g. initial `Cargo.lock` creation).
+    pub precondition_sha256: Option<[u8; 32]>,
+    /// Post-mutation SHA-256 produced inside the private writable overlay.
+    pub mutated_sha256: [u8; 32],
+    /// Exact post-mutation file bytes to replay if preconditions hold.
+    pub mutated_bytes: Vec<u8>,
+}
+
+/// Signed/typed receipt for bounded workspace mutations (`Cargo.lock`, manifest updates)
+/// captured on a private writable overlay (`E026`, risk `R77`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceMutationReceipt {
+    /// Session ID that initiated the command.
+    pub session_id: u64,
+    /// Operation ID within the session.
+    pub operation_id: u64,
+    /// Base workspace snapshot SHA-256 at command start.
+    pub base_snapshot_sha256: [u8; 32],
+    /// Ordered mutations captured from the private overlay.
+    pub mutations: Vec<WorkspaceFileMutation>,
+}
+
+impl WorkspaceMutationReceipt {
+    /// Compute the canonical [`TypedDigest`] of this workspace-mutation receipt (`E026`).
+    #[must_use]
+    pub fn digest(&self) -> TypedDigest {
+        let mut enc = CanonicalEncoder::new();
+        enc.u64(self.session_id)
+            .u64(self.operation_id)
+            .bytes(&self.base_snapshot_sha256)
+            .seq(&self.mutations, |enc, m| {
+                enc.str(&m.relative_path);
+                match &m.precondition_sha256 {
+                    Some(pre) => {
+                        enc.bool(true).bytes(pre);
+                    }
+                    None => {
+                        enc.bool(false);
+                    }
+                }
+                enc.bytes(&m.mutated_sha256).bytes(&m.mutated_bytes);
+            });
+        compute(DOMAIN_WORKSPACE_MUTATION_RECEIPT, &enc.finish())
+    }
+}
+
+/// Outcome of replaying a [`WorkspaceMutationReceipt`] into the requesting worktree (`E026`, `R77`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceMutationReplayOutcome {
+    /// All content preconditions matched the live worktree; mutations were applied
+    /// atomically once BEFORE unrelated cached outputs are declared complete.
+    ReplayedCleanly {
+        /// Paths updated in the requesting worktree.
+        updated_paths: Vec<String>,
+        /// Receipt digest recorded as applied.
+        receipt_digest: TypedDigest,
+    },
+    /// This exact receipt was already replayed; idempotent no-op so clean replay
+    /// happens at most once (`E026`).
+    AlreadyReplayed {
+        /// Receipt digest that was already applied.
+        receipt_digest: TypedDigest,
+    },
+    /// A concurrent user edit changed a target file in the worktree after command start;
+    /// remote mutation replay is ABORTED without touching any worktree file (`R77`).
+    AbortedWorktreeConflict {
+        /// The conflicting workspace-relative path.
+        conflicting_path: String,
+        /// Expected precondition SHA-256 from the receipt.
+        expected_sha256: Option<[u8; 32]>,
+        /// Actual SHA-256 observed in the live worktree.
+        actual_live_sha256: Option<[u8; 32]>,
+    },
+    /// Overlay attempted to mutate an unbounded path outside the `Cargo.lock` /
+    /// `Cargo.toml` allowlist; command must stay local/side-effecting (`E026`).
+    BypassedUnboundedMutation {
+        /// The disallowed relative path.
+        offending_path: String,
+    },
+}
+
+fn is_bounded_workspace_mutation_path(rel_path: &str) -> bool {
+    if rel_path.is_empty()
+        || rel_path.starts_with('/')
+        || rel_path
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return false;
+    }
+    rel_path == "Cargo.lock" || rel_path == "Cargo.toml" || rel_path.ends_with("/Cargo.toml")
+}
+
+/// Replay a [`WorkspaceMutationReceipt`] into `live_worktree_files` under strict
+/// content-hash preconditions and once-only idempotence (`E026`, risk `R77`).
+///
+/// Validates ALL mutations before applying any write so a conflict on the second
+/// file never partially mutates the first file.
+pub fn replay_workspace_mutation_receipt(
+    receipt: &WorkspaceMutationReceipt,
+    live_worktree_files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    applied_receipts: &mut std::collections::BTreeSet<[u8; 32]>,
+) -> WorkspaceMutationReplayOutcome {
+    use sha2::{Digest, Sha256};
+
+    let receipt_digest = receipt.digest();
+    if applied_receipts.contains(&receipt_digest.bytes) {
+        return WorkspaceMutationReplayOutcome::AlreadyReplayed { receipt_digest };
+    }
+
+    // Phase 1: Validate bounded path policy and content preconditions across ALL entries.
+    for m in &receipt.mutations {
+        if !is_bounded_workspace_mutation_path(&m.relative_path) {
+            return WorkspaceMutationReplayOutcome::BypassedUnboundedMutation {
+                offending_path: m.relative_path.clone(),
+            };
+        }
+        let expected_mutated: [u8; 32] = Sha256::digest(&m.mutated_bytes).into();
+        if expected_mutated != m.mutated_sha256 {
+            return WorkspaceMutationReplayOutcome::BypassedUnboundedMutation {
+                offending_path: m.relative_path.clone(),
+            };
+        }
+
+        let actual_live_sha256: Option<[u8; 32]> = live_worktree_files
+            .get(&m.relative_path)
+            .map(|bytes| Sha256::digest(bytes).into());
+        if actual_live_sha256 != m.precondition_sha256 {
+            return WorkspaceMutationReplayOutcome::AbortedWorktreeConflict {
+                conflicting_path: m.relative_path.clone(),
+                expected_sha256: m.precondition_sha256,
+                actual_live_sha256,
+            };
+        }
+    }
+
+    // Phase 2: All preconditions satisfied — apply atomically and record receipt.
+    let mut updated_paths = Vec::with_capacity(receipt.mutations.len());
+    for m in &receipt.mutations {
+        live_worktree_files.insert(m.relative_path.clone(), m.mutated_bytes.clone());
+        updated_paths.push(m.relative_path.clone());
+    }
+    applied_receipts.insert(receipt_digest.bytes);
+
+    WorkspaceMutationReplayOutcome::ReplayedCleanly {
+        updated_paths,
+        receipt_digest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3359,5 +3518,112 @@ mod tests {
             Err(CargoResolutionRefusal::InvalidCapture(message))
                 if message.contains("exact captured closure")
         ));
+    }
+
+    #[test]
+    fn t023_cargo_lock_mutation_fetch_capture_and_worktree_conflict_scenarios() {
+        use sha2::{Digest, Sha256};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let sha = |b: &[u8]| -> [u8; 32] { Sha256::digest(b).into() };
+
+        // 1. E025/R76: Same-lockfile resolution is reproducible offline from captured objects.
+        let cap_a = capture();
+        let cap_b = capture();
+        let plan_a = seal(&cap_a, "/attempt/repro-1/cargo-home").unwrap();
+        let plan_b = seal(&cap_b, "/attempt/repro-2/cargo-home").unwrap();
+        assert_eq!(
+            plan_a.record().resolution_digest,
+            plan_b.record().resolution_digest,
+            "E025/T023: same-lockfile resolution must be reproducible offline from captured objects"
+        );
+
+        // 2. E026/R77: Clean Cargo.lock mutation overlay receipt replays exactly once when preconditions match.
+        let old_lock_bytes = b"# Cargo.lock v3\nname = \"fx\"\nversion = \"0.1.0\"\n".to_vec();
+        let new_lock_bytes = b"# Cargo.lock v3\nname = \"fx\"\nversion = \"0.1.1\"\n".to_vec();
+        let user_edited_bytes =
+            b"# Cargo.lock v3\nname = \"fx\"\nversion = \"0.2.0-user-local\"\n".to_vec();
+
+        let receipt = WorkspaceMutationReceipt {
+            session_id: 5,
+            operation_id: 9,
+            base_snapshot_sha256: [8; 32],
+            mutations: vec![WorkspaceFileMutation {
+                relative_path: "Cargo.lock".into(),
+                precondition_sha256: Some(sha(&old_lock_bytes)),
+                mutated_sha256: sha(&new_lock_bytes),
+                mutated_bytes: new_lock_bytes.clone(),
+            }],
+        };
+
+        let mut worktree = BTreeMap::from([("Cargo.lock".to_string(), old_lock_bytes.clone())]);
+        let mut applied = BTreeSet::new();
+
+        let first = replay_workspace_mutation_receipt(&receipt, &mut worktree, &mut applied);
+        assert_eq!(
+            first,
+            WorkspaceMutationReplayOutcome::ReplayedCleanly {
+                updated_paths: vec!["Cargo.lock".into()],
+                receipt_digest: receipt.digest(),
+            }
+        );
+        assert_eq!(worktree.get("Cargo.lock"), Some(&new_lock_bytes));
+
+        // Replaying the same receipt a second time is idempotent (`AlreadyReplayed`).
+        let second = replay_workspace_mutation_receipt(&receipt, &mut worktree, &mut applied);
+        assert_eq!(
+            second,
+            WorkspaceMutationReplayOutcome::AlreadyReplayed {
+                receipt_digest: receipt.digest(),
+            }
+        );
+
+        // 3. E026/T023/R77: Concurrent user edit in the worktree conflicts with precondition
+        // and ABORTS without overwriting user edits!
+        let mut conflicting_worktree =
+            BTreeMap::from([("Cargo.lock".to_string(), user_edited_bytes.clone())]);
+        let mut fresh_applied = BTreeSet::new();
+        let conflict = replay_workspace_mutation_receipt(
+            &receipt,
+            &mut conflicting_worktree,
+            &mut fresh_applied,
+        );
+        assert_eq!(
+            conflict,
+            WorkspaceMutationReplayOutcome::AbortedWorktreeConflict {
+                conflicting_path: "Cargo.lock".into(),
+                expected_sha256: Some(sha(&old_lock_bytes)),
+                actual_live_sha256: Some(sha(&user_edited_bytes)),
+            }
+        );
+        assert_eq!(
+            conflicting_worktree.get("Cargo.lock"),
+            Some(&user_edited_bytes),
+            "E026/R77: concurrent worktree conflict must never overwrite user edits"
+        );
+        assert!(fresh_applied.is_empty());
+
+        // 4. E026: Unbounded workspace mutation (`src/lib.rs`) is refused and stays local.
+        let unbounded_receipt = WorkspaceMutationReceipt {
+            session_id: 5,
+            operation_id: 10,
+            base_snapshot_sha256: [8; 32],
+            mutations: vec![WorkspaceFileMutation {
+                relative_path: "src/lib.rs".into(),
+                precondition_sha256: None,
+                mutated_sha256: sha(b"pub fn bad() {}"),
+                mutated_bytes: b"pub fn bad() {}".to_vec(),
+            }],
+        };
+        assert_eq!(
+            replay_workspace_mutation_receipt(
+                &unbounded_receipt,
+                &mut conflicting_worktree,
+                &mut fresh_applied
+            ),
+            WorkspaceMutationReplayOutcome::BypassedUnboundedMutation {
+                offending_path: "src/lib.rs".into(),
+            }
+        );
     }
 }

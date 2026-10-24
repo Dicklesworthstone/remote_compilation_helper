@@ -58,10 +58,7 @@ fn embedded_canonical_paths(bytes: &[u8]) -> Vec<String> {
     for root in VISIBLE_ROOTS {
         let root_bytes = root.as_bytes();
         let mut search_from = 0;
-        while let Some(pos) = bytes[search_from..]
-            .windows(root_bytes.len())
-            .position(|w| w == root_bytes)
-        {
+        while let Some(pos) = memchr::memmem::find(&bytes[search_from..], root_bytes) {
             let start = search_from + pos;
             let mut end = start + root_bytes.len();
             while end < bytes.len()

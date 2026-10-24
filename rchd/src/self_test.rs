@@ -377,17 +377,31 @@ impl SelfTestService {
         let started_at = Utc::now();
 
         let workers = self.resolve_workers(options.worker_ids.clone()).await?;
-        let project_path = match &options.project_path {
-            Some(path) => path.clone(),
-            None => ensure_self_test_project()?,
+        // Each test writes a unique marker into the project's main.rs, builds
+        // it locally and restores the file. Concurrent tests on ONE tree
+        // overwrite and restore each other's marker and queue on one build
+        // directory, so `--all` reported every worker timed out while each
+        // passed alone (bd-57nk9). The daemon's own canary is tiny: give each
+        // worker a private copy. An operator-supplied tree cannot be copied
+        // blindly, so those tests run one at a time instead.
+        let isolate = options.project_path.is_none() && workers.len() > 1;
+        let sequential = options.project_path.is_some() && workers.len() > 1;
+        let shared_project_path = match &options.project_path {
+            Some(path) => Some(path.clone()),
+            None if isolate => None,
+            None => Some(ensure_self_test_project()?),
         };
 
         // Run all workers in PARALLEL to avoid sequential timeout accumulation
         // Each worker test runs concurrently with its own timeout
         let mut handles = Vec::new();
+        let mut results = Vec::new();
         for worker in workers {
             let worker_clone = worker.clone();
-            let project_path_clone = project_path.clone();
+            let project_path_clone = match &shared_project_path {
+                Some(path) => path.clone(),
+                None => ensure_self_test_project_for_worker(worker.id.as_str())?,
+            };
             let options_clone = options.clone();
             let config_clone = self.config.clone();
             let pool_clone = self.pool.clone();
@@ -403,29 +417,17 @@ impl SelfTestService {
                 )
                 .await
             });
-            handles.push(handle);
+            if sequential {
+                // Let this worker's marker cycle finish before the next starts.
+                results.push(self_test_task_result(run_id, handle.await));
+            } else {
+                handles.push(handle);
+            }
         }
 
         // Collect all results (parallel execution means total time ≈ slowest worker)
-        let mut results = Vec::new();
         for handle in handles {
-            match handle.await {
-                Ok(result) => results.push(result),
-                Err(join_err) => {
-                    // Task panicked - create a failure record
-                    warn!("Self-test task panicked: {}", join_err);
-                    results.push(SelfTestResultRecord {
-                        run_id,
-                        worker_id: "unknown".to_string(),
-                        passed: false,
-                        local_hash: None,
-                        remote_hash: None,
-                        local_time_ms: None,
-                        remote_time_ms: None,
-                        error: Some(format!("Task panicked: {}", join_err)),
-                    });
-                }
-            }
+            results.push(self_test_task_result(run_id, handle.await));
         }
 
         let workers_tested = results.len();
@@ -478,8 +480,24 @@ impl SelfTestService {
                 }
             }
         } else {
+            // "All" means every worker that takes builds. One an operator
+            // disabled or is draining is out of rotation on purpose; testing
+            // it only reports a timeout. Name it explicitly to test it anyway.
+            // The canary cannot run on Windows (see `canary_unsupported`), so
+            // those workers are left out rather than counted as failures.
             for worker in workers {
+                if matches!(
+                    worker.status().await,
+                    rch_common::WorkerStatus::Disabled
+                        | rch_common::WorkerStatus::Draining
+                        | rch_common::WorkerStatus::Drained
+                ) {
+                    continue;
+                }
                 let config = worker.config.read().await;
+                if canary_unsupported(&config).is_some() {
+                    continue;
+                }
                 result.push(config.clone());
             }
         }
@@ -581,6 +599,19 @@ async fn run_single_worker_test(
     let worker_id = worker.id.to_string();
     let timeout_total = options.timeout;
 
+    if let Some(reason) = canary_unsupported(worker) {
+        return SelfTestResultRecord {
+            run_id,
+            worker_id,
+            passed: false,
+            local_hash: None,
+            remote_hash: None,
+            local_time_ms: None,
+            remote_time_ms: None,
+            error: Some(reason),
+        };
+    }
+
     let retry_loop = async {
         let retry_delay =
             parse_duration(&config.retry_delay).unwrap_or_else(|| Duration::from_secs(300));
@@ -605,16 +636,7 @@ async fn run_single_worker_test(
                     remote_time_ms: Some(outcome.compilation_ms),
                     error: outcome.error,
                 },
-                Ok(Err(err)) => SelfTestResultRecord {
-                    run_id,
-                    worker_id: worker_id.clone(),
-                    passed: false,
-                    local_hash: None,
-                    remote_hash: None,
-                    local_time_ms: None,
-                    remote_time_ms: None,
-                    error: Some(err.to_string()),
-                },
+                Ok(Err(err)) => failed_worker_result(run_id, &worker_id, &err),
                 Err(_elapsed) => SelfTestResultRecord {
                     run_id,
                     worker_id: worker_id.clone(),
@@ -636,8 +658,12 @@ async fn run_single_worker_test(
             }
 
             warn!(
-                "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}",
-                worker_id, attempt, retry_count, retry_delay
+                "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}: {}",
+                worker_id,
+                attempt,
+                retry_count,
+                retry_delay,
+                record.error.as_deref().unwrap_or("no error recorded")
             );
             sleep(retry_delay).await;
         }
@@ -661,6 +687,64 @@ async fn run_single_worker_test(
     }
 }
 
+/// A panicked worker task becomes a failure record instead of losing the run.
+fn self_test_task_result(
+    run_id: u64,
+    joined: std::result::Result<SelfTestResultRecord, tokio::task::JoinError>,
+) -> SelfTestResultRecord {
+    joined.unwrap_or_else(|join_err| {
+        warn!("Self-test task panicked: {}", join_err);
+        SelfTestResultRecord {
+            run_id,
+            worker_id: "unknown".to_string(),
+            passed: false,
+            local_hash: None,
+            remote_hash: None,
+            local_time_ms: None,
+            remote_time_ms: None,
+            error: Some(format!("Task panicked: {}", join_err)),
+        }
+    })
+}
+
+/// Keep the complete failure chain in persisted and returned self-test results.
+/// Unknown hashes/timings stay absent; diagnostics do not establish execution.
+fn failed_worker_result(
+    run_id: u64,
+    worker_id: &str,
+    error: &anyhow::Error,
+) -> SelfTestResultRecord {
+    SelfTestResultRecord {
+        run_id,
+        worker_id: worker_id.to_owned(),
+        passed: false,
+        local_hash: None,
+        remote_hash: None,
+        local_time_ms: None,
+        remote_time_ms: None,
+        error: Some(format!("{error:#}")),
+    }
+}
+
+/// Why the canary cannot run on `worker`, if it cannot.
+///
+/// `RemoteCompilationTest` syncs with rsync and builds through a POSIX shell,
+/// and it compares against a reference built on this host. A Windows worker
+/// has neither, so each attempt failed at the sync step and the run only
+/// ended at the per-worker deadline (600 s by default), reported as a
+/// timeout. Real builds reach Windows workers through the hook's
+/// Windows-aware transport; their health shows in probes and benchmarks.
+fn canary_unsupported(worker: &WorkerConfig) -> Option<String> {
+    let os = rch_common::declared_os(&worker.tags)?;
+    (os == "windows").then(|| {
+        format!(
+            "self-test canary is POSIX-only (rsync + sh) and cannot run on Windows worker {id}; \
+             check it with `rch workers probe {id}` and `rch workers benchmark {id}`",
+            id = worker.id
+        )
+    })
+}
+
 /// Canonical source of the self-test canary's `src/main.rs`. Kept as a constant
 /// so [`ensure_self_test_project`] can both create AND heal the fixture.
 const SELF_TEST_MAIN_RS: &str = "fn main() {\n    println!(\"rch self-test\");\n}\n";
@@ -676,8 +760,38 @@ fn self_test_main_rs_is_healthy(contents: &str) -> bool {
 }
 
 fn ensure_self_test_project() -> Result<PathBuf> {
-    let cache_dir = default_self_test_dir()?;
-    let project_dir = cache_dir.join("project");
+    ensure_self_test_project_at(&default_self_test_dir()?.join("project"))
+}
+
+/// A private copy of the canary for one worker, so concurrent tests share no
+/// file and no build directory. Reused across runs to keep its local build warm.
+fn ensure_self_test_project_for_worker(worker_id: &str) -> Result<PathBuf> {
+    ensure_self_test_project_at(&self_test_worker_project_dir(
+        &default_self_test_dir()?,
+        worker_id,
+    ))
+}
+
+fn self_test_worker_project_dir(cache_dir: &Path, worker_id: &str) -> PathBuf {
+    let name: String = worker_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = if name.is_empty() {
+        "worker".to_owned()
+    } else {
+        name
+    };
+    cache_dir.join("workers").join(name).join("project")
+}
+
+fn ensure_self_test_project_at(project_dir: &Path) -> Result<PathBuf> {
     let src_dir = project_dir.join("src");
 
     fs::create_dir_all(&src_dir)
@@ -708,7 +822,7 @@ fn ensure_self_test_project() -> Result<PathBuf> {
             .with_context(|| format!("Failed to write {:?}", main_rs))?;
     }
 
-    Ok(project_dir)
+    Ok(project_dir.to_path_buf())
 }
 
 fn default_self_test_dir() -> Result<PathBuf> {
@@ -729,6 +843,177 @@ pub fn default_history_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn each_worker_gets_a_private_canary_project() {
+        let cache = tempfile::tempdir().unwrap();
+        let a = self_test_worker_project_dir(cache.path(), "vmi1264463");
+        let b = self_test_worker_project_dir(cache.path(), "hz3");
+        let odd = self_test_worker_project_dir(cache.path(), "../we ird/id");
+        assert_ne!(a, b);
+        for dir in [&a, &b, &odd] {
+            assert!(dir.starts_with(cache.path().join("workers")), "{dir:?}");
+            assert_eq!(dir.components().count(), a.components().count());
+            let project = ensure_self_test_project_at(dir).unwrap();
+            assert_eq!(
+                fs::read_to_string(project.join("src/main.rs")).unwrap(),
+                SELF_TEST_MAIN_RS
+            );
+            assert!(project.join("Cargo.toml").is_file());
+        }
+        // A marker left in one worker's tree never reaches another's.
+        fs::write(a.join("src/main.rs"), "// RCH_TEST_1\nfn main() {}\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(b.join("src/main.rs")).unwrap(),
+            SELF_TEST_MAIN_RS
+        );
+    }
+
+    #[tokio::test]
+    async fn all_skips_workers_taken_out_of_rotation_unless_named() {
+        let pool = WorkerPool::new();
+        for id in ["up", "disabled", "draining"] {
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new(id),
+                host: format!("{id}.invalid"),
+                user: "u".to_string(),
+                identity_file: "/dev/null".to_string(),
+                total_slots: 2,
+                priority: 100,
+                tags: vec![],
+                tools: Vec::new(),
+            })
+            .await;
+        }
+        pool.get(&WorkerId::new("disabled"))
+            .await
+            .unwrap()
+            .disable(Some("maintenance".into()))
+            .await;
+        pool.get(&WorkerId::new("draining"))
+            .await
+            .unwrap()
+            .set_status(rch_common::WorkerStatus::Draining)
+            .await;
+        let service = SelfTestService::new(
+            pool,
+            SelfTestConfig::default(),
+            Arc::new(SelfTestHistory::new(4, 4)),
+        );
+        let ids = |workers: Vec<WorkerConfig>| -> Vec<String> {
+            let mut ids: Vec<String> = workers.iter().map(|w| w.id.to_string()).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(service.resolve_workers(None).await.unwrap()), ["up"]);
+        let named = Some(vec![WorkerId::new("disabled"), WorkerId::new("up")]);
+        assert_eq!(
+            ids(service.resolve_workers(named).await.unwrap()),
+            ["disabled", "up"]
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_workers_are_left_out_of_all_and_refused_at_once_when_named() {
+        let pool = WorkerPool::new();
+        for (id, tags) in [
+            ("linux", vec![]),
+            (
+                "win",
+                vec!["rust".to_string(), rch_common::os_tag("Windows")],
+            ),
+        ] {
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new(id),
+                host: format!("{id}.invalid"),
+                user: "u".to_string(),
+                identity_file: "/dev/null".to_string(),
+                total_slots: 2,
+                priority: 100,
+                tags,
+                tools: Vec::new(),
+            })
+            .await;
+        }
+        let service = SelfTestService::new(
+            pool.clone(),
+            SelfTestConfig::default(),
+            Arc::new(SelfTestHistory::new(4, 4)),
+        );
+        let all = service.resolve_workers(None).await.unwrap();
+        assert_eq!(
+            all.iter().map(|w| w.id.to_string()).collect::<Vec<_>>(),
+            ["linux"]
+        );
+        assert!(canary_unsupported(&all[0]).is_none());
+
+        let named = service
+            .resolve_workers(Some(vec![WorkerId::new("win")]))
+            .await
+            .unwrap();
+        assert_eq!(named.len(), 1);
+        let options = SelfTestRunOptions {
+            run_type: SelfTestRunType::Manual,
+            worker_ids: None,
+            project_path: None,
+            timeout: Duration::from_secs(600),
+            release_mode: true,
+            retry_count_override: None,
+        };
+        // An unreachable host and a missing project: only the early refusal
+        // can answer before the 600 s deadline.
+        let record = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_single_worker_test(
+                9,
+                &named[0],
+                Path::new("/nonexistent/self-test-project"),
+                &options,
+                &SelfTestConfig::default(),
+                &pool,
+            ),
+        )
+        .await
+        .expect("a Windows worker is refused without attempting the canary");
+        assert!(!record.passed);
+        assert_eq!((record.run_id, record.worker_id.as_str()), (9, "win"));
+        let error = record.error.unwrap();
+        assert!(error.contains("POSIX-only"), "{error}");
+        assert!(error.contains("`rch workers probe win`"), "{error}");
+    }
+
+    #[test]
+    fn failed_worker_result_retains_real_io_cause_through_serialization() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let missing = retained.join("never-created-artifact");
+        let cause = fs::read(&missing).unwrap_err();
+        assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+        let cause_message = cause.to_string();
+        let error = anyhow::Error::new(cause)
+            .context("Returned artifact could not be read")
+            .context("Canary identity was not verified");
+        let expected = format!(
+            "Canary identity was not verified: Returned artifact could not be read: {cause_message}"
+        );
+        let record = failed_worker_result(47, "reader-case", &error);
+        assert_eq!(record.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(record.run_id, 47);
+        assert_eq!(record.worker_id, "reader-case");
+        assert!(!record.passed);
+        assert!(record.local_hash.is_none() && record.remote_hash.is_none());
+        assert!(record.local_time_ms.is_none() && record.remote_time_ms.is_none());
+
+        let document = serde_json::to_vec(&record).unwrap();
+        let restored: SelfTestResultRecord = serde_json::from_slice(&document).unwrap();
+        assert_eq!(restored.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(restored.run_id, 47);
+        assert_eq!(restored.worker_id, "reader-case");
+        assert!(!restored.passed);
+        assert!(restored.local_hash.is_none() && restored.remote_hash.is_none());
+        assert!(restored.local_time_ms.is_none() && restored.remote_time_ms.is_none());
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(retained).unwrap().count(), 0);
+    }
 
     // ==================== parse_duration tests ====================
 

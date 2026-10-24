@@ -46,7 +46,7 @@ fn golden_remediation_config_default_policy() {
                 "probe_timeout_secs": 10,
                 "min_disk_free_gb": 5.0,
                 "min_disk_inodes": 10000,
-                "disk_roots": ["/tmp", "/tmp/rch"],
+                "disk_roots": ["/tmp", "/tmp/rch", "/data/tmp/rch"],
                 "max_load_per_core": 4.0,
                 "min_protocol": 0,
                 "required_targets": [],

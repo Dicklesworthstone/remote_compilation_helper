@@ -1,0 +1,50 @@
+name: Remote-only policy regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/hook.rs'
+      - 'rch/src/hook/**'
+      - 'rch/src/config.rs'
+      - 'rch-common/src/types.rs'
+      - 'rch/tests/remote_only_policy.rs'
+      - '.github/workflows/remote-only-policy.yml'
+  pull_request:
+    paths:
+      - 'rch/src/hook.rs'
+      - 'rch/src/hook/**'
+      - 'rch/src/config.rs'
+      - 'rch-common/src/types.rs'
+      - 'rch/tests/remote_only_policy.rs'
+      - '.github/workflows/remote-only-policy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rch-remote-only-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-06
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check regression coverage is present
+        run: test -s rch/src/hook/fallback_policy_tests.rs
+      - name: Run spawn, envelope, ledger, and failure-path regressions
+        run: cargo test -p rch --bin rch fallback_policy_tests -- --test-threads=1
+      - name: Type-check all RCH targets
+        run: cargo check -p rch --all-targets
+      - name: Lint the RCH binary
+        run: cargo clippy -p rch --bin rch -- -D warnings
+      - name: Check regression-test formatting
+        run: rustfmt --edition 2024 --check rch/src/hook/fallback_policy_tests.rs

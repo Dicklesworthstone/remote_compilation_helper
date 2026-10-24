@@ -1,0 +1,1152 @@
+//! Authenticated, non-owning placement observations for remote agents.
+//!
+//! GET uses the shared percent-encoded `request` query; POST accepts the same
+//! typed request as JSON. Both enter the normal preview selector, never the
+//! reservation/queue handler. An observation can become stale immediately:
+//! it is not permission to execute, transfer sources, or release worker slots.
+
+use super::ApiState;
+use crate::DaemonContext;
+use axum::{
+    Extension, Json, Router,
+    extract::{DefaultBodyLimit, RawQuery, Request, State, rejection::JsonRejection},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use rch_common::admission_preview::{
+    MAX_REQUEST_BYTES, PROTOCOL_VERSION, PreviewRequest, PreviewResponse, ROUTE,
+};
+use rch_common::{SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const MAX_CONCURRENT_PREVIEWS: usize = 8;
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Merge BEFORE the parent router installs its bearer-token middleware.
+pub(super) fn router() -> Router<Arc<ApiState>> {
+    router_with_limit(Arc::new(Semaphore::new(MAX_CONCURRENT_PREVIEWS)))
+}
+
+fn router_with_limit(limit: Arc<Semaphore>) -> Router<Arc<ApiState>> {
+    Router::new()
+        .route(ROUTE, get(get_preview).post(post_preview))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .route_layer(middleware::from_fn_with_state(limit, bounded_request))
+}
+
+/// Charge ingress to the same budget as selection. A JSON extractor runs
+/// before its handler: acquiring here, not in `preview`, bounds incomplete
+/// uploads as well as fully decoded requests. The parent's auth layer is
+/// outside this layer, so an unauthenticated request never occupies a permit.
+async fn bounded_request(
+    State(limit): State<Arc<Semaphore>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let permit = match limit.try_acquire_owned() {
+        Ok(permit) => Arc::new(permit),
+        Err(_) => {
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "admission-preview capacity exhausted",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
+    request.extensions_mut().insert(Arc::clone(&permit));
+    // One deadline covers body ingestion, parsing, source inspection and
+    // selection. Finishing a slow upload does not start a fresh timeout.
+    let response = match tokio::time::timeout(PREVIEW_TIMEOUT, next.run(request)).await {
+        Ok(response) => no_store(response),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admission-preview timed out; no build was admitted",
+        ),
+    };
+    // A non-cancellable blocking source read retains its own Arc until it
+    // actually finishes, even if the request deadline expired above.
+    drop(permit);
+    response
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn error(status: StatusCode, message: &str) -> Response {
+    no_store(
+        (
+            status,
+            Json(serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "error": message,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+async fn get_preview(
+    State(state): State<Arc<ApiState>>,
+    Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let query = query.as_deref().unwrap_or_default();
+    // Match the shared wire request's complete line budget, not just its JSON.
+    if query.len().saturating_add(ROUTE.len() + 6) > MAX_REQUEST_BYTES {
+        return error(
+            StatusCode::URI_TOO_LONG,
+            "admission-preview request is too large",
+        );
+    }
+    match PreviewRequest::from_query(query) {
+        Ok(request) => preview(state, permit, request).await,
+        Err(_) => error(StatusCode::BAD_REQUEST, "invalid admission-preview request"),
+    }
+}
+
+async fn post_preview(
+    State(state): State<Arc<ApiState>>,
+    Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+    payload: Result<Json<PreviewRequest>, JsonRejection>,
+) -> Response {
+    match payload {
+        Ok(Json(request)) => preview(state, permit, request).await,
+        // Preserve 413/415 and syntax/data rejection status, but do not echo
+        // command contents, tool names or credentials in parser diagnostics.
+        Err(rejection) => error(rejection.status(), "invalid admission-preview JSON"),
+    }
+}
+
+async fn preview(
+    state: Arc<ApiState>,
+    permit: Arc<OwnedSemaphorePermit>,
+    request: PreviewRequest,
+) -> Response {
+    let request = match request.into_selection() {
+        Ok(request) => request,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid admission-preview request"),
+    };
+    match observe(&state.ctx, request, permit).await {
+        Ok(response) => no_store(Json(response).into_response()),
+        Err(message) => error(StatusCode::SERVICE_UNAVAILABLE, message),
+    }
+}
+
+fn refused(reason: &str) -> PreviewResponse {
+    PreviewResponse {
+        protocol_version: PROTOCOL_VERSION,
+        selection: SelectionResponse {
+            worker: None,
+            reason: SelectionReason::SelectionError(reason.to_string()),
+            build_id: None,
+            diagnostics: None,
+        },
+    }
+}
+
+/// Observe the lowest unused lane without advancing an identity or reserving
+/// anything. Admission chooses again under its ownership lock. Counts alone
+/// cannot identify a lane: lane one can remain owned after lane zero retires.
+fn available_project_lane(ctx: &DaemonContext, project: &str, worker: &str) -> Option<u32> {
+    let active = ctx.history.active_builds();
+    (0..ctx.pool.project_lanes(worker)).find(|lane| {
+        !active.iter().any(|build| {
+            build.project_id == project && build.worker_id == worker && build.project_lane == *lane
+        })
+    })
+}
+
+async fn observe(
+    ctx: &DaemonContext,
+    request: SelectionRequest,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Result<PreviewResponse, &'static str> {
+    // A restart cannot close admission between this check and the observation.
+    // The outer timeout bounds this read-lock hold; no reservation is created.
+    crate::api::recover_restart_admission(ctx).await;
+    let admission = ctx.admission_barrier.read().await;
+    if admission.is_closed() {
+        return Ok(refused("restart_admission_barrier_active"));
+    }
+    if ctx.history.ownership_failed() {
+        return Ok(refused("durable_ownership_uncertain"));
+    }
+
+    // Use the same history-owned exclusion sources as Unix admission. Source
+    // fences may inspect lease files: do not perform those reads on the async
+    // runtime. Keep the permit in that task until it finishes even if the HTTP
+    // caller leaves, so cancelled reads cannot evade the concurrency budget.
+    let history = Arc::clone(&ctx.history);
+    let pool = ctx.pool.clone();
+    let project = request.project.clone();
+    let (mut excluded, _permit) = tokio::task::spawn_blocking(move || {
+        // Match actual admission: an active build consumes one project lane,
+        // not necessarily the entire worker. Source fences below still apply
+        // to the worker regardless of how many unused lanes it has.
+        let mut excluded: std::collections::HashSet<String> = history
+            .active_build_counts_for_project(&project)
+            .into_iter()
+            .filter(|(worker, count)| *count >= pool.project_lanes(worker) as usize)
+            .map(|(worker, _)| worker)
+            .collect();
+        excluded.extend(
+            history.source_fenced_workers(&project, crate::cancellation::client_lease_owns_source),
+        );
+        excluded.extend(history.live_checkout_fenced_workers(&project));
+        excluded.extend(history.source_busy_fenced_workers(&project));
+        (excluded, permit)
+    })
+    .await
+    .map_err(|_| "admission-preview could not inspect source ownership")?;
+
+    // A starving queued job's hold also prevents a real, non-owning newcomer
+    // from taking that worker. Match the execution path's steer-then-busy rule
+    // rather than reporting that held capacity as immediately available.
+    let held_worker = ctx.history.queue_hold_against(None);
+    let mut steered_off_hold = false;
+    let mut steered_off_full_lanes = false;
+    loop {
+        let result = ctx
+            .worker_selector
+            .preview_with_exclusions(&ctx.pool, &request, &excluded)
+            .await;
+        let selected = match result.worker {
+            Some(worker) => {
+                let endpoint = worker.endpoint_snapshot().await;
+                if held_worker.as_deref() == Some(endpoint.config.id.as_str()) {
+                    steered_off_hold = true;
+                    excluded.insert(endpoint.config.id.to_string());
+                    continue;
+                }
+                let slots_available = worker.available_slots().await;
+                let speed_score = worker.get_speed_score();
+                // Do not combine old host/identity details with new capability
+                // or slot observations after a concurrent worker retarget.
+                let Some(config) = worker.lock_current_endpoint(&endpoint).await else {
+                    return Ok(refused("worker_endpoint_changed_during_preview"));
+                };
+                let Some(project_lane) =
+                    available_project_lane(ctx, &request.project, config.id.as_str())
+                else {
+                    // Another admission filled the last lane while selection
+                    // awaited worker facts. Re-select with the same constraints
+                    // and deadline; never fabricate an available lane zero.
+                    steered_off_full_lanes = true;
+                    excluded.insert(config.id.to_string());
+                    continue;
+                };
+                Some(SelectedWorker {
+                    id: config.id.clone(),
+                    host: config.host.clone(),
+                    user: config.user.clone(),
+                    identity_file: config.identity_file.clone(),
+                    slots_available,
+                    speed_score,
+                    declared_os: rch_common::declared_os(&config.tags),
+                    project_lane,
+                    disk_budget: ctx.worker_selector.build_disk_budget(&request),
+                })
+            }
+            None => None,
+        };
+        if ctx.history.ownership_failed() {
+            return Ok(refused("durable_ownership_uncertain"));
+        }
+        let reason = if selected.is_none() && (steered_off_hold || steered_off_full_lanes) {
+            SelectionReason::AllWorkersBusy
+        } else {
+            result.reason
+        };
+        let response = PreviewResponse {
+            protocol_version: PROTOCOL_VERSION,
+            selection: SelectionResponse {
+                worker: selected,
+                reason,
+                build_id: None,
+                diagnostics: result.diagnostics,
+            },
+        };
+        response
+            .validate()
+            .map_err(|_| "admission-preview selector result was inconsistent")?;
+        return Ok(response);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http_api::{HttpState, create_api_router, create_router};
+    use crate::workers::WorkerPool;
+    use axum::body::Body;
+    use axum::http::Request;
+    use rch_common::{RequiredRuntime, WorkerConfig, WorkerId};
+    use std::time::Instant;
+    use tower::ServiceExt;
+
+    fn input() -> PreviewRequest {
+        PreviewRequest {
+            protocol_version: PROTOCOL_VERSION,
+            project: "http-preview-fixture".into(),
+            command: "make".into(),
+            estimated_cores: 2,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            job_mode: false,
+            required_tools: Vec::new(),
+        }
+    }
+
+    async fn fixture() -> (DaemonContext, Router) {
+        let pool = WorkerPool::new();
+        for id in ["requested", "alternate"] {
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new(id),
+                host: "localhost".into(),
+                user: "fixture".into(),
+                identity_file: "/no-test-key".into(),
+                total_slots: 4,
+                priority: 100,
+                tags: Vec::new(),
+                tools: Vec::new(),
+            })
+            .await;
+            pool.get(&WorkerId::new(id))
+                .await
+                .unwrap()
+                .set_capabilities(rch_common::WorkerCapabilities {
+                    build_disk_free_gb: Some(100.0),
+                    build_disk_total_gb: Some(200.0),
+                    ..Default::default()
+                })
+                .await;
+        }
+        let ctx = crate::test_daemon_context(pool.clone());
+        let router = create_api_router(
+            ApiState {
+                ctx: ctx.clone(),
+                token: Some("fixture-token".into()),
+            },
+            HttpState {
+                pool,
+                version: "fixture",
+                started_at: Instant::now(),
+                pid: 1,
+            },
+        );
+        (ctx, router)
+    }
+
+    fn http_request(input: &PreviewRequest, post: bool, token: Option<&str>) -> Request<Body> {
+        let (method, uri, body) = if post {
+            (
+                "POST",
+                ROUTE.to_string(),
+                Body::from(serde_json::to_vec(input).unwrap()),
+            )
+        } else {
+            let line = input.request_line().unwrap();
+            (
+                "GET",
+                line.trim_end_matches('\n')
+                    .strip_prefix("GET ")
+                    .unwrap()
+                    .to_string(),
+                Body::empty(),
+            )
+        };
+        let mut request = Request::builder().method(method).uri(uri);
+        if post {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        if let Some(token) = token {
+            request = request.header("x-rch-token", token);
+        }
+        request.body(body).unwrap()
+    }
+
+    async fn decoded(response: Response) -> PreviewResponse {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 131_072)
+            .await
+            .unwrap();
+        let response: PreviewResponse = serde_json::from_slice(&body).unwrap();
+        response.validate().unwrap();
+        response
+    }
+
+    async fn assert_unowned(ctx: &DaemonContext, expected_free: u32) {
+        assert!(ctx.history.active_builds().is_empty());
+        assert_eq!(ctx.history.queue_depth(), 0);
+        for (id, expected) in [("requested", expected_free), ("alternate", 4)] {
+            assert_eq!(
+                ctx.pool
+                    .get(&WorkerId::new(id))
+                    .await
+                    .unwrap()
+                    .available_slots()
+                    .await,
+                expected,
+            );
+        }
+    }
+
+    async fn start_lane_owner(
+        ctx: &DaemonContext,
+        project: &str,
+        worker_id: &str,
+        wrapper: &str,
+    ) -> crate::history::ActiveBuildState {
+        let worker = ctx.pool.get(&WorkerId::new(worker_id)).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        ctx.history
+            .try_start_active_build_in_lanes(
+                project.into(),
+                worker_id.into(),
+                "make".into(),
+                0,
+                Some(wrapper.into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission {
+                    requested_gib: 0,
+                    floor_gib: 0,
+                    capacity: None,
+                },
+                None,
+                ctx.pool.project_lanes(worker_id),
+            )
+            .unwrap()
+            .expect("fixture must own a real project lane")
+    }
+
+    async fn finish_lane_owner(ctx: &DaemonContext, owner: &crate::history::ActiveBuildState) {
+        let completed = ctx
+            .history
+            .complete_durable_with_disk_fault(
+                owner.id,
+                &owner.worker_id,
+                owner.local_wrapper_id.as_deref(),
+                crate::history::BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    disk_peak_output_bytes: None,
+                    timing: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .unwrap()
+            .expect("only the fixture's exact owner may complete its lane");
+        assert_eq!(completed.0.project_lane, owner.project_lane);
+        ctx.pool
+            .get(&WorkerId::new(&owner.worker_id))
+            .await
+            .unwrap()
+            .release_slots(owner.slots)
+            .await;
+    }
+
+    fn lane_ownership(ctx: &DaemonContext) -> Vec<(u64, String, String, u32, u32)> {
+        let mut owners: Vec<_> = ctx
+            .history
+            .active_builds()
+            .into_iter()
+            .map(|b| (b.id, b.project_id, b.worker_id, b.project_lane, b.slots))
+            .collect();
+        owners.sort();
+        owners
+    }
+
+    #[tokio::test]
+    async fn previews_observe_spare_and_reused_lanes_without_consuming_ownership() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        ctx.pool
+            .set_project_lanes(std::collections::HashMap::from([("requested".into(), 2)]));
+        let request = input();
+        let first = start_lane_owner(&ctx, &request.project, "requested", "lane-first").await;
+        assert_eq!(first.project_lane, 0);
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        let before = lane_ownership(&ctx);
+        for post in [false, true, false, true] {
+            let result = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let selected = result.selection.worker.unwrap();
+            assert_eq!(selected.id.as_str(), "requested");
+            assert_eq!(selected.project_lane, 1);
+            assert_eq!(lane_ownership(&ctx), before);
+            assert_eq!(worker.available_slots().await, 3);
+            assert_eq!(ctx.history.queue_depth(), 0);
+        }
+        let second = start_lane_owner(&ctx, &request.project, "requested", "lane-second").await;
+        assert_eq!(second.project_lane, 1);
+        assert_eq!(second.id, first.id + 1, "previews must not mint build IDs");
+        let full = decoded(
+            router
+                .clone()
+                .oneshot(http_request(&request, true, Some("fixture-token")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            full.selection.worker.is_none(),
+            "spare slots are not spare project lanes"
+        );
+        assert_eq!(ctx.history.active_builds().len(), 2);
+        assert_eq!(worker.available_slots().await, 2);
+
+        finish_lane_owner(&ctx, &first).await;
+        let before = lane_ownership(&ctx);
+        for post in [false, true] {
+            let sparse = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(sparse.selection.worker.unwrap().project_lane, 0);
+            assert_eq!(
+                lane_ownership(&ctx),
+                before,
+                "lane one remains independently owned"
+            );
+        }
+        let third = start_lane_owner(&ctx, &request.project, "requested", "lane-third").await;
+        assert_eq!(third.project_lane, 0);
+        assert_eq!(third.id, second.id + 1);
+        finish_lane_owner(&ctx, &second).await;
+        finish_lane_owner(&ctx, &third).await;
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn default_lane_exclusion_preserves_pins_and_allows_an_unpinned_alternative() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        let mut request = input();
+        assert_eq!(ctx.pool.project_lanes("requested"), 1);
+        let owner = start_lane_owner(&ctx, &request.project, "requested", "default-lane").await;
+        let before = lane_ownership(&ctx);
+        let pinned = decoded(
+            router
+                .clone()
+                .oneshot(http_request(&request, true, Some("fixture-token")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(pinned.selection.worker.is_none());
+        request.preferred_workers.clear();
+        let automatic = decoded(
+            router
+                .oneshot(http_request(&request, false, Some("fixture-token")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let selected = automatic.selection.worker.unwrap();
+        assert_eq!(selected.id.as_str(), "alternate");
+        assert_eq!(selected.project_lane, 0);
+        assert_eq!(lane_ownership(&ctx), before);
+        finish_lane_owner(&ctx, &owner).await;
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn lane_scope_is_project_and_worker_specific_but_source_fences_still_win() {
+        let _guard = rch_common::test_guard!();
+        for source_fence in ["live", "busy"] {
+            let (ctx, router) = fixture().await;
+            ctx.pool
+                .set_project_lanes(std::collections::HashMap::from([("requested".into(), 3)]));
+            let request = input();
+            let other_project =
+                start_lane_owner(&ctx, "other-project", "requested", "other-project").await;
+            let other_worker =
+                start_lane_owner(&ctx, &request.project, "alternate", "other-worker").await;
+            let before = lane_ownership(&ctx);
+            let observed = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, true, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(observed.selection.worker.unwrap().project_lane, 0);
+            match source_fence {
+                "live" => ctx
+                    .history
+                    .fence_live_checkout(&request.project, "requested"),
+                "busy" => ctx.history.fence_source_busy(&request.project, "requested"),
+                _ => unreachable!(),
+            }
+            let denied = decoded(
+                router
+                    .oneshot(http_request(&request, false, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(denied.selection.worker.is_none(), "{source_fence}");
+            assert_eq!(lane_ownership(&ctx), before);
+            assert_eq!(ctx.history.queue_depth(), 0);
+            finish_lane_owner(&ctx, &other_project).await;
+            finish_lane_owner(&ctx, &other_worker).await;
+            assert_unowned(&ctx, 4).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_requires_auth_for_both_transports_and_never_appears_on_metrics_listener() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        for post in [false, true] {
+            for token in [None, Some("wrong")] {
+                let response = router
+                    .clone()
+                    .oneshot(http_request(&input(), post, token))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            let response = router
+                .clone()
+                .oneshot(http_request(&input(), post, Some("fixture-token")))
+                .await
+                .unwrap();
+            assert_eq!(
+                decoded(response)
+                    .await
+                    .selection
+                    .worker
+                    .unwrap()
+                    .id
+                    .as_str(),
+                "requested",
+            );
+        }
+        let metrics = create_router(HttpState {
+            pool: ctx.pool.clone(),
+            version: "fixture",
+            started_at: Instant::now(),
+            pid: 1,
+        });
+        let response = metrics
+            .oneshot(http_request(&input(), false, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_previews_and_busy_pins_never_reserve_enqueue_or_switch_workers() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        for post in [false, true, false, true] {
+            let response = router
+                .clone()
+                .oneshot(http_request(&input(), post, Some("fixture-token")))
+                .await
+                .unwrap();
+            assert_eq!(
+                decoded(response)
+                    .await
+                    .selection
+                    .worker
+                    .unwrap()
+                    .id
+                    .as_str(),
+                "requested",
+            );
+            assert_unowned(&ctx, 4).await;
+        }
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+        let response = router
+            .oneshot(http_request(&input(), true, Some("fixture-token")))
+            .await
+            .unwrap();
+        let response = decoded(response).await;
+        assert!(response.selection.worker.is_none());
+        assert_eq!(response.selection.reason, SelectionReason::AllWorkersBusy);
+        assert_unowned(&ctx, 0).await;
+        worker.release_slots(4).await;
+    }
+
+    #[tokio::test]
+    async fn source_fences_tool_requirements_and_unknown_disk_budget_are_not_dropped() {
+        let _guard = rch_common::test_guard!();
+        for fence in ["live", "busy", "tools", "disk"] {
+            let (ctx, router) = fixture().await;
+            let mut request = input();
+            match fence {
+                "live" => ctx
+                    .history
+                    .fence_live_checkout(&request.project, "requested"),
+                "busy" => ctx.history.fence_source_busy(&request.project, "requested"),
+                "tools" => request.required_tools.push("never-probed-tool".into()),
+                "disk" => {
+                    request.disk_headroom_gib = 23;
+                    ctx.pool
+                        .get(&WorkerId::new("requested"))
+                        .await
+                        .unwrap()
+                        .set_capabilities(rch_common::WorkerCapabilities::default())
+                        .await;
+                }
+                _ => unreachable!(),
+            }
+            let response = router
+                .oneshot(http_request(&request, true, Some("fixture-token")))
+                .await
+                .unwrap();
+            let response = decoded(response).await;
+            assert!(response.selection.worker.is_none(), "{fence}");
+            assert!(response.selection.diagnostics.is_some(), "{fence}");
+            assert_unowned(&ctx, 4).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_disk_preview_rejects_large_output_but_admits_measured_small_builds() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        for (project, gib) in [("large-test", 21), ("small-test", 2)] {
+            let seed = ctx.history.start_active_build_with_wrapper(
+                project.into(),
+                "seed".into(),
+                "cargo test --workspace".into(),
+                0,
+                Some(format!("owner-{project}")),
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            ctx.history
+                .complete_durable(
+                    seed.id,
+                    "seed",
+                    seed.local_wrapper_id.as_deref(),
+                    crate::history::BuildCompletion {
+                        exit_code: 0,
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        let mut caps = worker.capabilities().await;
+        caps.build_disk_free_gb = Some(33.0);
+        worker.set_capabilities(caps).await;
+        for post in [false, true] {
+            let mut request = input();
+            request.command = "cargo test --workspace".into();
+            request.project = "large-test".into();
+            let rejected = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(rejected.selection.worker.is_none());
+            request.project = "small-test".into();
+            let accepted = decoded(
+                router
+                    .clone()
+                    .oneshot(http_request(&request, post, Some("fixture-token")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let selected = accepted.selection.worker.unwrap();
+            assert_eq!(selected.id.as_str(), "requested");
+            assert_eq!(
+                selected.disk_budget,
+                Some(rch_common::BuildDiskBudget {
+                    max_growth_bytes: 4 * rch_common::BuildDiskBudget::GIB,
+                    min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+                })
+            );
+            // The independent flat-slot policy derates this 33 GiB worker
+            // to two slots; a read-only preview must preserve that capacity.
+            assert_unowned(&ctx, 2).await;
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("requested"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_barrier_is_observed_without_reopening_it_or_admitting_a_build() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        ctx.admission_barrier.write().await.begin_shutdown();
+        let response = router
+            .oneshot(http_request(&input(), false, Some("fixture-token")))
+            .await
+            .unwrap();
+        let response = decoded(response).await;
+        assert!(response.selection.worker.is_none());
+        assert_eq!(
+            response.selection.reason,
+            SelectionReason::SelectionError("restart_admission_barrier_active".into()),
+        );
+        assert!(ctx.admission_barrier.read().await.is_closed());
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_or_oversized_payloads_cannot_fall_through_to_execution() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        let valid = serde_json::to_string(&input()).unwrap();
+        let mut invalid = vec![
+            "{".to_string(),
+            format!("{{\"estimated_cores\":1,{}", &valid[1..]),
+        ];
+        for field in [
+            "wait",
+            "queue",
+            "dry_run",
+            "hook_pid",
+            "local_wrapper_id",
+            "future_requirement",
+        ] {
+            let mut value = serde_json::to_value(input()).unwrap();
+            value[field] = serde_json::json!(1);
+            invalid.push(value.to_string());
+        }
+        let mut version = input();
+        version.protocol_version += 1;
+        invalid.push(serde_json::to_string(&version).unwrap());
+        invalid.push(" ".repeat(MAX_REQUEST_BYTES + 1));
+        for body in invalid {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(ROUTE)
+                        .header("x-rch-token", "fixture-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_client_error());
+        }
+        let line = input().request_line().unwrap();
+        let uri = line.trim_end().strip_prefix("GET ").unwrap();
+        for suffix in ["&wait=1", "&dry_run=0", "&request={}"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{uri}{suffix}"))
+                        .header("x-rch-token", "fixture-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn saturated_preview_budget_refuses_instead_of_queueing() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let _held = limit.clone().acquire_owned().await.unwrap();
+        // Only this resource-budget fixture omits the auth layer; the actual
+        // protected router is exercised above with absent and wrong tokens.
+        let router = router_with_limit(limit).with_state(Arc::new(ApiState {
+            ctx: ctx.clone(),
+            token: None,
+        }));
+        let response = router
+            .oneshot(http_request(&input(), true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn a_stalled_restart_lock_times_out_without_claiming_a_selection() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        let _held = ctx.admission_barrier.write().await;
+        let response = tokio::time::timeout(
+            PREVIEW_TIMEOUT + Duration::from_secs(2),
+            router.oneshot(http_request(&input(), true, Some("fixture-token"))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    type UploadChunk = Result<hyper::body::Frame<axum::body::Bytes>, std::io::Error>;
+
+    /// A real streaming HTTP body: the JSON extractor must poll it to receive
+    /// bytes. Keeping the sender open models a client that stalls mid-upload.
+    struct Upload {
+        chunks: tokio::sync::mpsc::Receiver<UploadChunk>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl hyper::body::Body for Upload {
+        type Data = axum::body::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<UploadChunk>> {
+            let upload = self.get_mut();
+            upload
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            upload.chunks.poll_recv(cx)
+        }
+    }
+
+    fn upload() -> (
+        Body,
+        tokio::sync::mpsc::Sender<UploadChunk>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (sender, chunks) = tokio::sync::mpsc::channel(1);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = Body::new(Upload {
+            chunks,
+            polls: Arc::clone(&polls),
+        });
+        (body, sender, polls)
+    }
+
+    fn upload_request(body: Body) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(ROUTE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    fn limited_router(ctx: &DaemonContext, limit: Arc<Semaphore>) -> Router {
+        router_with_limit(limit)
+            .with_state(Arc::new(ApiState {
+                ctx: ctx.clone(),
+                token: None,
+            }))
+            .merge(create_router(HttpState {
+                pool: ctx.pool.clone(),
+                version: "fixture",
+                started_at: Instant::now(),
+                pid: 1,
+            }))
+    }
+
+    async fn body_was_polled(polls: &std::sync::atomic::AtomicUsize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler never entered the streaming body");
+    }
+
+    #[tokio::test]
+    async fn saturated_ingress_is_rejected_without_polling_the_body() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let _held = limit.clone().acquire_owned().await.unwrap();
+        let (body, _sender, polls) = upload();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            limited_router(&ctx, limit).oneshot(upload_request(body)),
+        )
+        .await
+        .expect("saturated ingress waited for a body")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_upload_holds_capacity_until_cancelled_but_not_health() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let router = limited_router(&ctx, limit.clone());
+        let (body, _sender, polls) = upload();
+        let slow = tokio::spawn(router.clone().oneshot(upload_request(body)));
+        body_was_polled(&polls).await;
+        assert_eq!(limit.available_permits(), 0);
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let busy = router
+            .clone()
+            .oneshot(http_request(&input(), true, None))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+        assert_eq!(limit.available_permits(), 1);
+        let response = router
+            .oneshot(http_request(&input(), true, None))
+            .await
+            .unwrap();
+        assert!(decoded(response).await.selection.worker.is_some());
+        assert_eq!(limit.available_permits(), 1);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_upload_expires_without_entering_selection() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let (body, _sender, polls) = upload();
+        let response = tokio::time::timeout(
+            PREVIEW_TIMEOUT + Duration::from_secs(1),
+            limited_router(&ctx, limit.clone()).oneshot(upload_request(body)),
+        )
+        .await
+        .expect("body ingress escaped the request deadline")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(polls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(limit.available_permits(), 1);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn completing_a_slow_upload_does_not_renew_selection_time() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let _blocked = ctx.admission_barrier.write().await;
+        let (body, sender, polls) = upload();
+        let slow = tokio::spawn(limited_router(&ctx, limit.clone()).oneshot(upload_request(body)));
+        body_was_polled(&polls).await;
+        tokio::time::sleep(PREVIEW_TIMEOUT * 3 / 4).await;
+        sender
+            .send(Ok(hyper::body::Frame::data(
+                serde_json::to_vec(&input()).unwrap().into(),
+            )))
+            .await
+            .unwrap();
+        drop(sender);
+        let response = tokio::time::timeout(PREVIEW_TIMEOUT / 2, slow)
+            .await
+            .expect("finishing the body restarted the selection timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(limit.available_permits(), 1);
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_and_oversized_streams_release_the_ingress_permit() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, _) = fixture().await;
+        let limit = Arc::new(Semaphore::new(1));
+        let router = limited_router(&ctx, limit.clone());
+        for (bytes, status) in [
+            (b"{".to_vec(), StatusCode::BAD_REQUEST),
+            (
+                vec![b' '; MAX_REQUEST_BYTES + 1],
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let (body, sender, _) = upload();
+            sender
+                .send(Ok(hyper::body::Frame::data(bytes.into())))
+                .await
+                .unwrap();
+            drop(sender);
+            let response = router.clone().oneshot(upload_request(body)).await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(limit.available_permits(), 1);
+        }
+        assert_unowned(&ctx, 4).await;
+    }
+
+    #[tokio::test]
+    async fn authentication_still_precedes_body_ingress() {
+        let _guard = rch_common::test_guard!();
+        let (ctx, router) = fixture().await;
+        for token in [None, Some("wrong-token")] {
+            let (body, _sender, polls) = upload();
+            let mut request = upload_request(body);
+            if let Some(token) = token {
+                request
+                    .headers_mut()
+                    .insert("x-rch-token", token.parse().unwrap());
+            }
+            let response =
+                tokio::time::timeout(Duration::from_secs(1), router.clone().oneshot(request))
+                    .await
+                    .expect("unauthenticated body was read")
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        assert_unowned(&ctx, 4).await;
+    }
+}

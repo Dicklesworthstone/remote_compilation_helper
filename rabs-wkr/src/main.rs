@@ -19,6 +19,7 @@ use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
+use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
 use rabs_wkr::artifacts::{
@@ -28,12 +29,14 @@ use rabs_wkr::execution::{
     DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, OUTPUT_PREVIEW_VERSION,
     StopReason, output_preview_reply,
 };
+use rabs_wkr::host_budget::HostBudget;
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{
-    CanonicalExecRequest, execute_canonical_controlled, execute_uploaded_canonical_controlled,
-    parse_command_context, probe_capability, sample_pressure,
+    CanonicalExecRequest, ExecutionResources, execute_canonical_controlled,
+    execute_uploaded_canonical_controlled, parse_command_context, parse_dependency_context,
+    probe_capability, sample_pressure,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceOwner};
@@ -458,6 +461,84 @@ fn worker_state_path(worker: &str, coordinator: &str) -> io::Result<PathBuf> {
         .join(rabs_wkr::session::sha256_hex(binding.as_bytes())))
 }
 
+fn target_cache_limit(
+    argument: Option<&str>,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<u64, String> {
+    let (name, value) = match argument {
+        Some(value) => ("--target-cache-bytes", value),
+        None => match environment {
+            Some(value) => (
+                "RABS_WORKER_TARGET_CACHE_BYTES",
+                value
+                    .to_str()
+                    .ok_or("RABS_WORKER_TARGET_CACHE_BYTES must be ASCII decimal digits")?,
+            ),
+            None => return Ok(0),
+        },
+    };
+    if !value.is_empty()
+        && value.len() <= 10
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(bytes) = value.parse::<u64>()
+        && bytes <= rabs_wkr::target_cache::MAX_TARGET_CACHE_BYTES
+    {
+        return Ok(bytes);
+    }
+    Err(format!(
+        "{name} requires 1..10 decimal digits representing 0 to 8589934592 bytes"
+    ))
+}
+
+fn target_cache_epoch(
+    argument: Option<&str>,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<Option<String>, String> {
+    let (name, value) = match argument {
+        Some(value) => ("--target-cache-epoch", value),
+        None => match environment {
+            Some(value) => (
+                "RABS_WORKER_TARGET_CACHE_EPOCH",
+                value
+                    .to_str()
+                    .ok_or("RABS_WORKER_TARGET_CACHE_EPOCH must be ASCII")?,
+            ),
+            None => return Ok(None),
+        },
+    };
+    // An explicit empty value restores process-only retention, including when
+    // overriding a previously managed durable-cache setting during deployment.
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Ok(Some(value.to_owned()));
+    }
+    Err(format!(
+        "{name} must be empty or 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
+    ))
+}
+
+/// Drive one top-level future on the worker's owned current-thread runtime.
+///
+/// # Panics
+/// Panics if called from inside an active `asupersync` task (`Cx::current().is_some()`).
+pub(crate) fn block_on_worker_runtime<F: Future>(
+    runtime: &asupersync::runtime::Runtime,
+    future: F,
+) -> F::Output {
+    assert!(
+        Cx::current().is_none(),
+        "nested runtime entry is forbidden inside an active asupersync task"
+    );
+    runtime.block_on(future)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -468,10 +549,15 @@ fn main() {
         Some("--help") => {
             println!(
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
-                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]\n\
+                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Reconnects with bounded backoff after session loss; execution is never replayed.\n\
                  --once performs one session only, without reconnecting.\n\
+                 --target-cache-bytes or RABS_WORKER_TARGET_CACHE_BYTES enables bounded private Cargo seeds (default 0/off).\n\
+                 --target-cache-epoch or RABS_WORKER_TARGET_CACHE_EPOCH also retains seeds across restarts.\n\
+                 Change the epoch before updating host tools, libraries or other runtime inputs.\n\
+                 Without an epoch, seeds are process-only. CLI values override environment settings.\n\
+                 Compatible inputs may reuse local target state; Cargo still executes every time.\n\
                  Select output_transfer=ranges-v1 and artifact_transfer=files-v1 in session-ok\n\
                  to retrieve diagnostics and declared compiled artifacts.\n\
                  Select source_transfer=source-files-v1 to upload verified source before execution.\n\
@@ -481,6 +567,8 @@ fn main() {
                  Fleet transport requires RABS_WORKER_TLS_CA, RABS_WORKER_TLS_CERT,\n\
                  RABS_WORKER_TLS_KEY and RABS_WORKER_TLS_SERVER_NAME.\n\
                  Request IDs must increase across restarts; request-status reconciles outcomes.\n\
+                 Optional shared-host admission: set RABS_WORKER_HOST_BUDGET_DIR and\n\
+                 RABS_WORKER_HOST_SLOTS together on every worker in one local capacity domain.\n\
                  RABS_WORKER_STATE_DIR selects a private durable directory (never reset it to retry work)."
             );
             return;
@@ -498,6 +586,8 @@ fn main() {
             .unwrap_or_else(|| "worker".to_string())
     });
     let mut once = false;
+    let mut target_cache_argument = None;
+    let mut target_epoch_argument = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -508,6 +598,17 @@ fn main() {
                 }
             }
             "--once" => once = true,
+            "--target-cache-bytes" | "--target-cache-epoch" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("rabs-wkr: {arg} requires a value");
+                    std::process::exit(2);
+                };
+                if arg == "--target-cache-bytes" {
+                    target_cache_argument = Some(value.as_str());
+                } else {
+                    target_epoch_argument = Some(value.as_str());
+                }
+            }
             other => {
                 eprintln!("rabs-wkr: unknown argument {other:?} (see --help)");
                 std::process::exit(2);
@@ -517,6 +618,33 @@ fn main() {
     let Some(coordinator) = coordinator else {
         eprintln!("rabs-wkr: --coordinator <host:port> is required");
         std::process::exit(2);
+    };
+    let target_cache_bytes = match target_cache_limit(
+        target_cache_argument,
+        std::env::var_os("RABS_WORKER_TARGET_CACHE_BYTES").as_deref(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("rabs-wkr: {error}");
+            std::process::exit(2);
+        }
+    };
+    let target_epoch = match target_cache_epoch(
+        target_epoch_argument,
+        std::env::var_os("RABS_WORKER_TARGET_CACHE_EPOCH").as_deref(),
+    ) {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            eprintln!("rabs-wkr: {error}");
+            std::process::exit(2);
+        }
+    };
+    let host_budget = match HostBudget::from_environment() {
+        Ok(budget) => budget,
+        Err(error) => {
+            eprintln!("rabs-wkr: shared host budget configuration: {error}");
+            std::process::exit(1);
+        }
     };
     // Persist ownership before any runtime task or network advertisement. An IO
     // error never falls back to a fresh temporary journal that forgets history.
@@ -529,14 +657,49 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let target_cache = if target_cache_bytes == 0 {
+        None
+    } else {
+        let cache = match target_epoch.as_deref() {
+            Some(epoch) => rabs_wkr::target_cache::TargetCache::open_persistent(
+                target_cache_bytes,
+                &journal.storage_root().join("target-cache"),
+                epoch,
+            ),
+            None => rabs_wkr::target_cache::TargetCache::new(target_cache_bytes),
+        };
+        match cache {
+            Ok(cache) => Some(std::sync::Arc::new(cache)),
+            Err(error) => {
+                eprintln!("rabs-wkr: target state configuration: {error}");
+                std::process::exit(1);
+            }
+        }
+    };
     let report = probe_capability(&worker_id);
     eprintln!(
-        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{}}}",
+        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"dependency_execution_modes\":{}}}",
         json_string(&report.worker_id),
         report.canonical_namespace,
-        report.slots
+        report.slots,
+        serde_json::json!(
+            report
+                .dependency_modes
+                .iter()
+                .map(|mode| mode.as_str())
+                .collect::<Vec<_>>()
+        ),
     );
-    std::process::exit(reconnect::run(coordinator, report, once, journal));
+    std::process::exit(reconnect::run(
+        coordinator,
+        report,
+        once,
+        journal,
+        reconnect::RuntimeResources {
+            host_budget,
+            target_cache,
+        },
+    ));
 }
 
 /// Partial input belongs to the session, not to a disposable read future.
@@ -1018,6 +1181,7 @@ where
         output_preview_enabled,
         execution_lease,
         false,
+        None,
         |request, timeout, artifacts, source, toolchain, lease| {
             assert!(
                 toolchain.is_none(),
@@ -1045,6 +1209,7 @@ async fn drive_session_with_inputs<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
+    dependency_mode: Option<DependencyExecutionMode>,
     launch: L,
     heartbeat: H,
 ) -> Result<(), String>
@@ -1071,6 +1236,7 @@ where
         output_preview_enabled,
         execution_lease,
         toolchain_reuse_enabled,
+        dependency_mode,
         InputBudgets::default(),
         launch,
         heartbeat,
@@ -1090,6 +1256,7 @@ async fn drive_session_with_input_budgets<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
+    dependency_mode: Option<DependencyExecutionMode>,
     input_budgets: InputBudgets,
     mut launch: L,
     mut heartbeat: H,
@@ -1108,6 +1275,17 @@ where
 {
     if toolchain_reuse_enabled && !toolchain_transfer_enabled {
         return Err("toolchain reuse requires toolchain transfer".to_owned());
+    }
+    if dependency_mode.is_some()
+        && !(source_transfer_enabled && toolchain_transfer_enabled && artifact_transfer_enabled)
+    {
+        return Err(
+            "dependency execution requires negotiated source, toolchain and artifact transfer"
+                .to_owned(),
+        );
+    }
+    if dependency_mode.is_some_and(|mode| !report.dependency_modes.contains(&mode)) {
+        return Err("dependency execution mode unavailable".to_owned());
     }
     let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
@@ -1260,8 +1438,12 @@ where
                                 }
                                 let id = request_id.ok_or("resume requires request_id")?;
                                 let original = value.get("request").ok_or("resume requires original request")?;
+                                // Recovery is version-neutral: the journal verifies
+                                // the full original fingerprint and recipient before
+                                // exposing retained bytes. A newer execution decoder
+                                // must not strand a valid result from an older context.
                                 if original["kind"] != "canonical-exec"
-                                    || parse_exec_request(original)?.request_id != id
+                                    || original["request_id"].as_u64() != Some(id)
                                 {
                                     return Err("resume request identity mismatch".to_owned());
                                 }
@@ -1349,7 +1531,11 @@ where
                             }
                         }
                         Some("canonical-exec") => {
-                            let parsed = parse_exec_request(&value).and_then(|mut request| {
+                            let parsed = (|| {
+                                let request = parse_exec_request(&value)?;
+                                validate_execution_selection(&request, report, dependency_mode)?;
+                                Ok(request)
+                            })().and_then(|mut request| {
                                 // A different request or a worker-local execute
                                 // cannot orphan the staged owner and its clock.
                                 input_deadline.execution_request(&value, toolchain_transfer_enabled)?;
@@ -1361,6 +1547,9 @@ where
                                 let artifacts = artifacts::parse_plan(&value)?;
                                 if artifacts.is_some() && !artifact_transfer_enabled {
                                     return Err("artifact transfer not negotiated".to_owned());
+                                }
+                                if request.dependency_context.is_some() && artifacts.is_none() {
+                                    return Err("dependency execution requires declared artifacts".to_owned());
                                 }
                                 if let Some(path) = source_transfer.prepared_path(&value, source_transfer_enabled)? {
                                     request.workspace_backing = path;
@@ -1482,6 +1671,9 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
+        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION],
+        "dependency_execution_modes": report.dependency_modes.iter()
+            .map(|mode| mode.as_str()).collect::<Vec<_>>(),
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
         "recovery_protocols": [RECOVERY_PROTOCOL],
         "result_retentions": [RESULT_RETENTION],
@@ -1501,6 +1693,7 @@ async fn session_loop(
     once: bool,
     journal: &mut WorkerJournal,
     admitted_at: &mut Option<std::time::Instant>,
+    resources: reconnect::RuntimeResources,
 ) -> Result<(), String> {
     let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
     cx.trace("rabs-wkr connected to coordinator");
@@ -1515,6 +1708,8 @@ async fn session_loop(
             ResultRecipient::LoopbackFixture
         }
     };
+    let target_scope =
+        rabs_wkr::target_cache::TargetCacheScope::new(&report.worker_id, coordinator, &recipient);
     let (
         capture_output,
         capture_artifacts,
@@ -1524,6 +1719,7 @@ async fn session_loop(
         reuse_toolchain,
         output_preview,
         execution_lease,
+        dependency_context,
     ) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
@@ -1621,6 +1817,15 @@ async fn session_loop(
             let reuse =
                 toolchain_transfer::selected_reuse(&ack, local_identity.is_some(), toolchain)?;
             let preview = output_preview_requested(&ack)?;
+            let dependency_context = dependency_context_selection(
+                &ack,
+                &report.dependency_modes,
+                local_identity.is_some(),
+                output,
+                artifacts,
+                source,
+                toolchain,
+            )?;
             let lease = execution_lease_selection(
                 &ack,
                 local_identity.is_some(),
@@ -1631,7 +1836,15 @@ async fn session_loop(
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
             Ok::<_, String>((
-                output, artifacts, retain, source, toolchain, reuse, preview, lease,
+                output,
+                artifacts,
+                retain,
+                source,
+                toolchain,
+                reuse,
+                preview,
+                lease,
+                dependency_context,
             ))
         },
     )
@@ -1660,11 +1873,14 @@ async fn session_loop(
         output_preview,
         &execution_lease,
         reuse_toolchain,
+        dependency_context,
         |request, timeout, artifacts, source, toolchain, lease| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
             let spills = spills.clone();
             let slots = report.slots;
+            let host_budget = resources.host_budget.clone();
+            let target_cache = resources.target_cache.clone();
             let id = request.request_id;
             let retention = retain_result
                 .then(|| RetentionTarget::from_admitted(&journal_root, id, recipient.clone()))
@@ -1676,12 +1892,17 @@ async fn session_loop(
                     control.request_output_capture();
                 }
                 let _toolchain_owner = toolchain;
+                let resources = ExecutionResources {
+                    slots,
+                    host_budget: host_budget.as_deref(),
+                    target_cache: target_cache.as_ref().map(|cache| (cache, target_scope)),
+                };
                 match source.as_ref() {
                     Some(source) => execute_uploaded_canonical_controlled(
                         &request,
                         &cargo_home,
                         &home,
-                        slots,
+                        resources,
                         &spills,
                         &control,
                         source,
@@ -1690,7 +1911,7 @@ async fn session_loop(
                         &request,
                         &cargo_home,
                         &home,
-                        slots,
+                        resources,
                         &spills,
                         &control,
                     ),
@@ -1764,6 +1985,73 @@ fn result_retention_requested(frame: &str) -> Result<bool, String> {
     }
 }
 
+/// This extension can only run with authenticated input and complete result
+/// transfer. Selection is explicit: a malformed or unknown grant cannot be
+/// ignored and an old peer cannot silently execute different path semantics.
+fn dependency_context_selection(
+    frame: &str,
+    supported: &[DependencyExecutionMode],
+    authenticated: bool,
+    output: bool,
+    artifacts: bool,
+    source: bool,
+    toolchain: bool,
+) -> Result<Option<DependencyExecutionMode>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(frame).map_err(|error| error.to_string())?;
+    match value.get("dependency_context") {
+        None if value.get("dependency_execution_mode").is_none() => Ok(None),
+        None => Err("dependency execution mode requires a versioned context".to_owned()),
+        Some(selected) if selected.as_str() == Some(DEPENDENCY_CONTEXT_VERSION) => {
+            let mode = match value
+                .get("dependency_execution_mode")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("metadata") => DependencyExecutionMode::Metadata,
+                Some("rlib") => DependencyExecutionMode::Rlib,
+                _ => return Err("unsupported dependency_execution_mode selection".to_owned()),
+            };
+            if !supported.contains(&mode) {
+                return Err("dependency execution mode unavailable".to_owned());
+            }
+            if !(authenticated && output && artifacts && source && toolchain) {
+                return Err(
+                    "dependency context requires authenticated input and complete result transfer"
+                        .to_owned(),
+                );
+            }
+            Ok(Some(mode))
+        }
+        Some(_) => Err("unsupported dependency_context selection".to_owned()),
+    }
+}
+
+/// Bind every new execution to its selected and measured namespace before
+/// durable admission. A recovery session may retrieve sealed results without
+/// selecting any execution profile; it cannot use that to launch a command.
+fn validate_execution_selection(
+    request: &CanonicalExecRequest,
+    report: &rabs_wkr::session::CapabilityReport,
+    selected: Option<DependencyExecutionMode>,
+) -> Result<(), String> {
+    match (request.dependency_context.as_ref(), selected) {
+        (Some(context), Some(mode))
+            if context.execution_mode() == mode && report.dependency_modes.contains(&mode) =>
+        {
+            Ok(())
+        }
+        (Some(_), None) => Err("dependency context not negotiated".to_owned()),
+        (Some(_), Some(_)) => {
+            Err("dependency execution mode does not match negotiation".to_owned())
+        }
+        (None, Some(_)) => {
+            Err("dependency session requires its negotiated execution context".to_owned())
+        }
+        (None, None) if report.canonical_namespace => Ok(()),
+        (None, None) => Err("canonical namespace unavailable".to_owned()),
+    }
+}
+
 fn parse_timeout(value: &serde_json::Value) -> Result<Duration, String> {
     match value.get("timeout_ms") {
         None => Ok(DEFAULT_EXECUTION_TIMEOUT),
@@ -1816,34 +2104,60 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
             .unwrap_or(u32::MAX),
         ),
     };
+    let dependency_context = parse_dependency_context(value)?;
+    let program = text("program")?;
+    let source_manifest = source_transfer::request_manifest(value)?;
+    let transferred_toolchain = toolchain_transfer::request_identity(value)?;
+    let toolchain_identity = rabs_wkr::session::parse_toolchain_identity(value)?;
+    if let Some(context) = &dependency_context
+        && (program != context.compiler()
+            || source_manifest.is_none()
+            || transferred_toolchain.is_none()
+            || toolchain_identity.is_none()
+            || value.get("cargo_home").is_some())
+    {
+        return Err(
+            "dependency execution requires its exact compiler and plain transferred inputs"
+                .to_owned(),
+        );
+    }
     // A source-bearing request has no worker path on the wire. Only the live
     // admission path can fill this slot from the exact sealed source owner.
-    let workspace_backing = if source_transfer::request_manifest(value)?.is_some() {
+    let workspace_backing = if source_manifest.is_some() {
         String::new()
     } else {
         text("workspace_backing")?
     };
-    let toolchain_backing = if toolchain_transfer::request_identity(value)?.is_some() {
+    let toolchain_backing = if transferred_toolchain.is_some() {
         String::new()
     } else {
         text("toolchain_backing")?
     };
-    Ok(CanonicalExecRequest {
+    let request = CanonicalExecRequest {
         request_id: value
             .get("request_id")
             .and_then(serde_json::Value::as_u64)
             .ok_or("exec request missing request_id")?,
-        program: text("program")?,
+        program,
         args,
         toolchain_backing,
-        toolchain_identity: rabs_wkr::session::parse_toolchain_identity(value)?,
+        toolchain_identity,
         workspace_backing,
         jobserver_grant,
         command_context: parse_command_context(value)?,
-    })
+        dependency_context,
+    };
+    if request.dependency_context.is_some() {
+        rabs_wkr::session::validate_dependency_execution(
+            &request,
+            artifacts::parse_plan(value)?.as_ref(),
+        )?;
+    }
+    Ok(request)
 }
 
 #[cfg(test)]
+#[path = "tests"]
 mod tests {
     use super::*;
     use asupersync::io::ReadBuf;
@@ -1854,8 +2168,99 @@ mod tests {
     use std::task::{Context, Wake, Waker};
     use std::time::Instant;
 
+    #[path = "../main/tests/dependency_tests.rs"]
+    mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;
+
+    #[test]
+    fn target_cache_settings_default_to_off_and_cli_overrides_environment() {
+        use std::ffi::OsStr;
+
+        assert_eq!(target_cache_limit(None, None).unwrap(), 0);
+        assert_eq!(target_cache_epoch(None, None).unwrap(), None);
+        assert_eq!(
+            target_cache_limit(None, Some(OsStr::new("1073741824"))).unwrap(),
+            1 << 30
+        );
+        assert_eq!(
+            target_cache_limit(Some("0"), Some(OsStr::new("invalid"))).unwrap(),
+            0
+        );
+        assert_eq!(
+            target_cache_limit(Some("8589934592"), None).unwrap(),
+            rabs_wkr::target_cache::MAX_TARGET_CACHE_BYTES
+        );
+        assert_eq!(
+            target_cache_epoch(None, Some(OsStr::new("image-2026.01_v2"))).unwrap(),
+            Some("image-2026.01_v2".to_owned())
+        );
+        assert_eq!(
+            target_cache_epoch(Some("image-v3"), Some(OsStr::new("old/image"))).unwrap(),
+            Some("image-v3".to_owned())
+        );
+        assert_eq!(
+            target_cache_epoch(Some(""), Some(OsStr::new("image-v3"))).unwrap(),
+            None
+        );
+        assert_eq!(
+            target_cache_epoch(None, Some(OsStr::new(""))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn target_cache_settings_refuse_unbounded_or_ambiguous_values() {
+        use std::ffi::OsStr;
+
+        for value in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1\n",
+            "1.5",
+            "0x100",
+            "8589934593",
+            "00000000000",
+        ] {
+            assert!(target_cache_limit(Some(value), None).is_err(), "{value:?}");
+            assert!(
+                target_cache_limit(None, Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "../image",
+            ".image",
+            "image/path",
+            "a b",
+            "v\n2",
+            "v$HOST",
+            "é",
+        ] {
+            assert!(target_cache_epoch(Some(value), None).is_err(), "{value:?}");
+            assert!(
+                target_cache_epoch(None, Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+        assert!(target_cache_epoch(Some(&"a".repeat(128)), None).is_ok());
+        assert!(target_cache_epoch(Some(&"a".repeat(129)), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_cache_settings_refuse_non_utf8_unless_overridden() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = std::ffi::OsStr::from_bytes(&[0xff]);
+        assert!(target_cache_limit(None, Some(invalid)).is_err());
+        assert!(target_cache_epoch(None, Some(invalid)).is_err());
+        assert_eq!(target_cache_limit(Some("0"), Some(invalid)).unwrap(), 0);
+        assert_eq!(target_cache_epoch(Some(""), Some(invalid)).unwrap(), None);
+    }
 
     #[derive(Default)]
     struct WireState {
@@ -1972,6 +2377,7 @@ mod tests {
         rabs_wkr::session::CapabilityReport {
             worker_id: "session-test".to_owned(),
             canonical_namespace: true,
+            dependency_modes: vec![],
             missing: vec![],
             slots: 4,
         }
@@ -2297,7 +2703,9 @@ mod tests {
             workspace_backing,
             jobserver_grant,
             command_context,
+            dependency_context,
         } = parse_exec_request(&frame).expect("parses");
+        assert!(dependency_context.is_none());
         assert_eq!(toolchain_identity, None);
         assert_eq!(request_id, 1);
         assert_eq!(program, "true");
@@ -2327,10 +2735,18 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn private_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
     #[test]
     fn invalid_command_context_is_refused_before_durable_admission() {
         use serde_json::{Value, json};
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -2374,7 +2790,7 @@ mod tests {
     #[test]
     fn admitted_context_reaches_execution_and_fences_changed_context_after_restart() {
         use serde_json::json;
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut original = request(170);
         original["command_context"] = json!({"version":"env-cwd-v1",
             "cwd":"/__rabs/workspace/member","env":{"LABEL":"exact\n雪","EMPTY":""}});
@@ -2811,7 +3227,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_result_write_failure_reconciles_without_duplicate_execution() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         wire.frame(request(40));
@@ -2870,7 +3286,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_disconnect_records_only_after_session_owned_cleanup() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         wire.frame(request(50));
@@ -2911,7 +3327,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_unfinished_admission_blocks_replay_and_new_work() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         journal
             .admit(&request(60), DEFAULT_EXECUTION_TIMEOUT)
@@ -2944,7 +3360,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_launch_failure_does_not_authorize_another_attempt() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -2973,7 +3389,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journal_handshake_advertises_identity_and_recovery_version() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         journal
             .admit(&request(80), DEFAULT_EXECUTION_TIMEOUT)
@@ -3020,7 +3436,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unnegotiated_artifact_request_does_not_burn_durable_admission() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -3048,7 +3464,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn durable_artifact_identity_survives_restart_without_claiming_scratch_recovery() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -3143,7 +3559,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retained_result_is_durable_before_failed_delivery_and_blocks_new_work() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         wire.frame(artifact_request(110));
@@ -3204,7 +3620,7 @@ mod tests {
     #[test]
     fn retained_spool_is_released_only_after_both_identity_bound_acks() {
         for artifacts_first in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = private_root();
             let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
             let mut wire = Wire::default();
             let peer = wire.clone();
@@ -3312,7 +3728,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restarted_session_resumes_exact_binary_ranges_without_launching_any_process() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         leave_retained_result(root.path(), 130);
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
@@ -3359,7 +3775,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resume_requires_negotiation_exact_original_request_and_original_tls_recipient() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         leave_retained_result(root.path(), 140);
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         for recipient in [
@@ -3429,7 +3845,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn disconnect_after_one_ack_retains_both_streams_for_a_second_restart() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         leave_retained_result(root.path(), 150);
         let mut original_offer = None;
         for _ in 0..2 {

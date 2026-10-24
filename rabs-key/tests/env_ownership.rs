@@ -8,6 +8,7 @@
 //! the environment component digest and NOTHING else — there is no
 //! second hash an env fact could inconsistently reach.
 
+use rabs_key::action_key::negative_dependency_set_digest;
 use rabs_key::environment::{EnvDisposition, PresentedEnvironment};
 use rabs_protocol::input_evidence::{NegativeDependency, NegativeDependencySet};
 use rabs_protocol::raw_bytes::RawBytes;
@@ -32,6 +33,7 @@ fn absence_mutations_route_through_the_env_component_only() {
         }],
     };
     let negdep_before = negdep_fingerprint(&negdeps);
+    let negdep_digest_before = negative_dependency_set_digest(&negdeps).unwrap();
 
     // …and an environment WITH a scrub record.
     let with_scrub = PresentedEnvironment {
@@ -63,6 +65,10 @@ fn absence_mutations_route_through_the_env_component_only() {
     // the mutation had no operation on it, and no NegativeDependency
     // variant could have carried the env fact anyway.
     assert_eq!(negdep_fingerprint(&negdeps), negdep_before);
+    assert_eq!(
+        negative_dependency_set_digest(&negdeps).unwrap(),
+        negdep_digest_before
+    );
 }
 
 #[test]

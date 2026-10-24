@@ -35,7 +35,8 @@ const CRITICAL_MEMORY_PRESSURE: f64 = 92.0;
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct WorkerCapacitySnapshot {
     pub(super) id: WorkerId,
-    /// Eligible to receive a build right now (status healthy, circuit not open).
+    /// A normal retry candidate (healthy/degraded, no open circuit or bypass).
+    /// This is not a reservation: the daemon must recheck current admission.
     pub(super) healthy: bool,
     /// Daemon flagged this worker's storage/memory pressure as critical — a hard
     /// exclusion (it is exactly the kind of small/stressed worker an OOM retry
@@ -54,8 +55,15 @@ pub(super) struct WorkerCapacitySnapshot {
 
 impl WorkerCapacitySnapshot {
     fn from_status(worker: &WorkerStatusFromApi) -> Self {
-        let healthy = worker.status.eq_ignore_ascii_case("healthy")
-            && !worker.circuit_state.eq_ignore_ascii_case("open");
+        // Degraded workers remain schedulable in the daemon's lifecycle.
+        // Excluding them here can exhaust remote retries even while the daemon
+        // could admit the build, sending it back to the protected dispatcher.
+        // Do not broaden this to "anything not unreachable": admin-disabled,
+        // draining and pending-canary workers must remain out of normal retry.
+        let healthy = (worker.status.eq_ignore_ascii_case("healthy")
+            || worker.status.eq_ignore_ascii_case("degraded"))
+            && !worker.circuit_state.eq_ignore_ascii_case("open")
+            && worker.bypass.is_none();
         let pressure_critical = worker
             .pressure_state
             .as_deref()
@@ -129,13 +137,16 @@ fn capacity_order(a: &WorkerCapacitySnapshot, b: &WorkerCapacitySnapshot) -> Ord
 /// most capacity / RAM headroom (see [`capacity_order`]).
 ///
 /// Filtering:
-/// * only `healthy` workers whose pressure is not `critical`,
+/// * only healthy/degraded workers without an active bypass or open circuit,
+/// * positive total capacity and non-critical pressure,
 /// * never a worker already in `tried`,
 /// * when `allowed` is non-empty (an explicit `RCH_WORKER(S)` pin), the
 ///   candidate must be within it — a retry must never escape the operator's pin.
 ///
 /// Ties break on ascending worker id for determinism. Returns `None` when no
 /// eligible untried worker remains (retries are exhausted).
+/// A busy candidate is retained: this snapshot may precede a completion, and
+/// the daemon's preferred-worker re-query owns the current slot decision.
 pub(super) fn pick_bigger_worker(
     snapshots: &[WorkerCapacitySnapshot],
     tried: &[WorkerId],
@@ -143,7 +154,7 @@ pub(super) fn pick_bigger_worker(
 ) -> Option<WorkerId> {
     let mut best: Option<&WorkerCapacitySnapshot> = None;
     for candidate in snapshots {
-        if !candidate.healthy || candidate.pressure_critical {
+        if !candidate.healthy || candidate.pressure_critical || candidate.total_slots == 0 {
             continue;
         }
         if tried.iter().any(|id| id == &candidate.id) {
@@ -174,6 +185,142 @@ pub(super) fn pick_bigger_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api_worker(id: &str, status: &str) -> WorkerStatusFromApi {
+        // Exercise the real wire-to-snapshot boundary, not a hand-built
+        // `healthy` flag that would miss the degraded-worker regression.
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "host": "worker.invalid",
+            "user": "builder",
+            "status": status,
+            "circuit_state": "closed",
+            "used_slots": 0,
+            "total_slots": 32,
+            "speed_score": 50.0,
+            "last_error": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn degraded_worker_remains_a_remote_retry_after_the_healthy_worker_failed() {
+        let snapshots: Vec<_> = [
+            api_worker("failed", "healthy"),
+            api_worker("remaining", "degraded"),
+        ]
+        .iter()
+        .map(WorkerCapacitySnapshot::from_status)
+        .collect();
+        assert_eq!(
+            pick_bigger_worker(&snapshots, &[WorkerId::new("failed")], &[]),
+            Some(WorkerId::new("remaining"))
+        );
+    }
+
+    #[test]
+    fn retry_status_whitelist_preserves_admin_and_canary_boundaries() {
+        for status in ["healthy", "degraded", "HEALTHY", "DeGrAdEd"] {
+            let worker = api_worker("candidate", status);
+            let snapshot = WorkerCapacitySnapshot::from_status(&worker);
+            assert_eq!(
+                pick_bigger_worker(&[snapshot], &[], &[]),
+                Some(WorkerId::new("candidate")),
+                "{status}"
+            );
+        }
+        for status in [
+            "disabled",
+            "draining",
+            "drained",
+            "unreachable",
+            "temporary_bypass",
+            "recovered_pending_canary",
+            "unknown",
+            "",
+        ] {
+            let snapshot = WorkerCapacitySnapshot::from_status(&api_worker("candidate", status));
+            assert_eq!(pick_bigger_worker(&[snapshot], &[], &[]), None, "{status}");
+        }
+    }
+
+    #[test]
+    fn degraded_workers_do_not_bypass_circuits_pressure_pins_or_retry_history() {
+        let mut worker = api_worker("candidate", "degraded");
+        let snapshot = WorkerCapacitySnapshot::from_status(&worker);
+        assert_eq!(
+            pick_bigger_worker(
+                std::slice::from_ref(&snapshot),
+                &[],
+                &[WorkerId::new("candidate")]
+            ),
+            Some(WorkerId::new("candidate"))
+        );
+        assert_eq!(
+            pick_bigger_worker(
+                std::slice::from_ref(&snapshot),
+                &[],
+                &[WorkerId::new("other")]
+            ),
+            None
+        );
+        assert_eq!(
+            pick_bigger_worker(&[snapshot], &[WorkerId::new("candidate")], &[]),
+            None
+        );
+        for circuit in ["open", "OPEN"] {
+            worker.circuit_state = circuit.into();
+            let snapshot = WorkerCapacitySnapshot::from_status(&worker);
+            assert_eq!(pick_bigger_worker(&[snapshot], &[], &[]), None);
+        }
+        worker.circuit_state = "closed".into();
+        for pressure in ["critical", "CRITICAL"] {
+            worker.pressure_state = Some(pressure.into());
+            let snapshot = WorkerCapacitySnapshot::from_status(&worker);
+            assert_eq!(pick_bigger_worker(&[snapshot], &[], &[]), None);
+        }
+    }
+
+    #[test]
+    fn an_active_bypass_record_vetoes_an_otherwise_eligible_status() {
+        for status in ["healthy", "degraded"] {
+            let mut worker = api_worker("candidate", status);
+            let mut bypass = rch_common::BypassRecord::new(
+                "candidate",
+                "worker.invalid",
+                "builder",
+                rch_common::BypassFailureClass::DiskInodePressure,
+                1,
+            );
+            for state in [
+                rch_common::BypassState::TemporaryBypass,
+                rch_common::BypassState::RecoveredPendingCanary,
+            ] {
+                bypass.state = state;
+                worker.bypass = Some(bypass.clone());
+                let snapshot = WorkerCapacitySnapshot::from_status(&worker);
+                assert_eq!(pick_bigger_worker(&[snapshot], &[], &[]), None);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_capacity_is_excluded_but_busy_workers_can_be_rechecked_by_the_daemon() {
+        let mut worker = api_worker("candidate", "degraded");
+        worker.total_slots = 0;
+        let snapshot = WorkerCapacitySnapshot::from_status(&worker);
+        assert_eq!(pick_bigger_worker(&[snapshot], &[], &[]), None);
+        worker.total_slots = 32;
+        for used in [32, 40] {
+            worker.used_slots = used;
+            let snapshot = WorkerCapacitySnapshot::from_status(&worker);
+            assert_eq!(snapshot.free_slots, 0);
+            assert_eq!(
+                pick_bigger_worker(&[snapshot], &[], &[]),
+                Some(WorkerId::new("candidate"))
+            );
+        }
+    }
 
     fn snap(
         id: &str,

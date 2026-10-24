@@ -13,6 +13,8 @@
 //!   not repeated observations or invented worker identities;
 //! - failed observations remain a safety veto, even when unattributed or
 //!   outnumbered by enough passing attempts to meet the rate threshold;
+//! - descriptor-bound live dependency classes stop serving when any member
+//!   has adverse evidence, including interrupted divergence quarantine;
 //! - rates are validated basis points and zero evidence always refuses,
 //!   including when the configured minimum is zero;
 //! - eligible keys are sampled deterministically from their action-key
@@ -29,6 +31,9 @@
 //! An interrupted demotion remains blocked by the durable serving gate.
 //!
 //! State-machine refusals reuse [`RevalidationError`] verbatim.
+
+mod class_quarantine;
+mod sprt_ladder;
 
 use sha2::{Digest, Sha256};
 
@@ -128,6 +133,27 @@ pub enum PrivateExecutionReason {
         /// Failed observations, including unknown and foreign attempts.
         observed: u64,
     },
+    /// Another member of the descriptor-bound live class has negative evidence.
+    /// This is a read-only safety hold, not a new per-action quarantine or a
+    /// claim that the requested action itself produced divergent bytes.
+    ClassSafetyHold {
+        /// Class recorded by coordinator submission, never a wire risk flag.
+        class: String,
+        /// Member whose durable negative evidence prevents class-wide replay.
+        culprit_action_key: String,
+        /// Stable category of the blocking evidence, not an untrusted detail.
+        reason: &'static str,
+    },
+    /// The opt-in class verification ladder requires another actual execution.
+    /// This is readiness for verification, not evidence of a divergence.
+    ClassVerificationRequired {
+        /// Descriptor-bound class accumulating independent comparisons.
+        class: String,
+        /// Conservatively credited, distinct admitted comparisons.
+        credited_comparisons: u64,
+        /// Minimum verification share: 10000, 2500, 500, or 100 basis points.
+        verification_basis_points: u32,
+    },
     /// Eligible, but this key's deterministic share says run privately.
     NotSampledThisEpoch {
         /// The key's bucket in basis points (stable per key).
@@ -159,8 +185,11 @@ pub fn key_bucket_basis_points(action: &TypedDigest) -> u32 {
 }
 
 /// Decide whether ONE action is eligible for sampled cache serving or
-/// must execute privately. Checks run strictest-first; this never writes
-/// metadata or repairs a quarantine.
+/// must execute privately. Checks run strictest-first and never repair a
+/// quarantine. By default this is read-only. RABS_SPRT_SAMPLING=1 opts the
+/// descriptor-bound live class into additional verification floors; it folds
+/// a bounded journal page and records promotion evidence before reuse.
+/// Callers must hold their existing CAS lock through admission and delivery.
 ///
 /// # Errors
 /// [`StoreError`] from reading publication, serving, or evidence state.
@@ -169,6 +198,35 @@ pub fn serving_sample_decision(
     action: &TypedDigest,
     risk: ActionClassRisk,
     policy: &SamplingPolicy,
+) -> Result<SampleGateDecision, StoreError> {
+    decide(store, action, risk, policy, sprt_ladder::enabled())
+}
+
+/// Existing durable class-wide negative-evidence veto without replay cadence.
+///
+/// A coordinator installing the freshly executed current producer still must
+/// reject a class with adverse evidence. This reads the same class receipts,
+/// incidents and quarantine rows used by serving_sample_decision, without
+/// requiring positive verification samples or spending cache-replay allowance.
+/// It does not check current authority, release authorization, the requested
+/// action's own serving state, artifact closure or destination ownership; those
+/// remain required under the caller's installation lock.
+///
+/// # Errors
+/// Store errors or malformed class/evidence rows refuse the installation.
+pub fn class_safety_refusal(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+) -> Result<Option<PrivateExecutionReason>, StoreError> {
+    class_quarantine::refusal(store, &digest_key(action))
+}
+
+fn decide(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    risk: ActionClassRisk,
+    policy: &SamplingPolicy,
+    use_sprt: bool,
 ) -> Result<SampleGateDecision, StoreError> {
     if risk == ActionClassRisk::Elevated {
         return Ok(SampleGateDecision::ExecutePrivately(
@@ -239,6 +297,12 @@ pub fn serving_sample_decision(
             },
         ));
     }
+    // The live coordinator holds the same CAS mutex through this check and
+    // installation. Check the durable class again for BOTH preview and install;
+    // a previous healthy preview is never an authorization token.
+    if let Some(reason) = class_safety_refusal(store, action)? {
+        return Ok(SampleGateDecision::ExecutePrivately(reason));
+    }
     let bucket = key_bucket_basis_points(action);
     if bucket >= policy.sample_rate_basis_points {
         return Ok(SampleGateDecision::ExecutePrivately(
@@ -246,6 +310,9 @@ pub fn serving_sample_decision(
                 key_bucket_basis_points: bucket,
             },
         ));
+    }
+    if use_sprt && let Some(reason) = sprt_ladder::refusal(store, &action_key)? {
+        return Ok(SampleGateDecision::ExecutePrivately(reason));
     }
     Ok(SampleGateDecision::ServeFromCache)
 }
@@ -373,12 +440,12 @@ mod tests {
 
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn fresh_path(tag: &str) -> std::path::PathBuf {
+    pub(super) fn fresh_path(tag: &str) -> std::path::PathBuf {
         let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("rabs-k008-{tag}-{}-{n}.db", std::process::id()))
     }
 
-    fn digest(domain: &'static str, tag: u8) -> TypedDigest {
+    pub(super) fn digest(domain: &'static str, tag: u8) -> TypedDigest {
         TypedDigest {
             algorithm: DigestAlgorithm::Sha256V1,
             domain,
@@ -386,7 +453,7 @@ mod tests {
         }
     }
 
-    fn action(tag: u8) -> TypedDigest {
+    pub(super) fn action(tag: u8) -> TypedDigest {
         digest("rabs.action-key.sha256.v1", tag)
     }
 
@@ -403,7 +470,11 @@ mod tests {
     /// Publish action `tag` at generation `generation` and return its
     /// canonical key string. Generations must strictly increase (the
     /// store enforces a high-water mark).
-    fn published(store: &mut dyn RabsMetadataStore, tag: u8, generation: u128) -> String {
+    pub(super) fn published(
+        store: &mut dyn RabsMetadataStore,
+        tag: u8,
+        generation: u128,
+    ) -> String {
         let active = digest("rabs.authority.sha256.v1", 1);
         store.acquire_authority(&authority_row(1)).unwrap();
         let entry = ActionEntryRow {
@@ -440,7 +511,7 @@ mod tests {
 
     /// Append independent attempts, never overwrite earlier failed
     /// samples to manufacture a healthy pass rate.
-    fn samples(
+    pub(super) fn samples(
         store: &mut dyn RabsMetadataStore,
         tag: u8,
         generation: u128,

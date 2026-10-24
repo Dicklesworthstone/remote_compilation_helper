@@ -16,7 +16,7 @@ use crate::metrics::{
     latency::{DecisionTimer, DecisionType},
 };
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use rand::RngExt;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, CompilationKind, RequiredRuntime,
@@ -673,15 +673,53 @@ impl WorkerSelector {
         self.build_history = Some(history);
     }
 
+    /// Use the same guarded job allowance in placement and authoritative
+    /// admission. A declaration is a minimum, not permission to underfund a
+    /// known large build. Generic worker-list previews have no build budget.
+    pub(crate) fn build_disk_budget(
+        &self,
+        request: &SelectionRequest,
+    ) -> Option<rch_common::BuildDiskBudget> {
+        let cold = request
+            .command
+            .as_deref()
+            .and_then(crate::headroom::cold_build_footprint_gib);
+        if cold.is_none() && request.disk_headroom_gib == 0 && !request.job_mode {
+            return None;
+        }
+        let estimate = request
+            .command
+            .as_deref()
+            .and_then(|command| {
+                self.build_history
+                    .as_ref()?
+                    .learned_footprint_gib(&request.project, command)
+            })
+            .or(cold)
+            .or_else(|| request.job_mode.then_some(16.0));
+        let growth_gib = estimate
+            .map(rch_common::BuildDiskBudget::growth_budget_gib)
+            .unwrap_or(0)
+            .max(request.disk_headroom_gib);
+        let floor_gib = match self.config.min_free_gb {
+            None => 0,
+            Some(floor) if floor.is_finite() && floor >= 0.0 => floor.ceil() as u64,
+            // Invalid configuration cannot silently remove the reserve floor.
+            Some(_) => u64::MAX,
+        };
+        Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: u64::from(growth_gib) * rch_common::BuildDiskBudget::GIB,
+            min_free_bytes: floor_gib.saturating_mul(rch_common::BuildDiskBudget::GIB),
+        })
+    }
+
     async fn disk_headroom_failure(
         &self,
         worker: &WorkerState,
         worker_id: &str,
-        request: &SelectionRequest,
+        budget: Option<rch_common::BuildDiskBudget>,
     ) -> Option<DiskHeadroomRejection> {
-        if request.disk_headroom_gib == 0 {
-            return None;
-        }
+        let budget = budget?;
         let Some(history) = &self.build_history else {
             return Some(DiskHeadroomRejection::Unknown);
         };
@@ -689,7 +727,15 @@ impl WorkerSelector {
             .check_disk_headroom(
                 worker_id,
                 &DiskHeadroomAdmission {
-                    requested_gib: request.disk_headroom_gib,
+                    requested_gib: u32::try_from(
+                        budget
+                            .max_growth_bytes
+                            .div_ceil(rch_common::BuildDiskBudget::GIB),
+                    )
+                    .unwrap_or(u32::MAX),
+                    floor_gib: budget
+                        .min_free_bytes
+                        .div_ceil(rch_common::BuildDiskBudget::GIB),
                     capacity: worker.disk_capacity_observation().await,
                 },
             )
@@ -763,6 +809,36 @@ impl WorkerSelector {
         request: &SelectionRequest,
         excluded_worker_ids: &HashSet<String>,
     ) -> SelectionResult {
+        self.preview_round()
+            .select_in_round(pool, request, excluded_worker_ids)
+            .await
+    }
+
+    /// [`Self::preview_with_exclusions`] that always reports every configured
+    /// worker's decision, also when it selects one (`rch diagnose`, GH #125).
+    /// The inventory comes from the same round, so it reads the admission
+    /// verdicts that round's preview used.
+    pub async fn preview_with_inventory(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+    ) -> SelectionResult {
+        let round = self.preview_round();
+        let mut result = round
+            .select_in_round(pool, request, excluded_worker_ids)
+            .await;
+        if result.diagnostics.is_none() {
+            result.diagnostics = Some(
+                round
+                    .build_selection_diagnostics(pool, request, excluded_worker_ids)
+                    .await,
+            );
+        }
+        result
+    }
+
+    fn preview_round(&self) -> Self {
         let mut round = self.clone();
         round.preview = true;
         round.admission_gate = self
@@ -770,8 +846,6 @@ impl WorkerSelector {
             .as_ref()
             .map(|gate| Arc::new(gate.for_selection()));
         round
-            .select_in_round(pool, request, excluded_worker_ids)
-            .await
     }
 
     async fn select_in_round(
@@ -1056,22 +1130,28 @@ impl WorkerSelector {
     /// pooled target dir holds the project's dependency artifacts. Record that
     /// as cache warmth only, so the next edit-fix-build is scored toward the
     /// warm pool instead of recompiling every dependency elsewhere (GH #81).
-    pub async fn record_remote_completion(
+    ///
+    /// Cache evidence from an admitted build belongs only to its original
+    /// live endpoint. Selection takes cache -> config locks; publication must
+    /// use the same order so a pending config writer cannot form a cycle.
+    pub(crate) async fn record_bound_remote_completion(
         &self,
-        worker_id: &str,
+        worker: &WorkerState,
+        endpoint: &WorkerEndpointSnapshot,
         project_id: &str,
         command: &str,
         exit_code: i32,
         remote_command_started: bool,
     ) {
+        let mut cache = self.cache_tracker.write().await;
+        let Some(_endpoint_guard) = worker.lock_current_endpoint(endpoint).await else {
+            return;
+        };
+        let worker_id = endpoint.config.id.as_str();
         if exit_code == 0 {
-            self.record_success(worker_id, project_id).await;
+            cache.record_success(worker_id, project_id);
         } else if remote_command_started {
-            let cache_use = cache_use_for_command(command);
-            self.cache_tracker
-                .write()
-                .await
-                .record_build(worker_id, project_id, cache_use);
+            cache.record_build(worker_id, project_id, cache_use_for_command(command));
         }
     }
 
@@ -1206,8 +1286,16 @@ impl WorkerSelector {
         let worker_id = WorkerId::new(&fallback_id);
         let worker = pool.get(&worker_id).await?;
 
+        // Last-success history is only a preference, never capability evidence.
+        // In particular, an exact runtime or named-tool requirement must not
+        // disappear when the normal eligibility pass finds no usable worker.
+        let capabilities = worker.capabilities().await;
+        if required_tool_capability_mismatch(request, &capabilities).is_some() {
+            return None;
+        }
+
         if self
-            .disk_headroom_failure(&worker, &fallback_id, request)
+            .disk_headroom_failure(&worker, &fallback_id, self.build_disk_budget(request))
             .await
             .is_some()
         {
@@ -1508,6 +1596,7 @@ impl WorkerSelector {
         let mut active_project_exclusion_count = 0usize;
 
         let required_os = required_os_for_request(request);
+        let disk_budget = self.build_disk_budget(request);
 
         for worker in all_workers {
             let config = worker.config.read().await;
@@ -1523,7 +1612,7 @@ impl WorkerSelector {
             let capabilities = worker.capabilities().await;
             let pressure = worker.pressure_assessment().await;
             let disk_headroom_failure = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), request)
+                .disk_headroom_failure(&worker, worker_id.as_str(), disk_budget)
                 .await;
             let success_rate = self.health_score(&worker).await;
             let active_project_excluded = excluded_worker_ids.contains(worker_id.as_str());
@@ -1586,7 +1675,14 @@ impl WorkerSelector {
             };
 
             let (final_decision, final_reason) =
-                if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
+                if outside_requested_set(request, worker_id.as_str()) {
+                    // `get_eligible_workers` drops these before any other gate.
+                    push_reason_code(&mut reason_codes, "selection.not_requested");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        "not in the requested worker set".to_string(),
+                    )
+                } else if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
                     push_reason_code(&mut reason_codes, "worker.status_not_assignable");
                     (
                         WorkerSelectionDiagnosticDecision::Deny,
@@ -2102,6 +2198,7 @@ impl WorkerSelector {
         let mut any_has_runtime = false;
 
         let required_os = required_os_for_request(request);
+        let disk_budget = self.build_disk_budget(request);
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
@@ -2171,10 +2268,10 @@ impl WorkerSelector {
 
             any_has_runtime = true;
 
-            // An explicit disk budget is a hard resource constraint, including
+            // A build disk budget is a hard resource constraint, including
             // for undersized CPU candidates and every health fail-open list.
             if let Some(failure) = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), request)
+                .disk_headroom_failure(&worker, worker_id.as_str(), disk_budget)
                 .await
             {
                 debug!("Worker {} excluded: {}", worker_id, failure);
@@ -2208,7 +2305,7 @@ impl WorkerSelector {
             }
 
             if let Some(reason) = self
-                .toolchain_preflight_failure(worker.as_ref(), worker_id.as_str(), request)
+                .toolchain_preflight_failure(worker.as_ref(), request)
                 .await
             {
                 debug!(
@@ -2918,43 +3015,15 @@ impl WorkerSelector {
     async fn toolchain_preflight_failure(
         &self,
         worker: &WorkerState,
-        worker_id: &str,
         request: &SelectionRequest,
     ) -> Option<String> {
         let toolchain = request.toolchain.as_ref()?;
         let toolchain_name = toolchain.rustup_toolchain();
 
-        if let Some(cached) = worker.toolchain_preflight_status(&toolchain_name).await
-            && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
-        {
-            return (!cached.usable).then(|| {
-                cached
-                    .reason
-                    .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
-            });
-        }
-
-        let result = probe_worker_toolchain(worker, &toolchain_name, self.ssh_pool.as_ref()).await;
-        match result {
-            Ok(()) => {
-                worker
-                    .record_toolchain_preflight(toolchain_name, true, None)
-                    .await;
-                None
-            }
-            Err(reason) => {
-                warn!(
-                    worker = %worker_id,
-                    toolchain = %toolchain_name,
-                    reason = %reason,
-                    "Worker toolchain preflight failed"
-                );
-                worker
-                    .record_toolchain_preflight(toolchain_name, false, Some(reason.clone()))
-                    .await;
-                Some(reason)
-            }
-        }
+        toolchain_preflight_with(worker, &toolchain_name, |endpoint| {
+            probe_worker_toolchain(endpoint, &toolchain_name, self.ssh_pool.as_ref())
+        })
+        .await
     }
 
     /// Priority strategy: respect worker priority first, then use cache/speed
@@ -3836,6 +3905,16 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
     }
 }
 
+/// An explicit worker request is an allow-set, not a preference: a worker
+/// outside it is never a candidate.
+fn outside_requested_set(request: &SelectionRequest, worker_id: &str) -> bool {
+    !request.preferred_workers.is_empty()
+        && !request
+            .preferred_workers
+            .iter()
+            .any(|requested| requested.as_str() == worker_id)
+}
+
 /// Append the OS-gate count to a combined admission summary.
 ///
 /// The OS gate gets a bespoke, prose-y message when it is the *sole* reason the
@@ -3981,6 +4060,14 @@ fn record_no_worker_outcome(got_worker: bool) {
 
 fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
     metrics::observe_reliability_decision("selection", selection_outcome_label(reason), duration);
+    // A busy pool is saturation, not a local fallback: capable workers exist,
+    // and the request queues by default. Every queued waiter re-selects each
+    // second, so counting busy rounds kept the fleet-degraded alarm latched and
+    // inflated the local-fallback metrics whenever anything queued. A queue
+    // timeout that does fall back is counted where it happens (api.rs).
+    if *reason == SelectionReason::AllWorkersBusy {
+        return;
+    }
     let got_worker = matches!(
         reason,
         SelectionReason::Success
@@ -4139,6 +4226,13 @@ fn required_tool_capability_mismatch(
     capabilities: &WorkerCapabilities,
 ) -> Option<String> {
     request.required_tools.iter().find_map(|tool| {
+        if let Some(check) = rch_common::tool_requirement::check_exact_runtime(
+            tool,
+            capabilities.node_version.as_deref(),
+            capabilities.bun_version.as_deref(),
+        ) {
+            return check.err();
+        }
         (!capabilities.tools_present.iter().any(|t| t == tool)).then(|| {
             if capabilities.tools_absent.iter().any(|t| t == tool) {
                 format!("capability_missing:tool:{tool}:probe_failed")
@@ -4148,6 +4242,9 @@ fn required_tool_capability_mismatch(
         })
     })
 }
+
+#[cfg(test)]
+mod exact_runtime_tests;
 
 fn rustup_component_capability_mismatch(
     request: &SelectionRequest,
@@ -4191,12 +4288,66 @@ fn rustc_version_key(value: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_string())
 }
 
-async fn probe_worker_toolchain(
+async fn toolchain_preflight_with<F, Fut>(
     worker: &WorkerState,
+    toolchain_name: &str,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce(rch_common::WorkerConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let endpoint = worker.endpoint_snapshot().await;
+    {
+        let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+            return Some("toolchain_preflight_endpoint_changed".to_string());
+        };
+        if let Some(cached) = worker.toolchain_preflight_status(toolchain_name).await
+            && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
+        {
+            return (!cached.usable).then(|| {
+                cached
+                    .reason
+                    .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
+            });
+        }
+    }
+
+    // Keep toolchain probes concurrent and reloadable: the configuration guard
+    // covers only cache access/publication, never connect or remote execution.
+    let result = probe(endpoint.config.clone()).await;
+    let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+        // A late success cannot authorize the replacement, and a late failure
+        // cannot poison its cache. A later selection obtains fresh evidence.
+        return Some("toolchain_preflight_endpoint_changed".to_string());
+    };
+    match result {
+        Ok(()) => {
+            worker
+                .record_toolchain_preflight(toolchain_name.to_string(), true, None)
+                .await;
+            None
+        }
+        Err(reason) => {
+            warn!(
+                worker = %endpoint.config.id,
+                toolchain = %toolchain_name,
+                reason = %reason,
+                "Worker toolchain preflight failed"
+            );
+            worker
+                .record_toolchain_preflight(toolchain_name.to_string(), false, Some(reason.clone()))
+                .await;
+            Some(reason)
+        }
+    }
+}
+
+async fn probe_worker_toolchain(
+    worker_config: rch_common::WorkerConfig,
     toolchain_name: &str,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> Result<(), String> {
-    let worker_config = worker.config.read().await.clone();
     let ssh_options = SshOptions {
         connect_timeout: TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT,
         command_timeout: TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
@@ -4350,6 +4501,8 @@ mod tests {
                 num_cpus: Some(8),
                 disk_free_gb: Some(100.0),
                 disk_total_gb: Some(200.0),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(200.0),
                 projects_root_ok: Some(true),
                 ..Default::default()
             })
@@ -4372,6 +4525,27 @@ mod tests {
                 evaluated_at_unix_ms: 0,
             })
             .await;
+    }
+
+    /// Scheduling fixtures model a healthy, separately measured build volume.
+    /// Preserve their explicit pressure assessment (which may model another
+    /// mount); tests for missing build telemetry construct their own samples.
+    async fn budgeted_fixture_selector(
+        pool: &WorkerPool,
+        mut selector: WorkerSelector,
+    ) -> WorkerSelector {
+        selector.set_build_history(Arc::new(crate::history::BuildHistory::new(100)));
+        for worker in pool.all_workers().await {
+            let mut caps = worker.capabilities().await;
+            if caps.build_disk_free_gb.is_none() || caps.build_disk_total_gb.is_none() {
+                let pressure = worker.pressure_assessment().await;
+                caps.build_disk_free_gb.get_or_insert(100.0);
+                caps.build_disk_total_gb.get_or_insert(200.0);
+                worker.set_capabilities(caps).await;
+                worker.set_pressure_assessment(pressure).await;
+            }
+        }
+        selector
     }
 
     fn process_only_weights() -> SignalWeights {
@@ -4709,6 +4883,20 @@ mod tests {
 
         assert!(decision_after > decision_before);
         assert!(fallback_after > fallback_before);
+    }
+
+    #[test]
+    fn busy_selection_rounds_are_not_local_fallbacks() {
+        let busy = || {
+            crate::metrics::LOCAL_FALLBACK_REASON_TOTAL
+                .with_label_values(&["all_workers_busy"])
+                .get()
+        };
+        let before = busy();
+        for _ in 0..(NO_WORKER_WINDOW * 2) {
+            record_selection_metrics(&SelectionReason::AllWorkersBusy, Duration::from_millis(1));
+        }
+        assert_eq!(busy(), before);
     }
 
     #[tokio::test]
@@ -5375,6 +5563,7 @@ mod tests {
             SelectionConfig::default(),
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
 
         let request = SelectionRequest {
             job_mode: false,
@@ -5417,6 +5606,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_native_apple_job_selects_only_declared_darwin_worker() {
+        for command in [
+            "xcodebuild -scheme App -jobs 1 build",
+            "/usr/bin/xcrun --sdk macosx xcodebuild -scheme App test",
+        ] {
+            let (pool, selector, mut request) = os_gate_fixture(command).await;
+            request.job_mode = true;
+            assert!(
+                selector.select(&pool, &request).await.worker.is_none(),
+                "Linux and Windows cannot execute native Apple tools: {command}"
+            );
+            pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
+                .await;
+            let selector = budgeted_fixture_selector(&pool, selector).await;
+            let result = selector.select(&pool, &request).await;
+            let selected = result
+                .worker
+                .expect("native Apple job should select the Mac");
+            assert_eq!(selected.config.read().await.id.as_str(), "mac-worker");
+
+            let diagnostics = selector
+                .build_selection_diagnostics(&pool, &request, &HashSet::new())
+                .await;
+            for worker in diagnostics
+                .workers
+                .iter()
+                .filter(|w| w.worker_id.as_str() != "mac-worker")
+            {
+                assert_eq!(
+                    worker.final_decision,
+                    WorkerSelectionDiagnosticDecision::Deny
+                );
+                assert!(
+                    worker
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "os.declared_mismatch")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_apple_job_mentions_do_not_claim_darwin_worker() {
+        for command in [
+            "./run_shards.sh",
+            "echo 'xcodebuild build'",
+            "env NOTE=xcrun bun test",
+        ] {
+            let (pool, selector, mut request) = os_gate_fixture(command).await;
+            request.job_mode = true;
+            pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
+                .await;
+            let selector = budgeted_fixture_selector(&pool, selector).await;
+            let selected = selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .expect("ordinary job still runs on Linux");
+            assert_eq!(
+                selected.config.read().await.id.as_str(),
+                "linux-worker",
+                "{command}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_undeclared_worker_cannot_satisfy_os_requirement() {
         // Only the windows worker can claim the MSVC target, so removing it must
         // leave nothing selectable rather than falling back to a Linux box.
@@ -5428,6 +5685,7 @@ mod tests {
             SelectionConfig::default(),
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
 
         let request = SelectionRequest {
             job_mode: false,
@@ -5541,6 +5799,7 @@ mod tests {
             },
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
         selector.record_success("warm-worker", "test-project").await;
 
         let request = SelectionRequest {
@@ -6024,7 +6283,8 @@ mod tests {
         pool.add_worker_state(worker).await;
 
         let request = pinned_component_request("asupersync", "cargo clippy --workspace");
-        let result = WorkerSelector::default().select(&pool, &request).await;
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
+        let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(
             result.reason,
@@ -6190,7 +6450,7 @@ mod tests {
 
         pool.add_worker_state(worker).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6244,7 +6504,7 @@ mod tests {
         .await;
         pool.add_worker_state(v3).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6311,7 +6571,7 @@ mod tests {
         .await;
         pool.add_worker_state(free).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6365,7 +6625,7 @@ mod tests {
             .await;
         pool.add_worker_state(rust_only).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let nix_request = SelectionRequest {
             job_mode: false,
             project: "test".to_string(),
@@ -6398,6 +6658,8 @@ mod tests {
             .set_capabilities(rch_common::WorkerCapabilities {
                 rustc_version: Some("1.87.0".to_string()),
                 nix_version: Some("nix (Nix) 2.24.9".to_string()),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(200.0),
                 ..Default::default()
             })
             .await;
@@ -6425,7 +6687,7 @@ mod tests {
             .await;
         pool.add_worker_state(pinned).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -6478,7 +6740,7 @@ mod tests {
         let non_rust = make_worker("non-rust", 4, 70.0);
         pool.add_worker_state(non_rust).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -6563,7 +6825,7 @@ mod tests {
             .await;
         pool.add_worker_state(busy_b).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let mut excluded_worker_ids = HashSet::new();
         excluded_worker_ids.insert("busy-a".to_string());
         excluded_worker_ids.insert("busy-b".to_string());
@@ -6691,7 +6953,7 @@ mod tests {
         .await;
         pool.add_worker_state(toolchain_mismatch).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -6754,7 +7016,7 @@ mod tests {
             .await;
         pool.add_worker_state(healthy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "topology-project".to_string(),
@@ -6792,7 +7054,7 @@ mod tests {
             .await;
         pool.add_worker_state(wrong_target).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "topology-project".to_string(),
@@ -6863,7 +7125,7 @@ mod tests {
         assert!(busy.reserve_slots(8).await);
         pool.add_worker_state(busy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-plus-busy".to_string(),
@@ -6912,7 +7174,7 @@ mod tests {
             pool.add_worker_state(worker).await;
         }
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "derated-fleet".to_string(),
@@ -7024,8 +7286,279 @@ mod tests {
         request.disk_headroom_gib = 0;
         assert!(
             selector.select(&pool, &request).await.worker.is_some(),
-            "undeclared jobs preserve existing admission"
+            "an ordinary build's cold budget still fits with the worker floor"
         );
+    }
+
+    /// Learned output is a hard condition across affinity and CPU degradation.
+    #[tokio::test]
+    async fn learned_footprint_is_a_hard_constraint_across_affinity_and_fallback() {
+        let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        selector.set_build_history(Arc::clone(&history));
+        request.estimated_cores = 1;
+        request.command = Some("cargo build --workspace".into());
+        let seed = history
+            .try_start_active_build_with_waiter(
+                request.project.clone(),
+                "seed-worker".into(),
+                "cargo build --workspace".into(),
+                0,
+                Some("seed-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission {
+                    requested_gib: 0,
+                    floor_gib: 0,
+                    capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                        "seed-worker",
+                        120.0,
+                        Duration::ZERO,
+                    )),
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        history.observe_build_disk("seed-worker", 56, Instant::now());
+        history
+            .complete_durable(
+                seed.id,
+                "seed-worker",
+                Some("seed-owner"),
+                crate::history::BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    disk_peak_output_bytes: Some(64 * rch_common::BuildDiskBudget::GIB),
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            history.learned_footprint_gib(&request.project, "cargo build"),
+            Some(64.0)
+        );
+
+        let set_free = |id: &'static str, free: f64| {
+            let pool = pool.clone();
+            async move {
+                let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+                let mut caps = worker.capabilities().await;
+                caps.build_disk_free_gb = Some(free);
+                caps.build_disk_total_gb = Some(400.0);
+                worker.set_capabilities(caps).await;
+            }
+        };
+        // The affinity-pinned worker has 51 GiB: the incident's shape.
+        set_free("active-project", 51.0).await;
+        set_free("free-small", 200.0).await;
+        for _ in 0..5 {
+            let selected = selector.select(&pool, &request).await;
+            let id = match &selected.worker {
+                Some(worker) => Some(worker.config.read().await.id.to_string()),
+                None => None,
+            };
+            assert_eq!(
+                id.as_deref(),
+                Some("free-small"),
+                "reason={:?}",
+                selected.reason
+            );
+        }
+
+        // A fleet with no room must not resurrect a worker through a different
+        // route, even when the requested CPU count could otherwise degrade.
+        set_free("free-small", 40.0).await;
+        for cores in [1, 4] {
+            request.estimated_cores = cores;
+            assert!(selector.select(&pool, &request).await.worker.is_none());
+            assert!(
+                selector
+                    .preview_with_exclusions(&pool, &request, &HashSet::new(),)
+                    .await
+                    .worker
+                    .is_none()
+            );
+            assert!(
+                selector
+                    .try_fallback(&pool, &request, &HashSet::new())
+                    .await
+                    .is_none()
+            );
+        }
+
+        // A different command class has no footprint and is not steered.
+        assert_eq!(
+            history.learned_footprint_gib(&request.project, "cargo test"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_21_gib_test_moves_to_safe_worker_and_small_control_still_runs() {
+        let pool = WorkerPool::new();
+        for (id, free) in [("hz3", 33.0), ("spare", 80.0)] {
+            let worker = make_worker(id, 8, 80.0);
+            prepare_fixture_worker(
+                &worker,
+                Some("1.97.0-nightly"),
+                PressureState::Healthy,
+                "healthy",
+            )
+            .await;
+            let mut caps = worker.capabilities().await;
+            caps.build_disk_free_gb = Some(free);
+            worker.set_capabilities(caps).await;
+            pool.add_worker_state(worker).await;
+        }
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        for (project, gib) in [("frankennumpy", 21), ("small", 2)] {
+            let seed = history.start_active_build_with_wrapper(
+                project.into(),
+                "seed".into(),
+                "cargo test --workspace".into(),
+                0,
+                Some(format!("owner-{project}")),
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            history
+                .complete_durable(
+                    seed.id,
+                    "seed",
+                    seed.local_wrapper_id.as_deref(),
+                    crate::history::BuildCompletion {
+                        exit_code: 0,
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let mut selector = WorkerSelector::with_config(
+            SelectionConfig {
+                min_free_gb: Some(13.0),
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+        selector.set_build_history(history);
+        selector.record_success("hz3", "frankennumpy").await;
+        let mut request = tool_gate_request();
+        request.job_mode = false;
+        request.project = "frankennumpy".into();
+        request.command = Some("cargo test --workspace".into());
+        request.required_runtime = RequiredRuntime::Rust;
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            27 * rch_common::BuildDiskBudget::GIB
+        );
+        assert_eq!(
+            selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str(),
+            "spare"
+        );
+        request.preferred_workers = vec![WorkerId::new("hz3")];
+        assert!(selector.select(&pool, &request).await.worker.is_none());
+
+        // 33 free minus the 13 GiB floor cannot fund the 21 GiB workload,
+        // but the measured 2 GiB workload has a guarded 4 GiB budget and fits.
+        request.project = "small".into();
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            4 * rch_common::BuildDiskBudget::GIB
+        );
+        assert_eq!(
+            selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str(),
+            "hz3"
+        );
+        request.command = Some("cargo test --workspace --profile release".into());
+        assert!(
+            selector.select(&pool, &request).await.worker.is_none(),
+            "new profiles retain the cold prior"
+        );
+        request.command = Some("cargo test --workspace".into());
+        request.project = "unmeasured".into();
+        assert!(
+            selector.select(&pool, &request).await.worker.is_none(),
+            "a new workspace test is conservatively sized"
+        );
+    }
+
+    #[test]
+    fn automatic_disk_budget_respects_valid_floors_and_explicit_minima() {
+        let mut selector = WorkerSelector::new();
+        let mut request = tool_gate_request();
+        request.job_mode = false;
+        assert_eq!(selector.build_disk_budget(&request), None);
+        request.disk_headroom_gib = 3;
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            3 * rch_common::BuildDiskBudget::GIB
+        );
+        request.command = Some("cargo check".into());
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            4 * rch_common::BuildDiskBudget::GIB
+        );
+        request.disk_headroom_gib = 12;
+        assert_eq!(
+            selector
+                .build_disk_budget(&request)
+                .unwrap()
+                .max_growth_bytes,
+            12 * rch_common::BuildDiskBudget::GIB
+        );
+        for (floor, expected) in [(None, 0), (Some(0.0), 0), (Some(0.25), 1), (Some(13.0), 13)] {
+            selector.config.min_free_gb = floor;
+            assert_eq!(
+                selector.build_disk_budget(&request).unwrap().min_free_bytes,
+                expected * rch_common::BuildDiskBudget::GIB
+            );
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            selector.config.min_free_gb = Some(invalid);
+            assert_eq!(
+                selector.build_disk_budget(&request).unwrap().min_free_bytes,
+                u64::MAX
+            );
+        }
     }
 
     #[tokio::test]
@@ -7046,13 +7579,15 @@ mod tests {
                 None,
                 DiskHeadroomAdmission {
                     requested_gib: 64,
+                    floor_gib: 0,
                     capacity: worker.disk_capacity_observation().await,
                 },
+                Some(worker.endpoint_snapshot().await),
             )
             .unwrap()
             .unwrap();
         let excluded = HashSet::from(["active-project".into()]);
-        request.disk_headroom_gib = 37;
+        request.disk_headroom_gib = 27;
         assert!(
             selector
                 .select_with_exclusions(&pool, &request, &excluded)
@@ -7060,7 +7595,7 @@ mod tests {
                 .worker
                 .is_none()
         );
-        request.disk_headroom_gib = 36;
+        request.disk_headroom_gib = 26;
         assert_eq!(
             selector
                 .select_with_exclusions(&pool, &request, &excluded)
@@ -7080,7 +7615,7 @@ mod tests {
             .await;
         let mut fallback_request = request.clone();
         fallback_request.estimated_cores = 1;
-        fallback_request.disk_headroom_gib = 36;
+        fallback_request.disk_headroom_gib = 26;
         assert_eq!(
             selector
                 .try_fallback(&pool, &fallback_request, &excluded)
@@ -7102,6 +7637,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -7380,7 +7916,7 @@ mod tests {
             .await;
         pool.add_worker_state(small_critical).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "degraded-must-respect-pressure".to_string(),
@@ -7440,7 +7976,7 @@ mod tests {
         assert!(busy.reserve_slots(8).await);
         pool.add_worker_state(busy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "os-gate-hijack".to_string(),
@@ -7520,7 +8056,7 @@ mod tests {
             .await;
         pool.add_worker_state(critical).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "os-gate-plus-pressure".to_string(),
@@ -7561,7 +8097,7 @@ mod tests {
             .await;
         pool.add_worker_state(flapping).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "topology-flap".to_string(),
@@ -7588,6 +8124,8 @@ mod tests {
                 rustc_version: Some("1.87.0".to_string()),
                 projects_root_ok: Some(true),
                 projects_root_checked_at_unix_ms: Some(1_700_000_100_000),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(200.0),
                 ..Default::default()
             })
             .await;
@@ -7598,6 +8136,99 @@ mod tests {
             .expect("expected worker to recover after explicit revalidation");
         assert_eq!(selected.config.read().await.id.as_str(), "flapping");
         assert_eq!(second.reason, SelectionReason::Success);
+    }
+
+    #[tokio::test]
+    async fn concurrent_preflights_discard_old_endpoint_results_and_reprobe_after_retarget() {
+        for return_to_original in [false, true] {
+            let worker = Arc::new(make_worker("retargeted-toolchains", 8, 50.0));
+            let original = worker.endpoint_snapshot().await.config;
+            let started = Arc::new(tokio::sync::Barrier::new(3));
+            let release = Arc::new(tokio::sync::Barrier::new(3));
+            let mut tasks = Vec::new();
+            for (toolchain, old_success) in [("stable", true), ("nightly", false)] {
+                let worker = worker.clone();
+                let started = started.clone();
+                let release = release.clone();
+                tasks.push(tokio::spawn(async move {
+                    toolchain_preflight_with(&worker, toolchain, |endpoint| async move {
+                        assert_eq!(endpoint.host, "localhost");
+                        started.wait().await;
+                        release.wait().await;
+                        if old_success {
+                            Ok(())
+                        } else {
+                            Err("old endpoint missing toolchain".to_string())
+                        }
+                    })
+                    .await
+                }));
+            }
+            tokio::time::timeout(Duration::from_secs(1), started.wait())
+                .await
+                .expect("different toolchains must probe concurrently");
+            let mut replacement = original.clone();
+            replacement.host = "replacement.host".to_string();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                assert!(worker.update_config(replacement).await);
+                if return_to_original {
+                    assert!(worker.update_config(original).await);
+                }
+            })
+            .await
+            .expect("preflight I/O must not block endpoint reload");
+            release.wait().await;
+            for task in tasks {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .expect("old preflight must finish")
+                        .unwrap()
+                        .as_deref(),
+                    Some("toolchain_preflight_endpoint_changed")
+                );
+            }
+
+            // Neither success nor failure was installed in the replacement's
+            // cache. Fresh evidence can reach the opposite verdict for each.
+            for (toolchain, fresh_success) in [("stable", false), ("nightly", true)] {
+                assert!(worker.toolchain_preflight_status(toolchain).await.is_none());
+                let fresh = toolchain_preflight_with(&worker, toolchain, |endpoint| {
+                    assert_eq!(
+                        endpoint.host,
+                        if return_to_original {
+                            "localhost"
+                        } else {
+                            "replacement.host"
+                        }
+                    );
+                    std::future::ready(if fresh_success {
+                        Ok(())
+                    } else {
+                        Err("replacement missing toolchain".to_string())
+                    })
+                })
+                .await;
+                assert_eq!(fresh.is_none(), fresh_success);
+                assert_eq!(
+                    worker
+                        .toolchain_preflight_status(toolchain)
+                        .await
+                        .unwrap()
+                        .usable,
+                    fresh_success
+                );
+                let cached = toolchain_preflight_with(
+                    &worker,
+                    toolchain,
+                    |_| -> std::future::Ready<Result<(), String>> {
+                        panic!("current endpoint verdict must be reusable");
+                    },
+                )
+                .await;
+                assert_eq!(cached, fresh);
+            }
+        }
     }
 
     #[tokio::test]
@@ -7622,7 +8253,7 @@ mod tests {
             .await;
         pool.add_worker_state(broken).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "toolchain-project".to_string(),
@@ -7685,7 +8316,7 @@ mod tests {
             .await;
         pool.add_worker_state(usable_slow).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "toolchain-project".to_string(),
@@ -7745,7 +8376,7 @@ mod tests {
             .await;
         pool.add_worker_state(critical).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-critical".to_string(),
@@ -7794,7 +8425,7 @@ mod tests {
         unhealthy.record_failure(None).await;
         pool.add_worker_state(unhealthy).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-and-health".to_string(),
@@ -7844,7 +8475,7 @@ mod tests {
         .await;
         pool.add_worker_state(telemetry_gap).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-mixed".to_string(),
@@ -7905,7 +8536,7 @@ mod tests {
             .await;
         pool.add_worker_state(telemetry_gap).await;
 
-        let selector = WorkerSelector::default();
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "pressure-gap".to_string(),
@@ -8049,6 +8680,7 @@ mod tests {
             CircuitBreakerConfig::default(),
         );
 
+        let selector = budgeted_fixture_selector(&pool, selector).await;
         // Record only build cache first (no test binaries yet).
         selector.record_build("test-warm", "proj", false).await;
 
@@ -8680,6 +9312,7 @@ mod tests {
             tools: Vec::new(),
         };
         pool.add_worker(worker_config).await;
+        let selector = budgeted_fixture_selector(&pool, selector).await;
 
         // Make a selection request
         let request = SelectionRequest {
@@ -8736,6 +9369,7 @@ mod tests {
             },
             CircuitBreakerConfig::default(),
         );
+        let selector = budgeted_fixture_selector(&pool, selector).await;
         let request = SelectionRequest {
             job_mode: false,
             project: "poolrepro".to_string(),
@@ -8768,8 +9402,17 @@ mod tests {
         );
 
         // Failed before the remote command started: nothing is warm.
+        let worker = pool.get(&WorkerId::new("worker-a")).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
         selector
-            .record_remote_completion("worker-a", "poolrepro", "cargo build -j 2", 1, false)
+            .record_bound_remote_completion(
+                &worker,
+                &endpoint,
+                "poolrepro",
+                "cargo build -j 2",
+                1,
+                false,
+            )
             .await;
         assert_eq!(
             selector
@@ -8779,7 +9422,14 @@ mod tests {
         );
 
         selector
-            .record_remote_completion("worker-a", "poolrepro", "cargo build -j 2", 101, true)
+            .record_bound_remote_completion(
+                &worker,
+                &endpoint,
+                "poolrepro",
+                "cargo build -j 2",
+                101,
+                true,
+            )
             .await;
         assert_eq!(
             selector
@@ -8799,8 +9449,23 @@ mod tests {
     #[tokio::test]
     async fn remote_completion_records_test_warmth_and_success_pins() {
         let selector = WorkerSelector::new();
+        let first = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("w1"),
+            ..WorkerConfig::default()
+        });
+        let second = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("w2"),
+            ..WorkerConfig::default()
+        });
         selector
-            .record_remote_completion("w1", "proj", "cargo test --workspace", 130, true)
+            .record_bound_remote_completion(
+                &first,
+                &first.endpoint_snapshot().await,
+                "proj",
+                "cargo test --workspace",
+                130,
+                true,
+            )
             .await;
         assert_eq!(
             selector.cache_warmth("w1", "proj", CacheUse::Test).await,
@@ -8809,12 +9474,88 @@ mod tests {
         assert_eq!(selector.get_pinned_worker("proj").await, None);
 
         selector
-            .record_remote_completion("w2", "proj", "cargo build", 0, true)
+            .record_bound_remote_completion(
+                &second,
+                &second.endpoint_snapshot().await,
+                "proj",
+                "cargo build",
+                0,
+                true,
+            )
             .await;
         assert_eq!(
             selector.get_pinned_worker("proj").await.as_deref(),
             Some("w2")
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_completion_cannot_publish_through_a_pruned_worker_arc() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        for prune in [false, true] {
+            let pool = WorkerPool::new();
+            let config = WorkerConfig {
+                id: WorkerId::new("reused-id"),
+                ..WorkerConfig::default()
+            };
+            pool.add_worker(config.clone()).await;
+            let old = pool.get(&config.id).await.unwrap();
+            let endpoint = old.endpoint_snapshot().await;
+            assert!(old.reserve_slots(1).await);
+            if prune {
+                old.drain_for_removal().await;
+            }
+            let selector = WorkerSelector::new();
+            let held_cache = selector.cache_tracker.write().await;
+            let completion = selector.record_bound_remote_completion(
+                &old,
+                &endpoint,
+                "owned-project",
+                "cargo build",
+                0,
+                true,
+            );
+            tokio::pin!(completion);
+            poll_fn(|cx| {
+                assert!(completion.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            pool.release_slots(&config.id, 1).await;
+            if prune {
+                assert_eq!(pool.prune_drained().await, 1);
+            } else {
+                assert!(pool.remove_worker(&config.id).await);
+            }
+            pool.add_worker(config.clone()).await;
+            let replacement = pool.get(&config.id).await.unwrap();
+            replacement
+                .record_failure(Some("replacement evidence".into()))
+                .await;
+            assert!(!Arc::ptr_eq(&old, &replacement));
+            assert!(old.lock_current_endpoint(&endpoint).await.is_none());
+            assert!(
+                old.lock_current_endpoint(&old.endpoint_snapshot().await)
+                    .await
+                    .is_none(),
+                "a new snapshot must not resurrect a detached Arc's authority"
+            );
+            assert!(replacement.lock_current_endpoint(&endpoint).await.is_none());
+            drop(held_cache);
+            tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .unwrap();
+            assert_eq!(selector.get_pinned_worker("owned-project").await, None);
+            assert_eq!(
+                selector
+                    .cache_warmth(config.id.as_str(), "owned-project", CacheUse::Build)
+                    .await,
+                0.0
+            );
+            assert_eq!(replacement.circuit_stats().await.consecutive_failures(), 1);
+        }
     }
 
     #[test]
@@ -9792,7 +10533,7 @@ mod tests {
             let mut reliability = ReliabilityAggregator::new(reliability_cfg);
             reliability.set_remediation(remediation);
 
-            let mut selector = WorkerSelector::with_config(
+            let selector = WorkerSelector::with_config(
                 SelectionConfig {
                     strategy: SelectionStrategy::Balanced,
                     weights: SelectionWeightConfig {
@@ -9808,6 +10549,7 @@ mod tests {
                 },
                 CircuitBreakerConfig::default(),
             );
+            let mut selector = budgeted_fixture_selector(&pool, selector).await;
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
@@ -9872,7 +10614,7 @@ mod tests {
             let mut reliability = ReliabilityAggregator::new(reliability_cfg);
             reliability.set_remediation(remediation);
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
@@ -9947,7 +10689,7 @@ mod tests {
 
             pool.add_worker_state(worker).await;
 
-            let mut selector = WorkerSelector::with_config(
+            let selector = WorkerSelector::with_config(
                 SelectionConfig {
                     strategy: SelectionStrategy::Balanced,
                     weights: SelectionWeightConfig {
@@ -9963,6 +10705,7 @@ mod tests {
                 },
                 CircuitBreakerConfig::default(),
             );
+            let mut selector = budgeted_fixture_selector(&pool, selector).await;
             selector.set_reliability(reliability.clone());
 
             let request = SelectionRequest {
@@ -10045,7 +10788,7 @@ mod tests {
                 .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10072,7 +10815,7 @@ mod tests {
                 )
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10117,7 +10860,7 @@ mod tests {
                 crate::repo_convergence::ConvergenceDriftState::Failed
             );
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10146,7 +10889,7 @@ mod tests {
                 crate::repo_convergence::ConvergenceDriftState::Converging
             );
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10178,7 +10921,7 @@ mod tests {
             let wid = WorkerId::new("converging");
             convergence.mark_converging(&wid).await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10202,7 +10945,7 @@ mod tests {
             let drift = convergence.get_drift_state(&wid).await;
             assert_eq!(drift, crate::repo_convergence::ConvergenceDriftState::Stale);
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10255,7 +10998,7 @@ mod tests {
                     .await;
             }
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10285,7 +11028,7 @@ mod tests {
             pool.add_worker(make_worker("w2", 8, 80.0).config.read().await.clone())
                 .await;
 
-            let selector = WorkerSelector::new();
+            let selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             // No convergence service set.
 
             let request = make_selection_request("test-project");
@@ -10310,7 +11053,7 @@ mod tests {
                 .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
 
             let request = make_selection_request("test-project");
@@ -10351,7 +11094,7 @@ mod tests {
             );
 
             // Step 2: Drifting workers are allowed (warn only).
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence.clone());
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -10362,7 +11105,7 @@ mod tests {
 
             // Step 3: Worker enters Converging → excluded.
             convergence.mark_converging(&wid).await;
-            let mut selector2 = WorkerSelector::new();
+            let mut selector2 = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector2.set_repo_convergence(convergence.clone());
             let result2 = selector2.select(&pool, &request).await;
             assert!(
@@ -10380,7 +11123,7 @@ mod tests {
                 crate::repo_convergence::ConvergenceDriftState::Ready
             );
 
-            let mut selector3 = WorkerSelector::new();
+            let mut selector3 = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector3.set_repo_convergence(convergence);
             let result3 = selector3.select(&pool, &request).await;
             assert!(
@@ -10425,7 +11168,7 @@ mod tests {
                 );
             }
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -10459,7 +11202,7 @@ mod tests {
                 .update_required_repos(&wid_ready, vec!["repo-a".into()], vec!["repo-a".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -10509,7 +11252,7 @@ mod tests {
                 .update_required_repos(&wid_fresh, vec!["repo-x".into()], vec!["repo-x".into()])
                 .await;
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
@@ -10544,7 +11287,7 @@ mod tests {
             let convergence = make_convergence_svc();
             // Neither worker registered → both Stale (fail-open).
 
-            let mut selector = WorkerSelector::new();
+            let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
             selector.set_repo_convergence(convergence);
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;

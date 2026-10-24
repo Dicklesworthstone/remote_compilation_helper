@@ -11,11 +11,29 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn spawn_daemon(socket: &std::path::Path, marker: &std::path::Path) -> Child {
+    spawn_daemon_with_live_dependency(socket, marker, false)
+}
+
+fn spawn_daemon_with_live_dependency(
+    socket: &std::path::Path,
+    marker: &std::path::Path,
+    live_dependency: bool,
+) -> Child {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .env("RABS_SOCKET_PATH", socket)
         .env("RABS_BOOT_MARKER", marker)
         .env("RABS_STATE_DIR", marker.with_extension("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
+        .env(
+            "RABS_LIVE_DEPENDENCY",
+            if live_dependency { "1" } else { "0" },
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -199,6 +217,7 @@ fn coord_singleflight_leader_follower_and_status() {
     let status = read_line(&mut second);
     assert!(status.contains("\"available\":true"), "{status}");
     assert!(status.contains("\"open_flights\":1"), "{status}");
+    assert!(status.contains("\"live_dependency\":false"), "{status}");
     assert!(
         status.contains("\"lease_registry_mounted\":true"),
         "{status}"
@@ -239,11 +258,34 @@ fn coord_singleflight_leader_follower_and_status() {
 }
 
 #[test]
+fn live_socket_status_advertises_the_actual_dependency_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rabsd.sock");
+    let marker = dir.path().join("rabsd.boot");
+    let mut daemon = spawn_daemon_with_live_dependency(&socket, &marker, true);
+    wait_for_socket(&socket);
+
+    let mut stream = connect(&socket);
+    assert!(handshake(&mut stream).contains("hello-ok"));
+    send_line(&mut stream, "{\"kind\":\"status\"}");
+    let status = read_line(&mut stream);
+    let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+    let (code, _) = terminate(&mut daemon);
+
+    assert_eq!(code, 0);
+    assert_eq!(status["kind"], "coord-status");
+    assert_eq!(status["live_dependency"], true);
+    assert_eq!(status["cas_mounted"], true);
+}
+
+#[test]
 fn coord_down_leaves_edge_alive_in_typed_degraded_mode() {
     // S6 fault arm: the coord region dies at boot (lab injection); edge
     // consults still answer, loudly degraded; the shutdown receipt
     // names the abandoned coord region (exit code 1 = unclean, honest).
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_rabsd"))
@@ -400,7 +442,10 @@ fn stale_socket_takeover_and_live_daemon_refusal() {
     let marker = dir.path().join("rabsd.boot");
 
     // A stale socket file from a dead incarnation.
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    use std::os::unix::fs::PermissionsExt;
+    let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(stale);
     assert!(socket.exists());
 
     let mut daemon = spawn_daemon(&socket, &marker);

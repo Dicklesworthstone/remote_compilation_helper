@@ -24,7 +24,7 @@ use crate::raw_bytes::RawBytes;
 use crate::redaction::{correlation_hash, redact_argv, redact_env, redact_path};
 
 /// Which tool the record captures (plan §140 context list).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(missing_docs)] // Plan vocabulary.
 pub enum ToolKind {
     Rustc,
@@ -37,6 +37,157 @@ pub enum ToolKind {
     NativeAr,
     CargoWholeCommand,
     Nextest,
+}
+
+impl ToolKind {
+    /// All ten required B003 tool contexts (`plan §140`).
+    pub const ALL: [Self; 10] = [
+        Self::Rustc,
+        Self::Rustdoc,
+        Self::Linker,
+        Self::BuildScriptCompile,
+        Self::BuildScriptRun,
+        Self::NativeCc,
+        Self::NativeCxx,
+        Self::NativeAr,
+        Self::CargoWholeCommand,
+        Self::Nextest,
+    ];
+
+    /// Stable canonical string representation used in B002/B010 NDJSON lines.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rustc => "Rustc",
+            Self::Rustdoc => "Rustdoc",
+            Self::Linker => "Linker",
+            Self::BuildScriptCompile => "BuildScriptCompile",
+            Self::BuildScriptRun => "BuildScriptRun",
+            Self::NativeCc => "NativeCc",
+            Self::NativeCxx => "NativeCxx",
+            Self::NativeAr => "NativeAr",
+            Self::CargoWholeCommand => "CargoWholeCommand",
+            Self::Nextest => "Nextest",
+        }
+    }
+
+    /// Parse a canonical or lowercase tool-kind name.
+    #[must_use]
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        match name {
+            "Rustc" | "rustc" => Some(Self::Rustc),
+            "Rustdoc" | "rustdoc" => Some(Self::Rustdoc),
+            "Linker" | "linker" => Some(Self::Linker),
+            "BuildScriptCompile" | "build_script_compile" => Some(Self::BuildScriptCompile),
+            "BuildScriptRun" | "build_script_run" => Some(Self::BuildScriptRun),
+            "NativeCc" | "native_cc" => Some(Self::NativeCc),
+            "NativeCxx" | "native_cxx" => Some(Self::NativeCxx),
+            "NativeAr" | "native_ar" => Some(Self::NativeAr),
+            "CargoWholeCommand" | "cargo_whole_command" => Some(Self::CargoWholeCommand),
+            "Nextest" | "nextest" => Some(Self::Nextest),
+            _ => None,
+        }
+    }
+}
+
+/// Deterministically classify an intercepted invocation across all ten B003
+/// tool contexts (`rustc`, `rustdoc`, `linker`, `build.rs` compile/run,
+/// `cc`/`cxx`/`ar`, `cargo`, `nextest`).
+#[must_use]
+pub fn classify_tool_context(argv: &[RawBytes], env: &[(RawBytes, RawBytes)]) -> Option<ToolKind> {
+    let first = argv.first()?.escaped();
+    let bin = first.rsplit('/').next().unwrap_or(first.as_str());
+    let args_escaped: Vec<String> = argv.iter().skip(1).map(RawBytes::escaped).collect();
+    let has_env = |key: &str, expected: Option<&str>| -> bool {
+        env.iter()
+            .any(|(k, v)| k.escaped() == key && expected.is_none_or(|exp| v.escaped() == exp))
+    };
+
+    // 1. rustdoc binary
+    if bin == "rustdoc" {
+        return Some(ToolKind::Rustdoc);
+    }
+
+    // 2. rustc (either build-script compile or regular crate compile)
+    if bin == "rustc" {
+        let is_build_script = args_escaped
+            .windows(2)
+            .any(|w| w[0] == "--crate-name" && w[1] == "build_script_build")
+            || args_escaped
+                .iter()
+                .any(|a| a == "--crate-name=build_script_build")
+            || has_env("CARGO_CRATE_NAME", Some("build_script_build"));
+        if is_build_script {
+            return Some(ToolKind::BuildScriptCompile);
+        }
+        return Some(ToolKind::Rustc);
+    }
+
+    // 3. build-script-build execution
+    if bin.starts_with("build-script-")
+        || bin.starts_with("build_script_")
+        || (first.contains("/build/")
+            && has_env("OUT_DIR", None)
+            && has_env("CARGO_MANIFEST_DIR", None))
+    {
+        return Some(ToolKind::BuildScriptRun);
+    }
+
+    // 4. Dedicated linkers
+    if matches!(
+        bin,
+        "ld" | "ld.lld" | "lld" | "rust-lld" | "wild" | "mold" | "collect2"
+    ) {
+        return Some(ToolKind::Linker);
+    }
+
+    // 5. Archive tools
+    if matches!(bin, "ar" | "llvm-ar" | "gcc-ar" | "ranlib" | "llvm-ranlib") {
+        return Some(ToolKind::NativeAr);
+    }
+
+    // 6. C / C++ compilers vs driver-invoked linker
+    let is_cc = matches!(bin, "cc" | "gcc" | "clang");
+    let is_cxx = matches!(bin, "c++" | "g++" | "clang++");
+    if is_cc || is_cxx {
+        let has_compile_only = args_escaped
+            .iter()
+            .any(|a| a == "-c" || a == "-S" || a == "-E");
+        let has_linker_inputs = args_escaped.iter().any(|a| {
+            a.starts_with("-Wl,")
+                || a.ends_with(".rlib")
+                || a.ends_with(".o")
+                || a.ends_with(".a")
+                || a.contains("symbols.o")
+        });
+        if !has_compile_only && has_linker_inputs {
+            return Some(ToolKind::Linker);
+        }
+        return Some(if is_cxx {
+            ToolKind::NativeCxx
+        } else {
+            ToolKind::NativeCc
+        });
+    }
+
+    // 7. nextest binary or cargo nextest subcommand
+    if bin == "cargo-nextest" {
+        return Some(ToolKind::Nextest);
+    }
+    if bin == "cargo" {
+        let subcmd = args_escaped
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .map(String::as_str);
+        return match subcmd {
+            Some("nextest") => Some(ToolKind::Nextest),
+            Some("doc" | "rustdoc") => Some(ToolKind::Rustdoc),
+            Some(_) => Some(ToolKind::CargoWholeCommand),
+            None => None,
+        };
+    }
+
+    None
 }
 
 /// Normalized process outcome, preserving signal-vs-exit semantics.
@@ -78,6 +229,30 @@ pub struct InvocationRecord {
 pub const INVOCATION_RECORD_VERSION: u32 = 1;
 
 impl InvocationRecord {
+    /// Classify the tool context from raw `argv`/`env` (bead B003) and capture
+    /// a redacted [`InvocationRecord`] if the invocation belongs to one of the
+    /// ten RABS tool contexts.
+    #[must_use]
+    pub fn capture_classified(
+        argv: &[RawBytes],
+        env: &[(RawBytes, RawBytes)],
+        cwd: &RawBytes,
+        home: &str,
+        outcome: NormalizedOutcome,
+        duration_ms: u64,
+    ) -> Option<Self> {
+        let tool = classify_tool_context(argv, env)?;
+        Some(Self::capture(
+            tool,
+            argv,
+            env,
+            cwd,
+            home,
+            outcome,
+            duration_ms,
+        ))
+    }
+
     /// Capture a record from raw observations, applying redaction and
     /// digesting the raw bytes. This is the ONLY constructor on purpose.
     #[must_use]
@@ -301,5 +476,93 @@ mod tests {
         let entry = lookup(SchemaDomain::Protocol, "rabs.invocation-record")
             .expect("invocation-record schema must be registered (A005)");
         assert_eq!(entry.version, INVOCATION_RECORD_VERSION);
+    }
+
+    #[test]
+    fn b003_classifies_and_captures_all_ten_tool_contexts() {
+        type ToolCase<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], ToolKind);
+        let cases: &[ToolCase<'_>] = &[
+            (
+                &["rustc", "--crate-name", "rabs_key", "src/lib.rs"],
+                &[],
+                ToolKind::Rustc,
+            ),
+            (
+                &["rustdoc", "--crate-name", "rabs_key", "src/lib.rs"],
+                &[],
+                ToolKind::Rustdoc,
+            ),
+            (
+                &[
+                    "cc",
+                    "-Wl,--as-needed",
+                    "target/debug/deps/rabs.o",
+                    "-o",
+                    "target/debug/rabs",
+                ],
+                &[],
+                ToolKind::Linker,
+            ),
+            (
+                &["rustc", "--crate-name", "build_script_build", "build.rs"],
+                &[],
+                ToolKind::BuildScriptCompile,
+            ),
+            (
+                &["target/debug/build/zstd-sys-123/build-script-build"],
+                &[
+                    ("OUT_DIR", "/tmp/out"),
+                    ("CARGO_MANIFEST_DIR", "/work/zstd-sys"),
+                ],
+                ToolKind::BuildScriptRun,
+            ),
+            (
+                &["clang", "-c", "-O2", "src/compress.c", "-o", "compress.o"],
+                &[],
+                ToolKind::NativeCc,
+            ),
+            (
+                &["clang++", "-c", "-O2", "src/bridge.cc", "-o", "bridge.o"],
+                &[],
+                ToolKind::NativeCxx,
+            ),
+            (
+                &["llvm-ar", "crs", "libzstd.a", "compress.o"],
+                &[],
+                ToolKind::NativeAr,
+            ),
+            (
+                &["cargo", "check", "--workspace"],
+                &[],
+                ToolKind::CargoWholeCommand,
+            ),
+            (
+                &["cargo", "nextest", "run", "--workspace"],
+                &[],
+                ToolKind::Nextest,
+            ),
+        ];
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (argv_strs, env_strs, expected) in cases {
+            let argv: Vec<RawBytes> = argv_strs.iter().map(|s| RawBytes::from(*s)).collect();
+            let env: Vec<(RawBytes, RawBytes)> = env_strs
+                .iter()
+                .map(|(k, v)| (RawBytes::from(*k), RawBytes::from(*v)))
+                .collect();
+            let rec = InvocationRecord::capture_classified(
+                &argv,
+                &env,
+                &RawBytes::from("/Users/alice/work/repo"),
+                "/Users/alice",
+                NormalizedOutcome::Exited(0),
+                42,
+            )
+            .expect("must classify tool context");
+            assert_eq!(rec.tool, *expected);
+            assert_eq!(ToolKind::from_str_name(rec.tool.as_str()), Some(*expected));
+            seen.insert(rec.tool);
+        }
+        assert_eq!(seen.len(), ToolKind::ALL.len());
     }
 }

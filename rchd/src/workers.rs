@@ -15,9 +15,9 @@ use rch_common::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard, watch};
 use tracing::debug;
 
 // Sized for a *loaded* worker, not an idle one.
@@ -399,6 +399,9 @@ enum DrainCompletionAction {
 pub struct WorkerState {
     /// Worker configuration.
     pub config: RwLock<WorkerConfig>,
+    /// Runtime-only identity: restored ownership must not reuse a generation
+    /// from another daemon lifetime or a removed and reintroduced worker.
+    endpoint_incarnation: Arc<WorkerEndpointIncarnation>,
     /// Authoritative worker lifecycle — the two-axis (admin intent + live
     /// eligibility) model from [`WorkerLifecycle`].
     ///
@@ -455,6 +458,9 @@ pub struct WorkerState {
     pressure_assessment: RwLock<PressureAssessment>,
     /// Disk budget shared by all workers created by the same daemon pool.
     disk_slot_policy: DiskSlotPolicy,
+    /// Until this instant, a worker with no disk capacity sample gets no
+    /// slots. `None` (tests, embedded pools) keeps the configured ceiling.
+    unmeasured_capacity_hold_until: std::sync::Mutex<Option<std::time::Instant>>,
     /// Reason for disabling this worker (if disabled).
     disabled_reason: RwLock<Option<String>>,
     /// Administrative intent to apply when a draining worker reaches zero slots.
@@ -479,6 +485,77 @@ pub(crate) struct CapabilityProbeContext {
     generation: u64,
 }
 
+/// Configuration and identity of the endpoint a network operation actually used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct WorkerEndpointSnapshot {
+    pub config: WorkerConfig,
+    #[serde(skip)]
+    pub generation: u64,
+    #[serde(skip)]
+    incarnation: Option<Arc<WorkerEndpointIncarnation>>,
+}
+
+#[derive(Debug)]
+struct WorkerEndpointIncarnation {
+    generation: AtomicU64,
+    retired: AtomicBool,
+}
+
+/// Stable coordinates used by durable filesystem obligations. CPU capacity
+/// and descriptive tags do not change the filesystem that failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerEndpointIdentity {
+    pub id: WorkerId,
+    pub host: String,
+    pub user: String,
+    pub identity_file: String,
+    pub declared_os: Option<String>,
+}
+
+impl WorkerEndpointIdentity {
+    pub(crate) fn from_config(config: &WorkerConfig) -> Self {
+        Self {
+            id: config.id.clone(),
+            host: config.host.clone(),
+            user: config.user.clone(),
+            identity_file: config.identity_file.clone(),
+            declared_os: rch_common::declared_os(&config.tags),
+        }
+    }
+
+    pub(crate) fn matches_config(&self, config: &WorkerConfig) -> bool {
+        self.id == config.id
+            && self.host == config.host
+            && self.user == config.user
+            && self.identity_file == config.identity_file
+            && self.declared_os == rch_common::declared_os(&config.tags)
+    }
+}
+
+impl WorkerEndpointSnapshot {
+    pub(crate) fn has_runtime_identity(&self) -> bool {
+        self.incarnation.is_some()
+    }
+
+    /// Retain a known retarget in durable decisions before process-local
+    /// generation evidence is lost on restart. Retirement alone is not a
+    /// retarget: the same filesystem may return after inventory removal.
+    pub(crate) fn source_was_retargeted(&self) -> bool {
+        self.incarnation.as_ref().is_some_and(|incarnation| {
+            self.generation != incarnation.generation.load(Ordering::Acquire)
+        })
+    }
+}
+
+fn same_endpoint(left: &WorkerConfig, right: &WorkerConfig) -> bool {
+    left.id == right.id
+        && left.host == right.host
+        && left.user == right.user
+        && left.identity_file == right.identity_file
+        && rch_common::declared_os(&left.tags) == rch_common::declared_os(&right.tags)
+}
+
 impl WorkerState {
     /// Create a new worker state from configuration.
     pub fn new(config: WorkerConfig) -> Self {
@@ -491,6 +568,10 @@ impl WorkerState {
     fn with_disk_slot_policy(config: WorkerConfig, disk_slot_policy: DiskSlotPolicy) -> Self {
         Self {
             config: RwLock::new(config),
+            endpoint_incarnation: Arc::new(WorkerEndpointIncarnation {
+                generation: AtomicU64::new(0),
+                retired: AtomicBool::new(false),
+            }),
             lifecycle: RwLock::new(WorkerLifecycle::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
@@ -505,19 +586,108 @@ impl WorkerState {
             toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
             disk_slot_policy,
+            unmeasured_capacity_hold_until: std::sync::Mutex::new(None),
             disabled_reason: RwLock::new(None),
             drain_completion: RwLock::new(DrainCompletionAction::default()),
             disabled_at: AtomicI64::new(0),
         }
     }
 
-    /// Update worker configuration.
-    pub async fn update_config(&self, new_config: WorkerConfig) {
-        {
-            let mut config = self.config.write().await;
-            self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
-            *config = new_config;
+    /// Snapshot the endpoint without retaining a configuration lock during I/O.
+    pub(crate) async fn endpoint_snapshot(&self) -> WorkerEndpointSnapshot {
+        let config = self.config.read().await;
+        WorkerEndpointSnapshot {
+            config: config.clone(),
+            generation: self.endpoint_incarnation.generation.load(Ordering::Acquire),
+            incarnation: Some(Arc::clone(&self.endpoint_incarnation)),
         }
+    }
+
+    /// Fence publication against retargeting, including an A -> B -> A change.
+    /// Hold the returned guard only for local state updates, never network I/O
+    /// or a method that reacquires `config`.
+    pub(crate) async fn lock_current_endpoint(
+        &self,
+        snapshot: &WorkerEndpointSnapshot,
+    ) -> Option<RwLockReadGuard<'_, WorkerConfig>> {
+        let config = self.config.read().await;
+        (!self.endpoint_incarnation.retired.load(Ordering::Acquire)
+            && snapshot
+                .incarnation
+                .as_ref()
+                .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
+            && snapshot.generation == self.endpoint_incarnation.generation.load(Ordering::Acquire)
+            && same_endpoint(&config, &snapshot.config))
+        .then_some(config)
+    }
+
+    /// Durable filesystem failures survive daemon restart and inventory
+    /// removal. A live retarget invalidates their publication, including ABA.
+    /// A retired incarnation that never retargeted may resume its deferred
+    /// obligation on matching coordinates; this does not authorize health or
+    /// cache feedback from the old build.
+    pub(crate) async fn lock_disk_fault_endpoint(
+        &self,
+        identity: &WorkerEndpointIdentity,
+        runtime: Option<&WorkerEndpointSnapshot>,
+    ) -> Option<RwLockReadGuard<'_, WorkerConfig>> {
+        let config = self.config.read().await;
+        let runtime_matches = runtime.is_none_or(|snapshot| {
+            snapshot.incarnation.as_ref().is_some_and(|incarnation| {
+                snapshot.generation == incarnation.generation.load(Ordering::Acquire)
+                    && (Arc::ptr_eq(incarnation, &self.endpoint_incarnation)
+                        || incarnation.retired.load(Ordering::Acquire))
+            })
+        });
+        (!self.endpoint_incarnation.retired.load(Ordering::Acquire)
+            && identity.matches_config(&config)
+            && runtime_matches)
+            .then_some(config)
+    }
+
+    pub(crate) fn is_endpoint_retired(&self) -> bool {
+        self.endpoint_incarnation.retired.load(Ordering::Acquire)
+    }
+
+    /// Pool removal uses workers -> config order. A publication that already
+    /// holds this config lock finishes before removal; one waiting elsewhere
+    /// can never credit the ID after a replacement is installed.
+    async fn retire_endpoint(&self) {
+        let _config = self.config.write().await;
+        self.endpoint_incarnation
+            .retired
+            .store(true, Ordering::Release);
+    }
+
+    /// Update configuration, returning whether the connection endpoint changed.
+    pub async fn update_config(&self, new_config: WorkerConfig) -> bool {
+        let endpoint_changed = {
+            let mut config = self.config.write().await;
+            let endpoint_changed = !same_endpoint(&config, &new_config);
+            self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
+            if endpoint_changed {
+                self.endpoint_incarnation
+                    .generation
+                    .fetch_add(1, Ordering::AcqRel);
+                // Observations of the previous host/key/OS cannot condemn (or
+                // qualify) its replacement. Preserve build ownership and the
+                // operator's administrative intent, including an active bypass.
+                *self.circuit.write().await = CircuitStats::new();
+                *self.last_error_msg.write().await = None;
+                self.last_latency_ms.store(0, Ordering::Relaxed);
+                self.cached_projects.write().await.clear();
+                self.toolchain_preflight.write().await.clear();
+                *self.capabilities.write().await = WorkerCapabilities::new();
+                *self.disk_capacity_observation.write().await = None;
+                *self.pressure_assessment.write().await = PressureAssessment::default();
+                self.lifecycle
+                    .write()
+                    .await
+                    .observe_health(EligibilityState::Unreachable);
+            }
+            *config = new_config;
+            endpoint_changed
+        };
 
         let cancelled_pending_removal = {
             let mut completion = self.drain_completion.write().await;
@@ -537,6 +707,7 @@ impl WorkerState {
                 lifecycle.set_admin(AdminIntent::Active);
             }
         }
+        endpoint_changed
     }
 
     /// Get the current worker status as the legacy single-axis [`WorkerStatus`].
@@ -621,8 +792,39 @@ impl WorkerState {
     pub async fn effective_total_slots(&self) -> u32 {
         let config = self.config.read().await;
         let pressure = self.pressure_assessment.read().await;
-        self.disk_slot_policy
-            .effective_slots(config.total_slots, &pressure)
+        self.slots_for(config.total_slots, &pressure)
+    }
+
+    /// Hold this worker at zero slots until its first disk capacity sample,
+    /// or until `hold` elapses, whichever comes first.
+    pub(crate) fn hold_until_capacity_measured(&self, hold: std::time::Duration) {
+        *self
+            .unmeasured_capacity_hold_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now().checked_add(hold);
+    }
+
+    /// Disk-derated slots. A restarted daemon knows no worker's disk until the
+    /// first capability probe lands, and `effective_slots` then grants the full
+    /// configured ceiling. On 2026-10-16 a drain-restart of every dispatcher
+    /// re-added a 193 GB worker with 12 GB free at its full 3 slots; one mtdt
+    /// source sync was admitted and filled the disk to 0. While the hold is
+    /// active, an unmeasured worker gets no slots. A worker whose telemetry
+    /// never arrives keeps the previous fail-open ceiling after the hold.
+    fn slots_for(&self, configured: u32, pressure: &PressureAssessment) -> u32 {
+        let measured = pressure
+            .capacity_free_gb()
+            .is_some_and(|free| free.is_finite());
+        let held = !measured
+            && self
+                .unmeasured_capacity_hold_until
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|until| std::time::Instant::now() < until);
+        if held {
+            return 0;
+        }
+        self.disk_slot_policy.effective_slots(configured, pressure)
     }
 
     /// Available slots after disk derating and existing reservations.
@@ -666,9 +868,7 @@ impl WorkerState {
             }
             let config = self.config.read().await;
             let pressure = self.pressure_assessment.read().await;
-            let total_slots = self
-                .disk_slot_policy
-                .effective_slots(config.total_slots, &pressure);
+            let total_slots = self.slots_for(config.total_slots, &pressure);
             let Some(next) = current.checked_add(count) else {
                 return false;
             };
@@ -958,7 +1158,7 @@ impl WorkerState {
             context.started_at,
         );
         *self.disk_capacity_observation.write().await = observation;
-        let pressure_config = DiskPressurePolicyConfig::default();
+        let pressure_config = DiskPressurePolicyConfig::configured();
         let pressure = evaluate_pressure_policy(&capabilities, None, &pressure_config);
         *self.capabilities.write().await = capabilities;
 
@@ -1252,6 +1452,9 @@ impl ToolchainPreflightStatus {
     }
 }
 
+/// Upper bound on per-worker project lanes: each lane is a full extra mirror.
+pub const MAX_PROJECT_LANES: u32 = 8;
+
 /// Pool of all workers.
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -1264,6 +1467,12 @@ pub struct WorkerPool {
     /// Track worker count atomically for sync access.
     worker_count: Arc<AtomicUsize>,
     disk_slot_policy: DiskSlotPolicy,
+    /// Zero-slot hold for each newly added worker until its first disk sample.
+    unmeasured_capacity_hold: Option<std::time::Duration>,
+    /// Per-worker project lanes from daemon.toml `[project_lanes]` (bd-sgvod).
+    project_lanes: Arc<std::sync::RwLock<HashMap<String, u32>>>,
+    /// Broadcast retargets to health and bypass recovery even while they probe.
+    endpoint_changes: watch::Sender<u64>,
 }
 
 impl WorkerPool {
@@ -1279,7 +1488,48 @@ impl WorkerPool {
             recovered_absent_slots: Arc::new(RwLock::new(HashMap::new())),
             worker_count: Arc::new(AtomicUsize::new(0)),
             disk_slot_policy: DiskSlotPolicy::from(config),
+            unmeasured_capacity_hold: None,
+            project_lanes: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            endpoint_changes: watch::channel(0).0,
         }
+    }
+
+    /// Replace the per-worker project lane counts (`[project_lanes]` in
+    /// daemon.toml, bd-sgvod). Unlisted workers keep one lane.
+    pub fn set_project_lanes(&self, lanes: HashMap<String, u32>) {
+        *self
+            .project_lanes
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = lanes;
+    }
+
+    /// How many builds of one project this worker may run at once, each in its
+    /// own mirror (`<root>.rch-lane-<k>`). At least 1, at most
+    /// [`MAX_PROJECT_LANES`].
+    pub fn project_lanes(&self, worker_id: &str) -> u32 {
+        self.project_lanes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(worker_id)
+            .copied()
+            .unwrap_or(1)
+            .clamp(1, MAX_PROJECT_LANES)
+    }
+
+    /// Give every worker this pool adds a zero-slot hold until its first disk
+    /// capacity sample, bounded by `hold` (see [`WorkerState::slots_for`]).
+    pub fn with_unmeasured_capacity_hold(mut self, hold: std::time::Duration) -> Self {
+        self.unmeasured_capacity_hold = Some(hold);
+        self
+    }
+
+    pub(crate) fn subscribe_endpoint_changes(&self) -> watch::Receiver<u64> {
+        self.endpoint_changes.subscribe()
+    }
+
+    fn notify_endpoint_change(&self) {
+        self.endpoint_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Add a worker to the pool.
@@ -1290,7 +1540,9 @@ impl WorkerPool {
             let workers = self.workers.read().await;
             if let Some(existing) = workers.get(&id) {
                 debug!("Updating existing worker: {}", id);
-                existing.update_config(config).await;
+                if existing.update_config(config).await {
+                    self.notify_endpoint_change();
+                }
                 return;
             }
         }
@@ -1299,13 +1551,18 @@ impl WorkerPool {
             config,
             self.disk_slot_policy,
         ));
+        if let Some(hold) = self.unmeasured_capacity_hold {
+            state.hold_until_capacity_measured(hold);
+        }
         let mut workers = self.workers.write().await;
         // Check again under write lock
         if let Some(existing) = workers.get(&id) {
             // Race condition: added between read and write lock
             // Just update config on the existing one, drop the new state
             let config = state.config.read().await.clone();
-            existing.update_config(config).await;
+            if existing.update_config(config).await {
+                self.notify_endpoint_change();
+            }
         } else {
             // Publish a reintroduced worker only after restoring its surviving
             // builds. Holding the registry's write lock makes this transfer
@@ -1325,6 +1582,7 @@ impl WorkerPool {
             workers.insert(id.clone(), state);
             self.worker_count.fetch_add(1, Ordering::SeqCst);
             debug!("Added worker: {}", id);
+            self.notify_endpoint_change();
         }
     }
 
@@ -1342,7 +1600,9 @@ impl WorkerPool {
     /// Remove a worker from the pool.
     pub async fn remove_worker(&self, id: &WorkerId) -> bool {
         let mut workers = self.workers.write().await;
-        if workers.remove(id).is_some() {
+        if let Some(worker) = workers.get(id) {
+            worker.retire_endpoint().await;
+            workers.remove(id);
             self.worker_count.fetch_sub(1, Ordering::SeqCst);
             debug!("Removed worker: {}", id);
             true
@@ -1390,7 +1650,9 @@ impl WorkerPool {
             let should_remove = worker.status().await == WorkerStatus::Drained
                 && worker.used_slots() == 0
                 && worker.remove_after_drain_pending().await;
-            if should_remove && workers.remove(&id).is_some() {
+            if should_remove {
+                worker.retire_endpoint().await;
+                workers.remove(&id);
                 count += 1;
                 debug!("Pruned drained worker: {}", id);
             }
@@ -1901,6 +2163,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_freshly_added_worker_gets_no_slots_until_its_disk_is_measured() {
+        // Daemon startup: every worker is re-added with unknown disk. Without
+        // the hold, a 12 GB-free worker took its full ceiling and one source
+        // sync filled it (2026-10-16).
+        let selection = rch_common::SelectionConfig {
+            min_free_gb: Some(10.0),
+            disk_gb_per_slot: 5.0,
+            ..Default::default()
+        };
+        let pool = WorkerPool::with_selection_config(&selection)
+            .with_unmeasured_capacity_hold(std::time::Duration::from_secs(120));
+        pool.add_worker(recovered_worker_config("unmeasured", 3))
+            .await;
+        let worker = pool.get(&WorkerId::new("unmeasured")).await.unwrap();
+        assert_eq!(worker.effective_total_slots().await, 0);
+        assert_eq!(worker.available_slots().await, 0);
+        assert!(!worker.reserve_slots(1).await);
+        // Startup re-adoption of durable ownership is not an admission.
+        worker.restore_slots(1).unwrap();
+        assert_eq!(worker.used_slots(), 1);
+
+        // The first sample ends the hold and the normal disk math applies:
+        // floor((22 - 10) / 5) = 2 of 3.
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: crate::disk_pressure::PressureState::Warning,
+                telemetry_fresh: true,
+                disk_free_gb: Some(22.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(worker.effective_total_slots().await, 2);
+        assert!(worker.reserve_slots(1).await);
+
+        // A worker whose telemetry never arrives regains the configured
+        // ceiling once the hold lapses (the previous behaviour).
+        pool.add_worker(recovered_worker_config("never-measured", 3))
+            .await;
+        let silent = pool.get(&WorkerId::new("never-measured")).await.unwrap();
+        assert_eq!(silent.effective_total_slots().await, 0);
+        silent.hold_until_capacity_measured(std::time::Duration::ZERO);
+        assert_eq!(silent.effective_total_slots().await, 3);
+
+        // Pools built without a hold (tests, embedded use) are unchanged.
+        let plain = WorkerPool::with_selection_config(&selection);
+        plain.add_worker(recovered_worker_config("plain", 3)).await;
+        let plain = plain.get(&WorkerId::new("plain")).await.unwrap();
+        assert_eq!(plain.effective_total_slots().await, 3);
+    }
+
+    #[tokio::test]
     async fn declared_disk_budget_observation_is_live_and_invalidated_by_capability_updates() {
         use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
         let worker = WorkerState::new(recovered_worker_config("disk-worker", 8));
@@ -1914,6 +2227,7 @@ mod tests {
             .await;
         let first = DiskHeadroomAdmission {
             requested_gib: 64,
+            floor_gib: 0,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(first.check("disk-worker", 0).is_ok());
@@ -1940,6 +2254,7 @@ mod tests {
         );
         let second = DiskHeadroomAdmission {
             requested_gib: 64,
+            floor_gib: 0,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(matches!(
@@ -1968,6 +2283,7 @@ mod tests {
             .await;
         let before_reload = DiskHeadroomAdmission {
             requested_gib: 64,
+            floor_gib: 0,
             capacity: worker.disk_capacity_observation().await,
         };
         let mut config = recovered_worker_config("disk-worker", 8);
@@ -2012,6 +2328,7 @@ mod tests {
         assert_eq!(
             DiskHeadroomAdmission {
                 requested_gib: 64,
+                floor_gib: 0,
                 capacity: worker.disk_capacity_observation().await,
             }
             .check("disk-worker", 0),
@@ -2242,6 +2559,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -3830,6 +4148,100 @@ mod tests {
         let config = state.config.read().await;
         assert_eq!(config.total_slots, 16);
         assert_eq!(config.priority, 200);
+    }
+
+    #[tokio::test]
+    async fn endpoint_retarget_invalidates_old_and_aba_probe_results() {
+        let state = WorkerState::new(test_config("retarget"));
+        let original = state.endpoint_snapshot().await;
+        let mut replacement = original.config.clone();
+        replacement.host = "replacement.host".to_string();
+        assert!(state.update_config(replacement).await);
+        assert!(state.lock_current_endpoint(&original).await.is_none());
+
+        let intermediate = state.endpoint_snapshot().await;
+        assert!(state.update_config(original.config.clone()).await);
+        assert!(state.lock_current_endpoint(&original).await.is_none());
+        assert!(state.lock_current_endpoint(&intermediate).await.is_none());
+        let current = state.endpoint_snapshot().await;
+        assert!(state.lock_current_endpoint(&current).await.is_some());
+
+        let mut capacity_edit = current.config.clone();
+        capacity_edit.total_slots += 1;
+        capacity_edit.priority += 1;
+        assert!(!state.update_config(capacity_edit).await);
+        assert!(state.lock_current_endpoint(&current).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn endpoint_retarget_resets_observations_but_preserves_ownership_and_admin_intent() {
+        for disabled in [false, true] {
+            let state = WorkerState::new(test_config("retarget"));
+            assert!(state.reserve_slots(2).await);
+            state
+                .record_failure(Some("old host authentication stalled".into()))
+                .await;
+            state.set_last_latency_ms(Some(25_000));
+            state
+                .cached_projects
+                .write()
+                .await
+                .push("old-project".into());
+            state
+                .record_toolchain_preflight("old-toolchain".into(), false, Some("old host".into()))
+                .await;
+            let mut capabilities = WorkerCapabilities::new();
+            capabilities.rustc_version = Some("old-rustc".into());
+            state.set_capabilities(capabilities).await;
+            state.enter_bypass(BypassFailureClass::Ssh).await;
+            if disabled {
+                state.disable(Some("operator maintenance".into())).await;
+            }
+            let previous_admin = state.lifecycle().await.admin;
+            let previous_reason = state.disabled_reason().await;
+            let mut replacement = state.endpoint_snapshot().await.config;
+            replacement.host = "new-lan-address".into();
+            replacement.total_slots = 1;
+            assert!(state.update_config(replacement).await);
+
+            assert_eq!(state.used_slots(), 2, "old builds retain slot ownership");
+            assert_eq!(state.available_slots().await, 0);
+            assert_eq!(state.lifecycle().await.admin, previous_admin);
+            assert_eq!(state.disabled_reason().await, previous_reason);
+            assert_eq!(state.eligibility().await, EligibilityState::TemporaryBypass);
+            assert_eq!(state.circuit_stats().await.consecutive_failures(), 0);
+            assert!(state.last_error().await.is_none());
+            assert!(state.last_latency_ms().is_none());
+            assert!(state.cached_projects.read().await.is_empty());
+            assert!(
+                state
+                    .toolchain_preflight_status("old-toolchain")
+                    .await
+                    .is_none()
+            );
+            assert!(state.capabilities().await.rustc_version.is_none());
+            state.release_slots(2).await;
+            assert_eq!(state.used_slots(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_changes_notify_all_monitors_without_losing_busy_subscribers() {
+        let pool = WorkerPool::new();
+        let mut config = test_config("watched");
+        pool.add_worker(config.clone()).await;
+        let mut health = pool.subscribe_endpoint_changes();
+        let mut recovery = pool.subscribe_endpoint_changes();
+        config.priority += 1;
+        pool.add_worker(config.clone()).await;
+        assert!(!health.has_changed().unwrap());
+        config.identity_file = "/new/key".into();
+        pool.add_worker(config).await;
+        assert!(health.has_changed().unwrap());
+        assert!(recovery.has_changed().unwrap());
+        health.changed().await.unwrap();
+        recovery.changed().await.unwrap();
+        assert_eq!(*health.borrow_and_update(), *recovery.borrow_and_update());
     }
 
     #[tokio::test]

@@ -48,6 +48,7 @@ RCH currently recognizes and can offload:
 |---|---|
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
+| Go | `go build -o <file>`, ordinary `go test`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
@@ -59,6 +60,34 @@ with Bun/Node). Nix outputs stay in the worker's `/nix/store` behind a `result`
 symlink, so these run as streaming, exit-status-only commands (no artifacts are
 copied back — the flake source is synced out, the build runs, the result stays
 remote).
+
+Go builds support an explicit, project-relative **file** output, for example
+`go build -o bin/app ./cmd/app` or `go build -o 'products/app [dev]*?' main.go`.
+The output is returned to that exact path, including when `CARGO_TARGET_DIR` is
+set. Common build flags such as `-p`, `-tags`, `-trimpath`, and `-race` are
+supported, as are linker stripping flags (`-ldflags '-s -w'`) and `-X` variable
+definitions. Builds require the durable Unix execution path and a local Go
+installation. Both endpoints must report empty effective `GOFLAGS` and the
+dispatcher's native `GOOS`/`GOARCH`. The caller's selected Go version, CGO
+configuration, experiments, and architecture tuning settings are captured
+before upload and must match the worker exactly before compilation starts.
+Ordinary builds with CGO enabled remain supported when those settings match.
+
+The worker compiles into a fresh private file outside the source root, preserving
+wildcard `go:embed` inputs. Only after successful compilation produces a regular
+file does it create output parents and an adjacent stage for atomic replacement
+of the previous worker file. Retrieval then stages and validates that file before
+replacing the local output. A missing download cannot be satisfied by an old
+local binary, and durable recovery resumes collection without rerunning Go.
+Directory outputs, symlinks or symlinked output parents, cross compilation,
+native-library modes such as `c-shared`/`c-archive`, and low-level flags that can
+create extra files are outside this output contract. Implicit forms such as
+`go build`, `go build .`, and `go build ./...` stay local because their output
+names depend on which packages they select. Go test options that write binaries,
+profiles, or fuzz corpora (`-c`, `-o`, `-coverprofile`, `-cpuprofile`, `-trace`,
+`-fuzz`, and related flags, including `-test.*` forms after `-args`) also stay
+local. Strict remote mode refuses
+unsupported forms instead of executing them locally.
 
 RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 
@@ -135,6 +164,12 @@ RCH now includes a deterministic reliability stack for multi-repo and multi-work
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
+
+The installer also refreshes the `rch` agent skill in `~/.claude/skills/rch`
+and `~/.codex/skills/rch`. It leaves both directories untouched when `jsm`
+reports that it manages an installed `rch` skill, or when you pass
+`--skip-skill` (or set `RCH_SKIP_SKILL=1`, which suits unattended updaters).
+Skipping the skill never affects the binaries, the hook or the daemon.
 
 ### From Source
 
@@ -301,6 +336,66 @@ rch capabilities --json
 rch robot-docs guide
 ```
 
+### Named Cargo JSON for installer consumers
+
+An installer selecting explicit binary targets can request caller-visible
+Cargo JSON through the canonical Cargo shim:
+
+```bash
+RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1 cargo build --locked --release \
+  --bin my-tool --bin my-alias --message-format=json,json-render-diagnostics
+```
+
+This opt-in requires the durable POSIX worker route and refuses local fallback,
+arbitrary jobs, machine envelopes, and unsupported target selections. Selected
+binary records reach stdout after artifact publication and acknowledged worker
+release. Their executable, filenames, manifest, and source paths refer to the
+caller tree. Selected output files are copied into an invocation-private retained
+directory beneath the caller's actual target root and checked against the exact
+publication fingerprints. A later build cannot replace these copies by publishing
+into the shared target paths. Each record carries an `rch` extension retaining the original worker
+record, exact retained stdout receipt, wrapper/build identity, and executable
+BLAKE3 publication fingerprint. Unselected dependency records keep their worker
+metadata and do not assert local delivery of intermediates. Diagnostics stay on
+stderr. Compiler failure stdout comes from the same invocation's immutable
+nonzero completion receipt; a successful compile with failed artifact delivery
+advertises no caller-local success records. The ordinary hook and `rch --json
+exec` envelope contracts are unchanged.
+
+The delivery JSON, its private file paths, and their fingerprints are persisted
+before source retirement and worker release. After the original wrapper has
+exited, recover that same invocation without compiling again:
+
+```bash
+rch jobs recover ORIGINAL_WRAPPER_ID --cargo-json
+```
+
+This explicit output mode requires an invocation originally admitted with
+`RCH_CARGO_JSON_STDOUT=1`; it cannot upgrade an ordinary job. It returns verified
+retained stdout only after the original recovery and acknowledgement complete,
+and uses the original exit status. Repeating it returns the first delivery's
+exact JSON bytes and private paths, including after later builds or a failed
+stdout write. A live unacknowledged wrapper or unknown owner identity refuses
+detached recovery. `--json` machine envelopes conflict with `--cargo-json`.
+The complete compiler stderr is collected from the same supervisor log with
+the original completion status and retained before retirement. Its path,
+length, BLAKE3 and compiler status appear in the selected record's receipt.
+Recovery verifies those bytes and writes them to stderr without line or UTF-8
+conversion. Failed compiler stdout and stderr use the exact nonzero completion;
+no successful Cargo record is advertised when artifact delivery failed. Older
+completed journals lacking retained diagnostics refuse this explicit output
+mode rather than fabricate diagnostic parity.
+
+Use the exit status together with the record binding. This route does not
+provide native Windows delivery, an installer transaction, a source-content
+receipt, or performance qualification. `scripts/e2e_cargo_json_stdout.py` checks
+the actual shim, retained producer bytes, both real native binaries, cached
+delivery, completed same-id stdout recovery, a broken stdout pipe, and a genuine
+Cargo target-selection failure against an externally
+admitted source and artifact root. No test result is implied by this description.
+Wrapper-loss, pending recovery, cancellation, full installers, native Windows,
+and same-invocation live-incumbent/A/A performance acceptance remain open.
+
 ### Job Mode (non-compilation workloads)
 
 `rch exec --job` admits an arbitrary NON-compilation workload (sharded tests,
@@ -320,13 +415,31 @@ partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
 job's own exit status. Paths must be repository-relative; conflicts with
 `--clean-overlay` / `--source-content-receipt` are refused.
 
+Native Apple commands can use job mode too: direct `xcodebuild` and `xcrun`
+invocations require a worker declaring `os = "darwin"`. This preserves the OS
+fence: ordinary jobs cannot consume that worker, and Linux workers cannot take
+an Xcode job. Invoke the tool directly; RCH does not inspect arbitrary scripts
+or infer a Mac requirement from text merely mentioning Xcode.
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_BUILD_SLOTS=1 rch exec --job -- \
+  xcodebuild -project ios/App.xcodeproj -scheme App -jobs 1 build
+```
+
+This is host routing, not proof that Xcode, signing credentials, or a Simulator
+are ready. Native test and Simulator safety checks still apply. Both `rch` and
+`rchd` need the native-command routing support; keep explicit strict-remote
+mode when qualifying a build so an older daemon cannot silently run it locally.
+
 #### Requiring a verified tool
 
-A job that needs a tool the fleet does not uniformly have can demand a worker
+A compilation or job that needs a tool the fleet does not uniformly have can demand a worker
 that has **verified** it:
 
 ```bash
 rch exec --job --require-tool clang -- ./native_fuzz.sh
+rch exec --require-tool cargo-xwin --require-tool llvm-ar -- \
+  cargo xwin build --locked --release --target x86_64-pc-windows-msvc --bin my-cli
 ```
 
 The gate runs before any slot is reserved, and it is evidence-based: the worker
@@ -339,16 +452,55 @@ make the requirement a default for all of its jobs:
 required_tools = ["clang"]
 ```
 
-Project defaults ADD to `--require-tool` rather than being replaced by it, and
-both apply to job mode only — a project-wide requirement that silently narrowed
-every ordinary build's worker pool would be a surprising way to lose the fleet.
+Project defaults ADD to `--require-tool` in job mode. These `[jobs]` defaults
+apply only to jobs; explicit CLI requirements also apply to compilations while
+preserving their classifier, Rust target and toolchain checks. Any required tool
+makes execution strict remote, including when configuration forces local or
+disables RCH. Both client and daemon must support the verified-tools endpoint;
+an older daemon refuses the request instead of silently ignoring requirements.
 
-`rch admit --job [--require-tool NAME]... -- <command>` preflights the same
+A successful named probe establishes cached tool presence. It does not bind the
+executable bytes, compiler version or SDK inventory used by a particular build.
+
+**Exact Node and Bun versions.** `--require-tool` (alias `--require-toolchain`)
+also accepts `node@VERSION` and `bun@VERSION`, matched against the version each
+worker reports in its capabilities (`rch workers capabilities --refresh`):
+
+```bash
+rch exec --require-toolchain bun@1.3.2 -- bun test
+rch exec --job --require-toolchain node@22.11.0 -- npm test
+```
+
+```toml
+[jobs]
+required_tools = ["node@22.11.0"]   # job mode only, like named tools
+```
+
+The version must be a complete `MAJOR.MINOR.PATCH`; an optional prerelease or
+build suffix must match exactly, and the `v` that `node --version` prints is
+ignored. Ranges, partial versions (`22`, `22.11`) and aliases (`lts`) are
+refused, and a worker that reports no version, or another one, is not
+admitted. Like named tools, the check happens before reservation, makes the
+run strict remote, and only filters: it never reorders workers. It compares
+the version the worker's capability probe found. It does not install runtimes,
+and it does not override a version manager (nvm, fnm, a login profile) that
+picks a different binary when the job runs.
+
+There is no `rust@VERSION`: a worker's default `rustc` says nothing about the
+compiler a job selects. Pin Rust exactly with the toolchain instead, for
+example `channel = "1.90.0"` in `rust-toolchain.toml` (or `RUSTUP_TOOLCHAIN`,
+or `cargo +1.90.0`). RCH sends that toolchain to the worker, only selects a
+worker on which `rustup run <toolchain> rustc --version` and
+`cargo --version` succeed, and runs the build under that toolchain.
+
+`rch admit [--job] [--require-tool NAME]... -- <command>` preflights the same
 decision read-only — it syncs nothing and reserves nothing. Without `--job` the
 preflight consults the compilation classifier, so a fuzz script answers
 `local`; with it the classifier is bypassed exactly as `exec --job` does, and
 the answer is `offload`. The classification facts are still reported, so a
 compilation accidentally passed to `--job` still shows its family.
+This static preflight reports requirements and classification; it does not
+verify current worker readiness or establish native release qualification.
 
 A required name that no worker has verified admits **no worker at all**,
 including when the name is a typo. That is deliberate: silently dropping the
@@ -366,6 +518,76 @@ rch jobs attach <wrapper-id> --timeout-secs 300 # observe the original job
 rch jobs cancel <wrapper-id>                   # cancel the identity-matched job
 rch jobs recover <wrapper-id> --timeout-secs 300
 ```
+
+For an unfinished detached retrieval, the current `[transfer]` configuration
+can extend the original recipe's `max_transfer_time_ms`. Recovery persists a
+larger positive budget under its exclusive journal lock; smaller values never
+shorten the retained budget. Recovery extensions are bounded to 24 hours.
+It keeps the original worker, build, output policy,
+verification settings and ownership evidence, and never replays compilation.
+Set `--timeout-secs` large enough for the entire recovery operation as well;
+that observation deadline is separate from the transfer budget.
+
+```toml
+[transfer]
+max_transfer_time_ms = 900000
+retrieval_staging_dir = "/mnt/controller-storage/rch-retrieval"
+retrieval_min_free_bytes = 67108864
+```
+
+`retrieval_staging_dir` is an absolute durable controller staging base, separate
+from the worker's `remote_base`, the checkout and `TMPDIR`. Unset uses the
+job-lease directory's `retrieval/` subtree. Before downloading, Unix retrieval
+checks the selected uncompressed file size plus `retrieval_min_free_bytes`
+against space available to the controller user. Windows-worker tar retrieval
+also stages its bounded archive there and budgets both the archive and extracted
+outputs while they coexist. This preflight cannot reserve
+space against concurrent writers; a later storage failure remains retryable.
+Failure retains the outputs and ownership and does not acknowledge completion.
+Internal `.rch-clean-overlay-base.tar` source archives are excluded even when
+recovering an older broad Make artifact recipe.
+
+Recovery can redirect an old recipe's staging before any phase has published
+or recorded a pending publication. It leaves the old stage intact and collects
+the same worker outputs into the new location. Once publication begins, a
+location change is refused to preserve its pending and published evidence;
+extend its timeout or provide space on its existing filesystem instead.
+Terminal acknowledgment still requires verified delivery and source release.
+
+`rch --json jobs` reports valid leases alongside `journal_errors`. An unreadable
+or malformed journal, or an entry observed as nonregular, makes `complete` false
+and the command exits 1, while valid jobs remain visible in the same JSON document.
+Each valid row
+also reports `owner_presence` as `live`, `absent` or `unknown`; a false legacy
+`wrapper_alive` value alone does not establish that an owner is absent. The listing
+does not remove, repair or treat the unreadable entry as an absent owner. An
+initially missing journal directory is an empty, complete listing.
+The directory is opened once and journal names are read relative to its file
+descriptor. Journal opens reject symlinks and do not wait for a FIFO writer;
+the opened descriptor must represent a regular file before any bytes are read.
+The directory root itself must be a directory rather than a symlink.
+Initial attach/recover loads and recovery-owner reloads use the same regular-file,
+nofollow, nonblocking reader. A changed parent directory is refused; a FIFO
+cannot block these journal reads while waiting for a writer.
+Detached recovery retains the opened directory and persistent lock through
+journal publication and terminal reporting. Its clones share that ownership;
+reads and atomic writes use the held directory. A replaced directory or lock
+refuses acknowledgement. Failed recovery publications retain their exclusive
+temporary bytes for diagnosis; recovery does not remove them. Ordinary running
+wrappers keep their existing journal writer.
+`complete` describes this scan, not an immutable ownership snapshot: entries
+and regular-file contents can still change during observation.
+If a journal path contains non-UTF-8 bytes, its error has a printable `path`
+and an exact Unix `path_bytes` array. A job command whose output cannot be written
+or flushed exits with an error rather than reporting successful delivery.
+
+Completed/recovered reports include an `admission` reference from one committed
+terminal observation: exact decimal build ID, wrapper, worker, journal path and
+caller fingerprint, matching the ordinary execution reference. Unadmitted
+terminal jobs have `admission: null`. Unknown exit, incomplete identity or
+unacknowledged state cannot become a completed report. This reports journal
+identity/custody; it does not replay the original execution envelope or attest
+compiler, SDK, slots or artifact contents.
 
 These commands never replay the original command. Recovery requires retained
 identity and completion/retrieval evidence; ambiguous or missing evidence is
@@ -513,6 +735,10 @@ compression_level = 3
 # mirror — see `[remediation.pooled_target] store_base` below to place those
 # stores on another filesystem.
 remote_base = "/data/tmp/rch"
+# Optional durable controller staging base (absolute, independent of TMPDIR).
+# retrieval_staging_dir = "/mnt/controller-storage/rch-retrieval"
+# Free-space reserve in addition to the selected uncompressed outputs.
+# retrieval_min_free_bytes = 67108864
 # Optional per-attempt source-sync cap. When unset, the default is payload-aware:
 # 30 seconds plus one second per MiB, capped at one hour.
 # sync_timeout_ms = 120000
@@ -560,6 +786,10 @@ strategy = "balanced"
 # Reserve this much free disk, then budget space for each concurrent slot (GiB).
 min_free_gb = 10.0
 disk_gb_per_slot = 10.0
+# A worker at or below this free-disk ratio gets no slots (rchd reads it at start).
+# disk_critical_free_ratio = 0.05
+# Judge large disks by absolute headroom: the ratio rule applies only at or below this many GB.
+# disk_critical_ratio_cap_gb = 25.0
 
 [self_healing]
 hook_starts_daemon = true
@@ -595,6 +825,20 @@ mounts. Other dispatchers, undeclared jobs, and external writes are outside its
 accounting. The full budget stays reserved even after a disk sample reflects
 some of the build's output, so admission deliberately errs toward leaving extra
 space. The default is `0`, retaining ordinary disk-pressure admission.
+
+Without a declaration, the daemon still learns each project's footprint. For
+every remote build that had a worker to itself (no other build from this
+daemon overlapped there), it records how far the worker's free build-disk
+space fell between the admission probe and the lowest probe seen while the
+build ran. Footprints are kept per project and command class (`cargo test` is
+learned separately from `cargo check`), for 30 days, in
+`history.footprints.json` beside the build history. When some candidate
+worker has room for the largest recent footprint plus 10% (at least 5 GiB),
+after declared budgets and the remaining growth of builds already running
+there, selection only considers those workers. If none has room, selection is
+unchanged. Learned footprints are evidence, not a budget, so they never refuse
+a build. Other dispatchers' builds can inflate a measurement and cache cleanup
+can shrink one; declare `disk_headroom_gib` when you need a hard requirement.
 
 Unix artifact downloads estimate the files matched by the retrieval filters
 before transferring them. Their default total retry budget grows with that size
@@ -634,6 +878,14 @@ builds retain their reservations when capacity drops; new work waits for space.
 `rch workers list` reports the effective total when the daemon is reachable.
 Change the budget with `rch config set selection.disk_gb_per_slot 10` and restart
 the daemon to apply it.
+
+Separately, rchd marks a worker Critical, with no slots at all, when its free
+space falls to `selection.disk_critical_free_ratio` (default `0.05`) or to 10 GB.
+On a 900 GB worker the ratio line is 45 GB. Set `selection.disk_critical_ratio_cap_gb`
+(for example `25.0`) so the ratio rule applies only at or below that many free GB and
+large disks are judged by absolute headroom. Both keys go in the daemon's
+`config.toml` and take effect when rchd restarts; the defaults keep the ratio rule
+unconditional.
 
 Balanced selection also favors free disk before a worker reaches the admission
 floor. `selection.weights.disk` (default `0.2`, range `0` to `1`) adds disk
@@ -685,6 +937,45 @@ ask a worker to run an arbitrary command "to check for a tool" would be a
 remote execution primitive wearing a capability-probe hat; declaring the argv
 in operator config keeps the set of probe commands finite and reviewable.
 
+### Worker Execution Policy (Linux workers)
+
+A worker can lower the priority of the builds RCH runs on it, or confine them
+to a systemd slice, independently of `rchd`'s own service settings. The policy
+is set on the worker, in exactly one of these files:
+
+- `/etc/rch/worker-execution.conf`, owned by root, or
+- `~/.config/rch/worker-execution.conf` of the SSH user, owned by that user or
+  by root.
+
+```ini
+version=1
+nice=10
+systemd_slice=jobs.slice
+systemd_manager=user
+```
+
+`version=1` is required, plus at least one of `nice` (-20 to 19) and
+`systemd_slice` (an existing, active `*.slice` unit). `systemd_manager` (`user`,
+the default, or `system`) names the manager that owns the slice and is only
+valid together with `systemd_slice`. Every setting in the file is enforced
+before the build starts. The launch is refused, never run unconfined, when the
+file is unsafe (not a regular single-link ASCII file of at most 8 KiB, writable
+by group or others, wrongly owned), has unknown or duplicate keys, or exists in
+both places, and when enforcement fails (no `busctl`, `systemctl` or `timeout`,
+an inactive slice, a failed priority change, a cgroup placement it cannot
+confirm, or a non-Linux worker). The launcher writes the cause to its stderr as
+`RCH_WORKER_POLICY_REFUSED:<reason>`, and what it applied as
+`RCH_WORKER_EXECUTION_POLICY:nice=…,slice=…,manager=…,scope=…`.
+
+With a slice, RCH attaches the build's existing process-group leader to a
+transient scope in that slice, so the watchdog, cancellation and recovery keep
+working, and cleanup covers the whole cgroup. Without a policy file, builds run
+as before.
+
+The policy covers the tracked build payload only. Source sync, pre-launch
+package bootstrap and untracked execution are not confined, so it does not on
+its own make a shared developer machine safe to admit as a worker (#104).
+
 ---
 
 ## Output Modes
@@ -719,10 +1010,10 @@ plan for any command is shown by `rch diagnose <command> --json` under
 |---|---|---|
 | Requested worker | `RCH_WORKER` (`RCH_WORKERS`) | Request specific worker(s) by id. Still passes capability/admission checks; an inadmissible requested worker is **refused** with a stable `RCH-Innn` reason code and a next action — never silently swapped. |
 | Requested profile | `RCH_PRESET` | Named execution profile (recorded as `requested_profile`). |
-| Strict remote (fail-closed) | `RCH_REQUIRE_REMOTE` | Refuse local fallback (proof mode). Takes precedence over `RCH_FORCE_REMOTE`. |
+| Strict remote (fail-closed) | `RCH_REQUIRE_REMOTE`; per call `rch exec --require-remote` | Refuse local fallback (proof mode). Takes precedence over `RCH_FORCE_REMOTE`. |
 | Force remote (fail-open) | `RCH_FORCE_REMOTE` | Always attempt offload (bypass local-time/speedup gating) but still fail open to local. Distinct from `RCH_REQUIRE_REMOTE`. |
 | Queue when busy | `RCH_QUEUE_WHEN_BUSY` (default `1`) | Wait for a busy worker instead of falling back to local. Set `0` to disable. |
-| Wait timeout | `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (`RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. |
+| Wait timeout | `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (`RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker: default 330, or 6 h for `rch exec --job`. The daemon caps a compilation's wait at `[queue] timeout_secs` (300) and a job's at 24 h. |
 | Visibility | `RCH_VISIBILITY=none\|summary\|verbose` (`RCH_QUIET`, `RCH_VERBOSE`) | Hook output verbosity. |
 | Target dir | `RCH_DISABLE_TARGET_REUSE` | Legacy unique-per-job remote target dir instead of the pooled, reuse-friendly dir. |
 | Source-sync timeout | `RCH_SYNC_TIMEOUT_MS` | Per-attempt source-upload timeout in milliseconds (1000..=3600000). Unset uses the payload-aware default. This does not change remote Cargo or artifact-return timeouts. |
@@ -733,6 +1024,16 @@ The resolved plan reports `requested_worker`, `requested_profile`,
 outcome, and a `diagnostics` list. Any control value that cannot be applied as
 written (an unrecognized value or a superseded alias) surfaces a diagnostic
 rather than being silently ignored.
+
+The simulated selection also lists every worker the daemon considered, under
+`data.worker_selection.inventory` (human output: `Inventory:` under `Worker
+Selection (simulated)`). Each entry is `selected`, `eligible` (passed every
+gate, ranked lower), `fallback_candidate` or `excluded`, with the selector's
+reason and reason codes, for example `available slots 2 < 4`
+(`slots.insufficient`), `not in the requested worker set`
+(`selection.not_requested`), or a project exclusion such as
+`project.live_checkout_fenced`. A daemon older than the client reports no
+inventory after a successful selection.
 
 ---
 
@@ -840,6 +1141,14 @@ RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+`rch exec --require-remote -- <cmd>` asks the same for one call without
+touching the environment. Because it is always the caller's own request (the
+cargo shim exports `RCH_REQUIRE_REMOTE=1` into every agent), it also outranks
+config that would run the command locally (`force_local`, `enabled = false`,
+the execution allowlist), as `--worker` does. A non-compilation command is
+refused with `RCH-E301` instead of running locally; to run one on a worker, use
+`rch exec --job -- <cmd>`.
+
 ### Exact source-content receipts
 
 Proof-oriented callers can require a single-worker, fail-closed source transfer
@@ -850,9 +1159,11 @@ RCH_REQUIRE_REMOTE=1 rch exec --source-content-receipt -- \
   cargo test --locked --workspace
 ```
 
-Receipt mode resolves the active Cargo path-dependency closure, gives every
-root an invocation-unique worker path, transfers with checksum comparison, and
-reopens every selected file before and after the command. The emitted
+Receipt mode resolves the active Cargo path-dependency closure, stages its
+roots beneath the configured worker build base, transfers with checksum
+comparison, and reopens every selected file before and after the command.
+Preflight initializes the isolated staging topology and skips canonical worker
+repository convergence. The emitted
 `rch.source_content_receipt.v1` JSON binds the worker and build IDs, exact
 command digest and exit code, transfer filter policy, per-root file paths,
 lengths, executable bits, SHA-256 digests, and content roots. Any unproved
@@ -860,6 +1171,34 @@ dependency closure, transfer delta, worker verification error, local lasting
 change, retry, or local fallback refuses the invocation instead of emitting a
 receipt. Receipt mode currently requires the Unix rsync transport and cannot be
 combined with clean-overlay mode.
+
+On Linux with target reuse enabled, supported Cargo commands use an owned
+source/target pair. The source layout preserves sibling dependencies, selected
+manifests, and enclosing workspace metadata under a stable
+`source-content-pair-<key>/projects/` container. Every invocation materializes
+fresh source files there while holding the pair and its complete source grant.
+Uploads use checksums without deleting entries or running cache sweeps; the
+read-only rsync barrier still rejects surplus selected files. Cargo's target
+and build directories are bound to the granted pool outside that container.
+
+An unchanged file can reuse its previous compiler-visible timestamp only when
+the previous attempt completed its source-content verification. An interrupted
+or unverified attempt forces fresh timestamps beyond the pool's artifacts on
+the next invocation. After artifact delivery, the source container moves to
+its recorded `.retained-<attempt>` sibling using Linux no-replace rename. The
+job journal retains both paths before acquisition, so recovery can reconcile
+an interrupted move without replacing an existing retained tree. Python 3 and
+the Linux rename capability are checked before source ownership is acquired.
+
+This owned route validates Cargo manifests and configuration against the
+captured transfer inventory. Relative and absolute `--manifest-path` selectors
+map into that inventory. File-based `--config`, custom target-specification
+files, directory-changing wrappers, and caller overrides of managed output
+paths or Cargo home currently refuse before execution. Other Unix platforms,
+invocations with `RCH_DISABLE_TARGET_REUSE=1`, and external Cargo drivers such
+as Nextest, Zigbuild, and xwin retain invocation-unique staging paths. The
+owned route currently covers the built-in build, test, check, documentation,
+benchmark, and verified packaging families, plus Clippy.
 
 The receipt is emitted after the remote command and its post-command source
 barrier, but before ordinary artifact retrieval completes. Artifact-grade
@@ -973,7 +1312,8 @@ commands may still run locally. For several focused checks, run separate direct
 - Sensitive field masking and structured error taxonomy are built in.
 - `rch update` enforces the release's SHA-256 checksums and verifies the
   archive's `.minisig` against a public key pinned in the binary (minisign key
-  `69B3955C8D2E62A8`, which signs every release since 2.0.0); a bad signature
+  `69B3955C8D2E62A8`, which signs every release since 2.1.0; 2.0.x and earlier
+  used `1BBD79B28BF718D0`); a bad signature
   aborts the update. A Sigstore bundle is also verified when the release ships
   one and `cosign` is installed. `--skip-verify` bypasses signature checks only.
   `install.sh` still verifies checksums only.

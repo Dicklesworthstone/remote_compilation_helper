@@ -358,11 +358,10 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
             .build()
             .map_err(|error| io::Error::other(format!("job follow runtime: {error:?}")))?;
         let mut exchange = |request: &Value, deadline| {
-            runtime.block_on(exchange_until(
-                UnixStream::connect(socket),
-                request,
-                deadline,
-            ))
+            rabs_asupersync::daemon_runtime::block_on_top_level(
+                &runtime,
+                exchange_until(UnixStream::connect(socket), request, deadline),
+            )
         };
         let mut output = io::stdout().lock();
         let completion = follow(id, until, &mut exchange, std::thread::sleep, |event| {

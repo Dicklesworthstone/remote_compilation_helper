@@ -350,6 +350,19 @@ pub struct SelectionConfig {
         deserialize_with = "deserialize_disk_gb_per_slot"
     )]
     pub disk_gb_per_slot: f64,
+    /// Free-disk ratio at or below which rchd marks a worker Critical and
+    /// gives it no slots (bd-xxck3). Read by rchd at startup.
+    #[serde(default = "default_disk_critical_free_ratio")]
+    pub disk_critical_free_ratio: f64,
+    /// When set, the ratio rule above trips only while free space is also at
+    /// or below this many GB, so a large disk is judged by absolute headroom
+    /// (5% of 900 GB is 45 GB). Unset keeps the ratio rule unconditional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_critical_ratio_cap_gb: Option<f64>,
+}
+
+fn default_disk_critical_free_ratio() -> f64 {
+    0.05
 }
 
 impl Default for SelectionConfig {
@@ -363,6 +376,8 @@ impl Default for SelectionConfig {
             max_load_per_core: default_max_load_per_core(),
             min_free_gb: default_min_free_gb(),
             disk_gb_per_slot: default_disk_gb_per_slot(),
+            disk_critical_free_ratio: default_disk_critical_free_ratio(),
+            disk_critical_ratio_cap_gb: None,
         }
     }
 }
@@ -566,6 +581,92 @@ fn default_fallback_min_success_rate() -> f64 {
     0.5 // More lenient than normal min_success_rate (0.8)
 }
 
+/// A job's additional allocation allowance and the worker's protected reserve.
+///
+/// The daemon reserves growth atomically; the worker enforces these byte limits
+/// against fresh filesystem observations for the lifetime of the execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BuildDiskBudget {
+    pub max_growth_bytes: u64,
+    pub min_free_bytes: u64,
+}
+
+impl BuildDiskBudget {
+    pub const GIB: u64 = 1 << 30;
+
+    /// Conservative cold output estimates until this project and command have
+    /// successful, attributable worker measurements. Test workspaces have much
+    /// larger linker and incremental outputs than metadata-only checks.
+    pub fn cold_growth_gib(command: &str) -> Option<u32> {
+        let wide = command.split_whitespace().any(|arg| {
+            matches!(
+                arg,
+                "--workspace" | "--all" | "--all-targets" | "--all-features"
+            )
+        });
+        Some(match crate::classify_command(command).kind? {
+            CompilationKind::CargoTest
+            | CompilationKind::CargoNextest
+            | CompilationKind::CargoBench => {
+                if wide {
+                    32
+                } else {
+                    24
+                }
+            }
+            CompilationKind::CargoBuild | CompilationKind::CargoZigbuild => {
+                if wide {
+                    16
+                } else {
+                    8
+                }
+            }
+            CompilationKind::CargoCheck | CompilationKind::CargoClippy => {
+                if wide {
+                    8
+                } else {
+                    2
+                }
+            }
+            CompilationKind::CargoDoc => 8,
+            CompilationKind::Rustc
+            | CompilationKind::Gcc
+            | CompilationKind::Gpp
+            | CompilationKind::Clang
+            | CompilationKind::Clangpp
+            | CompilationKind::BunTypecheck
+            | CompilationKind::GoVet
+            | CompilationKind::Tsc => 2,
+            CompilationKind::BunTest | CompilationKind::GoBuild | CompilationKind::GoTest => 4,
+            CompilationKind::Make
+            | CompilationKind::CmakeBuild
+            | CompilationKind::Ninja
+            | CompilationKind::Meson
+            | CompilationKind::NixBuild
+            | CompilationKind::Job => 16,
+        })
+    }
+
+    /// Allow at least 2 GiB or 25% above the observed high water, rounded up.
+    /// Invalid history must never turn into a zero-size admission allowance.
+    pub fn growth_budget_gib(footprint_gib: f64) -> u32 {
+        if !footprint_gib.is_finite() || footprint_gib < 0.0 {
+            return u32::MAX;
+        }
+        (footprint_gib + (footprint_gib * 0.25).max(2.0)).ceil() as u32
+    }
+
+    /// Compatibility fallback for a new client talking to a pre-budget daemon.
+    /// Worker-side admission remains authoritative even without a wire budget.
+    pub fn cold_for_command(command: &str) -> Option<Self> {
+        let footprint = Self::cold_growth_gib(command)?;
+        Some(Self {
+            max_growth_bytes: u64::from(Self::growth_budget_gib(f64::from(footprint))) * Self::GIB,
+            min_free_bytes: 10 * Self::GIB,
+        })
+    }
+}
+
 /// Details about a selected worker for remote compilation.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SelectedWorker {
@@ -588,6 +689,18 @@ pub struct SelectedWorker {
     /// wire-compatible.
     #[serde(default)]
     pub declared_os: Option<String>,
+    /// The worker project lane this build holds (bd-sgvod). 0 is the
+    /// canonical mirror; k > 0 means every remote root is `<root>.rch-lane-<k>`.
+    /// Old daemons never send it, so old and new hooks both read 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub project_lane: u32,
+    /// The allowance committed with this build's durable admission record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_budget: Option<BuildDiskBudget>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Worker selection response from daemon to hook.
@@ -698,6 +811,10 @@ pub struct ReleaseRequest {
     /// Optional bytes transferred during the pipeline (upload + artifact download).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_transferred: Option<u64>,
+    /// Peak allocated output bytes, including the preexisting output pool.
+    /// Only a confirmed worker receipt may supply this measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_peak_output_bytes: Option<u64>,
     /// Optional per-phase timing breakdown for the build pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<CommandTimingBreakdown>,
@@ -715,6 +832,15 @@ pub struct ReleaseRequest {
     /// Recovery must measure these filesystems as well as configured roots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_disk_roots: Vec<String>,
+    /// The worker's source receiver refused the sync because its copy of the
+    /// project is a declared live checkout (`RCH_SYNC_LIVE_CHECKOUT_REFUSED`,
+    /// bd-fbtws). The daemon keeps that project off the worker for a while.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_live_checkout_refused: bool,
+    /// Another owner held this worker's source past the admission wait
+    /// (bd-p3kuz). The daemon keeps the project off the worker briefly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_source_busy: bool,
 }
 
 /// Build execution phase for daemon heartbeat tracking.
@@ -1509,6 +1635,9 @@ pub struct FleetConfig {
     #[serde(default = "default_fleet_min_disk_space_mb")]
     pub min_disk_space_mb: u64,
     /// Maximum acceptable load average for worker health.
+    ///
+    /// Not read anywhere yet: setting it changes nothing. Selection already
+    /// accounts for load through telemetry pressure and SpeedScore.
     #[serde(default = "default_fleet_max_load_average")]
     pub max_load_average: f64,
     /// Maximum number of concurrent SSH connections.
@@ -1640,11 +1769,25 @@ pub struct GeneralConfig {
 }
 
 /// Environment variable passthrough configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentConfig {
     /// Allowlist of environment variables to forward to remote workers.
     #[serde(default)]
     pub allowlist: Vec<String>,
+    /// Automatically forward validated Cargo artifact-size settings, including
+    /// custom profiles and build overrides. Exact allowlist entries still work
+    /// when this is disabled; arbitrary Cargo variables are never added.
+    #[serde(default = "default_true")]
+    pub forward_cargo_profile_settings: bool,
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            allowlist: Vec::new(),
+            forward_cargo_profile_settings: true,
+        }
+    }
 }
 
 impl Default for GeneralConfig {
@@ -1825,6 +1968,9 @@ pub struct SelfHealingConfig {
     pub auto_start_timeout_secs: u64,
     /// Log level for self-healing diagnostic events. Default: info.
     /// Override via `RCH_SELF_HEALING_LOG_LEVEL=debug|info|warn|error`.
+    ///
+    /// Parsed but not applied yet: self-healing events log at their own
+    /// levels under the normal `RUST_LOG` / `general.log_level` filter.
     #[serde(default)]
     pub self_healing_log_level: SelfHealingLogLevel,
 }
@@ -2520,14 +2666,22 @@ pub struct CompilationConfig {
     /// Minimum confidence score to intercept (0.0-1.0).
     #[serde(default = "default_confidence")]
     pub confidence_threshold: f64,
-    /// Skip interception if estimated local time < this (ms).
+    /// Run locally when this build's measured local median is below this (ms).
+    /// Consulted only by the speed gate, i.e. when `local_slots > 0`.
     #[serde(default = "default_min_local_time")]
     pub min_local_time_ms: u64,
-    /// Minimum expected speedup ratio (local_time / remote_time) to offload.
-    /// If predicted speedup < threshold, run locally. Default: 1.2 (20% faster).
-    /// Set to 1.0 to always offload when other criteria are met.
+    /// Minimum measured speedup ratio (local_time / remote_time) to offload.
+    /// If the measured speedup < threshold, run locally. Default: 1.2 (20% faster).
+    /// Consulted only by the speed gate, i.e. when `local_slots > 0`.
     #[serde(default = "default_speedup_threshold")]
     pub remote_speedup_threshold: f64,
+    /// Speed gate (bd-2spi4): how many offloadable builds may run concurrently
+    /// on THIS machine because its own measured build history says remote is
+    /// not worth it. Zero (default) disables the gate, so every offloadable
+    /// build is offloaded as before. Set it only on a dispatcher that is faster
+    /// than its workers; local runs also need free memory (see the hook).
+    #[serde(default)]
+    pub local_slots: u32,
     /// Default slot estimate for build commands (cargo build, gcc, etc.).
     #[serde(default = "default_build_slots")]
     pub build_slots: u32,
@@ -2573,9 +2727,13 @@ pub struct CompilationConfig {
     /// whole fleet, so it is a genuine last resort and can flood that box. This
     /// flag gates it. Default `true` preserves the historical fail-open behavior
     /// (local only when no worker can serve); set to `false` on an orchestrator
-    /// to refuse local fallback and fail the build closed instead. `force_remote`
-    /// / proof mode / `RCH_REQUIRE_REMOTE` still override this by refusing local
-    /// unconditionally.
+    /// to refuse local fallback and fail the build closed instead. It covers
+    /// every local exit after remote placement was attempted: no admissible
+    /// worker, daemon unavailable, dependency preflight failure, transfer skip,
+    /// an unrequested worker, and retry exhaustion (#114). Proof mode,
+    /// `RCH_REQUIRE_REMOTE` and `general.role = "dispatcher"` refuse local
+    /// unconditionally. `force_remote` only skips local-time gating; it still
+    /// fails open.
     #[serde(default = "default_allow_local_fallback")]
     pub allow_local_fallback: bool,
     /// Per-job rustc parallelism cap applied on the WORKER (issue #49).
@@ -2689,6 +2847,7 @@ impl Default for CompilationConfig {
             confidence_threshold: 0.85,
             min_local_time_ms: 2000,
             remote_speedup_threshold: default_speedup_threshold(),
+            local_slots: 0,
             build_slots: default_build_slots(),
             test_slots: default_test_slots(),
             check_slots: default_check_slots(),
@@ -2786,7 +2945,7 @@ impl CompilationConfig {
 /// Bump when a knob is added, removed, or its meaning changes; consumers
 /// record the version alongside emitted baselines so regressions are
 /// attributable to a specific pack revision.
-pub const LAYER0_PACK_VERSION: &str = "1";
+pub const LAYER0_PACK_VERSION: &str = "2";
 
 /// Layer 0 configuration pack knobs (bd-bqu38).
 ///
@@ -2795,8 +2954,10 @@ pub const LAYER0_PACK_VERSION: &str = "1";
 /// representative p95, output equivalence, debugger behavior, or
 /// compatibility). Knobs are injected into remote cargo builds as
 /// `CARGO_PROFILE_*` environment variables, so enabling one never mutates any
-/// user-owned `.cargo/config.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// user-owned `.cargo/config.toml`. Verification lanes (`--clean-overlay`,
+/// `--source-content-receipt`) build exactly what the project declares and
+/// never receive the pack.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(default)]
 pub struct Layer0Config {
     /// Master switch: nothing is injected unless this is on.
@@ -2806,6 +2967,13 @@ pub struct Layer0Config {
     /// `profile.release.codegen-units = 1` via
     /// `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
     pub release_codegen_units_1: bool,
+    /// `debug = "line-tables-only"` for the dev and test profiles, via
+    /// `CARGO_PROFILE_{DEV,TEST}_DEBUG` (bd-hoxgn). Full DWARF was about 77%
+    /// of fleet debug/test binaries (2026-09-25 sweep), so this is the main
+    /// lever on worker target size. Backtraces keep file and line; debuggers
+    /// lose local variables. A host-level `.cargo/config.toml` cannot carry
+    /// it: clean-overlay builds refuse any ancestor Cargo config (RCH-E413).
+    pub debug_line_tables_only: bool,
 }
 
 impl Layer0Config {
@@ -2826,18 +2994,36 @@ impl Layer0Config {
         if self.release_codegen_units_1 {
             env.push(("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"));
         }
+        if self.debug_line_tables_only {
+            env.push(("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"));
+            env.push(("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"));
+        }
         env
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferConfig {
+    /// Durable controller retrieval staging base. Unset uses the job-lease
+    /// directory's retrieval subtree. Must be absolute; TMPDIR is not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_staging_dir: Option<PathBuf>,
+    /// Free bytes to retain on the staging filesystem in addition to selected
+    /// uncompressed output bytes. The preflight never deletes retained data.
+    #[serde(default)]
+    pub retrieval_min_free_bytes: u64,
     /// zstd compression level (1-19).
     #[serde(default = "default_compression")]
     pub compression_level: u32,
     /// Patterns to exclude from transfer.
     #[serde(default = "default_excludes")]
     pub exclude_patterns: Vec<String>,
+    /// Built-in default exclude patterns that a custom `exclude_patterns` list
+    /// omits on purpose (for example `*.pem` when TLS test fixtures must reach
+    /// workers). Only the omitted-defaults diagnostics read it; it never
+    /// changes what is transferred (bd-rqjaj).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_defaults_acknowledged: Vec<String>,
     /// SSH keepalive interval in seconds (`ssh -o ServerAliveInterval=<N>`).
     ///
     /// When unset, build transfers use 15 seconds. Zero defers to OpenSSH configuration.
@@ -2886,9 +3072,10 @@ pub struct TransferConfig {
     pub retry: RetryConfig,
     /// Verify artifact integrity using blake3 hashes after transfer (bd-377q).
     ///
-    /// When enabled, computes blake3 hashes of key artifacts (binaries, test outputs)
-    /// on the worker after build, then verifies them locally after download.
-    /// Disabled by default to avoid extra overhead.
+    /// Not wired: no transfer path calls `artifact_verify`, so enabling this
+    /// has no effect. rsync already checks each transferred file against a
+    /// whole-file checksum, and recovery publication verifies delivered
+    /// outputs, which is why the extra pass was never connected.
     #[serde(default)]
     pub verify_artifacts: bool,
     /// Maximum file size (bytes) for artifact verification (bd-377q).
@@ -2975,8 +3162,11 @@ pub struct TransferConfig {
 impl Default for TransferConfig {
     fn default() -> Self {
         Self {
+            retrieval_staging_dir: None,
+            retrieval_min_free_bytes: 0,
             compression_level: 3,
             exclude_patterns: default_excludes(),
+            exclude_defaults_acknowledged: Vec::new(),
             ssh_server_alive_interval_secs: None,
             ssh_control_persist_secs: None,
             remote_base: default_remote_base(),
@@ -3000,6 +3190,21 @@ impl Default for TransferConfig {
 }
 
 impl TransferConfig {
+    /// Built-in default exclude patterns that `exclude_patterns` lacks and
+    /// `exclude_defaults_acknowledged` does not list. A configured list replaces
+    /// the defaults, so without this check defaults added after the list was
+    /// written (agent state, credentials) are dropped silently (bd-rqjaj).
+    #[must_use]
+    pub fn unacknowledged_omitted_default_excludes(&self) -> Vec<String> {
+        default_excludes()
+            .into_iter()
+            .filter(|pattern| {
+                !self.exclude_patterns.contains(pattern)
+                    && !self.exclude_defaults_acknowledged.contains(pattern)
+            })
+            .collect()
+    }
+
     /// Smallest accepted explicit source-sync timeout (one second).
     pub const MIN_SYNC_TIMEOUT_MS: u64 = 1_000;
     /// Largest accepted explicit or derived source-sync timeout (one hour).
@@ -3467,8 +3672,15 @@ fn default_excludes() -> Vec<String> {
         ".nuxt/".to_string(),
         ".turbo/".to_string(),
         ".parcel-cache/".to_string(),
-        // Beads runtime state (local issue DB + lock/temp files); not needed remotely.
+        // Agent/session state, not ordinary compilation inputs (issue #109).
+        // Directory-only basenames cover nested copies, not similarly named
+        // files or directories. .beads/ also covers .beads/.br_recovery/.
         ".beads/".to_string(),
+        ".ntm/".to_string(),
+        ".beads-recovery/".to_string(),
+        // Do not exclude scratch/, data/, artifacts/ or project configuration:
+        // they may contain required build inputs. .rchignore adds project-local
+        // exclusions; an explicit exclude_patterns list replaces these defaults.
         // Local diagnostic runs may contain host-specific symlinks and are not build inputs.
         ".doctor/".to_string(),
         // Coverage reports (generated during tests)
@@ -4425,6 +4637,7 @@ retry_max = 2
             enabled: false,
             release_lto_thin: true,
             release_codegen_units_1: true,
+            debug_line_tables_only: true,
         };
         assert!(cfg.active_env().is_empty());
         assert!(knobs_on.active_env().is_empty());
@@ -4436,22 +4649,37 @@ retry_max = 2
         let lto_only = Layer0Config {
             enabled: true,
             release_lto_thin: true,
-            release_codegen_units_1: false,
+            ..Layer0Config::default()
         };
         assert_eq!(
             lto_only.active_env(),
             vec![("CARGO_PROFILE_RELEASE_LTO", "thin")]
         );
-        let both = Layer0Config {
+        let debug_only = Layer0Config {
+            enabled: true,
+            debug_line_tables_only: true,
+            ..Layer0Config::default()
+        };
+        assert_eq!(
+            debug_only.active_env(),
+            vec![
+                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
+            ]
+        );
+        let all = Layer0Config {
             enabled: true,
             release_lto_thin: true,
             release_codegen_units_1: true,
+            debug_line_tables_only: true,
         };
         assert_eq!(
-            both.active_env(),
+            all.active_env(),
             vec![
                 ("CARGO_PROFILE_RELEASE_LTO", "thin"),
                 ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"),
+                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
             ],
             "emission order must stay stable for deterministic baselines"
         );
@@ -4736,6 +4964,8 @@ retry_max = 2
                 slots_available: 8,
                 speed_score: 75.0,
                 declared_os: None,
+                project_lane: 0,
+                disk_budget: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4830,6 +5060,8 @@ retry_max = 2
                 slots_available: 16,
                 speed_score: 90.5,
                 declared_os: None,
+                project_lane: 0,
+                disk_budget: BuildDiskBudget::cold_for_command("cargo test --workspace"),
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -4844,7 +5076,26 @@ retry_max = 2
         assert_eq!(worker.id.as_str(), "worker-1");
         assert_eq!(worker.host, "192.168.1.100");
         assert_eq!(worker.slots_available, 16);
+        assert_eq!(
+            worker.disk_budget,
+            BuildDiskBudget::cold_for_command("cargo test --workspace")
+        );
         assert_eq!(parsed.reason, SelectionReason::Success);
+    }
+
+    #[test]
+    fn build_disk_budget_incident_and_small_build_controls() {
+        assert_eq!(BuildDiskBudget::growth_budget_gib(21.0), 27);
+        assert_eq!(BuildDiskBudget::growth_budget_gib(2.0), 4);
+        assert_eq!(
+            BuildDiskBudget::cold_growth_gib("cargo test --workspace"),
+            Some(32)
+        );
+        assert_eq!(BuildDiskBudget::cold_growth_gib("cargo check"), Some(2));
+        assert_eq!(BuildDiskBudget::cold_growth_gib("echo hello"), None);
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(BuildDiskBudget::growth_budget_gib(invalid), u32::MAX);
+        }
     }
 
     #[test]

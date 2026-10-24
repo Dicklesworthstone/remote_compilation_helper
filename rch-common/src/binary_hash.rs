@@ -459,6 +459,34 @@ pub fn classify_canary(
     }
 }
 
+/// Classify a returned artifact only after reading its nonempty identity marker.
+/// I/O failure is an unavailable verification result, never marker presence.
+pub fn classify_returned_canary(
+    path: &Path,
+    marker: &str,
+    local: &BinaryHashResult,
+    remote: &BinaryHashResult,
+    toolchains_match: Option<bool>,
+) -> Result<CanaryVerdict> {
+    if marker.is_empty() {
+        return Err(anyhow!(
+            "Cannot verify a canary with an empty identity marker"
+        ));
+    }
+    let marker_present = binary_contains_marker(path, marker).with_context(|| {
+        format!(
+            "Failed to verify returned canary identity: {}",
+            path.display()
+        )
+    })?;
+    Ok(classify_canary(
+        local,
+        remote,
+        marker_present,
+        toolchains_match,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1163,47 @@ mod tests {
             text_section_size: text,
             is_debug: false,
         }
+    }
+
+    #[test]
+    fn returned_canary_requires_readable_nonempty_identity() {
+        // Retained exclusive files: these byte fixtures test the reader, not a fleet.
+        let root = std::env::temp_dir().join(format!("rch-marker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let artifact = root.join("artifact");
+        let bytes = b"prefix RCH_TEST_unique suffix";
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&artifact)
+            .unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+        drop(file);
+        let local = hash("aaaa", 100);
+        for remote in [hash("aaaa", 100), hash("bbbb", 99)] {
+            let verdict =
+                classify_returned_canary(&artifact, "RCH_TEST_unique", &local, &remote, None)
+                    .unwrap();
+            assert!(verdict.passed());
+            assert_eq!(verdict.is_advisory(), remote.code_hash != local.code_hash);
+            assert_eq!(
+                classify_returned_canary(&artifact, "absent", &local, &remote, None,).unwrap(),
+                CanaryVerdict::MissingMarker
+            );
+            assert!(classify_returned_canary(&artifact, "", &local, &remote, None,).is_err());
+            for unreadable in [root.clone(), root.join("never-created")] {
+                let error =
+                    classify_returned_canary(&unreadable, "RCH_TEST_unique", &local, &remote, None)
+                        .unwrap_err();
+                assert!(
+                    error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&artifact).unwrap(), bytes);
+        assert!(!root.join("never-created").exists());
     }
 
     #[test]

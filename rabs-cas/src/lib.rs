@@ -61,6 +61,7 @@ pub mod pin_leases;
 pub mod provisional_pins;
 pub mod provisional_recovery;
 pub mod publication;
+pub mod read_indexes;
 pub mod serving_sample_gate;
 pub mod serving_state;
 pub mod sparse_writer;

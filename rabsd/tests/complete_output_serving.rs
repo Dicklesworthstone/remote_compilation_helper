@@ -372,11 +372,10 @@ fn corrupted_tail_reports_the_metadata_prefix_instead_of_an_untouched_tree() {
     let Err(ServeError::Materialize(failure)) =
         fixture.serve(&root, &ExpectedOutputs::Exactly(fixture.names()))
     else {
-        panic!("must report partial materialization");
+        panic!("must reject corrupt tail during staging");
     };
-    assert_eq!(failure.installed.len(), 1);
-    assert_eq!(failure.installed[0].destination, root.join("z.rmeta"));
-    assert_eq!(std::fs::read(root.join("z.rmeta")).unwrap(), b"metadata");
+    assert!(failure.installed.is_empty());
+    assert!(!root.join("z.rmeta").exists());
     assert!(!root.join("a.rlib").exists());
 }
 

@@ -14,6 +14,7 @@
 use super::*;
 
 mod discovery;
+pub(crate) use discovery::alternate_default_sockets;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum AutoStartError {
@@ -463,20 +464,16 @@ pub(super) async fn try_auto_start_daemon(
     config: &SelfHealingConfig,
     socket_path: &Path,
 ) -> Result<PathBuf, AutoStartError> {
-    discovery::recover_daemon(
-        config,
-        socket_path,
-        |socket| {
-            let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;
-            info!(
-                target: "rch::hook::auto_start",
-                binary = %rchd_path.display(),
-                socket = %socket.display(),
-                "Spawning rchd"
-            );
-            spawn_rchd(&rchd_path, socket)
-        },
-    )
+    discovery::recover_daemon(config, socket_path, |socket| {
+        let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;
+        info!(
+            target: "rch::hook::auto_start",
+            binary = %rchd_path.display(),
+            socket = %socket.display(),
+            "Spawning rchd"
+        );
+        spawn_rchd(&rchd_path, socket)
+    })
     .await
 }
 
@@ -1559,12 +1556,14 @@ mod tests {
         let link = dir.path().join("socket-link");
         std::fs::write(&regular, b"keep me").unwrap();
         std::os::unix::fs::symlink(&regular, &link).unwrap();
-        for socket in [&regular, &link] {
+        // One start lock per endpoint: re-taking a lock this test just released
+        // can race a concurrent test's forked child that still shares it.
+        for (socket, name) in [(&regular, "regular"), (&link, "link")] {
             let result = recover_daemon_with_paths(
                 &recovery_config(),
                 socket,
-                &dir.path().join("start.lock"),
-                &dir.path().join("cooldown"),
+                &dir.path().join(format!("{name}.start.lock")),
+                &dir.path().join(format!("{name}.cooldown")),
                 |_| panic!("invalid endpoint must not launch"),
             )
             .await;

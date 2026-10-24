@@ -2,6 +2,7 @@
 //! The coordinator region owns every blocking executor through shutdown. A
 //! client disconnect never drops a queued job or authorizes another execution.
 
+mod build;
 mod follow;
 mod wait;
 
@@ -19,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const EXECUTORS: usize = 4;
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 const CLIENT_BUDGET: Duration = Duration::from_secs(20);
 
@@ -36,7 +36,7 @@ impl Drivers {
             stopped: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
         };
-        for index in 0..EXECUTORS {
+        for index in 0..drivers.store.concurrency().get() {
             let store = Arc::clone(&drivers.store);
             let coord = Arc::clone(&coord);
             let stopped = Arc::clone(&drivers.stopped);
@@ -71,11 +71,11 @@ impl Drivers {
                                 return Err(format!("prepared job claim: {error}"));
                             }
                         };
-                        let Some(claim) = claim else {
+                        let Some(mut claim) = claim else {
                             store.wait_for_work(IDLE_WAIT);
                             continue;
                         };
-                        let outcome = crate::worker_exec::execute_prepared_operation(&claim);
+                        let outcome = crate::worker_exec::execute_prepared_operation(&mut claim);
                         if let Err(error) = claim.finish(outcome) {
                             stopped.store(true, Ordering::Release);
                             let _ = store.stop();
@@ -185,8 +185,8 @@ fn request(args: &[String]) -> Result<Value, &'static str> {
         return Err("job ID must be exactly 32 lowercase hexadecimal digits");
     }
     match args.first().map(String::as_str) {
-        Some("--job-submit") if args.len() == 8 => Ok(json!({
-            "kind":"prepared-submit", "operation":{
+        Some("--job-submit" | "--job-submit-allocated") if args.len() == 8 => Ok(json!({
+            "kind":if args[0] == "--job-submit-allocated" { "prepared-submit-allocated" } else { "prepared-submit" }, "operation":{
                 "id":id, "address":args[2], "worker":args[3],
                 "worker_spki_sha256":args[4], "bundle":args[5],
                 "delivery":args[6], "output":args[7],
@@ -260,7 +260,10 @@ fn exchange(socket: &str, request: &Value) -> io::Result<Value> {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| io::Error::other(format!("job client runtime: {error:?}")))?;
-    runtime.block_on(exchange_until(UnixStream::connect(socket), request, until))
+    rabs_asupersync::daemon_runtime::block_on_top_level(
+        &runtime,
+        exchange_until(UnixStream::connect(socket), request, until),
+    )
 }
 
 async fn exchange_until(
@@ -366,18 +369,28 @@ async fn exchange_frames(
 }
 
 pub(crate) fn run(args: &[String], socket: &str) -> i32 {
+    if args.first().is_some_and(|arg| arg == "--job-build") {
+        return build::run(args, socket);
+    }
     if args.first().is_some_and(|arg| arg == "--job-wait") {
         return wait::run(args, socket);
     }
     if args.first().is_some_and(|arg| arg == "--job-follow") {
         return follow::run(args, socket);
     }
-    let request = match request(args) {
+    let parsed = if args.first().is_some_and(|arg| arg == "--job-submit-pool") {
+        build::pool_request(args)
+    } else {
+        request(args).map_err(invalid)
+    };
+    let request = match parsed {
         Ok(request) => request,
         Err(detail) => {
             eprintln!(
                 "rabsd: {detail}\n\
                 --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <output>\n\
+                --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <template-bundle> <delivery> <output>\n\
+                --job-submit-pool <id32hex> <pool.json> <template-bundle> <delivery> <output>\n\
                 --job-status <id32hex>\n\
                 --job-wait <id32hex> [timeout-seconds]\n\
                 --job-follow <id32hex> [timeout-seconds]\n\
@@ -421,6 +434,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn allocated_submit_reuses_the_exact_job_and_paths_under_a_distinct_intent_api() {
+        let mut values: Vec<String> = [
+            "--job-submit-allocated",
+            "0123456789abcdef0123456789abcdef",
+            "127.0.0.1:7091",
+            "worker",
+            "ab",
+            "/bundle",
+            "/delivery",
+            "/output",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let allocated = request(&values).unwrap();
+        assert_eq!(allocated["kind"], "prepared-submit-allocated");
+        values[0] = "--job-submit".into();
+        let numeric = request(&values).unwrap();
+        assert_eq!(numeric["kind"], "prepared-submit");
+        assert_eq!(allocated["operation"], numeric["operation"]);
+        assert!(request(&values[..7]).is_err());
+    }
+
+    #[test]
     fn client_deadline_covers_a_pending_connection_and_drops_it() {
         use std::pin::Pin;
         use std::task::{Context, Poll};
@@ -440,13 +477,38 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        let result = runtime.block_on(exchange_until(
-            PendingConnect(Arc::clone(&dropped)),
-            &json!({"kind":"prepared-status"}),
-            Instant::now() + Duration::from_millis(10),
-        ));
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            exchange_until(
+                PendingConnect(Arc::clone(&dropped)),
+                &json!({"kind":"prepared-status"}),
+                Instant::now() + Duration::from_millis(10),
+            ),
+        );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn configured_driver_pool_owns_and_joins_every_executor() {
+        use rabsd::coord::prepared_operation::PreparedConcurrency;
+        for width in [1, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let store = PreparedOperationStore::open_with_concurrency(
+                &root.path().join("operations"),
+                PreparedConcurrency::new(width).unwrap(),
+            )
+            .unwrap();
+            // An unavailable coordinator cannot dispatch; the real drivers
+            // still exist and must all be stopped and joined by their owner.
+            let mut drivers =
+                Drivers::start(Arc::clone(&store), Arc::new(CoordLive::new())).unwrap();
+            assert_eq!(drivers.threads.len(), width);
+            let failure = drivers.stop();
+            drivers.join(failure).unwrap();
+            assert!(drivers.threads.is_empty());
+            assert!(!store.capacity_status().unwrap().accepting);
+        }
     }
 
     #[test]
@@ -468,24 +530,23 @@ mod tests {
             .build()
             .unwrap();
         let mut released = false;
-        runtime
-            .block_on(async {
-                let mut finishing = pin!(drivers.finish());
-                poll_fn(|cx| match finishing.as_mut().poll(cx) {
-                    Poll::Ready(result) => Poll::Ready(result),
-                    Poll::Pending => {
-                        if !released {
-                            // This sibling work can release the executor only if
-                            // shutdown has yielded instead of joining synchronously.
-                            release.send(()).unwrap();
-                            released = true;
-                        }
-                        Poll::Pending
+        rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
+            let mut finishing = pin!(drivers.finish());
+            poll_fn(|cx| match finishing.as_mut().poll(cx) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => {
+                    if !released {
+                        // This sibling work can release the executor only if
+                        // shutdown has yielded instead of joining synchronously.
+                        release.send(()).unwrap();
+                        released = true;
                     }
-                })
-                .await
+                    Poll::Pending
+                }
             })
-            .unwrap();
+            .await
+        })
+        .unwrap();
         assert!(released);
         assert!(drivers.threads.is_empty());
     }

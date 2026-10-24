@@ -55,6 +55,16 @@ impl OutputWriter {
         }
     }
 
+    /// Write and flush a line, reporting delivery or poisoned-lock failures.
+    pub fn write_line_checked(&self, line: &str) -> io::Result<()> {
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("output writer lock poisoned"))?;
+        writeln!(writer, "{line}")?;
+        writer.flush()
+    }
+
     /// Write text without a trailing newline.
     pub fn write(&self, text: &str) {
         if let Ok(mut writer) = self.inner.lock() {
@@ -218,6 +228,27 @@ mod tests {
         let writer = buffer.as_writer(false);
         writer.write_line("test line");
         assert_eq!(buffer.to_string_lossy(), "test line\n");
+        writer.write_line_checked("checked line").unwrap();
+        assert_eq!(buffer.to_string_lossy(), "test line\nchecked line\n");
+    }
+
+    #[test]
+    fn checked_line_reports_a_poisoned_lock_without_writing() {
+        let buffer = SharedOutputBuffer::new();
+        let writer = buffer.as_writer(false);
+        let poisoned = writer.clone();
+        assert!(
+            thread::spawn(move || {
+                let _guard = poisoned.inner.lock().unwrap();
+                panic!("intentional output writer lock poisoning");
+            })
+            .join()
+            .is_err()
+        );
+        let error = writer.write_line_checked("undelivered").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("output writer lock poisoned"));
+        assert!(buffer.to_string_lossy().is_empty());
     }
 
     #[test]

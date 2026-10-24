@@ -40,6 +40,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "snapshot_capture/agent_state_tests.rs"]
+mod agent_state_tests;
+
 /// How the underlying filesystem lets us establish the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsSemanticClass {
@@ -937,6 +941,9 @@ fn scan_retained_directory_fd(
         let metadata = observed
             .metadata()
             .map_err(|error| capture_io(Path::new(&rel), error))?;
+        if metadata.is_dir() && excluded_directory(&rel, declared_git_state) {
+            continue;
+        }
         let member = if metadata.file_type().is_symlink() {
             let target = readlinkat(&observed, "", Vec::new())
                 .map_err(|error| sealed_open_error(&rel, error))?;
@@ -1035,6 +1042,9 @@ fn scan_retained_directory(
         }
         let metadata =
             std::fs::symlink_metadata(&path).map_err(|error| capture_io(&path, error))?;
+        if metadata.is_dir() && excluded_directory(&rel, declared_git_state) {
+            continue;
+        }
         let member = if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(&path).map_err(|error| capture_io(&path, error))?;
             let target = target
@@ -1239,6 +1249,15 @@ fn is_ephemeral_lock(rel_path: &str) -> bool {
         || (name.ends_with(".lock") && name != "Cargo.lock")
 }
 
+/// Apply directory-only membership after observing a real directory, before
+/// opening it for enumeration or recording it as mutation evidence (#109).
+/// A trailing separator tells the shared policy that the last component is
+/// an ancestor, not a same-named regular file or symlink. No second name list
+/// or glob interpreter is introduced. Structural checks still run first.
+fn excluded_directory(rel_path: &str, declared_git_state: bool) -> bool {
+    member_disposition(&format!("{rel_path}/"), declared_git_state) != MemberDisposition::Include
+}
+
 /// Classify one repo-relative path for snapshot membership.
 /// `declared_git_state` is whether a canonical git-state object was
 /// declared for this capture (D031); without it `.git` stays hidden.
@@ -1331,6 +1350,9 @@ pub fn scan_directory(
                 path: rel.clone(),
                 cause: e.to_string(),
             })?;
+            if meta.is_dir() && excluded_directory(&rel, declared_git_state) {
+                continue;
+            }
             observation
                 .identities
                 .insert(rel.clone(), identity_of(&meta));

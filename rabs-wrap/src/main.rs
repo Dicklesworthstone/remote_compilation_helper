@@ -13,20 +13,33 @@
 //!    shadow decisions are always pass-through;
 //! 4. `on_outcome` update persisted (probe starts persisted WRITE-AHEAD
 //!    per the breaker contract);
-//! 5. `exec` the real rustc — the wrapper process BECOMES the compiler,
-//!    so exit codes, signals, and stdio streaming are preserved by
-//!    construction (no buffering exists to get wrong).
+//! 5. on pass-through, `exec` the real rustc — the wrapper process
+//!    BECOMES the compiler, preserving exit codes, signals, and stdio.
+//!    An accepted hit instead awaits installation and replays the
+//!    transcript only after explicit compiler-skip authorization.
 //!
-//! Failure philosophy: every wrapper-side problem — no daemon, timeout,
-//! malformed reply, unreadable state file — degrades to local exec.
-//! A build must never fail because RABS had a bad day (fail-open).
+//! Failure philosophy: before hit acceptance, wrapper-side problems —
+//! no daemon, timeout, malformed reply, unreadable state file — degrade
+//! to local exec. After acceptance, the daemon may own output writes:
+//! uncertain delivery fails closed. Local exec resumes only after a
+//! complete, typed reply on the install connection explicitly
+//! confirms that the install writer has returned. A lost original caller
+//! is cancellation, not a cache failure: it never authorizes local fallback,
+//! a new compiler attempt, or acceptance of a cache installation.
+
+mod capture;
+mod remote;
+mod singleflight;
+mod supervision;
 
 use rabs_protocol::wrapper_breaker::{
     AttemptOutcome, BreakerPolicy, BreakerState, ConnectDecision, decide, decode_state,
     encode_state, on_outcome,
 };
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -130,7 +143,11 @@ mod reply_json {
         }
         fn hex4(&mut self) -> Option<u32> {
             let end = self.at.checked_add(4)?;
-            let digits = std::str::from_utf8(self.bytes.get(self.at..end)?).ok()?;
+            let bytes = self.bytes.get(self.at..end)?;
+            if !bytes.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            let digits = std::str::from_utf8(bytes).ok()?;
             self.at = end;
             u32::from_str_radix(digits, 16).ok()
         }
@@ -189,6 +206,42 @@ mod reply_json {
                 }
             }
         }
+        fn decimal_digits(&mut self) -> Option<()> {
+            let start = self.at;
+            while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+            (self.at != start).then_some(())
+        }
+
+        fn number(&mut self) -> Option<Value> {
+            let start = self.at;
+            if self.bytes.get(self.at) == Some(&b'-') {
+                self.at += 1;
+            }
+            match self.bytes.get(self.at).copied()? {
+                b'0' => self.at += 1,
+                b'1'..=b'9' => self.decimal_digits()?,
+                _ => return None,
+            }
+            if self.bytes.get(self.at) == Some(&b'.') {
+                self.at += 1;
+                self.decimal_digits()?;
+            }
+            if matches!(self.bytes.get(self.at).copied(), Some(b'e' | b'E')) {
+                self.at += 1;
+                if matches!(self.bytes.get(self.at).copied(), Some(b'+' | b'-')) {
+                    self.at += 1;
+                }
+                self.decimal_digits()?;
+            }
+            Some(Value::Number(
+                std::str::from_utf8(&self.bytes[start..self.at])
+                    .ok()?
+                    .to_owned(),
+            ))
+        }
+
         fn value(&mut self, depth: usize) -> Option<Value> {
             if depth > MAX_DEPTH {
                 return None;
@@ -230,19 +283,7 @@ mod reply_json {
                         self.eat(b',')?;
                     }
                 }
-                b'-' | b'0'..=b'9' => {
-                    let start = self.at;
-                    while self.bytes.get(self.at).is_some_and(|b| {
-                        b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E')
-                    }) {
-                        self.at += 1;
-                    }
-                    Some(Value::Number(
-                        std::str::from_utf8(&self.bytes[start..self.at])
-                            .ok()?
-                            .to_owned(),
-                    ))
-                }
+                b'-' | b'0'..=b'9' => self.number(),
                 _ => None,
             }
         }
@@ -261,7 +302,7 @@ mod reply_json {
 }
 
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    if !text.len().is_multiple_of(2) || !text.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
     text.as_bytes()
@@ -434,10 +475,12 @@ impl Write for ConsultStream {
     }
 }
 
+#[cfg(test)]
 fn read_reply(reader: &mut BufReader<ConsultStream>) -> io::Result<String> {
     read_reply_bounded(reader, MAX_REPLY_BYTES)
 }
 
+#[cfg(test)]
 fn read_reply_bounded(reader: &mut BufReader<ConsultStream>, max_bytes: u64) -> io::Result<String> {
     // Check even when BufReader already has bytes: a pipelined reply
     // cannot make an expired attempt healthy without another socket read.
@@ -501,7 +544,7 @@ enum Live {
         attempt: String,
         env: Vec<(String, String)>,
     },
-    /// An accepted hit whose install outcome is unknown: fail the compile.
+    /// An accepted hit with an unknown outcome, or a cancelled caller.
     FailClosed(String),
 }
 
@@ -511,6 +554,20 @@ fn live_decision_timeout_ms(breaker_budget_ms: u32) -> u32 {
         .and_then(|value| value.parse().ok())
         .unwrap_or(LIVE_DECISION_TIMEOUT_MS)
         .max(breaker_budget_ms)
+}
+
+/// Unsupported supervision keeps its existing pass-through behavior. Once a
+/// caller was captured, however, losing that exact birth identity is terminal.
+/// Never recapture a reparented wrapper as a new, apparently healthy request.
+fn caller_still_owned(owner: Option<supervision::Owner>) -> bool {
+    owner.is_none_or(supervision::Owner::can_acknowledge_capture)
+}
+
+fn stop_if_caller_lost(owner: Option<supervision::Owner>) {
+    if !caller_still_owned(owner) {
+        eprintln!("rabs-wrap: original compiler caller disappeared; refusing further work");
+        std::process::exit(1);
+    }
 }
 
 /// The full live request, or `None` when it cannot be represented
@@ -526,7 +583,7 @@ fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
     }
     let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
     let frame = format!(
-        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}]}}",
+        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}],\"wait_for_inflight\":true,\"remote_protocol\":1}}",
         argv_json.join(","),
         json_string(cwd),
         env.join(","),
@@ -538,10 +595,21 @@ fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
 fn live_outcome(
     reply: &reply_json::Value,
     mut reader: BufReader<ConsultStream>,
+    owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
+    if !owned() {
+        return Ok(Live::FailClosed(
+            "original compiler caller disappeared".into(),
+        ));
+    }
     match reply.get("decision").and_then(reply_json::Value::as_str) {
         Some("pass-through") => Ok(Live::PassThrough),
         Some("execute") => {
+            // An older daemon may publish after the wrapper exits. Do not
+            // supply it an observed completion without a custody handshake.
+            if !capture::supported(reply) {
+                return Ok(Live::PassThrough);
+            }
             let attempt = reply.get("attempt").and_then(reply_json::Value::as_str);
             let env = reply.get("env").and_then(reply_json::Value::as_array);
             let (Some(attempt), Some(env)) = (attempt, env) else {
@@ -561,22 +629,36 @@ fn live_outcome(
                 env,
             })
         }
+        Some("remote") => remote::outcome(reply, reader, owned),
         Some("hit") => {
+            // Decline before accepting output writes from an older daemon:
+            // its publications belong to the pre-custody key namespace.
+            if !capture::supported(reply) {
+                return Ok(Live::PassThrough);
+            }
             // Commit to waiting: from here on the daemon may write outputs,
             // so this process must not run the compiler unless a complete,
             // typed answer confirms that the install writer returned. Losing
             // a connection does not prove that its daemon or writer died.
-            reader.get_mut().deadline = Instant::now() + install_wait();
-            if reader
-                .get_mut()
-                .write_all(b"{\"kind\":\"rustc-accept\"}\n")
-                .is_err()
+            let Some(deadline) = Instant::now().checked_add(install_wait()) else {
+                return Ok(Live::FailClosed(
+                    "RABS install deadline is not representable".into(),
+                ));
+            };
+            if singleflight::write_owned(
+                &mut reader,
+                b"{\"kind\":\"rustc-accept\"}\n",
+                deadline,
+                owned,
+            )
+            .is_err()
             {
                 return Ok(Live::FailClosed(
                     "the RABS cache-hit acceptance could not be confirmed".into(),
                 ));
             }
-            match read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES) {
+            match singleflight::read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, deadline, owned)
+            {
                 Ok(line) => Ok(accepted_install_reply(&line)),
                 // A socket read timeout surfaces as WouldBlock (EAGAIN) on
                 // Linux and TimedOut elsewhere; both mean "still alive, no
@@ -592,9 +674,9 @@ fn live_outcome(
                             .into(),
                     ))
                 }
-                // EOF/reset, invalid UTF-8, oversized or truncated frames
-                // are all uncertain delivery. A daemon's independently owned
-                // writer may still be running after its connection closes.
+                // Caller loss, EOF/reset, invalid UTF-8, oversized or truncated
+                // frames all fail closed. Closing our connection does not stop
+                // an independently owned daemon writer or authorize fallback.
                 Err(error) => Ok(Live::FailClosed(format!(
                     "the RABS cache-hit install outcome is unknown: {error}"
                 ))),
@@ -642,6 +724,45 @@ fn accepted_install_reply(line: &str) -> Live {
     }
 }
 
+/// Establish a bounded socket connection. The helper thread has no authority
+/// to send protocol frames or accept an installation.
+fn connect_owned(
+    socket: &str,
+    timeout: Duration,
+    owned: &impl Fn() -> bool,
+) -> io::Result<UnixStream> {
+    if !owned() {
+        return Err(io::Error::other("original compiler caller disappeared"));
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let socket_owned = socket.to_owned();
+    std::thread::Builder::new().spawn(move || {
+        let _ = sender.send(UnixStream::connect(socket_owned));
+    })?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("RABS connect deadline overflow"))?;
+    loop {
+        if !owned() {
+            return Err(io::Error::other("original compiler caller disappeared"));
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "RABS connect deadline"))?;
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "RABS connect worker stopped",
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 /// One consult attempt under the breaker budgets. `Ok(_)` = a decision
 /// was received (shadow decisions are always pass-through).
 fn consult(
@@ -649,26 +770,24 @@ fn consult(
     connect_timeout_ms: u32,
     decision_timeout_ms: u32,
     args: &[String],
+    owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
-    // std UDS has no connect timeout: connect on a helper thread and
-    // bound the wait. A short-lived process reaps stragglers at exit.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let socket_owned = socket.to_string();
-    std::thread::Builder::new()
-        .spawn(move || {
-            let _ = sender.send(UnixStream::connect(socket_owned));
-        })
-        .map_err(|_| ())?;
-    let stream = receiver
-        .recv_timeout(Duration::from_millis(u64::from(connect_timeout_ms)))
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+    if !owned() {
+        return Err(());
+    }
+    let stream = connect_owned(
+        socket,
+        Duration::from_millis(u64::from(connect_timeout_ms)),
+        owned,
+    )
+    .map_err(|_| ())?;
     let cwd = std::env::current_dir()
         .map_err(|_| ())?
         .into_os_string()
         .into_string()
         .map_err(|_| ())?;
     let live_frame = live_request_frame(args, &cwd);
+    let may_wait = live_frame.is_some();
     let budget = Duration::from_millis(u64::from(if live_frame.is_some() {
         live_decision_timeout_ms(decision_timeout_ms)
     } else {
@@ -677,12 +796,10 @@ fn consult(
     let deadline = Instant::now().checked_add(budget).ok_or(())?;
     let mut reader = BufReader::new(ConsultStream { stream, deadline });
 
-    reader
-        .get_mut()
-        .write_all(HELLO.as_bytes())
+    singleflight::write_owned(&mut reader, HELLO.as_bytes(), deadline, owned).map_err(|_| ())?;
+    singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
+    let line = singleflight::read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, owned)
         .map_err(|_| ())?;
-    reader.get_mut().write_all(b"\n").map_err(|_| ())?;
-    let line = read_reply(&mut reader).map_err(|_| ())?;
     if !line.contains("hello-ok") {
         return Err(());
     }
@@ -707,21 +824,17 @@ fn consult(
             )
         }
     };
-    reader
-        .get_mut()
-        .write_all(frame.as_bytes())
-        .map_err(|_| ())?;
-    reader.get_mut().write_all(b"\n").map_err(|_| ())?;
-    let line = read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES).map_err(|_| ())?;
-    if line.contains("\"kind\":\"rustc-decision\"") {
-        let reply = reply_json::parse(&line).ok_or(())?;
-        return live_outcome(&reply, reader);
-    }
-    if consult_succeeded(&line) {
-        Ok(Live::PassThrough)
-    } else {
-        Err(())
-    }
+    singleflight::write_owned(&mut reader, frame.as_bytes(), deadline, owned).map_err(|_| ())?;
+    singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
+    singleflight::read_decision(
+        reader,
+        &frame,
+        budget,
+        may_wait,
+        socket,
+        Duration::from_millis(u64::from(connect_timeout_ms)),
+        owned,
+    )
 }
 
 /// Did the daemon actually answer this consult, or only admit that it
@@ -743,7 +856,16 @@ fn consult_succeeded(reply: &str) -> bool {
     !reply.contains("\"mode\":\"shadow-error\"")
 }
 
-fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
+fn observe_with_breaker(
+    socket: &str,
+    path: &str,
+    args: &[String],
+    owner: Option<supervision::Owner>,
+) -> Live {
+    let owned = || caller_still_owned(owner);
+    if !owned() {
+        return Live::FailClosed("original compiler caller disappeared".into());
+    }
     let policy = BreakerPolicy::default();
     // The breaker lock covers DECISIONS and RECORDS, not the consult. A
     // closed breaker admits concurrent consults: holding the lock across a
@@ -782,7 +904,19 @@ fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
             }
         }
     };
-    let outcome = consult(socket, connect_timeout_ms, decision_timeout_ms, args);
+    let outcome = consult(
+        socket,
+        connect_timeout_ms,
+        decision_timeout_ms,
+        args,
+        &owned,
+    );
+    if !owned() {
+        // Cancellation is neither daemon failure nor evidence of its health.
+        // An abandoned probe keeps its already published cooldown reservation;
+        // the lock still drops here, and no compiler or install is retried.
+        return Live::FailClosed("original compiler caller disappeared".into());
+    }
     let attempt = match &outcome {
         Ok(Live::FailClosed(_)) | Err(()) => AttemptOutcome::Failed,
         Ok(_) => AttemptOutcome::Succeeded,
@@ -806,12 +940,34 @@ fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
     outcome.unwrap_or(Live::PassThrough)
 }
 
-/// Copy a compiler stream to ours as bytes arrive (no buffering beyond
-/// one read), capturing up to `MAX_CAPTURE_BYTES`. Returns the capture and
-/// whether it overflowed.
-fn tee(mut source: impl Read, mut sink: impl Write) -> (Vec<u8>, bool) {
-    let mut captured = Vec::new();
-    let mut overflow = false;
+/// Capture limits are cache policy; delivery failures are build failures.
+/// Never conflate an intentionally uncached transcript with lost compiler IO.
+#[derive(Debug)]
+struct CompilerStream {
+    bytes: Vec<u8>,
+    overflowed: bool,
+    delivered: bool,
+}
+
+impl CompilerStream {
+    fn unavailable() -> Self {
+        Self {
+            bytes: Vec::new(),
+            overflowed: false,
+            delivered: false,
+        }
+    }
+}
+
+/// Copy raw bytes live, keeping only a bounded PREFIX for optional caching.
+/// After a sink error, drain the source without further writes: closing the
+/// pipe would change the compiler's status, and stopping reads could wedge it.
+fn tee(mut source: impl Read, mut sink: impl Write) -> CompilerStream {
+    let mut capture = CompilerStream {
+        bytes: Vec::new(),
+        overflowed: false,
+        delivered: true,
+    };
     let mut buffer = [0_u8; 8192];
     loop {
         let read = match source.read(&mut buffer) {
@@ -819,18 +975,124 @@ fn tee(mut source: impl Read, mut sink: impl Write) -> (Vec<u8>, bool) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
-                overflow = true;
+                capture.delivered = false;
                 break;
             }
         };
-        let _ = sink.write_all(&buffer[..read]).and_then(|()| sink.flush());
-        if captured.len() + read <= MAX_CAPTURE_BYTES {
-            captured.extend_from_slice(&buffer[..read]);
-        } else {
-            overflow = true;
+        if capture.delivered && forward_compiler_bytes(&mut sink, &buffer[..read]).is_err() {
+            capture.delivered = false;
+        }
+        let retained = read.min(MAX_CAPTURE_BYTES.saturating_sub(capture.bytes.len()));
+        capture.bytes.extend_from_slice(&buffer[..retained]);
+        capture.overflowed |= retained != read;
+    }
+    capture
+}
+
+fn forward_compiler_bytes(sink: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    sink.write_all(bytes)?;
+    loop {
+        match sink.flush() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
         }
     }
-    (captured, overflow)
+}
+
+const COMPILER_POLL: Duration = Duration::from_millis(20);
+/// This starts only AFTER the supervised compiler has stopped. It does not
+/// impose a new runtime limit on a healthy, still-executing compiler.
+const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+const EXIT_OUTPUT_INCOMPLETE: i32 = 122;
+
+#[derive(Debug)]
+struct CompilerOutput {
+    status: std::process::ExitStatus,
+    stdout: CompilerStream,
+    stderr: CompilerStream,
+}
+
+impl CompilerOutput {
+    fn delivered(&self) -> bool {
+        self.stdout.delivered && self.stderr.delivered
+    }
+
+    fn capture_eligible(&self) -> bool {
+        self.delivered() && !self.stdout.overflowed && !self.stderr.overflowed
+    }
+}
+
+/// Each relay sends exactly one completed capture. No stream bytes or progress
+/// messages accumulate in this channel. A missing/panicked relay is incomplete.
+fn collect_stream(
+    receiver: &std::sync::mpsc::Receiver<CompilerStream>,
+    output: &mut Option<CompilerStream>,
+) {
+    if output.is_none() {
+        *output = match receiver.try_recv() {
+            Ok(captured) => Some(captured),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(CompilerStream::unavailable()),
+        };
+    }
+}
+
+/// Never join a thread that may be blocked in inherited stdout/stderr. Observe
+/// the child AND the original caller while the relays run; a terminal status
+/// starts a single bounded drain window for both streams. The caller MUST exit
+/// the process on an incomplete result/error, which ends any blocked relays.
+/// This is private to the short-lived wrapper, not a reusable detached-IO API.
+fn collect_compiler_output(
+    mut poll_child: impl FnMut() -> io::Result<Option<std::process::ExitStatus>>,
+    stdout: std::sync::mpsc::Receiver<CompilerStream>,
+    stderr: std::sync::mpsc::Receiver<CompilerStream>,
+    owned: impl Fn() -> bool,
+    drain_budget: Duration,
+) -> io::Result<CompilerOutput> {
+    let mut terminal = None;
+    let mut drain_deadline = None;
+    let mut out = None;
+    let mut err = None;
+    loop {
+        if !owned() {
+            return Err(io::Error::other("original compiler caller disappeared"));
+        }
+        if terminal.is_none() {
+            match poll_child() {
+                Ok(Some(status)) => {
+                    terminal = Some(status);
+                    drain_deadline =
+                        Some(Instant::now().checked_add(drain_budget).ok_or_else(|| {
+                            io::Error::other("compiler output deadline is not representable")
+                        })?);
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        collect_stream(&stdout, &mut out);
+        collect_stream(&stderr, &mut err);
+        if let Some(status) = terminal {
+            let expired = drain_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            if (out.is_some() && err.is_some()) || expired {
+                // Recheck after the last observation, before returning a result
+                // that could lead to capture/publication consent.
+                if !owned() {
+                    return Err(io::Error::other("original compiler caller disappeared"));
+                }
+                return Ok(CompilerOutput {
+                    status,
+                    stdout: out.unwrap_or_else(CompilerStream::unavailable),
+                    stderr: err.unwrap_or_else(CompilerStream::unavailable),
+                });
+            }
+        }
+        let pause = drain_deadline.map_or(COMPILER_POLL, |deadline| {
+            COMPILER_POLL.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        std::thread::sleep(pause);
+    }
 }
 
 /// Terminate exactly as the compiler did: its exit code, or its signal.
@@ -850,73 +1112,122 @@ fn exit_like(status: std::process::ExitStatus) -> ! {
     std::process::exit(1);
 }
 
-/// Run the compiler as the admitted attempt: the constructed environment
-/// exactly, streams forwarded live and captured, then one completion frame
-/// on the decision's connection. A capture that overflowed is not
-/// reported; the daemon then settles the attempt without publishing.
+fn is_executable_file_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ExecutableFileBusy || error.raw_os_error() == Some(26)
+}
+
+fn exec_compiler(real_rustc: &OsStr, args: &[OsString]) -> ! {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let error = std::process::Command::new(real_rustc).args(args).exec();
+        if is_executable_file_busy(&error) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
+        std::process::exit(127);
+    }
+}
+
+/// Run the admitted compiler with exact environment and live streams, then
+/// retain output custody until the daemon has captured immutable bytes.
+/// Overflowed, abandoned or unacknowledged captures are never published.
+/// Cache-population failure preserves compiler status; incomplete IO delivery
+/// refuses an otherwise successful result. Nonzero compiler exits/signals win.
 fn run_attempt(
     real_rustc: &OsStr,
     args: &[OsString],
     mut session: BufReader<ConsultStream>,
     attempt: &str,
     env: &[(String, String)],
+    owner: supervision::Owner,
 ) -> ! {
-    let mut child = match std::process::Command::new(real_rustc)
-        .args(args)
-        .env_clear()
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+    let mut child = match supervision::spawn(real_rustc, args, env, owner) {
         Ok(child) => child,
-        Err(error) => {
-            eprintln!("rabs-wrap: spawn {}: {error}", real_rustc.to_string_lossy());
-            std::process::exit(127);
+        Err(_) => {
+            // No compiler started. Abandon admission and become the original
+            // compiler, rather than leave an unsupervised observed child.
+            drop(session);
+            stop_if_caller_lost(Some(owner));
+            exec_compiler(real_rustc, args);
         }
     };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out = std::thread::spawn(move || match stdout {
-        Some(pipe) => tee(pipe, io::stdout()),
-        None => (Vec::new(), true),
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel(1);
+    let (err_tx, err_rx) = std::sync::mpsc::sync_channel(1);
+    let out = std::thread::Builder::new().spawn(move || {
+        let capture = match stdout {
+            // Hold stdout's lock through the relay. On process exit Rust's
+            // best-effort stdout cleanup must not flush a buffer concurrently
+            // with a blocked relay (including between its write and flush).
+            Some(pipe) => tee(pipe, io::stdout().lock()),
+            None => CompilerStream::unavailable(),
+        };
+        let _ = out_tx.send(capture);
     });
-    let err = std::thread::spawn(move || match stderr {
-        Some(pipe) => tee(pipe, io::stderr()),
-        None => (Vec::new(), true),
+    let err = std::thread::Builder::new().spawn(move || {
+        let capture = match stderr {
+            Some(pipe) => tee(pipe, io::stderr().lock()),
+            None => CompilerStream::unavailable(),
+        };
+        let _ = err_tx.send(capture);
     });
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!("rabs-wrap: wait for compiler: {error}");
+    if out.is_err() || err.is_err() {
+        drop(session);
+        // No fallback/replay after spawn. Exiting also releases a partial
+        // relay setup; the Linux compiler guard observes its wrapper's death.
+        std::process::exit(1);
+    }
+    let output = match collect_compiler_output(
+        || child.try_wait(),
+        out_rx,
+        err_rx,
+        || owner.can_acknowledge_capture(),
+        OUTPUT_DRAIN_BUDGET,
+    ) {
+        Ok(output) => output,
+        Err(_) => {
+            drop(session);
+            // Do not print or join here: a relay may hold the stderr lock
+            // while its consumer is stalled. Process exit ends the relays;
+            // the existing guard owns compiler-group cancellation, not us.
             std::process::exit(1);
         }
     };
-    let (stdout, out_overflow) = out.join().unwrap_or((Vec::new(), true));
-    let (stderr, err_overflow) = err.join().unwrap_or((Vec::new(), true));
-    if !out_overflow && !err_overflow {
+    if !output.delivered() {
+        drop(session);
+        if output.status.success() {
+            std::process::exit(EXIT_OUTPUT_INCOMPLETE);
+        }
+        exit_like(output.status);
+    }
+    if output.capture_eligible() {
         use std::os::unix::process::ExitStatusExt;
         let number =
             |value: Option<i32>| value.map_or_else(|| "null".to_owned(), |v| v.to_string());
         let frame = format!(
-            "{{\"kind\":\"rustc-complete\",\"attempt\":{},\"exit_code\":{},\"signal\":{},\
+            "{{\"kind\":\"rustc-complete\",\"capture_protocol\":1,\"attempt\":{},\"exit_code\":{},\"signal\":{},\
              \"stdout_hex\":\"{}\",\"stderr_hex\":\"{}\"}}\n",
             json_string(attempt),
-            number(status.code()),
-            number(status.signal()),
-            hex_encode(&stdout),
-            hex_encode(&stderr),
+            number(output.status.code()),
+            number(output.status.signal()),
+            hex_encode(&output.stdout.bytes),
+            hex_encode(&output.stderr.bytes),
         );
-        // The daemon harvests outputs on its own time; the compile's
-        // caller does not wait for publication.
-        session.get_mut().deadline = Instant::now() + Duration::from_secs(5);
-        let _ = session.get_mut().write_all(frame.as_bytes());
+        // A report is not publication consent. Hold Cargo's output lifetime
+        // until capture is acknowledged, using one bounded deadline. No ACK
+        // means no publication, including a receipt arriving after timeout.
+        let _ = capture::finish(&mut session, attempt, &frame, || {
+            owner.can_acknowledge_capture()
+        });
     }
     drop(session);
-    exit_like(status);
+    exit_like(output.status);
 }
 
 fn main() {
+    supervision::run_if_guard();
     let mut argv = std::env::args_os().skip(1);
     let Some(real_rustc) = argv.next() else {
         eprintln!("rabs-wrap: usage: rabs-wrap <real-rustc> <args…>");
@@ -926,13 +1237,19 @@ fn main() {
 
     // Probes and unrepresentable argv: no state, no socket, no consult.
     if let Some(consult_argv) = shadow_argv(&real_rustc, &args) {
+        let owner = supervision::Owner::capture().ok();
+        stop_if_caller_lost(owner);
         // The consult argv is the FULL command the compiler runs:
         // argv[0] is the real tool (the daemon stats it for the
         // toolchain-identity key component and records it as argv0),
         // followed by every rustc argument. Sending only the args would
         // leave the daemon statting `--crate-name` and mislabeling
         // receipts.
-        match observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv) {
+        let decision = observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv, owner);
+        // Every return path, including errors, an open/contended breaker,
+        // legacy decisions and writer-returned fallback, keeps this fence.
+        stop_if_caller_lost(owner);
+        match decision {
             Live::PassThrough => {}
             Live::Served(stderr) => {
                 // The daemon installed and verified every declared output;
@@ -947,7 +1264,13 @@ fn main() {
                 session,
                 attempt,
                 env,
-            } => run_attempt(&real_rustc, &args, *session, &attempt, &env),
+            } => {
+                if let Some(owner) = owner {
+                    run_attempt(&real_rustc, &args, *session, &attempt, &env, owner);
+                }
+                // No usable supervision evidence: drop the admission and exec
+                // normally. Never claim to have supervised or published it.
+            }
             Live::FailClosed(reason) => {
                 eprintln!(
                     "rabs-wrap: {reason}; refusing to run rustc over a possibly changing output tree"
@@ -955,18 +1278,273 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        stop_if_caller_lost(owner);
     }
 
     // Become the compiler. On success this never returns; exit codes,
     // signals, and stdio semantics are the real chain's, exactly.
-    let error = std::process::Command::new(&real_rustc).args(&args).exec();
-    eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
-    std::process::exit(127);
+    exec_compiler(&real_rustc, &args);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delivered_stream(bytes: &[u8]) -> CompilerStream {
+        CompilerStream {
+            bytes: bytes.to_vec(),
+            overflowed: false,
+            delivered: true,
+        }
+    }
+
+    fn compiler_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn compiler_tee_preserves_binary_bytes_and_unterminated_output() {
+        for bytes in [b"".as_slice(), b"\0\xff\r\ncompiler\x1b[0m"] {
+            let mut sink = Vec::new();
+            let capture = tee(bytes, &mut sink);
+            assert_eq!(sink, bytes);
+            assert_eq!(capture.bytes, bytes);
+            assert!(capture.delivered);
+            assert!(!capture.overflowed);
+        }
+    }
+
+    #[test]
+    fn compiler_tee_overflow_only_disables_caching_and_keeps_an_exact_prefix() {
+        let bytes = (0..MAX_CAPTURE_BYTES + 19)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut sink = Vec::new();
+        let capture = tee(bytes.as_slice(), &mut sink);
+        assert_eq!(sink, bytes);
+        assert_eq!(capture.bytes, bytes[..MAX_CAPTURE_BYTES]);
+        assert!(capture.delivered && capture.overflowed);
+        let output = CompilerOutput {
+            status: compiler_status(0),
+            stdout: delivered_stream(b""),
+            stderr: capture,
+        };
+        assert!(output.delivered() && output.status.success());
+        assert!(!output.capture_eligible());
+        let exact = tee(&bytes[..MAX_CAPTURE_BYTES], io::sink());
+        assert!(exact.delivered && !exact.overflowed);
+    }
+
+    struct FailedSink {
+        writes: usize,
+        flushes: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FailedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.fail_flush {
+                Ok(bytes.len())
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Err(io::Error::other("failed output flush"))
+        }
+    }
+
+    #[test]
+    fn compiler_tee_drains_after_write_or_flush_failure_without_retrying_delivery() {
+        for fail_flush in [false, true] {
+            let bytes = vec![b'x'; 32 * 1024];
+            let mut source = io::Cursor::new(&bytes);
+            let mut sink = FailedSink {
+                writes: 0,
+                flushes: 0,
+                fail_flush,
+            };
+            let capture = tee(&mut source, &mut sink);
+            assert_eq!(source.position(), bytes.len() as u64);
+            assert_eq!(capture.bytes, bytes);
+            assert!(!capture.delivered);
+            assert!(!capture.overflowed);
+            assert_eq!(sink.writes, 1, "do not repeat failed delivery");
+            assert_eq!(sink.flushes, usize::from(fail_flush));
+        }
+    }
+
+    #[test]
+    fn compiler_tee_read_error_is_not_eof_or_capture_overflow() {
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken compiler stream"))
+            }
+        }
+        let mut sink = Vec::new();
+        let capture = tee(b"prefix".as_slice().chain(FailedRead), &mut sink);
+        assert_eq!(sink, b"prefix");
+        assert_eq!(capture.bytes, b"prefix");
+        assert!(!capture.delivered && !capture.overflowed);
+    }
+
+    #[test]
+    fn compiler_tee_retries_interrupted_io_without_duplicating_bytes() {
+        struct InterruptedSink {
+            bytes: Vec<u8>,
+            write_interrupted: bool,
+            flush_interrupted: bool,
+        }
+        impl Write for InterruptedSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.write_interrupted {
+                    self.write_interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let count = bytes.len().min(3);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if !self.flush_interrupted {
+                    self.flush_interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                Ok(())
+            }
+        }
+        let mut sink = InterruptedSink {
+            bytes: Vec::new(),
+            write_interrupted: false,
+            flush_interrupted: false,
+        };
+        let bytes = b"partial\0binary\xffoutput";
+        let capture = tee(bytes.as_slice(), &mut sink);
+        assert!(capture.delivered && !capture.overflowed);
+        assert_eq!(sink.bytes, bytes);
+        assert_eq!(capture.bytes, bytes);
+    }
+
+    #[test]
+    fn compiler_stream_eof_does_not_start_a_running_compilers_drain_deadline() {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        out_tx.send(delivered_stream(b"out")).unwrap();
+        err_tx.send(delivered_stream(b"err")).unwrap();
+        let mut polls = 0;
+        let result = collect_compiler_output(
+            || {
+                polls += 1;
+                Ok((polls == 3).then(|| compiler_status(0)))
+            },
+            out_rx,
+            err_rx,
+            || true,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(polls, 3);
+        assert!(result.status.success() && result.capture_eligible());
+        assert_eq!(result.stdout.bytes, b"out");
+        assert_eq!(result.stderr.bytes, b"err");
+    }
+
+    #[test]
+    fn compiler_terminal_status_bounds_either_held_stream_without_masking_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        for raw_status in [0, 41 << 8, 15] {
+            for held_stdout in [false, true] {
+                let (out_tx, out_rx) = std::sync::mpsc::channel();
+                let (err_tx, err_rx) = std::sync::mpsc::channel();
+                if held_stdout {
+                    err_tx.send(delivered_stream(b"err")).unwrap();
+                } else {
+                    out_tx.send(delivered_stream(b"out")).unwrap();
+                }
+                let result = collect_compiler_output(
+                    || Ok(Some(std::process::ExitStatus::from_raw(raw_status))),
+                    out_rx,
+                    err_rx,
+                    || true,
+                    Duration::ZERO,
+                )
+                .unwrap();
+                assert_eq!(result.status.into_raw(), raw_status);
+                assert!(!result.delivered() && !result.capture_eligible());
+                assert_eq!(result.stdout.delivered, !held_stdout);
+                assert_eq!(result.stderr.delivered, held_stdout);
+            }
+        }
+    }
+
+    #[test]
+    fn compiler_output_wait_observes_caller_loss_before_and_after_child_exit() {
+        use std::cell::Cell;
+        for completed in [false, true] {
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            let (err_tx, err_rx) = std::sync::mpsc::channel();
+            let owned = Cell::new(true);
+            let error = collect_compiler_output(
+                || {
+                    owned.set(false);
+                    Ok(completed.then(|| compiler_status(0)))
+                },
+                out_rx,
+                err_rx,
+                || owned.get(),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("caller disappeared"));
+            drop((out_tx, err_tx));
+        }
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        assert!(
+            collect_compiler_output(
+                || panic!("lost owner must not poll or start work"),
+                out_rx,
+                err_rx,
+                || false,
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+        drop((out_tx, err_tx));
+    }
+
+    #[test]
+    fn compiler_output_wait_rejects_missing_relays_and_propagates_wait_errors() {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        drop((out_tx, err_tx));
+        let result = collect_compiler_output(
+            || Ok(Some(compiler_status(0))),
+            out_rx,
+            err_rx,
+            || true,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(!result.delivered() && !result.capture_eligible());
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let error = collect_compiler_output(
+            || Err(io::Error::other("wait failed")),
+            out_rx,
+            err_rx,
+            || true,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "wait failed");
+        drop((out_tx, err_tx));
+    }
 
     #[test]
     fn accepted_install_reply_requires_unambiguous_completion_authority() {
@@ -981,6 +1559,8 @@ mod tests {
             r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true,"writer_returned":false}"#,
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true}"#,
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"zz"}"#,
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"+a"}"#,
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"\u+030a"}"#,
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"compiler_skip_authorized":false,"stderr_hex":""}"#,
             r#"{"kind":"rustc-decision","kind":"status","decision":"serve-failed","writer_returned":true}"#,
             r#"{"kind":"rustc-decision","decision":"serve-failed","decision":"served","writer_returned":true}"#,
@@ -992,7 +1572,7 @@ mod tests {
         }
         assert!(matches!(
             accepted_install_reply(
-                r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true}"#
+                r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true}"#,
             ),
             Live::PassThrough
         ));
@@ -1000,6 +1580,132 @@ mod tests {
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a"}"#,
         );
         assert!(matches!(served, Live::Served(bytes) if bytes == b"ok\n"));
+    }
+
+    #[test]
+    fn cancelled_caller_cannot_accept_a_hit_or_admit_execution() {
+        for line in [
+            r#"{"kind":"rustc-decision","decision":"hit","capture_protocol":1}"#,
+            r#"{"kind":"rustc-decision","decision":"execute","capture_protocol":1,"attempt":"id","env":[]}"#,
+            r#"{"kind":"rustc-decision","decision":"pass-through"}"#,
+        ] {
+            let reply = reply_json::parse(line).unwrap();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let reader = BufReader::new(ConsultStream {
+                stream,
+                deadline: Instant::now() + Duration::from_secs(2),
+            });
+            assert!(matches!(
+                live_outcome(&reply, reader, &|| false),
+                Ok(Live::FailClosed(_))
+            ));
+            assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0, "no install consent");
+        }
+    }
+
+    #[test]
+    fn reply_json_numbers_follow_exact_grammar() {
+        for number in [
+            "0",
+            "-0",
+            "1",
+            "-42",
+            "0.0",
+            "-0.25",
+            "1e0",
+            "1E+03",
+            "-1.25e-9",
+            "123456789012345678901234567890",
+            "1e9999",
+        ] {
+            assert!(
+                matches!(
+                    reply_json::parse(number),
+                    Some(reply_json::Value::Number(raw)) if raw == number
+                ),
+                "valid number must retain its exact spelling: {number}"
+            );
+        }
+        for number in [
+            "-", "+1", "01", "-01", ".5", "-.5", "1.", "1e", "1E+", "1e-", "--1", "1+2", "1e+-2",
+            "1..2", "0x1", "NaN", "inf",
+        ] {
+            assert!(
+                reply_json::parse(number).is_none(),
+                "malformed number must be rejected: {number}"
+            );
+        }
+    }
+
+    #[test]
+    fn reply_hex_fields_require_ascii_hex_digits() {
+        assert_eq!(hex_decode(""), Some(Vec::new()));
+        assert_eq!(hex_decode("0aFf"), Some(vec![0x0a, 0xff]));
+        for text in ["+a", "+0", "-0", "0+", "0g", "a"] {
+            assert!(
+                hex_decode(text).is_none(),
+                "malformed transcript hex must be rejected: {text}"
+            );
+        }
+        assert_eq!(
+            reply_json::parse(r#""\u0000\u0041\u00e9\uD83D\uDE80""#),
+            Some(reply_json::Value::Str("\0Aé🚀".into()))
+        );
+        for text in [r#""\u+000""#, r#""\u000g""#, r#""\u000""#] {
+            assert!(
+                reply_json::parse(text).is_none(),
+                "malformed Unicode escape must be rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_install_reply_requires_valid_ignored_json() {
+        for ignored in [
+            "-",
+            "01",
+            "1.",
+            "1e",
+            "1E+",
+            "1+2",
+            "[1e]",
+            r#"{"nested":01}"#,
+            r#""\u+000""#,
+        ] {
+            let returned = format!(
+                r#"{{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true,"ignored":{ignored}}}"#,
+            );
+            let served = format!(
+                r#"{{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a","ignored":{ignored}}}"#,
+            );
+            for line in [returned, served] {
+                assert!(
+                    matches!(accepted_install_reply(&line), Live::FailClosed(_)),
+                    "malformed ignored JSON cannot authorize execution: {line}"
+                );
+            }
+        }
+        for ignored in [
+            "1e9999",
+            r#"{"numbers":[-0,0.25,1E+03,-1.5e-2,123456789012345678901234567890]}"#,
+            r#""\u0000\u0041\u00e9\uD83D\uDE80""#,
+        ] {
+            let returned = format!(
+                r#"{{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true,"ignored":{ignored}}}"#,
+            );
+            assert!(
+                matches!(accepted_install_reply(&returned), Live::PassThrough),
+                "valid ignored JSON must preserve explicit writer return: {ignored}"
+            );
+            let served = format!(
+                r#"{{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a","ignored":{ignored}}}"#,
+            );
+            let replay = accepted_install_reply(&served);
+            assert!(
+                matches!(replay, Live::Served(bytes) if bytes == b"ok\n"),
+                "valid ignored JSON must preserve authorized replay: {ignored}"
+            );
+        }
     }
 
     fn reply_from_peer(bytes: Vec<u8>) -> io::Result<String> {
@@ -1251,7 +1957,12 @@ mod tests {
         let socket_text = socket.to_str().unwrap().to_owned();
         let wrapper_path = path_text.clone();
         let wrapper = std::thread::spawn(move || {
-            observe_with_breaker(&socket_text, &wrapper_path, &["/tc/bin/rustc".to_owned()])
+            observe_with_breaker(
+                &socket_text,
+                &wrapper_path,
+                &["/tc/bin/rustc".to_owned()],
+                None,
+            )
         });
         mid_consult
             .recv_timeout(Duration::from_secs(5))
@@ -1279,7 +1990,7 @@ mod tests {
         };
         store_state(path, &state).unwrap();
 
-        observe_with_breaker(socket.to_str().unwrap(), path, &[]);
+        observe_with_breaker(socket.to_str().unwrap(), path, &[], None);
 
         assert_eq!(load_state(path), state);
         assert_eq!(
@@ -1313,7 +2024,7 @@ mod tests {
             // No outcome publication: model an owner lost mid-consult.
         }
 
-        observe_with_breaker(socket.to_str().unwrap(), path, &[]);
+        observe_with_breaker(socket.to_str().unwrap(), path, &[], None);
 
         assert_eq!(load_state(path), probing);
         assert_eq!(
@@ -1332,7 +2043,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
 
-        observe_with_breaker(socket.to_str().unwrap(), path.to_str().unwrap(), &[]);
+        observe_with_breaker(socket.to_str().unwrap(), path.to_str().unwrap(), &[], None);
 
         assert_eq!(std::fs::read(parent).unwrap(), b"preserve me");
         assert_eq!(
@@ -1396,7 +2107,7 @@ mod tests {
     #[test]
     fn consult_against_nothing_fails_within_budget() {
         let start = std::time::Instant::now();
-        let result = consult("/nonexistent/rabsd.sock", 25, 50, &[]);
+        let result = consult("/nonexistent/rabsd.sock", 25, 50, &[], &|| true);
         assert!(result.is_err());
         assert!(
             start.elapsed() < Duration::from_millis(200),

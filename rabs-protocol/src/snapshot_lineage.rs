@@ -14,6 +14,17 @@
 //!   interleaves; a post-seal mutation of semantically relevant state
 //!   forces a strictly newer seal (or coherent replanning/downgrade —
 //!   an operation-level decision outside these types).
+//!
+//! ### Protocol vs. Edge Lineage Types (`bd-l108t`)
+//!
+//! This module defines the wire-level / protocol-level model for snapshot lineage
+//! and closure verification (`ActionSnapshotBinding`, `validate_closure`), designed
+//! for distributed worker transmission and replay verification.
+//!
+//! The local edge daemon's Cargo resolution lifecycle (lockfile mutation,
+//! advisory downgrade, and generation management) is governed by
+//! `rabsd::edge::snapshot_lineage::SnapshotLineage` (bead D032), which is wired into
+//! `rabsd::edge::cargo_resolution::seal_offline_resolution`.
 
 use crate::result_identity::ObjectId;
 

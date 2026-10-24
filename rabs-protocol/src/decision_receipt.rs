@@ -199,6 +199,13 @@ impl ReceiptStore {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Borrow all stored receipts in append order (immutable; history cannot
+    /// be mutated through this slice).
+    #[must_use]
+    pub fn as_slice(&self) -> &[DecisionReceipt] {
+        &self.records
+    }
 }
 
 #[cfg(test)]

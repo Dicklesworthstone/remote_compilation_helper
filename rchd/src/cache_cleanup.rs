@@ -66,11 +66,178 @@ fn cleanup_threshold_kb(min_free_gb: u64) -> u64 {
 /// Where the remote launcher publishes process records (`transfer.rs`).
 const REMOTE_RUN_ROOT: &str = "/tmp/rch-run";
 
+#[cfg(test)]
+use rch_common::stale_target_reap::RETAINED_SOURCE_GC_GUARD;
+
+/// Refresh real activity after source admission, never using the pre-wait CWD
+/// snapshot as authority. Return 0 only for known idle, 1 for observed activity,
+/// and 2 for unknown inspection. No scratch file or filesystem mutation here.
+const CLEANUP_SOURCE_ACTIVITY_GUARD: &str = r#"
+rch_cleanup_process_cwd() {
+    # stdin holds this exact proc directory; PID reuse cannot retarget it.
+    if rch_process_cwd=$(readlink /proc/self/fd/0/cwd); then
+        case "$rch_process_cwd" in "$2"|"$2"/*) return 1;; esac
+        return 0
+    fi
+    if rch_process_state=$(awk '/^State:[[:space:]]/ { print $2; n++ } END { exit n != 1 }' /proc/self/fd/0/status); then
+        case "$rch_process_state" in Z|X) return 0;; esac
+    else
+        if rch_process_identity=$(readlink /proc/self/fd/0) &&
+           [ "$rch_process_identity" = "$1 (deleted)" ]; then
+            return 0
+        fi
+    fi
+    return 2
+}
+rch_cleanup_bound_process_cwd() {
+    rch_process_opened=0
+    if {
+        rch_process_opened=1
+        rch_cleanup_process_cwd "$1" "$2"
+    } < "$1"; then
+        return 0
+    else
+        rch_process_status=$?
+    fi
+    # A failed directory open never entered the group. Its shell status is
+    # not the helper's typed result and cannot prove observed CWD activity.
+    if [ "$rch_process_opened" -eq 1 ]; then return "$rch_process_status"; fi
+    return 2
+}
+rch_cleanup_source_activity() {
+    if rch_recent_active=$(find "$1" -type f -mmin -"$2" -print -quit); then
+        if [ -n "$rch_recent_active" ]; then
+            printf 'RCH_CLEANUP_ACTIVITY_HOLD dir=%s reason=recent\n' "$1" >&2
+            return 1
+        fi
+    else
+        printf 'RCH_CLEANUP_ACTIVITY_UNKNOWN dir=%s reason=recent\n' "$1" >&2
+        return 2
+    fi
+    if [ ! -d /proc/self/fd ] || [ ! -L /proc/self/cwd ]; then
+        printf 'RCH_CLEANUP_ACTIVITY_UNKNOWN dir=%s reason=proc\n' "$1" >&2
+        return 2
+    fi
+    rch_seen_process=0
+    for rch_proc_dir in /proc/[0-9]*; do
+        [ -d "$rch_proc_dir" ] || continue
+        rch_seen_process=1
+        if rch_cleanup_bound_process_cwd "$rch_proc_dir" "$1"; then
+            :
+        else
+            rch_process_status=$?
+            if [ "$rch_process_status" -eq 1 ]; then
+                printf 'RCH_CLEANUP_ACTIVITY_HOLD dir=%s reason=cwd\n' "$1" >&2
+                return 1
+            fi
+            [ -d "$rch_proc_dir" ] || continue
+            printf 'RCH_CLEANUP_ACTIVITY_UNKNOWN dir=%s reason=cwds\n' "$1" >&2
+            return 2
+        fi
+    done
+    if [ "$rch_seen_process" -eq 0 ]; then
+        printf 'RCH_CLEANUP_ACTIVITY_UNKNOWN dir=%s reason=empty-cwds\n' "$1" >&2
+        return 2
+    fi
+    return 0
+}
+"#;
+
+/// Admit a cleanup candidate under the same durable registry transaction as
+/// source admission, then recheck retention before any mutation. Return 0 with
+/// the transaction held, 1 for a retained or active candidate, 2 for unavailable
+/// ownership or inspection, and 3 if retirement failed (the caller must stop
+/// the sweep).
+/// Every successful admission requires a checked end after the mutation.
+const CLEANUP_SOURCE_TRANSACTION: &str = r#"
+rch_cleanup_source_candidate_end() {
+    if __gc_source_end; then return 0; fi;
+    printf 'RCH_CLEANUP_SOURCE_RETIREMENT_FAILED dir=%s\n' "$1" >&2
+    return 1
+}
+rch_cleanup_source_candidate_begin() {
+    if __gc_source_begin "$1"; then
+        :
+    else
+        rch_source_admission_status=$?
+        if [ "$rch_source_admission_status" -eq 3 ]; then
+            printf 'RCH_CLEANUP_RETENTION_HOLD dir=%s\n' "$1" >&2
+            return 1
+        fi
+        # Removed by someone else while this sweep waited for the registry lock.
+        if [ "$rch_source_admission_status" -eq 4 ]; then return 1; fi
+        printf 'RCH_CLEANUP_SOURCE_OWNERSHIP_UNAVAILABLE dir=%s\n' "$1" >&2
+        return 2
+    fi
+    if rch_retained_source_gc_hold "$__gc_candidate"; then
+        rch_retention_status=0
+    else
+        rch_retention_status=$?
+    fi
+    if [ "$rch_retention_status" -eq 1 ]; then
+        if rch_cleanup_source_activity "$__gc_candidate" "${2:-5}"; then
+            return 0
+        else
+            rch_activity_status=$?
+        fi
+        if ! rch_cleanup_source_candidate_end "$1"; then return 3; fi
+        if [ "$rch_activity_status" -eq 1 ]; then return 1; fi
+        return 2
+    fi
+    if ! rch_cleanup_source_candidate_end "$1"; then return 3; fi
+    if [ "$rch_retention_status" -eq 0 ]; then
+        printf 'RCH_CLEANUP_RETENTION_HOLD dir=%s\n' "$1" >&2
+        return 1
+    fi
+    return 2
+}
+"#;
+
 fn build_cleanup_command(
     escaped_base: &str,
     escaped_run_root: &str,
     max_cache_age_hours: u64,
     min_free_gb: u64,
+) -> String {
+    build_cleanup_command_with_source_guard(
+        escaped_base,
+        escaped_run_root,
+        max_cache_age_hours,
+        min_free_gb,
+        placement_low_disk_permille(),
+        &rch_common::stale_target_reap::source_claim_gc_guard_fragment(),
+    )
+}
+
+/// rchd gives a worker zero slots once its free ratio falls to the placement
+/// policy's `critical_free_ratio`. Below that line no new build replaces these
+/// caches, so an age-only prune can leave a large worker starved with tens of
+/// GB free (bd-xxck3: css queue-timed-out ~466 builds/h on 2026-10-13). Low-disk
+/// eviction therefore also runs until the filesystem is back above that line
+/// with two percentage points of headroom.
+pub(crate) fn placement_low_disk_permille() -> u64 {
+    let critical = crate::disk_pressure::DiskPressurePolicyConfig::configured().critical_free_ratio;
+    ((critical * 1000.0).ceil() as u64).saturating_add(20)
+}
+
+/// Whether placement has zeroed this worker for lack of free space. Only the
+/// two free-space verdicts count: a saturated-I/O or stale-telemetry critical
+/// must not attract a sweep.
+fn disk_starved(pressure: &crate::disk_pressure::PressureAssessment) -> bool {
+    pressure.state == crate::disk_pressure::PressureState::Critical
+        && matches!(
+            pressure.reason_code.as_str(),
+            "disk_free_below_critical_gb" | "disk_ratio_below_critical"
+        )
+}
+
+fn build_cleanup_command_with_source_guard(
+    escaped_base: &str,
+    escaped_run_root: &str,
+    max_cache_age_hours: u64,
+    min_free_gb: u64,
+    low_disk_permille: u64,
+    source_guard: &str,
 ) -> String {
     let max_age_minutes = max_cache_age_hours.saturating_mul(60);
     let threshold_kb = cleanup_threshold_kb(min_free_gb);
@@ -92,10 +259,15 @@ fn build_cleanup_command(
          base={base}; \
          max_age_minutes={max_age_minutes}; \
          threshold_kb={threshold_kb}; \
+         low_disk_permille={low_disk_permille}; \
          active_grace_minutes={active_grace_minutes}; \
          orphan_after_minutes={orphan_after_minutes}; \
          if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
          if physical=$(cd \"$base\" 2>/dev/null && pwd -P); then base=$physical; fi; \
+         total_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $2}}'); \
+         case \"$total_kb\" in ''|*[!0-9]*) total_kb=0 ;; esac; \
+         ratio_kb=$((total_kb / 1000 * low_disk_permille)); \
+         if [ \"$ratio_kb\" -gt \"$threshold_kb\" ]; then threshold_kb=$ratio_kb; fi; \
          before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
          removed=0; freed_kb=0; low_disk=0; remove_errors=0; orphans_killed=0; \
@@ -126,8 +298,9 @@ fn build_cleanup_command(
            case \"$orphans_killed\" in ''|*[!0-9]*) orphans_killed=0 ;; esac; \
            find \"$run_root\" -mindepth 1 -maxdepth 1 -type d -empty -mmin +{empty_run_dir_minutes} -exec rmdir -- {{}} + 2>/dev/null || :; \
          fi; \
-         cwds=$(mktemp /tmp/rch-cleanup.XXXXXX); \
-         find /proc -mindepth 2 -maxdepth 2 -name cwd -printf '%l\\n' 2>/dev/null > \"$cwds\" || :; \
+         {source_guard}\n\
+         {activity_guard}\n\
+         {source_transaction}\n\
          candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
          if [ \"$low_disk\" -eq 1 ]; then \
            find \"$base\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null \
@@ -139,9 +312,31 @@ fn build_cleanup_command(
            [ -z \"$dir\" ] && continue; \
            [ ! -d \"$dir\" ] && continue; \
            case \"$dir\" in \"$base\"/*) ;; *) continue ;; esac; \
-           recent_active=$(find \"$dir\" -type f -mmin -\"$active_grace_minutes\" -print -quit 2>/dev/null || true); \
+           if rch_retained_source_gc_hold \"$dir\"; then \
+             printf 'RCH_CLEANUP_RETENTION_HOLD dir=%s\\n' \"$dir\" >&2; continue; \
+           else \
+             rch_retention_status=$?; \
+           fi; \
+           if [ \"$rch_retention_status\" -ne 1 ]; then \
+             remove_errors=$((remove_errors + 1)); continue; \
+           fi; \
+           if recent_active=$(find \"$dir\" -type f -mmin -\"$active_grace_minutes\" -print -quit); then \
+             :; \
+           else \
+             remove_errors=$((remove_errors + 1)); \
+             printf 'RCH_CLEANUP_ACTIVITY_UNKNOWN dir=%s reason=recent\\n' \"$dir\" >&2; continue; \
+           fi; \
            if [ -n \"$recent_active\" ]; then continue; fi; \
-           if D=\"$dir\" awk 'BEGIN {{ d = ENVIRON[\"D\"] }} $0 == d || index($0, d \"/\") == 1 {{ f = 1; exit }} END {{ exit !f }}' \"$cwds\"; then continue; fi; \
+           if rch_cleanup_source_candidate_begin \"$dir\" \"$active_grace_minutes\"; then \
+             :; \
+           else \
+             rch_source_status=$?; \
+             if [ \"$rch_source_status\" -eq 1 ]; then continue; fi; \
+             remove_errors=$((remove_errors + 1)); \
+             if [ \"$rch_source_status\" -eq 3 ]; then break; fi; \
+             continue; \
+           fi; \
+           dir=$__gc_candidate; \
            size_kb=$(du -sk \"$dir\" 2>/dev/null | awk '{{print $1}}'); \
            if [ -z \"$size_kb\" ]; then size_kb=0; fi; \
          if rm -rf \"$dir\" 2>/dev/null; then \
@@ -163,12 +358,15 @@ fn build_cleanup_command(
            remove_errors=$((remove_errors + 1)); \
            printf 'RCH_CLEANUP_RM_FAILURE dir=%s kb=%s\\n' \"$dir\" \"$size_kb\" >&2; \
          fi; \
+           if ! rch_cleanup_source_candidate_end \"$dir\"; then \
+             remove_errors=$((remove_errors + 1)); break; \
+           fi; \
            if [ \"$low_disk\" -eq 1 ]; then \
              current_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
              if [ -n \"$current_kb\" ] && [ \"$current_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
            fi; \
          done < \"$candidates\"; \
-         rm -f \"$candidates\" \"$cwds\"; \
+         rm -f \"$candidates\"; \
          after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
          printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
@@ -177,10 +375,14 @@ fn build_cleanup_command(
         run_root = escaped_run_root,
         max_age_minutes = max_age_minutes,
         threshold_kb = threshold_kb,
+        low_disk_permille = low_disk_permille,
         active_grace_minutes = active_grace_minutes,
         orphan_after_minutes = orphan_after_minutes,
         empty_run_dir_minutes = empty_run_dir_minutes,
         identity = rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+        activity_guard = CLEANUP_SOURCE_ACTIVITY_GUARD,
+        source_guard = source_guard,
+        source_transaction = CLEANUP_SOURCE_TRANSACTION,
     )
 }
 
@@ -371,9 +573,19 @@ impl CacheCleanupScheduler {
             return false;
         }
 
+        // Placement gives a worker no new builds once it is critically short
+        // of free space, but the builds it already runs can hold slots for
+        // hours, and a ghost reservation holds one indefinitely. Requiring an
+        // idle worker then keeps the sweep away from exactly the workers
+        // that need it (2026-10-13: css swept three idle workers and skipped
+        // every starved one). The script protects live trees itself (recent
+        // activity, retention holds, the source registry), so a starved
+        // worker is swept while it drains.
+        let disk_starved = disk_starved(&worker_state.pressure_assessment().await);
+
         // Check if worker is busy (has active slots)
         let used_slots = worker_state.used_slots();
-        if used_slots != 0 {
+        if used_slots != 0 && !disk_starved {
             debug!(
                 "Worker {} is busy ({} slots reserved), skipping cleanup",
                 worker_id, used_slots
@@ -384,7 +596,7 @@ impl CacheCleanupScheduler {
 
         // Enforce idle threshold before cleanup.
         let idle_threshold = Duration::from_secs(self.config.idle_threshold_secs);
-        if !idle_threshold.is_zero() {
+        if !idle_threshold.is_zero() && !disk_starved {
             let now = Instant::now();
             let idle_for = {
                 let mut idle_since = self.idle_since.write().await;
@@ -954,6 +1166,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_disk_starved_worker_is_swept_while_its_builds_drain() {
+        use crate::disk_pressure::{PressureAssessment, PressureState};
+        let pool = WorkerPool::new();
+        pool.add_worker(create_test_worker_config("starved")).await;
+        let worker = pool.get(&WorkerId::new("starved")).await.unwrap();
+        // The default idle threshold: a busy worker never satisfies it.
+        let scheduler = CacheCleanupScheduler::new(pool, CacheCleanupConfig::default());
+        assert!(worker.reserve_slots(1).await);
+        let critical = |reason: &str| PressureAssessment {
+            state: PressureState::Critical,
+            reason_code: reason.to_string(),
+            ..Default::default()
+        };
+        for reason in ["disk_ratio_below_critical", "disk_free_below_critical_gb"] {
+            worker.set_pressure_assessment(critical(reason)).await;
+            assert!(scheduler.is_worker_eligible(&worker).await, "{reason}");
+        }
+        // Critical for another reason, or merely tight, still waits for idle.
+        for other in [
+            critical("memory_pressure_critical"),
+            critical("disk_io_saturated_with_low_headroom"),
+            critical("disk_critical_without_fresh_telemetry"),
+            PressureAssessment {
+                state: PressureState::Warning,
+                reason_code: "disk_ratio_below_warning".to_string(),
+                ..Default::default()
+            },
+        ] {
+            let reason = other.reason_code.clone();
+            worker.set_pressure_assessment(other).await;
+            assert!(!scheduler.is_worker_eligible(&worker).await, "{reason}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_is_worker_eligible_unhealthy() {
         let pool = WorkerPool::new();
         let config = create_test_worker_config("unhealthy-worker");
@@ -1155,11 +1402,444 @@ mod tests {
         assert_eq!(metrics.remove_errors, 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn retained_source_gc_guard_holds_markers_and_ancestors_without_erasure() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::Builder::new()
+            .prefix("retained-source-gc-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let directory = directory.keep();
+        let ancestor = directory.join("parent with ' quoted name");
+        let retained = ancestor.join("retained source");
+        let malformed = directory.join("malformed-marker");
+        let ordinary = directory.join("ordinary-unmarked");
+        for path in [&retained, &malformed, &ordinary] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let sentinel = retained.join("original-input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sentinel)
+            .unwrap()
+            .write_all(b"original retained bytes")
+            .unwrap();
+        // A dangling metadata symlink is a hold without following its target.
+        // Marker contents are not asserted as a valid source seal by this gate.
+        symlink("metadata-not-a-path", retained.join(".rch-retention-v1")).unwrap();
+        let beneath_retained = retained.join("nested/target");
+        std::fs::create_dir_all(&beneath_retained).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(malformed.join(".rch-retention-v1"))
+            .unwrap();
+        let script = format!("{RETAINED_SOURCE_GC_GUARD}\nrch_retained_source_gc_hold \"$1\"");
+        for (path, held) in [
+            (&retained, true),
+            (&beneath_retained, true),
+            (&ancestor, true),
+            (&malformed, true),
+            (&ordinary, false),
+        ] {
+            // Execute the actual production predicate, not the deleting sweep.
+            // This is local filesystem policy coverage, not worker GC proof.
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "retention-guard"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(if held { 0 } else { 1 }));
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"original retained bytes"
+            );
+        }
+        let absent = directory.join("absent-probe-root");
+        let unknown = std::process::Command::new("sh")
+            .args(["-c", &script, "retention-guard"])
+            .arg(absent)
+            .output()
+            .unwrap();
+        assert_eq!(unknown.status.code(), Some(2));
+        assert!(
+            String::from_utf8(unknown.stderr)
+                .unwrap()
+                .contains("RCH_CLEANUP_RETENTION_UNKNOWN")
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"original retained bytes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_transaction_fixture(body: &str) -> (std::process::Output, std::path::PathBuf) {
+        use std::io::Write;
+
+        let directory = tempfile::Builder::new()
+            .prefix("cleanup-source-transaction-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let directory = directory.canonicalize().unwrap();
+        let candidate = directory.join("parent with ' quote/candidate");
+        std::fs::create_dir_all(&candidate).unwrap();
+        let mut original = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(candidate.join("original-input"))
+            .unwrap();
+        original.write_all(b"preserved cleanup input").unwrap();
+        original
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(10 * 60))
+            .unwrap();
+        // Execute the real GNU/Linux transaction with an owned fixture registry,
+        // never the deleting sweep or
+        // the production registry. This is local policy coverage, not a worker
+        // lifecycle, SDK, transport, crash recovery or performance assertion.
+        let script = format!(
+            "{}\n{CLEANUP_SOURCE_ACTIVITY_GUARD}\n{CLEANUP_SOURCE_TRANSACTION}\n\
+             set -eu; candidate=$1;\n{body}",
+            rch_common::stale_target_reap::source_claim_gc_guard_fragment_with_registry(
+                directory.join("claims").to_str().unwrap(),
+            ),
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script, "cleanup-source-transaction"])
+            .arg(&candidate)
+            .arg(&directory)
+            .output()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(candidate.join("original-input")).unwrap(),
+            b"preserved cleanup input"
+        );
+        (output, directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_source_transaction_holds_real_lock_until_checked_retirement() {
+        let _guard = test_guard!();
+        let (output, directory) = source_transaction_fixture(
+            r#"
+rch_cleanup_source_candidate_begin "$candidate";
+claim=$__gc_reservation;
+rch_claim_record_valid "$claim";
+[ "$(cat "$claim")" = "$candidate" ];
+if flock -n -E 73 "$__gc_source_registry/metadata.lock" true; then exit 10;
+else [ "$?" -eq 73 ]; fi;
+rch_cleanup_source_candidate_end "$candidate";
+[ ! -e "$claim" ];
+rch_claim_record_valid "$__gc_source_registry/released/${claim##*/}";
+[ "$(cat "$__gc_source_registry/released/${claim##*/}")" = "$candidate" ];
+flock -n "$__gc_source_registry/metadata.lock" true;
+"#,
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_dir(directory.join("claims/released"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_source_transaction_late_marker_prevents_a_gc_claim() {
+        let _guard = test_guard!();
+        let (output, directory) = source_transaction_fixture(
+            r#"
+if rch_retained_source_gc_hold "$candidate"; then exit 10; else [ "$?" -eq 1 ]; fi;
+ln -s 'retention-metadata-not-a-path' "$candidate/.rch-retention-v1";
+if rch_cleanup_source_candidate_begin "$candidate"; then exit 11; else [ "$?" -eq 1 ]; fi;
+[ -z "$__gc_reservation" ];
+[ ! -e "$__gc_source_registry/released" ];
+for record in "$__gc_source_registry"/*.claim "$__gc_source_registry"/*.pending; do
+    [ ! -e "$record" ] && [ ! -L "$record" ];
+done;
+flock -n "$__gc_source_registry/metadata.lock" true;
+"#,
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_CLEANUP_RETENTION_HOLD"));
+        assert!(!directory.join("claims/released").exists());
+        assert!(
+            std::fs::symlink_metadata(
+                directory.join("parent with ' quote/candidate/.rch-retention-v1")
+            )
+            .unwrap()
+            .file_type()
+            .is_symlink()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_source_transaction_preserves_active_ancestor_claim() {
+        let _guard = test_guard!();
+        let (output, directory) = source_transaction_fixture(
+            r#"
+mkdir "$__gc_source_registry";
+root=$(cd "$candidate/.." && pwd -P);
+actual=$(printf '%s\n' "$root" | sha256sum); digest=${actual%% *};
+claim="$__gc_source_registry/ca01.$digest.claim";
+exec 9>"$__gc_source_registry/metadata.lock"; flock -x 9;
+rch_claim_write_atomic "$__gc_source_registry" "$claim" "$digest" "$root";
+exec 9>&-;
+if rch_cleanup_source_candidate_begin "$candidate"; then exit 10; else [ "$?" -eq 2 ]; fi;
+rch_claim_record_valid "$claim";
+[ "$(cat "$claim")" = "$root" ];
+[ ! -e "$__gc_source_registry/released" ];
+flock -n "$__gc_source_registry/metadata.lock" true;
+"#,
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("RCH_CLEANUP_SOURCE_OWNERSHIP_UNAVAILABLE")
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.join("claims")).unwrap().count(),
+            2
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_source_transaction_rechecks_writes_during_metadata_admission() {
+        let _guard = test_guard!();
+        let (output, directory) = source_transaction_fixture(
+            r#"
+early=$(find "$candidate" -type f -mmin -5 -print -quit);
+[ -z "$early" ];
+mkdir "$__gc_source_registry";
+exec 9>"$__gc_source_registry/metadata.lock"; flock -x 9;
+(
+    exec 9>&-;
+    if rch_cleanup_source_candidate_begin "$candidate"; then exit 10;
+    else [ "$?" -eq 1 ]; fi;
+    [ -z "$__gc_reservation" ];
+) &
+child=$!;
+attempt=0;
+waiter_seen=0;
+while [ "$waiter_seen" -eq 0 ]; do
+    children=$(cat "/proc/$child/task/$child/children");
+    for waiter in $children; do
+        if name=$(cat "/proc/$waiter/comm") && [ "$name" = flock ] &&
+           descriptor=$(readlink "/proc/$waiter/fd/8") &&
+           [ "$descriptor" = "$__gc_source_registry/metadata.lock" ]; then
+            waiter_seen=1; break;
+        fi;
+    done;
+    [ "$waiter_seen" -eq 0 ] || break;
+    [ "$attempt" -lt 200 ] || exit 11;
+    attempt=$((attempt + 1)); sleep 0.01;
+done;
+(set -C; printf 'late input' > "$candidate/late-input");
+exec 9>&-;
+wait "$child";
+flock -n "$__gc_source_registry/metadata.lock" true;
+"#,
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("reason=recent"),
+            "{output:?}"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("parent with ' quote/candidate/late-input")).unwrap(),
+            b"late input"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.join("claims/released"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_source_activity_keeps_recent_inputs_and_reports_missing_inspection() {
+        use std::io::Write;
+
+        let directory = tempfile::Builder::new()
+            .prefix("cleanup-source-activity-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let directory = directory.canonicalize().unwrap();
+        let original = directory.join("original-input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&original)
+            .unwrap()
+            .write_all(b"recent original bytes")
+            .unwrap();
+        let script =
+            format!("{CLEANUP_SOURCE_ACTIVITY_GUARD}\nrch_cleanup_source_activity \"$1\" 5");
+        for (candidate, expected) in [(&directory, 1), (&directory.join("absent-probe"), 2)] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "activity-guard"])
+                .arg(candidate)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{output:?}");
+            assert_eq!(std::fs::read(&original).unwrap(), b"recent original bytes");
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostics.contains(if expected == 1 {
+                "RCH_CLEANUP_ACTIVITY_HOLD"
+            } else {
+                "RCH_CLEANUP_ACTIVITY_UNKNOWN"
+            }));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_source_activity_keeps_live_cwd_and_classifies_a_real_zombie() {
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::Builder::new()
+            .prefix("cleanup-process-cwd-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let directory = directory.canonicalize().unwrap();
+        let original = directory.join("original-input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&original)
+            .unwrap()
+            .write_all(b"original process input")
+            .unwrap();
+        let script =
+            format!("{CLEANUP_SOURCE_ACTIVITY_GUARD}\nrch_cleanup_bound_process_cwd \"$1\" \"$2\"");
+
+        // Actual redirection failure must remain unknown under both shells,
+        // independent of the shell's own redirection-error exit code.
+        for shell in ["sh", "bash"] {
+            let output = Command::new(shell)
+                .args(["-c", &script, "missing-process-directory"])
+                .arg(directory.join("missing-process-directory"))
+                .arg(&directory)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{shell}: {output:?}");
+            assert!(!output.stderr.is_empty());
+        }
+
+        // Do not reap before inspection: the kernel must actually report Z.
+        let mut zombie = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let proc = std::path::PathBuf::from(format!("/proc/{}", zombie.id()));
+        let mut observed_zombie = false;
+        for _ in 0..200 {
+            let status = std::fs::read_to_string(proc.join("status")).unwrap();
+            observed_zombie = status.lines().any(|line| {
+                line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z")
+            });
+            if observed_zombie {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = Command::new("sh")
+            .args(["-c", &script, "zombie-cwd"])
+            .arg(&proc)
+            .arg(&directory)
+            .output()
+            .unwrap();
+        assert!(zombie.wait().unwrap().success());
+        assert!(observed_zombie, "the real kernel zombie was not observed");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+        let mut live = Command::new("sh")
+            .args([
+                "-c",
+                "cd \"$1\"; printf 'ready\\n'; read release",
+                "live-cwd",
+            ])
+            .arg(&directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(live.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let proc = std::path::PathBuf::from(format!("/proc/{}", live.id()));
+        let output = Command::new("sh")
+            .args(["-c", &script, "live-cwd"])
+            .arg(&proc)
+            .arg(&directory)
+            .output()
+            .unwrap();
+        live.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        assert!(live.wait().unwrap().success());
+        assert_eq!(ready, "ready\n");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(std::fs::read(&original).unwrap(), b"original process input");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_source_transaction_failed_retirement_keeps_durable_claim() {
+        let _guard = test_guard!();
+        let (output, directory) = source_transaction_fixture(
+            r#"
+mkdir "$__gc_source_registry";
+ln -s "$2" "$__gc_source_registry/released";
+printf '%s\n' 'real recent input' > "$candidate/late-input";
+if rch_cleanup_source_candidate_begin "$candidate"; then exit 10; else [ "$?" -eq 3 ]; fi;
+rch_claim_record_valid "$__gc_reservation";
+[ "$(cat "$__gc_reservation")" = "$candidate" ];
+flock -n "$__gc_source_registry/metadata.lock" true;
+"#,
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("RCH_CLEANUP_SOURCE_RETIREMENT_FAILED")
+        );
+        assert!(
+            std::fs::symlink_metadata(directory.join("claims/released"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.join("claims")).unwrap().count(),
+            3
+        );
+    }
+
     #[test]
     fn test_build_cleanup_command_contains_threshold_and_marker() {
         let _guard = test_guard!();
         let command = build_cleanup_command("'/tmp/rch'", REMOTE_RUN_ROOT, 72, 10);
         assert!(command.contains("threshold_kb=10485760"));
+        assert!(command.contains("low_disk_permille=70"));
+        assert!(command.contains("ratio_kb=$((total_kb / 1000 * low_disk_permille))"));
         assert!(command.contains("active_grace_minutes=5"));
         assert!(command.contains("-mmin -\"$active_grace_minutes\""));
         assert!(command.contains("case \"$dir\" in \"$base\"/*)"));
@@ -1347,9 +2027,40 @@ mod tests {
         runs: &std::path::Path,
         prepend_path: &[std::path::PathBuf],
     ) -> (String, String, Option<i32>) {
+        // A zero ratio keeps low-disk mode independent of the test host's disk.
+        run_sweep_with(base, runs, prepend_path, 0, 0)
+    }
+
+    fn run_sweep_with(
+        base: &std::path::Path,
+        runs: &std::path::Path,
+        prepend_path: &[std::path::PathBuf],
+        max_cache_age_hours: u64,
+        low_disk_permille: u64,
+    ) -> (String, String, Option<i32>) {
         use std::env::{join_paths, split_paths};
         let escaped = format!("'{}'", base.display());
-        let command = build_cleanup_command(&escaped, &format!("'{}'", runs.display()), 0, 0);
+        // Registry records are protocol state, not a host-wide test fixture.
+        // Preserve this private registry even if a test panics; the real worker
+        // registry must never be used by a sweep against an owned scratch tree.
+        let registry = tempfile::Builder::new()
+            .prefix("cleanup-sweep-claims-")
+            .disable_cleanup(true)
+            .tempdir()
+            .expect("private source registry")
+            .keep();
+        let source_guard =
+            rch_common::stale_target_reap::source_claim_gc_guard_fragment_with_registry(
+                registry.to_str().unwrap(),
+            );
+        let command = build_cleanup_command_with_source_guard(
+            &escaped,
+            &format!("'{}'", runs.display()),
+            max_cache_age_hours,
+            0,
+            low_disk_permille,
+            &source_guard,
+        );
         let mut full_path: Vec<std::path::PathBuf> = prepend_path.to_vec();
         full_path.extend(split_paths(&std::env::var_os("PATH").unwrap_or_default()));
         let output = std::process::Command::new("sh")
@@ -1365,6 +2076,63 @@ mod tests {
         )
     }
 
+    /// A worker at or below the placement policy's critical free ratio gets no
+    /// slots, so the sweep must evict inactive caches there even when they are
+    /// younger than max_age (bd-xxck3). `find -printf` makes this Linux-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_command_evicts_young_inactive_caches_below_the_placement_ratio() {
+        let _guard = test_guard!();
+        assert_eq!(placement_low_disk_permille(), 70);
+        let base = tempfile::tempdir().expect("base");
+        let runs = tempfile::tempdir().expect("run root");
+        let pool = base
+            .path()
+            .join("busy_repo")
+            .join(".rch-target-pool-0123abcd");
+        std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
+        // Past the 5-minute activity grace, far younger than 72 h.
+        age_dir(&pool);
+        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 0);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("removed=0") && stdout.contains("low_disk=0"),
+            "{stdout}"
+        );
+        assert!(pool.exists());
+        // No filesystem has 100% free, so this ratio always demands eviction.
+        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 1000);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("removed=1") && stdout.contains("low_disk=1"),
+            "{stdout}"
+        );
+        assert!(!pool.exists());
+    }
+
+    /// Without procfs the sweep cannot prove a pool idle, so it keeps it and
+    /// reports why; the reap tests are Linux-only for that reason.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn cleanup_command_keeps_aged_pool_when_activity_is_unprovable() {
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        let pool = base
+            .path()
+            .join("gcverify_pool_repo")
+            .join(".rch-target-pool-deadbeefcafe");
+        std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
+        age_dir(&pool);
+        let (stdout, stderr, _) = run_sweep(base.path(), &[]);
+        assert!(stdout.contains("removed=0"), "{stdout}");
+        assert!(
+            stderr.contains("RCH_CLEANUP_ACTIVITY_UNKNOWN") && stderr.contains("reason=proc"),
+            "{stderr}"
+        );
+        assert!(pool.join("deps").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reaps_aged_pool_normally() {
         let _guard = test_guard!();
@@ -1375,12 +2143,13 @@ mod tests {
             .join(".rch-target-pool-deadbeefcafe");
         std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
         age_dir(&pool);
-        let (stdout, _stderr, code) = run_sweep(base.path(), &[]);
-        assert_eq!(code, Some(0));
+        let (stdout, stderr, code) = run_sweep(base.path(), &[]);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
         assert!(stdout.contains("removed=1"), "{stdout}");
         assert!(stdout.contains("remove_errors=0"), "{stdout}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reaps_empty_husk_when_rmdir_succeeds() {
         let _guard = test_guard!();
@@ -1412,6 +2181,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reports_survivor_and_unreapable_husk_as_errors() {
         let _guard = test_guard!();

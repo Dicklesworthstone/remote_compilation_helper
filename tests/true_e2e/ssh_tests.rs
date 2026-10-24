@@ -766,6 +766,7 @@ async fn test_ssh_connection_timeout() {
         total_slots: 1,
         priority: 1,
         tags: vec![],
+        tools: vec![],
     };
 
     let options = SshOptions {

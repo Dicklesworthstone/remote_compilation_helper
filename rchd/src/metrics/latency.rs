@@ -68,6 +68,14 @@ impl DecisionType {
         }
     }
 
+    fn index(self) -> usize {
+        match self {
+            DecisionType::NonCompilation => 0,
+            DecisionType::Compilation => 1,
+            DecisionType::WorkerSelection => 2,
+        }
+    }
+
     /// Get the label for Prometheus metrics.
     pub fn label(self) -> &'static str {
         match self {
@@ -76,6 +84,38 @@ impl DecisionType {
             DecisionType::WorkerSelection => "worker_selection",
         }
     }
+}
+
+/// A busy dispatcher exceeds these budgets on most selections (css logged ~10
+/// "CRITICAL" lines a minute on 2026-10-14), burying real errors. The
+/// counters stay exact; each decision type and severity logs at most once
+/// per interval, with the number of lines suppressed since the last one.
+const VIOLATION_LOG_INTERVAL_MS: u64 = 60_000;
+// Slots: decision index * 2 + (0 budget, 1 panic); slot 6 is the unit test's.
+static VIOLATION_LAST_LOG_MS: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+static VIOLATION_SUPPRESSED: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// `Some(suppressed)` when this slot may log now, else counts a suppression.
+fn violation_log_gate(slot: usize, now_ms: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let last = VIOLATION_LAST_LOG_MS[slot].load(Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < VIOLATION_LOG_INTERVAL_MS
+        || VIOLATION_LAST_LOG_MS[slot]
+            .compare_exchange(last, now_ms.max(1), Relaxed, Relaxed)
+            .is_err()
+    {
+        VIOLATION_SUPPRESSED[slot].fetch_add(1, Relaxed);
+        return None;
+    }
+    Some(VIOLATION_SUPPRESSED[slot].swap(0, Relaxed))
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// Record decision latency and check budget compliance.
@@ -106,12 +146,15 @@ pub fn record_decision_latency(decision_type: DecisionType, start: Instant) -> D
             .with_label_values(&[decision_type.label()])
             .inc();
 
-        warn!(
-            decision_type = decision_type.label(),
-            duration_ms = format!("{:.3}", duration_ms),
-            budget_ms = budget_ms,
-            "Decision latency budget violation"
-        );
+        if let Some(suppressed) = violation_log_gate(decision_type.index() * 2, unix_now_ms()) {
+            warn!(
+                decision_type = decision_type.label(),
+                duration_ms = format!("{:.3}", duration_ms),
+                budget_ms = budget_ms,
+                suppressed,
+                "Decision latency budget violation"
+            );
+        }
     }
 
     // Log panic threshold violations at error level
@@ -121,12 +164,15 @@ pub fn record_decision_latency(decision_type: DecisionType, start: Instant) -> D
             .with_label_values(&[decision_type.label()])
             .inc();
 
-        tracing::error!(
-            decision_type = decision_type.label(),
-            duration_ms = format!("{:.3}", duration_ms),
-            panic_threshold_ms = panic_ms,
-            "CRITICAL: Decision latency exceeded panic threshold"
-        );
+        if let Some(suppressed) = violation_log_gate(decision_type.index() * 2 + 1, unix_now_ms()) {
+            tracing::error!(
+                decision_type = decision_type.label(),
+                duration_ms = format!("{:.3}", duration_ms),
+                panic_threshold_ms = panic_ms,
+                suppressed,
+                "CRITICAL: Decision latency exceeded panic threshold"
+            );
+        }
     }
 
     duration
@@ -281,6 +327,26 @@ mod tests {
         timer.stop();
 
         // Metric should have been recorded (verified by prometheus)
+    }
+
+    #[test]
+    fn violation_logs_are_gated_per_slot_and_report_suppressions() {
+        // The reserved test slot, with synthetic clocks.
+        let base = 1_000_000_000;
+        assert_eq!(violation_log_gate(6, base), Some(0));
+        assert_eq!(violation_log_gate(6, base + 1), None);
+        assert_eq!(
+            violation_log_gate(6, base + VIOLATION_LOG_INTERVAL_MS - 1),
+            None
+        );
+        assert_eq!(
+            violation_log_gate(6, base + VIOLATION_LOG_INTERVAL_MS),
+            Some(2)
+        );
+        assert_eq!(
+            violation_log_gate(6, base + VIOLATION_LOG_INTERVAL_MS + 5),
+            None
+        );
     }
 
     #[test]

@@ -51,6 +51,9 @@ use crate::collision_policy::REASON_OBJECT_COLLISION_QUARANTINED;
 use crate::digest_set::{DigestError, DigestRequest, StreamingObjectWriter};
 use crate::metadata_store::{QuarantineScope, RabsMetadataStore, StoreError, digest_key};
 
+mod raw_target_observation;
+pub use raw_target_observation::RawTargetObservation;
+
 /// The storage profile this bead ships: bytes stored exactly as the
 /// logical object (encoded digest == logical digest).
 pub const RAW_PROFILE_V1: &str = "raw-v1";
@@ -452,6 +455,31 @@ pub fn publish_staged(
     )
 }
 
+/// Publish an already-verified raw staging file using a fresh destination
+/// observation made without the metadata lock. All fsyncs, no-clobber linking,
+/// metadata recording and collision handling remain in the ordinary publisher.
+///
+/// # Errors
+/// As [`publish_staged`]. A stale or newly appeared duplicate is a typed step
+/// error recognized by [`RawTargetObservation::changed`]; leave the stage intact
+/// and reobserve only after releasing the store lock. Never fall back to hashing
+/// an artifact under that lock on this path.
+pub fn publish_staged_with_observation(
+    layout: &BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    declared: &TypedDigest,
+    staging: &Path,
+    durability: DurabilityPolicy,
+    observation: &RawTargetObservation,
+) -> Result<PutOutcome, PutError> {
+    observation.check_binding(&layout.published_path(declared, RAW_PROFILE_V1, declared), declared)?;
+    let logical_size = fs::metadata(staging).map_err(io_err("stat-staging"))?.len();
+    publish_staged_observed_inner(
+        layout, store, declared, staging, logical_size, durability, None,
+        RAW_PROFILE_V1, declared, Some(observation),
+    )
+}
+
 /// Steps 3–5 for ANY representation (H030): `profile` + `file_digest`
 /// name the representation — for raw the file digest IS the logical
 /// identity, for encoded profiles it is the encoded digest — while
@@ -468,6 +496,25 @@ fn publish_staged_inner(
     fault: Option<FaultPoint>,
     profile: &str,
     file_digest: &TypedDigest,
+) -> Result<PutOutcome, PutError> {
+    publish_staged_observed_inner(
+        layout, store, declared, staging, logical_size, durability, fault,
+        profile, file_digest, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_staged_observed_inner(
+    layout: &BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    declared: &TypedDigest,
+    staging: &Path,
+    logical_size: u64,
+    durability: DurabilityPolicy,
+    fault: Option<FaultPoint>,
+    profile: &str,
+    file_digest: &TypedDigest,
+    observation: Option<&RawTargetObservation>,
 ) -> Result<PutOutcome, PutError> {
     // 3. fsync file data per durability policy.
     if durability.fsync_file {
@@ -506,6 +553,7 @@ fn publish_staged_inner(
                 staging,
                 &target,
                 durability,
+                observation,
             );
         }
         Err(e) => {
@@ -720,8 +768,12 @@ fn handle_existing(
     staging: &Path,
     target: &Path,
     durability: DurabilityPolicy,
+    observation: Option<&RawTargetObservation>,
 ) -> Result<PutOutcome, PutError> {
-    let existing_digest = hash_file_under_domain(target, file_digest.domain)?;
+    let existing_digest = match observation {
+        Some(observation) => observation.digest(target, file_digest)?,
+        None => hash_file_under_domain(target, file_digest.domain)?,
+    };
     if existing_digest == *file_digest {
         // Identical representation already published. Make sure the
         // metadata rows exist (the original writer may have died
@@ -731,12 +783,19 @@ fn handle_existing(
         // full profile the loser fsyncs the published copy itself
         // before this location may claim durability (H032).
         if durability.is_full() {
-            let file = fs::File::open(target).map_err(io_err("fsync-existing"))?;
-            file.sync_all().map_err(io_err("fsync-existing"))?;
+            if let Some(observation) = observation {
+                observation.sync(target, file_digest)?;
+            } else {
+                let file = fs::File::open(target).map_err(io_err("fsync-existing"))?;
+                file.sync_all().map_err(io_err("fsync-existing"))?;
+            }
             if let Some(dir) = target.parent() {
                 let dir = fs::File::open(dir).map_err(io_err("fsync-existing-dir"))?;
                 dir.sync_all().map_err(io_err("fsync-existing-dir"))?;
             }
+        }
+        if let Some(observation) = observation {
+            observation.validate(target, file_digest)?;
         }
         store.record_object(declared, logical_size)?;
         store.add_location(
@@ -755,6 +814,9 @@ fn handle_existing(
     // Existing digest, different bytes: incident. Preserve BOTH
     // candidates — the existing file stays exactly where it is; the
     // incoming staging file moves to quarantine (rename, same fs).
+    if let Some(observation) = observation {
+        observation.validate(target, file_digest)?;
+    }
     let preserved = layout.quarantine_path(declared);
     fs::rename(staging, &preserved).map_err(io_err("preserve-incoming"))?;
     store.add_quarantine(

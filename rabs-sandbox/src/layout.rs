@@ -78,12 +78,9 @@ pub const PROGRAM_VISIBLE_SURFACES: [&str; 8] = [
 /// debuginfo alike.
 #[must_use]
 pub fn leaks_backing_path(value: &[u8], hidden_backing_roots: &[&str]) -> bool {
-    hidden_backing_roots.iter().any(|root| {
-        !root.is_empty()
-            && value
-                .windows(root.len())
-                .any(|window| window == root.as_bytes())
-    })
+    hidden_backing_roots
+        .iter()
+        .any(|root| !root.is_empty() && memchr::memmem::find(value, root.as_bytes()).is_some())
 }
 
 /// Whether a path string is inside the visible layout.

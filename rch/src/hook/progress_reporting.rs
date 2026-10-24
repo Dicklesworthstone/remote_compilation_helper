@@ -17,6 +17,9 @@
 
 use super::*;
 
+#[path = "heartbeat_executor.rs"]
+mod heartbeat_executor;
+
 const BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -72,6 +75,8 @@ pub(super) struct BuildHeartbeatLoop {
     state: Arc<Mutex<BuildHeartbeatSnapshot>>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    lease_stop_tx: Option<oneshot::Sender<()>>,
+    lease_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BuildHeartbeatLoop {
@@ -81,6 +86,24 @@ impl BuildHeartbeatLoop {
         worker_id: &WorkerId,
         local_wrapper_id: Option<&str>,
         durable_lease: Option<&DurableLeaseWriter>,
+    ) -> Self {
+        Self::start_with_interval(
+            socket_path,
+            build_id,
+            worker_id,
+            local_wrapper_id,
+            durable_lease,
+            BUILD_HEARTBEAT_INTERVAL,
+        )
+    }
+
+    fn start_with_interval(
+        socket_path: &str,
+        build_id: u64,
+        worker_id: &WorkerId,
+        local_wrapper_id: Option<&str>,
+        durable_lease: Option<&DurableLeaseWriter>,
+        interval: Duration,
     ) -> Self {
         let state = Arc::new(Mutex::new(BuildHeartbeatSnapshot::new()));
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
@@ -92,11 +115,13 @@ impl BuildHeartbeatLoop {
         let local_wrapper_id = local_wrapper_id.map(str::to_string);
         let local_wrapper_id_for_task = local_wrapper_id.clone();
         let durable_lease = durable_lease.cloned();
-        let durable_lease_for_task = durable_lease.clone();
 
-        let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(BUILD_HEARTBEAT_INTERVAL);
-            let mut last_warning = None;
+        // The wire heartbeat must not await a durable journal writer. Even on
+        // a blocking thread, a long fsync or publication-held journal mutex
+        // would otherwise prevent this loop's next daemon heartbeat (#112).
+        let task = heartbeat_executor::runtime().spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -106,7 +131,6 @@ impl BuildHeartbeatLoop {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .clone()
                         };
-                        let phase_token = heartbeat_phase_token(&snapshot.phase);
                         let heartbeat = BuildHeartbeatRequest {
                             build_id,
                             worker_id: worker_id_owned.clone(),
@@ -121,45 +145,24 @@ impl BuildHeartbeatLoop {
                         if let Err(e) = send_build_heartbeat(&socket_path_owned, &heartbeat).await {
                             debug!("build heartbeat send failed for build {}: {}", build_id, e);
                         }
-                        if let Some(lease) = durable_lease_for_task.as_ref()
-                        {
-                            let evidence = lease.snapshot();
-                            let cancellation = default_job_lease_directory().join(format!("{}.cancel", evidence.identity.local_wrapper_id));
-                            if let Ok(bytes) = std::fs::read(cancellation)
-                                && serde_json::from_slice::<JobIdentity>(&bytes).ok().as_ref() == Some(&evidence.identity)
-                                && let Ok(status) = crate::commands::jobs::query(&evidence).await
-                                && status["status"] == "completed"
-                            {
-                                let code = status["record"]["exit_code"].as_i64().and_then(|n| i32::try_from(n).ok()).unwrap_or(130);
-                                if lease.acknowledge_observed_completion(&evidence, code).is_ok() {
-                                    std::process::exit(code);
-                                }
-                            }
-                            let observed = crate::commands::jobs::query(&evidence).await;
-                            let mut state = rch_common::job_recovery::WrapperState::waiting(evidence.state);
-                            if let Ok(status) = observed {
-                                if status["status"] == "not_found" { state.remote_absent = true; }
-                                if status["status"] == "completed" {
-                                    state.job_state = rch_common::job_identity::JobLifecycleState::Finished;
-                                    state.artifacts_pending = evidence.recovery.is_some();
-                                }
-                            }
-                            let warning = rch_common::job_recovery::diagnose_stuck_wrapper(&evidence.identity, &state);
-                            if warning.stuck && last_warning != Some(warning.class) {
-                                if let Ok(json) = serde_json::to_string(&warning) { eprintln!("{json}"); }
-                                last_warning = Some(warning.class);
-                            }
-                        }
-                        if let Some(lease) = durable_lease_for_task.as_ref()
-                            && let Err(error) = lease.heartbeat(phase_token)
-                        {
-                            debug!("durable lease heartbeat write failed for build {}: {}", build_id, error);
-                        }
                     }
                     _ = &mut stop_rx => break,
                 }
             }
         });
+        // Exactly one maintenance loop: do not enqueue one blocking journal
+        // write per wire tick when storage is slow. It shares the existing
+        // serialized writer and preserves identity-checked cancellation.
+        let (lease_stop_tx, lease_task) = if let Some(lease) = durable_lease.clone() {
+            let (stop, stopped) = oneshot::channel();
+            let state = Arc::clone(&state);
+            let task = heartbeat_executor::runtime().spawn(maintain_durable_lease(
+                lease, state, build_id, interval, stopped,
+            ));
+            (Some(stop), Some(task))
+        } else {
+            (None, None)
+        };
 
         Self {
             socket_path: socket_path.to_string(),
@@ -171,6 +174,8 @@ impl BuildHeartbeatLoop {
             state,
             stop_tx: Some(stop_tx),
             task: Some(task),
+            lease_stop_tx,
+            lease_task,
         }
     }
 
@@ -213,7 +218,7 @@ impl BuildHeartbeatLoop {
             );
         }
         if let Some(lease) = self.durable_lease.as_ref()
-            && let Err(error) = lease.heartbeat(phase_token)
+            && let Err(error) = write_durable_heartbeat(lease, phase_token).await
         {
             debug!(
                 "durable lease flush write failed for build {}: {}",
@@ -228,8 +233,113 @@ impl BuildHeartbeatLoop {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
+        if let Some(stop_tx) = self.lease_stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
         if let Some(task) = self.task.take() {
             let _ = task.await;
+        }
+        if let Some(task) = self.lease_task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+async fn write_durable_heartbeat(
+    writer: &DurableLeaseWriter,
+    phase: &'static str,
+) -> anyhow::Result<()> {
+    let writer = writer.clone();
+    tokio::task::spawn_blocking(move || writer.heartbeat(phase))
+        .await
+        .context("durable heartbeat worker failed")?
+}
+
+fn cancellation_marker_matches(path: &Path, identity: &JobIdentity) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<JobIdentity>(&bytes).ok())
+        .as_ref()
+        == Some(identity)
+}
+
+async fn maintain_durable_lease(
+    lease: DurableLeaseWriter,
+    heartbeat_state: Arc<Mutex<BuildHeartbeatSnapshot>>,
+    build_id: u64,
+    interval: Duration,
+    mut stopped: oneshot::Receiver<()>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_warning = None;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = &mut stopped => break,
+        }
+        let writer = lease.clone();
+        let evidence = tokio::task::spawn_blocking(move || {
+            let evidence = writer.snapshot();
+            let cancellation = default_job_lease_directory()
+                .join(format!("{}.cancel", evidence.identity.local_wrapper_id));
+            let cancelled = cancellation_marker_matches(&cancellation, &evidence.identity);
+            (evidence, cancelled)
+        })
+        .await;
+        let (evidence, cancelled) = match evidence {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                debug!(
+                    "durable lease observation failed for build {}: {}",
+                    build_id, error
+                );
+                continue;
+            }
+        };
+        let observed = crate::commands::jobs::query(&evidence).await;
+        if cancelled
+            && let Ok(status) = &observed
+            && let Ok(code) = crate::commands::jobs::validate_completion(&evidence, status)
+        {
+            let writer = lease.clone();
+            let completion_evidence = evidence.clone();
+            let acknowledged = tokio::task::spawn_blocking(move || {
+                writer.acknowledge_observed_completion(&completion_evidence, code)
+            })
+            .await;
+            if matches!(acknowledged, Ok(Ok(()))) {
+                std::process::exit(code);
+            }
+        }
+        let mut state = rch_common::job_recovery::WrapperState::waiting(evidence.state);
+        if let Ok(status) = observed {
+            if status["status"] == "not_found" {
+                state.remote_absent = true;
+            }
+            if status["status"] == "completed" {
+                state.job_state = rch_common::job_identity::JobLifecycleState::Finished;
+                state.artifacts_pending = evidence.recovery.is_some();
+            }
+        }
+        let warning = rch_common::job_recovery::diagnose_stuck_wrapper(&evidence.identity, &state);
+        if warning.stuck && last_warning != Some(warning.class) {
+            if let Ok(json) = serde_json::to_string(&warning) {
+                eprintln!("{json}");
+            }
+            last_warning = Some(warning.class);
+        }
+        let phase = heartbeat_phase_token(
+            &heartbeat_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phase,
+        );
+        if let Err(error) = write_durable_heartbeat(&lease, phase).await {
+            debug!(
+                "durable lease heartbeat write failed for build {}: {}",
+                build_id, error
+            );
         }
     }
 }
@@ -248,7 +358,13 @@ impl Drop for BuildHeartbeatLoop {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
+        if let Some(stop_tx) = self.lease_stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
         if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.lease_task.take() {
             task.abort();
         }
     }
@@ -459,5 +575,115 @@ mod tests {
         server.await.unwrap();
         let error = result.expect_err("mismatched acknowledgement must not pass");
         assert!(error.to_string().contains("does not match"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_durable_publication_does_not_stop_wire_heartbeats() {
+        // Exercise the actual shared journal mutex and actual acknowledged
+        // Unix-socket heartbeat protocol, without contacting an ambient daemon.
+        let root = tempfile::tempdir().unwrap().keep();
+        let socket = root.join("heartbeat.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let worker = WorkerId::new("publication-worker");
+        let lease = DurableLeaseWriter {
+            path: root.join("lease.json"),
+            recovery_ownership: None,
+            lease: Arc::new(Mutex::new(DurableJobLease::new(
+                JobIdentity::new_local(),
+                std::process::id(),
+                None,
+                None,
+                0,
+                false,
+                false,
+                "heartbeat-publication-fixture".into(),
+            ))),
+        };
+        lease.admit(72, &worker).unwrap();
+        let wrapper = lease.wrapper_id();
+        let blocked = lease.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            blocked.persist_snapshot(|path, bytes| {
+                let _ = ready_tx.send(());
+                // Independent watchdog makes reactor-blocking regressions
+                // fail instead of hanging the process indefinitely.
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+                atomic_write(path, bytes)
+            })
+        });
+        ready_rx.await.unwrap();
+        let server =
+            tokio::spawn(async move {
+                let mut publishing = 0;
+                while publishing < 4 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = String::new();
+                    stream.read_to_string(&mut request).await.unwrap();
+                    let (route, body) = request.split_once('\n').unwrap();
+                    assert_eq!(route, "POST /build-heartbeat");
+                    let heartbeat: BuildHeartbeatRequest = serde_json::from_str(body).unwrap();
+                    assert_eq!(heartbeat.build_id, 72);
+                    // The service now runs concurrently with start()'s caller.
+                    // An initial SyncUp can precede update_phase(); it does not
+                    // count toward the four required publication heartbeats.
+                    if heartbeat.phase == BuildHeartbeatPhase::SyncUp {
+                        assert_eq!(heartbeat.detail.as_deref(), Some("build_started"));
+                        assert_eq!(heartbeat.progress_counter, Some(0));
+                    } else {
+                        assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncDown);
+                        assert_eq!(heartbeat.detail.as_deref(), Some("publishing"));
+                        publishing += 1;
+                    }
+                    let response = serde_json::json!({
+                        "status": "ok", "build_id": heartbeat.build_id,
+                        "worker_id": heartbeat.worker_id,
+                        "phase": heartbeat_phase_token(&heartbeat.phase)
+                    });
+                    stream.write_all(format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
+                ).as_bytes()).await.unwrap();
+                }
+            });
+        let mut heartbeat = BuildHeartbeatLoop::start_with_interval(
+            socket.to_str().unwrap(),
+            72,
+            &worker,
+            Some(&wrapper),
+            Some(&lease),
+            Duration::from_millis(20),
+        );
+        heartbeat.update_phase(BuildHeartbeatPhase::SyncDown, Some("publishing".into()));
+        let result = tokio::time::timeout(Duration::from_secs(1), server).await;
+        // Abort maintenance before unlocking it: this fixture must never query
+        // a real job service after the blocked snapshot becomes available.
+        let maintenance = heartbeat.lease_task.take().unwrap();
+        maintenance.abort();
+        let _ = maintenance.await;
+        drop(heartbeat);
+        let _ = release_tx.send(());
+        holder.join().unwrap().unwrap();
+        result
+            .expect("journal I/O stopped daemon heartbeats")
+            .unwrap();
+    }
+
+    #[test]
+    fn cancellation_marker_requires_the_exact_job_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("owned.cancel");
+        let identity = JobIdentity::new_local();
+        assert!(!cancellation_marker_matches(&marker, &identity));
+        std::fs::write(&marker, b"not an identity").unwrap();
+        assert!(!cancellation_marker_matches(&marker, &identity));
+        std::fs::write(
+            &marker,
+            serde_json::to_vec(&JobIdentity::new_local()).unwrap(),
+        )
+        .unwrap();
+        assert!(!cancellation_marker_matches(&marker, &identity));
+        std::fs::write(&marker, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert!(cancellation_marker_matches(&marker, &identity));
     }
 }

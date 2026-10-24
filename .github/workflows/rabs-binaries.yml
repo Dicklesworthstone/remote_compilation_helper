@@ -14,6 +14,27 @@ on:
       - 'rabs-wrap/**'
       - 'rabs-wkr/**'
       - 'rabs-asupersync/**'
+      - 'rabs-cas/**'
+      - 'rabs-key/**'
+      - 'rabs-sandbox/**'
+      - 'rch-common/src/toolchain.rs'
+      - 'rch-common/src/toolchain/**'
+      - 'scripts/cargo-rabs'
+      - 'scripts/tests/test_cargo_rabs.py'
+      - 'scripts/tests/test_cargo_rabs_canonical.py'
+      - 'scripts/tests/test_cargo_rabs_environment.py'
+      - 'scripts/tests/test_cargo_rabs_job_controls.py'
+      - 'scripts/install-rabs'
+      - 'scripts/rabs-recover'
+      - 'scripts/tests/test_rabs_recover.py'
+      - 'scripts/tests/test_rabs_recover_canonical.py'
+      - 'tests/test_install_rabs*.py'
+      - 'tests/test_rabs_sprt_evidence.py'
+      - 'tests/test_rabs_worker_cache.py'
+      - 'tests/test_rabs_worker_cache_diagnostics.py'
+      - 'tests/test_rabs_capture_recovery.py'
+      - 'tests/test_rabs_evidence_queries.py'
+      - '.github/workflows/release.yml'
       - '.github/workflows/rabs-binaries.yml'
   pull_request:
   workflow_dispatch:
@@ -30,6 +51,40 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  installation:
+    name: complete RABS installation (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native filesystem, process, archive and upgrade regressions
+        run: python3 -m unittest discover -s tests -p 'test_install_rabs*.py' -v
+      - name: SPRT native SQL and boundary model (not a Rust execution proof)
+        run: python3 -m unittest discover -s tests -p test_rabs_sprt_evidence.py -v
+      - name: Worker-local RABS bridge and managed launcher regressions
+        run: |
+          python3 scripts/tests/test_cargo_rabs.py -v
+          python3 tests/test_rabs_worker_cache.py -v
+          python3 tests/test_rabs_worker_cache_diagnostics.py -v
+      - name: Canonical Cargo frontend (native driver is an explicit fixture)
+        run: python3 -I -S scripts/tests/test_cargo_rabs_canonical.py -v
+      - name: Explicit canonical build inputs (native driver is an explicit fixture)
+        run: python3 -I -S scripts/tests/test_cargo_rabs_environment.py -v
+      - name: Saved canonical job status and cancellation (native driver fixture)
+        run: python3 -I -S scripts/tests/test_cargo_rabs_job_controls.py -v
+      - name: Retained remote recovery (native driver, explicit daemon fixture)
+        run: |
+          python3 -I -S scripts/tests/test_rabs_recover.py -v
+          python3 -I -S scripts/tests/test_rabs_recover_canonical.py -v
+      - name: Capture recovery SQL and interruption model (not a Rust execution proof)
+        run: python3 tests/test_rabs_capture_recovery.py -v
+      - name: Indexed evidence queries (native SQLite, not Rust execution)
+        run: python3 tests/test_rabs_evidence_queries.py -v
+
   # Exercise the accepted-hit delivery frontier independently of the slower
   # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
   # these tests must still run unchanged on a native runner.
@@ -47,6 +102,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned test toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - name: Native toolchain retention ownership without the daemon dependency graph
+        run: |
+          # Compile the actual production module, not an extracted or rewritten model.
+          # This complements, and does not replace, the full daemon gates below.
+          printf '#![forbid(unsafe_code)]\n#[path = "%s/rabsd/src/coord/live_dependency/remote/toolchains.rs"]\nmod toolchains;\n' \
+            "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/rabs_toolchain_retention.rs"
+          rustc --edition=2024 --test -D warnings \
+            "$RUNNER_TEMP/rabs_toolchain_retention.rs" \
+            -o "$RUNNER_TEMP/rabs_toolchain_retention_tests"
+          timeout 60 "$RUNNER_TEMP/rabs_toolchain_retention_tests"
+          timeout 60 "$RUNNER_TEMP/rabs_toolchain_retention_tests" --test-threads=1
       - name: Check changed wrapper formatting
         run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
       - name: Run wrapper unit and real socket delivery regressions
@@ -63,11 +129,106 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Release build the three spine binaries
         run: cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
+      - name: Worker-cache command assembly and opt-out parity
+        run: cargo test --release -p rch-common --lib toolchain::worker_cache --locked
+      - name: Coherent preparation to native worker-build handoff
+        run: cargo test --release -p rabsd --bin rabsd worker_exec::prepared_build --locked
+      - name: Shared prepared inputs and durable job ownership
+        run: |
+          cargo test --release -p rabsd --lib coord::prepared_operation --locked
+          cargo test --release -p rabsd --test prepared_job_wait --test prepared_live_status --locked
+      - name: Locked registry capture and isolated Cargo workspace
+        run: |
+          cargo test --release -p rabsd --lib coord::source_delivery::preparation::cargo --locked
+          cargo test --release -p rabsd --test cargo_vendor_prepare --locked
+          cargo test --release -p rabs-sandbox --lib cargo_home --locked
+          cargo test --release -p rabs-wkr --lib cargo_home --locked
+      - name: Cargo workspace outputs and independent delivery verification
+        run: |
+          cargo test --release -p rabs-sandbox --lib canonical_namespace --locked
+          cargo test --release -p rabs-sandbox --lib cargo_artifacts --locked
+          cargo test --release -p rabs-sandbox --test cargo_artifacts --locked -- --nocapture
+          cargo test --release -p rabs-wkr --lib cargo_capture --locked
+          cargo test --release -p rabs-wkr --lib cargo_dynamic_outputs --locked
+          cargo test --release -p rabsd --lib coord::worker_delivery::tests --locked
+      - name: Private Cargo target reuse and concurrent seed lifetimes
+        run: cargo test --release -p rabs-wkr --lib target_cache --locked
       - name: Binary size budget (rabs-wrap < 2 MiB, A021)
         run: |
           size=$(stat -c%s target/release/rabs-wrap)
           echo "rabs-wrap release size: $size bytes"
           test "$size" -lt 2097152
+      - name: Worker diagnostic custody through real pipes and retained readers
+        run: |
+          cargo test --release -p rabs-asupersync --lib stream_drain --locked
+          cargo test --release -p rabs-wkr --lib output::tests --locked
+          cargo test --release -p rabs-wkr --lib session::tests --locked
+          cargo test --release -p rabs-wkr --lib host_budget --locked
+          cargo test --release -p rabs-wkr --lib root_admission --locked
+      - name: Durable replay allowance and real compiler verification
+        run: |
+          cargo test --release -p rabs-cas --lib serving_sample_gate --locked
+          cargo test --release -p rabs-cas --lib materialization::staged --locked
+          cargo test --release -p rabs-cas --lib read_indexes --locked
+          cargo test --release -p rabs-cas --lib trust_evidence --locked
+          cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --locked
+          cargo test --release -p rabsd --test publication_lineage --locked
+          cargo test --release -p rabsd --lib edge::server --locked
+          cargo test --release -p rabs-wrap --test live_dependency_e2e --locked
+      - name: Shared endpoint ownership and restart fences
+        run: cargo test --release -p rabs-sandbox --lib socket_endpoint --locked
+      - name: Recurring CAS maintenance and physical reclaim
+        run: |
+          cargo test --release -p rabsd --lib janitor --locked
+          cargo test --release -p rabsd --test janitor_gc_live --test janitor_reclaim_live --locked
+      - name: Compiler capture custody and durable restart recovery
+        run: |
+          cargo test --release -p rabs-cas --lib blob_store --locked
+          cargo test --release -p rabsd --lib output_capture --locked
+          cargo test --release -p rabsd --lib capture_pins --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::recovery --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::toolchains --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::remote::worker_pool_tests --locked
+          cargo test --release -p rabsd --lib coord::remote_dependency_transport::tests --locked
+          cargo test --release -p rabsd --lib edge::live_facts::package_capture --locked
+      - name: Toolchain ownership and complete live input observations
+        run: |
+          cargo test --release -p rabs-key --lib live_dependency --locked
+          cargo test --release -p rabsd --lib edge::live_facts --locked
+          cargo test --release -p rabsd --test live_dependency_inventory --locked
+      - name: Closed archive isolation and authenticated mode selection
+        run: |
+          cargo test --release -p rabs-sandbox --lib dependency_context --locked
+          RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+            cargo test --release -p rabs-sandbox --lib \
+              real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
+              --locked -- --ignored --nocapture
+          cargo test --release -p rabs-wkr --bin rabs-wkr dependency --locked
+          cargo test --release -p rabs-wkr --bin rabs-wkr archive --locked
+          cargo test --release -p rabsd --lib coord::secure_worker_delivery::tests --locked
+          cargo test --release -p rabs-wkr --test process_tree_linux \
+            real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
+            --locked -- --nocapture
+      - name: Actual offline Cargo builds, links and replays remote archives
+        timeout-minutes: 30
+        env:
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+          RABS_TEST_WRAP_BIN: ${{ github.workspace }}/target/release/rabs-wrap
+        run: |
+          cargo test --release -p rabsd --test prepared_operation_live \
+            actual_offline_cargo_build_uses_remote_archives_then_links_and_replays \
+            --locked -- --ignored --nocapture
+      - name: Cargo layout projection keys and real split-directory builds
+        run: |
+          cargo test --release -p rabsd cargo_placement_reuse --locked
+          cargo test --release -p rabs-wrap --test live_cargo_layout --locked -- --nocapture
+      - name: Real Cargo worktrees receive served dependencies (M4)
+        run: cargo test --release -p rabs-wrap --test live_cargo_worktrees --locked -- --nocapture
+      - name: Stock differential release gate and durable verdict authorization (T011 / bd-dockb)
+        run: |
+          cargo test --release -p rabs-protocol --lib release_authorization --locked
+          cargo test --release -p rabs-replay --lib release_gate --locked
+          cargo test --release -p rabsd --test coord_commit_live the_release_gate_governs_serving_promotion_for_the_whole_build --locked
       - name: Doctor + wrapper overhead gate (release, enforcing)
         run: |
           cargo test --release -p rabsd --test doctor_live

@@ -19,6 +19,8 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+mod registry_health;
+
 fn is_mock_transport(_worker: &WorkerState) -> bool {
     // In mock mode, we assume mock config is active
     // We can't easily check worker.config without async lock here,
@@ -417,6 +419,7 @@ impl HealthMonitor {
     /// Start the health monitoring background task.
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
         let pool = self.pool.clone();
+        let mut endpoint_changes = pool.subscribe_endpoint_changes();
         let config = self.config.clone();
         let health_states = self.health_states.clone();
         let running = self.running.clone();
@@ -428,20 +431,25 @@ impl HealthMonitor {
         tokio::spawn(async move {
             *running.write().await = true;
             let mut ticker = interval(config.check_interval);
+            let mut recheck = false;
 
             info!(
                 "Health monitor started (interval: {:?})",
                 config.check_interval
             );
 
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {}
-                    () = shutdown.notified() => {
-                        info!("Health monitor stopping");
-                        break;
+            'monitor: loop {
+                if !recheck {
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = endpoint_changes.changed() => {}
+                        () = shutdown.notified() => {
+                            info!("Health monitor stopping");
+                            break;
+                        }
                     }
                 }
+                recheck = false;
 
                 if !*running.read().await {
                     info!("Health monitor stopping");
@@ -456,14 +464,59 @@ impl HealthMonitor {
                 let total_workers = workers.len();
                 let mut unreachable_count = 0;
 
+                // Each endpoint progresses independently. A stalled SSH auth
+                // must not delay publication of healthy peers or a reload.
+                let mut probes = tokio::task::JoinSet::new();
                 for worker in workers {
-                    let worker_config_guard = worker.config.read().await;
-                    let worker_id = worker_config_guard.id.as_str().to_string();
-                    // Drop lock before check_worker_health to avoid holding it during IO
-                    drop(worker_config_guard);
+                    let probe_config = config.clone();
+                    let probe_pool = ssh_pool.clone();
+                    let mock_enabled = is_mock_transport(&worker);
+                    probes.spawn(async move {
+                        let endpoint = worker.endpoint_snapshot().await;
+                        let result = check_worker_health_for_endpoint(
+                            &endpoint.config,
+                            mock_enabled,
+                            &probe_config,
+                            probe_pool.as_ref(),
+                        )
+                        .await;
+                        (worker, endpoint, result)
+                    });
+                }
 
+                loop {
+                    let completed = tokio::select! {
+                        completed = probes.join_next() => completed,
+                        _ = endpoint_changes.changed() => {
+                            // Cancellation drops the owned SSH connection
+                            // attempt. Do not wait out the old host's deadline
+                            // before probing its replacement.
+                            probes.shutdown().await;
+                            recheck = true;
+                            continue 'monitor;
+                        }
+                        () = shutdown.notified() => {
+                            probes.shutdown().await;
+                            break 'monitor;
+                        }
+                    };
+                    let Some(completed) = completed else { break };
+                    let (worker, endpoint, result) = match completed {
+                        Ok(result) => result,
+                        Err(error) => {
+                            warn!("Worker health task failed: {}", error);
+                            continue;
+                        }
+                    };
+                    let worker_id = endpoint.config.id.as_str().to_string();
+                    let Some(endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+                        debug!(
+                            "Discarding health result for replaced endpoint {}",
+                            worker_id
+                        );
+                        continue;
+                    };
                     let previous_effective_status = worker.status().await;
-                    let result = check_worker_health(&worker, &config, ssh_pool.as_ref()).await;
 
                     // Record health check latency metric
                     if result.healthy {
@@ -484,11 +537,15 @@ impl HealthMonitor {
                     // selection never consulted.
                     //
                     // A probe that connected but whose command never completed
-                    // is command-class evidence (issue #48): it must block a
-                    // half-open close and trip the breaker on its own threshold
-                    // even when interleaved liveness probes succeed.
-                    let (previous_circuit_state, new_circuit_state) = if result.command_failure {
-                        worker.record_command_outcome(false, &config.circuit).await
+                    // is command-class evidence (issue #48). Successful real
+                    // probes now execute storage operations too, so they can
+                    // supply command-class recovery rather than just liveness.
+                    let (previous_circuit_state, new_circuit_state) = if result.command_failure
+                        || result.healthy
+                    {
+                        worker
+                            .record_command_outcome(result.healthy, &config.circuit)
+                            .await
                     } else {
                         worker
                             .record_health_check(result.healthy, result.transient, &config.circuit)
@@ -504,13 +561,18 @@ impl HealthMonitor {
                     // Derive the health-facing status from the authoritative
                     // circuit outcome via the shared mapping, then apply it to the
                     // worker lifecycle (respecting admin intent / quarantine).
-                    let new_status = derive_worker_status(
+                    let new_status = registry_health::status_after_probe(
+                        previous_effective_status,
                         new_circuit_state,
-                        result.healthy,
-                        result.response_time_ms,
+                        &result,
                         &config,
                     );
                     let effective_status = worker.apply_health_status(new_status).await;
+                    let circuit_stats = worker.circuit_stats().await;
+                    // All authoritative updates above are fenced against
+                    // retargeting. Diagnostics and slot access below may take
+                    // their own config locks, so release this guard first.
+                    drop(endpoint_guard);
 
                     // Mirror the same outcome into the diagnostic WorkerHealth so
                     // get_health()/all_health_states()/the status panel keep
@@ -524,13 +586,16 @@ impl HealthMonitor {
                     let mut states = health_states.write().await;
                     let health = states.entry(worker_id.clone()).or_default();
                     health.mirror(
-                        worker.circuit_stats().await,
+                        circuit_stats,
                         result.healthy,
                         result.response_time_ms,
                         &config,
                         &worker_id,
                     );
                     health.set_last_result(result.clone());
+                    // Keep health separate from admin intent, but include the
+                    // storage exclusion rather than the circuit-only projection.
+                    health.current_status = new_status;
 
                     // Track unreachable workers for all-workers-offline alert
                     if effective_status == WorkerStatus::Unreachable {
@@ -567,6 +632,8 @@ impl HealthMonitor {
                             alert_mgr.handle_circuit_closed(&worker_id);
                         }
                     }
+                    let consecutive_failures = health.circuit_stats().consecutive_failures();
+                    drop(states);
 
                     // Record worker status metric
                     let status_value = match effective_status {
@@ -615,20 +682,26 @@ impl HealthMonitor {
                         // scheduling onto a worker that is about to run out of disk.
                         let timeout = CAPABILITY_PROBE_TIMEOUT;
                         let probe_pool = ssh_pool.clone();
-                        tokio::spawn(async move {
-                            let _ = probe_worker_capabilities(
-                                &worker_clone,
-                                timeout,
-                                probe_pool.as_ref(),
-                            )
-                            .await;
-                        });
+                        // An admin-disabled worker receives no work, so its
+                        // capability facts have no consumer; the first cycle
+                        // after re-enable refreshes them. Probing anyway ran
+                        // `rch-wkr capabilities` on trj every few seconds for
+                        // a disabled entry, and each probe outlived this
+                        // timeout and aborted on the closed pipe (2026-10-15).
+                        if !worker.is_disabled().await {
+                            tokio::spawn(async move {
+                                let _ = probe_worker_capabilities(
+                                    &worker_clone,
+                                    timeout,
+                                    probe_pool.as_ref(),
+                                )
+                                .await;
+                            });
+                        }
                     } else {
                         warn!(
                             "Worker {} check failed: {:?} (failures: {})",
-                            worker_id,
-                            result.error,
-                            health.circuit_stats().consecutive_failures()
+                            worker_id, result.error, consecutive_failures
                         );
                     }
                 }
@@ -651,7 +724,10 @@ impl HealthMonitor {
     #[allow(dead_code)] // Will be used for graceful shutdown
     pub async fn stop(&self) {
         *self.running.write().await = false;
-        self.shutdown.notify_waiters();
+        // There is one monitor consumer. Keep a permit if it is publishing a
+        // completed probe instead of waiting in select!, so shutdown cannot
+        // disappear before it reaches the remaining probes or next interval.
+        self.shutdown.notify_one();
     }
 
     /// Get health state for a worker.
@@ -678,12 +754,26 @@ async fn check_worker_health(
     config: &HealthConfig,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> HealthCheckResult {
+    let endpoint = worker.endpoint_snapshot().await;
+    check_worker_health_for_endpoint(
+        &endpoint.config,
+        is_mock_transport(worker),
+        config,
+        ssh_pool,
+    )
+    .await
+}
+
+async fn check_worker_health_for_endpoint(
+    worker_config: &rch_common::WorkerConfig,
+    mock_enabled: bool,
+    config: &HealthConfig,
+    ssh_pool: Option<&Arc<rch_common::SshPool>>,
+) -> HealthCheckResult {
     let start = Instant::now();
 
     // Debug: log mock mode status and env var
     let mock_env = std::env::var("RCH_MOCK_SSH").unwrap_or_default();
-    let mock_enabled = is_mock_transport(worker);
-    let worker_config = worker.config.read().await;
 
     debug!(
         "Health check for {}: mock_enabled={}, RCH_MOCK_SSH='{}', host='{}'",
@@ -723,8 +813,6 @@ async fn check_worker_health(
         ..Default::default()
     };
 
-    let worker_config = worker_config.clone();
-
     // Retry a *retryable* transport error (connect/timeout blip) a couple of
     // times with a short backoff before recording a circuit failure. A single
     // packet-loss window or a momentarily-busy sshd otherwise trips the breaker
@@ -737,7 +825,7 @@ async fn check_worker_health(
     let mut last_error: Option<HealthProbeError> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let attempt_start = Instant::now();
-        match probe_health_once(&worker_config, ssh_options.clone(), ssh_pool).await {
+        match probe_health_once(worker_config, ssh_options.clone(), ssh_pool).await {
             Ok(()) => {
                 let duration = attempt_start.elapsed();
                 return HealthCheckResult::success(duration_millis_u64(duration));
@@ -820,7 +908,7 @@ fn pooled_error_stage(message: &str, retryable: bool) -> ProbeStage {
     }
 }
 
-/// Perform ONE health-probe attempt (connect + `echo health_check`) against a
+/// Perform ONE health-probe attempt (connect + source-registry storage probe) against a
 /// worker over a throwaway SSH session. Returns `Ok(())` on the expected
 /// sentinel, or a classified [`HealthProbeError`] otherwise. The retry policy
 /// lives in the caller ([`check_worker_health`]).
@@ -829,6 +917,7 @@ async fn probe_health_once(
     ssh_options: SshOptions,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> Result<(), HealthProbeError> {
+    let command = registry_health::command();
     // Pooled path: run over the warm shared ControlMaster. run_with_timeout
     // collapses connect+execute into one call; classify any error as retryable
     // via the shared transport-error heuristic so the caller's retry/transient
@@ -836,7 +925,7 @@ async fn probe_health_once(
     if let Some(pool) = ssh_pool {
         let command_timeout = ssh_options.command_timeout;
         return match pool
-            .run_with_timeout(worker_config, "echo health_check", command_timeout)
+            .run_with_timeout(worker_config, &command, command_timeout)
             .await
         {
             Ok(result) => classify_health_output(&result),
@@ -856,7 +945,7 @@ async fn probe_health_once(
     let mut client = SshClient::new(worker_config.clone(), ssh_options);
 
     match client.connect().await {
-        Ok(()) => match client.execute("echo health_check").await {
+        Ok(()) => match client.execute(&command).await {
             Ok(result) => {
                 let _ = client.disconnect().await;
                 classify_health_output(&result)
@@ -882,23 +971,10 @@ async fn probe_health_once(
     }
 }
 
-/// Map a health-probe command result onto the expected `echo health_check`
-/// sentinel. A command that ran but produced the wrong output is not a transport
-/// blip (not retryable).
+/// Classify the storage probe, preserving explicit refusal evidence even when
+/// diagnostic output must be truncated for display.
 fn classify_health_output(result: &rch_common::CommandResult) -> Result<(), HealthProbeError> {
-    if result.success() && result.stdout.trim().eq("health_check") {
-        Ok(())
-    } else {
-        Err(HealthProbeError {
-            message: format!(
-                "Unexpected response: exit={}, stdout={}",
-                result.exit_code,
-                result.stdout.trim()
-            ),
-            retryable: false,
-            stage: ProbeStage::Command,
-        })
-    }
+    registry_health::classify_output(result)
 }
 
 /// Perform a one-time health check on a worker.
@@ -2165,6 +2241,161 @@ mod tests {
         assert!(worker_ids.contains(&"worker-1"));
         assert!(worker_ids.contains(&"worker-2"));
         assert!(worker_ids.contains(&"worker-3"));
+    }
+
+    #[tokio::test]
+    async fn stalled_probes_do_not_block_peers_overlapping_reloads_or_endpoint_rechecks() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        let mut slow = MockConfig::success().with_stdout("health_check");
+        slow.execution_delay_ms = 60_000;
+        set_mock_ssh_config_override(Some(slow));
+
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("reload-stalled-worker");
+        let peer_id = WorkerId::new("reload-stalled-peer");
+        let config = WorkerConfig {
+            id: worker_id.clone(),
+            host: "old-auth-stalled.host".into(),
+            user: "user".into(),
+            identity_file: "~/.ssh/key".into(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+            tools: vec![],
+        };
+        pool.add_worker(config.clone()).await;
+        let mut peer = config.clone();
+        peer.id = peer_id.clone();
+        pool.add_worker(peer).await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        assert!(worker.reserve_slots(2).await);
+        let monitor = HealthMonitor::new(
+            pool.clone(),
+            HealthConfig {
+                check_interval: Duration::from_secs(3600),
+                ..Default::default()
+            },
+        );
+        let handle = monitor.start();
+
+        // Wait for both actual probe futures to enter transport execution.
+        // A serial monitor cannot reach this point while either is stalled.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let calls = mock::global_ssh_invocations_snapshot();
+                if [&worker_id, &peer_id].iter().all(|id| {
+                    calls.iter().any(|call| {
+                        &call.worker_id == *id
+                            && call.command.as_deref() == Some("echo health_check")
+                    })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a stalled worker must not delay its peer's health probe");
+
+        let mut fast = MockConfig::success().with_stdout("health_check");
+        fast.execution_delay_ms = 1;
+        set_mock_ssh_config_override(Some(fast));
+        let mut replacement = config;
+        replacement.host = "new-lan-address".into();
+        let diff = crate::reload::ConfigDiff {
+            to_add: vec![],
+            to_update: vec![replacement],
+            to_remove: vec![],
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let (first, second, fleet) = tokio::join!(
+                crate::reload::apply_worker_diff(&pool, &diff),
+                crate::reload::apply_worker_diff(&pool, &diff),
+                pool.all_workers(),
+            );
+            assert_eq!(first.unwrap().updated, 1);
+            assert_eq!(second.unwrap().updated, 1);
+            assert_eq!(fleet.len(), 2);
+        })
+        .await
+        .expect("SSH must not hold a worker or fleet lock across I/O");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if monitor.get_health(worker_id.as_str()).await == Some(WorkerStatus::Healthy)
+                    && monitor.get_health(peer_id.as_str()).await == Some(WorkerStatus::Healthy)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("retarget must cancel old probes and wake the hourly health loop immediately");
+        assert_eq!(worker.config.read().await.host, "new-lan-address");
+        assert_eq!(
+            worker.used_slots(),
+            2,
+            "reload must preserve the running build"
+        );
+        monitor.stop().await;
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("monitor shutdown must cancel pending I/O")
+            .unwrap();
+        worker.release_slots(2).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_health_publication_is_not_lost() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        let mut fast = MockConfig::success().with_stdout("health_check");
+        fast.execution_delay_ms = 1;
+        set_mock_ssh_config_override(Some(fast));
+
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("publication-shutdown");
+        pool.add_worker(WorkerConfig {
+            id: worker_id.clone(),
+            host: "mock://publication-shutdown".into(),
+            user: "user".into(),
+            identity_file: "~/.ssh/key".into(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+            tools: vec![],
+        })
+        .await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        let monitor = HealthMonitor::new(
+            pool,
+            HealthConfig {
+                check_interval: Duration::from_secs(3600),
+                ..Default::default()
+            },
+        );
+        let publication_guard = monitor.health_states.write().await;
+        let handle = monitor.start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.last_latency_ms().is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the completed probe must reach publication");
+
+        // The monitor cannot be listening to shutdown while this write guard
+        // prevents publication. Its next select must still observe stop().
+        monitor.stop().await;
+        drop(publication_guard);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown during publication must not wait for the next interval")
+            .unwrap();
     }
 
     #[tokio::test]

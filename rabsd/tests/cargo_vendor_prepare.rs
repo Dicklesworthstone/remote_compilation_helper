@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -20,6 +21,15 @@ const LOG_LIMIT: u64 = 4 * 1024 * 1024;
 const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const LABEL: &str = "exact\n雪";
 const WORKER: &str = "vendor-build-test";
+
+fn private_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
+#[path = "cargo_vendor_prepare/registry.rs"]
+mod registry;
 
 fn hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -171,7 +181,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = private_tempdir();
         let anchor = owner.path().join("approved source");
         fs::create_dir(&anchor).unwrap();
         let cargo = fs::canonicalize(std::env::var_os("CARGO").expect("Cargo test runner"))
@@ -270,6 +280,53 @@ impl Fixture {
             specification,
         }
     }
+    fn with_config_environment() -> Self {
+        let mut fixture = Self::new();
+        let config = fs::read_to_string(fixture.anchor.join(".cargo/config.toml")).unwrap();
+        write(
+            &fixture.anchor,
+            ".cargo/config.toml",
+            format!(
+                "{config}\n[env]\nBUILD_LABEL={{value={},force=true}}\nCONFIG_DEFAULT='from captured config'\nPROFILE_WINS={{value='config fallback',force=false}}\nCONFIG_EMPTY=''\nCONFIG_ASSET={{value='app/data/message.txt',relative=true}}\nCONFIG_ROOT={{value='',relative=true}}\n",
+                serde_json::to_string(LABEL).unwrap()
+            ),
+        );
+        fixture.specification["command_context"]["env"]["BUILD_LABEL"] =
+            json!("overridden by force");
+        fixture.specification["command_context"]["env"]["PROFILE_WINS"] = json!("explicit context");
+        write(&fixture.anchor, "app/data/message.txt", "captured asset\n");
+        write(
+            &fixture.anchor,
+            "app/build.rs",
+            r#"fn main() {
+    let root = std::path::PathBuf::from(std::env::var_os("CONFIG_ROOT").unwrap());
+    let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    assert_eq!(root, package.parent().unwrap());
+    assert_eq!(std::env::var("CONFIG_DEFAULT").unwrap(), "from captured config");
+    assert_eq!(std::env::var("PROFILE_WINS").unwrap(), "explicit context");
+    assert_eq!(std::env::var("CONFIG_EMPTY").unwrap(), "");
+    let asset = std::path::PathBuf::from(std::env::var_os("CONFIG_ASSET").unwrap());
+    assert_eq!(asset, package.join("data/message.txt"));
+    assert_eq!(std::fs::read_to_string(asset).unwrap(), "captured asset\n");
+    println!("cargo:rerun-if-env-changed=CONFIG_ASSET");
+    println!("cargo:rerun-if-changed=data/message.txt");
+}
+"#,
+        );
+        write(
+            &fixture.anchor,
+            "app/src/main.rs",
+            r#"fn main() {
+    assert_eq!(env!("CONFIG_DEFAULT"), "from captured config");
+    assert_eq!(env!("PROFILE_WINS"), "explicit context");
+    assert_eq!(env!("CONFIG_EMPTY"), "");
+    assert_eq!(include_str!(env!("CONFIG_ASSET")), "captured asset\n");
+    println!("{}:{}", registry_dep::answer() + local_dep::answer(), env!("BUILD_LABEL"));
+}
+"#,
+        );
+        fixture
+    }
     fn vendor(root: &Path, name: &str, files: BTreeMap<&str, &str>) -> String {
         let mut checksums = serde_json::Map::new();
         for (path, bytes) in files {
@@ -321,7 +378,13 @@ impl Fixture {
         fixture
     }
     fn git() -> (Self, String) {
-        let owner = tempfile::tempdir().unwrap();
+        Self::git_with_history(false)
+    }
+    fn git_with_history(parented: bool) -> (Self, String) {
+        Self::git_with_reference(parented, "full-rev")
+    }
+    fn git_with_reference(parented: bool, selector: &str) -> (Self, String) {
+        let owner = private_tempdir();
         let anchor = owner.path().join("approved source");
         fs::create_dir(&anchor).unwrap();
         let cargo = fs::canonicalize(std::env::var_os("CARGO").expect("Cargo test runner"))
@@ -379,6 +442,13 @@ impl Fixture {
             stdout
         };
         git("git-init", &["init", "--initial-branch=main"]);
+        if parented {
+            write(
+                &repository,
+                "dep/payload.txt",
+                "superseded-private-ancestor-payload\n",
+            );
+        }
         git("git-add", &["add", "."]);
         git(
             "git-commit",
@@ -395,12 +465,56 @@ impl Fixture {
                 "captured Git source",
             ],
         );
+        if parented {
+            write(&repository, "dep/payload.txt", "40\n");
+            git("git-selected-add", &["add", "dep/payload.txt"]);
+            git(
+                "git-selected-commit",
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-m",
+                    "selected Git source",
+                ],
+            );
+        }
         let revision = String::from_utf8(git("git-revision", &["rev-parse", "HEAD"]))
             .unwrap()
             .trim()
             .to_owned();
         assert_eq!(revision.len(), 40);
         let url = format!("file://{}", repository.display());
+        let reference = match selector {
+            "full-rev" => Some(("rev", revision.clone())),
+            "short-rev" => Some(("rev", revision[..7].to_owned())),
+            "branch" => Some(("branch", "main".to_owned())),
+            "tag" => {
+                git("git-tag", &["tag", "release+%2F#&name"]);
+                Some(("tag", "release+%2F#&name".to_owned()))
+            }
+            "default" => None,
+            _ => panic!("unknown Git fixture selector: {selector}"),
+        };
+        let manifest_reference = reference
+            .as_ref()
+            .map(|(kind, value)| format!(",{kind}='{value}'"))
+            .unwrap_or_default();
+        let locked_reference = reference
+            .as_ref()
+            .map(|(kind, value)| {
+                if *kind == "tag" {
+                    "?tag=release%2B%252F%23%26name".to_owned()
+                } else {
+                    format!("?{kind}={value}")
+                }
+            })
+            .unwrap_or_default();
         write(
             &anchor,
             "Cargo.toml",
@@ -410,7 +524,7 @@ impl Fixture {
             &anchor,
             "app/Cargo.toml",
             format!(
-                "[package]\nname='vendor_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nlocal_dep={{path='../local_dep'}}\ngit_dep={{git='{url}',rev='{revision}'}}\n"
+                "[package]\nname='vendor_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nlocal_dep={{path='../local_dep'}}\ngit_dep={{git='{url}'{manifest_reference}}}\n"
             ),
         );
         write(
@@ -454,7 +568,7 @@ impl Fixture {
         );
         write(&anchor, ".cargo/config.toml", config);
         let lock = fs::read_to_string(anchor.join("Cargo.lock")).unwrap();
-        assert!(lock.contains(&format!("git+{url}?rev={revision}#{revision}")));
+        assert!(lock.contains(&format!("git+{url}{locked_reference}#{revision}")));
         assert!(!lock.contains("checksum ="));
         for package in ["git_dep", "git_leaf"] {
             let checksums: Value = serde_json::from_slice(
@@ -469,6 +583,54 @@ impl Fixture {
         let dep_manifest =
             fs::read_to_string(anchor.join("vendor/git_dep-1.0.0/Cargo.toml")).unwrap();
         assert!(dep_manifest.contains("path = \"../leaf\""));
+        if selector != "full-rev" {
+            // Move both the origin and the approved object's ordinary refs to
+            // different code after Cargo generated the lock. Capture must use
+            // only the old locked object closure, never the selector's new tip.
+            write(&repository, "dep/payload.txt", "99\n");
+            write(
+                &repository,
+                "leaf/src/lib.rs",
+                "pub fn answer() -> u32 { 99 }\n",
+            );
+            git("git-advanced-add", &["add", "."]);
+            git(
+                "git-advanced-commit",
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-m",
+                    "moving references must not replace the locked commit",
+                ],
+            );
+            if selector == "tag" {
+                git("git-advanced-tag", &["tag", "--force", "release+%2F#&name"]);
+            }
+            let database = fs::read_dir(seed_home.join("git/db"))
+                .unwrap()
+                .map(Result::unwrap)
+                .next()
+                .unwrap()
+                .path();
+            git(
+                "git-advanced-cache",
+                &[
+                    "--git-dir",
+                    database.to_str().unwrap(),
+                    "fetch",
+                    "--force",
+                    &url,
+                    "+refs/heads/*:refs/remotes/origin/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+            );
+        }
         fs::rename(&repository, owner.path().join("retired-original-git")).unwrap();
         fs::rename(&seed_home, owner.path().join("retired-seed-cargo-home")).unwrap();
         let specification = json!({"kind":"canonical-exec","request_id":92,
@@ -522,15 +684,33 @@ impl Fixture {
             serde_json::from_slice(&fs::read(bundle.join("request.json")).unwrap()).unwrap();
         let mut expected = self.specification.clone();
         expected.as_object_mut().unwrap().remove("cargo_source");
+        if self.specification["cargo_source"]
+            .get("cargo_home_source")
+            .is_some()
+        {
+            let lock = fs::read_to_string(self.anchor.join("Cargo.lock")).unwrap();
+            let version = if lock.contains("git+") {
+                rabs_sandbox::cargo_home::ISOLATED_GIT_CARGO_HOME_SOURCE_VERSION
+            } else {
+                rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION
+            };
+            expected["cargo_home"] = json!({
+                "version":version,
+                "prefix":"rabs-cargo-home"});
+        }
         expected["source_manifest"] = request["source_manifest"].clone();
         assert_eq!(
             request, expected,
             "only preparation intent becomes a manifest"
         );
-        assert_eq!(
-            fs::read(bundle.join("source/.cargo/config.toml")).unwrap(),
-            fs::read(self.anchor.join(".cargo/config.toml")).unwrap()
-        );
+        if self.anchor.join(".cargo/config.toml").exists() {
+            assert_eq!(
+                fs::read(bundle.join("source/.cargo/config.toml")).unwrap(),
+                fs::read(self.anchor.join(".cargo/config.toml")).unwrap()
+            );
+        } else {
+            assert!(!bundle.join("source/.cargo/config.toml").exists());
+        }
         assert_eq!(
             fs::read(bundle.join("source/Cargo.lock")).unwrap(),
             fs::read(self.anchor.join("Cargo.lock")).unwrap()
@@ -542,6 +722,65 @@ impl Fixture {
 #[test]
 fn real_preparation_and_frozen_cargo_build_use_captured_transitive_and_build_script_inputs() {
     run_captured_vendor_build(Fixture::new());
+}
+
+#[test]
+fn vendored_build_preserves_captured_compiler_flags_with_source_replacements() {
+    let fixture = Fixture::new();
+    let config = fs::read_to_string(fixture.anchor.join(".cargo/config.toml")).unwrap();
+    write(
+        &fixture.anchor,
+        ".cargo/config.toml",
+        format!(
+            "{config}\n[build]\nrustflags=['--cfg=rabs_captured_config', '--check-cfg=cfg(rabs_captured_config)', '-Copt-level=1', '-Zthreads=4']\nrustdocflags=['-Dwarnings']\n[llvm-cov]\nexclude=['*/tests/*']\n"
+        ),
+    );
+    write(
+        &fixture.anchor,
+        "app/src/main.rs",
+        concat!(
+            "#[cfg(not(rabs_captured_config))] compile_error!(\"captured flags were lost\");\n",
+            "fn main() { println!(\"{}:{}\", registry_dep::answer()+local_dep::answer(), env!(\"BUILD_LABEL\")); }\n",
+        ),
+    );
+    // This executes the actual preparer and then real frozen Cargo over the
+    // retained source after retiring the original checkout. The source bundle
+    // and config bytes must still reconstruct the exact selected build.
+    run_captured_vendor_build(fixture);
+}
+
+#[test]
+fn captured_cargo_environment_reaches_real_build_scripts_and_compilers() {
+    run_captured_vendor_build(Fixture::with_config_environment());
+}
+
+#[test]
+fn vendor_source_replacements_do_not_bypass_compiler_config_validation() {
+    for extra in [
+        "[build]\nrustc-wrapper='outside'\n",
+        "[build]\nrustflags=['-Clinker=/outside']\n",
+        "[target.'cfg(unix)']\nrunner='outside'\n",
+        "[env]\nRUSTFLAGS='--sysroot=/outside'\n",
+        "[env]\nAPP_INPUT={value='../outside',relative=true}\n",
+        "[env]\nAPP_INPUT={value='/outside',relative=true}\n",
+        "[env]\nLD_PRELOAD={value='/outside',force=true}\n",
+    ] {
+        let fixture = Fixture::new();
+        let config = fs::read_to_string(fixture.anchor.join(".cargo/config.toml")).unwrap();
+        write(
+            &fixture.anchor,
+            ".cargo/config.toml",
+            format!("{config}\n{extra}"),
+        );
+        let (bundle, status, stdout, stderr) = fixture.prepare("config-refused");
+        assert!(!status.success());
+        assert!(stdout.is_empty());
+        assert!(!bundle.exists());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stderr).unwrap()["kind"],
+            "worker-prepare-failed"
+        );
+    }
 }
 
 #[test]
@@ -584,6 +823,13 @@ fn run_captured_vendor_build(fixture: Fixture) {
         .env("RUSTC", &fixture.rustc)
         .env("CARGO_INCREMENTAL", "0")
         .env("BUILD_LABEL", LABEL);
+    // Exercise the same application inputs that the native worker will present.
+    // The target and compiler remain local to this filesystem-only fixture.
+    for (name, value) in request["command_context"]["env"].as_object().unwrap() {
+        if !matches!(name.as_str(), "CARGO_TARGET_DIR" | "RUSTC") {
+            cmd.env(name, value.as_str().unwrap());
+        }
+    }
     let (status, _, stderr) =
         Process::spawn(fixture.owner.path(), "cargo-build", &mut cmd).wait(Duration::from_secs(90));
     assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
@@ -869,7 +1115,17 @@ fn uploaded_toolchain_builds_vendored_workspace_over_native_tls_and_recovers_off
     run_vendored_native_tls_build(true);
 }
 
+#[test]
+#[ignore = "requires canonical-capable Linux, OpenSSL and matching RABS_TEST_WORKER_BIN; run explicitly"]
+fn captured_cargo_environment_resolves_inside_canonical_native_tls_builds() {
+    run_native_tls_build(Fixture::with_config_environment(), false);
+}
+
 fn run_vendored_native_tls_build(upload_toolchain: bool) {
+    run_native_tls_build(Fixture::new(), upload_toolchain);
+}
+
+fn run_native_tls_build(mut fixture: Fixture, upload_toolchain: bool) {
     let missing =
         rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical();
     assert!(
@@ -881,7 +1137,6 @@ fn run_vendored_native_tls_build(upload_toolchain: bool) {
             .expect("set RABS_TEST_WORKER_BIN to the absolute rabs-wkr built from this revision"),
     );
     assert!(worker_binary.is_absolute() && worker_binary.is_file());
-    let mut fixture = Fixture::new();
     let (bundle, request) = if upload_toolchain {
         fixture.specification["toolchain_source"] =
             json!(fixture.cargo.parent().and_then(Path::parent).unwrap());
@@ -914,6 +1169,13 @@ fn run_vendored_native_tls_build(upload_toolchain: bool) {
         fixture.owner.path().join("retired-checkout"),
     )
     .unwrap();
+    if let Some(home) = fixture.specification["cargo_source"]["cargo_home_source"].as_str() {
+        fs::rename(
+            home,
+            fixture.owner.path().join("retired-original-cargo-home"),
+        )
+        .unwrap();
+    }
     let credentials = fixture.owner.path().join("credentials");
     fs::create_dir(&credentials).unwrap();
     let certificates = Certificates::new(&credentials);

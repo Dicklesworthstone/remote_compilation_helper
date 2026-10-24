@@ -119,6 +119,7 @@ pub struct ExecutionControl {
     lease: Arc<Mutex<Option<ExecutionLease>>>,
     output: Arc<Mutex<OutputCapture>>,
     artifacts: Arc<Mutex<ArtifactCapture>>,
+    target_seed: Arc<Mutex<Option<crate::target_cache::PendingTargetSeed>>>,
     preview: Arc<LiveOutputPreview>,
 }
 
@@ -170,6 +171,7 @@ impl ExecutionControl {
             lease: Arc::new(Mutex::new(lease)),
             output: Arc::new(Mutex::new(OutputCapture::default())),
             artifacts: Arc::new(Mutex::new(ArtifactCapture::default())),
+            target_seed: Arc::new(Mutex::new(None)),
             preview: Arc::new(LiveOutputPreview::default()),
         })
     }
@@ -336,6 +338,23 @@ impl ExecutionControl {
         Ok(())
     }
 
+    /// Keep optional hot state private until completion validates cleanup,
+    /// diagnostics, artifacts and the frozen interruption frontier together.
+    pub(crate) fn retain_target_seed(
+        &self,
+        seed: crate::target_cache::PendingTargetSeed,
+    ) -> io::Result<()> {
+        let mut pending = self
+            .target_seed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending.is_some() || self.state.load(Ordering::Acquire) & FINISHED != 0 {
+            return Err(io::Error::other("target state already completed"));
+        }
+        *pending = Some(seed);
+        Ok(())
+    }
+
     /// Freeze the result frontier, including interrupted executions. Retain
     /// the first stop reason while rejecting all later capture writes. Taking
     /// the capture locks in one fixed order makes the freeze atomic relative
@@ -343,6 +362,7 @@ impl ExecutionControl {
     pub(crate) fn finish(&self) -> Option<StopReason> {
         let _output = self.output.lock().unwrap_or_else(|e| e.into_inner());
         let _artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
+        let _target_seed = self.target_seed.lock().unwrap_or_else(|e| e.into_inner());
         let mut lease = self.lease.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.observe_reason(&mut lease, Instant::now());
         if let Some(lease) = lease.as_mut() {
@@ -372,6 +392,14 @@ fn complete_result(
     mut result: ExecResult,
     stop_reason: Option<StopReason>,
 ) -> Result<ExecutionCompletion, String> {
+    // Taking ownership immediately also releases the reservation on every
+    // error/early return. Only the seed's exact normal native exit can publish;
+    // interruptions and invalid completions cannot retain private hot state.
+    let target_seed = control
+        .target_seed
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
     // Process cleanup is a prerequisite for EVERY completion, including
     // digest-only requests, compiler failures and interrupted executions.
     // Otherwise a resumable result can outlive children that still mutate
@@ -422,6 +450,15 @@ fn complete_result(
         // them before cancellation won. Diagnostics remain available separately.
         None
     };
+    drop(capture);
+    if result.executed
+        && stop_reason.is_none()
+        && control.state.load(Ordering::Acquire) == FINISHED
+        && let Some(seed) = target_seed
+        && seed.matches_completion(result.request_id, result.exit_code, artifacts.is_some())
+    {
+        seed.publish();
+    }
     Ok(ExecutionCompletion {
         result,
         stop_reason,
@@ -1129,6 +1166,43 @@ mod tests {
             control
                 .retain_artifacts(Ok(artifacts(artifact_plan("a"))))
                 .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_dynamic_outputs_preserve_admitted_plan_through_completion() {
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["check", "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-json-v1"},
+        });
+        let plan = crate::artifacts::parse_plan(&request).unwrap().unwrap();
+        let expected = plan.clone();
+        let mut task = ExecutionTask::spawn_with_artifacts(29, Duration::from_secs(5), plan.clone(), move |control| {
+            let prepared = crate::artifacts::PreparedArtifacts::new(plan.clone()).unwrap();
+            std::fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+            std::fs::write(prepared.backing().join("debug/deps/libapp-123.rmeta"), b"compiled metadata").unwrap();
+            std::fs::write(prepared.backing().join("debug/intermediate"), b"retained intermediate").unwrap();
+            let stdout = concat!(
+                "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+                "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp-123.rmeta\"],\"executable\":null}\n",
+                "{\"reason\":\"build-finished\",\"success\":true}\n",
+            );
+            let captured = prepared.capture_with_cargo_output(None, stdout.as_bytes(), || false).unwrap();
+            assert_eq!(captured.plan(), &plan, "output discovery must not change admission identity");
+            control.retain_artifacts(Ok(captured)).unwrap();
+            result(29)
+        }).unwrap();
+        let mut completion = wait(&mut task).unwrap();
+        let captured = completion.artifacts.as_mut().unwrap();
+        assert_eq!(captured.plan(), &expected);
+        assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            captured
+                .read_chunk("debug/deps/libapp-123.rmeta", 0, 64)
+                .unwrap(),
+            b"compiled metadata"
         );
     }
 

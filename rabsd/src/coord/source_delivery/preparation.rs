@@ -103,6 +103,14 @@ impl SourcePreparation {
                 !closure && specification.get("source_files").is_none(),
                 "cargo_source, source_roots and source_files are mutually exclusive",
             )?;
+            if cargo.cargo_home_projection().is_some() {
+                require(
+                    specification.get("cargo_home").is_none()
+                        && specification.get("dependency_context").is_none(),
+                    "automatic registry capture cannot replace an explicit Cargo home or dependency context",
+                )?;
+                cargo.validate_cache_boundary(base)?;
+            }
             roots.push(("workspace".to_owned(), base.to_path_buf()));
             selections.push(("workspace".to_owned(), vec![cargo.manifest().to_owned()]));
         } else if closure {
@@ -208,6 +216,12 @@ impl SourcePreparation {
         self.roots.len()
     }
 
+    pub(super) fn cargo_home_projection(&self) -> Option<Value> {
+        self.cargo
+            .as_ref()
+            .and_then(cargo::CargoSource::cargo_home_projection)
+    }
+
     pub(super) fn capture(&self) -> io::Result<SourceUpload> {
         // Never capture roots independently and merge them afterward. The scanner
         // compares a complete first closure pass with a complete second pass and
@@ -217,7 +231,8 @@ impl SourcePreparation {
                 .map_err(|error| invalid(&format!("source closure capture refused: {error:?}")))?,
         );
         if let Some(cargo) = &self.cargo {
-            cargo.prepare(image)
+            let (image, files) = cargo.prepare(image)?;
+            SourceUpload::from_snapshot(image, "workspace", &files)
         } else if self.closure {
             SourceUpload::from_snapshot_closure(image, &self.selections)
         } else {

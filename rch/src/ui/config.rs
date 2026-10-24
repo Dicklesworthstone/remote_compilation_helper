@@ -136,6 +136,17 @@ impl<'a> ConfigDisplay<'a> {
             "{} [environment]",
             Icons::tree_branch(self.context)
         ));
+        self.push_config_line(
+            &mut lines,
+            "  ",
+            "forward_cargo_profile_settings",
+            &self
+                .config
+                .environment
+                .forward_cargo_profile_settings
+                .to_string(),
+            "environment.forward_cargo_profile_settings",
+        );
         let allowlist = format!("{:?}", self.config.environment.allowlist);
         self.push_config_line(
             &mut lines,
@@ -341,6 +352,16 @@ impl<'a> ConfigDisplay<'a> {
         // Environment section
         console.print_plain("");
         console.print_plain("[environment]");
+        self.print_plain_value(
+            console,
+            "forward_cargo_profile_settings",
+            &self
+                .config
+                .environment
+                .forward_cargo_profile_settings
+                .to_string(),
+            "environment.forward_cargo_profile_settings",
+        );
         let allowlist = format!("{:?}", self.config.environment.allowlist);
         self.print_plain_value(console, "allowlist", &allowlist, "environment.allowlist");
 
@@ -449,6 +470,7 @@ mod tests {
                 confidence_threshold: 0.8,
                 min_local_time_ms: 1000,
                 remote_speedup_threshold: 1.2,
+                local_slots: 0,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,
@@ -460,6 +482,8 @@ mod tests {
                 remote_build_jobs: "auto".to_string(),
             },
             transfer: ConfigTransferSection {
+                retrieval_staging_dir: None,
+                retrieval_min_free_bytes: 0,
                 compression_level: 6,
                 exclude_patterns: vec!["target".to_string(), "node_modules".to_string()],
                 remote_base: "/tmp/rch".to_string(),
@@ -477,6 +501,7 @@ mod tests {
             },
             environment: ConfigEnvironmentSection {
                 allowlist: vec!["RUSTFLAGS".to_string()],
+                forward_cargo_profile_settings: true,
             },
             circuit: ConfigCircuitSection {
                 failure_threshold: 3,
@@ -496,6 +521,7 @@ mod tests {
                 auto_start_cooldown_secs: 60,
                 auto_start_timeout_secs: 10,
             },
+            layer0: Default::default(),
             sources: vec![
                 "Environment variables (RCH_*)".to_string(),
                 "Project config: .rch/config.toml".to_string(),

@@ -1030,4 +1030,290 @@ mod tests {
             .expect("telemetry domain");
         assert_eq!(telemetry.1, 0, "an untouched domain resumes from zero");
     }
+
+    #[test]
+    fn i020_v1_same_worker_child_execution_enforces_second_hop_dispatch_off_and_benchmarks_nested_tree()
+     {
+        let parent_worker = PeerId("wkr-primary-1".into());
+        let other_worker = PeerId("wkr-secondary-2".into());
+
+        // 1. Same-worker child execution under parent jobserver + process group is admitted.
+        assert_eq!(
+            evaluate_v1_nested_child_execution(
+                &parent_worker,
+                &parent_worker,
+                7001,
+                7001,
+                9001,
+                9001,
+                &NestedChildOperation::LocalJobserverExecuteOnSameWorker,
+            ),
+            Ok(NestedChildDecision::AdmittedSameWorkerExecution {
+                jobserver_id: 7001,
+                process_group_id: 9001,
+            })
+        );
+
+        // 2. Child may query local/shared CAS and join coordinator singleflight from the same worker.
+        assert_eq!(
+            evaluate_v1_nested_child_execution(
+                &parent_worker,
+                &parent_worker,
+                7001,
+                7001,
+                9001,
+                9001,
+                &NestedChildOperation::QueryLocalOrSharedCas {
+                    action_key_digest: [0xAA; 32],
+                },
+            ),
+            Ok(NestedChildDecision::AdmittedCasQuery)
+        );
+        assert_eq!(
+            evaluate_v1_nested_child_execution(
+                &parent_worker,
+                &parent_worker,
+                7001,
+                7001,
+                9001,
+                9001,
+                &NestedChildOperation::JoinCoordinatorSingleflight {
+                    action_key_digest: [0xBB; 32],
+                },
+            ),
+            Ok(NestedChildDecision::AdmittedCoordinatorSingleflightJoin)
+        );
+
+        // 3. Second-hop dispatch is strictly DISABLED in V1 (both explicit SecondHopRemoteDispatch
+        //    and any child targeting a different worker).
+        assert_eq!(
+            evaluate_v1_nested_child_execution(
+                &parent_worker,
+                &parent_worker,
+                7001,
+                7001,
+                9001,
+                9001,
+                &NestedChildOperation::SecondHopRemoteDispatch {
+                    target_worker: other_worker.clone(),
+                },
+            ),
+            Err(NestedExecutionRefusal::SecondHopDispatchDisabledInV1 {
+                parent_worker: parent_worker.clone(),
+                attempted_target_worker: other_worker.clone(),
+            })
+        );
+        assert_eq!(
+            evaluate_v1_nested_child_execution(
+                &parent_worker,
+                &other_worker,
+                7001,
+                7001,
+                9001,
+                9001,
+                &NestedChildOperation::LocalJobserverExecuteOnSameWorker,
+            ),
+            Err(NestedExecutionRefusal::SecondHopDispatchDisabledInV1 {
+                parent_worker: parent_worker.clone(),
+                attempted_target_worker: other_worker,
+            })
+        );
+
+        // 4. Child escaping parent's worker-local jobserver or process group is refused.
+        assert_eq!(
+            evaluate_v1_nested_child_execution(
+                &parent_worker,
+                &parent_worker,
+                7001,
+                8888,
+                9001,
+                9001,
+                &NestedChildOperation::LocalJobserverExecuteOnSameWorker,
+            ),
+            Err(NestedExecutionRefusal::JobserverOrProcessTreeMismatch)
+        );
+
+        // 5. Nested-execution benchmark: 64 child actions under one remote Cargo parent
+        //    (40 local/shared CAS hits, 8 coordinator singleflight joins, 16 same-worker
+        //    jobserver compiles across 16 slots).
+        let bench = benchmark_v1_same_worker_nested_execution(64, 40, 8, 16, 16, 120, 45);
+        assert_eq!(bench.total_child_actions, 64);
+        assert_eq!(bench.second_hop_dispatches, 0);
+        assert!(
+            bench.same_worker_wall_time_ms < bench.unproxied_serial_wall_time_ms,
+            "same-worker nested execution with CAS + jobserver must beat uncached execution"
+        );
+        assert!(
+            bench.same_worker_wall_time_ms < bench.hypothetical_second_hop_wall_time_ms,
+            "same-worker execution avoids per-child second-hop serialization/materialization overhead"
+        );
+    }
+}
+
+/// Operations a child wrapper (`rustc`/linker/build-script) inside a remote Cargo
+/// build may request (bead I020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedChildOperation {
+    /// Execute the child compiler/linker/build-script on the SAME worker under the
+    /// parent's worker-local jobserver and process group.
+    LocalJobserverExecuteOnSameWorker,
+    /// Query worker-local CAS or shared coordinator CAS for an existing action result.
+    QueryLocalOrSharedCas {
+        /// Action key queried.
+        action_key_digest: [u8; 32],
+    },
+    /// Subscribe to an in-flight coordinator singleflight execution without spawning a second hop.
+    JoinCoordinatorSingleflight {
+        /// Action key joined.
+        action_key_digest: [u8; 32],
+    },
+    /// Attempt to dispatch a child compilation from one remote worker to another remote worker.
+    /// Strictly disabled in V1 (bead I020).
+    SecondHopRemoteDispatch {
+        /// Target second-hop worker.
+        target_worker: crate::wire_time::PeerId,
+    },
+}
+
+/// Admitted V1 nested child execution decision (bead I020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestedChildDecision {
+    /// Child executes on the same worker under the parent's jobserver and process tree.
+    AdmittedSameWorkerExecution {
+        /// Worker-local jobserver token pool ID.
+        jobserver_id: u64,
+        /// Parent/child process group ID.
+        process_group_id: u64,
+    },
+    /// Child queries local or shared CAS.
+    AdmittedCasQuery,
+    /// Child joins coordinator singleflight.
+    AdmittedCoordinatorSingleflightJoin,
+}
+
+/// Refusal when a nested child violates the V1 same-worker execution contract (bead I020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedExecutionRefusal {
+    /// Second-hop cross-worker child dispatch is disabled in V1 to prevent distributed
+    /// jobserver deadlock and recursive worker starvation.
+    SecondHopDispatchDisabledInV1 {
+        /// Worker hosting the parent Cargo process.
+        parent_worker: crate::wire_time::PeerId,
+        /// Worker targeted by the forbidden second hop.
+        attempted_target_worker: crate::wire_time::PeerId,
+    },
+    /// Child process did not inherit the parent's worker-local jobserver or process group.
+    JobserverOrProcessTreeMismatch,
+}
+
+/// Enforce V1 same-worker child execution and forbid second-hop remote dispatch (bead I020).
+///
+/// # Errors
+/// Returns [`NestedExecutionRefusal`] if the child attempts second-hop dispatch or escapes
+/// the parent's worker-local jobserver / process group.
+pub fn evaluate_v1_nested_child_execution(
+    parent_worker: &crate::wire_time::PeerId,
+    child_worker: &crate::wire_time::PeerId,
+    parent_jobserver_id: u64,
+    child_jobserver_id: u64,
+    parent_process_group_id: u64,
+    child_process_group_id: u64,
+    operation: &NestedChildOperation,
+) -> Result<NestedChildDecision, NestedExecutionRefusal> {
+    if let NestedChildOperation::SecondHopRemoteDispatch { target_worker } = operation {
+        return Err(NestedExecutionRefusal::SecondHopDispatchDisabledInV1 {
+            parent_worker: parent_worker.clone(),
+            attempted_target_worker: target_worker.clone(),
+        });
+    }
+    if parent_worker != child_worker {
+        return Err(NestedExecutionRefusal::SecondHopDispatchDisabledInV1 {
+            parent_worker: parent_worker.clone(),
+            attempted_target_worker: child_worker.clone(),
+        });
+    }
+    if parent_jobserver_id == 0
+        || parent_process_group_id == 0
+        || parent_jobserver_id != child_jobserver_id
+        || parent_process_group_id != child_process_group_id
+    {
+        return Err(NestedExecutionRefusal::JobserverOrProcessTreeMismatch);
+    }
+
+    match operation {
+        NestedChildOperation::LocalJobserverExecuteOnSameWorker => {
+            Ok(NestedChildDecision::AdmittedSameWorkerExecution {
+                jobserver_id: parent_jobserver_id,
+                process_group_id: parent_process_group_id,
+            })
+        }
+        NestedChildOperation::QueryLocalOrSharedCas { .. } => {
+            Ok(NestedChildDecision::AdmittedCasQuery)
+        }
+        NestedChildOperation::JoinCoordinatorSingleflight { .. } => {
+            Ok(NestedChildDecision::AdmittedCoordinatorSingleflightJoin)
+        }
+        NestedChildOperation::SecondHopRemoteDispatch { target_worker } => {
+            Err(NestedExecutionRefusal::SecondHopDispatchDisabledInV1 {
+                parent_worker: parent_worker.clone(),
+                attempted_target_worker: target_worker.clone(),
+            })
+        }
+    }
+}
+
+/// Benchmark summary for V1 same-worker nested child execution (bead I020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NestedExecutionBenchmarkReport {
+    /// Total child compiler/linker/build-script actions invoked by the remote Cargo parent.
+    pub total_child_actions: u32,
+    /// Children satisfied via local/shared CAS hit on the same worker.
+    pub cas_hits: u32,
+    /// Children satisfied by joining coordinator singleflight.
+    pub singleflight_joins: u32,
+    /// Children compiled locally under the worker-local jobserver.
+    pub same_worker_compiles: u32,
+    /// Second-hop cross-worker dispatches (always `0` in V1).
+    pub second_hop_dispatches: u32,
+    /// Estimated wall-clock time (ms) for V1 same-worker execution.
+    pub same_worker_wall_time_ms: u64,
+    /// Baseline wall-clock time (ms) without child CAS/singleflight.
+    pub unproxied_serial_wall_time_ms: u64,
+    /// Hypothetical wall-clock time (ms) if every miss incurred second-hop transfer overhead.
+    pub hypothetical_second_hop_wall_time_ms: u64,
+}
+
+/// Compute the deterministic nested-execution benchmark report for V1 same-worker child execution (bead I020).
+#[must_use]
+pub fn benchmark_v1_same_worker_nested_execution(
+    total_child_actions: u32,
+    cas_hits: u32,
+    singleflight_joins: u32,
+    same_worker_compiles: u32,
+    worker_jobserver_slots: u32,
+    avg_compile_ms: u64,
+    second_hop_transfer_overhead_ms: u64,
+) -> NestedExecutionBenchmarkReport {
+    let slots = u64::from(worker_jobserver_slots.max(1));
+    let waves = u64::from(same_worker_compiles).div_ceil(slots);
+    let same_worker_wall_time_ms = waves
+        .saturating_mul(avg_compile_ms)
+        .saturating_add(u64::from(cas_hits) * 2)
+        .saturating_add(u64::from(singleflight_joins) * 5);
+    let unproxied_waves = u64::from(total_child_actions).div_ceil(slots);
+    let unproxied_serial_wall_time_ms = unproxied_waves.saturating_mul(avg_compile_ms);
+    let hypothetical_second_hop_wall_time_ms = same_worker_wall_time_ms.saturating_add(
+        u64::from(same_worker_compiles).saturating_mul(second_hop_transfer_overhead_ms),
+    );
+
+    NestedExecutionBenchmarkReport {
+        total_child_actions,
+        cas_hits,
+        singleflight_joins,
+        same_worker_compiles,
+        second_hop_dispatches: 0,
+        same_worker_wall_time_ms,
+        unproxied_serial_wall_time_ms,
+        hypothetical_second_hop_wall_time_ms,
+    }
 }

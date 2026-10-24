@@ -21,7 +21,7 @@ use super::worker_delivery::{DeliveryMode, MAX_FRAME_BYTES, toolchain_identity, 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -32,10 +32,57 @@ use std::time::{Duration, Instant};
 const MAX_OPERATIONS: usize = 1024;
 const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const RECORD_OVERHEAD: usize = 96 * 1024;
-const MAX_RECORD_BYTES: usize = MAX_FRAME_BYTES + RECORD_OVERHEAD;
+const MAX_WORKER_POOL_BYTES: usize = 16 * 1024;
+const MAX_RECORD_BYTES: usize = MAX_FRAME_BYTES + RECORD_OVERHEAD + MAX_WORKER_POOL_BYTES;
 const MAX_DETAIL_BYTES: usize = 2048;
-const MAX_RUNNING: usize = 4;
 const MAX_AUTOMATIC_RECOVERIES: u8 = 3;
+const MAX_PREPARED_WORKERS: usize = 32;
+/// Locality is a bounded admission hint, not an inventory of worker caches.
+/// Ignore cold archives and executions older than this many queue admissions.
+const CARGO_LOCALITY_WINDOW: u64 = 128;
+
+/// One process-wide bound shared by execution, local recovery and previews.
+/// The upper bound permits a full configured worker pool without allowing
+/// unbounded executor threads, TLS sessions or retained diagnostic tails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedConcurrency(usize);
+
+impl PreparedConcurrency {
+    pub const DEFAULT: usize = 4;
+    pub const MAX: usize = 32;
+
+    pub fn new(value: usize) -> io::Result<Self> {
+        if (1..=Self::MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("prepared concurrency must be between 1 and {}", Self::MAX),
+            ))
+        }
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for PreparedConcurrency {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
+    }
+}
+
+/// Observed queue ownership, not a promise that a particular worker is free.
+/// Active includes cancellation and local recovery until their owner finishes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreparedCapacityStatus {
+    pub concurrency: usize,
+    pub active: usize,
+    pub queued: usize,
+    pub accepting: bool,
+    pub persistence_uncertain: bool,
+}
 
 fn recovery_delay(attempt: u8) -> Duration {
     Duration::from_secs(1_u64 << u32::from(attempt.saturating_sub(1).min(2)))
@@ -52,6 +99,48 @@ pub struct PreparedOperationSpec {
     pub bundle: PathBuf,
     pub delivery: PathBuf,
     pub output: PathBuf,
+}
+
+/// An operator-approved canonical worker and its fixed coordinator listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedWorker {
+    pub address: String,
+    pub worker: String,
+    pub worker_spki_sha256: String,
+}
+
+/// Placement is selected once when this immutable template enters the queue.
+/// The ordered candidate list remains part of admission identity on retries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedPoolOperationSpec {
+    pub id: String,
+    pub workers: Vec<PreparedWorker>,
+    pub bundle: PathBuf,
+    pub delivery: PathBuf,
+    pub output: PathBuf,
+}
+
+impl PreparedPoolOperationSpec {
+    /// Validate immutable admission shape without reading or creating inputs.
+    /// Native callers can reject a malformed pool before expensive capture.
+    pub fn validate(&self) -> io::Result<()> {
+        validate_worker_pool(&self.workers)?;
+        let first = self
+            .workers
+            .first()
+            .ok_or_else(|| invalid("canonical worker pool is empty"))?;
+        validate_spec_shape(&PreparedOperationSpec {
+            id: self.id.clone(),
+            address: first.address.clone(),
+            worker: first.worker.clone(),
+            worker_spki_sha256: first.worker_spki_sha256.clone(),
+            bundle: self.bundle.clone(),
+            delivery: self.delivery.clone(),
+            output: self.output.clone(),
+        })
+    }
 }
 
 /// These are operation/recovery states, not action publication states.
@@ -81,8 +170,13 @@ enum StoredMode {
 pub struct OperationStatus {
     pub id: String,
     pub state: OperationState,
+    /// Domain-separated job identity. Version 1 binds the numeric request;
+    /// version 2 binds the immutable allocation intent. Actual delivery always
+    /// verifies the separately retained full numeric execution request.
     pub request_sha256: String,
-    pub request_id: u64,
+    /// Pending daemon allocation has no worker identity. Numeric identities are
+    /// exposed only after the exclusive claim has durably bound the request.
+    pub request_id: Option<u64>,
     /// Durable claim number, zero until the first execution owner is admitted.
     pub attempt: u64,
     /// Number of automatically scheduled result/ACK recovery attempts. These
@@ -143,8 +237,16 @@ pub enum OperationOutcome {
 struct Record {
     version: u32,
     spec: PreparedOperationSpec,
+    /// Retain the exact ordered placement intent without changing execution or
+    /// recovery identity. Older singleton records intentionally omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_pool: Option<Vec<PreparedWorker>>,
     request: Value,
     request_sha256: String,
+    /// Version 2 additionally binds the complete numeric execution request.
+    /// The stable intent fingerprint deliberately excludes its assigned ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allocated_request_sha256: Option<String>,
     order: u64,
     attempt: u64,
     #[serde(default)]
@@ -170,14 +272,16 @@ struct Record {
 }
 
 impl Record {
+    fn allocation_pending(&self) -> bool {
+        self.version == 2 && self.request["request_id"].as_str() == Some("allocate")
+    }
+
     fn status(&self) -> OperationStatus {
         OperationStatus {
             id: self.spec.id.clone(),
             state: self.state,
             request_sha256: self.request_sha256.clone(),
-            request_id: self.request["request_id"]
-                .as_u64()
-                .expect("validated request"),
+            request_id: self.request["request_id"].as_u64(),
             attempt: self.attempt,
             automatic_recoveries: self.automatic_recoveries,
             recovery_pending: self.recovery_pending,
@@ -213,6 +317,12 @@ impl Record {
     fn weight(&self) -> io::Result<usize> {
         Ok(serde_json::to_vec(&self.request)?.len()
             + serde_json::to_vec(&self.spec)?.len()
+            + self
+                .worker_pool
+                .as_ref()
+                .map(serde_json::to_vec)
+                .transpose()?
+                .map_or(0, |bytes| bytes.len())
             + RECORD_OVERHEAD)
     }
 
@@ -273,6 +383,7 @@ impl Drop for StoreLock {
 pub struct PreparedOperationStore {
     root: PathBuf,
     _lock: StoreLock,
+    concurrency: PreparedConcurrency,
     state: Mutex<State>,
     previews: preview::PreviewRegistry,
     changed: Condvar,
@@ -301,6 +412,180 @@ fn valid_id(id: &str) -> bool {
 fn overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
+
+fn endpoints_overlap(left: SocketAddr, right: SocketAddr) -> bool {
+    let canonical_ip = |address: SocketAddr| match address.ip() {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(ip)),
+        ip => ip,
+    };
+    let left_ip = canonical_ip(left);
+    let right_ip = canonical_ip(right);
+    left.port() != 0
+        && left.port() == right.port()
+        && (left_ip == right_ip
+            // A wildcard listener may own every local interface, including a
+            // dual-stack IPv6 socket. Do not place simultaneous jobs there.
+            || left_ip.is_unspecified()
+            || right_ip.is_unspecified())
+}
+
+fn worker_owns_record(worker: &PreparedWorker, record: &Record) -> bool {
+    worker.worker == record.spec.worker
+        || worker.worker_spki_sha256 == record.spec.worker_spki_sha256
+        || worker.address.parse::<SocketAddr>().is_ok_and(|candidate| {
+            record
+                .bound_address
+                .as_deref()
+                .unwrap_or(&record.spec.address)
+                .parse::<SocketAddr>()
+                .is_ok_and(|other| endpoints_overlap(candidate, other))
+        })
+}
+
+/// Derive a placement hint using the worker's private-target compatibility
+/// policy. The retained request and its durable execution fingerprint stay
+/// exact. The shared source policy permits only local source/data edits while
+/// keeping Cargo manifests, configuration, executables and dependency caches
+/// bound to their complete captured contents.
+///
+/// Every other request field, including unknown extensions, remains exact. A
+/// matching hint cannot authorize target restoration or compiler skipping: the
+/// selected worker independently verifies its actual retained state and Cargo
+/// still executes the original command.
+fn cargo_compatibility_fingerprint(request: &Value) -> io::Result<Option<[u8; 32]>> {
+    use rabs_sandbox::cargo_artifacts::{private_incremental_roots, requested};
+    use rabs_sandbox::cargo_home::CargoHomeProjection;
+    use rabs_sandbox::cargo_target::{compatible_arguments, source_edit_identity};
+
+    let Some(mode) = requested(request)? else {
+        return Ok(None);
+    };
+    let private_roots = private_incremental_roots(request)?;
+    let program = request["program"]
+        .as_str()
+        .ok_or_else(|| invalid("Cargo locality requires a literal program"))?;
+    let arguments = request["args"]
+        .as_array()
+        .ok_or_else(|| invalid("Cargo locality requires an argument array"))?
+        .iter()
+        .map(|argument| {
+            argument
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("Cargo locality requires literal arguments"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let Some(arguments) = compatible_arguments(program, &arguments, mode) else {
+        return Ok(None);
+    };
+    let Some(source) = request_manifest(request)? else {
+        return Ok(None);
+    };
+    let projection = request
+        .get("cargo_home")
+        .map(|home| {
+            CargoHomeProjection::for_version(
+                home["version"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo locality requires a projection version"))?,
+                home["prefix"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo locality requires a projection prefix"))?,
+                &source,
+            )
+        })
+        .transpose()?;
+    let workspace = projection
+        .as_ref()
+        .and_then(CargoHomeProjection::workspace_manifest)
+        .unwrap_or(&source);
+    let mut intent = request.clone();
+    intent["request_id"] = serde_json::json!("allocate");
+    intent["args"] = serde_json::json!(arguments);
+    intent["artifacts"]["cargo"] = serde_json::json!("current-cargo-contract-required-v1");
+    if let Some(source_family) =
+        source_edit_identity(workspace, source.digest(), projection.as_ref())
+    {
+        intent["source_manifest"] = serde_json::json!(source_family);
+    }
+    // Keep the independently validated output projection outside the request
+    // object so an unknown extension cannot collide with an internal hint field.
+    let encoded = serde_json::to_vec(&(intent, private_roots))?;
+    let mut hash = Sha256::new();
+    hash.update(b"rabs.prepared-operation.cargo-compatible-locality.v1\0");
+    hash.update((encoded.len() as u64).to_le_bytes());
+    hash.update(encoded);
+    Ok(Some(hash.finalize().into()))
+}
+
+/// Prefer an exact captured command, then a compatible private Cargo target,
+/// when queue loads are equal. Recency breaks ties within each class. The exact
+/// allocated-intent fingerprint still binds every source, toolchain, command
+/// and extension byte except the wire request ID.
+///
+/// Resolved ordinary failures can also leave useful targets. Cancellation,
+/// stopped processes, uncertain ownership and jobs never dispatched cannot.
+/// This uses only bounded live history and never changes durable request or
+/// recovery identity. Missing or evicted worker targets merely make it a miss.
+fn cargo_locality(
+    state: &State,
+    request: &Value,
+    workers: &[PreparedWorker],
+) -> io::Result<Vec<Option<(u8, u64)>>> {
+    let mut recent = vec![None; workers.len()];
+    if rabs_sandbox::cargo_artifacts::requested(request)?.is_none() {
+        return Ok(recent);
+    }
+    let fingerprint = record_request_digest(2, request)?;
+    let compatible = cargo_compatibility_fingerprint(request)?;
+    for record in state.records.values().filter(|record| {
+        record.state == OperationState::Completed
+            && !record.unresolved()
+            && record.execution_may_have_run
+            && !record.cancel_requested
+            && record
+                .exit_code
+                .is_some_and(|code| (0..128).contains(&code))
+            && record.stop_reason.is_none()
+            && state.next_order.saturating_sub(record.order) <= CARGO_LOCALITY_WINDOW
+    }) {
+        // Avoid parsing large manifests for records belonging to another pool.
+        // Unlike overlapping-owner exclusion, locality requires all three
+        // identities: endpoint, worker name and certificate pin.
+        let matches_worker = |worker: &PreparedWorker| {
+            worker.address == record.spec.address
+                && worker.worker == record.spec.worker
+                && worker.worker_spki_sha256 == record.spec.worker_spki_sha256
+        };
+        if !workers.iter().any(matches_worker) {
+            continue;
+        }
+        let exact = if record.version == 2 {
+            record.request_sha256 == fingerprint
+        } else {
+            record_request_digest(2, &record.request)? == fingerprint
+        };
+        let rank = if exact {
+            2
+        } else if compatible.is_some()
+            && cargo_compatibility_fingerprint(&record.request)? == compatible
+        {
+            1
+        } else {
+            continue;
+        };
+        for (index, worker) in workers.iter().enumerate() {
+            if matches_worker(worker) {
+                recent[index] = recent[index].max(Some((rank, record.order)));
+            }
+        }
+    }
+    Ok(recent)
+}
+
 fn shares_worker_or_endpoint(left: &Record, right: &Record) -> bool {
     let endpoint = |record: &Record| {
         record
@@ -313,8 +598,32 @@ fn shares_worker_or_endpoint(left: &Record, right: &Record) -> bool {
     };
     left.spec.worker == right.spec.worker
         || left.spec.worker_spki_sha256 == right.spec.worker_spki_sha256
-        || endpoint(left).is_some_and(|left| endpoint(right) == Some(left))
+        || endpoint(left)
+            .is_some_and(|left| endpoint(right).is_some_and(|right| endpoints_overlap(left, right)))
 }
+
+/// A captured bundle is read-only during dispatch, unlike delivery/output state.
+/// Permit only the exact same bundle and saved input identity to be shared.
+/// Allocated jobs retain that identity after binding different numeric IDs;
+/// neither claiming a job nor allocating its ID rewrites the bundle template.
+/// The adapter still revalidates each upload against its saved numeric request.
+fn conflicting_active_paths(left: &Record, right: &Record) -> bool {
+    let share_bundle = left.spec.bundle == right.spec.bundle
+        && left.version == right.version
+        && left.request_sha256 == right.request_sha256;
+    let left_paths = left.paths();
+    let right_paths = right.paths();
+    left_paths.iter().enumerate().any(|(left_index, left)| {
+        right_paths.iter().enumerate().any(|(right_index, right)| {
+            // paths() puts the input bundle first. All remaining roles stay
+            // exclusive, including prior deliveries and recovery prefixes.
+            // Compare roles, not path equality: a destination or prefix equal
+            // to a bundle must never inherit its read-sharing exception.
+            !(share_bundle && left_index == 0 && right_index == 0) && overlap(left, right)
+        })
+    })
+}
+
 fn bounded_detail(value: &str) -> String {
     let mut end = value.len().min(MAX_DETAIL_BYTES);
     while !value.is_char_boundary(end) {
@@ -384,6 +693,69 @@ fn validate_spec_shape(spec: &PreparedOperationSpec) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_worker_pool(workers: &[PreparedWorker]) -> io::Result<()> {
+    require(
+        !workers.is_empty() && workers.len() <= MAX_PREPARED_WORKERS,
+        "canonical worker pool requires 1..=32 workers",
+    )?;
+    let mut names = BTreeSet::new();
+    let mut pins = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for worker in workers {
+        require(
+            worker.worker.len() <= 128
+                && worker
+                    .worker
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && worker
+                    .worker
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "canonical pool worker name must be a bounded ASCII identifier",
+        )?;
+        parse_worker_pin(&worker.worker_spki_sha256)?;
+        let endpoint = worker
+            .address
+            .parse::<SocketAddr>()
+            .map_err(|_| invalid("canonical pool listener must be a literal IP:port"))?;
+        require(
+            worker.address.len() <= 128 && endpoint.port() != 0,
+            "canonical pool listener requires a bounded address and nonzero port",
+        )?;
+        require(
+            names.insert(worker.worker.as_str())
+                && pins.insert(worker.worker_spki_sha256.as_str())
+                && endpoints
+                    .iter()
+                    .all(|other| !endpoints_overlap(endpoint, *other)),
+            "canonical worker pool repeats a worker, pin or overlapping listener",
+        )?;
+        endpoints.push(endpoint);
+    }
+    require(
+        serde_json::to_vec(workers)?.len() <= MAX_WORKER_POOL_BYTES,
+        "canonical worker pool exceeds its byte limit",
+    )
+}
+
+fn validate_record_pool(record: &Record) -> io::Result<()> {
+    if let Some(workers) = &record.worker_pool {
+        validate_worker_pool(workers)?;
+        require(
+            record.version == 2
+                && workers.iter().any(|worker| {
+                    worker.address == record.spec.address
+                        && worker.worker == record.spec.worker
+                        && worker.worker_spki_sha256 == record.spec.worker_spki_sha256
+                }),
+            "pooled operation does not bind an approved allocated worker",
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_bound_request(request: &Value) -> io::Result<()> {
     validate_request(request)?;
     require(
@@ -394,6 +766,44 @@ fn validate_bound_request(request: &Value) -> io::Result<()> {
         toolchain_identity(request)?.is_some(),
         "prepared operations require pinned toolchain_identity",
     )
+}
+
+/// Allocation intent is accepted only on the explicit local daemon API. Probe
+/// all ordinary execution/source/toolchain constraints without turning the
+/// template into a wire request or assigning it a placeholder identity.
+fn validate_allocation_template(request: &Value) -> io::Result<()> {
+    require(
+        request["kind"] == "canonical-exec" && request["request_id"].as_str() == Some("allocate"),
+        "daemon allocation requires an explicit prepared request template",
+    )?;
+    let mut probe = request.clone();
+    probe["request_id"] = serde_json::json!(0);
+    validate_bound_request(&probe)
+}
+
+fn record_request_digest(version: u32, request: &Value) -> io::Result<String> {
+    match version {
+        1 => request_digest(request),
+        2 => {
+            let mut intent = request.clone();
+            intent["request_id"] = serde_json::json!("allocate");
+            let bytes = serde_json::to_vec(&intent)?;
+            require(
+                bytes.len() <= MAX_FRAME_BYTES,
+                "prepared intent exceeds frame budget",
+            )?;
+            let mut hash = Sha256::new();
+            hash.update(b"rabs.prepared-operation.allocated-intent.v1\0");
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+            Ok(hash
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect())
+        }
+        _ => Err(invalid("unsupported prepared operation record version")),
+    }
 }
 
 fn request_digest(request: &Value) -> io::Result<String> {
@@ -445,6 +855,15 @@ fn read_bounded(path: &Path, limit: usize, private: bool) -> io::Result<Vec<u8>>
 
 impl PreparedOperationStore {
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
+        Self::open_with_concurrency(root, PreparedConcurrency::default())
+    }
+
+    /// Capacity belongs to this daemon incarnation, not to durable job identity.
+    /// Reopening with a different bound preserves every request and placement.
+    pub fn open_with_concurrency(
+        root: &Path,
+        concurrency: PreparedConcurrency,
+    ) -> io::Result<Arc<Self>> {
         ordinary_directory(root, true)?;
         if !root.exists() {
             let mut builder = fs::DirBuilder::new();
@@ -546,6 +965,7 @@ impl PreparedOperationStore {
         let store = Arc::new(Self {
             root,
             _lock: lock,
+            concurrency,
             state: Mutex::new(State {
                 records,
                 active: BTreeMap::new(),
@@ -557,7 +977,7 @@ impl PreparedOperationStore {
                 poisoned: false,
             }),
             changed: Condvar::new(),
-            previews: preview::PreviewRegistry::default(),
+            previews: preview::PreviewRegistry::new(concurrency),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -592,18 +1012,52 @@ impl PreparedOperationStore {
                 .cloned()
                 .collect();
             for mut record in recover {
-                record.state = OperationState::Uncertain;
-                record.execution_may_have_run = true;
+                let pending = record.allocation_pending();
+                record.state = if pending {
+                    OperationState::FailedBeforeStart
+                } else {
+                    OperationState::Uncertain
+                };
+                record.execution_may_have_run = !pending;
                 record.listen_address = None;
                 record.recovery_pending = false;
-                record.detail = Some(
+                record.detail = Some(if pending {
+                    "daemon owner stopped before binding a worker request; no execution was dispatched"
+                } else {
                     "daemon owner stopped before a terminal result; explicit resume required"
-                        .into(),
-                );
+                }.into());
                 store.replace(&mut state, record)?;
             }
         }
         Ok(store)
+    }
+
+    pub const fn concurrency(&self) -> PreparedConcurrency {
+        self.concurrency
+    }
+
+    /// Status must not wait for a queued filesystem transaction. A busy result
+    /// is explicitly unavailable rather than silently reporting stale counts.
+    pub fn capacity_status(&self) -> io::Result<PreparedCapacityStatus> {
+        let state = self.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, "prepared operation state busy")
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                io::Error::other("prepared operation lock poisoned")
+            }
+        })?;
+        Ok(PreparedCapacityStatus {
+            concurrency: self.concurrency.get(),
+            active: state.active.len(),
+            queued: state
+                .records
+                .values()
+                .filter(|record| record.state == OperationState::Queued)
+                .count(),
+            accepting: state.accepting && !state.poisoned,
+            persistence_uncertain: state.poisoned,
+        })
     }
 
     fn lock_state(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
@@ -669,18 +1123,77 @@ impl PreparedOperationStore {
     }
 
     pub fn submit(&self, spec: PreparedOperationSpec) -> io::Result<OperationStatus> {
+        self.submit_inner(spec, false, None)
+    }
+
+    /// Admit a fully captured template, leaving request allocation to its sole
+    /// claimed execution owner. Queue order cannot be overtaken by allocating
+    /// IDs in clients, and a client disconnect does not relinquish saved work.
+    pub fn submit_allocated(&self, spec: PreparedOperationSpec) -> io::Result<OperationStatus> {
+        self.submit_inner(spec, true, None)
+    }
+
+    /// Select one approved worker under durable admission ownership. Busy
+    /// workers remain queue candidates; unresolved execution ownership does
+    /// not. Retries and restart retain the selected worker, never fail over.
+    pub fn submit_allocated_pool(
+        &self,
+        spec: PreparedPoolOperationSpec,
+    ) -> io::Result<OperationStatus> {
+        spec.validate()?;
+        let first = spec
+            .workers
+            .first()
+            .ok_or_else(|| invalid("canonical worker pool is empty"))?;
+        let operation = PreparedOperationSpec {
+            id: spec.id,
+            address: first.address.clone(),
+            worker: first.worker.clone(),
+            worker_spki_sha256: first.worker_spki_sha256.clone(),
+            bundle: spec.bundle,
+            delivery: spec.delivery,
+            output: spec.output,
+        };
+        self.submit_inner(operation, true, Some(spec.workers))
+    }
+
+    fn submit_inner(
+        &self,
+        mut spec: PreparedOperationSpec,
+        allocate: bool,
+        worker_pool: Option<Vec<PreparedWorker>>,
+    ) -> io::Result<OperationStatus> {
         self.validate_paths(&spec)?;
         let request: Value = serde_json::from_slice(&read_bounded(
             &spec.bundle.join("request.json"),
             MAX_FRAME_BYTES,
             false,
         )?)?;
-        validate_bound_request(&request)?;
-        let fingerprint = request_digest(&request)?;
+        let version = if allocate { 2 } else { 1 };
+        if allocate {
+            validate_allocation_template(&request)?;
+        } else {
+            validate_bound_request(&request)?;
+        }
+        let fingerprint = record_request_digest(version, &request)?;
         let existing_status = |record: Record| -> io::Result<OperationStatus> {
+            let mut accepted = record.request.clone();
+            if allocate {
+                accepted["request_id"] = serde_json::json!("allocate");
+            }
+            let mut intended_spec = spec.clone();
+            if worker_pool.is_some() {
+                // Exact pool identity binds the previously selected placement.
+                // Do not rerun selection against a changed queue on retry.
+                intended_spec.address = record.spec.address.clone();
+                intended_spec.worker = record.spec.worker.clone();
+                intended_spec.worker_spki_sha256 = record.spec.worker_spki_sha256.clone();
+            }
             require(
-                record.spec == spec
-                    && record.request == request
+                record.version == version
+                    && record.spec == intended_spec
+                    && record.worker_pool == worker_pool
+                    && accepted == request
                     && record.request_sha256 == fingerprint,
                 "operation id already belongs to another request or destination",
             )?;
@@ -728,12 +1241,45 @@ impl PreparedOperationStore {
         for existing in state.records.values() {
             check_paths(existing)?;
         }
+        if let Some(workers) = &worker_pool {
+            let locality = cargo_locality(&state, &request, workers)?;
+            let (_, selected) = workers
+                .iter()
+                .enumerate()
+                .filter(|(_, worker)| {
+                    state
+                        .records
+                        .values()
+                        .all(|record| !record.unresolved() || !worker_owns_record(worker, record))
+                })
+                .min_by_key(|(index, worker)| {
+                    let load = state
+                        .records
+                        .values()
+                        .filter(|record| {
+                            matches!(
+                                record.state,
+                                OperationState::Queued
+                                    | OperationState::Running
+                                    | OperationState::Cancelling
+                            ) && worker_owns_record(worker, record)
+                        })
+                        .count();
+                    (load, std::cmp::Reverse(locality[*index]), *index)
+                })
+                .ok_or_else(|| invalid("all canonical pool workers have unresolved ownership"))?;
+            spec.address = selected.address.clone();
+            spec.worker = selected.worker.clone();
+            spec.worker_spki_sha256 = selected.worker_spki_sha256.clone();
+        }
         let record = Record {
-            version: 1,
+            version,
             delivery: spec.delivery.clone(),
             spec,
+            worker_pool,
             request,
             request_sha256: fingerprint,
+            allocated_request_sha256: None,
             order: state.next_order,
             attempt: 0,
             automatic_recoveries: 0,
@@ -962,7 +1508,7 @@ impl PreparedOperationStore {
 
     fn claim_next_at(self: &Arc<Self>, now: Instant) -> io::Result<Option<OperationClaim>> {
         let mut state = self.lock_state()?;
-        if !state.accepting || state.active.len() >= MAX_RUNNING {
+        if !state.accepting || state.active.len() >= self.concurrency.get() {
             return Ok(None);
         }
         let next = state
@@ -987,10 +1533,7 @@ impl PreparedOperationStore {
                         state.active.contains_key(&other.spec.id) || other.unresolved();
                     (!owns_worker || !shares_worker_or_endpoint(record, other))
                         && (!state.active.contains_key(&other.spec.id)
-                            || !record
-                                .paths()
-                                .iter()
-                                .any(|left| other.paths().iter().any(|right| overlap(left, right))))
+                            || !conflicting_active_paths(record, other))
                 })
             })
             .min_by_key(|record| record.order)
@@ -1005,7 +1548,7 @@ impl PreparedOperationStore {
             .checked_add(1)
             .ok_or_else(|| invalid("operation attempts exhausted"))?;
         // Persist this before the callback can listen, upload, or send execution.
-        record.execution_may_have_run = true;
+        record.execution_may_have_run = !record.allocation_pending();
         let cancellation = OperationCancellation::default();
         let mut spec = record.spec.clone();
         spec.delivery = record.delivery.clone();
@@ -1027,6 +1570,7 @@ impl PreparedOperationStore {
             store: Arc::clone(self),
             spec,
             request: record.request.clone(),
+            allocation_pending: record.allocation_pending(),
             mode: record.mode,
             resume_from: record.resume_from.clone(),
             attempt: record.attempt,
@@ -1069,6 +1613,7 @@ pub struct OperationClaim {
     store: Arc<PreparedOperationStore>,
     spec: PreparedOperationSpec,
     request: Value,
+    allocation_pending: bool,
     mode: StoredMode,
     resume_from: Option<PathBuf>,
     attempt: u64,
@@ -1083,6 +1628,64 @@ impl OperationClaim {
     }
     pub fn request(&self) -> &Value {
         &self.request
+    }
+
+    pub fn needs_request_allocation(&self) -> bool {
+        self.allocation_pending
+    }
+
+    /// Bind once while the caller retains the exclusive pinned-worker admission
+    /// that supplied this ID. Persistence precedes any execution-capable network
+    /// work. A crash after binding retains this request for result-only recovery;
+    /// neither this owner nor a restarted daemon may allocate a replacement.
+    pub fn bind_request_id(&mut self, request_id: u64) -> io::Result<()> {
+        require(
+            request_id > 0 && self.allocation_pending,
+            "worker request is not awaiting allocation",
+        )?;
+        let mut state = self.store.lock_state()?;
+        let mut record = self.current(&state)?;
+        require(
+            state.accepting
+                && !self.cancellation.is_cancelled()
+                && !record.cancel_requested
+                && record.allocation_pending()
+                && record.mode == StoredMode::Execute,
+            "worker request allocation cancelled or already bound",
+        )?;
+        let old_weight = record.weight()?;
+        record.request["request_id"] = serde_json::json!(request_id);
+        validate_bound_request(&record.request)?;
+        let execution_bytes = serde_json::to_vec(&record.request)?;
+        require(
+            execution_bytes.len() <= MAX_FRAME_BYTES,
+            "bound worker request exceeds frame budget",
+        )?;
+        record.allocated_request_sha256 = Some(
+            Sha256::digest(execution_bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
+        require(
+            record_request_digest(record.version, &record.request)? == record.request_sha256,
+            "worker request binding changed its admitted intent",
+        )?;
+        // Persist the execution frontier with the assigned request. The native
+        // adapter still owns the reservation and validates every byte at handoff.
+        record.execution_may_have_run = true;
+        let new_weight = record.weight()?;
+        let retained_bytes = state
+            .retained_bytes
+            .checked_sub(old_weight)
+            .and_then(|bytes| bytes.checked_add(new_weight))
+            .filter(|bytes| *bytes <= MAX_RETAINED_BYTES)
+            .ok_or_else(|| invalid("operation storage budget exceeded while binding request"))?;
+        self.store.replace(&mut state, record.clone())?;
+        state.retained_bytes = retained_bytes;
+        self.request = record.request;
+        self.allocation_pending = false;
+        Ok(())
     }
     pub fn mode(&self) -> DeliveryMode {
         if self.mode == StoredMode::Execute {
@@ -1108,6 +1711,10 @@ impl OperationClaim {
     }
 
     pub fn listening(&self, address: SocketAddr) -> io::Result<()> {
+        require(
+            !self.allocation_pending,
+            "unbound request cannot listen for a worker",
+        )?;
         let mut state = self.store.lock_state()?;
         let mut record = self.current(&state)?;
         require(
@@ -1270,6 +1877,20 @@ impl OperationClaim {
         };
         let mut record = self.current(&state)?;
         record.listen_address = None;
+        require(
+            !record.allocation_pending()
+                || matches!(
+                    &outcome,
+                    OperationOutcome::Failed {
+                        execution_may_have_run: false,
+                        ..
+                    } | OperationOutcome::TransportInterrupted {
+                        execution_may_have_run: false,
+                        ..
+                    }
+                ),
+            "unallocated operation cannot report an execution outcome",
+        )?;
         match outcome {
             OperationOutcome::Completed { result } | OperationOutcome::Cancelled { result } => {
                 let delivery = &result["delivery"];
@@ -1435,12 +2056,19 @@ impl Drop for OperationClaim {
             && record.attempt == self.attempt
             && state.active.contains_key(&self.spec.id)
         {
-            record.state = OperationState::Uncertain;
-            record.execution_may_have_run = true;
+            let pending = record.allocation_pending();
+            record.state = if pending {
+                OperationState::FailedBeforeStart
+            } else {
+                OperationState::Uncertain
+            };
+            record.execution_may_have_run = !pending;
             record.listen_address = None;
-            record.detail = Some(
-                "dispatch owner ended without terminal evidence; explicit resume required".into(),
-            );
+            record.detail = Some(if pending {
+                "dispatch owner ended before binding a worker request; no execution was dispatched"
+            } else {
+                "dispatch owner ended without terminal evidence; explicit resume required"
+            }.into());
             if !state.poisoned {
                 let _ = self.store.replace(&mut state, record);
             }
@@ -1452,3 +2080,9 @@ impl Drop for OperationClaim {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod shared_bundle_tests;
+
+#[cfg(all(test, unix))]
+mod pool_tests;

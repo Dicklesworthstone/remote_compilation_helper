@@ -12,6 +12,9 @@
 //!
 //! - credential/key locations (`.env*`, private-key formats, cloud
 //!   creds, signing material) default `Denied`/`SecretCapability`;
+//! - agent/session directory contents default `LocalOnly`; an explicit
+//!   build-input class may override this hygiene default, never a secret
+//!   or structural refusal;
 //! - symlink/bind escapes, devices, sockets, and unrelated
 //!   home/ancestor paths are structurally refused;
 //! - discovery reading a denied path does NOT silently upload it: the
@@ -81,9 +84,27 @@ const SECRET_LOCATION_PATTERNS: &[&[u8]] = &[
     b"secring",
 ];
 
+/// Match only descendants of exact directory names, as in RCH's default
+/// source-sync exclusions (#109). The leaf itself may be an ordinary file:
+/// `fixtures/.ntm` is not evidence of a session directory. No generic scratch,
+/// data, artifacts or project-configuration directory is classified here.
+///
+/// Paths use the capture protocol's `/` separator. Keep this byte-preserving
+/// and case-sensitive, unlike the stronger, case-folded credential policy.
+/// Directory entries can remain in a snapshot; their contents are not read,
+/// retained, or materialized by the default membership policy.
+fn is_agent_state_descendant(raw_path: &[u8]) -> bool {
+    raw_path
+        .rsplit(|byte| *byte == b'/')
+        .skip(1)
+        .any(|component| matches!(component, b".ntm" | b".beads-recovery" | b".beads"))
+}
+
 /// Classify one candidate path. `configured` is the project's declared
 /// class for the path, if any. There is NO `.gitignore` parameter —
 /// ignore state cannot be consulted even by mistake (I38).
+/// The hygiene override uses this API argument; snapshot capture currently
+/// supplies `None`. This does not add `.rchignore` support to RABS.
 #[must_use]
 pub fn classify_path(
     raw_path: &[u8],
@@ -129,7 +150,13 @@ pub fn classify_path(
             _ => SourceCapturePolicy::Denied,
         };
     }
-    configured.unwrap_or(SourceCapturePolicy::BuildInputAllowed)
+    configured.unwrap_or_else(|| {
+        if is_agent_state_descendant(raw_path) {
+            SourceCapturePolicy::LocalOnly
+        } else {
+            SourceCapturePolicy::BuildInputAllowed
+        }
+    })
 }
 
 /// The action-level consequence of discovery touching a denied path.
@@ -181,6 +208,131 @@ pub fn partition_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_state_is_local_only_at_every_depth() {
+        for prefix in ["", "nested/", "/__rabs/workspace/nested/"] {
+            for directory in [".ntm", ".beads-recovery", ".beads"] {
+                for suffix in [
+                    "state.json",
+                    "sessions/log.txt",
+                    "Cargo.lock",
+                    ".cargo/config.toml",
+                ] {
+                    let path = format!("{prefix}{directory}/{suffix}");
+                    assert_eq!(
+                        classify_path(path.as_bytes(), PathShape::REGULAR, None),
+                        SourceCapturePolicy::LocalOnly,
+                        "{path}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            classify_path(b".beads/.br_recovery/state.json", PathShape::REGULAR, None),
+            SourceCapturePolicy::LocalOnly
+        );
+    }
+
+    #[test]
+    fn agent_state_policy_preserves_legitimate_inputs_and_raw_bytes() {
+        for path in [
+            &b"scratch/generated.rs"[..],
+            b"data/input.bin",
+            b"artifacts/fixture.txt",
+            b".cargo/config.toml",
+            b".claude/settings.json",
+            b".rch/config.toml",
+            b".ntm-fixtures/input.txt",
+            b".beads-recovery-tools/input.txt",
+            b"fixtures/.ntm",
+            b"fixtures/.beads-recovery",
+            b"fixtures/.beads",
+            b".ntm",
+            b".beads-recovery",
+            b"raw-\xff/.ntm",
+        ] {
+            assert_eq!(
+                classify_path(path, PathShape::REGULAR, None),
+                SourceCapturePolicy::BuildInputAllowed,
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            classify_path(b"raw-\xff/.ntm/log-\xfe", PathShape::REGULAR, None),
+            SourceCapturePolicy::LocalOnly
+        );
+    }
+
+    #[test]
+    fn agent_state_explicit_classes_preserve_secret_and_structural_denials() {
+        for policy in [
+            SourceCapturePolicy::BuildInputAllowed,
+            SourceCapturePolicy::LocalOnly,
+            SourceCapturePolicy::SecretCapability,
+            SourceCapturePolicy::Denied,
+            SourceCapturePolicy::ExplicitOperatorApproval,
+        ] {
+            assert_eq!(
+                classify_path(b".ntm/fixture.json", PathShape::REGULAR, Some(policy)),
+                policy
+            );
+            for shape in [
+                PathShape {
+                    escapes_closure: true,
+                    ..PathShape::REGULAR
+                },
+                PathShape {
+                    special_node: true,
+                    ..PathShape::REGULAR
+                },
+                PathShape {
+                    unrelated_ancestor: true,
+                    ..PathShape::REGULAR
+                },
+            ] {
+                assert_eq!(
+                    classify_path(b".ntm/fixture.json", shape, Some(policy)),
+                    SourceCapturePolicy::Denied
+                );
+            }
+            for secret in [&b".ntm/.env"[..], b".beads-recovery/signing.pem"] {
+                let expected = if policy == SourceCapturePolicy::SecretCapability {
+                    policy
+                } else {
+                    SourceCapturePolicy::Denied
+                };
+                assert_eq!(
+                    classify_path(secret, PathShape::REGULAR, Some(policy)),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_state_partition_keeps_unapproved_observations_edge_private() {
+        let input = b"src/raw-\xff.rs".to_vec();
+        let local = b"nested/.ntm/log-\xfe".to_vec();
+        let approved = b"fixtures/.beads-recovery/input.txt".to_vec();
+        let secret = b".ntm/.env".to_vec();
+        let decision = partition_capture(&[
+            (input.clone(), PathShape::REGULAR, None),
+            (local.clone(), PathShape::REGULAR, None),
+            (
+                approved.clone(),
+                PathShape::REGULAR,
+                Some(SourceCapturePolicy::BuildInputAllowed),
+            ),
+            (
+                secret.clone(),
+                PathShape::REGULAR,
+                Some(SourceCapturePolicy::BuildInputAllowed),
+            ),
+        ]);
+        assert_eq!(decision.uploaded, vec![input, approved]);
+        assert_eq!(decision.edge_private_receipt, vec![local, secret]);
+    }
 
     #[test]
     fn seeded_secret_paths_never_reach_uploadable_surfaces() {

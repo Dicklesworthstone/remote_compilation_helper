@@ -8,7 +8,12 @@
 //! subtrees whose digests differ and returns exactly the chunk set the
 //! receiver lacks.
 
-use rabs_protocol::result_identity::TypedDigest;
+use crate::closure_validation::{ClosureError, GraphBounds, ManifestNode, validate_closure};
+use rabs_protocol::result_identity::{ObjectId, TypedDigest};
+
+/// Domain tag for synthetic file-node identities when projecting a [`TreeNode`]
+/// into a [`ManifestNode`] closure graph.
+const TREE_FILE_NODE_DOMAIN: &str = "rabs.tree.file.v1";
 
 /// A tree node: leaf (file with chunk digests) or directory (children
 /// with a summarizing digest).
@@ -42,6 +47,127 @@ impl TreeNode {
             Self::File { name, .. } | Self::Directory { name, .. } => name,
         }
     }
+
+    /// Validate this tree manifest's reference closure against `bounds`
+    /// via [`validate_closure`] (`bd-i7zop` / H031 / R95).
+    ///
+    /// Projects directories by `subtree_digest`, files by path-scoped content
+    /// digest, and chunks as leaf nodes. Rejects self-referential directory
+    /// digest cycles, conflicting duplicate directory digests, excessive
+    /// directory/chunk fan-out, excessive nesting depth, and node-count bombs.
+    ///
+    /// # Errors
+    /// Returns the first [`ClosureError`] found by [`validate_closure`].
+    pub fn validate_closure(&self, bounds: GraphBounds) -> Result<(), ClosureError> {
+        let mut nodes = Vec::new();
+        let mut active_ancestors = Vec::new();
+        let root_id = collect_manifest_nodes(
+            self,
+            b"",
+            &mut nodes,
+            &mut active_ancestors,
+            bounds.max_nodes,
+        );
+        validate_closure(&root_id, &nodes, bounds)
+    }
+}
+
+fn file_node_object_id(parent_scope: &[u8], name: &str, chunks: &[TypedDigest]) -> ObjectId {
+    let mut payload = Vec::with_capacity(parent_scope.len() + 1 + name.len() + chunks.len() * 32);
+    payload.extend_from_slice(&(parent_scope.len() as u64).to_be_bytes());
+    payload.extend_from_slice(parent_scope);
+    payload.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    payload.extend_from_slice(name.as_bytes());
+    for chunk in chunks {
+        payload.extend_from_slice(chunk.domain.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&chunk.bytes);
+    }
+    ObjectId(rabs_key::typed_digest::compute(
+        TREE_FILE_NODE_DOMAIN,
+        &payload,
+    ))
+}
+
+fn collect_manifest_nodes(
+    node: &TreeNode,
+    parent_scope: &[u8],
+    nodes: &mut Vec<ManifestNode>,
+    active_ancestors: &mut Vec<ObjectId>,
+    max_nodes: usize,
+) -> ObjectId {
+    match node {
+        TreeNode::File { name, chunks } => {
+            let id = file_node_object_id(parent_scope, name, chunks);
+            if nodes.len() > max_nodes {
+                return id;
+            }
+            let references: Vec<ObjectId> = chunks.iter().cloned().map(ObjectId).collect();
+            for chunk_id in &references {
+                if nodes.len() > max_nodes {
+                    break;
+                }
+                if !nodes.iter().any(|existing| &existing.id == chunk_id) {
+                    nodes.push(ManifestNode {
+                        id: chunk_id.clone(),
+                        references: Vec::new(),
+                    });
+                }
+            }
+            if nodes.len() <= max_nodes
+                && !nodes
+                    .iter()
+                    .any(|existing| existing.id == id && existing.references == references)
+            {
+                nodes.push(ManifestNode {
+                    id: id.clone(),
+                    references,
+                });
+            }
+            id
+        }
+        TreeNode::Directory {
+            name,
+            subtree_digest,
+            children,
+        } => {
+            let id = ObjectId(subtree_digest.clone());
+            // If an ancestor directory on the current path already claims this
+            // subtree_digest, return the id so the ancestor's references form a
+            // cycle that `validate_closure` reports as `ClosureError::Cycle`.
+            if active_ancestors.contains(&id) || nodes.len() > max_nodes {
+                return id;
+            }
+            let mut scope = Vec::with_capacity(parent_scope.len() + 1 + name.len() + 32);
+            scope.extend_from_slice(parent_scope);
+            scope.push(b'/');
+            scope.extend_from_slice(name.as_bytes());
+            scope.extend_from_slice(&subtree_digest.bytes);
+
+            active_ancestors.push(id.clone());
+            let mut references = Vec::with_capacity(children.len());
+            for child in children {
+                let child_id =
+                    collect_manifest_nodes(child, &scope, nodes, active_ancestors, max_nodes);
+                references.push(child_id);
+            }
+            active_ancestors.pop();
+
+            // Identical repeated subtrees deduplicate cleanly; conflicting
+            // directories under the same digest are both pushed so
+            // `validate_closure` rejects them with `ClosureError::DuplicateNode`.
+            let identical_exists = nodes
+                .iter()
+                .any(|existing| existing.id == id && existing.references == references);
+            if !identical_exists {
+                nodes.push(ManifestNode {
+                    id: id.clone(),
+                    references,
+                });
+            }
+            id
+        }
+    }
 }
 
 /// Statistics from one diff run (proves the short-circuit happened).
@@ -51,6 +177,24 @@ pub struct DiffStats {
     pub subtrees_skipped: u64,
     /// Nodes actually visited.
     pub nodes_visited: u64,
+}
+
+/// Validate `want` (and `have` when present) against `bounds` via
+/// [`TreeNode::validate_closure`], then compute the missing chunks (`bd-i7zop`).
+///
+/// # Errors
+/// Returns [`ClosureError`] if either tree violates `bounds` or contains a
+/// self-referential or conflicting directory digest.
+pub fn missing_chunks_validated(
+    want: &TreeNode,
+    have: Option<&TreeNode>,
+    bounds: GraphBounds,
+) -> Result<(Vec<TypedDigest>, DiffStats), ClosureError> {
+    want.validate_closure(bounds)?;
+    if let Some(have_tree) = have {
+        have_tree.validate_closure(bounds)?;
+    }
+    Ok(missing_chunks(want, have))
 }
 
 /// Compute the chunks `have` is missing relative to `want`
@@ -116,6 +260,7 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::closure_validation::DEFAULT_BOUNDS;
     use rabs_protocol::result_identity::DigestAlgorithm;
 
     fn d(tag: u8) -> TypedDigest {
@@ -219,5 +364,58 @@ mod tests {
         let want_dup = dir("root", 100, vec![file("x", &[7]), file("y", &[7])]);
         let (missing_dup, _) = missing_chunks(&want_dup, None);
         assert_eq!(missing_dup, vec![d(7)]);
+    }
+
+    #[test]
+    fn tree_validate_closure_enforces_bounds_cycles_and_conflicting_digests() {
+        let valid = want_tree(30);
+        let (missing, stats) =
+            missing_chunks_validated(&valid, Some(&want_tree(29)), DEFAULT_BOUNDS).unwrap();
+        assert_eq!(missing, vec![d(30)]);
+        assert_eq!(stats.subtrees_skipped, 1);
+
+        // Self-referential directory digest cycle: parent and child share digest 77.
+        let cyclic = dir("root", 77, vec![dir("child", 77, vec![])]);
+        assert_eq!(
+            cyclic.validate_closure(DEFAULT_BOUNDS),
+            Err(ClosureError::Cycle(ObjectId(subtree(77))))
+        );
+
+        // Conflicting sibling directories claiming the same subtree_digest (88).
+        let conflicting = dir(
+            "root",
+            99,
+            vec![
+                dir("a", 88, vec![file("x", &[1])]),
+                dir("b", 88, vec![file("y", &[2])]),
+            ],
+        );
+        assert_eq!(
+            conflicting.validate_closure(DEFAULT_BOUNDS),
+            Err(ClosureError::DuplicateNode(ObjectId(subtree(88))))
+        );
+
+        // Depth, fan-out, and node-count bounds.
+        assert_eq!(
+            valid.validate_closure(GraphBounds {
+                max_depth: 2,
+                ..DEFAULT_BOUNDS
+            }),
+            Err(ClosureError::DepthExceeded)
+        );
+        assert!(matches!(
+            valid.validate_closure(GraphBounds {
+                max_fanout: 1,
+                ..DEFAULT_BOUNDS
+            }),
+            Err(ClosureError::FanoutExceeded(_))
+        ));
+        assert_eq!(
+            valid.validate_closure(GraphBounds {
+                max_nodes: 3,
+                ..DEFAULT_BOUNDS
+            }),
+            Err(ClosureError::NodeCountExceeded)
+        );
     }
 }

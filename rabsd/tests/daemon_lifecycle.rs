@@ -8,7 +8,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn rabsd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rabsd"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
+    command.env_remove("RABS_PREPARED_CONCURRENCY");
+    command
 }
 
 fn run_capture(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32, Duration) {
@@ -69,6 +71,47 @@ fn unknown_config_keys_refuse_loudly() {
 }
 
 #[test]
+fn prepared_concurrency_configuration_and_environment_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let path = config.to_str().unwrap();
+    for (contents, expected) in [
+        ("[rabs]\n", 4),
+        ("[rabs]\nprepared_concurrency = 1\n", 1),
+        ("[rabs]\nprepared_concurrency = 8\n", 8),
+        ("[rabs]\nprepared_concurrency = 32\n", 32),
+    ] {
+        std::fs::write(&config, contents).unwrap();
+        let (stdout, stderr, code, _) = run_capture(&["--check-config"], &[("RABS_CONFIG", path)]);
+        assert_eq!(code, 0, "{stderr}");
+        let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["prepared_concurrency"], expected);
+    }
+    std::fs::write(&config, "[rabs]\nprepared_concurrency = 1\n").unwrap();
+    let (stdout, stderr, code, _) = run_capture(
+        &["--check-config"],
+        &[("RABS_CONFIG", path), ("RABS_PREPARED_CONCURRENCY", "8")],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["prepared_concurrency"], 8);
+    for raw in ["0", "33", "-1", "", "1.5", "many", "18446744073709551616"] {
+        let (stdout, stderr, code, _) = run_capture(
+            &["--check-config"],
+            &[("RABS_CONFIG", path), ("RABS_PREPARED_CONCURRENCY", raw)],
+        );
+        assert_eq!(code, 1, "{raw}: {stdout}");
+        assert!(stderr.contains("RABS_PREPARED_CONCURRENCY"), "{stderr}");
+    }
+    for raw in ["0", "33", "-1", "1.5", "\"8\"", "true"] {
+        std::fs::write(&config, format!("[rabs]\nprepared_concurrency = {raw}\n")).unwrap();
+        let (stdout, stderr, code, _) = run_capture(&["--check-config"], &[("RABS_CONFIG", path)]);
+        assert_eq!(code, 1, "{raw}: {stdout}");
+        assert!(stderr.contains("rabs.prepared_concurrency"), "{stderr}");
+    }
+}
+
+#[test]
 fn hundred_boot_shutdown_cycles_all_obligation_clean() {
     // THE S1 acceptance loop: 100 real boot/shutdown cycles, every
     // receipt clean, every marker removed. Unique socket per test —
@@ -79,6 +122,8 @@ fn hundred_boot_shutdown_cycles_all_obligation_clean() {
     // concurrent daemons fight over one store (and scribble on the
     // developer's own).
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let marker = dir.path().join("rabsd.boot");
     let socket = dir.path().join("rabsd.sock");
     let state = dir.path().join("state");
@@ -108,6 +153,12 @@ fn hundred_boot_shutdown_cycles_all_obligation_clean() {
 fn spawn_daemon(marker: &std::path::Path) -> Child {
     // Unique socket AND state dir beside the marker: concurrent daemons
     // on one host must never share the default socket path or the store.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        marker.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let socket = marker.with_extension("sock");
     rabsd()
         .env("RABS_BOOT_MARKER", marker)

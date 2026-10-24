@@ -14,6 +14,16 @@ use colored::Color;
 use serde::Serialize;
 use std::env;
 
+/// Encoding fails before stdout is touched; delivery can leave a partial document.
+/// Keep these distinct so callers never retry stdout after a failed delivery.
+#[derive(Debug, thiserror::Error)]
+pub enum OutputError {
+    #[error(transparent)]
+    Encoding(#[from] serde_json::Error),
+    #[error("structured output could not be delivered")]
+    Delivery(#[source] std::io::Error),
+}
+
 /// Output mode determining how content is formatted and displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputMode {
@@ -609,30 +619,33 @@ impl OutputContext {
     // --- JSON output ---
 
     /// Output machine format (JSON or TOON) in JSON mode.
-    pub fn json<T: Serialize>(&self, value: &T) -> serde_json::Result<()> {
+    pub fn json<T: Serialize>(&self, value: &T) -> Result<(), OutputError> {
         if !self.is_json() {
             return Ok(());
         }
         let output = self.encode_machine(value, true)?;
-        self.stdout.write_line(&output);
-        Ok(())
+        self.stdout
+            .write_line_checked(&output)
+            .map_err(OutputError::Delivery)
     }
 
     /// Output JSON regardless of current mode.
-    pub fn json_force<T: Serialize>(&self, value: &T) -> serde_json::Result<()> {
+    pub fn json_force<T: Serialize>(&self, value: &T) -> Result<(), OutputError> {
         let json = serde_json::to_string_pretty(value)?;
-        self.stdout.write_line(&json);
-        Ok(())
+        self.stdout
+            .write_line_checked(&json)
+            .map_err(OutputError::Delivery)
     }
 
     /// Output compact machine format (JSON or TOON) in JSON mode.
-    pub fn json_compact<T: Serialize>(&self, value: &T) -> serde_json::Result<()> {
+    pub fn json_compact<T: Serialize>(&self, value: &T) -> Result<(), OutputError> {
         if !self.is_json() {
             return Ok(());
         }
         let output = self.encode_machine(value, false)?;
-        self.stdout.write_line(&output);
-        Ok(())
+        self.stdout
+            .write_line_checked(&output)
+            .map_err(OutputError::Delivery)
     }
 
     fn encode_machine<T: Serialize>(&self, value: &T, pretty: bool) -> serde_json::Result<String> {
@@ -711,6 +724,131 @@ mod tests {
         let stderr = stderr_buf.as_writer(true);
         let ctx = OutputContext::with_writers(config, stdout, stderr);
         (ctx, stdout_buf, stderr_buf)
+    }
+
+    #[test]
+    fn structured_output_formats_and_encoding_errors_preserve_real_files() {
+        use std::collections::BTreeMap;
+        use std::io::Write as _;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let payload = serde_json::json!({"status": "observed", "count": 7});
+        // Non-string map keys are a real serde encoding error, before any write.
+        let invalid = BTreeMap::from([(vec![1_u8, 2], "unsupported key")]);
+        for (index, (format, compact, forced)) in [
+            (OutputFormat::Json, false, false),
+            (OutputFormat::Json, true, false),
+            (OutputFormat::Toon, false, false),
+            (OutputFormat::Toon, true, false),
+            (OutputFormat::Json, false, true),
+            (OutputFormat::Toon, false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = retained.join(format!("output-{index}"));
+            let mut file = std::fs::File::create_new(&path).unwrap();
+            file.write_all(b"retained prefix\n").unwrap();
+            file.flush().unwrap();
+            let ctx = OutputContext::with_writers(
+                OutputConfig {
+                    force_mode: Some(if forced {
+                        OutputMode::Plain
+                    } else {
+                        OutputMode::Json
+                    }),
+                    color: ColorChoice::Never,
+                    format,
+                    ..Default::default()
+                },
+                OutputWriter::new(file, false),
+                OutputWriter::stderr(),
+            );
+            let failure = if forced {
+                ctx.json_force(&invalid)
+            } else if compact {
+                ctx.json_compact(&invalid)
+            } else {
+                ctx.json(&invalid)
+            }
+            .unwrap_err();
+            assert!(matches!(failure, OutputError::Encoding(_)));
+            assert_eq!(std::fs::read(&path).unwrap(), b"retained prefix\n");
+
+            if forced {
+                ctx.json_force(&payload)
+            } else if compact {
+                ctx.json_compact(&payload)
+            } else {
+                ctx.json(&payload)
+            }
+            .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(bytes.starts_with(b"retained prefix\n") && bytes.ends_with(b"\n"));
+            let encoded = &bytes[b"retained prefix\n".len()..];
+            let actual = if format == OutputFormat::Toon && !forced {
+                serde_json::from_str::<Value>(
+                    &toon_rust::toon_to_json(std::str::from_utf8(encoded).unwrap()).unwrap(),
+                )
+                .unwrap()
+            } else {
+                serde_json::from_slice::<Value>(encoded).unwrap()
+            };
+            // TOON decodes every number as f64 (`7` comes back as `7.0`).
+            assert!(
+                json_values_loose_eq(&actual, &payload),
+                "{format:?} compact={compact} forced={forced}: {actual}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_output_classifies_real_closed_socket_writes_and_flushes() {
+        use std::os::unix::net::UnixStream;
+
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            for operation in ["pretty", "compact", "forced"] {
+                for buffered in [false, true] {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    let stdout = if buffered {
+                        OutputWriter::new(std::io::BufWriter::with_capacity(8192, socket), false)
+                    } else {
+                        OutputWriter::new(socket, false)
+                    };
+                    let ctx = OutputContext::with_writers(
+                        OutputConfig {
+                            force_mode: Some(if operation == "forced" {
+                                OutputMode::Plain
+                            } else {
+                                OutputMode::Json
+                            }),
+                            color: ColorChoice::Never,
+                            format,
+                            ..Default::default()
+                        },
+                        stdout,
+                        OutputWriter::stderr(),
+                    );
+                    let payload = serde_json::json!({"status": "observed"});
+                    let error = match operation {
+                        "pretty" => ctx.json(&payload),
+                        "compact" => ctx.json_compact(&payload),
+                        "forced" => ctx.json_force(&payload),
+                        _ => unreachable!(),
+                    }
+                    .unwrap_err();
+                    let OutputError::Delivery(cause) = error else {
+                        panic!("closed socket must be a delivery failure");
+                    };
+                    assert_eq!(cause.kind(), std::io::ErrorKind::BrokenPipe);
+                }
+            }
+        }
     }
 
     fn json_values_loose_eq(left: &Value, right: &Value) -> bool {

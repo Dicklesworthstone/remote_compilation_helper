@@ -6,7 +6,7 @@
 
 use rch_common::{
     Classification, ClassificationTier, PlacementPlan, RequiredRuntime, SelectedWorker,
-    SelectionDiagnostics, SelectionReason, WorkerCapabilities, WorkerConfig,
+    SelectionDiagnostics, SelectionReason, WorkerCapabilities, WorkerConfig, WorkerId,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -169,6 +169,8 @@ pub struct DaemonStatusResponse {
     pub socket_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_seconds: Option<u64>,
+    /// Complete fenced admission snapshot; null when it could not be queried.
+    pub admission: Option<serde_json::Value>,
 }
 
 /// System overview response.
@@ -230,6 +232,8 @@ pub struct ConfigShowResponse {
     pub circuit: ConfigCircuitSection,
     pub output: ConfigOutputSection,
     pub self_healing: ConfigSelfHealingSection,
+    /// Layer 0 profile pack knobs (bd-bqu38, bd-hoxgn).
+    pub layer0: rch_common::types::Layer0Config,
     pub sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_sources: Option<Vec<ConfigValueSourceInfo>>,
@@ -276,6 +280,7 @@ pub struct ConfigCompilationSection {
     pub confidence_threshold: f64,
     pub min_local_time_ms: u64,
     pub remote_speedup_threshold: f64,
+    pub local_slots: u32,
     pub build_slots: u32,
     pub test_slots: u32,
     pub check_slots: u32,
@@ -291,6 +296,8 @@ pub struct ConfigCompilationSection {
 /// Transfer configuration section.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigTransferSection {
+    pub retrieval_staging_dir: Option<std::path::PathBuf>,
+    pub retrieval_min_free_bytes: u64,
     pub compression_level: u32,
     pub exclude_patterns: Vec<String>,
     pub remote_base: String,
@@ -327,6 +334,7 @@ pub fn is_default_verify_size(val: &u64) -> bool {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigEnvironmentSection {
     pub allowlist: Vec<String>,
+    pub forward_cargo_profile_settings: bool,
 }
 
 /// Circuit breaker configuration section.
@@ -464,6 +472,10 @@ pub struct DiagnoseResponse {
     /// control diagnostics. This is the surface agents should read before
     /// forcing local/remote behavior (bd-...remediation-ocv9i.13.5).
     pub placement: PlacementPlan,
+    /// bd-2spi4: the speed gate's view of this build (intercepted builds only):
+    /// measured local/remote medians, the threshold and the decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_gate: Option<crate::hook::SpeedGateDiagnosis>,
     /// Dry-run summary showing the full pipeline (only present when --dry-run is used).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<DryRunSummary>,
@@ -505,6 +517,36 @@ pub struct DiagnoseWorkerSelection {
     pub reason: SelectionReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<SelectionDiagnostics>,
+    /// Every worker the daemon considered: the selected one, and why each
+    /// other one was not chosen (GH #125). Absent when the daemon reported
+    /// no per-worker diagnostics (an rchd older than this rch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<Vec<DiagnoseWorkerInventoryEntry>>,
+}
+
+/// One worker's place in a simulated selection.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct DiagnoseWorkerInventoryEntry {
+    pub worker_id: WorkerId,
+    pub outcome: DiagnoseWorkerOutcome,
+    /// The selector's reason, e.g. `available slots 2 < 4`.
+    pub reason: String,
+    /// The selector's stable reason codes, e.g. `slots.insufficient`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnoseWorkerOutcome {
+    /// The worker this build would get.
+    Selected,
+    /// Passed every gate; another eligible worker ranked higher.
+    Eligible,
+    /// Usable only if no eligible worker exists (fail-open fallback).
+    FallbackCandidate,
+    /// Denied by a gate; `reason` says which.
+    Excluded,
 }
 
 /// Pipeline step for dry-run output.
@@ -667,4 +709,6 @@ pub struct DoctorResponse {
     pub checks: Vec<DoctorCheck>,
     pub summary: DoctorSummary,
     pub fixes_applied: Vec<DoctorFixApplied>,
+    /// Complete admission state, including owner identity and recovery deadline.
+    pub admission: Option<serde_json::Value>,
 }

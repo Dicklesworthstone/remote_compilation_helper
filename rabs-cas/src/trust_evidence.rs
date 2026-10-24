@@ -36,13 +36,13 @@
 //! a more permissive one. The serving gate independently checks durable
 //! quarantine, including when the disposition update has not landed.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod aggregate;
 
 use rabs_protocol::result_identity::TypedDigest;
 use rabs_protocol::serving::TrustEvidenceTier;
 
 use crate::metadata_store::{
-    QuarantineScope, RabsMetadataStore, SqlValue, StoreError, TrustEvaluationRow, digest_key,
+    QuarantineScope, RabsMetadataStore, StoreError, TrustEvaluationRow, digest_key,
 };
 use crate::serving_state::{action_quarantine_present, divergence_quarantine_disposition};
 
@@ -115,6 +115,7 @@ pub(crate) fn require_active_authority(
     store: &mut dyn RabsMetadataStore,
     authority: &TypedDigest,
 ) -> Result<(), StoreError> {
+    store.intern_domain(authority.domain);
     match store.active_authority()? {
         Some(current) if &current.digest == authority => Ok(()),
         _ => Err(StoreError::NotActiveAuthority),
@@ -187,54 +188,13 @@ pub(crate) struct VerificationEvidence {
 /// Aggregate verification evidence without inventing executions or
 /// worker identities. Unknown and foreign-action attempts never count
 /// as positive evidence; their negative observations are still retained.
+/// Two scalar result rows replace unbounded sample/attempt collections. SQL
+/// still scans this action's evidence; callers retain the same CAS lock.
 pub(crate) fn verification_evidence(
     store: &mut dyn RabsMetadataStore,
     action: &TypedDigest,
 ) -> Result<VerificationEvidence, StoreError> {
-    let samples = store.list_verification_samples(action)?;
-    let adverse_samples = samples.iter().filter(|sample| !sample.passed).count() as u64;
-    let rows = store.query(
-        "SELECT DISTINCT a.id_hex, a.worker FROM verification_samples s \
-         JOIN action_attempts a ON a.id_hex = s.attempt_hex \
-         JOIN action_generations g ON g.id_hex = a.generation_hex \
-         WHERE s.action_key = ?1 AND g.action_key = ?1 \
-         ORDER BY a.id_hex",
-        &[SqlValue::Text(digest_key(action))],
-    )?;
-    let mut attempts = BTreeMap::new();
-    for row in rows {
-        match row.as_slice() {
-            [SqlValue::Text(attempt), SqlValue::Text(worker)] => {
-                if !worker.is_empty() {
-                    attempts.insert(attempt.clone(), (worker.clone(), true));
-                }
-            }
-            _ => {
-                return Err(StoreError::Backend(
-                    "invalid verification attempt attribution row".to_owned(),
-                ));
-            }
-        }
-    }
-    for sample in &samples {
-        if let Some((_, passed)) = attempts.get_mut(&sample.attempt_hex) {
-            *passed &= sample.passed;
-        }
-    }
-    let mut passed_workers = BTreeSet::new();
-    let mut passed_attempts = 0_u64;
-    for (worker, passed) in attempts.values() {
-        if *passed {
-            passed_attempts += 1;
-            passed_workers.insert(worker.as_str());
-        }
-    }
-    Ok(VerificationEvidence {
-        attempts: attempts.len() as u64,
-        passed_attempts,
-        passed_workers: passed_workers.len(),
-        adverse_samples,
-    })
+    aggregate::read(store, action)
 }
 
 /// Derive an observed evidence tier, never a semantic-correctness claim
@@ -265,6 +225,7 @@ pub fn reevaluate_action(
     policies: &[TrustPolicy],
     seq: u64,
 ) -> Result<TrustReevaluation, TrustEvidenceError> {
+    store.intern_domain(action.domain);
     if !store.has_publication(action)? {
         return Err(TrustEvidenceError::NotPublished);
     }
@@ -400,12 +361,143 @@ pub fn report_compromise(
     reevaluate_action(store, authority, action, policies, seq)
 }
 
+/// Quarantine subject prefix used to record durable revocation of a worker's
+/// authoritative publication eligibility after divergence/compromise (bead S018; risk R79).
+pub const WORKER_PUBLICATION_ELIGIBILITY_PREFIX: &str = "worker-publication:";
+
+/// Check whether `worker_peer_id` remains eligible for authoritative publication (bead S018; R79).
+///
+/// Any divergence detected during cross-worker or stock verification revokes
+/// this eligibility in the durable quarantine ledger.
+pub fn is_worker_publication_eligible(
+    store: &mut dyn RabsMetadataStore,
+    worker_peer_id: &str,
+) -> Result<bool, StoreError> {
+    let subject = format!("{WORKER_PUBLICATION_ELIGIBILITY_PREFIX}{worker_peer_id}");
+    Ok(store
+        .query(
+            "SELECT 1 FROM quarantines WHERE scope = 'location' AND subject = ?1 LIMIT 1",
+            &[crate::metadata_store::SqlValue::Text(subject)],
+        )?
+        .is_empty())
+}
+
+/// Immediately revoke `worker_peer_id`'s authoritative publication eligibility and
+/// quarantine/demote `compromised_actions` via [`report_compromise`] without rewriting
+/// immutable `action_publications` rows (beads S018/T032; risks R79/R99).
+#[allow(clippy::too_many_arguments)]
+pub fn revoke_worker_publication_eligibility(
+    store: &mut dyn RabsMetadataStore,
+    authority: &TypedDigest,
+    worker_peer_id: &str,
+    compromise_report: &TypedDigest,
+    compromised_actions: &[(TypedDigest, u128, u128)],
+    policies: &[TrustPolicy],
+    base_seq: u64,
+) -> Result<Vec<TrustReevaluation>, TrustEvidenceError> {
+    if compromise_report.domain != COMPROMISE_REPORT_DOMAIN {
+        return Err(TrustEvidenceError::NotACompromiseReport {
+            presented: compromise_report.domain.to_owned(),
+        });
+    }
+    require_active_authority(store, authority)?;
+    let subject = format!("{WORKER_PUBLICATION_ELIGIBILITY_PREFIX}{worker_peer_id}");
+    if is_worker_publication_eligible(store, worker_peer_id)? {
+        store.add_quarantine(
+            QuarantineScope::Location,
+            &subject,
+            "s018-worker-divergence-publication-eligibility-revoked",
+        )?;
+    }
+    let mut results = Vec::with_capacity(compromised_actions.len());
+    for (idx, (action, generation, attempt)) in compromised_actions.iter().enumerate() {
+        let seq = base_seq.saturating_add(idx as u64);
+        let eval = report_compromise(
+            store,
+            authority,
+            action,
+            compromise_report,
+            *generation,
+            *attempt,
+            policies,
+            seq,
+        )?;
+        results.push(eval);
+    }
+    Ok(results)
+}
+
+/// Outcome of evaluating a committed action against a subscriber's minimum tier
+/// and the latest non-revoked policy (bead S021; invariant I42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscriberStoreEligibility {
+    /// Committed result satisfies both the latest non-revoked policy and the subscriber's minimum tier.
+    Eligible {
+        /// Observed tier at evaluation time.
+        observed_tier: TrustEvidenceTier,
+        /// Versioned trust-evaluation ledger version.
+        ledger_version: u32,
+    },
+    /// Committed result exists, is not quarantined, and may even satisfy the global policy,
+    /// but is below this subscriber's minimum required tier (coordinator can launch/join a
+    /// verification attempt, append evidence, and re-evaluate).
+    IneligibleNeedsVerificationAttempt {
+        /// Current observed tier.
+        observed_tier: TrustEvidenceTier,
+        /// Effective required tier (`max(policy.required_tier, subscriber_minimum_tier)`).
+        required_tier: TrustEvidenceTier,
+        /// Versioned trust-evaluation ledger version.
+        ledger_version: u32,
+    },
+    /// Action is quarantined or blocked by adverse/compromise evidence.
+    Quarantined {
+        /// Versioned trust-evaluation ledger version.
+        ledger_version: u32,
+    },
+}
+
+/// Re-evaluate an action under the latest non-revoked policy and filter eligibility
+/// against `subscriber_minimum_tier` (beads S021/T032; invariant I42).
+pub fn evaluate_subscriber_for_action(
+    store: &mut dyn RabsMetadataStore,
+    authority: &TypedDigest,
+    action: &TypedDigest,
+    policies: &[TrustPolicy],
+    subscriber_minimum_tier: TrustEvidenceTier,
+    seq: u64,
+) -> Result<SubscriberStoreEligibility, TrustEvidenceError> {
+    let eval = reevaluate_action(store, authority, action, policies, seq)?;
+    if eval.disposition == DISPOSITION_QUARANTINED
+        || eval.disposition == DISPOSITION_PRESENTATION_QUARANTINED
+    {
+        return Ok(SubscriberStoreEligibility::Quarantined {
+            ledger_version: eval.ledger_version,
+        });
+    }
+    let policy = latest_nonrevoked_policy(policies).ok_or(TrustEvidenceError::NoActivePolicy)?;
+    let effective_required = policy.required_tier.max(subscriber_minimum_tier);
+    if eval.disposition == DISPOSITION_SERVABLE && eval.observed_tier >= effective_required {
+        Ok(SubscriberStoreEligibility::Eligible {
+            observed_tier: eval.observed_tier,
+            ledger_version: eval.ledger_version,
+        })
+    } else {
+        Ok(
+            SubscriberStoreEligibility::IneligibleNeedsVerificationAttempt {
+                observed_tier: eval.observed_tier,
+                required_tier: effective_required,
+                ledger_version: eval.ledger_version,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metadata_store::{
         ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
-        RusqliteEngine, SqlMetadataStore,
+        RusqliteEngine, SqlMetadataStore, SqlValue,
     };
     use crate::serving_state::{ServeDecision, serving_gate};
     use rabs_protocol::result_identity::DigestAlgorithm;
@@ -1209,6 +1301,127 @@ mod tests {
         assert_eq!(
             reference.differential_snapshot().unwrap(),
             candidate.differential_snapshot().unwrap()
+        );
+    }
+
+    fn run_t032_s018_s021_flow(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+        let (active, action) = published_fixture(store);
+        let frozen_publications = publication_lines(store);
+        let policies = [policy(1, false, TrustEvidenceTier::ShadowMatched)];
+
+        // Initially worker-a is eligible for publication.
+        assert!(is_worker_publication_eligible(store, "worker-a").unwrap());
+        assert!(is_worker_publication_eligible(store, "worker-b").unwrap());
+
+        // 1. One verification sample on worker-a (attempt 20) passes -> ShadowMatched.
+        store
+            .record_verification_sample(&action, 20, true, 100)
+            .unwrap();
+
+        // Subscriber 1 requires ShadowMatched -> Eligible!
+        assert_eq!(
+            evaluate_subscriber_for_action(
+                store,
+                &active,
+                &action,
+                &policies,
+                TrustEvidenceTier::ShadowMatched,
+                101,
+            )
+            .unwrap(),
+            SubscriberStoreEligibility::Eligible {
+                observed_tier: TrustEvidenceTier::ShadowMatched,
+                ledger_version: 1,
+            }
+        );
+
+        // Subscriber 2 requires ReproducibleCrossWorker -> IneligibleNeedsVerificationAttempt!
+        assert_eq!(
+            evaluate_subscriber_for_action(
+                store,
+                &active,
+                &action,
+                &policies,
+                TrustEvidenceTier::ReproducibleCrossWorker,
+                102,
+            )
+            .unwrap(),
+            SubscriberStoreEligibility::IneligibleNeedsVerificationAttempt {
+                observed_tier: TrustEvidenceTier::ShadowMatched,
+                required_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+                ledger_version: 2,
+            }
+        );
+
+        // 2. Coordinator runs cross-worker verification on worker-b (attempt 21), appends
+        // passing sample, and re-evaluates Subscriber 2 -> now Eligible!
+        store
+            .record_verification_sample(&action, 21, true, 103)
+            .unwrap();
+        assert_eq!(
+            evaluate_subscriber_for_action(
+                store,
+                &active,
+                &action,
+                &policies,
+                TrustEvidenceTier::ReproducibleCrossWorker,
+                104,
+            )
+            .unwrap(),
+            SubscriberStoreEligibility::Eligible {
+                observed_tier: TrustEvidenceTier::ReproducibleCrossWorker,
+                ledger_version: 3,
+            }
+        );
+
+        // 3. Post-publication worker-compromise detected on worker-a (S018/T032):
+        // revoke_worker_publication_eligibility revokes worker-a's publication eligibility
+        // and demotes/quarantines its prior results without rewriting action_publications (R99).
+        let compromise_report = digest(COMPROMISE_REPORT_DOMAIN, 0xCC);
+        let reevals = revoke_worker_publication_eligibility(
+            store,
+            &active,
+            "worker-a",
+            &compromise_report,
+            &[(action.clone(), 10, 20)],
+            &policies,
+            110,
+        )
+        .unwrap();
+        assert_eq!(reevals.len(), 1);
+        assert!(reevals[0].compromised);
+        assert_eq!(reevals[0].disposition, DISPOSITION_QUARANTINED);
+        assert!(!is_worker_publication_eligible(store, "worker-a").unwrap());
+        assert!(is_worker_publication_eligible(store, "worker-b").unwrap());
+
+        // Re-evaluating either subscriber now yields Quarantined.
+        assert_eq!(
+            evaluate_subscriber_for_action(
+                store,
+                &active,
+                &action,
+                &policies,
+                TrustEvidenceTier::ShadowMatched,
+                120,
+            )
+            .unwrap(),
+            SubscriberStoreEligibility::Quarantined { ledger_version: 5 }
+        );
+
+        // Immutable publication rows remain byte-for-byte untouched (I42; R99).
+        assert_eq!(publication_lines(store), frozen_publications);
+        store.differential_snapshot().unwrap()
+    }
+
+    #[test]
+    fn t032_s018_s021_compromised_worker_revocation_and_subscriber_reevaluation_flow() {
+        let reference_engine = RusqliteEngine::open(&fresh_path("s018-s021-ref")).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let candidate_engine = FsqliteEngine::open(&fresh_path("s018-s021-fsq")).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+        assert_eq!(
+            run_t032_s018_s021_flow(&mut reference),
+            run_t032_s018_s021_flow(&mut candidate)
         );
     }
 }

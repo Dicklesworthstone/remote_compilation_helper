@@ -895,19 +895,24 @@ mod tests {
 
         info!("INPUT: Recording daemon metrics");
 
+        // DAEMON_REQUESTS_TOTAL is process-global and the API handlers increment real
+        // endpoint labels ("select-worker", "status", ...) while other tests in this
+        // binary run in parallel, so this test counts labels no handler uses.
         set_daemon_info("0.1.0-test");
         inc_connections();
         inc_connections();
-        inc_requests("select-worker");
-        inc_requests("status");
+        inc_requests("metric-helpers-test-select");
+        inc_requests("metric-helpers-test-status");
         dec_connections();
 
         let info_val = DAEMON_INFO.with_label_values(&["0.1.0-test"]).get();
         let connections = DAEMON_CONNECTIONS_ACTIVE.get();
         let select_requests = DAEMON_REQUESTS_TOTAL
-            .with_label_values(&["select-worker"])
+            .with_label_values(&["metric-helpers-test-select"])
             .get();
-        let status_requests = DAEMON_REQUESTS_TOTAL.with_label_values(&["status"]).get();
+        let status_requests = DAEMON_REQUESTS_TOTAL
+            .with_label_values(&["metric-helpers-test-status"])
+            .get();
 
         assert_eq!(info_val, 1.0);
         assert_eq!(connections, 1.0); // 2 inc - 1 dec

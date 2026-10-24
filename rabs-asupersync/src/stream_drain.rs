@@ -43,8 +43,10 @@
 //! vector per lane).
 
 pub mod preview;
+mod retained;
 
 use preview::{LiveOutputPreview, PreviewStream};
+use retained::{RetainedSpill, SpillReader};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -229,6 +231,8 @@ pub struct LaneDrain {
     spill: Option<SpillReceipt>,
     /// Total bytes seen on the stream (resident + spilled).
     total_bytes: u64,
+    /// The drain's original descriptor, never reopened through the spill name.
+    custody: Option<RetainedSpill>,
 }
 
 impl LaneDrain {
@@ -239,6 +243,7 @@ impl LaneDrain {
             resident: Vec::new(),
             spill: None,
             total_bytes: 0,
+            custody: None,
         }
     }
 
@@ -264,6 +269,36 @@ impl LaneDrain {
     #[must_use]
     pub fn spilled_bytes(&self) -> u64 {
         self.spill.as_ref().map_or(0, |s| s.bytes)
+    }
+
+    /// Read the complete resident prefix and retained spill with an independent
+    /// cursor. Spill paths are diagnostic only: replacement, links and FIFOs
+    /// cannot substitute a different source. Metadata changes may conservatively
+    /// refuse even a harmless rename; successful EOF certifies the recorded size.
+    /// Call from a blocking owner, and discard incomplete data on any error.
+    ///
+    /// # Errors
+    /// Inconsistent receipts, poisoned custody, or a changed retained file.
+    pub fn reader(&self) -> io::Result<impl Read + '_> {
+        if (self.resident.len() as u64).checked_add(self.spilled_bytes())
+            != Some(self.total_bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "drain receipt length mismatch",
+            ));
+        }
+        let spill = match (&self.spill, &self.custody) {
+            (None, None) => SpillReader::empty(),
+            (Some(receipt), Some(custody)) => custody.reader(receipt.bytes)?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "drain spill custody is incomplete",
+                ));
+            }
+        };
+        Ok(std::io::Cursor::new(self.resident()).chain(spill))
     }
 }
 
@@ -341,7 +376,7 @@ fn drain_lane_inner<R: Read>(
                     std::fs::create_dir_all(&limits.spill_dir)?;
                     let path = limits.spill_dir.join(spill_name);
                     let mut options = std::fs::OpenOptions::new();
-                    options.write(true).create_new(true);
+                    options.read(true).write(true).create_new(true);
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::OpenOptionsExt;
@@ -371,14 +406,19 @@ fn drain_lane_inner<R: Read>(
         }
     }
 
-    let spill = match spill_writer {
-        None => None,
+    let (spill, custody) = match spill_writer {
+        None => (None, None),
         Some((path, mut writer)) => {
             writer.flush()?;
-            Some(SpillReceipt {
-                path,
-                bytes: spilled_bytes,
-            })
+            let file = writer.into_inner().map_err(|error| error.into_error())?;
+            let custody = RetainedSpill::new(file, spilled_bytes)?;
+            (
+                Some(SpillReceipt {
+                    path,
+                    bytes: spilled_bytes,
+                }),
+                Some(custody),
+            )
         }
     };
     debug_assert_eq!(total, resident.len() as u64 + spilled_bytes);
@@ -386,6 +426,7 @@ fn drain_lane_inner<R: Read>(
         resident,
         spill,
         total_bytes: total,
+        custody,
     })
 }
 

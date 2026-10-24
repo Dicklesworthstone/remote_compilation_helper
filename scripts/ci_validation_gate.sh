@@ -149,7 +149,9 @@ else
         "bd-session-history-remediation-ocv9i.16.5" "skipped (no beads export)"
 fi
 
-# --- 3..7 cargo + e2e stages (mock-worker; no live fleet) ---------------------
+# --- 3..8 cargo + e2e stages (mock-worker; no live fleet) ---------------------
+cargo_stage "workspace_check" "RCH-GATE-WORKSPACE-CHECK" "bd-44q54" -- \
+    check --workspace --all-targets
 cargo_stage "matrix" "RCH-GATE-MATRIX-GAP" "bd-session-history-remediation-ocv9i.16.1" -- \
     test -p rch-common --test reliability_coverage_matrix_e2e
 cargo_stage "schema_goldens" "RCH-GATE-SCHEMA-DRIFT" "bd-session-history-remediation-ocv9i.16.4" -- \

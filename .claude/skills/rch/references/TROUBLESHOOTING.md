@@ -189,7 +189,7 @@ rch gc --dry-run --workers <id>            # what the reaper would remove
 ssh ubuntu@<host> 'df -h / /data /tmp 2>/dev/null'
 ```
 
-Prefer `rch gc --workers <id>` over any manual `rm`; see `DISK_AND_PRESSURE.md`.
+Prefer `rch gc --apply --workers <id>` (1.0.58: no `--apply`) over any manual `rm`; see `DISK_AND_PRESSURE.md`.
 
 ### Sync fails with `Permission denied` or `Operation not permitted` inside `/data/projects/<repo>`
 
@@ -213,7 +213,7 @@ Then retry:
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --workspace --all-targets
 ```
 
-On main, `rch doctor --reliability --scope ownership` detects root-owned
+On 2.0.0, `rch doctor --reliability --scope ownership` detects root-owned
 entries in the mirror tree fleet-wide (detection only; reason codes
 `RCH-R70x`). The 1.0.58 release has no such probe under any scope — check per
 worker with the `stat` command above.
@@ -338,7 +338,7 @@ rch daemon restart -y                                    # only when `rch queue`
 rch --json status | jq -r '.data.daemon.daemon.version'  # confirm equal
 ```
 
-`rch daemon restart -y` is the upgrade path, but it does **not** drain: the interactive prompt says "N active build(s) will be interrupted", `-y` skips exactly that prompt, and the daemon itself may answer `shutdown_blocked` (with the active/queued build ids) while builds run. Check `rch --json queue | jq '.data.active_builds|length'` is 0 first, or `rch cancel` deliberately.
+`rch daemon restart -y` is the upgrade path, but it does **not** drain: the interactive prompt says "N active build(s) will be interrupted", `-y` skips exactly that prompt, and the daemon itself may answer `shutdown_blocked` (with the active/queued build ids) while builds run. Check `rch --json queue | jq '.data.active_builds|length'` is 0 first, or `rch cancel` deliberately. On 2.0.0 the CLI itself refuses while builds are in flight; `rch daemon restart --drain [--drain-timeout N]` closes admission and waits, `--force` interrupts.
 
 If a worker shows mismatched binary version after a host upgrade:
 

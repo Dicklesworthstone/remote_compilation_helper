@@ -3,6 +3,11 @@
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
 use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+use crate::headroom::{
+    FootprintBook, cold_build_footprint_gib, family_footprint_key, footprint_key,
+    legacy_footprint_key,
+};
+use crate::workers::{WorkerEndpointIdentity, WorkerEndpointSnapshot};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::{
     BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
@@ -64,9 +69,14 @@ struct TerminalOwnership {
     /// before its worker quarantine is durable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_disk_fault: Option<PendingDiskFault>,
+    /// Preserve a late fault whose endpoint is stale or unknown, without
+    /// granting it authority over a replacement worker. This evidence follows
+    /// normal terminal receipt retention; it is never replayed as quarantine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unapplied_disk_fault: Option<PendingDiskFault>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingDiskFault {
     pub build_id: u64,
@@ -74,13 +84,76 @@ pub(crate) struct PendingDiskFault {
     pub incident_id: String,
     pub roots: Vec<String>,
     pub reported_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_endpoint: Option<WorkerEndpointIdentity>,
+    /// Additional same-daemon ABA evidence; persistence equality deliberately
+    /// excludes this runtime-only authority, which never survives restart.
+    #[serde(skip)]
+    pub runtime_endpoint: Option<WorkerEndpointSnapshot>,
 }
 
+impl PartialEq for PendingDiskFault {
+    fn eq(&self, other: &Self) -> bool {
+        self.build_id == other.build_id
+            && self.worker_id == other.worker_id
+            && self.incident_id == other.incident_id
+            && self.roots == other.roots
+            && self.reported_unix_ms == other.reported_unix_ms
+            && self.worker_endpoint == other.worker_endpoint
+    }
+}
+
+impl Eq for PendingDiskFault {}
+
 /// Terminal result supplied by completion or cancellation; ownership stays separate.
+/// A failed remote build's slot is released at completion, but its client
+/// lease keeps the worker's source claim until lease recovery retires it
+/// (exit 102 retrieval incomplete, 130 interrupted: 15-21 min on css). The
+/// worker's source registry refuses the same project meanwhile, so selection
+/// must not keep choosing it (bd-jqhno).
+#[derive(Debug, Clone)]
+struct SourceFence {
+    project_id: String,
+    worker_id: String,
+    wrapper: String,
+    created: Instant,
+}
+
+/// Lease recovery acts after 15 min of heartbeat staleness and scans every
+/// 5 min; a fence never outlives that window by much, whatever the lease says.
+pub(crate) const SOURCE_FENCE_MAX_AGE: Duration = Duration::from_secs(25 * 60);
+const SOURCE_FENCE_LIMIT: usize = 1024;
+
+/// A dual-role worker refuses every sync into its live checkout of a project
+/// (bd-fbtws), so selection skips that pair for hours rather than paying a
+/// reservation and a refused sync per build. Expiry lets a host that stopped
+/// declaring the checkout come back; another refusal fences it again.
+pub(crate) const LIVE_CHECKOUT_FENCE_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Another owner held a project's source on a worker past the admission wait
+/// (bd-p3kuz). A stopped client can hold it for hours after rchd retired its
+/// build; without a fence every placement there waits 60 s and is refused.
+/// The fence is short because most holders finish: a worker still held when
+/// it lapses costs one more probe, whose refusal fences it again.
+pub(crate) const SOURCE_BUSY_FENCE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+fn canonical_local_wrapper(wrapper: &str) -> bool {
+    wrapper
+        .strip_prefix(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
+        .and_then(|suffix| {
+            uuid::Uuid::parse_str(suffix)
+                .ok()
+                .map(|id| id.to_string() == suffix)
+        })
+        .unwrap_or(false)
+}
+
 pub struct BuildCompletion {
     pub exit_code: i32,
     pub duration_ms: Option<u64>,
     pub bytes_transferred: Option<u64>,
+    /// Attributed peak allocated output, including the starting artifact pool.
+    pub disk_peak_output_bytes: Option<u64>,
     pub timing: Option<CommandTimingBreakdown>,
     pub cancellation: Option<BuildCancellationMetadata>,
 }
@@ -129,6 +202,10 @@ fn build_record_succeeded(record: &BuildRecord) -> bool {
     record.exit_code == 0
 }
 
+fn is_lane_zero(lane: &u32) -> bool {
+    *lane == 0
+}
+
 /// In-flight build state tracked for active build visibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveBuildState {
@@ -136,6 +213,10 @@ pub struct ActiveBuildState {
     pub project_id: String,
     pub worker_id: String,
     pub command: String,
+    /// SSH coordinates admitted for this exact build. A worker ID may be
+    /// retargeted while the build runs; missing legacy coordinates stay unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_endpoint: Option<WorkerEndpointSnapshot>,
     pub started_at: String,
     #[serde(skip, default = "Instant::now")]
     pub started_at_mono: Instant,
@@ -147,9 +228,26 @@ pub struct ActiveBuildState {
     pub local_wrapper_id: Option<String>,
     pub remote_pgid_file: Option<String>,
     pub slots: u32,
-    /// Declared additional build space retained until this owner completes.
+    /// Which of the worker's project lanes this build holds (bd-sgvod). Lane
+    /// 0 is the canonical mirror; lane k > 0 is `<root>.rch-lane-<k>`.
+    #[serde(default, skip_serializing_if = "is_lane_zero")]
+    pub project_lane: u32,
+    /// Guarded additional build space retained until this owner completes.
     #[serde(default)]
     pub disk_headroom_gib: u32,
+    /// Worker free-space floor admitted for this owner, retained across restart.
+    #[serde(default)]
+    pub disk_floor_gib: u64,
+    /// Free build-disk GiB on the worker at admission (bd-wv746 footprint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_start_gib: Option<u64>,
+    /// Lowest free build-disk GiB probed on the worker while this build ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_min_gib: Option<u64>,
+    /// Another build admitted by this daemon overlapped on the same worker,
+    /// so the observed growth cannot be attributed to this build alone.
+    #[serde(default)]
+    pub disk_shared: bool,
     pub location: BuildLocation,
     pub heartbeat_phase: BuildHeartbeatPhase,
     pub heartbeat_detail: Option<String>,
@@ -253,6 +351,22 @@ pub struct QueuedWaiterClaim {
     nonce: u64,
 }
 
+/// One worker reserved for a starving queued waiter (bd-decdd). While the hold
+/// is live, younger requests are not placed on that worker, so it drains until
+/// the waiter's slots fit instead of being refilled by single-slot jobs.
+/// Transient: a restart drops it, and the waiter claims again once eligible.
+#[derive(Debug, Clone)]
+struct QueueHold {
+    queue_id: u64,
+    worker_id: String,
+    /// The holder's `queued_at_mono`; with `queue_id`, the age order.
+    since: Instant,
+    refreshed: Instant,
+}
+
+/// A hold not refreshed for this long is ignored (its waiter polls every second).
+const QUEUE_HOLD_STALE: Duration = Duration::from_secs(30);
+
 /// Build history manager.
 ///
 /// Thread-safe ring buffer of recent builds with optional persistence.
@@ -266,9 +380,21 @@ pub struct BuildHistory {
     /// Transient: startup loads history before probing workers, and WorkerState
     /// never restores capacity observations from disk.
     disk_budget_completed_at: Mutex<HashMap<String, Instant>>,
+    /// Failed remote builds whose client lease may still own worker source
+    /// (bd-jqhno). Transient: selection consults them for the same project.
+    source_fences: Mutex<Vec<SourceFence>>,
+    /// (project, worker) pairs whose live checkout refused a source sync, and
+    /// when (bd-fbtws). Transient, like `source_fences`.
+    live_checkout_fences: Mutex<HashMap<(String, String), Instant>>,
+    /// (project, worker) pairs whose source another owner held past the
+    /// admission wait, and when (bd-p3kuz). Transient.
+    source_busy_fences: Mutex<HashMap<(String, String), Instant>>,
     /// Queued builds (waiting for workers). Membership changes take `active`
     /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
+    /// At most one worker reserved for the oldest starving waiter (bd-decdd).
+    /// Never held while taking `queued`.
+    queue_hold: Mutex<Option<QueueHold>>,
     /// Maximum capacity for history.
     capacity: usize,
     /// Maximum queue depth (0 = unlimited).
@@ -286,10 +412,13 @@ pub struct BuildHistory {
     cancelled_wrappers: RwLock<HashSet<String>>,
     /// When each active build's heartbeat was last made durable.
     heartbeat_persisted: Mutex<HashMap<u64, Instant>>,
+    /// Learned per-project build-disk growth (bd-wv746). Advisory only.
+    footprints: Mutex<FootprintBook>,
     /// A duplicate release may resume a fault, but never race the first
     /// completion's slot release or its quarantine acknowledgment.
     release_lock: tokio::sync::Mutex<()>,
     ownership_failed: std::sync::atomic::AtomicBool,
+    ownership_error: Mutex<Option<String>>,
     #[cfg(test)]
     fail_after_ownership_rename: std::sync::atomic::AtomicBool,
 }
@@ -312,7 +441,11 @@ impl BuildHistory {
             records: RwLock::new(VecDeque::with_capacity(capacity)),
             active: RwLock::new(HashMap::new()),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
+            source_fences: Mutex::new(Vec::new()),
+            live_checkout_fences: Mutex::new(HashMap::new()),
+            source_busy_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(VecDeque::new()),
+            queue_hold: Mutex::new(None),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
@@ -322,8 +455,10 @@ impl BuildHistory {
             terminal: RwLock::new(HashMap::new()),
             cancelled_wrappers: RwLock::new(HashSet::new()),
             heartbeat_persisted: Mutex::new(HashMap::new()),
+            footprints: Mutex::new(FootprintBook::default()),
             release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
+            ownership_error: Mutex::new(None),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
         }
@@ -347,6 +482,21 @@ impl BuildHistory {
     }
     pub fn ownership_failed(&self) -> bool {
         self.ownership_failed.load(Ordering::SeqCst)
+    }
+
+    /// The original persistence failure stays distinct from maintenance
+    /// ownership. Releasing or recovering a maintenance lease cannot clear it.
+    pub fn ownership_failure_reason(&self) -> Option<String> {
+        if !self.ownership_failed() {
+            return None;
+        }
+        Some(
+            self.ownership_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+                .unwrap_or_else(|| "durable ownership uncertain; restart required".into()),
+        )
     }
 
     /// Get the next build ID.
@@ -428,6 +578,7 @@ impl BuildHistory {
             project_id,
             worker_id,
             command,
+            worker_endpoint: None,
             started_at: started_at.clone(),
             hook_process_identity: process_identity(hook_pid),
             started_at_mono,
@@ -435,7 +586,12 @@ impl BuildHistory {
             local_wrapper_id,
             remote_pgid_file: None,
             slots,
+            project_lane: 0,
             disk_headroom_gib: 0,
+            disk_floor_gib: 0,
+            disk_free_start_gib: None,
+            disk_free_min_gib: None,
+            disk_shared: false,
             location,
             heartbeat_phase: BuildHeartbeatPhase::SyncUp,
             heartbeat_detail: Some("build_started".to_string()),
@@ -502,11 +658,12 @@ impl BuildHistory {
             location,
             None,
             DiskHeadroomAdmission::default(),
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn try_start_active_build_with_waiter(
+    pub(crate) fn try_start_active_build_with_waiter(
         &self,
         project_id: String,
         worker_id: String,
@@ -517,7 +674,49 @@ impl BuildHistory {
         location: BuildLocation,
         waiter: Option<&QueuedWaiterClaim>,
         disk: DiskHeadroomAdmission,
+        worker_endpoint: Option<WorkerEndpointSnapshot>,
     ) -> std::io::Result<Option<ActiveBuildState>> {
+        self.try_start_active_build_in_lanes(
+            project_id,
+            worker_id,
+            command,
+            hook_pid,
+            local_wrapper_id,
+            slots,
+            location,
+            waiter,
+            disk,
+            worker_endpoint,
+            1,
+        )
+    }
+
+    /// Admit a build into the lowest free of the worker's `project_lanes`
+    /// lanes for this project (bd-sgvod). One lane is the historical rule:
+    /// at most one active build of a project per worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_start_active_build_in_lanes(
+        &self,
+        project_id: String,
+        worker_id: String,
+        command: String,
+        hook_pid: u32,
+        local_wrapper_id: Option<String>,
+        slots: u32,
+        location: BuildLocation,
+        waiter: Option<&QueuedWaiterClaim>,
+        disk: DiskHeadroomAdmission,
+        worker_endpoint: Option<WorkerEndpointSnapshot>,
+        project_lanes: u32,
+    ) -> std::io::Result<Option<ActiveBuildState>> {
+        if worker_endpoint.as_ref().is_some_and(|endpoint| {
+            endpoint.config.id.as_str() != worker_id || location != BuildLocation::Remote
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "active build endpoint does not match its remote worker",
+            ));
+        }
         let id = self.next_id();
         if id >= QUEUE_ID_NAMESPACE {
             return Err(std::io::Error::other(
@@ -526,11 +725,19 @@ impl BuildHistory {
         }
         let started_at = Utc::now().to_rfc3339();
         let started_at_mono = Instant::now();
-        let state = ActiveBuildState {
+        let disk_free_start_gib = if location == BuildLocation::Remote {
+            disk.capacity
+                .as_ref()
+                .and_then(|sample| sample.current_free_gib(&worker_id))
+        } else {
+            None
+        };
+        let mut state = ActiveBuildState {
             id,
             project_id,
             worker_id,
             command,
+            worker_endpoint,
             started_at: started_at.clone(),
             hook_process_identity: process_identity(hook_pid),
             started_at_mono,
@@ -538,7 +745,12 @@ impl BuildHistory {
             local_wrapper_id,
             remote_pgid_file: None,
             slots,
+            project_lane: 0,
             disk_headroom_gib: disk.requested_gib,
+            disk_floor_gib: disk.floor_gib,
+            disk_free_start_gib,
+            disk_free_min_gib: None,
+            disk_shared: false,
             location,
             heartbeat_phase: BuildHeartbeatPhase::SyncUp,
             heartbeat_detail: Some("build_started".to_string()),
@@ -568,7 +780,15 @@ impl BuildHistory {
         // Recovery may meanwhile have promoted the worker from an older
         // healthy probe. Its transient lifecycle must not authorize a new
         // build while the newer fault is still awaiting durable quarantine.
-        if self.has_pending_disk_fault(&state.worker_id) {
+        let pending_disk_fault = state.worker_endpoint.as_ref().map_or_else(
+            || self.has_pending_disk_fault(&state.worker_id),
+            |endpoint| {
+                self.has_pending_disk_fault_for_endpoint(&WorkerEndpointIdentity::from_config(
+                    &endpoint.config,
+                ))
+            },
+        );
+        if pending_disk_fault {
             return Ok(None);
         }
         // This lock also serializes completion. Two selectors may have seen
@@ -622,10 +842,28 @@ impl BuildHistory {
             // reply or retry indistinguishable from duplicate execution.
             return Ok(None);
         }
-        if active.values().any(|existing| {
-            existing.project_id == state.project_id && existing.worker_id == state.worker_id
-        }) {
-            return Ok(None);
+        // Lanes are separate worker mirrors, locks and targets (bd-sgvod), so
+        // a project may hold one active build per lane on a worker.
+        let used_lanes: Vec<u32> = active
+            .values()
+            .filter(|existing| {
+                existing.project_id == state.project_id && existing.worker_id == state.worker_id
+            })
+            .map(|existing| existing.project_lane)
+            .collect();
+        match (0..project_lanes.max(1)).find(|lane| !used_lanes.contains(lane)) {
+            Some(lane) => state.project_lane = lane,
+            None => return Ok(None),
+        }
+        if state.location == BuildLocation::Remote {
+            // Overlapping builds on one worker share its free-space drop, so
+            // none of them can attribute that growth to itself (bd-wv746).
+            for other in active.values_mut().filter(|other| {
+                other.location == BuildLocation::Remote && other.worker_id == state.worker_id
+            }) {
+                other.disk_shared = true;
+                state.disk_shared = true;
+            }
         }
         active.insert(id, state.clone());
         if let Some(claim) = waiter {
@@ -646,6 +884,127 @@ impl BuildHistory {
         reserved_disk_headroom(&active, worker_id)
     }
 
+    /// Feed one worker build-disk probe into every remote build running there.
+    /// Only probes taken after a build's admission can describe its growth.
+    pub(crate) fn observe_build_disk(&self, worker_id: &str, free_gib: u64, observed_at: Instant) {
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        for state in active.values_mut().filter(|state| {
+            state.location == BuildLocation::Remote
+                && state.worker_id == worker_id
+                && state.disk_free_start_gib.is_some()
+                && observed_at > state.started_at_mono
+        }) {
+            state.disk_free_min_gib = Some(
+                state
+                    .disk_free_min_gib
+                    .map_or(free_gib, |min| min.min(free_gib)),
+            );
+        }
+    }
+
+    /// Exact complete output can establish a small requirement. Broader command
+    /// families and legacy df deltas may raise the cold prior, never lower it.
+    pub(crate) fn learned_footprint_gib(&self, project_id: &str, command: &str) -> Option<f64> {
+        let now = Utc::now().timestamp();
+        let cold = cold_build_footprint_gib(command).unwrap_or(16.0);
+        let exact_key = footprint_key(project_id, command);
+        let family_key = family_footprint_key(project_id, command);
+        let legacy_key = legacy_footprint_key(project_id, command);
+        let book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
+        let estimate = book
+            .admission_estimate_gib(&exact_key, now, cold)
+            .or_else(|| {
+                book.estimate_gib(&family_key, now)
+                    .map(|growth| growth.max(cold))
+            });
+        let legacy = book
+            .estimate_gib(&legacy_key, now)
+            .map(|growth| growth.max(cold));
+        match (estimate, legacy) {
+            (Some(current), Some(legacy)) => Some(current.max(legacy)),
+            (current, legacy) => current.or(legacy),
+        }
+    }
+
+    /// Diagnostic estimate only: this never releases an active reservation.
+    /// Learned growth minus a worker's observed drop is not admission credit.
+    #[cfg(test)]
+    pub(crate) fn pending_footprint_gib(&self, worker_id: &str) -> f64 {
+        let builds: Vec<(String, String, f64)> = self
+            .active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|state| state.location == BuildLocation::Remote && state.worker_id == worker_id)
+            .map(|state| {
+                let grown = match (state.disk_free_start_gib, state.disk_free_min_gib) {
+                    (Some(start), Some(min)) => start.saturating_sub(min) as f64,
+                    _ => 0.0,
+                };
+                (state.project_id.clone(), state.command.clone(), grown)
+            })
+            .collect();
+        builds
+            .into_iter()
+            .filter_map(|(project, command, grown)| {
+                self.learned_footprint_gib(&project, &command)
+                    .map(|footprint| (footprint - grown).max(0.0))
+            })
+            .sum()
+    }
+
+    /// Only attributed total output can prove a small successful build.
+    /// Filesystem deltas can be deflated by concurrent cleanup even when this
+    /// daemon owns the worker's only job, so they are incomplete lower bounds.
+    fn learn_footprint(
+        &self,
+        state: &ActiveBuildState,
+        exit_code: i32,
+        disk_peak_output_bytes: Option<u64>,
+    ) {
+        // A cancelled build stopped early; its growth says little.
+        if state.location != BuildLocation::Remote || exit_code == 130 {
+            return;
+        }
+        let measured_output = disk_peak_output_bytes
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| (bytes as f64 / rch_common::BuildDiskBudget::GIB as f64).max(1.0));
+        let growth = match measured_output {
+            Some(output) => output,
+            None if !state.disk_shared => {
+                let (Some(start), Some(min)) = (state.disk_free_start_gib, state.disk_free_min_gib)
+                else {
+                    return;
+                };
+                start.saturating_sub(min) as f64
+            }
+            None => return,
+        };
+        let complete = exit_code == 0 && measured_output.is_some();
+        let now = Utc::now().timestamp();
+        let exact_key = footprint_key(&state.project_id, &state.command);
+        let family_key = family_footprint_key(&state.project_id, &state.command);
+        let mut book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
+        if !book.record(&exact_key, growth, now, complete) {
+            return;
+        }
+        book.record(&family_key, growth, now, false);
+        book.prune(now);
+        debug!(
+            build_id = state.id,
+            project = %state.project_id,
+            worker = %state.worker_id,
+            growth_gib = growth,
+            complete,
+            "learned remote build disk footprint"
+        );
+        if let Some(path) = self.persistence_path.as_deref().map(footprint_path)
+            && let Err(error) = book.persist(&path)
+        {
+            warn!(path = %path.display(), %error, "could not persist build footprints");
+        }
+    }
+
     /// Advisory selection uses the same budget and completion boundary checked
     /// again by authoritative admission under the same ownership lock.
     pub(crate) fn check_disk_headroom(
@@ -663,13 +1022,22 @@ impl BuildHistory {
         worker_id: &str,
         disk: &DiskHeadroomAdmission,
     ) -> Result<(), DiskHeadroomRejection> {
-        if disk.requested_gib > 0 && self.ownership_failed() {
+        if (disk.requested_gib > 0 || disk.floor_gib > 0) && self.ownership_failed() {
             return Err(DiskHeadroomRejection::Unknown);
         }
         let completed = self
             .disk_budget_completed_at
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let floor_gib = active
+            .values()
+            .filter(|state| state.location == BuildLocation::Remote && state.worker_id == worker_id)
+            .map(|state| state.disk_floor_gib)
+            .fold(disk.floor_gib, u64::max);
+        let disk = DiskHeadroomAdmission {
+            floor_gib,
+            ..disk.clone()
+        };
         disk.check_after_completion(
             worker_id,
             reserved_disk_headroom(active, worker_id),
@@ -854,6 +1222,7 @@ impl BuildHistory {
                 exit_code,
                 duration_ms,
                 bytes_transferred,
+                disk_peak_output_bytes: None,
                 timing,
                 cancellation: None,
             },
@@ -878,6 +1247,7 @@ impl BuildHistory {
                 exit_code: 130,
                 duration_ms: None,
                 bytes_transferred,
+                disk_peak_output_bytes: None,
                 timing: None,
                 cancellation,
             },
@@ -918,6 +1288,21 @@ impl BuildHistory {
             .any(|state| state.project_id == project_id && state.worker_id == worker_id)
     }
 
+    /// Active builds of `project_id` per worker (bd-sgvod lane occupancy).
+    pub fn active_build_counts_for_project(&self, project_id: &str) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for state in self
+            .active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|state| state.project_id == project_id)
+        {
+            *counts.entry(state.worker_id.clone()).or_insert(0) += 1;
+        }
+        counts
+    }
+
     /// Return worker IDs currently running an active build for the given project.
     pub fn active_workers_for_project(&self, project_id: &str) -> HashSet<String> {
         self.active
@@ -926,6 +1311,103 @@ impl BuildHistory {
             .values()
             .filter(|state| state.project_id == project_id)
             .map(|state| state.worker_id.clone())
+            .collect()
+    }
+
+    /// Workers fenced for `project_id` by a failed build whose client lease
+    /// still owns worker source. `owns_source(wrapper)` reads that lease; a
+    /// fence ends when it answers no, or after [`SOURCE_FENCE_MAX_AGE`].
+    pub fn source_fenced_workers(
+        &self,
+        project_id: &str,
+        owns_source: impl Fn(&str) -> bool,
+    ) -> HashSet<String> {
+        let candidates: Vec<SourceFence> = {
+            let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
+            fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
+            fences
+                .iter()
+                .filter(|fence| fence.project_id == project_id)
+                .cloned()
+                .collect()
+        };
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+        // Lease reads happen outside the lock.
+        let (held, released): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|fence| owns_source(&fence.wrapper));
+        if !released.is_empty() {
+            self.source_fences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|fence| {
+                    !released.iter().any(|gone| {
+                        gone.wrapper == fence.wrapper && gone.worker_id == fence.worker_id
+                    })
+                });
+        }
+        held.into_iter().map(|fence| fence.worker_id).collect()
+    }
+
+    /// Keep `project_id` off `worker_id`: its live checkout refused a sync.
+    pub fn fence_live_checkout(&self, project_id: &str, worker_id: &str) {
+        let mut fences = self
+            .live_checkout_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < LIVE_CHECKOUT_FENCE_MAX_AGE);
+        if fences.len() >= SOURCE_FENCE_LIMIT {
+            return;
+        }
+        fences.insert(
+            (project_id.to_owned(), worker_id.to_owned()),
+            Instant::now(),
+        );
+    }
+
+    /// Workers whose live checkout of `project_id` refused a recent sync.
+    pub fn live_checkout_fenced_workers(&self, project_id: &str) -> HashSet<String> {
+        let mut fences = self
+            .live_checkout_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < LIVE_CHECKOUT_FENCE_MAX_AGE);
+        fences
+            .keys()
+            .filter(|(project, _)| project == project_id)
+            .map(|(_, worker)| worker.clone())
+            .collect()
+    }
+
+    /// Keep `project_id` off `worker_id` while another owner holds its source.
+    pub fn fence_source_busy(&self, project_id: &str, worker_id: &str) {
+        let mut fences = self
+            .source_busy_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < SOURCE_BUSY_FENCE_MAX_AGE);
+        if fences.len() >= SOURCE_FENCE_LIMIT {
+            return;
+        }
+        fences.insert(
+            (project_id.to_owned(), worker_id.to_owned()),
+            Instant::now(),
+        );
+    }
+
+    /// Workers where another owner recently held `project_id`'s source.
+    pub fn source_busy_fenced_workers(&self, project_id: &str) -> HashSet<String> {
+        let mut fences = self
+            .source_busy_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < SOURCE_BUSY_FENCE_MAX_AGE);
+        fences
+            .keys()
+            .filter(|(project, _)| project == project_id)
+            .map(|(_, worker)| worker.clone())
             .collect()
     }
 
@@ -1244,6 +1726,81 @@ impl BuildHistory {
             .any(|row| {
                 row.id == claim.queue_id && row.waiter_claim == Some(claim.nonce) && !row.recovered
             })
+    }
+
+    fn live_queue_hold(&self) -> std::sync::MutexGuard<'_, Option<QueueHold>> {
+        let mut hold = self.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+        if hold
+            .as_ref()
+            .is_some_and(|h| h.refreshed.elapsed() >= QUEUE_HOLD_STALE)
+        {
+            *hold = None;
+        }
+        hold
+    }
+
+    /// The worker a live hold reserves against this caller: a fresh request
+    /// (no waiter) or a waiter younger than the holder. `None` for the holder
+    /// itself, for older waiters, and when no hold is live.
+    pub fn queue_hold_against(&self, waiter: Option<&QueuedWaiterClaim>) -> Option<String> {
+        let caller = waiter.map(|claim| {
+            let since = self
+                .queued
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|row| row.id == claim.queue_id)
+                .map(|row| row.queued_at_mono);
+            (claim.queue_id, since)
+        });
+        let hold = self.live_queue_hold();
+        let hold = hold.as_ref()?;
+        match caller {
+            Some((queue_id, _)) if queue_id == hold.queue_id => None,
+            Some((queue_id, Some(since))) if (since, queue_id) < (hold.since, hold.queue_id) => {
+                None
+            }
+            _ => Some(hold.worker_id.clone()),
+        }
+    }
+
+    /// The worker `queue_id` holds, while its hold is live.
+    pub fn queue_hold_of(&self, queue_id: u64) -> Option<String> {
+        self.live_queue_hold()
+            .as_ref()
+            .filter(|hold| hold.queue_id == queue_id)
+            .map(|hold| hold.worker_id.clone())
+    }
+
+    /// Claim, move or refresh `queue_id`'s hold on `worker_id`. A live hold
+    /// owned by an older waiter is never displaced; a younger one is. Returns
+    /// whether the hold changed hands or workers (a refresh returns false).
+    pub fn claim_queue_hold(&self, queue_id: u64, since: Instant, worker_id: String) -> bool {
+        let mut hold = self.live_queue_hold();
+        if let Some(current) = hold.as_ref()
+            && current.queue_id != queue_id
+            && (current.since, current.queue_id) < (since, queue_id)
+        {
+            return false;
+        }
+        let changed = hold
+            .as_ref()
+            .is_none_or(|h| h.queue_id != queue_id || h.worker_id != worker_id);
+        *hold = Some(QueueHold {
+            queue_id,
+            worker_id,
+            since,
+            refreshed: Instant::now(),
+        });
+        changed
+    }
+
+    /// Drop `queue_id`'s hold, if it has one.
+    pub fn release_queue_hold(&self, queue_id: u64) {
+        let mut hold = self.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+        if hold.as_ref().is_some_and(|h| h.queue_id == queue_id) {
+            *hold = None;
+        }
     }
 
     /// Dequeue the next build (FIFO).
@@ -1630,6 +2187,10 @@ impl BuildHistory {
                     if state.id == 0
                         || state.id >= QUEUE_ID_NAMESPACE
                         || state.worker_id.is_empty()
+                        || state.worker_endpoint.as_ref().is_some_and(|endpoint| {
+                            endpoint.config.id.as_str() != state.worker_id
+                                || state.location != BuildLocation::Remote
+                        })
                         || active.contains_key(&state.id)
                         || state.local_wrapper_id.as_ref().is_some_and(|wrapper| {
                             wrapper.is_empty()
@@ -1662,7 +2223,19 @@ impl BuildHistory {
                 }
                 for receipt in snapshot.completed {
                     let id = receipt.record.id;
-                    if let Some(fault) = &receipt.pending_disk_fault {
+                    if receipt.pending_disk_fault.is_some()
+                        && receipt.unapplied_disk_fault.is_some()
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "disk fault cannot be pending and archived",
+                        ));
+                    }
+                    for fault in receipt
+                        .pending_disk_fault
+                        .iter()
+                        .chain(receipt.unapplied_disk_fault.iter())
+                    {
                         let normalized =
                             crate::bypass_recovery_service::validate_disk_fault_roots(&fault.roots)
                                 .map_err(|error| {
@@ -1674,6 +2247,10 @@ impl BuildHistory {
                         if fault.build_id != id
                             || receipt.record.worker_id.as_deref() != Some(fault.worker_id.as_str())
                             || fault.worker_id.is_empty()
+                            || fault.worker_endpoint.as_ref().is_some_and(|endpoint| {
+                                endpoint.id.as_str() != fault.worker_id
+                                    || receipt.record.location != BuildLocation::Remote
+                            })
                             || receipt.record.exit_code == 0
                             || fault.incident_id
                                 != format!("build:{id}:{}", receipt.record.completed_at)
@@ -1769,7 +2346,11 @@ impl BuildHistory {
             records: RwLock::new(records),
             active: RwLock::new(active),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
+            source_fences: Mutex::new(Vec::new()),
+            live_checkout_fences: Mutex::new(HashMap::new()),
+            source_busy_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(queued),
+            queue_hold: Mutex::new(None),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
@@ -1779,8 +2360,10 @@ impl BuildHistory {
             terminal: RwLock::new(terminal),
             cancelled_wrappers: RwLock::new(cancelled_wrappers),
             heartbeat_persisted: Mutex::new(HashMap::new()),
+            footprints: Mutex::new(FootprintBook::load(&footprint_path(path))),
             release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
+            ownership_error: Mutex::new(None),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
         };
@@ -1901,12 +2484,56 @@ impl BuildHistory {
             })
     }
 
+    pub(crate) fn has_pending_disk_fault_for_endpoint(
+        &self,
+        endpoint: &WorkerEndpointIdentity,
+    ) -> bool {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|receipt| {
+                receipt
+                    .pending_disk_fault
+                    .as_ref()
+                    .is_some_and(|fault| fault.worker_endpoint.as_ref() == Some(endpoint))
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unapplied_disk_fault(&self, build_id: u64) -> Option<PendingDiskFault> {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&build_id)
+            .and_then(|receipt| receipt.unapplied_disk_fault.clone())
+    }
+
     /// The caller holds the bypass store lock until this commit finishes, so
     /// recovery cannot erase its incident receipt before acknowledgment.
     pub(crate) fn acknowledge_disk_fault(
         &self,
         build_id: u64,
         incident_id: &str,
+    ) -> std::io::Result<()> {
+        self.resolve_disk_fault(build_id, incident_id, false)
+    }
+
+    /// A mismatched or legacy fault remains inspectable in its terminal
+    /// receipt, but cannot block admission or later quarantine any endpoint.
+    pub(crate) fn archive_disk_fault(
+        &self,
+        build_id: u64,
+        incident_id: &str,
+    ) -> std::io::Result<()> {
+        self.resolve_disk_fault(build_id, incident_id, true)
+    }
+
+    fn resolve_disk_fault(
+        &self,
+        build_id: u64,
+        incident_id: &str,
+        archive: bool,
     ) -> std::io::Result<()> {
         let active = self.active.write().unwrap_or_else(|e| e.into_inner());
         let mut receipt = self
@@ -1927,13 +2554,52 @@ impl BuildHistory {
                 "worker disk fault identity mismatch",
             ));
         }
-        receipt.pending_disk_fault = None;
+        let fault = receipt.pending_disk_fault.take();
+        if archive {
+            receipt.unapplied_disk_fault = fault;
+        }
         self.persist_ownership(&active, Some(&receipt))?;
         self.terminal
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(build_id, receipt);
         Ok(())
+    }
+
+    /// The wrapper a pre-2.1 client leaves out of its own release (GH #119).
+    ///
+    /// Clients v1.0.56 through v2.0.x send `local_wrapper_id` with
+    /// `select-worker`, so their builds record one, but not with
+    /// `release-worker`, which gained it in 2.1.0. Their release therefore
+    /// fails the exact owner check in [`Self::complete_durable`], and the
+    /// finished build keeps its slots until the stuck detector can confirm a
+    /// remote cancel, which the old watchdog's orphaned timer blocks for the
+    /// build timeout.
+    ///
+    /// Every 2.1+ client presents the wrapper it selected with. A release that
+    /// omits it while the build recorded one is that legacy shape, and it is
+    /// accepted only from the build's own client: the kernel-reported peer of
+    /// the release connection must be the hook process recorded at selection,
+    /// with the same PID and the same birth identity. A build without a
+    /// recorded birth identity, another worker, or any other process gets
+    /// `None` and stays under the exact check.
+    pub(crate) fn legacy_release_wrapper(
+        &self,
+        build_id: u64,
+        worker_id: &str,
+        peer_pid: u32,
+        peer_identity: &rch_common::process_identity::ProcessIdentity,
+    ) -> Option<String> {
+        let active = self.active.read().unwrap_or_else(|e| e.into_inner());
+        let state = active.get(&build_id)?;
+        let wrapper = state.local_wrapper_id.as_ref()?;
+        let recorded = state.hook_process_identity.as_deref()?;
+        let peer_identity = peer_identity.to_record()?;
+        (state.worker_id == worker_id
+            && state.hook_pid > 1
+            && state.hook_pid == peer_pid
+            && recorded == peer_identity)
+            .then(|| wrapper.clone())
     }
 
     /// One locked transition owns both the durable terminal receipt and release.
@@ -1961,6 +2627,7 @@ impl BuildHistory {
             exit_code,
             duration_ms,
             bytes_transferred,
+            disk_peak_output_bytes,
             timing,
             cancellation,
         } = completion;
@@ -1999,7 +2666,7 @@ impl BuildHistory {
             timing,
             cancellation,
         };
-        let pending_disk_fault = if exit_code != 0 {
+        let disk_fault = if exit_code != 0 {
             disk_roots
                 .map(|roots| {
                     crate::bypass_recovery_service::validate_disk_fault_roots(&roots).map(|roots| {
@@ -2010,6 +2677,14 @@ impl BuildHistory {
                             roots,
                             reported_unix_ms: u64::try_from(Utc::now().timestamp_millis())
                                 .unwrap_or(0),
+                            worker_endpoint: state.worker_endpoint.as_ref().map(|endpoint| {
+                                WorkerEndpointIdentity::from_config(&endpoint.config)
+                            }),
+                            runtime_endpoint: state
+                                .worker_endpoint
+                                .as_ref()
+                                .filter(|endpoint| endpoint.has_runtime_identity())
+                                .cloned(),
                         }
                     })
                 })
@@ -2020,10 +2695,25 @@ impl BuildHistory {
         } else {
             None
         };
+        // The first terminal commit must retain a retarget already known by
+        // the originating incarnation. Deferring this decision until bypass
+        // publication loses ABA evidence if the daemon crashes in between.
+        // Unknown restart epochs and same-generation retirement remain valid
+        // durable obligations for their saved coordinates.
+        let (pending_disk_fault, unapplied_disk_fault) = if state
+            .worker_endpoint
+            .as_ref()
+            .is_some_and(WorkerEndpointSnapshot::source_was_retargeted)
+        {
+            (None, disk_fault)
+        } else {
+            (disk_fault, None)
+        };
         let receipt = TerminalOwnership {
             record: record.clone(),
             local_wrapper_id: state.local_wrapper_id.clone(),
             pending_disk_fault,
+            unapplied_disk_fault,
         };
         prune_terminal_receipts(
             &mut self.terminal.write().unwrap_or_else(|e| e.into_inner()),
@@ -2034,7 +2724,7 @@ impl BuildHistory {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(build_id, receipt);
-        if state.location == BuildLocation::Remote && state.disk_headroom_gib > 0 {
+        if state.location == BuildLocation::Remote && active_disk_reservation_gib(state) > 0 {
             // Keep the old sample fenced before releasing `active`: completed
             // output still occupies disk even though its reservation is gone.
             self.disk_budget_completed_at
@@ -2042,7 +2732,31 @@ impl BuildHistory {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(state.worker_id.clone(), Instant::now());
         }
+        if exit_code != 0
+            && state.location == BuildLocation::Remote
+            && let Some(wrapper) = state
+                .local_wrapper_id
+                .as_deref()
+                .filter(|wrapper| canonical_local_wrapper(wrapper))
+        {
+            let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
+            fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
+            if fences.len() >= SOURCE_FENCE_LIMIT {
+                fences.remove(0);
+            }
+            fences.push(SourceFence {
+                project_id: state.project_id.clone(),
+                worker_id: state.worker_id.clone(),
+                wrapper: wrapper.to_owned(),
+                created: Instant::now(),
+            });
+        }
         let state = active.remove(&build_id).expect("locked ownership exists");
+        self.learn_footprint(
+            &state,
+            exit_code,
+            disk_peak_output_bytes.filter(|_| record.cancellation.is_none()),
+        );
         self.record(record.clone());
         Ok(Some((state, record)))
     }
@@ -2095,7 +2809,11 @@ impl BuildHistory {
             ));
         }
         let result = self.write_ownership(active, completed, queued);
-        if result.is_err() {
+        if let Err(error) = &result {
+            *self
+                .ownership_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(error.to_string());
             self.ownership_failed.store(true, Ordering::SeqCst);
         }
         result
@@ -2139,12 +2857,16 @@ impl BuildHistory {
             .unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         let temporary = path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&temporary)?;
-        serde_json::to_writer(&mut file, &snapshot)?;
+        // Unbuffered, serde_json issues one write(2) per JSON token (~50k for
+        // a 280 KB snapshot) while the caller holds the `active` write lock.
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &snapshot)?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         std::fs::rename(&temporary, &path)?;
         #[cfg(test)]
@@ -2206,13 +2928,30 @@ fn prune_terminal_receipts(terminal: &mut HashMap<u64, TerminalOwnership>, now: 
     }
 }
 
+/// Learned footprints live beside the history log (`history.footprints.json`).
+fn footprint_path(history_path: &Path) -> PathBuf {
+    history_path.with_extension("footprints.json")
+}
+
 fn reserved_disk_headroom(active: &HashMap<u64, ActiveBuildState>, worker_id: &str) -> u64 {
     active
         .values()
         .filter(|state| state.worker_id == worker_id && state.location == BuildLocation::Remote)
         .fold(0u64, |sum, state| {
-            sum.saturating_add(u64::from(state.disk_headroom_gib))
+            sum.saturating_add(active_disk_reservation_gib(state))
         })
+}
+
+fn active_disk_reservation_gib(state: &ActiveBuildState) -> u64 {
+    if state.disk_headroom_gib > 0 || !state.recovered {
+        return u64::from(state.disk_headroom_gib);
+    }
+    // A job restored from an older daemon still consumes capacity. Missing
+    // historical budgets must not make live output free to the new scheduler.
+    let cold = rch_common::BuildDiskBudget::cold_growth_gib(&state.command).unwrap_or(16);
+    u64::from(rch_common::BuildDiskBudget::growth_budget_gib(f64::from(
+        cold,
+    )))
 }
 
 impl Default for BuildHistory {
@@ -2224,9 +2963,250 @@ impl Default for BuildHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rch_common::test_guard;
+    use rch_common::{WorkerId, test_guard};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    /// GH #119: a pre-2.1 client's wrapper-less release resolves to the
+    /// recorded wrapper only for the build's own hook process.
+    #[test]
+    fn legacy_release_wrapper_requires_the_builds_own_hook_process() {
+        use rch_common::process_identity::{ProcessIdentity, ProcessStart};
+        let history = BuildHistory::new(10);
+        let pid = observable_test_process_id();
+        let wrapper = format!("rchw-{}", uuid::Uuid::new_v4());
+        let build = history.start_active_build_with_wrapper(
+            "legacy-project".into(),
+            "w".into(),
+            "cargo build".into(),
+            pid,
+            Some(wrapper.clone()),
+            2,
+            BuildLocation::Remote,
+        );
+        let identity =
+            ProcessIdentity::from_record(build.hook_process_identity.as_deref().unwrap()).unwrap();
+        let mut reborn = identity.clone();
+        reborn.start = match reborn.start {
+            ProcessStart::Linux { ticks } => ProcessStart::Linux { ticks: ticks + 1 },
+            ProcessStart::Darwin {
+                seconds,
+                microseconds,
+            } => ProcessStart::Darwin {
+                seconds: seconds + 1,
+                microseconds,
+            },
+        };
+
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid, &identity),
+            Some(wrapper.clone())
+        );
+        // Another worker, another PID, or the same PID with another birth
+        // (a recycled PID) is not the build's client.
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "other", pid, &identity),
+            None
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid + 1, &identity),
+            None
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid, &reborn),
+            None
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id + 1000, "w", pid, &identity),
+            None
+        );
+
+        // No recorded wrapper: nothing to resolve; the exact check already
+        // matches a wrapper-less release. No recorded birth: never resolved.
+        let unwrapped = history.start_active_build(
+            "plain".into(),
+            "w".into(),
+            "cargo build".into(),
+            pid,
+            1,
+            BuildLocation::Remote,
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(unwrapped.id, "w", pid, &identity),
+            None
+        );
+        let unidentified = history.start_active_build_with_wrapper(
+            "no-birth".into(),
+            "w".into(),
+            "cargo build".into(),
+            0,
+            Some(format!("rchw-{}", uuid::Uuid::new_v4())),
+            1,
+            BuildLocation::Remote,
+        );
+        assert!(unidentified.hook_process_identity.is_none());
+        assert_eq!(
+            history.legacy_release_wrapper(unidentified.id, "w", 0, &identity),
+            None
+        );
+
+        // The exact owner check itself is unchanged: a wrapper-less release
+        // is still refused, and the resolved wrapper completes the build.
+        let refused = history
+            .complete_durable(build.id, "w", None, disk_budget_completion(0))
+            .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            history
+                .complete_durable(build.id, "w", Some(&wrapper), disk_budget_completion(0))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            history.legacy_release_wrapper(build.id, "w", pid, &identity),
+            None
+        );
+    }
+
+    #[test]
+    fn live_checkout_fences_are_per_project_and_expire() {
+        let history = BuildHistory::new(10);
+        assert!(history.live_checkout_fenced_workers("music").is_empty());
+        history.fence_live_checkout("music", "hz2");
+        history.fence_live_checkout("music", "hz2");
+        history.fence_live_checkout("music", "ts1");
+        assert_eq!(
+            history.live_checkout_fenced_workers("music"),
+            HashSet::from(["hz2".to_owned(), "ts1".to_owned()])
+        );
+        assert!(history.live_checkout_fenced_workers("other").is_empty());
+        *history
+            .live_checkout_fences
+            .lock()
+            .unwrap()
+            .get_mut(&("music".to_owned(), "hz2".to_owned()))
+            .unwrap() = Instant::now() - LIVE_CHECKOUT_FENCE_MAX_AGE;
+        assert_eq!(
+            history.live_checkout_fenced_workers("music"),
+            HashSet::from(["ts1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn source_busy_fences_are_per_project_refresh_and_expire() {
+        let history = BuildHistory::new(10);
+        assert!(history.source_busy_fenced_workers("mtdt").is_empty());
+        history.fence_source_busy("mtdt", "vmi1293453");
+        history.fence_source_busy("mtdt", "vmi1264463");
+        assert_eq!(
+            history.source_busy_fenced_workers("mtdt"),
+            HashSet::from(["vmi1293453".to_owned(), "vmi1264463".to_owned()])
+        );
+        assert!(history.source_busy_fenced_workers("other").is_empty());
+        // Live-checkout fences are a separate verdict with a longer life.
+        assert!(history.live_checkout_fenced_workers("mtdt").is_empty());
+        let expired = Instant::now() - SOURCE_BUSY_FENCE_MAX_AGE;
+        for worker in ["vmi1293453", "vmi1264463"] {
+            *history
+                .source_busy_fences
+                .lock()
+                .unwrap()
+                .get_mut(&("mtdt".to_owned(), worker.to_owned()))
+                .unwrap() = expired;
+        }
+        // A worker still held when its fence lapses is fenced again by the
+        // next refusal.
+        history.fence_source_busy("mtdt", "vmi1293453");
+        assert_eq!(
+            history.source_busy_fenced_workers("mtdt"),
+            HashSet::from(["vmi1293453".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_failed_remote_build_fences_its_worker_until_its_lease_releases_source() {
+        let history = BuildHistory::new(10);
+        let held = "rchw-10000000-0000-4000-8000-0000000000f1";
+        let start = |worker: &str, wrapper: &str, location| {
+            history.start_active_build_with_wrapper(
+                "music".into(),
+                worker.into(),
+                "cargo test".into(),
+                0,
+                Some(wrapper.into()),
+                1,
+                location,
+            )
+        };
+        let failed = start("w1", held, BuildLocation::Remote);
+        let succeeded = start(
+            "w2",
+            "rchw-10000000-0000-4000-8000-0000000000f2",
+            BuildLocation::Remote,
+        );
+        let unkeyed = start("w3", "not-a-wrapper", BuildLocation::Remote);
+        let local = start(
+            "w4",
+            "rchw-10000000-0000-4000-8000-0000000000f4",
+            BuildLocation::Local,
+        );
+        for (build, exit_code) in [
+            (&failed, 102),
+            (&succeeded, 0),
+            (&unkeyed, 130),
+            (&local, 1),
+        ] {
+            history
+                .complete_durable(
+                    build.id,
+                    &build.worker_id,
+                    build.local_wrapper_id.as_deref(),
+                    BuildCompletion {
+                        exit_code,
+                        duration_ms: Some(1),
+                        bytes_transferred: None,
+                        disk_peak_output_bytes: None,
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap();
+        }
+        // The slot is gone, but the worker still refuses this project's root.
+        assert!(history.active_workers_for_project("music").is_empty());
+        let fenced = history.source_fenced_workers("music", |_| true);
+        assert_eq!(fenced, HashSet::from(["w1".to_owned()]));
+        assert!(history.source_fenced_workers("other", |_| true).is_empty());
+        // Once the lease no longer owns source the fence is gone for good.
+        assert!(
+            history
+                .source_fenced_workers("music", |wrapper| wrapper != held)
+                .is_empty()
+        );
+        assert!(history.source_fenced_workers("music", |_| true).is_empty());
+
+        // An unanswered lease cannot hold a worker past the recovery window.
+        let again = start("w1", held, BuildLocation::Remote);
+        history
+            .complete_durable(
+                again.id,
+                "w1",
+                Some(held),
+                BuildCompletion {
+                    exit_code: 130,
+                    duration_ms: Some(1),
+                    bytes_transferred: None,
+                    disk_peak_output_bytes: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(history.source_fenced_workers("music", |_| true).len(), 1);
+        history.source_fences.lock().unwrap()[0].created =
+            Instant::now().checked_sub(SOURCE_FENCE_MAX_AGE).unwrap();
+        assert!(history.source_fenced_workers("music", |_| true).is_empty());
+    }
 
     fn disk_budget_admit(
         history: &BuildHistory,
@@ -2241,6 +3221,7 @@ mod tests {
             worker,
             DiskHeadroomAdmission {
                 requested_gib: budget,
+                floor_gib: 0,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     worker,
                     free,
@@ -2267,8 +3248,54 @@ mod tests {
                 BuildLocation::Remote,
                 None,
                 disk,
+                None,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn project_lanes_admit_one_build_per_lane_and_reuse_freed_lanes() {
+        // bd-sgvod: three lanes on one worker, one project.
+        let history = BuildHistory::new(10);
+        let start = |worker: &str, wrapper: &str, lanes: u32| {
+            history
+                .try_start_active_build_in_lanes(
+                    "mtdt".into(),
+                    worker.into(),
+                    "bash scripts/gate_of_record_job.sh".into(),
+                    0,
+                    Some(wrapper.into()),
+                    1,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    None,
+                    lanes,
+                )
+                .unwrap()
+        };
+        let a = start("hz3", "w-a", 3).expect("lane 0");
+        let b = start("hz3", "w-b", 3).expect("lane 1");
+        let c = start("hz3", "w-c", 3).expect("lane 2");
+        assert_eq!((a.project_lane, b.project_lane, c.project_lane), (0, 1, 2));
+        assert!(start("hz3", "w-d", 3).is_none(), "every lane is busy");
+        // Another worker has its own lanes.
+        assert_eq!(start("hz4", "w-e", 3).unwrap().project_lane, 0);
+        // A worker with one lane keeps the historical one-build rule.
+        assert!(start("hz4", "w-f", 1).is_none());
+        assert_eq!(history.active_build_counts_for_project("mtdt")["hz3"], 3);
+
+        // The lowest freed lane is reused.
+        history.finish_active_build(b.id, 0, None, None, None);
+        assert_eq!(start("hz3", "w-g", 3).unwrap().project_lane, 1);
+
+        // The lane survives the durable ownership snapshot.
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["project_lane"], 2);
+        let zero = serde_json::to_value(&a).unwrap();
+        assert!(zero.get("project_lane").is_none(), "lane 0 stays implicit");
+        let restored: ActiveBuildState = serde_json::from_value(zero).unwrap();
+        assert_eq!(restored.project_lane, 0);
     }
 
     fn disk_budget_completion(exit_code: i32) -> BuildCompletion {
@@ -2276,9 +3303,359 @@ mod tests {
             exit_code,
             duration_ms: None,
             bytes_transferred: None,
+            disk_peak_output_bytes: None,
             timing: None,
             cancellation: None,
         }
+    }
+
+    fn finish_owned(history: &BuildHistory, active: &ActiveBuildState, exit_code: i32) {
+        history
+            .complete_durable(
+                active.id,
+                &active.worker_id,
+                active.local_wrapper_id.as_deref(),
+                disk_budget_completion(exit_code),
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn footprint_is_learned_from_an_unshared_remote_build_and_persisted() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let active = disk_budget_admit(&history, "fgdb", "ovh-b", 0, 120.0).unwrap();
+        assert_eq!(active.disk_free_start_gib, Some(120));
+
+        // A probe taken before admission says nothing about this build.
+        history.observe_build_disk("ovh-b", 10, active.started_at_mono);
+        // Probes on another worker are not this build's.
+        history.observe_build_disk("other", 1, Instant::now());
+        history.observe_build_disk("ovh-b", 70, Instant::now());
+        history.observe_build_disk("ovh-b", 56, Instant::now());
+        history.observe_build_disk("ovh-b", 90, Instant::now());
+        assert_eq!(
+            history.active_build(active.id).unwrap().disk_free_min_gib,
+            Some(56)
+        );
+        // While running, the learned footprint is still unknown.
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 0.0);
+
+        // A failing test run (101) still filled the disk: learn from it.
+        finish_owned(&history, &active, 101);
+        assert_eq!(
+            history.learned_footprint_gib("fgdb", "cargo test"),
+            Some(64.0)
+        );
+        // The command class is part of the identity.
+        assert_eq!(history.learned_footprint_gib("fgdb", "cargo check"), None);
+        assert_eq!(history.learned_footprint_gib("other", "cargo test"), None);
+
+        // The book survives a daemon restart beside the history log.
+        drop(history);
+        let reloaded = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(
+            reloaded.learned_footprint_gib("fgdb", "cargo test"),
+            Some(64.0)
+        );
+    }
+
+    #[test]
+    fn footprint_running_build_reserves_its_remaining_growth() {
+        let history = BuildHistory::new(10);
+        let first = disk_budget_admit(&history, "fgdb", "ovh-b", 0, 120.0).unwrap();
+        history.observe_build_disk("ovh-b", 56, Instant::now());
+        finish_owned(&history, &first, 0);
+
+        let second = disk_budget_admit(&history, "fgdb", "ovh-b", 0, 100.0).unwrap();
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 64.0);
+        history.observe_build_disk("ovh-b", 80, Instant::now());
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 44.0);
+        history.observe_build_disk("ovh-b", 10, Instant::now());
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 0.0);
+        assert_eq!(history.pending_footprint_gib("elsewhere"), 0.0);
+        finish_owned(&history, &second, 0);
+        // The larger observation is now the estimate.
+        assert_eq!(
+            history.learned_footprint_gib("fgdb", "cargo test"),
+            Some(90.0)
+        );
+    }
+
+    #[test]
+    fn footprint_is_not_learned_from_shared_cancelled_or_unprobed_builds() {
+        let history = BuildHistory::new(10);
+
+        // Two of this daemon's builds overlapped on one worker: neither can
+        // claim the drop, including the one that finishes after the other.
+        let a = disk_budget_admit(&history, "a", "w", 0, 200.0).unwrap();
+        let b = disk_budget_admit(&history, "b", "w", 0, 200.0).unwrap();
+        history.observe_build_disk("w", 100, Instant::now());
+        finish_owned(&history, &a, 0);
+        history.observe_build_disk("w", 90, Instant::now());
+        finish_owned(&history, &b, 0);
+        assert_eq!(history.learned_footprint_gib("a", "cargo test"), None);
+        assert_eq!(history.learned_footprint_gib("b", "cargo test"), None);
+
+        // Cancelled builds stopped early.
+        let cancelled = disk_budget_admit(&history, "c", "w", 0, 200.0).unwrap();
+        history.observe_build_disk("w", 100, Instant::now());
+        finish_owned(&history, &cancelled, 130);
+        assert_eq!(history.learned_footprint_gib("c", "cargo test"), None);
+
+        // No probe arrived during the build.
+        let unprobed = disk_budget_admit(&history, "d", "w", 0, 200.0).unwrap();
+        finish_owned(&history, &unprobed, 0);
+        assert_eq!(history.learned_footprint_gib("d", "cargo test"), None);
+
+        // A stale admission sample cannot be a starting point.
+        let stale = disk_budget_admit_snapshot(
+            &history,
+            "e",
+            "w",
+            DiskHeadroomAdmission {
+                requested_gib: 0,
+                floor_gib: 0,
+                capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                    "w",
+                    200.0,
+                    Duration::from_secs(3600),
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(stale.disk_free_start_gib, None);
+        history.observe_build_disk("w", 100, Instant::now());
+        finish_owned(&history, &stale, 0);
+        assert_eq!(history.learned_footprint_gib("e", "cargo test"), None);
+    }
+
+    #[test]
+    fn attributed_total_output_is_required_to_lower_cold_build_estimates() {
+        let history = BuildHistory::new(20);
+        let measured = |state: &ActiveBuildState, gib: u64, exit_code| {
+            history
+                .complete_durable(
+                    state.id,
+                    &state.worker_id,
+                    state.local_wrapper_id.as_deref(),
+                    BuildCompletion {
+                        disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        ..disk_budget_completion(exit_code)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        };
+        let df_only = disk_budget_admit(&history, "df-only", "w", 0, 100.0).unwrap();
+        history.observe_build_disk("w", 98, Instant::now());
+        finish_owned(&history, &df_only, 0);
+        assert_eq!(
+            history.learned_footprint_gib("df-only", "cargo test"),
+            Some(24.0)
+        );
+
+        let first = disk_budget_admit(
+            &history,
+            "numpy::clean-overlay::0123456789abcdef",
+            "w",
+            0,
+            100.0,
+        )
+        .unwrap();
+        // External cleanup hid most of the 21 GiB pool from the df delta.
+        history.observe_build_disk("w", 98, Instant::now());
+        measured(&first, 21, 0);
+        let warm = disk_budget_admit(
+            &history,
+            "numpy::clean-overlay::fedcba9876543210",
+            "w",
+            0,
+            100.0,
+        )
+        .unwrap();
+        measured(&warm, 2, 0);
+        assert_eq!(
+            history.learned_footprint_gib("numpy", "cargo test"),
+            Some(21.0)
+        );
+        assert_eq!(
+            history.learned_footprint_gib("numpy", "cargo test --workspace"),
+            Some(32.0)
+        );
+        assert_eq!(history.learned_footprint_gib("other", "cargo test"), None);
+
+        let small = disk_budget_admit(&history, "small", "shared", 0, 100.0).unwrap();
+        let neighbour = disk_budget_admit(&history, "neighbour", "shared", 0, 100.0).unwrap();
+        history.observe_build_disk("shared", 70, Instant::now());
+        measured(&small, 2, 0);
+        finish_owned(&history, &neighbour, 0);
+        assert_eq!(
+            history.learned_footprint_gib("small", "cargo test"),
+            Some(2.0)
+        );
+        assert_eq!(
+            history.learned_footprint_gib("neighbour", "cargo test"),
+            None
+        );
+        let failed = disk_budget_admit(&history, "failed", "w", 0, 100.0).unwrap();
+        measured(&failed, 2, 101);
+        assert_eq!(
+            history.learned_footprint_gib("failed", "cargo test"),
+            Some(24.0)
+        );
+        let zero = disk_budget_admit(&history, "zero", "w", 0, 100.0).unwrap();
+        measured(&zero, 0, 0);
+        assert_eq!(history.learned_footprint_gib("zero", "cargo test"), None);
+
+        history.footprints.lock().unwrap().record(
+            &legacy_footprint_key("legacy", "cargo test"),
+            2.0,
+            Utc::now().timestamp(),
+            false,
+        );
+        assert_eq!(
+            history.learned_footprint_gib("legacy", "cargo test"),
+            Some(24.0)
+        );
+    }
+
+    #[test]
+    fn output_measurement_requires_the_owner_and_first_terminal_completion() {
+        let history = BuildHistory::new(10);
+        let state = disk_budget_admit(&history, "numpy", "w", 0, 100.0).unwrap();
+        let completion = |gib| BuildCompletion {
+            disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+            ..disk_budget_completion(0)
+        };
+        assert!(
+            history
+                .complete_durable(state.id, "w", Some("forged"), completion(1))
+                .is_err()
+        );
+        assert_eq!(history.learned_footprint_gib("numpy", "cargo test"), None);
+        assert!(
+            history
+                .complete_durable(
+                    state.id,
+                    "w",
+                    state.local_wrapper_id.as_deref(),
+                    completion(21),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            history
+                .complete_durable(
+                    state.id,
+                    "w",
+                    state.local_wrapper_id.as_deref(),
+                    completion(1),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            history.learned_footprint_gib("numpy", "cargo test"),
+            Some(21.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_disk_reservation_charges_floor_once_and_survives_restart() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let sample = || DiskHeadroomAdmission {
+            requested_gib: 4,
+            floor_gib: 13,
+            capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                "hz3",
+                33.0,
+                Duration::ZERO,
+            )),
+        };
+        let first = disk_budget_admit_snapshot(&history, "p0", "hz3", sample()).unwrap();
+        // A lost reply cannot create a second reservation for the same owner,
+        // even though four more independent small builds still fit.
+        assert!(disk_budget_admit_snapshot(&history, "p0", "hz3", sample()).is_none());
+        for index in 1..5 {
+            assert!(
+                disk_budget_admit_snapshot(&history, &format!("p{index}"), "hz3", sample(),)
+                    .is_some()
+            );
+        }
+        assert_eq!(history.reserved_disk_headroom_gib("hz3"), 20);
+        assert!(disk_budget_admit_snapshot(&history, "overflow", "hz3", sample()).is_none());
+        history.observe_build_disk("hz3", 25, Instant::now());
+        assert_eq!(
+            history.reserved_disk_headroom_gib("hz3"),
+            20,
+            "observed growth does not release reservations"
+        );
+        drop(history);
+
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("hz3"), 20);
+        assert!(
+            restored
+                .active_builds()
+                .iter()
+                .all(|state| state.disk_floor_gib == 13)
+        );
+        let mut lowered_floor = sample();
+        lowered_floor.floor_gib = 0;
+        assert!(
+            disk_budget_admit_snapshot(&restored, "lower-floor", "hz3", lowered_floor,).is_none(),
+            "new configuration cannot erase active jobs' reserve floor"
+        );
+        let old = sample();
+        assert!(
+            restored
+                .complete_durable(first.id, "hz3", Some("forged"), disk_budget_completion(130),)
+                .is_err()
+        );
+        assert!(restored.disk_budget_completed_at.lock().unwrap().is_empty());
+        finish_owned(&restored, &first, 130);
+        assert_eq!(restored.reserved_disk_headroom_gib("hz3"), 16);
+        assert_eq!(
+            restored.check_disk_headroom("hz3", &old),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert!(disk_budget_admit_snapshot(&restored, "replacement", "hz3", sample()).is_some());
+    }
+
+    #[tokio::test]
+    async fn recovered_legacy_job_reserves_cold_growth_until_owned_completion_and_new_probe() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let legacy = disk_budget_admit(&history, "old", "w", 0, 100.0).unwrap();
+        drop(history);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restored.active_build(legacy.id).unwrap().recovered);
+        assert_eq!(restored.reserved_disk_headroom_gib("w"), 30);
+        let sample = || DiskHeadroomAdmission {
+            requested_gib: 4,
+            floor_gib: 10,
+            capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                "w",
+                40.0,
+                Duration::ZERO,
+            )),
+        };
+        let old = sample();
+        assert!(disk_budget_admit_snapshot(&restored, "new", "w", old.clone()).is_none());
+        finish_owned(&restored, &legacy, 0);
+        assert_eq!(restored.reserved_disk_headroom_gib("w"), 0);
+        assert_eq!(
+            restored.check_disk_headroom("w", &old),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert!(disk_budget_admit_snapshot(&restored, "new", "w", sample()).is_some());
     }
 
     #[tokio::test]
@@ -2288,6 +3665,7 @@ mod tests {
         let history = BuildHistory::new(10).with_persistence(path);
         let request = |worker, free| DiskHeadroomAdmission {
             requested_gib: 80,
+            floor_gib: 0,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 worker,
                 free,
@@ -2387,6 +3765,7 @@ mod tests {
                 Arc::new(BuildHistory::new(10).with_persistence(root.path().join("history.jsonl")));
             let sample = DiskHeadroomAdmission {
                 requested_gib: 80,
+                floor_gib: 0,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     "worker",
                     100.0,
@@ -2444,6 +3823,7 @@ mod tests {
         assert!(history.disk_budget_completed_at.lock().unwrap().is_empty());
         let sample = DiskHeadroomAdmission {
             requested_gib: 1,
+            floor_gib: 0,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "worker",
                 100.0,
@@ -2465,6 +3845,7 @@ mod tests {
                 "worker",
                 &DiskHeadroomAdmission {
                     requested_gib: 20,
+                    floor_gib: 0,
                     capacity: None
                 }
             ),
@@ -2478,6 +3859,7 @@ mod tests {
         let history = BuildHistory::new(10);
         let sample = DiskHeadroomAdmission {
             requested_gib: 80,
+            floor_gib: 0,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "worker",
                 100.0,
@@ -2506,6 +3888,7 @@ mod tests {
                 BuildLocation::Local,
                 None,
                 sample.clone(),
+                None,
             )
             .unwrap()
             .unwrap();
@@ -2561,6 +3944,7 @@ mod tests {
             exit_code: 0,
             duration_ms: None,
             bytes_transferred: None,
+            disk_peak_output_bytes: None,
             timing: None,
             cancellation: None,
         };
@@ -2604,12 +3988,14 @@ mod tests {
                 None,
                 DiskHeadroomAdmission {
                     requested_gib: 64,
+                    floor_gib: 0,
                     capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                         "worker",
                         100.0,
                         Duration::from_secs(91),
                     )),
                 },
+                None,
             )
             .unwrap();
         assert!(rejected.is_none());
@@ -2634,6 +4020,52 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn queue_hold_reserves_against_younger_requests_only() {
+        let history = BuildHistory::new(10);
+        let (old, old_claim) = queue_resume_enqueue(&history, Some("old"));
+        let (young, young_claim) = queue_resume_enqueue(&history, Some("young"));
+        assert!(old.queued_at_mono <= young.queued_at_mono && old.id < young.id);
+        assert_eq!(history.queue_hold_against(None), None);
+
+        // The younger waiter claims first; the older one displaces it.
+        assert!(history.claim_queue_hold(young.id, young.queued_at_mono, "w1".into()));
+        assert_eq!(history.queue_hold_against(None).as_deref(), Some("w1"));
+        assert_eq!(history.queue_hold_against(Some(&young_claim)), None);
+        assert_eq!(history.queue_hold_against(Some(&old_claim)), None);
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w2".into()));
+        assert_eq!(history.queue_hold_of(young.id), None);
+        assert_eq!(history.queue_hold_of(old.id).as_deref(), Some("w2"));
+        assert_eq!(
+            history.queue_hold_against(Some(&young_claim)).as_deref(),
+            Some("w2")
+        );
+        assert_eq!(history.queue_hold_against(Some(&old_claim)), None);
+
+        // A younger waiter cannot take it back; a refresh is not a change.
+        assert!(!history.claim_queue_hold(young.id, young.queued_at_mono, "w1".into()));
+        assert!(!history.claim_queue_hold(old.id, old.queued_at_mono, "w2".into()));
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w3".into()));
+
+        // Only the holder's release drops it.
+        history.release_queue_hold(young.id);
+        assert_eq!(history.queue_hold_of(old.id).as_deref(), Some("w3"));
+        history.release_queue_hold(old.id);
+        assert_eq!(history.queue_hold_against(None), None);
+
+        // An unrefreshed hold goes stale.
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w1".into()));
+        history
+            .queue_hold
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .refreshed -= QUEUE_HOLD_STALE;
+        assert_eq!(history.queue_hold_against(None), None);
+        assert!(history.claim_queue_hold(young.id, young.queued_at_mono, "w4".into()));
     }
 
     #[test]
@@ -2756,6 +4188,7 @@ mod tests {
                     BuildLocation::Remote,
                     Some(&claim),
                     DiskHeadroomAdmission::default(),
+                    None,
                 )
                 .unwrap()
                 .unwrap();
@@ -2773,6 +4206,7 @@ mod tests {
                         BuildLocation::Remote,
                         Some(&claim),
                         DiskHeadroomAdmission::default(),
+                        None,
                     )
                     .unwrap()
                     .is_none()
@@ -2818,6 +4252,7 @@ mod tests {
                         BuildLocation::Remote,
                         Some(&claim),
                         DiskHeadroomAdmission::default(),
+                        None,
                     )
                     .unwrap()
             });
@@ -2874,6 +4309,7 @@ mod tests {
                     BuildLocation::Remote,
                     Some(&claim),
                     DiskHeadroomAdmission::default(),
+                    None,
                 )
                 .is_err()
         );
@@ -2943,6 +4379,430 @@ mod tests {
             std::fs::read(&temporary).unwrap().as_slice(),
             &prior_temporary[..]
         );
+    }
+
+    #[tokio::test]
+    async fn admitted_endpoint_persists_coordinates_without_restoring_runtime_authority() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("durable-endpoint"),
+            host: "admitted.example".into(),
+            user: "build-user".into(),
+            identity_file: "/keys/admitted key".into(),
+            tags: vec!["os:linux".into()],
+            ..rch_common::WorkerConfig::default()
+        };
+        let worker = crate::workers::WorkerState::new(config.clone());
+        let endpoint = worker.endpoint_snapshot().await;
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let active = history
+            .try_start_active_build_with_waiter(
+                "persist-endpoint".into(),
+                config.id.to_string(),
+                "cargo test".into(),
+                std::process::id(),
+                Some("endpoint-owner".into()),
+                3,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission::default(),
+                Some(endpoint.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            worker
+                .lock_current_endpoint(active.worker_endpoint.as_ref().unwrap())
+                .await
+                .is_some()
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
+        let saved = snapshot["active"][0]["worker_endpoint"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            saved.len(),
+            1,
+            "only endpoint coordinates are durable, never a process-local epoch"
+        );
+        assert_eq!(saved["config"]["host"], "admitted.example");
+        assert_eq!(saved["config"]["identity_file"], "/keys/admitted key");
+
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        let recovered = restored.active_build(active.id).unwrap();
+        let recovered_endpoint = recovered.worker_endpoint.as_ref().unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(recovered.slots, 3);
+        assert_eq!(recovered_endpoint.config.id, config.id);
+        assert_eq!(recovered_endpoint.config.host, config.host);
+        assert_eq!(recovered_endpoint.config.user, config.user);
+        assert_eq!(
+            recovered_endpoint.config.identity_file,
+            config.identity_file
+        );
+        assert_eq!(recovered_endpoint.config.tags, config.tags);
+        assert!(
+            worker
+                .lock_current_endpoint(recovered_endpoint)
+                .await
+                .is_none()
+        );
+        let restarted_worker = crate::workers::WorkerState::new(config);
+        assert!(
+            restarted_worker
+                .lock_current_endpoint(&endpoint)
+                .await
+                .is_none()
+        );
+        assert!(
+            restarted_worker
+                .lock_current_endpoint(recovered_endpoint)
+                .await
+                .is_none(),
+            "same coordinates and generation zero cannot credit an earlier daemon's build"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_endpoint_rejects_mismatched_worker_at_admission_and_recovery() {
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("original-worker"),
+            ..rch_common::WorkerConfig::default()
+        };
+        let worker = crate::workers::WorkerState::new(config);
+        let endpoint = worker.endpoint_snapshot().await;
+        for (worker_id, location) in [
+            ("other-worker", BuildLocation::Remote),
+            ("original-worker", BuildLocation::Local),
+        ] {
+            let history = BuildHistory::new(10);
+            let error = history
+                .try_start_active_build_with_waiter(
+                    "invalid-endpoint".into(),
+                    worker_id.into(),
+                    "cargo check".into(),
+                    0,
+                    None,
+                    2,
+                    location,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(endpoint.clone()),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(history.active_builds().is_empty());
+        }
+        for version in [1, 2] {
+            for mismatch in ["worker_id", "location"] {
+                let root = TempDir::new().unwrap();
+                let path = root.path().join("history.jsonl");
+                let (mut snapshot, _) = recovery_validation_fixture(&path, version);
+                snapshot["active"][0]["worker_endpoint"] = serde_json::to_value(&endpoint).unwrap();
+                if mismatch == "worker_id" {
+                    snapshot["active"][0]["worker_endpoint"]["config"]["id"] =
+                        serde_json::json!("other-worker");
+                } else {
+                    snapshot["active"][0]["location"] =
+                        serde_json::to_value(BuildLocation::Local).unwrap();
+                }
+                assert_recovery_rejects_without_rewriting(&path, &snapshot);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_active_ownership_keeps_unknown_endpoint_after_recovery() {
+        for version in [1, 2] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let (snapshot, active) = recovery_validation_fixture(&path, version);
+            assert!(snapshot["active"][0].get("worker_endpoint").is_none());
+            std::fs::write(
+                path.with_extension("ownership.json"),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            let recovered = restored.active_build(active.id).unwrap();
+            assert!(recovered.worker_endpoint.is_none());
+            assert_eq!(recovered.worker_id, "original-worker");
+            assert_eq!(recovered.slots, 2);
+            let (completed, _) = restored
+                .complete_durable(
+                    active.id,
+                    "original-worker",
+                    Some("recovery-owner"),
+                    disk_budget_completion(0),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(completed.worker_endpoint.is_none());
+            assert_eq!(completed.slots, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_fault_archive_is_durable_owner_validated_and_endpoint_scoped() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("disk-worker"),
+            host: "admitted.example".into(),
+            ..Default::default()
+        };
+        let worker = crate::workers::WorkerState::new(config.clone());
+        let endpoint = worker.endpoint_snapshot().await;
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let build = history
+            .try_start_active_build_with_waiter(
+                "failed-volume".into(),
+                config.id.to_string(),
+                "cargo test".into(),
+                0,
+                Some("disk-owner".into()),
+                2,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission::default(),
+                Some(endpoint.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        history
+            .complete_durable_with_disk_fault(
+                build.id,
+                "disk-worker",
+                Some("disk-owner"),
+                disk_budget_completion(101),
+                Some(vec!["/admitted-volume/rch".into()]),
+            )
+            .unwrap()
+            .unwrap();
+        let fault = history.pending_disk_fault(build.id).unwrap();
+        assert!(fault.runtime_endpoint.is_some());
+        assert!(
+            history
+                .has_pending_disk_fault_for_endpoint(&WorkerEndpointIdentity::from_config(&config))
+        );
+        assert!(
+            history
+                .try_start_active_build_with_waiter(
+                    "same-endpoint".into(),
+                    config.id.to_string(),
+                    "cargo build".into(),
+                    0,
+                    None,
+                    1,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(endpoint),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let replacement = crate::workers::WorkerState::new(rch_common::WorkerConfig {
+            host: "replacement.example".into(),
+            ..config
+        });
+        let replacement_endpoint = replacement.endpoint_snapshot().await;
+        assert!(!history.has_pending_disk_fault_for_endpoint(
+            &WorkerEndpointIdentity::from_config(&replacement_endpoint.config)
+        ));
+        assert!(
+            history
+                .try_start_active_build_with_waiter(
+                    "different-endpoint".into(),
+                    "disk-worker".into(),
+                    "cargo build".into(),
+                    0,
+                    None,
+                    1,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(replacement_endpoint),
+                )
+                .unwrap()
+                .is_some(),
+            "an absent endpoint's fault cannot fence a replacement ID"
+        );
+
+        assert_eq!(
+            history
+                .archive_disk_fault(build.id, "wrong-incident")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(history.pending_disk_fault(build.id), Some(fault.clone()));
+        history
+            .archive_disk_fault(build.id, &fault.incident_id)
+            .unwrap();
+        assert!(history.pending_disk_fault(build.id).is_none());
+        assert_eq!(history.unapplied_disk_fault(build.id), Some(fault.clone()));
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        let archived = restored.unapplied_disk_fault(build.id).unwrap();
+        assert_eq!(archived, fault);
+        assert!(archived.runtime_endpoint.is_none());
+        assert!(restored.pending_disk_faults().is_empty());
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
+        for corruption in [
+            "mismatched_worker",
+            "pending_and_archived",
+            "wrong_incident",
+        ] {
+            let mut invalid = snapshot.clone();
+            match corruption {
+                "mismatched_worker" => {
+                    invalid["completed"][0]["unapplied_disk_fault"]["worker_endpoint"]["id"] =
+                        serde_json::json!("replacement-owner")
+                }
+                "pending_and_archived" => {
+                    invalid["completed"][0]["pending_disk_fault"] =
+                        invalid["completed"][0]["unapplied_disk_fault"].clone()
+                }
+                "wrong_incident" => {
+                    invalid["completed"][0]["unapplied_disk_fault"]["incident_id"] =
+                        serde_json::json!("new-unowned-incident")
+                }
+                _ => unreachable!(),
+            }
+            assert_recovery_rejects_without_rewriting(&path, &invalid);
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_fault_first_terminal_commit_preserves_known_retarget_across_restart() {
+        for change in ["aba", "retarget_removed", "removed", "active_restarted"] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let store_path = root.path().join("bypasses.json");
+            let original = rch_common::WorkerConfig {
+                id: WorkerId::new("disk-worker"),
+                host: "admitted.example".into(),
+                total_slots: 8,
+                ..Default::default()
+            };
+            let pool = crate::workers::WorkerPool::new();
+            pool.add_worker(original.clone()).await;
+            let worker = pool.get(&original.id).await.unwrap();
+            let mut history = BuildHistory::new(10).with_persistence(path.clone());
+            let build = history
+                .try_start_active_build_with_waiter(
+                    "late-disk-fault".into(),
+                    original.id.to_string(),
+                    "cargo build".into(),
+                    0,
+                    Some("disk-owner".into()),
+                    2,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            if matches!(change, "aba" | "retarget_removed") {
+                pool.add_worker(rch_common::WorkerConfig {
+                    host: "replacement.example".into(),
+                    ..original.clone()
+                })
+                .await;
+                if change == "aba" {
+                    pool.add_worker(original.clone()).await;
+                }
+            }
+            if matches!(change, "removed" | "retarget_removed") {
+                assert!(pool.remove_worker(&original.id).await);
+            } else if change == "active_restarted" {
+                history = BuildHistory::load_from_file(&path, 10).unwrap();
+            }
+            let (completed, record) = history
+                .complete_durable_with_disk_fault(
+                    build.id,
+                    "disk-worker",
+                    Some("disk-owner"),
+                    disk_budget_completion(101),
+                    Some(vec!["/admitted-volume/rch".into()]),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.slots, 2);
+            let known_retarget = matches!(change, "aba" | "retarget_removed");
+            let evidence = if known_retarget {
+                assert!(history.pending_disk_fault(build.id).is_none(), "{change}");
+                history.unapplied_disk_fault(build.id).unwrap()
+            } else {
+                assert!(history.unapplied_disk_fault(build.id).is_none(), "{change}");
+                history.pending_disk_fault(build.id).unwrap()
+            };
+            assert_eq!(
+                evidence.incident_id,
+                format!("build:{}:{}", build.id, record.completed_at)
+            );
+            assert_eq!(evidence.roots, ["/admitted-volume/rch"]);
+            assert!(
+                evidence
+                    .worker_endpoint
+                    .as_ref()
+                    .unwrap()
+                    .matches_config(&original)
+            );
+
+            // Stop at the actual first ownership commit: no bypass producer or
+            // archive acknowledgment runs before reopening the durable file.
+            drop(history);
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            let worker = std::sync::Arc::new(crate::workers::WorkerState::new(original));
+            assert!(worker.reserve_slots(1).await); // Unrelated surviving work.
+            let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+                rch_common::BypassRecordStore::with_path(&store_path),
+            ));
+            let restored_evidence = if known_retarget {
+                assert!(restored.pending_disk_faults().is_empty());
+                restored.unapplied_disk_fault(build.id).unwrap()
+            } else {
+                restored.pending_disk_fault(build.id).unwrap()
+            };
+            assert_eq!(restored_evidence, evidence);
+            assert!(restored_evidence.runtime_endpoint.is_none());
+            crate::bypass_recovery_service::apply_owned_disk_fault(
+                &store,
+                Some(&worker),
+                &restored,
+                &restored_evidence,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                worker.used_slots(),
+                1,
+                "replay cannot release another build"
+            );
+            assert_eq!(
+                worker.lifecycle().await.is_schedulable(),
+                known_retarget,
+                "{change}"
+            );
+            assert_eq!(
+                rch_common::BypassRecordStore::load(&store_path).contains("disk-worker"),
+                !known_retarget,
+                "{change}"
+            );
+            if known_retarget {
+                assert_eq!(restored.unapplied_disk_fault(build.id), Some(evidence));
+            } else {
+                assert!(restored.pending_disk_faults().is_empty());
+                assert!(restored.unapplied_disk_fault(build.id).is_none());
+            }
+        }
     }
 
     #[test]
@@ -3590,6 +5450,7 @@ mod tests {
                     record,
                     local_wrapper_id: None,
                     pending_disk_fault: None,
+                    unapplied_disk_fault: None,
                 },
             )
         };
@@ -3626,6 +5487,7 @@ mod tests {
             exit_code: 101,
             duration_ms: Some(10),
             bytes_transferred: None,
+            disk_peak_output_bytes: None,
             timing: None,
             cancellation: None,
         };
@@ -3715,6 +5577,7 @@ mod tests {
                     exit_code: 1,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -3778,6 +5641,7 @@ mod tests {
                     exit_code: 101,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -4328,6 +6192,7 @@ mod tests {
                     exit_code: 137,
                     duration_ms: Some(17),
                     bytes_transferred: Some(23),
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -4387,6 +6252,7 @@ mod tests {
                         exit_code: 0,
                         duration_ms: None,
                         bytes_transferred: None,
+                        disk_peak_output_bytes: None,
                         timing: None,
                         cancellation: None,
                     }
@@ -5303,6 +7169,7 @@ mod tests {
                     exit_code: 0,
                     duration_ms: None,
                     bytes_transferred: None,
+                    disk_peak_output_bytes: None,
                     timing: None,
                     cancellation: None,
                 },

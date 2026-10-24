@@ -260,4 +260,400 @@ mod tests {
         assert!(codes.contains(&"SCHEMA_FINGERPRINT_MISMATCH"));
         assert_eq!(report.findings.len(), 2);
     }
+
+    #[test]
+    fn e019_sandbox_doctor_reports_capability_matrix_and_findings() {
+        let full_probe = SandboxDoctorProbeInput {
+            node_id: 1,
+            user_mount_pid_net_namespaces: true,
+            cgroup_v2_delegated: true,
+            seccomp_bpf_tsync: true,
+            landlock_abi_version: 3,
+        };
+        let matrix = probe_host_sandbox_capabilities(&full_probe);
+        assert!(matrix.strict_hermetic_capable());
+        assert_eq!(
+            matrix.effective_profile,
+            crate::authority_matrix::IsolationProfile::StrictHermeticLinux
+        );
+        assert!(
+            matrix.findings.is_empty(),
+            "fully capable host should produce zero doctor findings"
+        );
+
+        // Missing cgroup v2 delegation and seccomp degrades profile and reports actionable findings.
+        let degraded_probe = SandboxDoctorProbeInput {
+            node_id: 2,
+            user_mount_pid_net_namespaces: true,
+            cgroup_v2_delegated: false,
+            seccomp_bpf_tsync: false,
+            landlock_abi_version: 0,
+        };
+        let degraded = probe_host_sandbox_capabilities(&degraded_probe);
+        assert!(!degraded.strict_hermetic_capable());
+        assert_eq!(
+            degraded.effective_profile,
+            crate::authority_matrix::IsolationProfile::HostSandboxAudit
+        );
+        let codes: Vec<&str> = degraded.findings.iter().map(|f| f.code).collect();
+        assert!(codes.contains(&"SANDBOX_CGROUP_V2_UNAVAILABLE"));
+        assert!(codes.contains(&"SANDBOX_SECCOMP_BPF_UNAVAILABLE"));
+        assert!(codes.contains(&"SANDBOX_LANDLOCK_UNAVAILABLE"));
+
+        // Missing namespaces degrades all the way to VolatileLocal.
+        let no_ns_probe = SandboxDoctorProbeInput {
+            node_id: 3,
+            user_mount_pid_net_namespaces: false,
+            cgroup_v2_delegated: false,
+            seccomp_bpf_tsync: false,
+            landlock_abi_version: 0,
+        };
+        let no_ns = probe_host_sandbox_capabilities(&no_ns_probe);
+        assert_eq!(
+            no_ns.effective_profile,
+            crate::authority_matrix::IsolationProfile::VolatileLocal
+        );
+        assert!(
+            no_ns
+                .findings
+                .iter()
+                .any(|f| f.code == "SANDBOX_NAMESPACES_UNAVAILABLE")
+        );
+    }
+
+    #[test]
+    fn e019_failure_bundle_generated_on_induced_sandbox_setup_failure() {
+        let probe = SandboxDoctorProbeInput {
+            node_id: 7,
+            user_mount_pid_net_namespaces: true,
+            cgroup_v2_delegated: false,
+            seccomp_bpf_tsync: true,
+            landlock_abi_version: 2,
+        };
+        let capability_matrix = probe_host_sandbox_capabilities(&probe);
+
+        let bundle = generate_sandbox_failure_bundle(
+            [0x42; 32],
+            99,
+            SandboxFailurePhase::CgroupV2Attach,
+            13, // EACCES
+            vec![
+                SandboxMountEntry {
+                    source: "overlay".into(),
+                    target: "/rabs/execroot/ws".into(),
+                    fstype: "overlay".into(),
+                    read_only: true,
+                },
+                SandboxMountEntry {
+                    source: "tmpfs".into(),
+                    target: "/rabs/execroot/out".into(),
+                    fstype: "tmpfs".into(),
+                    read_only: false,
+                },
+            ],
+            vec![
+                SandboxNamespaceEntry {
+                    ns_kind: "mnt".into(),
+                    entered: true,
+                    detail: "mnt:[4026532210]".into(),
+                },
+                SandboxNamespaceEntry {
+                    ns_kind: "cgroup".into(),
+                    entered: false,
+                    detail: "permission denied opening cgroup.procs".into(),
+                },
+            ],
+            SandboxCgroupState {
+                slice_path: "/sys/fs/cgroup/rabs.slice/act-99".into(),
+                controllers_enabled: vec!["cpu".into(), "memory".into()],
+                memory_peak_bytes: 0,
+                oom_kill_count: 0,
+                pids_current: 1,
+            },
+            vec![
+                "helper: entered user+mount+pid namespaces".into(),
+                "helper: failed to write PID to /sys/fs/cgroup/rabs.slice/act-99/cgroup.procs (EACCES)".into(),
+            ],
+            vec![SandboxDeniedOperation {
+                operation: "openat(O_WRONLY)".into(),
+                target: "/sys/fs/cgroup/rabs.slice/act-99/cgroup.procs".into(),
+                enforcer: "dac_cgroup_v2".into(),
+                errno: 13,
+            }],
+            capability_matrix,
+        );
+
+        assert_eq!(bundle.attempt_id, 99);
+        assert_eq!(bundle.phase, SandboxFailurePhase::CgroupV2Attach);
+        assert_eq!(bundle.errno, 13);
+        assert_eq!(bundle.mounts.len(), 2);
+        assert_eq!(bundle.namespaces.len(), 2);
+        assert_eq!(
+            bundle.cgroup_state.slice_path,
+            "/sys/fs/cgroup/rabs.slice/act-99"
+        );
+        assert_eq!(bundle.helper_logs.len(), 2);
+        assert_eq!(bundle.denied_operations.len(), 1);
+        assert!(
+            !bundle.capability_matrix.strict_hermetic_capable(),
+            "bundle records the host capability matrix at the moment of failure"
+        );
+        assert_ne!(bundle.bundle_digest, [0u8; 32]);
+    }
+}
+
+/// Host sandbox capability probe inputs collected by `rch doctor` (bead E019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxDoctorProbeInput {
+    /// Host/worker node identifier.
+    pub node_id: u64,
+    /// Whether `CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET` works.
+    pub user_mount_pid_net_namespaces: bool,
+    /// Whether a writable cgroup v2 slice with delegated `cpu`, `memory`, `io`, `pids` is available.
+    pub cgroup_v2_delegated: bool,
+    /// Whether `SECCOMP_SET_MODE_FILTER` with `SECCOMP_FILTER_FLAG_TSYNC` works.
+    pub seccomp_bpf_tsync: bool,
+    /// Supported Landlock ABI version (`0` if unsupported/disabled on host kernel).
+    pub landlock_abi_version: u32,
+}
+
+/// Host sandbox capability matrix and doctor findings (bead E019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCapabilityMatrix {
+    /// Host/worker node identifier.
+    pub node_id: u64,
+    /// Namespace isolation available.
+    pub namespaces_ok: bool,
+    /// cgroup v2 resource envelope available.
+    pub cgroup_v2_ok: bool,
+    /// seccomp-bpf syscall filter available.
+    pub seccomp_ok: bool,
+    /// Landlock LSM ABI version (`0` = unavailable).
+    pub landlock_abi_version: u32,
+    /// Highest `IsolationProfile` the host can legitimately claim.
+    pub effective_profile: crate::authority_matrix::IsolationProfile,
+    /// Remediation findings for any missing capability.
+    pub findings: Vec<Finding>,
+}
+
+impl SandboxCapabilityMatrix {
+    /// Whether the host meets the full `StrictHermeticLinux` capability contract.
+    #[must_use]
+    pub const fn strict_hermetic_capable(&self) -> bool {
+        self.namespaces_ok && self.cgroup_v2_ok && self.seccomp_ok
+    }
+}
+
+/// Probe and evaluate host sandbox capabilities for `rch doctor` (bead E019).
+#[must_use]
+pub fn probe_host_sandbox_capabilities(input: &SandboxDoctorProbeInput) -> SandboxCapabilityMatrix {
+    let mut findings = Vec::new();
+    if !input.user_mount_pid_net_namespaces {
+        findings.push(Finding {
+            node_id: input.node_id,
+            code: "SANDBOX_NAMESPACES_UNAVAILABLE",
+            remediation: format!(
+                "node {} cannot create user/mount/pid/net namespaces; enable \
+                 kernel.unprivileged_userns_clone=1 or install the audited namespace helper",
+                input.node_id
+            ),
+        });
+    }
+    if !input.cgroup_v2_delegated {
+        findings.push(Finding {
+            node_id: input.node_id,
+            code: "SANDBOX_CGROUP_V2_UNAVAILABLE",
+            remediation: format!(
+                "node {} lacks a delegated cgroup v2 slice (cpu, memory, io, pids); \
+                 configure systemd Delegate=yes on rabs-wkr.service",
+                input.node_id
+            ),
+        });
+    }
+    if !input.seccomp_bpf_tsync {
+        findings.push(Finding {
+            node_id: input.node_id,
+            code: "SANDBOX_SECCOMP_BPF_UNAVAILABLE",
+            remediation: format!(
+                "node {} lacks seccomp-bpf TSYNC support; verify CONFIG_SECCOMP_FILTER=y \
+                 and container seccomp profile",
+                input.node_id
+            ),
+        });
+    }
+    if input.landlock_abi_version == 0 {
+        findings.push(Finding {
+            node_id: input.node_id,
+            code: "SANDBOX_LANDLOCK_UNAVAILABLE",
+            remediation: format!(
+                "node {} reports Landlock ABI 0; enable lsm=landlock,... in kernel boot parameters \
+                 for defense-in-depth filesystem restriction",
+                input.node_id
+            ),
+        });
+    }
+
+    let effective_profile = if input.user_mount_pid_net_namespaces
+        && input.cgroup_v2_delegated
+        && input.seccomp_bpf_tsync
+    {
+        crate::authority_matrix::IsolationProfile::StrictHermeticLinux
+    } else if input.user_mount_pid_net_namespaces {
+        crate::authority_matrix::IsolationProfile::HostSandboxAudit
+    } else {
+        crate::authority_matrix::IsolationProfile::VolatileLocal
+    };
+
+    SandboxCapabilityMatrix {
+        node_id: input.node_id,
+        namespaces_ok: input.user_mount_pid_net_namespaces,
+        cgroup_v2_ok: input.cgroup_v2_delegated,
+        seccomp_ok: input.seccomp_bpf_tsync,
+        landlock_abi_version: input.landlock_abi_version,
+        effective_profile,
+        findings,
+    }
+}
+
+/// Phase in which a sandbox setup or enforcement failure occurred (bead E019).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxFailurePhase {
+    /// Creating `CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET`.
+    NamespaceSetup,
+    /// Bind-mounting canonical execroot directories or `pivot_root`.
+    MountAndPivotRoot,
+    /// Attaching child PID or configuring limits in cgroup v2 slice.
+    CgroupV2Attach,
+    /// Installing seccomp-bpf or Landlock ruleset pre-exec.
+    SeccompOrLandlockInstall,
+    /// Runtime enforcement denied an operation (e.g. closed-view read escape or forbidden syscall).
+    RuntimeEnforcementDenied,
+}
+
+/// Captured mount-table entry in a sandbox failure bundle (bead E019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMountEntry {
+    /// Mount source device or fstype tag.
+    pub source: String,
+    /// Canonical mount target inside the sandbox.
+    pub target: String,
+    /// Filesystem type (`overlay`, `bind`, `tmpfs`, `proc`).
+    pub fstype: String,
+    /// Whether mounted `MS_RDONLY`.
+    pub read_only: bool,
+}
+
+/// Captured namespace state entry in a sandbox failure bundle (bead E019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxNamespaceEntry {
+    /// Namespace kind (`user`, `mnt`, `pid`, `net`, `uts`, `ipc`, `cgroup`).
+    pub ns_kind: String,
+    /// Whether the helper successfully entered/configured this namespace.
+    pub entered: bool,
+    /// Inode or diagnostic detail.
+    pub detail: String,
+}
+
+/// Captured cgroup v2 resource state in a sandbox failure bundle (bead E019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCgroupState {
+    /// Delegated cgroup v2 slice path.
+    pub slice_path: String,
+    /// Active controllers in `cgroup.subtree_control`.
+    pub controllers_enabled: Vec<String>,
+    /// Peak memory usage (`memory.peak`).
+    pub memory_peak_bytes: u64,
+    /// Recorded OOM kills (`memory.events` `oom_kill`).
+    pub oom_kill_count: u64,
+    /// Current PIDs (`pids.current`).
+    pub pids_current: u32,
+}
+
+/// Denied operation recorded during sandbox setup or runtime enforcement (bead E019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxDeniedOperation {
+    /// Syscall or filesystem operation name.
+    pub operation: String,
+    /// Target path or resource.
+    pub target: String,
+    /// Enforcing layer (`seccomp`, `landlock`, `canonical_mount_ro`, `dac_cgroup_v2`).
+    pub enforcer: String,
+    /// OS errno returned (`EACCES = 13`, `EPERM = 1`, `EROFS = 30`, etc.).
+    pub errno: i32,
+}
+
+/// Diagnostic bundle emitted when sandbox setup or enforcement fails (bead E019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxFailureBundle {
+    /// Action key digest that triggered the sandboxed execution.
+    pub action_key_digest: [u8; 32],
+    /// Attempt identifier.
+    pub attempt_id: u64,
+    /// Setup/enforcement phase that failed.
+    pub phase: SandboxFailurePhase,
+    /// OS errno code at failure.
+    pub errno: i32,
+    /// Mount table snapshot at failure time.
+    pub mounts: Vec<SandboxMountEntry>,
+    /// Namespace status snapshot at failure time.
+    pub namespaces: Vec<SandboxNamespaceEntry>,
+    /// cgroup v2 state snapshot at failure time.
+    pub cgroup_state: SandboxCgroupState,
+    /// Bounded helper log lines.
+    pub helper_logs: Vec<String>,
+    /// Denied operations leading to the failure.
+    pub denied_operations: Vec<SandboxDeniedOperation>,
+    /// Host capability matrix captured by the doctor probe.
+    pub capability_matrix: SandboxCapabilityMatrix,
+    /// Deterministic content digest over the failure bundle.
+    pub bundle_digest: [u8; 32],
+}
+
+/// Generate a deterministic `SandboxFailureBundle` on induced or live sandbox setup/enforcement failure (bead E019).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn generate_sandbox_failure_bundle(
+    action_key_digest: [u8; 32],
+    attempt_id: u64,
+    phase: SandboxFailurePhase,
+    errno: i32,
+    mounts: Vec<SandboxMountEntry>,
+    namespaces: Vec<SandboxNamespaceEntry>,
+    cgroup_state: SandboxCgroupState,
+    helper_logs: Vec<String>,
+    denied_operations: Vec<SandboxDeniedOperation>,
+    capability_matrix: SandboxCapabilityMatrix,
+) -> SandboxFailureBundle {
+    let mut acc: u64 = 0xCBF2_9CE4_8422_2325;
+    for b in action_key_digest {
+        acc ^= u64::from(b);
+        acc = acc.wrapping_mul(0x0100_0000_01B3);
+    }
+    acc ^= attempt_id;
+    acc = acc.wrapping_mul(0x0100_0000_01B3);
+    acc ^= errno as u64;
+    acc = acc.wrapping_mul(0x0100_0000_01B3);
+    acc ^= (mounts.len() as u64)
+        .wrapping_shl(16)
+        .wrapping_add(namespaces.len() as u64)
+        .wrapping_add(denied_operations.len() as u64);
+    let mut bundle_digest = [0u8; 32];
+    for (i, chunk) in bundle_digest.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let word = acc.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        *chunk = word.to_le_bytes();
+    }
+
+    SandboxFailureBundle {
+        action_key_digest,
+        attempt_id,
+        phase,
+        errno,
+        mounts,
+        namespaces,
+        cgroup_state,
+        helper_logs,
+        denied_operations,
+        capability_matrix,
+        bundle_digest,
+    }
 }

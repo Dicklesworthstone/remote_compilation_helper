@@ -10,7 +10,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 /// Result of a CPU benchmark run.
@@ -22,7 +23,11 @@ pub struct CpuBenchmarkResult {
     pub duration_ms: u64,
     /// Number of benchmark iterations performed.
     pub iterations: u64,
-    /// Operations per second (prime count throughput).
+    /// Prime-count throughput over the complete mixed sieve/matrix workload.
+    ///
+    /// Kept as mixed-workload throughput for compatibility with existing raw
+    /// results and SpeedScore calibration. The independently timed sieve rate
+    /// is represented by `prime_sieve_score`, not this field.
     pub ops_per_second: f64,
     /// Timestamp when the benchmark was taken.
     pub timestamp: DateTime<Utc>,
@@ -107,7 +112,7 @@ impl CpuBenchmark {
     /// Run the CPU benchmark and return results.
     ///
     /// This runs both the prime sieve and matrix multiplication benchmarks,
-    /// combining their scores into an overall CPU performance score.
+    /// combining their independently measured scores into a CPU score.
     pub fn run(&self) -> CpuBenchmarkResult {
         debug!(
             sieve_limit = self.sieve_limit,
@@ -117,54 +122,58 @@ impl CpuBenchmark {
             "Starting CPU benchmark"
         );
 
-        // Warmup run (not counted)
+        if self.iterations == 0 {
+            return CpuBenchmarkResult::default();
+        }
+
+        // Keep warmup observable even when benchmark tracing is compiled out.
         if self.warmup {
             debug!("Running warmup iteration");
-            let _ = prime_sieve(self.sieve_limit);
-            let _ = matrix_multiply(self.matrix_size);
+            black_box(prime_sieve(black_box(self.sieve_limit)));
+            black_box(matrix_multiply(black_box(self.matrix_size)));
         }
 
         let start = Instant::now();
+        let mut sieve_duration = Duration::ZERO;
+        let mut matrix_duration = Duration::ZERO;
         let mut total_primes = 0u64;
         let mut matrix_checksum = 0.0f64;
 
-        // Run benchmark iterations
         for i in 0..self.iterations {
-            let primes = prime_sieve(self.sieve_limit);
+            let sieve_start = Instant::now();
+            let primes = black_box(prime_sieve(black_box(self.sieve_limit)));
+            sieve_duration += sieve_start.elapsed();
             total_primes += primes;
 
-            let checksum = matrix_multiply(self.matrix_size);
+            let matrix_start = Instant::now();
+            let checksum = black_box(matrix_multiply(black_box(self.matrix_size)));
+            matrix_duration += matrix_start.elapsed();
             matrix_checksum += checksum;
 
+            // Diagnostic I/O is not part of either computational measurement.
             debug!(iteration = i + 1, primes, checksum, "Completed iteration");
         }
 
         let duration = start.elapsed();
         let duration_ms = duration.as_millis() as u64;
-
-        // Calculate ops per second (primes found per second)
-        let ops_per_second = if duration.as_secs_f64() > 0.0 {
-            total_primes as f64 / duration.as_secs_f64()
+        let work_seconds = (sieve_duration + matrix_duration).as_secs_f64();
+        let ops_per_second = if work_seconds > 0.0 {
+            total_primes as f64 / work_seconds
         } else {
             0.0
         };
 
-        // Calculate component scores
-        // Prime sieve baseline: 1M primes/second = score 1000
-        let prime_sieve_score = ops_per_second / 1_000.0;
+        let (prime_sieve_score, matrix_multiply_score) = component_scores(
+            total_primes,
+            sieve_duration.as_secs_f64(),
+            self.matrix_size,
+            self.iterations,
+            matrix_duration.as_secs_f64(),
+        );
 
-        // Matrix multiply baseline: duration for iterations
-        // Expected ~2s for 10 iterations of 200x200 on baseline = score 1000
-        let matrix_baseline_ms = 2000.0;
-        let matrix_multiply_score = if duration_ms > 0 {
-            matrix_baseline_ms / (duration_ms as f64 / self.iterations as f64) * 1000.0
-        } else {
-            0.0
-        };
-
-        // Combined score (60% prime sieve, 40% matrix multiply)
-        // Prime sieve emphasizes integer ops (common in parsing)
-        // Matrix multiply emphasizes FP and cache (common in codegen)
+        // Prime sieve emphasizes integer operations; matrix multiply exercises
+        // floating-point work and cache behavior. Neither score includes the
+        // other component's runtime.
         let score = prime_sieve_score * 0.6 + matrix_multiply_score * 0.4;
 
         let result = CpuBenchmarkResult {
@@ -242,6 +251,32 @@ impl CpuBenchmark {
     }
 }
 
+/// Compute scores from independently timed work, retaining sub-millisecond
+/// precision. The matrix reference is 2 seconds for TEN 200x200 multiplies,
+/// i.e. 200 ms per iteration, not 2000 ms per iteration. Scale by n^3 so a
+/// smaller configured workload cannot inflate the reported throughput.
+fn component_scores(
+    total_primes: u64,
+    sieve_seconds: f64,
+    matrix_size: usize,
+    iterations: u32,
+    matrix_seconds: f64,
+) -> (f64, f64) {
+    let prime_score = if sieve_seconds.is_finite() && sieve_seconds > 0.0 {
+        // Reference: one million primes per second = 1000 points.
+        total_primes as f64 / sieve_seconds / 1000.0
+    } else {
+        0.0
+    };
+    let matrix_score = if matrix_seconds.is_finite() && matrix_seconds > 0.0 {
+        let relative_work = (matrix_size as f64 / 200.0).powi(3) * iterations as f64;
+        0.2 * relative_work / matrix_seconds * 1000.0
+    } else {
+        0.0
+    };
+    (prime_score, matrix_score)
+}
+
 /// Run the Sieve of Eratosthenes to count primes below `limit`.
 ///
 /// This benchmark exercises:
@@ -303,7 +338,9 @@ pub fn matrix_multiply(size: usize) -> f64 {
         }
     }
 
-    // Return checksum from center of result
+    // Returning only the center element is not enough to make the rest of
+    // the matrix observable to an optimizing compiler. Keep the whole work.
+    black_box(&c);
     c[size / 2][size / 2]
 }
 
@@ -466,9 +503,12 @@ mod tests {
         );
 
         assert!(result.score > 0.0);
-        assert!(result.duration_ms > 0);
+        // A real small workload can finish in less than one millisecond;
+        // integer display rounding must not erase its component scores.
+        assert!(result.prime_sieve_score > 0.0);
+        assert!(result.matrix_multiply_score > 0.0);
         assert!(result.ops_per_second > 0.0);
-        info!("VERIFY: Benchmark produced positive score and duration");
+        info!("VERIFY: Benchmark produced positive component scores and throughput");
 
         info!("TEST PASS: test_cpu_benchmark_produces_positive_score");
     }
@@ -664,5 +704,61 @@ mod tests {
         info!("VERIFY: Benchmark functions work correctly");
 
         info!("TEST PASS: test_convenience_functions");
+    }
+
+    #[test]
+    fn component_reference_times_score_one_thousand() {
+        let (prime, matrix) = component_scores(1_000_000, 1.0, 200, 10, 2.0);
+        assert!((prime - 1000.0).abs() < 1e-9);
+        assert!((matrix - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn component_timings_do_not_contaminate_each_other() {
+        let baseline = component_scores(1_000_000, 1.0, 200, 10, 2.0);
+        let slow_matrix = component_scores(1_000_000, 1.0, 200, 10, 4.0);
+        assert_eq!(baseline.0, slow_matrix.0);
+        assert_eq!(baseline.1, slow_matrix.1 * 2.0);
+        let slow_sieve = component_scores(1_000_000, 2.0, 200, 10, 2.0);
+        assert_eq!(baseline.0, slow_sieve.0 * 2.0);
+        assert_eq!(baseline.1, slow_sieve.1);
+    }
+
+    #[test]
+    fn matrix_score_accounts_for_workload_size_and_iteration_count() {
+        let (_, full) = component_scores(0, 0.0, 200, 10, 2.0);
+        let (_, one) = component_scores(0, 0.0, 200, 1, 0.2);
+        let (_, half_size) = component_scores(0, 0.0, 100, 10, 0.25);
+        assert!((full - one).abs() < 1e-9);
+        assert!((full - half_size).abs() < 1e-9);
+    }
+
+    #[test]
+    fn component_scores_preserve_sub_millisecond_measurements() {
+        let (prime, matrix) = component_scores(100, 0.0001, 20, 1, 0.0002);
+        assert!((prime - 1000.0).abs() < 1e-9);
+        assert!((matrix - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_or_invalid_component_times_are_not_measurements() {
+        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(component_scores(100, seconds, 200, 10, seconds), (0.0, 0.0));
+        }
+        assert_eq!(component_scores(0, 1.0, 0, 0, 1.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn zero_iterations_skip_warmup_and_report_missing_evidence() {
+        // A huge configured matrix must never be allocated for an empty run.
+        let result = CpuBenchmark::new()
+            .with_iterations(0)
+            .with_matrix_size(usize::MAX)
+            .with_warmup(true)
+            .run();
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.duration_ms, 0);
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.ops_per_second, 0.0);
     }
 }

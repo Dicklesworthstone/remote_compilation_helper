@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use rabs_sandbox::process_context::CommandContext;
 use rabs_wkr::jobserver::{replace_with_worker_local, worker_makeflags};
-use rabs_wkr::session::{CanonicalExecRequest, execute_canonical};
+use rabs_wkr::session::{CanonicalExecRequest, ExecutionResources, execute_canonical};
 
 /// The RABS fleet shape: unprivileged userns + bubblewrap. On any other
 /// host SKIP loudly rather than fake a pass.
@@ -38,6 +38,73 @@ fn namespace_supported() -> bool {
         );
     }
     ok
+}
+
+fn link_or_copy(src: &std::path::Path, dst: &std::path::Path) {
+    if std::fs::hard_link(src, dst).is_err() {
+        std::fs::copy(src, dst).unwrap();
+    }
+}
+
+fn stage_minimal_rustc(host_toolchain: &std::path::Path) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let staged = tempfile::Builder::new()
+        .prefix("rabs-min-rustc-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let root = staged.path();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    let rustc_src = host_toolchain.join("bin/rustc");
+    link_or_copy(&rustc_src, &root.join("bin/rustc"));
+
+    let vv = std::process::Command::new(&rustc_src)
+        .arg("-vV")
+        .output()
+        .expect("rustc -vV");
+    let vv_str = String::from_utf8_lossy(&vv.stdout);
+    let host_triple = vv_str
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("host triple in rustc -vV")
+        .trim();
+
+    for entry in std::fs::read_dir(host_toolchain.join("lib")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if (name_str.starts_with("librustc_driver-") || name_str.starts_with("libLLVM"))
+            && entry.file_type().unwrap().is_file()
+        {
+            link_or_copy(&entry.path(), &root.join("lib").join(&name));
+        }
+    }
+
+    let rel_target_lib = format!("lib/rustlib/{host_triple}/lib");
+    std::fs::create_dir_all(root.join(&rel_target_lib)).unwrap();
+    for entry in std::fs::read_dir(host_toolchain.join(&rel_target_lib)).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if (name_str.ends_with(".rlib") || name_str.ends_with(".rmeta"))
+            && !name_str.starts_with("libtest-")
+            && !name_str.starts_with("libproc_macro-")
+            && entry.file_type().unwrap().is_file()
+        {
+            link_or_copy(&entry.path(), &root.join(&rel_target_lib).join(&name));
+        }
+    }
+    let rel_target_bin = format!("lib/rustlib/{host_triple}/bin");
+    for rel_tool in ["rust-lld", "gcc-ld/ld.lld"] {
+        let src_tool = host_toolchain.join(&rel_target_bin).join(rel_tool);
+        if src_tool.is_file() {
+            let dst_tool = root.join(&rel_target_bin).join(rel_tool);
+            std::fs::create_dir_all(dst_tool.parent().unwrap()).unwrap();
+            link_or_copy(&src_tool, &dst_tool);
+        }
+    }
+    staged
 }
 
 #[test]
@@ -82,6 +149,9 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let cargo_home = tempfile::tempdir().expect("cargo-home tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
+    let host_budget_root = tempfile::tempdir().expect("host budget tempdir");
+    let host_budget = rabs_wkr::host_budget::HostBudget::open(host_budget_root.path(), 6)
+        .expect("fixed shared host capacity");
 
     // The action writes EVERY coordination var it can see into its own
     // writable workspace — the only honest way to assert what the
@@ -102,6 +172,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             toolchain_backing: toolchain.path().display().to_string(),
             toolchain_identity: None,
             workspace_backing: workspace.path().display().to_string(),
+            dependency_context: None,
             jobserver_grant: requested_grant,
             command_context: CommandContext::default(),
         };
@@ -109,7 +180,11 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             &request,
             cargo_home.path(),
             home.path(),
-            6,
+            ExecutionResources {
+                slots: 6,
+                host_budget: Some(&host_budget),
+                target_cache: None,
+            },
             &workspace.path().join("spills"),
         );
 
@@ -165,6 +240,80 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             "jobserver setup does not edit source"
         );
     }
+
+    // Exercise the actual executor's cancellation/drain release boundary. The
+    // child ignores TERM and owns a descendant; the follow-up needs the ENTIRE
+    // host grant, so neither a leaked lease nor an unfinished two-credit owner
+    // can be hidden by spare host capacity.
+    use rabs_wkr::execution::{ExecutionControl, StopReason};
+    use rabs_wkr::session::execute_canonical_controlled;
+    use std::time::{Duration, Instant};
+    let control = ExecutionControl::new(Duration::from_secs(15)).unwrap();
+    let mut request = CanonicalExecRequest {
+        request_id: 424_243,
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "trap '' TERM; printf ready > /__rabs/workspace/host-budget-started; sleep 30 & wait"
+                .into(),
+        ],
+        toolchain_backing: toolchain.path().display().to_string(),
+        toolchain_identity: None,
+        workspace_backing: workspace.path().display().to_string(),
+        dependency_context: None,
+        jobserver_grant: Some(2),
+        command_context: CommandContext::default(),
+    };
+    let resources = ExecutionResources {
+        slots: 6,
+        host_budget: Some(&host_budget),
+        target_cache: None,
+    };
+    let result = std::thread::scope(|scope| {
+        let execution = scope.spawn(|| {
+            execute_canonical_controlled(
+                &request,
+                cargo_home.path(),
+                home.path(),
+                resources,
+                &workspace.path().join("spills"),
+                &control,
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while !workspace.path().join("host-budget-started").is_file() {
+            assert!(
+                !execution.is_finished(),
+                "worker refused before real child admission"
+            );
+            assert!(Instant::now() < until, "real worker child did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(control.cancel(StopReason::Cancelled));
+        execution.join().unwrap()
+    });
+    assert!(
+        result.executed,
+        "cancellation must finish the managed process wait: {result:?}"
+    );
+    assert_eq!(result.exit_code, StopReason::Cancelled.exit_code());
+    assert_eq!(result.residual_group_members, 0);
+    request.request_id += 1;
+    request.args = vec!["-c".into(), "test \"$NUM_JOBS\" = 6".into()];
+    request.jobserver_grant = Some(6);
+    let after = execute_canonical(
+        &request,
+        cargo_home.path(),
+        home.path(),
+        resources,
+        &workspace.path().join("spills"),
+    );
+    assert!(
+        after.executed,
+        "clean cancellation must return the whole host grant: {after:?}"
+    );
+    assert_eq!(after.exit_code, 0);
+    assert_eq!(after.residual_group_members, 0);
 }
 
 #[test]
@@ -191,6 +340,7 @@ fn jobserver_setup_failure_refuses_execution() {
         toolchain_backing: toolchain.path().display().to_string(),
         toolchain_identity: None,
         workspace_backing: workspace.path().display().to_string(),
+        dependency_context: None,
         jobserver_grant: Some(2),
         command_context: CommandContext::default(),
     };
@@ -198,7 +348,7 @@ fn jobserver_setup_failure_refuses_execution() {
         &request,
         cargo_home.path(),
         &obstruction,
-        6,
+        ExecutionResources::new(6),
         &workspace.path().join("spills"),
     );
     assert_eq!(result.request_id, request.request_id);
@@ -223,10 +373,12 @@ fn real_rustc_and_its_output_run_with_exact_workspace_member_context() {
     }
     let cargo =
         std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo supplies its path")).unwrap();
-    let toolchain = cargo
+    let host_toolchain = cargo
         .parent()
         .and_then(std::path::Path::parent)
         .expect("toolchain/bin/cargo");
+    let staged_toolchain = stage_minimal_rustc(host_toolchain);
+    let toolchain = staged_toolchain.path();
     let workspace = tempfile::tempdir().unwrap();
     let cargo_home = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -261,6 +413,7 @@ fn main() {
         toolchain_backing: toolchain.to_str().unwrap().into(),
         toolchain_identity: None,
         workspace_backing: workspace.path().to_str().unwrap().into(),
+        dependency_context: None,
         jobserver_grant: Some(1),
         command_context: CommandContext::new("/__rabs/workspace/member", vec![
             ("CARGO_PKG_NAME".into(), "context-member".into()),
@@ -270,12 +423,12 @@ fn main() {
         ]).unwrap(),
     };
     let original = request.clone();
-    let control = ExecutionControl::new(std::time::Duration::from_secs(60)).unwrap();
+    let control = ExecutionControl::new(std::time::Duration::from_secs(120)).unwrap();
     let result = execute_canonical_controlled(
         &request,
         cargo_home.path(),
         home.path(),
-        4,
+        ExecutionResources::new(4),
         spills.path(),
         &control,
     );
@@ -288,6 +441,751 @@ fn main() {
         request, original,
         "execution does not rewrite the declared context"
     );
+}
+
+fn wait_dependency_execution(
+    mut task: rabs_wkr::execution::ExecutionTask,
+) -> Result<rabs_wkr::execution::ExecutionCompletion, String> {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::{Duration, Instant};
+
+    struct Signal(std::thread::Thread);
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Signal(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(task.wait());
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dependency worker execution timed out"
+        );
+        std::thread::park_timeout(Duration::from_millis(10));
+    }
+}
+
+/// A real rustc invocation, retained source owner, pinned toolchain lease,
+/// private output capture and the dependency-exec-v6 alias namespace. The sealed
+/// source bundle uses package/ while rustc retains its original source paths.
+/// This exercises the worker executor; authenticated transport is covered by
+/// its session tests.
+#[test]
+fn real_dependency_rustc_preserves_paths_env_and_stock_metadata() {
+    use rabs_sandbox::dependency_context::DependencyExecContext;
+    use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    use rabs_sandbox::toolchain_dataset::{ToolchainLimits, fingerprint_toolchain};
+    use rabs_wkr::artifacts::ArtifactPlan;
+    use rabs_wkr::execution::ExecutionTask;
+    use rabs_wkr::session::execute_uploaded_canonical_controlled;
+    use rabs_wkr::source_transfer::{SourceTransferState, hex};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+    use std::time::Duration;
+
+    if !namespace_supported() {
+        return;
+    }
+    let cargo =
+        std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo supplies its path")).unwrap();
+    let host_toolchain = cargo.parent().and_then(Path::parent).unwrap();
+    let toolchain = stage_minimal_rustc(host_toolchain);
+    let identity =
+        fingerprint_toolchain(toolchain.path(), &ToolchainLimits::default(), || false).unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let output_owner = tempfile::tempdir().unwrap();
+    let out = output_owner.path().join("target/debug/deps");
+    std::fs::create_dir_all(&out).unwrap();
+    let loader_parent = out.parent().unwrap().to_path_buf();
+    let empty_search = tempfile::tempdir().unwrap();
+    std::fs::create_dir(source.path().join("src")).unwrap();
+    let files: [(&str, &[u8]); 2] = [
+        (
+            "src/lib.rs",
+            br#"pub const FLAVOR: &str = env!("DEPENDENCY_FLAVOR");
+pub const JOBS: Option<&str> = option_env!("NUM_JOBS");
+pub const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+pub const HERE: &str = file!();
+pub const INCLUDED: &str = include_str!("message.txt");
+"#,
+        ),
+        ("src/message.txt", b"immutable included source\n"),
+    ];
+    for (name, bytes) in files {
+        std::fs::write(source.path().join(name), bytes).unwrap();
+    }
+    // Only the transfer layout changes. Both compilers still observe the
+    // original source directory and unchanged relative compiler arguments.
+    let manifest = SourceManifest::new(
+        files
+            .iter()
+            .map(|(path, bytes)| SourceFile {
+                path: format!("package/{path}"),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(bytes).into(),
+                executable: false,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let manifest_json = json!({
+        "manifest_sha256":hex(&manifest.digest()),
+        "files":files.iter().map(|(path, bytes)| json!({
+            "path":format!("package/{path}"),"bytes":bytes.len(),
+            "sha256":hex(&Sha256::digest(bytes)),"executable":false,
+        })).collect::<Vec<_>>(),
+    });
+    let visible_toolchain = toolchain.path().to_str().unwrap().to_owned();
+    let compiler = toolchain
+        .path()
+        .join("bin/rustc")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let visible_source = source.path().to_str().unwrap().to_owned();
+    let visible_out = out.as_path().to_str().unwrap().to_owned();
+    let visible_empty = empty_search.path().to_str().unwrap().to_owned();
+    let loader = toolchain.path().join("lib");
+    let cohort = observe_runtime_cohort(
+        Path::new(&compiler),
+        toolchain.path(),
+        std::slice::from_ref(&loader),
+        out.as_path(),
+    )
+    .unwrap();
+    let args = vec![
+        "--crate-name".to_owned(),
+        "dependency_fixture".to_owned(),
+        "--crate-type".to_owned(),
+        "lib".to_owned(),
+        "--edition=2024".to_owned(),
+        "--emit=dep-info,metadata".to_owned(),
+        "-L".to_owned(),
+        format!("dependency={visible_out}"),
+        "-L".to_owned(),
+        format!("dependency={visible_empty}"),
+        "--out-dir".to_owned(),
+        visible_out.clone(),
+        "src/lib.rs".to_owned(),
+    ];
+    for (iteration, number) in [None, Some(""), Some("19")].into_iter().enumerate() {
+        let mut env = vec![
+            ("CARGO_MANIFEST_DIR".to_owned(), visible_source.clone()),
+            (
+                "DEPENDENCY_FLAVOR".to_owned(),
+                "spaces \"quotes\" $HOME\n雪".to_owned(),
+            ),
+            (
+                "LD_LIBRARY_PATH".to_owned(),
+                format!(
+                    "{}:{}:{}",
+                    out.display(),
+                    loader_parent.display(),
+                    loader.display()
+                ),
+            ),
+        ];
+        if let Some(number) = number {
+            env.push(("NUM_JOBS".to_owned(), number.to_owned()));
+        }
+        let stock = std::process::Command::new(&compiler)
+            .args(&args)
+            .env_clear()
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .current_dir(source.path())
+            .output()
+            .unwrap();
+        assert!(
+            stock.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stock.stderr)
+        );
+        let expected = ["dependency_fixture.d", "libdependency_fixture.rmeta"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    std::fs::read(out.as_path().join(name)).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let request_id = 425_000 + iteration as u64;
+        let wire = json!({"kind":"canonical-exec","request_id":request_id,"source_manifest":manifest_json});
+        let mut transfer = SourceTransferState::default();
+        transfer
+            .handle(
+                &json!({"kind":"source-begin","request_id":request_id,"manifest":manifest_json}),
+                true,
+                false,
+            )
+            .unwrap();
+        for (name, bytes) in files {
+            transfer
+                .handle(
+                    &json!({"kind":"source-chunk","request_id":request_id,
+                "manifest_sha256":hex(&manifest.digest()),"path":format!("package/{name}"),
+                "offset":0,"data_hex":hex(bytes),
+                "chunk_sha256":hex(&Sha256::digest(bytes))}),
+                    true,
+                    false,
+                )
+                .unwrap();
+        }
+        transfer
+            .handle(
+                &json!({"kind":"source-seal","request_id":request_id,
+            "manifest_sha256":hex(&manifest.digest())}),
+                true,
+                false,
+            )
+            .unwrap();
+        let source_owner = transfer.take_prepared(&wire).unwrap().unwrap();
+        let context = DependencyExecContext::new_with_loader_dirs(
+            visible_source.clone(),
+            visible_source.clone(),
+            visible_toolchain.clone(),
+            compiler.clone(),
+            visible_out.clone(),
+            vec![visible_out.clone(), visible_empty.clone()],
+            vec![
+                visible_out.clone(),
+                loader_parent.to_str().unwrap().to_owned(),
+            ],
+            env,
+            cohort.bytes,
+        )
+        .unwrap();
+        assert!(
+            context.artifact_roots().is_empty(),
+            "the leaf constructor must select an explicit empty artifact closure"
+        );
+        let request = CanonicalExecRequest {
+            request_id,
+            program: compiler.clone(),
+            args: args.clone(),
+            command_context: CommandContext::default(),
+            dependency_context: Some(context),
+            toolchain_backing: visible_toolchain.clone(),
+            toolchain_identity: Some(identity),
+            workspace_backing: String::new(),
+            jobserver_grant: Some(3),
+        };
+        let cargo_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let spills = tempfile::tempdir().unwrap();
+        let task = ExecutionTask::spawn_with_artifacts(
+            request_id,
+            Duration::from_secs(240),
+            ArtifactPlan::new(
+                "dependency-fixture".into(),
+                expected.iter().map(|(name, _)| name.clone()).collect(),
+            )
+            .unwrap(),
+            move |control| {
+                control.request_output_capture();
+                execute_uploaded_canonical_controlled(
+                    &request,
+                    cargo_home.path(),
+                    home.path(),
+                    ExecutionResources::new(4),
+                    spills.path(),
+                    &control,
+                    &source_owner,
+                )
+            },
+        )
+        .unwrap();
+        let mut completion = wait_dependency_execution(task).expect("complete worker execution");
+        assert!(completion.result.executed, "{:?}", completion.result);
+        assert_eq!(completion.result.exit_code, 0);
+        assert_eq!(completion.result.residual_group_members, 0);
+        let captured = completion
+            .artifacts
+            .as_mut()
+            .expect("private artifact capture");
+        for (name, bytes) in expected {
+            assert_eq!(
+                captured.read_chunk(&name, 0, bytes.len()).unwrap(),
+                bytes,
+                "{name} differs from stock rustc"
+            );
+            assert_eq!(
+                std::fs::read(out.as_path().join(&name)).unwrap(),
+                bytes,
+                "worker must not write the subscriber output directory"
+            );
+        }
+    }
+}
+
+/// Direct and transitive dependency bytes must remain readable when Cargo's
+/// input search root is also this action's output directory. Stock and worker
+/// receive identical rustc arguments; only private backing paths differ.
+#[test]
+fn real_dependency_rustc_reads_shared_output_metadata_dag() {
+    dependency_metadata_dag(false, false);
+}
+
+/// Captured Cargo OUT_DIR files must remain readable beside shared dependency
+/// inputs, including beneath a private loader-parent mount. Both compilers use
+/// the same generated paths and environment, and their actual outputs agree.
+#[test]
+fn real_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag() {
+    dependency_metadata_dag(true, false);
+}
+
+/// A real archive consumer runs through source transfer, retained toolchain,
+/// the closed worker view and exact artifact capture. Its complete bytes and
+/// diagnostics must agree with stock rustc despite changed original OUT_DIR.
+#[test]
+fn real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag() {
+    dependency_metadata_dag(true, true);
+}
+
+fn dependency_metadata_dag(with_generated: bool, archive: bool) {
+    use rabs_sandbox::dependency_context::{
+        DependencyArtifactRoot, DependencyExecContext, DependencyExecutionMode,
+        DependencyIsolationSupport,
+    };
+    use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
+    use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceFile, SourceManifest};
+    use rabs_sandbox::toolchain_dataset::{ToolchainLimits, fingerprint_toolchain};
+    use rabs_wkr::artifacts::ArtifactPlan;
+    use rabs_wkr::execution::ExecutionTask;
+    use rabs_wkr::output::MAX_OUTPUT_CHUNK_BYTES;
+    use rabs_wkr::session::{execute_uploaded_canonical_controlled, sha256_hex};
+    use rabs_wkr::source_transfer::{SourceTransferState, hex};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mode = if archive {
+        DependencyExecutionMode::Rlib
+    } else {
+        DependencyExecutionMode::Metadata
+    };
+    let support = DependencyIsolationSupport::probe(mode);
+    if !support.is_supported() {
+        eprintln!(
+            "SKIP: dependency {} isolation unavailable: {:?}",
+            mode.as_str(),
+            support.missing()
+        );
+        return;
+    }
+    let cargo =
+        std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo supplies its path")).unwrap();
+    let host_toolchain = cargo.parent().and_then(Path::parent).unwrap();
+    let toolchain = stage_minimal_rustc(host_toolchain);
+    let identity =
+        fingerprint_toolchain(toolchain.path(), &ToolchainLimits::default(), || false).unwrap();
+    let compiler = toolchain.path().join("bin/rustc");
+    let loader = toolchain.path().join("lib");
+    let source = tempfile::tempdir().unwrap();
+    let upstream_source = tempfile::tempdir().unwrap();
+    let output_owner = tempfile::tempdir().unwrap();
+    let out = output_owner.path().join("target/debug/deps");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir(source.path().join("src")).unwrap();
+    std::fs::write(
+        upstream_source.path().join("leaf.rs"),
+        "pub struct Token(pub u32);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        upstream_source.path().join("middle.rs"),
+        "pub use dag_leaf::Token;\npub fn token() -> Token { Token(42) }\n",
+    )
+    .unwrap();
+    // Top has no direct --extern for leaf. Resolving the field on Token and
+    // its public return type requires the transitive crate metadata.
+    let mut top_source = br#"pub fn answer() -> u32 { dag_middle::token().0 }
+pub fn token() -> dag_middle::Token { dag_middle::token() }
+pub const FLAVOR: &str = env!("SHARED_DAG_FLAVOR");
+pub const SOURCE: &str = file!();
+"#
+    .to_vec();
+    let generated_root = output_owner.path().join("target/debug/build/dag_top/out");
+    let generated_source = b"pub const GENERATED_VALUE: u32 = 73;\npub const GENERATED_FLAVOR: &str = env!(\"BUILD_SCRIPT_FLAVOR\");\npub const GENERATED_SOURCE: &str = file!();\n";
+    if with_generated {
+        std::fs::create_dir_all(generated_root.join("nested")).unwrap();
+        top_source.extend_from_slice(b"include!(concat!(env!(\"OUT_DIR\"), \"/nested/generated.rs\"));\npub const FROM_GENERATOR: u32 = GENERATED_VALUE;\n");
+    }
+    std::fs::write(source.path().join("src/lib.rs"), &top_source).unwrap();
+
+    for (name, file) in [("dag_leaf", "leaf.rs"), ("dag_middle", "middle.rs")] {
+        let mut command = Command::new(&compiler);
+        command
+            .arg(format!("--crate-name={name}"))
+            .args([
+                "--crate-type=rlib",
+                "--edition=2024",
+                "--emit=link,metadata",
+            ])
+            .arg(format!("--out-dir={}", out.display()))
+            .arg(upstream_source.path().join(file))
+            .env_clear()
+            .env("LD_LIBRARY_PATH", &loader)
+            .stdin(Stdio::null());
+        if name == "dag_middle" {
+            command
+                .args(["-L", &format!("dependency={}", out.display())])
+                .args([
+                    "--extern",
+                    &format!("dag_leaf={}", out.join("libdag_leaf.rmeta").display()),
+                ]);
+        }
+        let produced = command.output().unwrap();
+        assert!(
+            produced.status.success(),
+            "compile real {name}: {}",
+            String::from_utf8_lossy(&produced.stderr)
+        );
+    }
+    let loader_parent = out.parent().unwrap();
+    let visible_out = out.to_str().unwrap().to_owned();
+    let cohort = observe_runtime_cohort(
+        &compiler,
+        toolchain.path(),
+        std::slice::from_ref(&loader),
+        &out,
+    )
+    .unwrap();
+
+    let direct_kinds: &[&str] = if archive {
+        &["rlib"]
+    } else {
+        &["rmeta", "rlib"]
+    };
+    for (iteration, direct_kind) in direct_kinds.iter().enumerate() {
+        let args = vec![
+            "--crate-name=dag_top".to_owned(),
+            "--crate-type=lib".to_owned(),
+            "--edition=2024".to_owned(),
+            if archive {
+                "--emit=dep-info,metadata,link"
+            } else {
+                "--emit=dep-info,metadata"
+            }
+            .to_owned(),
+            "--error-format=json".to_owned(),
+            "--json=artifacts".to_owned(),
+            "--cap-lints=allow".to_owned(),
+            "-L".to_owned(),
+            format!("dependency={visible_out}"),
+            "--extern".to_owned(),
+            format!(
+                "dag_middle={}",
+                out.join(format!("libdag_middle.{direct_kind}")).display()
+            ),
+            "--out-dir".to_owned(),
+            visible_out.clone(),
+            "src/lib.rs".to_owned(),
+        ];
+        let mut env = vec![
+            (
+                "CARGO_MANIFEST_DIR".to_owned(),
+                source.path().to_str().unwrap().to_owned(),
+            ),
+            (
+                "SHARED_DAG_FLAVOR".to_owned(),
+                "retained DAG inputs".to_owned(),
+            ),
+            (
+                "LD_LIBRARY_PATH".to_owned(),
+                format!(
+                    "{}:{}:{}",
+                    out.display(),
+                    loader_parent.display(),
+                    loader.display()
+                ),
+            ),
+        ];
+        if with_generated {
+            std::fs::write(generated_root.join("nested/generated.rs"), generated_source).unwrap();
+            env.push((
+                "OUT_DIR".to_owned(),
+                generated_root.to_str().unwrap().to_owned(),
+            ));
+            env.push((
+                "BUILD_SCRIPT_FLAVOR".to_owned(),
+                "captured Cargo directive".to_owned(),
+            ));
+        }
+        let stock = Command::new(&compiler)
+            .args(&args)
+            .env_clear()
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .current_dir(source.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            stock.status.success(),
+            "stock {direct_kind} consumer: {}",
+            String::from_utf8_lossy(&stock.stderr)
+        );
+        assert!(
+            !stock.stderr.is_empty(),
+            "real rustc must emit artifact notifications"
+        );
+        let names: &[&str] = if archive {
+            &["dag_top.d", "libdag_top.rlib", "libdag_top.rmeta"]
+        } else {
+            &["dag_top.d", "libdag_top.rmeta"]
+        };
+        let expected: BTreeMap<_, _> = names
+            .iter()
+            .copied()
+            .map(|name| (name.to_owned(), std::fs::read(out.join(name)).unwrap()))
+            .collect();
+        let mut retained = BTreeMap::from([
+            ("package/src/lib.rs".to_owned(), top_source.to_vec()),
+            (
+                "dependencies/0000/libdag_leaf.rmeta".to_owned(),
+                std::fs::read(out.join("libdag_leaf.rmeta")).unwrap(),
+            ),
+            (
+                "dependencies/0000/libdag_leaf.rlib".to_owned(),
+                std::fs::read(out.join("libdag_leaf.rlib")).unwrap(),
+            ),
+            (
+                "dependencies/0000/libdag_middle.rmeta".to_owned(),
+                std::fs::read(out.join("libdag_middle.rmeta")).unwrap(),
+            ),
+            (
+                "dependencies/0000/libdag_middle.rlib".to_owned(),
+                std::fs::read(out.join("libdag_middle.rlib")).unwrap(),
+            ),
+        ]);
+        if with_generated {
+            retained.insert(
+                "generated/nested/generated.rs".to_owned(),
+                generated_source.to_vec(),
+            );
+            // This worker-boundary oracle proves retained bytes are mounted.
+            // The live coordinator separately refuses changed original inputs.
+            std::fs::write(
+                generated_root.join("nested/generated.rs"),
+                b"changed outside retained snapshot",
+            )
+            .unwrap();
+            let dep_info = std::str::from_utf8(&expected["dag_top.d"]).unwrap();
+            assert!(
+                dep_info.contains(generated_root.join("nested/generated.rs").to_str().unwrap())
+            );
+            assert!(dep_info.contains("# env-dep:OUT_DIR="));
+            assert!(dep_info.contains("# env-dep:BUILD_SCRIPT_FLAVOR=captured Cargo directive"));
+        }
+        let manifest = SourceManifest::new(
+            retained
+                .iter()
+                .map(|(path, bytes)| SourceFile {
+                    path: path.clone(),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let manifest_json = json!({
+            "manifest_sha256":hex(&manifest.digest()),
+            "files":retained.iter().map(|(path, bytes)| json!({
+                "path":path,"bytes":bytes.len(),"sha256":hex(&Sha256::digest(bytes)),
+                "executable":false,
+            })).collect::<Vec<_>>(),
+        });
+        let request_id = 426_000
+            + if with_generated { 1_000 } else { 0 }
+            + if archive { 2_000 } else { 0 }
+            + iteration as u64;
+        let wire = json!({"kind":"canonical-exec", "request_id":request_id,
+            "source_manifest":manifest_json});
+        let mut transfer = SourceTransferState::default();
+        transfer
+            .handle(
+                &json!({"kind":"source-begin","request_id":request_id,
+            "manifest":manifest_json}),
+                true,
+                false,
+            )
+            .unwrap();
+        for (path, bytes) in &retained {
+            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                transfer
+                    .handle(
+                        &json!({"kind":"source-chunk","request_id":request_id,
+                    "manifest_sha256":hex(&manifest.digest()),"path":path,
+                    "offset":index * MAX_SOURCE_CHUNK,"data_hex":hex(chunk),
+                    "chunk_sha256":hex(&Sha256::digest(chunk))}),
+                        true,
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+        transfer
+            .handle(
+                &json!({"kind":"source-seal","request_id":request_id,
+            "manifest_sha256":hex(&manifest.digest())}),
+                true,
+                false,
+            )
+            .unwrap();
+        let source_owner = transfer.take_prepared(&wire).unwrap().unwrap();
+        let context = DependencyExecContext::new_with_generated_artifacts(
+            source.path().to_str().unwrap().to_owned(),
+            source.path().to_str().unwrap().to_owned(),
+            toolchain.path().to_str().unwrap().to_owned(),
+            compiler.to_str().unwrap().to_owned(),
+            visible_out.clone(),
+            vec![visible_out.clone()],
+            vec![
+                visible_out.clone(),
+                loader_parent.to_str().unwrap().to_owned(),
+            ],
+            vec![DependencyArtifactRoot {
+                path: visible_out.clone(),
+                prefix: "dependencies/0000".to_owned(),
+            }],
+            with_generated.then(|| generated_root.to_str().unwrap().to_owned()),
+            env,
+            cohort.bytes,
+        )
+        .unwrap()
+        .with_execution_mode(mode);
+        let request = CanonicalExecRequest {
+            request_id,
+            program: compiler.to_str().unwrap().to_owned(),
+            args: args.clone(),
+            command_context: CommandContext::default(),
+            dependency_context: Some(context),
+            toolchain_backing: toolchain.path().to_str().unwrap().to_owned(),
+            toolchain_identity: Some(identity),
+            workspace_backing: String::new(),
+            jobserver_grant: Some(2),
+        };
+        let cargo_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let spills = tempfile::tempdir().unwrap();
+        let task = ExecutionTask::spawn_with_artifacts(
+            request_id,
+            Duration::from_secs(240),
+            ArtifactPlan::new(
+                "shared-dependency-dag".to_owned(),
+                expected.keys().cloned().collect(),
+            )
+            .unwrap(),
+            move |control| {
+                control.request_output_capture();
+                execute_uploaded_canonical_controlled(
+                    &request,
+                    cargo_home.path(),
+                    home.path(),
+                    ExecutionResources::new(4),
+                    spills.path(),
+                    &control,
+                    &source_owner,
+                )
+            },
+        )
+        .unwrap();
+        let mut completion =
+            wait_dependency_execution(task).expect("shared dependency worker completion");
+        assert!(completion.result.executed, "{:?}", completion.result);
+        assert_eq!(completion.result.exit_code, 0, "{:?}", completion.result);
+        assert_eq!(completion.result.residual_group_members, 0);
+        assert_eq!(completion.stop_reason, None);
+        assert_eq!(completion.result.stdout_sha256, sha256_hex(&stock.stdout));
+        assert_eq!(completion.result.stderr_sha256, sha256_hex(&stock.stderr));
+        let streams = completion
+            .outputs
+            .as_mut()
+            .expect("captured compiler diagnostics");
+        assert!(stock.stderr.len() <= MAX_OUTPUT_CHUNK_BYTES);
+        assert_eq!(
+            streams
+                .stdout
+                .read_chunk(0, MAX_OUTPUT_CHUNK_BYTES)
+                .unwrap(),
+            stock.stdout
+        );
+        assert_eq!(
+            streams
+                .stderr
+                .read_chunk(0, MAX_OUTPUT_CHUNK_BYTES)
+                .unwrap(),
+            stock.stderr
+        );
+        let captured = completion
+            .artifacts
+            .as_mut()
+            .expect("exact private output capture");
+        let captured_manifest = captured.manifest();
+        let names = captured_manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            expected.keys().map(String::as_str).collect::<Vec<_>>(),
+            "retained inputs and their mount placeholders must not be returned as outputs"
+        );
+        for (name, bytes) in &expected {
+            assert_eq!(
+                captured.read_chunk(name, 0, bytes.len()).unwrap(),
+                *bytes,
+                "{direct_kind} consumer {name} differs from stock"
+            );
+            assert_eq!(
+                std::fs::read(out.join(name)).unwrap(),
+                *bytes,
+                "worker must not change the caller's output tree"
+            );
+        }
+        for (path, bytes) in retained
+            .iter()
+            .filter(|(path, _)| path.starts_with("dependencies/"))
+        {
+            let name = path.rsplit('/').next().unwrap();
+            assert!(
+                captured.read_chunk(name, 0, 1).is_err(),
+                "input {name} leaked into output capture"
+            );
+            assert_eq!(
+                std::fs::read(out.join(name)).unwrap(),
+                *bytes,
+                "worker must not change original dependency {name}"
+            );
+        }
+        if with_generated {
+            assert!(
+                captured
+                    .read_chunk("generated/nested/generated.rs", 0, 1)
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(generated_root.join("nested/generated.rs")).unwrap(),
+                b"changed outside retained snapshot",
+                "worker must not write the original generated tree"
+            );
+        }
+    }
 }
 
 mod toolchain_binding {

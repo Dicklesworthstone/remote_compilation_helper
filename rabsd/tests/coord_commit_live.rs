@@ -498,8 +498,294 @@ fn concurrent_submission_and_dispatch_claims_collapse_at_public_api() {
     }
 }
 
+#[test]
+fn speculation_browns_out_before_foreground_and_feeds_roi_dashboard() {
+    use rabs_scheduler::speculation_brownout::{PressureBand, WorkCategory};
+    use rabsd::coord::live::SubmissionRefusal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (coord, worker) = submission_coordinator(dir.path());
+
+    let make_source = |name: &str, contents: &[u8]| {
+        let src_dir = dir.path().join(name);
+        std::fs::create_dir(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.txt"), contents).unwrap();
+        capture_submission_source(&src_dir)
+    };
+
+    // 1. Normal pressure: speculative S1 runs a real shell process to completion (saved).
+    let s1_source = make_source("s1-src", b"speculative saved\n");
+    let s1 = coord
+        .submit_action(
+            submission_from_source(Arc::clone(&s1_source)),
+            submission_join(1, SubscriberKind::Speculative),
+            now_micros(),
+            0,
+        )
+        .unwrap();
+    let mut s1_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+    let s1_backing = &s1_dispatch
+        .input()
+        .materialize_into(&dir.path().join("s1-mat"))
+        .unwrap()["workspace"];
+    let _s1_attempt = s1_dispatch.begin(&worker, 60_000).unwrap().clone();
+    for state in [
+        AttemptState::LeaseAccepted,
+        AttemptState::AwaitingInputs,
+        AttemptState::Materializing,
+    ] {
+        s1_dispatch.advance(state).unwrap();
+    }
+    let s1_starts = dir.path().join("s1-starts");
+    let s1_stdout = dir.path().join("s1-stdout");
+    let mut s1_child = SubmissionChild(
+        Command::new("/bin/sh")
+            .args(["-c", SUBMISSION_COMMAND, "q006-s1"])
+            .arg(&s1_starts)
+            .current_dir(s1_backing)
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&s1_stdout).unwrap())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    s1_dispatch.advance(AttemptState::Running).unwrap();
+    let s1_pid = s1_child.0.id().to_string();
+    s1_child.wait_until(|| std::fs::read_to_string(&s1_starts).is_ok_and(|v| v.trim() == s1_pid));
+    std::thread::sleep(Duration::from_millis(25));
+    s1_child.release_and_wait();
+    for state in [
+        AttemptState::ProcessExited,
+        AttemptState::Draining,
+        AttemptState::Finished,
+    ] {
+        s1_dispatch.advance(state).unwrap();
+    }
+    s1_dispatch.complete().unwrap();
+
+    // Start low-value speculative S2 (held running subprocess).
+    let s2_source = make_source("s2-src", b"speculative cancelled\n");
+    let s2 = coord
+        .submit_action(
+            submission_from_source(Arc::clone(&s2_source)),
+            submission_join(2, SubscriberKind::Speculative),
+            now_micros(),
+            0,
+        )
+        .unwrap();
+    let mut s2_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+    let s2_backing = &s2_dispatch
+        .input()
+        .materialize_into(&dir.path().join("s2-mat"))
+        .unwrap()["workspace"];
+    let _s2_attempt = s2_dispatch.begin(&worker, 60_000).unwrap().clone();
+    for state in [
+        AttemptState::LeaseAccepted,
+        AttemptState::AwaitingInputs,
+        AttemptState::Materializing,
+    ] {
+        s2_dispatch.advance(state).unwrap();
+    }
+    let s2_starts = dir.path().join("s2-starts");
+    let s2_stdout = dir.path().join("s2-stdout");
+    let mut s2_child = SubmissionChild(
+        Command::new("/bin/sh")
+            .args(["-c", SUBMISSION_COMMAND, "q006-s2"])
+            .arg(&s2_starts)
+            .current_dir(s2_backing)
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&s2_stdout).unwrap())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    s2_dispatch.advance(AttemptState::Running).unwrap();
+    let s2_pid = s2_child.0.id().to_string();
+    s2_child.wait_until(|| std::fs::read_to_string(&s2_starts).is_ok_and(|v| v.trim() == s2_pid));
+
+    // 2. Soft pressure: new speculation S3 is refused; running S2 survives; foreground F1 admits.
+    assert_eq!(
+        coord
+            .apply_speculation_pressure_permille(650, 600, 850)
+            .unwrap(),
+        PressureBand::Soft
+    );
+    let s3_source = make_source("s3-src", b"speculative shed\n");
+    assert_eq!(
+        coord
+            .submit_action(
+                submission_from_source(s3_source),
+                submission_join(3, SubscriberKind::Speculative),
+                now_micros(),
+                0,
+            )
+            .unwrap_err(),
+        SubmissionRefusal::Brownout
+    );
+    assert!(
+        coord
+            .submitted_actor(&s2.action_key)
+            .unwrap()
+            .unwrap()
+            .active_generation()
+            .is_some(),
+        "running speculation survives soft brownout"
+    );
+
+    // 3. Hard pressure: low-value running speculation S2 cancels and drains;
+    //    foreground F1 admits and runs its real process; cleanup remains unaffected.
+    assert_eq!(
+        coord
+            .apply_speculation_pressure_permille(900, 600, 850)
+            .unwrap(),
+        PressureBand::Hard
+    );
+    assert!(
+        coord
+            .work_category_admitted(WorkCategory::Foreground)
+            .unwrap()
+    );
+    assert!(coord.work_category_admitted(WorkCategory::Cleanup).unwrap());
+    assert!(
+        coord
+            .work_category_admitted(WorkCategory::ObjectIntegrity)
+            .unwrap()
+    );
+    let s2_actor = coord.submitted_actor(&s2.action_key).unwrap().unwrap();
+    assert!(s2_actor.active_generation().is_none());
+    assert_eq!(
+        s2_actor.attempts().next().unwrap().state,
+        AttemptState::Draining
+    );
+    let _ = s2_child.0.kill();
+    let _ = s2_child.0.wait();
+    drop(s2_dispatch);
+
+    let f1_source = make_source("f1-src", b"foreground unaffected\n");
+    let f1 = coord
+        .submit_action(
+            submission_from_source(f1_source),
+            submission_join(4, SubscriberKind::ForegroundAgent),
+            now_micros(),
+            0,
+        )
+        .unwrap();
+    let mut f1_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+    assert_eq!(f1_dispatch.input().key(), f1.action_key);
+    let f1_backing = &f1_dispatch
+        .input()
+        .materialize_into(&dir.path().join("f1-mat"))
+        .unwrap()["workspace"];
+    let _f1_attempt = f1_dispatch.begin(&worker, 60_000).unwrap().clone();
+    for state in [
+        AttemptState::LeaseAccepted,
+        AttemptState::AwaitingInputs,
+        AttemptState::Materializing,
+        AttemptState::Running,
+        AttemptState::ProcessExited,
+        AttemptState::Draining,
+        AttemptState::Finished,
+    ] {
+        f1_dispatch.advance(state).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(f1_backing.join("input.txt")).unwrap(),
+        b"foreground unaffected\n"
+    );
+    f1_dispatch.complete().unwrap();
+
+    // Cleanup succeeds under Hard pressure.
+    assert!(coord.retire_finished_action(&s1.action_key).unwrap());
+    assert!(coord.retire_finished_action(&f1.action_key).unwrap());
+
+    // Q009 ROI dashboard fed by real speculation runs.
+    let roi = coord.speculation_roi_panel().unwrap();
+    assert_eq!(roi.saved, 1);
+    assert_eq!(roi.cancelled, 1);
+    assert_eq!(roi.wasted, 1);
+    assert_eq!(roi.admissions_refused, 1);
+    assert!(roi.saved_foreground_latency_ms >= 1);
+    assert!(roi.wasted_execution_cost_ms >= 1);
+    assert_eq!(
+        roi.wasted_transfer_cost_bytes,
+        b"speculative cancelled\n".len() as u64
+    );
+    assert_eq!(
+        roi.wasted_storage_cost_bytes,
+        b"speculative cancelled\n".len() as u64
+    );
+
+    // Q010: Default-on speculation ships DefaultOff and writes durable decision receipts.
+    use rabs_cas::metadata_store::SqlValue;
+    use rabs_protocol::dashboards::SpeculationDefaultOnPosture;
+    use rabsd::coord::live::SPECULATION_DEFAULT_ON_RECEIPT_KIND;
+
+    coord
+        .set_speculation_pressure(PressureBand::Normal)
+        .unwrap();
+    assert_eq!(
+        coord.speculation_default_on_posture().unwrap(),
+        SpeculationDefaultOnPosture::DefaultOff
+    );
+    let s4_source = make_source("s4-src", b"default-on gated candidate\n");
+    assert!(
+        coord
+            .submit_default_on_speculation(
+                submission_from_source(Arc::clone(&s4_source)),
+                submission_join(40, SubscriberKind::Speculative),
+                now_micros(),
+                0,
+            )
+            .is_err()
+    );
+
+    let gated_off = coord.evaluate_speculation_default_on_gate().unwrap();
+    assert_eq!(gated_off.posture, SpeculationDefaultOnPosture::DefaultOff);
+    assert!(!gated_off.permits_default_on());
+
+    for ms in [350_u64, 480, 620] {
+        coord.record_foreground_latency_sample(false, ms).unwrap();
+    }
+    for ms in [110_u64, 150, 210] {
+        coord.record_foreground_latency_sample(true, ms).unwrap();
+    }
+    let authorized = coord.evaluate_speculation_default_on_gate().unwrap();
+    assert_eq!(authorized.posture, SpeculationDefaultOnPosture::DefaultOn);
+    assert!(authorized.permits_default_on());
+
+    let admitted_default_on = coord
+        .submit_default_on_speculation(
+            submission_from_source(s4_source),
+            submission_join(40, SubscriberKind::Speculative),
+            now_micros(),
+            0,
+        )
+        .unwrap();
+    assert!(admitted_default_on.actor_created);
+
+    let receipt_rows = open_store(dir.path())
+        .query(
+            "SELECT decision, reason FROM decision_receipts WHERE kind = ?1 ORDER BY seq ASC",
+            &[SqlValue::Text(
+                SPECULATION_DEFAULT_ON_RECEIPT_KIND.to_owned(),
+            )],
+        )
+        .unwrap();
+    assert_eq!(receipt_rows.len(), 2);
+    assert_eq!(
+        receipt_rows[0][0],
+        SqlValue::Text("default-off-gated".to_owned())
+    );
+    assert_eq!(
+        receipt_rows[1][0],
+        SqlValue::Text("default-on-authorized".to_owned())
+    );
+}
+
 /// Run the real binary over `state_dir` for a short bounded life.
 fn boot_binary(state_dir: &std::path::Path, ms: &str) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .args(["--run-for-ms", ms])
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))
@@ -608,6 +894,8 @@ struct LiveOutcomes {
 #[test]
 fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = dir.path().to_path_buf();
     let cas_root = state_dir.join("cas");
 
@@ -866,6 +1154,8 @@ fn divergence_is_classified_from_cas_bytes_after_a_restart() {
 #[test]
 fn committed_state_survives_a_kill_dash_nine_and_reboot() {
     let dir = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = dir.path().to_path_buf();
     let cas_root = state_dir.join("cas");
 
@@ -1330,6 +1620,36 @@ fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
             ServeOutcome::Served { .. }
         ),
         "advisory must never refuse on release grounds"
+    );
+
+    // bd-dockb: CoordLive derives default_build_identity() automatically, so
+    // `with_release_mode(Required)` matches a verdict recorded for the binary's
+    // own derived identity without a hand-supplied build string.
+    let derived_required =
+        CoordLive::with_cas(Arc::clone(&cas)).with_release_mode(ReleaseAuthorizationMode::Required);
+    assert_eq!(
+        derived_required.build_identity(),
+        rabs_protocol::release_authorization::default_build_identity()
+    );
+    let derived_verdict = ReleaseVerdict {
+        build: rabs_protocol::release_authorization::default_build_identity(),
+        ..verdict.clone()
+    };
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        store
+            .record_release_verdict(&derived_verdict)
+            .expect("record derived verdict");
+    }
+    let target = next_worktree();
+    assert!(
+        matches!(
+            derived_required
+                .serve_action(&sample_action_key(), &target, &expected(), now, 0)
+                .expect("serve with derived build identity"),
+            ServeOutcome::Served { .. }
+        ),
+        "derived build identity must authorize Required mode when recorded"
     );
 
     // Unused-variable guard: the verdict type is the crossing point

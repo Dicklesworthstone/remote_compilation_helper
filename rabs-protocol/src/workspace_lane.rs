@@ -341,4 +341,268 @@ mod tests {
             WorkspaceLane::DependencyOrLocalOnly
         );
     }
+
+    #[test]
+    fn m012_rmeta_equality_and_skip_rate_corpus_experiment_produces_go_no_go_report() {
+        let policy = RmetaExperimentProceedPolicy {
+            min_safe_skip_gain_bps: 2_000, // 20% minimum skip-rate improvement required
+            candidate_projection_epoch: 2,
+            rollback_projection_epoch: 1,
+        };
+
+        // Case 1: Candidate projection has a shadow divergence on an inline-generic/span shift -> NO-GO!
+        let divergent_corpus = vec![
+            RmetaCorpusSample {
+                canonicalized_first: true,
+                edit_kind: UpstreamEditKind::ImplementationBodyOnly,
+                exact_rmeta_byte_identical: true,
+                candidate_projection_matched: true,
+                shadow_downstream_matched: true,
+                oversensitivity: RmetaOversensitivitySource::None,
+            },
+            RmetaCorpusSample {
+                canonicalized_first: true,
+                edit_kind: UpstreamEditKind::ImplementationBodyOnly,
+                exact_rmeta_byte_identical: false,
+                candidate_projection_matched: true,
+                shadow_downstream_matched: false, // shadow execution diverged!
+                oversensitivity: RmetaOversensitivitySource::SourceSpanLineShift,
+            },
+        ];
+        let no_go_report =
+            evaluate_rmeta_corpus_experiment(&divergent_corpus, &policy).expect("valid corpus");
+        assert_eq!(no_go_report.shadow_divergences, 1);
+        assert_eq!(
+            no_go_report.recommendation,
+            RmetaProjectionRecommendation::NoGoKeepConservativeExactKeys {
+                reason: "shadow-execution-divergence-detected",
+                rollback_epoch: 1,
+            }
+        );
+
+        // Case 2: Zero shadow divergences and 60% safe skip rate (>= 20% threshold) -> GO!
+        let clean_corpus = vec![
+            RmetaCorpusSample {
+                canonicalized_first: true,
+                edit_kind: UpstreamEditKind::ImplementationBodyOnly,
+                exact_rmeta_byte_identical: true,
+                candidate_projection_matched: true,
+                shadow_downstream_matched: true,
+                oversensitivity: RmetaOversensitivitySource::None,
+            },
+            RmetaCorpusSample {
+                canonicalized_first: true,
+                edit_kind: UpstreamEditKind::ImplementationBodyOnly,
+                exact_rmeta_byte_identical: false,
+                candidate_projection_matched: true,
+                shadow_downstream_matched: true,
+                oversensitivity: RmetaOversensitivitySource::SourceSpanLineShift,
+            },
+            RmetaCorpusSample {
+                canonicalized_first: true,
+                edit_kind: UpstreamEditKind::ImplementationBodyOnly,
+                exact_rmeta_byte_identical: false,
+                candidate_projection_matched: true,
+                shadow_downstream_matched: true,
+                oversensitivity: RmetaOversensitivitySource::CrateMetadataHash,
+            },
+            RmetaCorpusSample {
+                canonicalized_first: true,
+                edit_kind: UpstreamEditKind::PublicInterfaceOrInlineMir,
+                exact_rmeta_byte_identical: false,
+                candidate_projection_matched: false,
+                shadow_downstream_matched: true,
+                oversensitivity: RmetaOversensitivitySource::InlinedGenericOrMacroBody,
+            },
+            RmetaCorpusSample {
+                canonicalized_first: true,
+                edit_kind: UpstreamEditKind::PublicInterfaceOrInlineMir,
+                exact_rmeta_byte_identical: false,
+                candidate_projection_matched: false,
+                shadow_downstream_matched: true,
+                oversensitivity: RmetaOversensitivitySource::None,
+            },
+        ];
+        let go_report =
+            evaluate_rmeta_corpus_experiment(&clean_corpus, &policy).expect("valid corpus");
+        assert_eq!(go_report.total_samples, 5);
+        assert_eq!(go_report.body_only_edits, 3);
+        assert_eq!(go_report.exact_rmeta_identical_bps, 2_000); // 1/5 = 20%
+        assert_eq!(go_report.projected_safe_skip_bps, 6_000); // 3/5 = 60%
+        assert_eq!(go_report.shadow_divergences, 0);
+        assert_eq!(
+            go_report.recommendation,
+            RmetaProjectionRecommendation::GoEnableProjectedEpoch {
+                enabled_epoch: 2,
+                rollback_epoch: 1,
+            }
+        );
+
+        // Case 3: Uncanonicalized sample is rejected (plan §94: "canonicalize first").
+        let mut uncanonical = clean_corpus;
+        uncanonical[0].canonicalized_first = false;
+        assert!(evaluate_rmeta_corpus_experiment(&uncanonical, &policy).is_err());
+    }
+}
+
+/// Classification of an upstream workspace crate edit in the M012 `.rmeta` corpus (plan §94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamEditKind {
+    /// Private function body or comment change that does not alter the public signature.
+    ImplementationBodyOnly,
+    /// Public signature, trait impl, const eval, macro, or `#[inline]` MIR change.
+    PublicInterfaceOrInlineMir,
+}
+
+/// Source of `.rmeta` oversensitivity when a body-only edit changes `.rmeta` bytes (bead M012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RmetaOversensitivitySource {
+    /// Byte-identical `.rmeta` (no oversensitivity).
+    None,
+    /// DefSpan / line-number offset shift in encoded spans.
+    SourceSpanLineShift,
+    /// Crate-level SVH / metadata hash mixing body hashes.
+    CrateMetadataHash,
+    /// Cross-crate inlined generic / proc-macro / `#[inline]` MIR body.
+    InlinedGenericOrMacroBody,
+}
+
+/// One recorded sample from the M012 `.rmeta` equality and skip-rate corpus experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RmetaCorpusSample {
+    /// Whether the action ran in the canonical execroot first (mandatory per plan §94).
+    pub canonicalized_first: bool,
+    /// Classification of the upstream edit.
+    pub edit_kind: UpstreamEditKind,
+    /// Whether the emitted `.rmeta` artifact was byte-for-byte identical.
+    pub exact_rmeta_byte_identical: bool,
+    /// Whether the candidate metadata projection key matched the prior version.
+    pub candidate_projection_matched: bool,
+    /// Whether shadow-executing the downstream consumer produced identical outputs.
+    pub shadow_downstream_matched: bool,
+    /// Diagnosed source of `.rmeta` oversensitivity, if any.
+    pub oversensitivity: RmetaOversensitivitySource,
+}
+
+/// Proceed threshold and projection-epoch rollback policy defined BEFORE enabling any
+/// reduced `.rmeta` projection (bead M012; plan §94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RmetaExperimentProceedPolicy {
+    /// Minimum downstream safe skip-rate in basis points (`0..=10_000`) required to justify complexity.
+    pub min_safe_skip_gain_bps: u16,
+    /// Candidate projection epoch to enable if gates pass.
+    pub candidate_projection_epoch: u32,
+    /// Conservative exact-key projection epoch to roll back to on any incident.
+    pub rollback_projection_epoch: u32,
+}
+
+/// Go / No-Go recommendation from the M012 `.rmeta` corpus experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RmetaProjectionRecommendation {
+    /// Proceed with the candidate projection epoch, retaining the pre-wired rollback epoch.
+    GoEnableProjectedEpoch {
+        /// Admitted projection epoch.
+        enabled_epoch: u32,
+        /// Pre-configured rollback epoch.
+        rollback_epoch: u32,
+    },
+    /// Do not enable reduced projection; keep conservative exact `.rmeta` keys.
+    NoGoKeepConservativeExactKeys {
+        /// Reason reduced projection was rejected.
+        reason: &'static str,
+        /// Active conservative epoch.
+        rollback_epoch: u32,
+    },
+}
+
+/// Complete M012 `.rmeta` equality/skip-rate corpus experiment report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RmetaCorpusExperimentReport {
+    /// Total upstream edit samples analyzed.
+    pub total_samples: usize,
+    /// Count of implementation-body-only edits.
+    pub body_only_edits: usize,
+    /// Frequency of byte-identical `.rmeta` outputs in basis points (`0..=10_000`).
+    pub exact_rmeta_identical_bps: u16,
+    /// Downstream skip rate under candidate projection in basis points (`0..=10_000`).
+    pub projected_safe_skip_bps: u16,
+    /// Count of span-shift oversensitivity occurrences.
+    pub span_oversensitivity_count: usize,
+    /// Count of shadow-execution divergences observed across projected hits.
+    pub shadow_divergences: usize,
+    /// Final Go/No-Go recommendation.
+    pub recommendation: RmetaProjectionRecommendation,
+}
+
+/// Evaluate the M012 `.rmeta` equality/skip-rate corpus experiment and produce a
+/// Go/No-Go recommendation (plan §94).
+///
+/// # Errors
+/// Returns `&'static str` if the corpus is empty, if any sample was not canonicalized first,
+/// or if rollback epoch is not strictly less than candidate epoch.
+pub fn evaluate_rmeta_corpus_experiment(
+    samples: &[RmetaCorpusSample],
+    policy: &RmetaExperimentProceedPolicy,
+) -> Result<RmetaCorpusExperimentReport, &'static str> {
+    if samples.is_empty() {
+        return Err("rmeta corpus experiment requires at least one sample");
+    }
+    if policy.rollback_projection_epoch >= policy.candidate_projection_epoch {
+        return Err("rollback_projection_epoch must precede candidate_projection_epoch");
+    }
+    if samples.iter().any(|s| !s.canonicalized_first) {
+        return Err("all rmeta corpus samples must be canonicalized first (plan sec 94)");
+    }
+
+    let total_samples = samples.len();
+    let body_only_edits = samples
+        .iter()
+        .filter(|s| s.edit_kind == UpstreamEditKind::ImplementationBodyOnly)
+        .count();
+    let exact_identical = samples
+        .iter()
+        .filter(|s| s.exact_rmeta_byte_identical)
+        .count();
+    let projected_hits = samples
+        .iter()
+        .filter(|s| s.candidate_projection_matched && s.shadow_downstream_matched)
+        .count();
+    let shadow_divergences = samples
+        .iter()
+        .filter(|s| s.candidate_projection_matched && !s.shadow_downstream_matched)
+        .count();
+    let span_oversensitivity_count = samples
+        .iter()
+        .filter(|s| s.oversensitivity == RmetaOversensitivitySource::SourceSpanLineShift)
+        .count();
+
+    let exact_rmeta_identical_bps = ((exact_identical * 10_000) / total_samples) as u16;
+    let projected_safe_skip_bps = ((projected_hits * 10_000) / total_samples) as u16;
+
+    let recommendation = if shadow_divergences > 0 {
+        RmetaProjectionRecommendation::NoGoKeepConservativeExactKeys {
+            reason: "shadow-execution-divergence-detected",
+            rollback_epoch: policy.rollback_projection_epoch,
+        }
+    } else if projected_safe_skip_bps < policy.min_safe_skip_gain_bps {
+        RmetaProjectionRecommendation::NoGoKeepConservativeExactKeys {
+            reason: "skip-rate-below-proceed-threshold",
+            rollback_epoch: policy.rollback_projection_epoch,
+        }
+    } else {
+        RmetaProjectionRecommendation::GoEnableProjectedEpoch {
+            enabled_epoch: policy.candidate_projection_epoch,
+            rollback_epoch: policy.rollback_projection_epoch,
+        }
+    };
+
+    Ok(RmetaCorpusExperimentReport {
+        total_samples,
+        body_only_edits,
+        exact_rmeta_identical_bps,
+        projected_safe_skip_bps,
+        span_oversensitivity_count,
+        shadow_divergences,
+        recommendation,
+    })
 }

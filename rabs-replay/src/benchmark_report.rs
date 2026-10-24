@@ -266,6 +266,560 @@ impl BenchmarkReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// B013: CI regression gates against the corpus (plan §143)
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeSet;
+
+/// Baseline snapshot against which candidate PR corpus runs are gated (bead B013; plan §143).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusBaselineSnapshot {
+    /// Stable identifier of the baseline snapshot (e.g. `"ci-stratified-v1"`).
+    pub snapshot_id: String,
+    /// Wrapper p95 overhead SLO in microseconds (`<= 10_000` us = 10ms).
+    pub wrapper_p95_slo_us: u64,
+    /// Baseline p95 intent-to-result latency in milliseconds.
+    pub baseline_intent_to_result_p95_ms: u64,
+    /// Baseline cache hit rate in permille (`0..=1000`).
+    pub baseline_hit_rate_permille: u64,
+    /// Maximum unexplained divergences permitted (`0`).
+    pub max_allowed_divergences: usize,
+    /// Maximum uncompensated storage or transfer bloat in permille over baseline.
+    pub max_storage_transfer_growth_permille: u32,
+    /// Minimum stratified corpus strata that must be covered in the sample.
+    pub min_selected_strata: usize,
+}
+
+/// Canonical pinned baseline snapshot enforced by the B013 CI regression gate.
+#[must_use]
+pub fn canonical_ci_baseline_snapshot() -> CorpusBaselineSnapshot {
+    CorpusBaselineSnapshot {
+        snapshot_id: "ci-stratified-v1".to_owned(),
+        wrapper_p95_slo_us: 10_000,
+        baseline_intent_to_result_p95_ms: 4_500,
+        baseline_hit_rate_permille: 750,
+        max_allowed_divergences: 0,
+        max_storage_transfer_growth_permille: 100,
+        min_selected_strata: 3,
+    }
+}
+
+/// Regression dimension evaluated by the B013 CI corpus gate (plan §143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CorpusRegressionKind {
+    /// Wrapper/miss overhead violated the p95 SLO.
+    WrapperSloExceeded,
+    /// p95 intent-to-result worsened without documented compensating benefit.
+    IntentToResultP95Regressed,
+    /// Cache hit rate degraded relative to baseline without explanation.
+    HitRateDegraded,
+    /// Semantic or output divergence count exceeded baseline (`> 0`).
+    /// Never waivable by an override.
+    DivergenceRegression,
+    /// Storage or transfer cost grew beyond the documented value threshold.
+    StorageOrTransferBloat,
+    /// Stratified replay sample covered fewer strata than required.
+    StratifiedCoverageInsufficient,
+    /// Cancellation or cleanup health check failed.
+    CancellationOrCleanupDegraded,
+    /// Default-on feature lacks rollback posture or decision receipt.
+    /// Never waivable by an override.
+    MissingRollbackOrReceipt,
+}
+
+impl CorpusRegressionKind {
+    /// Stable machine code for CI reports and override validation.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::WrapperSloExceeded => "wrapper_slo_exceeded",
+            Self::IntentToResultP95Regressed => "intent_to_result_p95_regressed",
+            Self::HitRateDegraded => "hit_rate_degraded",
+            Self::DivergenceRegression => "divergence_regression",
+            Self::StorageOrTransferBloat => "storage_or_transfer_bloat",
+            Self::StratifiedCoverageInsufficient => "stratified_coverage_insufficient",
+            Self::CancellationOrCleanupDegraded => "cancellation_or_cleanup_degraded",
+            Self::MissingRollbackOrReceipt => "missing_rollback_or_receipt",
+        }
+    }
+
+    /// Correctness and rollback/receipt gates are never waivable by performance overrides.
+    #[must_use]
+    pub const fn is_waivable(self) -> bool {
+        !matches!(
+            self,
+            Self::DivergenceRegression | Self::MissingRollbackOrReceipt
+        )
+    }
+}
+
+/// Specific violation recorded by the B013 CI regression gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusGateViolation {
+    /// Which gate dimension failed.
+    pub kind: CorpusRegressionKind,
+    /// Human- and machine-readable detail naming baseline vs candidate figures.
+    pub detail: String,
+}
+
+/// Candidate PR metrics evaluated against a [`CorpusBaselineSnapshot`] (bead B013).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusCandidateMetrics {
+    /// Benchmark report from the stratified replay sample (B008).
+    pub benchmark: BenchmarkReport,
+    /// Observed wrapper p95 overhead (microseconds).
+    pub wrapper_p95_us: u64,
+    /// Observed p95 intent-to-result latency (milliseconds, from B012 or candidate latency).
+    pub intent_to_result_p95_ms: u64,
+    /// Number of strata covered in the B010 stratified sample.
+    pub selected_strata: usize,
+    /// Observed storage/transfer growth in permille over baseline.
+    pub storage_transfer_growth_permille: u32,
+    /// Whether cancellation and cleanup invariants passed without leaks.
+    pub cancellation_cleanup_healthy: bool,
+    /// Whether the feature ships with an explicit rollback switch and decision receipt.
+    pub has_rollback_and_receipt: bool,
+    /// Whether an intentional p95 tradeoff has a documented compensating benefit.
+    pub compensating_benefit_documented: bool,
+}
+
+/// Auditable, time-bounded override protocol for controlled B013 gate waivers.
+///
+/// Overrides must name the exact [`CorpusRegressionKind`]s being waived, carry
+/// a non-empty ticket/approver/reason, and be unexpired at `now_unix_ms`.
+/// `DivergenceRegression` and `MissingRollbackOrReceipt` can NEVER be waived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegressionGateOverride {
+    /// Issue or bead identifier authorizing the waiver.
+    pub override_id: String,
+    /// Operator or reviewer who approved the waiver.
+    pub approver: String,
+    /// Documented rationale / compensating benefit.
+    pub reason: String,
+    /// Expiration timestamp (Unix milliseconds).
+    pub expires_at_unix_ms: u64,
+    /// Closed set of regression kinds this override is permitted to waive.
+    pub waived_kinds: BTreeSet<CorpusRegressionKind>,
+}
+
+impl RegressionGateOverride {
+    /// Whether this override is well-formed and live at `now_unix_ms`.
+    #[must_use]
+    pub fn is_valid_at(&self, now_unix_ms: u64) -> bool {
+        !self.override_id.trim().is_empty()
+            && !self.approver.trim().is_empty()
+            && !self.reason.trim().is_empty()
+            && now_unix_ms < self.expires_at_unix_ms
+    }
+
+    /// Whether this override may waive `kind` at `now_unix_ms`.
+    #[must_use]
+    pub fn waives(&self, kind: CorpusRegressionKind, now_unix_ms: u64) -> bool {
+        kind.is_waivable() && self.is_valid_at(now_unix_ms) && self.waived_kinds.contains(&kind)
+    }
+}
+
+/// Verdict of the B013 CI regression gate against the corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusRegressionVerdict {
+    /// Whether the PR passes the CI gate (`unwaived_violations.is_empty()`).
+    pub passed: bool,
+    /// Baseline snapshot ID consulted.
+    pub snapshot_id: String,
+    /// Unwaived violations that fail the CI gate.
+    pub unwaived_violations: Vec<CorpusGateViolation>,
+    /// Violations explicitly waived by a valid [`RegressionGateOverride`].
+    pub waived_violations: Vec<CorpusGateViolation>,
+    /// Override ID applied, if any violation was waived.
+    pub override_applied: Option<String>,
+}
+
+impl CorpusRegressionVerdict {
+    /// Emit a stable machine-readable NDJSON receipt for CI logs and audit artefacts.
+    #[must_use]
+    pub fn to_ndjson(&self) -> String {
+        let unwaived: Vec<serde_json::Value> = self
+            .unwaived_violations
+            .iter()
+            .map(|v| serde_json::json!({ "kind": v.kind.code(), "detail": v.detail }))
+            .collect();
+        let waived: Vec<serde_json::Value> = self
+            .waived_violations
+            .iter()
+            .map(|v| serde_json::json!({ "kind": v.kind.code(), "detail": v.detail }))
+            .collect();
+        serde_json::json!({
+            "schema": "rabs.corpus-regression-gate",
+            "schema_version": 1,
+            "passed": self.passed,
+            "snapshot_id": self.snapshot_id,
+            "unwaived_violations": unwaived,
+            "waived_violations": waived,
+            "override_applied": self.override_applied,
+        })
+        .to_string()
+    }
+}
+
+/// Evaluate the B013 CI regression gate against a baseline snapshot and optional override.
+#[must_use]
+pub fn evaluate_corpus_regression_gate(
+    baseline: &CorpusBaselineSnapshot,
+    candidate: &CorpusCandidateMetrics,
+    override_policy: Option<&RegressionGateOverride>,
+    now_unix_ms: u64,
+) -> CorpusRegressionVerdict {
+    let mut raw_violations = Vec::new();
+
+    if candidate.selected_strata < baseline.min_selected_strata {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::StratifiedCoverageInsufficient,
+            detail: format!(
+                "selected_strata={} < min_selected_strata={}",
+                candidate.selected_strata, baseline.min_selected_strata
+            ),
+        });
+    }
+
+    if candidate.wrapper_p95_us > baseline.wrapper_p95_slo_us {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::WrapperSloExceeded,
+            detail: format!(
+                "wrapper_p95_us={} > wrapper_p95_slo_us={}",
+                candidate.wrapper_p95_us, baseline.wrapper_p95_slo_us
+            ),
+        });
+    }
+
+    if candidate.intent_to_result_p95_ms > baseline.baseline_intent_to_result_p95_ms
+        && !candidate.compensating_benefit_documented
+    {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::IntentToResultP95Regressed,
+            detail: format!(
+                "intent_to_result_p95_ms={} > baseline_p95_ms={}",
+                candidate.intent_to_result_p95_ms, baseline.baseline_intent_to_result_p95_ms
+            ),
+        });
+    }
+
+    if candidate.benchmark.availability.hit_rate_permille < baseline.baseline_hit_rate_permille {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::HitRateDegraded,
+            detail: format!(
+                "hit_rate_permille={} < baseline_hit_rate_permille={}",
+                candidate.benchmark.availability.hit_rate_permille,
+                baseline.baseline_hit_rate_permille
+            ),
+        });
+    }
+
+    if candidate.benchmark.divergence.diverged > baseline.max_allowed_divergences {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::DivergenceRegression,
+            detail: format!(
+                "diverged={} > max_allowed_divergences={}",
+                candidate.benchmark.divergence.diverged, baseline.max_allowed_divergences
+            ),
+        });
+    }
+
+    if candidate.storage_transfer_growth_permille > baseline.max_storage_transfer_growth_permille {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::StorageOrTransferBloat,
+            detail: format!(
+                "storage_transfer_growth_permille={} > max_allowed_permille={}",
+                candidate.storage_transfer_growth_permille,
+                baseline.max_storage_transfer_growth_permille
+            ),
+        });
+    }
+
+    if !candidate.cancellation_cleanup_healthy {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::CancellationOrCleanupDegraded,
+            detail: "cancellation or cleanup health check failed".to_owned(),
+        });
+    }
+
+    if !candidate.has_rollback_and_receipt {
+        raw_violations.push(CorpusGateViolation {
+            kind: CorpusRegressionKind::MissingRollbackOrReceipt,
+            detail: "default-on feature lacks rollback switch or decision receipt".to_owned(),
+        });
+    }
+
+    let mut unwaived_violations = Vec::new();
+    let mut waived_violations = Vec::new();
+    for v in raw_violations {
+        if override_policy.is_some_and(|ov| ov.waives(v.kind, now_unix_ms)) {
+            waived_violations.push(v);
+        } else {
+            unwaived_violations.push(v);
+        }
+    }
+
+    let override_applied = if waived_violations.is_empty() {
+        None
+    } else {
+        override_policy.map(|ov| ov.override_id.clone())
+    };
+
+    CorpusRegressionVerdict {
+        passed: unwaived_violations.is_empty(),
+        snapshot_id: baseline.snapshot_id.clone(),
+        unwaived_violations,
+        waived_violations,
+        override_applied,
+    }
+}
+
+/// The four canonical baseline systems required by bead B009 (`plan §140`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BaselineVariantKind {
+    /// Unmodified stock Cargo (`CARGO_INCREMENTAL=0`, no wrapper, no config overlay).
+    Stock,
+    /// Layer-0 configuration pack (`rabs-key::layer0_pack` overlay).
+    Layer0,
+    /// `RUSTC_WRAPPER=sccache` baseline.
+    Sccache,
+    /// Conventional RCH (`rch exec -- cargo ...`) remote/pooled baseline.
+    CurrentRch,
+}
+
+impl BaselineVariantKind {
+    /// Closed set of all four required B009 baseline variants.
+    pub const ALL: [Self; 4] = [Self::Stock, Self::Layer0, Self::Sccache, Self::CurrentRch];
+
+    /// Canonical NDJSON variant string emitted by `scripts/rabs_layer0_bench.sh`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stock => "stock",
+            Self::Layer0 => "layer0",
+            Self::Sccache => "sccache",
+            Self::CurrentRch => "current-rch",
+        }
+    }
+
+    /// Parse from the `"variant"` field of a `layer0-baseline` NDJSON record.
+    #[must_use]
+    pub fn from_variant_str(value: &str) -> Option<Self> {
+        match value {
+            "stock" => Some(Self::Stock),
+            "layer0" => Some(Self::Layer0),
+            "sccache" => Some(Self::Sccache),
+            "current-rch" => Some(Self::CurrentRch),
+            _ => None,
+        }
+    }
+}
+
+/// One parsed line from `benchmarks/baselines/*.ndjson` (`kind = "layer0-baseline"`, v1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer0BaselineRecord {
+    /// Repository identifier (e.g. `"rch-workspace"`, `"asupersync"`).
+    pub repo: String,
+    /// Host identifier (e.g. `"hetzner2"`).
+    pub host: String,
+    /// Toolchain version string.
+    pub toolchain: String,
+    /// Which of the 4 B009 baseline variants ran.
+    pub variant: BaselineVariantKind,
+    /// Scenario name (`"cold-check"`, `"incremental-check"`, `"cold-build"`, `"cold-build-cached"`).
+    pub scenario: String,
+    /// 1-based iteration index.
+    pub iteration: u32,
+    /// Observed wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    /// Process exit code (`0` for success, `-1` for recorded skip).
+    pub exit: i32,
+}
+
+/// Comparative latency summary for one `(repo, scenario)` across the four B009 baselines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineComparisonRow {
+    /// Repository name.
+    pub repo: String,
+    /// Scenario name (`"cold-check"`, `"incremental-check"`, `"cold-build"`).
+    pub scenario: String,
+    /// Median (`p50`) duration in ms for stock Cargo.
+    pub stock_p50_ms: Option<u64>,
+    /// Median (`p50`) duration in ms for the Layer-0 pack.
+    pub layer0_p50_ms: Option<u64>,
+    /// Median (`p50`) duration in ms for sccache.
+    pub sccache_p50_ms: Option<u64>,
+    /// Median (`p50`) duration in ms for current RCH.
+    pub current_rch_p50_ms: Option<u64>,
+}
+
+impl BaselineComparisonRow {
+    /// Whether all four required B009 baseline variants have measured (`exit == 0`) numbers
+    /// for this `(repo, scenario)`.
+    #[must_use]
+    pub const fn has_all_four_variants(&self) -> bool {
+        self.stock_p50_ms.is_some()
+            && self.layer0_p50_ms.is_some()
+            && self.sccache_p50_ms.is_some()
+            && self.current_rch_p50_ms.is_some()
+    }
+}
+
+/// Aggregated B009 baseline comparison summary across repositories and scenarios.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineComparisonSummary {
+    /// Distinct repositories present in the baseline dataset.
+    pub repos: BTreeSet<String>,
+    /// Distinct baseline variants with successful (`exit == 0`) measurements.
+    pub variants_present: BTreeSet<BaselineVariantKind>,
+    /// Per-`(repo, scenario)` comparison rows.
+    pub rows: Vec<BaselineComparisonRow>,
+    /// Count of lines that failed to parse.
+    pub malformed_lines: usize,
+}
+
+impl BaselineComparisonSummary {
+    /// Whether the dataset covers at least `min_repos` repositories and all four required
+    /// B009 baseline variants (`stock`, `layer0`, `sccache`, `current-rch`) across the
+    /// three core scenarios (`cold-check`, `incremental-check`, `cold-build`).
+    #[must_use]
+    pub fn satisfies_b009(&self, min_repos: usize) -> bool {
+        if self.malformed_lines > 0 || self.repos.len() < min_repos {
+            return false;
+        }
+        if !BaselineVariantKind::ALL
+            .iter()
+            .all(|v| self.variants_present.contains(v))
+        {
+            return false;
+        }
+        for repo in &self.repos {
+            for scenario in ["cold-check", "incremental-check", "cold-build"] {
+                let Some(row) = self
+                    .rows
+                    .iter()
+                    .find(|r| r.repo == *repo && r.scenario == scenario)
+                else {
+                    return false;
+                };
+                if !row.has_all_four_variants() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Parse `kind = "layer0-baseline"` NDJSON content into typed [`Layer0BaselineRecord`] rows
+/// and a count of malformed lines.
+#[must_use]
+pub fn parse_layer0_baseline_ndjson(ndjson: &str) -> (Vec<Layer0BaselineRecord>, usize) {
+    let mut records = Vec::new();
+    let mut malformed = 0;
+    for raw_line in ndjson.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            malformed += 1;
+            continue;
+        };
+        if val["v"].as_u64() != Some(1) || val["kind"].as_str() != Some("layer0-baseline") {
+            malformed += 1;
+            continue;
+        }
+        let (
+            Some(repo),
+            Some(host),
+            Some(toolchain),
+            Some(variant_str),
+            Some(scenario),
+            Some(iteration),
+            Some(duration_ms),
+            Some(exit),
+        ) = (
+            val["repo"].as_str(),
+            val["host"].as_str(),
+            val["toolchain"].as_str(),
+            val["variant"].as_str(),
+            val["scenario"].as_str(),
+            val["iteration"].as_u64(),
+            val["duration_ms"].as_u64(),
+            val["exit"].as_i64(),
+        )
+        else {
+            malformed += 1;
+            continue;
+        };
+        let Some(variant) = BaselineVariantKind::from_variant_str(variant_str) else {
+            malformed += 1;
+            continue;
+        };
+        records.push(Layer0BaselineRecord {
+            repo: repo.to_owned(),
+            host: host.to_owned(),
+            toolchain: toolchain.to_owned(),
+            variant,
+            scenario: scenario.to_owned(),
+            iteration: u32::try_from(iteration).unwrap_or(0),
+            duration_ms,
+            exit: i32::try_from(exit).unwrap_or(-1),
+        });
+    }
+    (records, malformed)
+}
+
+/// Summarize parsed [`Layer0BaselineRecord`]s into a [`BaselineComparisonSummary`].
+#[must_use]
+pub fn summarize_baseline_comparison(
+    records: &[Layer0BaselineRecord],
+    malformed_lines: usize,
+) -> BaselineComparisonSummary {
+    let mut repos = BTreeSet::new();
+    let mut variants_present = BTreeSet::new();
+    let mut scenarios_by_repo: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for rec in records {
+        if rec.exit == 0 && rec.scenario != "skipped" {
+            repos.insert(rec.repo.clone());
+            variants_present.insert(rec.variant);
+            scenarios_by_repo.insert((rec.repo.clone(), rec.scenario.clone()));
+        }
+    }
+
+    let mut rows = Vec::with_capacity(scenarios_by_repo.len());
+    for (repo, scenario) in scenarios_by_repo {
+        let p50_for = |variant: BaselineVariantKind| -> Option<u64> {
+            let durations: Vec<u64> = records
+                .iter()
+                .filter(|r| {
+                    r.exit == 0 && r.repo == repo && r.scenario == scenario && r.variant == variant
+                })
+                .map(|r| r.duration_ms)
+                .collect();
+            percentiles(&durations).map(|p| p.p50_ms)
+        };
+        rows.push(BaselineComparisonRow {
+            stock_p50_ms: p50_for(BaselineVariantKind::Stock),
+            layer0_p50_ms: p50_for(BaselineVariantKind::Layer0),
+            sccache_p50_ms: p50_for(BaselineVariantKind::Sccache),
+            current_rch_p50_ms: p50_for(BaselineVariantKind::CurrentRch),
+            repo,
+            scenario,
+        });
+    }
+
+    BaselineComparisonSummary {
+        repos,
+        variants_present,
+        rows,
+        malformed_lines,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +981,168 @@ mod tests {
         assert!(report.baseline_latency.is_some());
         let parsed: serde_json::Value = serde_json::from_str(&report.to_ndjson()).unwrap();
         assert_eq!(parsed["divergence"]["rows"], 1);
+    }
+
+    #[test]
+    fn b013_ci_regression_gate_enforces_baseline_and_override_protocol() {
+        let baseline = canonical_ci_baseline_snapshot();
+        let healthy_bench = BenchmarkReport {
+            baseline_latency: Some(Percentiles {
+                p50_ms: 400,
+                p90_ms: 700,
+                p95_ms: 900,
+                samples: 100,
+            }),
+            candidate_latency: Some(Percentiles {
+                p50_ms: 350,
+                p90_ms: 600,
+                p95_ms: 750,
+                samples: 100,
+            }),
+            availability: AvailabilityMetrics {
+                cache_hits: 82,
+                executed: 15,
+                unavailable: 3,
+                hit_rate_permille: 820,
+            },
+            divergence: DivergenceMetrics {
+                rows: 100,
+                diverged: 0,
+                outcome: 0,
+                stdout: 0,
+                stderr: 0,
+                skipped: 0,
+            },
+            first_diagnostic_latency: MetricGroup::NotInstrumented { needs: "C007" },
+            first_metadata_ready_latency: MetricGroup::NotInstrumented { needs: "K-series" },
+            tool_seconds: MetricGroup::NotInstrumented { needs: "B003" },
+            queue_delay: MetricGroup::NotInstrumented { needs: "G-series" },
+            transfer: MetricGroup::NotInstrumented { needs: "H-series" },
+            cpu_memory: MetricGroup::NotInstrumented { needs: "E004" },
+            storage_growth: MetricGroup::NotInstrumented { needs: "H014" },
+            speculation: MetricGroup::NotInstrumented { needs: "L-series" },
+        };
+
+        let healthy_candidate = CorpusCandidateMetrics {
+            benchmark: healthy_bench.clone(),
+            wrapper_p95_us: 4_500,
+            intent_to_result_p95_ms: 3_200,
+            selected_strata: 4,
+            storage_transfer_growth_permille: 50,
+            cancellation_cleanup_healthy: true,
+            has_rollback_and_receipt: true,
+            compensating_benefit_documented: false,
+        };
+        let pass_verdict =
+            evaluate_corpus_regression_gate(&baseline, &healthy_candidate, None, 1_760_100_000_000);
+        assert!(pass_verdict.passed);
+        assert!(pass_verdict.unwaived_violations.is_empty());
+
+        // Introduce violations across all 8 dimensions.
+        let mut regressed_bench = healthy_bench;
+        regressed_bench.availability.hit_rate_permille = 500;
+        regressed_bench.divergence.diverged = 1;
+        let regressed_candidate = CorpusCandidateMetrics {
+            benchmark: regressed_bench,
+            wrapper_p95_us: 15_000,
+            intent_to_result_p95_ms: 6_000,
+            selected_strata: 1,
+            storage_transfer_growth_permille: 250,
+            cancellation_cleanup_healthy: false,
+            has_rollback_and_receipt: false,
+            compensating_benefit_documented: false,
+        };
+
+        let fail_verdict = evaluate_corpus_regression_gate(
+            &baseline,
+            &regressed_candidate,
+            None,
+            1_760_100_000_000,
+        );
+        assert!(!fail_verdict.passed);
+        assert_eq!(fail_verdict.unwaived_violations.len(), 8);
+
+        // DivergenceRegression and MissingRollbackOrReceipt are NEVER waivable even with an active override.
+        let override_all = RegressionGateOverride {
+            override_id: "ovr-b013-test".to_owned(),
+            approver: "rel-eng".to_owned(),
+            reason: "temporary storage migration".to_owned(),
+            expires_at_unix_ms: 1_760_200_000_000,
+            waived_kinds: BTreeSet::from([
+                CorpusRegressionKind::WrapperSloExceeded,
+                CorpusRegressionKind::IntentToResultP95Regressed,
+                CorpusRegressionKind::HitRateDegraded,
+                CorpusRegressionKind::DivergenceRegression,
+                CorpusRegressionKind::StorageOrTransferBloat,
+                CorpusRegressionKind::StratifiedCoverageInsufficient,
+                CorpusRegressionKind::CancellationOrCleanupDegraded,
+                CorpusRegressionKind::MissingRollbackOrReceipt,
+            ]),
+        };
+        let still_blocked = evaluate_corpus_regression_gate(
+            &baseline,
+            &regressed_candidate,
+            Some(&override_all),
+            1_760_100_000_000,
+        );
+        assert!(!still_blocked.passed);
+        assert_eq!(still_blocked.unwaived_violations.len(), 2);
+        assert_eq!(still_blocked.waived_violations.len(), 6);
+
+        // Once non-waivable dimensions (divergence + rollback/receipt) are resolved, the valid override passes.
+        let mut waivable_only_candidate = regressed_candidate;
+        waivable_only_candidate.benchmark.divergence.diverged = 0;
+        waivable_only_candidate.has_rollback_and_receipt = true;
+        let waived_verdict = evaluate_corpus_regression_gate(
+            &baseline,
+            &waivable_only_candidate,
+            Some(&override_all),
+            1_760_100_000_000,
+        );
+        assert!(waived_verdict.passed);
+        assert_eq!(
+            waived_verdict.override_applied.as_deref(),
+            Some("ovr-b013-test")
+        );
+
+        // Expired override no longer waives.
+        let expired_verdict = evaluate_corpus_regression_gate(
+            &baseline,
+            &waivable_only_candidate,
+            Some(&override_all),
+            1_760_300_000_000,
+        );
+        assert!(!expired_verdict.passed);
+        let parsed: serde_json::Value = serde_json::from_str(&expired_verdict.to_ndjson()).unwrap();
+        assert_eq!(parsed["passed"], false);
+    }
+
+    #[test]
+    fn b009_parses_and_compares_stock_layer0_sccache_and_current_rch_baselines() {
+        let baseline_ndjson =
+            include_str!("../../benchmarks/baselines/hetzner2-nightly-09ee43b2d.ndjson");
+        let (records, malformed) = parse_layer0_baseline_ndjson(baseline_ndjson);
+        assert_eq!(malformed, 0, "canonical baseline NDJSON must parse cleanly");
+        assert!(
+            records.len() >= 34,
+            "expected at least 34 baseline records across two repos and four variants"
+        );
+        let summary = summarize_baseline_comparison(&records, malformed);
+        assert!(
+            summary.satisfies_b009(2),
+            "canonical baseline file must cover >=2 repos and all 4 B009 variants: {summary:?}"
+        );
+        assert!(summary.repos.contains("rch-workspace"));
+        assert!(summary.repos.contains("asupersync"));
+
+        let rch_cold_build = summary
+            .rows
+            .iter()
+            .find(|r| r.repo == "rch-workspace" && r.scenario == "cold-build")
+            .expect("rch-workspace cold-build row");
+        assert_eq!(rch_cold_build.stock_p50_ms, Some(242_194));
+        assert_eq!(rch_cold_build.layer0_p50_ms, Some(137_293));
+        assert_eq!(rch_cold_build.sccache_p50_ms, Some(216_686));
+        assert_eq!(rch_cold_build.current_rch_p50_ms, Some(184_910));
     }
 }

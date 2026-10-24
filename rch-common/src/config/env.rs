@@ -8,6 +8,101 @@ use std::env;
 use std::path::PathBuf;
 use thiserror::Error;
 
+#[derive(Clone, Copy)]
+enum CargoArtifactSetting {
+    Debug,
+    Strip,
+    Incremental,
+    GlobalIncremental,
+    SplitDebuginfo,
+    OptLevel,
+    CodegenUnits,
+    Lto,
+}
+
+fn cargo_artifact_setting(key: &str) -> Option<CargoArtifactSetting> {
+    use CargoArtifactSetting as Setting;
+
+    match key {
+        "CARGO_INCREMENTAL" => return Some(Setting::GlobalIncremental),
+        "CARGO_BUILD_INCREMENTAL" => return Some(Setting::Incremental),
+        _ => {}
+    }
+    let rest = key.strip_prefix("CARGO_PROFILE_")?;
+    let (profile, setting) = [
+        ("_CODEGEN_UNITS", Setting::CodegenUnits),
+        ("_SPLIT_DEBUGINFO", Setting::SplitDebuginfo),
+        ("_INCREMENTAL", Setting::Incremental),
+        ("_OPT_LEVEL", Setting::OptLevel),
+        ("_DEBUG", Setting::Debug),
+        ("_STRIP", Setting::Strip),
+        ("_LTO", Setting::Lto),
+    ]
+    .into_iter()
+    .find_map(|(suffix, setting)| rest.strip_suffix(suffix).map(|profile| (profile, setting)))?;
+    let profile = if let Some(profile) = profile.strip_suffix("_BUILD_OVERRIDE") {
+        // Cargo's build overrides do not support LTO, panic or rpath.
+        if matches!(setting, Setting::Lto) {
+            return None;
+        }
+        profile
+    } else {
+        profile
+    };
+    (!profile.is_empty()
+        && profile
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+    .then_some(setting)
+}
+
+/// Whether a key names one of the Cargo artifact-size controls RCH forwards.
+///
+/// This is a fixed set of settings, including build overrides and custom
+/// profile names in Cargo's uppercase/underscore environment spelling. It is
+/// deliberately not a `CARGO_*` or `CARGO_PROFILE_*` wildcard: executable,
+/// path, compiler-flag and credential settings are outside this policy.
+pub fn cargo_profile_env_key_is_supported(key: &str) -> bool {
+    cargo_artifact_setting(key).is_some()
+}
+
+/// Validate both the key and Cargo's scalar value before automatic forwarding.
+///
+/// Values are kept unchanged and must still be quoted as shell data by callers.
+/// See Cargo's environment-variables and profiles reference chapters.
+pub fn cargo_profile_env_is_safe(key: &str, value: &str) -> bool {
+    use CargoArtifactSetting as Setting;
+
+    match cargo_artifact_setting(key) {
+        Some(Setting::Debug) => matches!(
+            value,
+            "0" | "1"
+                | "2"
+                | "false"
+                | "true"
+                | "none"
+                | "limited"
+                | "full"
+                | "line-directives-only"
+                | "line-tables-only"
+        ),
+        Some(Setting::Strip) => {
+            matches!(value, "none" | "debuginfo" | "symbols" | "false" | "true")
+        }
+        Some(Setting::Incremental) => matches!(value, "false" | "true"),
+        Some(Setting::GlobalIncremental) => matches!(value, "0" | "1"),
+        Some(Setting::SplitDebuginfo) => matches!(value, "off" | "packed" | "unpacked"),
+        Some(Setting::OptLevel) => matches!(value, "0" | "1" | "2" | "3" | "s" | "z"),
+        Some(Setting::CodegenUnits) => {
+            !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u32>().is_ok_and(|units| units > 0)
+        }
+        Some(Setting::Lto) => matches!(value, "false" | "true" | "off" | "thin" | "fat"),
+        None => false,
+    }
+}
+
 /// Errors that can occur during environment variable parsing.
 #[derive(Debug, Error)]
 pub enum EnvError {
@@ -323,6 +418,107 @@ mod tests {
     use super::*;
     use crate::config::env_test_lock;
     use std::env;
+
+    #[test]
+    fn cargo_profile_forwarding_accepts_cargo_scalar_values_and_custom_profiles() {
+        let settings: &[(&str, &[&str])] = &[
+            (
+                "DEBUG",
+                &[
+                    "0",
+                    "1",
+                    "2",
+                    "false",
+                    "true",
+                    "none",
+                    "limited",
+                    "full",
+                    "line-directives-only",
+                    "line-tables-only",
+                ],
+            ),
+            ("STRIP", &["none", "debuginfo", "symbols", "false", "true"]),
+            ("INCREMENTAL", &["false", "true"]),
+            ("SPLIT_DEBUGINFO", &["off", "packed", "unpacked"]),
+            ("OPT_LEVEL", &["0", "1", "2", "3", "s", "z"]),
+            ("CODEGEN_UNITS", &["1", "16", "256", "4294967295"]),
+            ("LTO", &["false", "true", "off", "thin", "fat"]),
+        ];
+        for profile in [
+            "DEV",
+            "TEST",
+            "RELEASE",
+            "BENCH",
+            "CI_SMALL",
+            "RELEASE_LTO_2",
+        ] {
+            for (setting, values) in settings {
+                let key = format!("CARGO_PROFILE_{profile}_{setting}");
+                assert!(cargo_profile_env_key_is_supported(&key), "{key}");
+                for value in *values {
+                    assert!(cargo_profile_env_is_safe(&key, value), "{key}={value}");
+                    let build = format!("CARGO_PROFILE_{profile}_BUILD_OVERRIDE_{setting}");
+                    assert_eq!(
+                        cargo_profile_env_is_safe(&build, value),
+                        *setting != "LTO",
+                        "{build}={value}"
+                    );
+                }
+            }
+        }
+        for value in ["0", "1"] {
+            assert!(cargo_profile_env_is_safe("CARGO_INCREMENTAL", value));
+        }
+        for value in ["false", "true"] {
+            assert!(cargo_profile_env_is_safe("CARGO_BUILD_INCREMENTAL", value));
+        }
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_rejects_unrelated_keys_and_invalid_values() {
+        for key in [
+            "CARGO_PROFILE_*",
+            "CARGO_PROFILE__DEBUG",
+            "CARGO_PROFILE_ci_DEBUG",
+            "CARGO_PROFILE_CI-SMALL_DEBUG",
+            "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS",
+            "CARGO_PROFILE_DEV_PANIC",
+            "CARGO_PROFILE_DEV_RUSTFLAGS",
+            "CARGO_PROFILE_DEV_BUILD_OVERRIDE_LTO",
+            "CARGO_PROFILE_DEV_BUILD_OVERRIDE_PANIC",
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTFLAGS",
+            "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+            "CARGO_PROFILE_DEV_DEBUG;touch /tmp/x",
+        ] {
+            assert!(!cargo_profile_env_key_is_supported(key), "{key}");
+            assert!(!cargo_profile_env_is_safe(key, "0"), "{key}");
+        }
+        for (key, value) in [
+            ("CARGO_PROFILE_DEV_DEBUG", "3"),
+            ("CARGO_PROFILE_DEV_DEBUG", "TRUE"),
+            ("CARGO_PROFILE_DEV_DEBUG", " 0"),
+            ("CARGO_PROFILE_DEV_DEBUG", "0\n"),
+            ("CARGO_PROFILE_DEV_DEBUG", "0\0"),
+            ("CARGO_PROFILE_DEV_DEBUG", "$(touch /tmp/x)"),
+            ("CARGO_PROFILE_DEV_STRIP", "/usr/bin/strip"),
+            ("CARGO_PROFILE_DEV_INCREMENTAL", "/tmp/cache"),
+            ("CARGO_PROFILE_DEV_INCREMENTAL", "0"),
+            ("CARGO_INCREMENTAL", "false"),
+            ("CARGO_BUILD_INCREMENTAL", "0"),
+            ("CARGO_PROFILE_DEV_OPT_LEVEL", "4"),
+            ("CARGO_PROFILE_DEV_LTO", "yes"),
+            ("CARGO_PROFILE_DEV_CODEGEN_UNITS", "0"),
+            ("CARGO_PROFILE_DEV_CODEGEN_UNITS", "-1"),
+            ("CARGO_PROFILE_DEV_CODEGEN_UNITS", "+1"),
+            ("CARGO_PROFILE_DEV_CODEGEN_UNITS", "4294967296"),
+            ("CARGO_PROFILE_DEV_CODEGEN_UNITS", ""),
+        ] {
+            assert!(!cargo_profile_env_is_safe(key, value), "{key}={value:?}");
+        }
+    }
 
     fn cleanup_env(vars: &[&str]) {
         for var in vars {

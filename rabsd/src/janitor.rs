@@ -12,4 +12,6 @@
 //! reads through it once serving is wired (a later W1 vertebra). The
 //! worker still only OFFERS results and never commits (R50).
 
+mod maintenance;
+pub mod reclaim;
 pub mod store;

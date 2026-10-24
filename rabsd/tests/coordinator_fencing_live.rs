@@ -49,6 +49,8 @@ use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
 /// Run the shipped `rabsd` binary over `state_dir` for a short bounded
 /// life (the cross-process restart step).
 fn boot_binary(state_dir: &std::path::Path, ms: &str) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .args(["--run-for-ms", ms])
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))

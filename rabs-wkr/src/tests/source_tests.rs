@@ -49,10 +49,17 @@ fn upload(peer: &Wire, request: &Value) {
     peer.frame(seal(request));
 }
 
+fn private_root() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    root
+}
+
 #[test]
 fn partial_or_unnegotiated_source_never_burns_execution_admission() {
     for enabled in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -95,7 +102,7 @@ fn partial_or_unnegotiated_source_never_burns_execution_admission() {
 
 #[test]
 fn verified_source_is_execution_owned_but_the_original_request_is_journaled() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut wire = Wire::default();
     let peer = wire.clone();
@@ -158,7 +165,7 @@ fn verified_source_is_execution_owned_but_the_original_request_is_journaled() {
 
 #[test]
 fn disconnect_does_not_remove_source_before_the_execution_owner_drains() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut wire = Wire::default();
     let peer = wire.clone();
@@ -212,7 +219,7 @@ fn disconnect_does_not_remove_source_before_the_execution_owner_drains() {
 
 #[test]
 fn resumed_source_bound_results_need_no_worker_source_directory_or_new_upload() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut wire = Wire::default();
     let peer = wire.clone();
@@ -301,7 +308,7 @@ fn resumed_source_bound_results_need_no_worker_source_directory_or_new_upload() 
 
 #[test]
 fn pipelined_source_frames_finish_in_order_and_controls_can_interleave() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut wire = Wire::default();
     let peer = wire.clone();
@@ -352,7 +359,7 @@ fn pipelined_source_frames_finish_in_order_and_controls_can_interleave() {
 
 #[test]
 fn cancelling_a_sealed_upload_is_exact_id_idempotent_and_prevents_admission() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut wire = Wire::default();
     let peer = wire.clone();

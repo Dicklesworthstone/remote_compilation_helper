@@ -7,13 +7,14 @@
 //! coordinator authority acquisition and janitor sweeps. A second process must
 //! not reinterpret a live coordinator's authority as a dead boot's authority.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rabs_asupersync::daemon_runtime::SubsystemWork;
 use rabs_cas::blob_store::BlobStoreLayout;
-use rabs_cas::metadata_store::{RusqliteEngine, SqlMetadataStore};
+use rabs_cas::metadata_store::{RabsMetadataStore, RusqliteEngine, SqlMetadataStore};
 use rabs_cas::startup_reconciliation::{FilesystemReality, ServingDecision, reconcile_startup};
 
 const MOUNT_LOCK: &str = ".mount.lock";
@@ -134,46 +135,172 @@ impl Drop for MountLock {
     }
 }
 
-/// Production `FilesystemReality`: real `exists` checks plus a recursive
-/// walk of the store roots for orphan detection. (The library ships only
-/// a set-backed test double, `SetFilesystem`.)
+/// A fully inspected startup inventory, constructed BEFORE reconciliation can
+/// retire any location or tombstone. Only an explicit NotFound observation
+/// permits a negative answer. Unknown paths fail toward metadata retention.
+///
+/// This is not content verification or an atomic filesystem snapshot. The
+/// caller holds exclusive CAS ownership and has not admitted writers yet.
+/// Same-UID processes deliberately racing pathname replacement are outside
+/// that cooperative ownership model; this is not a filesystem sandbox.
+#[derive(Debug)]
 pub struct OsFilesystem {
-    roots: Vec<PathBuf>,
+    present: BTreeSet<String>,
+    missing: BTreeSet<String>,
 }
 
 impl OsFilesystem {
-    /// A view over the given store roots.
-    #[must_use]
-    pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self { roots }
+    /// Inspect every store root and every recorded location before returning
+    /// an infallible reconciliation view. Paths must be absolute physical
+    /// paths without symlink components. No file contents are read or changed.
+    ///
+    /// Bounds cover filesystem entries and retained path bytes, not the SQL
+    /// metadata scan that supplies `claimed`. An incomplete inventory refuses
+    /// startup instead of becoming a partial, apparently authoritative view.
+    ///
+    /// # Errors
+    /// IO errors other than a confirmed missing location; links, special nodes,
+    /// unrepresentable paths, changed directories, or exhausted scan budgets.
+    pub fn new(roots: Vec<PathBuf>, claimed: &[String]) -> Result<Self, String> {
+        Self::with_limits(roots, claimed, 1_000_000, 256 * 1024 * 1024)
     }
 
-    fn walk(dir: &Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
+    fn with_limits(
+        roots: Vec<PathBuf>,
+        claimed: &[String],
+        max_entries: usize,
+        max_path_bytes: usize,
+    ) -> Result<Self, String> {
+        if roots.is_empty() || roots.len() > max_entries || claimed.len() > max_entries {
+            return Err("CAS inventory root/location limit exceeded".into());
+        }
+        let mut inventory = Self {
+            present: BTreeSet::new(),
+            missing: BTreeSet::new(),
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                Self::walk(&path, out);
-            } else if let Some(text) = path.to_str() {
-                out.push(text.to_string());
+        let mut bytes_left = max_path_bytes;
+        let mut entries_left = max_entries;
+        let mut pending = Vec::new();
+        let mut visited = BTreeSet::new();
+        for root in roots {
+            Self::charge_path(&root, &mut bytes_left)?;
+            pending.push(root);
+        }
+        while let Some(directory) = pending.pop() {
+            if !visited.insert(directory.clone()) {
+                continue;
+            }
+            let before = Self::inspect_path(&directory)?
+                .ok_or_else(|| format!("CAS inventory root disappeared: {}", directory.display()))?;
+            if !before.is_dir() {
+                return Err(format!("CAS inventory root is not a directory: {}", directory.display()));
+            }
+            let entries = std::fs::read_dir(&directory)
+                .map_err(|error| format!("CAS inventory read directory: {error}"))?;
+            for entry in entries {
+                entries_left = entries_left.checked_sub(1)
+                    .ok_or("CAS inventory entry limit exceeded")?;
+                let path = entry.map_err(|error| format!("CAS inventory entry: {error}"))?.path();
+                let text = Self::charge_path(&path, &mut bytes_left)?;
+                let metadata = Self::inspect_path(&path)?
+                    .ok_or_else(|| format!("CAS inventory entry disappeared: {}", path.display()))?;
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() {
+                    inventory.present.insert(text.to_owned());
+                } else {
+                    return Err(format!("CAS inventory unsupported node: {}", path.display()));
+                }
+            }
+            let after = Self::inspect_path(&directory)?
+                .ok_or("CAS inventory directory disappeared during traversal")?;
+            if !same_directory(&before, &after) {
+                return Err("CAS inventory directory changed during traversal".into());
             }
         }
+        // All absence judgments must succeed BEFORE the reconciler's first
+        // repair. Permission errors, ENOTDIR and IO faults are not absence.
+        for path in claimed {
+            let physical = Path::new(path);
+            Self::charge_path(physical, &mut bytes_left)?;
+            match Self::inspect_path(physical)? {
+                Some(metadata) if metadata.is_file() => {
+                    if inventory.missing.contains(path) {
+                        return Err(format!("CAS location changed during inventory: {path}"));
+                    }
+                    inventory.present.insert(path.clone());
+                }
+                Some(_) => return Err(format!("CAS location is not a regular file: {path}")),
+                None if inventory.present.contains(path) => {
+                    return Err(format!("CAS location changed during inventory: {path}"));
+                }
+                None => {
+                    inventory.missing.insert(path.clone());
+                }
+            }
+        }
+        Ok(inventory)
     }
+
+    fn charge_path<'a>(path: &'a Path, bytes_left: &mut usize) -> Result<&'a str, String> {
+        let text = path.to_str().ok_or("CAS inventory path is not UTF-8")?;
+        *bytes_left = bytes_left.checked_sub(text.len())
+            .ok_or("CAS inventory path-byte limit exceeded")?;
+        Ok(text)
+    }
+
+    fn inspect_path(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+        if !path.is_absolute() {
+            return Err("CAS inventory requires absolute physical paths".into());
+        }
+        if path.components().any(|component| {
+            !matches!(component, Component::RootDir | Component::Normal(_))
+        }) {
+            return Err("CAS inventory path is not a physical path".into());
+        }
+        let mut prefix = PathBuf::new();
+        let mut components = path.components().peekable();
+        let mut last = None;
+        while let Some(component) = components.next() {
+            match component {
+                Component::RootDir | Component::Normal(_) => prefix.push(component.as_os_str()),
+                _ => return Err("CAS inventory path is not a physical path".into()),
+            }
+            let metadata = match std::fs::symlink_metadata(&prefix) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(format!("CAS inventory metadata: {error}")),
+            };
+            if metadata.file_type().is_symlink() {
+                return Err(format!("CAS inventory refuses symlink: {}", prefix.display()));
+            }
+            if components.peek().is_some() && !metadata.is_dir() {
+                return Err(format!("CAS inventory parent is not a directory: {}", prefix.display()));
+            }
+            last = Some(metadata);
+        }
+        Ok(last)
+    }
+}
+
+fn same_directory(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    after.is_dir()
+        && (before.dev(), before.ino(), before.mtime(), before.mtime_nsec(),
+            before.ctime(), before.ctime_nsec())
+            == (after.dev(), after.ino(), after.mtime(), after.mtime_nsec(),
+                after.ctime(), after.ctime_nsec())
 }
 
 impl FilesystemReality for OsFilesystem {
     fn exists(&self, store_path: &str) -> bool {
-        Path::new(store_path).exists()
+        // The reconciler interprets false as permission to delete metadata.
+        // Never manufacture that permission for a path we did not inspect.
+        !self.missing.contains(store_path)
     }
 
     fn all_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for root in &self.roots {
-            Self::walk(root, &mut out);
-        }
-        out
+        self.present.iter().cloned().collect()
     }
 }
 
@@ -223,6 +350,23 @@ impl LiveCas {
     pub fn cas_root(&self) -> &Path {
         &self.cas_root
     }
+
+    /// A pathname replaced after mounting must not redirect physical GC into
+    /// another store. Check the named fencing inode against the held descriptor.
+    pub(super) fn verify_mount_path(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self._mount_lock.0.metadata().map_err(|e| e.to_string())?;
+        let named = std::fs::symlink_metadata(self.cas_root.join(MOUNT_LOCK))
+            .map_err(|e| format!("CAS mount lock disappeared: {e}"))?;
+        if !named.file_type().is_file()
+            || named.nlink() != 1
+            || named.mode() & 0o077 != 0
+            || (named.dev(), named.ino(), named.uid()) != (held.dev(), held.ino(), held.uid())
+        {
+            return Err("CAS mount lock changed after mounting".into());
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for LiveCas {
@@ -268,8 +412,18 @@ pub fn mount_and_reconcile(cas_root: &Path) -> Result<LiveCas, String> {
     let engine = RusqliteEngine::open(&cas_root.join("meta.sqlite"))
         .map_err(|e| format!("metadata engine: {e:?}"))?;
     let mut store = SqlMetadataStore::open(engine).map_err(|e| format!("metadata store: {e:?}"))?;
+    // Secondary read indexes are installed once under exclusive mount ownership,
+    // never lazily on a compiler's consultation or while a writer is admitted.
+    rabs_cas::read_indexes::prepare_serving_indexes(&mut store)
+        .map_err(|e| format!("metadata query indexes: {e:?}"))?;
 
-    let filesystem = OsFilesystem::new(vec![layout.root().to_path_buf()]);
+    // Finish every fallible filesystem observation before reconciliation is
+    // allowed to remove a single location or tombstone. The mount lock spans
+    // capture and application; no writer has been admitted in between.
+    let claimed: Vec<String> = store.reconciliation_scan()
+        .map_err(|error| format!("reconciliation inventory metadata: {error:?}"))?
+        .into_iter().map(|row| row.store_path).collect();
+    let filesystem = OsFilesystem::new(vec![layout.root().to_path_buf()], &claimed)?;
     let report =
         reconcile_startup(&mut store, &filesystem).map_err(|e| format!("reconcile: {e:?}"))?;
 
@@ -364,45 +518,7 @@ pub fn janitor_work_with_gc(
     mounted: Result<Arc<LiveCas>, String>,
     quota_bytes: Option<u64>,
 ) -> SubsystemWork {
-    Box::new(move |cx, mut shutdown| {
-        Box::pin(async move {
-            let mounted = mounted?;
-            println!(
-                "{{\"v\":1,\"kind\":\"janitor-cas-mounted\",\"root\":{:?},\"serving_refused\":{},\"repaired\":{},\"reported\":{}}}",
-                mounted.cas_root().display().to_string(),
-                mounted.serving_refused,
-                mounted.repaired,
-                mounted.reported,
-            );
-            match mounted.gc_sweep(rabs_cas::gc::GcMode::Normal) {
-                Ok(s) => println!(
-                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep\",\"planned\":{},\"reclaimed\":{},\"skipped\":{}}}",
-                    s.planned, s.reclaimed, s.skipped
-                ),
-                Err(reason) => println!(
-                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep-failed\",\"reason\":{:?}}}",
-                    reason
-                ),
-            }
-            let usage = mounted.store_usage_bytes();
-            if let Some(q) = quota_bytes
-                && usage > q
-            {
-                println!(
-                    "{{\"v\":1,\"kind\":\"janitor-quota-exceeded\",\"bytes\":{},\"quota_bytes\":{}}}",
-                    usage, q
-                );
-            }
-            println!(
-                "{{\"v\":1,\"kind\":\"janitor-store-usage\",\"bytes\":{}}}",
-                usage
-            );
-            cx.trace("janitor region up: store mounted, gc swept, quota checked");
-            let _held = mounted;
-            shutdown.wait().await;
-            Ok(())
-        })
-    })
+    super::maintenance::work(mounted, quota_bytes)
 }
 
 #[cfg(test)]
@@ -537,14 +653,168 @@ mod tests {
     #[test]
     fn os_filesystem_sees_written_files_and_absent_paths() {
         let dir = private_tempdir();
-        let nested = dir.path().join("a").join("b");
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let nested = root.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
         let file = nested.join("obj.bin");
         std::fs::write(&file, b"x").unwrap();
-        let fs = OsFilesystem::new(vec![dir.path().to_path_buf()]);
+        let fs = OsFilesystem::new(
+            vec![root.clone()],
+            &[root.join("missing").to_str().unwrap().to_owned()],
+        ).unwrap();
         assert!(fs.exists(file.to_str().unwrap()));
-        assert!(!fs.exists(dir.path().join("missing").to_str().unwrap()));
+        assert!(!fs.exists(root.join("missing").to_str().unwrap()));
         assert!(fs.all_paths().iter().any(|p| p.ends_with("obj.bin")));
+    }
+
+    #[test]
+    fn inventory_is_complete_deterministic_and_unknown_paths_never_authorize_repair() {
+        let dir = private_tempdir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let first = root.join("first");
+        let second = nested.join("second");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let missing = root.join("absent").to_str().unwrap().to_owned();
+        let inventory =
+            OsFilesystem::new(vec![root.clone()], std::slice::from_ref(&missing)).unwrap();
+        assert_eq!(inventory.all_paths(), vec![
+            first.to_str().unwrap().to_owned(), second.to_str().unwrap().to_owned(),
+        ]);
+        assert!(!inventory.exists(&missing));
+        assert!(inventory.exists(root.join("never-inspected").to_str().unwrap()));
+        // The reconciler consumes the checked observation, not another IO
+        // lookup that can fail after it has already started deleting rows.
+        std::fs::rename(&first, root.join("retained-first")).unwrap();
+        assert!(inventory.exists(first.to_str().unwrap()));
+        assert_eq!(std::fs::read(root.join("retained-first")).unwrap(), b"first");
+    }
+
+    #[test]
+    fn inventory_refuses_missing_roots_invalid_parents_and_resource_exhaustion() {
+        let dir = private_tempdir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, b"unchanged").unwrap();
+        assert!(OsFilesystem::new(vec![root.join("absent")], &[]).is_err());
+        assert!(OsFilesystem::new(vec![file.clone()], &[]).is_err());
+        assert!(OsFilesystem::new(vec![root.clone()], &[
+            file.join("child").to_str().unwrap().to_owned(),
+        ]).is_err(), "ENOTDIR must not be turned into a missing location");
+        assert!(OsFilesystem::new(vec![root.clone()], &["relative/path".into()]).is_err());
+        assert!(OsFilesystem::new(vec![root.clone()], &[
+            root.to_str().unwrap().to_owned(),
+        ]).is_err(), "a directory is not a blob location");
+        assert!(OsFilesystem::with_limits(vec![root.clone()], &[], 1, 1).is_err());
+        std::fs::write(root.join("another"), b"another").unwrap();
+        assert!(OsFilesystem::with_limits(vec![root.clone()], &[], 1, 8192).is_err());
+        let complete = OsFilesystem::with_limits(vec![root], &[], 2, 8192).unwrap();
+        assert_eq!(complete.all_paths().len(), 2);
+        assert_eq!(std::fs::read(file).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_refuses_links_cycles_and_special_nodes_without_following_them() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        for case in ["cycle", "external", "file", "dangling", "socket"] {
+            let dir = private_tempdir();
+            let outside = private_tempdir();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let outside = std::fs::canonicalize(outside.path()).unwrap();
+            let evidence = outside.join("evidence");
+            std::fs::write(&evidence, b"outside bytes remain unchanged").unwrap();
+            let path = root.join("suspicious");
+            let _socket = match case {
+                "cycle" => { symlink(&root, &path).unwrap(); None }
+                "external" => { symlink(&outside, &path).unwrap(); None }
+                "file" => { symlink(&evidence, &path).unwrap(); None }
+                "dangling" => { symlink(outside.join("missing"), &path).unwrap(); None }
+                "socket" => Some(UnixListener::bind(&path).unwrap()),
+                _ => unreachable!(),
+            };
+            assert!(OsFilesystem::new(vec![root], &[]).is_err(), "{case}");
+            assert!(std::fs::symlink_metadata(path).is_ok(), "evidence retained: {case}");
+            assert_eq!(std::fs::read(evidence).unwrap(), b"outside bytes remain unchanged");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_refuses_symlink_ancestors_even_when_the_leaf_is_missing() {
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = root.join("alias");
+        symlink(&real, &alias).unwrap();
+        assert!(OsFilesystem::new(vec![alias.clone()], &[]).is_err());
+        assert!(OsFilesystem::new(vec![real], &[
+            alias.join("missing").to_str().unwrap().to_owned(),
+        ]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_inventory_paths_refuse_instead_of_being_silently_omitted() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = private_tempdir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let path = root.join(std::ffi::OsString::from_vec(b"object-\xff".to_vec()));
+        std::fs::write(&path, b"preserved").unwrap();
+        let error = OsFilesystem::new(vec![root], &[]).unwrap_err();
+        assert!(error.contains("UTF-8"));
+        assert_eq!(std::fs::read(path).unwrap(), b"preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_inventory_retains_location_and_tombstone_until_a_complete_remount() {
+        use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let cas = mount_and_reconcile(&root).unwrap();
+        let object = TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: "rabs.object.sha256.v1",
+            bytes: [91; 32],
+        };
+        let missing = cas.layout().root().join("missing").to_str().unwrap().to_owned();
+        let key = rabs_cas::metadata_store::digest_key(&object);
+        let before = {
+            let mut store = cas.store().lock().unwrap();
+            store.record_object(&object, 13).unwrap();
+            store.add_location(&object, &missing, Some(1), "raw", true).unwrap();
+            store.add_gc_tombstone(&key, &missing, 1, 2).unwrap();
+            store.differential_snapshot().unwrap()
+        };
+        let obstruction = cas.layout().root().join("cycle");
+        symlink(cas.layout().root(), &obstruction).unwrap();
+        drop(cas);
+        assert!(mount_and_reconcile(&root).is_err());
+        // Test-owned store, no daemon is alive. Startup may have opened and
+        // prepared indexes, but not retired any location/tombstone evidence.
+        let mut store = SqlMetadataStore::open(
+            RusqliteEngine::open(&root.join("meta.sqlite")).unwrap(),
+        ).unwrap();
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        assert!(store.object_located(&object).unwrap());
+        assert_eq!(store.due_gc_tombstones(u64::MAX).unwrap().len(), 1);
+        drop(store);
+        // Preserve the obstruction outside the scanned blob layout. A later
+        // clean mount may repair the genuinely missing row and stale marker.
+        std::fs::rename(obstruction, root.join("retained-cycle")).unwrap();
+        let remounted = mount_and_reconcile(&root).unwrap();
+        assert!(!remounted.serving_refused);
+        assert_eq!(remounted.repaired, 2);
+        let mut store = remounted.store().lock().unwrap();
+        assert!(!store.object_located(&object).unwrap());
+        assert!(store.due_gc_tombstones(u64::MAX).unwrap().is_empty());
     }
 
     /// A cold start must succeed on a host whose default umask is
@@ -553,7 +823,8 @@ mod tests {
     /// `create_dir_all` honours the umask, so the mount used to create a
     /// 0775 CAS root and then refuse it for being group-writable: the
     /// daemon declined to mount a directory it had just made itself, and
-    /// no cold start could succeed on a stock host. The whole rabsd test
+    /// no cold start could succeed on a stock Debian/Ubuntu box at all.
+    /// The whole rabsd test
     /// suite failed on exactly those workers too, which is how this was
     /// found.
     #[cfg(unix)]

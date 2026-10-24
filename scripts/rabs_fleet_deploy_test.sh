@@ -103,6 +103,10 @@ map_roots() {
     printf '%s' "$text"
 }
 mapped_command=$(map_roots "$remote_command")
+# A managed EnvironmentFile path is read from the unit as data at activation.
+# Translate that indirect open into the same private filesystem namespace as
+# the literal command paths, without rewriting the saved service/environment.
+mapped_command=${mapped_command//'previous_environment=${line#EnvironmentFile=}'/'previous_environment="$RABS_TEST_REMOTE_ROOT${line#EnvironmentFile=}"'}
 # A permissive peer default must not hide missing production chmod/umask.
 umask 022
 if [[ "${RABS_TEST_FAIL_TLS_TRANSFER:-0}" == 1 && "$remote_command" == *cat* \
@@ -125,7 +129,10 @@ cat > "$FIXTURE_BIN/bwrap" <<'BWRAP'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$RABS_TEST_CASE/bwrap.log"
-[[ "${RABS_TEST_BWRAP:-allow}" == allow ]]
+[[ "${RABS_TEST_BWRAP:-allow}" == allow ]] || exit 1
+for argument do
+    [[ "$argument" != "${RABS_TEST_BWRAP_DENY:-}" ]] || exit 1
+done
 BWRAP
 
 cat > "$FIXTURE_BIN/systemctl" <<'SYSTEMCTL'
@@ -241,9 +248,10 @@ run_deploy() {
             > "$CASE_DIR/remote/root/.local/state/rabs/retained-state"
     fi
     snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.before"
-    if env -u BASH_ENV -u ENV PATH="$FIXTURE_BIN:$PATH" \
+    if env -u BASH_ENV -u ENV -u RABS_WORKER_ID -u RABS_WORKER_STATE_DIR \
+        -u RABS_WORKER_TARGET_CACHE_BYTES -u RABS_WORKER_TARGET_CACHE_EPOCH PATH="$FIXTURE_BIN:$PATH" \
         RABS_TEST_CASE="$CASE_DIR" RABS_TEST_REMOTE_ROOT="$CASE_DIR/remote" \
-        RABS_TEST_BWRAP=allow RABS_TEST_FAIL_TLS_TRANSFER=0 \
+        RABS_TEST_BWRAP=allow RABS_TEST_BWRAP_DENY= RABS_TEST_FAIL_TLS_TRANSFER=0 \
         RABS_TEST_SYSTEMCTL_FAIL= RABS_TEST_VERSION_FAIL=0 \
         RABS_WORKER_TLS_CA="$CERT_DIR/coordinator-ca.pem" \
         RABS_WORKER_TLS_CERT="$CERT_DIR/client.pem" \
@@ -317,6 +325,26 @@ run_deploy injected-coordinator failure worker.example $'coordinator.example:744
 assert_local_refusal 'coordinator systemd injection'
 run_deploy invalid-port failure worker.example coordinator.example:65536
 assert_local_refusal 'out-of-range coordinator port'
+for identity in '' 'worker name' 'worker/name' 'worker%h' 'worker"name' $'worker\nID=other'; do
+    run_deploy "invalid-worker-id-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        "RABS_WORKER_ID=$identity"
+    assert_local_refusal 'invalid worker identity cannot reach SSH'
+done
+for state_path in '' 'relative/state' '/' $'/var/lib/rabs\nRABS_WORKER_ID=other' $'/var/lib/rabs\tstate' $'/var/lib/rabs\377'; do
+    run_deploy "invalid-state-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        "RABS_WORKER_STATE_DIR=$state_path"
+    assert_local_refusal 'invalid journal directory cannot reach SSH'
+done
+for cache_bytes in '' '-1' '+1' '1.5' '0x100' ' 1' '1 ' '8589934593' '00000000000' $'1\nExecStart=/bin/false'; do
+    run_deploy "invalid-target-limit-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        "RABS_WORKER_TARGET_CACHE_BYTES=$cache_bytes"
+    assert_local_refusal 'invalid target-cache quota cannot reach SSH'
+done
+for cache_epoch in '.image' '../image' 'image/path' 'image with spaces' 'image%h' $'image\nExecStart=/bin/false'; do
+    run_deploy "invalid-target-epoch-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        "RABS_WORKER_TARGET_CACHE_EPOCH=$cache_epoch"
+    assert_local_refusal 'invalid target-cache runtime epoch cannot reach SSH'
+done
 
 run_deploy bwrap-refused failure worker.example coordinator.example:7443 RABS_TEST_BWRAP=refuse
 [[ -s "$CASE_DIR/ssh.log" && -s "$CASE_DIR/bwrap.log" ]] || fail 'bwrap gate was not exercised'
@@ -325,6 +353,26 @@ cmp "$CASE_DIR/attempt-$ATTEMPT.before" "$CASE_DIR/attempt-$ATTEMPT.after" \
     || fail 'bwrap refusal wrote deployment files'
 [[ ! -s "$CASE_DIR/systemctl.log" ]] || fail 'bwrap refusal touched the service'
 pass 'bwrap refuses before remote installation writes'
+
+# Each controlled host admits the old root-bind userns smoke command but
+# refuses one operation required by the actual canonical worker. The complete
+# generated remote shell must reject it before transferring a single file.
+for facet in --proc --dev --tmpfs --unshare-pid --unshare-ipc --unshare-uts --unshare-net; do
+    run_deploy "canonical-refused-${facet#--}" failure worker.example coordinator.example:7443 \
+        "RABS_TEST_BWRAP_DENY=$facet"
+    grep -Fq 'refused:bwrap-present-but-canonical-fails' "$CASE_STDOUT" \
+        || fail "$facet refusal did not identify the canonical capability failure"
+    [[ $(grep -c '^CALL$' "$CASE_DIR/ssh.log") == 1 ]] \
+        || fail "$facet refusal reached a later deployment step"
+    snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.after"
+    cmp "$CASE_DIR/attempt-$ATTEMPT.before" "$CASE_DIR/attempt-$ATTEMPT.after" \
+        || fail "$facet refusal wrote deployment files"
+    [[ ! -s "$CASE_DIR/systemctl.log" ]] || fail "$facet refusal touched the service"
+    env RABS_TEST_CASE="$CASE_DIR" RABS_TEST_BWRAP=allow RABS_TEST_BWRAP_DENY="$facet" \
+        "$FIXTURE_BIN/bwrap" --unshare-user --uid 0 --ro-bind / / true \
+        || fail "controlled $facet host must admit the old, insufficient smoke probe"
+    pass "$facet failure refuses canonical deployment despite a working root-bind userns"
+done
 
 run_deploy systemd-unavailable failure worker.example coordinator.example:7443 \
     RABS_TEST_SYSTEMCTL_FAIL=show-environment
@@ -344,6 +392,7 @@ assert_mode() {
 # through its EnvironmentFile to the private generation's credentials.
 assert_installation() {
     local client=$1 coordinator=$2 server_name=$3 unit environment_path environment_file stage
+    local expected_id=${4-} expected_state=${5-} expected_bytes=${6-} expected_epoch=${7-} observed expected_key
     unit="$CASE_DIR/remote/etc/systemd/system/rabs-wkr.service"
     [[ -f "$unit" ]] || fail 'the service unit was not installed'
     environment_path=$(sed -n 's/^EnvironmentFile=//p' "$unit")
@@ -378,9 +427,39 @@ assert_installation() {
     grep -Fxq 'User=root' "$unit" || fail 'service lost its root identity and default durable state'
     grep -Fxq "ExecStart=/usr/local/bin/rabs-wkr --coordinator \"$coordinator\"" "$unit" \
         || fail 'coordinator route changed in the service unit'
-    if grep -Eq 'RABS_WORKER_(STATE_DIR|ID)=' "$unit" "$environment_file"; then
-        fail 'deployment unexpectedly changed worker identity or durable state configuration'
+    # The generated optional values use the POSIX double-quoted subset of
+    # EnvironmentFile syntax. Evaluate that subset in an empty subprocess
+    # environment to check the effective values, including literal dollar,
+    # quote/backslash/backtick bytes; this is not a systemd service proof.
+    observed=$(env -i bash --noprofile --norc -c \
+        '. "$1"; printf "worker_id=%s\nworker_state=%s\ncache_bytes=%s\ncache_epoch=%s" "${RABS_WORKER_ID-}" "${RABS_WORKER_STATE_DIR-}" "${RABS_WORKER_TARGET_CACHE_BYTES-}" "${RABS_WORKER_TARGET_CACHE_EPOCH-}"' \
+        -- "$environment_file") || fail 'worker environment could not be read'
+    [[ "$observed" == "worker_id=$expected_id"$'\n'"worker_state=$expected_state"$'\n'"cache_bytes=$expected_bytes"$'\n'"cache_epoch=$expected_epoch" ]] \
+        || fail 'installed service changed the selected identity, journal directory or target-cache settings'
+    if [[ -z "$expected_id" ]]; then
+        ! grep -q '^RABS_WORKER_ID=' "$environment_file" || fail 'default worker identity was overridden'
+    else
+        [[ $(grep -c '^RABS_WORKER_ID=' "$environment_file") == 1 ]] \
+            || fail 'worker identity was duplicated or dropped during upgrade'
     fi
+    if [[ -z "$expected_state" ]]; then
+        ! grep -q '^RABS_WORKER_STATE_DIR=' "$environment_file" || fail 'default state path was overridden'
+    else
+        [[ $(grep -c '^RABS_WORKER_STATE_DIR=' "$environment_file") == 1 ]] \
+            || fail 'worker journal path was duplicated or dropped during upgrade'
+    fi
+    if [[ -z "$expected_bytes" ]]; then
+        ! grep -q '^RABS_WORKER_TARGET_CACHE_BYTES=' "$environment_file" || fail 'default target-cache quota was overridden'
+    else
+        [[ $(grep -c '^RABS_WORKER_TARGET_CACHE_BYTES=' "$environment_file") == 1 ]] \
+            || fail 'target-cache quota was duplicated or dropped during upgrade'
+    fi
+    [[ $(grep -c '^RABS_WORKER_TARGET_CACHE_EPOCH=' "$environment_file" || true) -le 1 ]] \
+        || fail 'target-cache runtime epoch was duplicated during upgrade'
+    expected_key=$(openssl x509 -in "$CERT_DIR/$client.pem" -pubkey -noout |
+        openssl pkey -pubin -outform DER | openssl dgst -sha256)
+    grep -Fxq "Coordinator enrollment: RABS_DEPENDENCY_WORKER_SPKI_SHA256=${expected_key##* }" "$CASE_STDERR" \
+        || fail 'coordinator enrollment pin does not match the deployed certificate'
     grep -Fxq 'existing worker identity and durable state' \
         "$CASE_DIR/remote/root/.local/state/rabs/retained-state" \
         || fail 'existing worker state was modified'
@@ -407,6 +486,81 @@ cmp "$CERT_DIR/client.key" "$CASE_DIR/remote$FIRST_STAGE/worker.key" \
 [[ $(grep -c '^restart rabs-wkr.service$' "$CASE_DIR/systemctl.log") == 2 ]] \
     || fail 'redeployment did not explicitly restart an already-enabled service'
 pass 'redeployment uses a new private generation, restarts, and retains prior state'
+
+# The selected TLS identity alone does not set the protocol's worker label.
+# Both the direct worker CLI's identity and its durable journal location must
+# survive service installation and later credential-only/binary upgrades.
+SPECIAL_STATE='/var/lib/rabs/worker with spaces\backslash"quote"$HOME`hostname`'
+run_deploy selected-worker success worker.example coordinator.example:7443 \
+    RABS_WORKER_ID=leaf-worker "RABS_WORKER_STATE_DIR=$SPECIAL_STATE"
+assert_installation client coordinator.example:7443 coordinator.example leaf-worker "$SPECIAL_STATE"
+grep -Fxq 'Coordinator enrollment: RABS_DEPENDENCY_WORKER_ID=leaf-worker' "$CASE_STDERR" \
+    || fail 'the selected protocol identity was not reported for coordinator enrollment'
+SELECTED_STAGE=$LAST_STAGE
+pass 'selected worker identity and exact remote journal path reach the installed service'
+
+run_deploy selected-worker success worker.example coordinator.example:7443
+assert_installation client coordinator.example:7443 coordinator.example leaf-worker "$SPECIAL_STATE"
+[[ "$LAST_STAGE" != "$SELECTED_STAGE" ]] || fail 'selected worker did not receive a new credential generation'
+[[ -f "$CASE_DIR/remote$SELECTED_STAGE/worker.env" ]] || fail 'upgrade discarded prior worker settings'
+pass 'omitting runtime settings during an upgrade retains the current identity and journal'
+
+run_deploy selected-worker success worker.example coordinator.example:7443 RABS_WORKER_ID=leaf-worker
+assert_installation client coordinator.example:7443 coordinator.example leaf-worker "$SPECIAL_STATE"
+pass 'explicit identity with an omitted journal retains the existing journal assignment once'
+
+run_deploy selected-worker success worker.example coordinator.example:7443 "RABS_WORKER_STATE_DIR=$SPECIAL_STATE"
+assert_installation client coordinator.example:7443 coordinator.example leaf-worker "$SPECIAL_STATE"
+pass 'explicit journal with an omitted identity retains the existing identity assignment once'
+
+run_deploy retained-targets success worker.example coordinator.example:7443 \
+    RABS_WORKER_TARGET_CACHE_BYTES=1073741824 RABS_WORKER_TARGET_CACHE_EPOCH=image-v1
+assert_installation client coordinator.example:7443 coordinator.example '' '' 1073741824 image-v1
+pass 'managed service receives the target quota and stable runtime epoch'
+
+run_deploy retained-targets success worker.example coordinator.example:7443
+assert_installation client coordinator.example:7443 coordinator.example '' '' 1073741824 image-v1
+pass 'credential-only upgrade retains target-cache quota and runtime epoch'
+
+run_deploy retained-targets success worker.example coordinator.example:7443 RABS_WORKER_TARGET_CACHE_BYTES=8589934592
+assert_installation client coordinator.example:7443 coordinator.example '' '' 8589934592 image-v1
+pass 'changing the target quota preserves the runtime epoch'
+
+run_deploy retained-targets success worker.example coordinator.example:7443 RABS_WORKER_TARGET_CACHE_EPOCH=image-v2
+assert_installation client coordinator.example:7443 coordinator.example '' '' 8589934592 image-v2
+pass 'runtime epoch rotation preserves the configured target quota'
+
+run_deploy retained-targets success worker.example coordinator.example:7443 RABS_WORKER_TARGET_CACHE_EPOCH=
+assert_installation client coordinator.example:7443 coordinator.example '' '' 8589934592 ''
+grep -Fxq 'RABS_WORKER_TARGET_CACHE_EPOCH=""' "$CASE_DIR/remote$LAST_STAGE/worker.env" \
+    || fail 'empty epoch did not explicitly clear durable retention'
+pass 'an empty epoch restores process-only retention without losing the byte quota'
+
+run_deploy retained-targets success worker.example coordinator.example:7443 RABS_WORKER_TARGET_CACHE_BYTES=0
+assert_installation client coordinator.example:7443 coordinator.example '' '' 0 ''
+pass 'zero bytes explicitly disables target retention'
+
+run_deploy selected-identity-only success worker.example coordinator.example:7443 RABS_WORKER_ID=identity-only
+assert_installation client coordinator.example:7443 coordinator.example identity-only
+pass 'selecting only an identity retains the worker default journal layout'
+
+run_deploy selected-state-only success worker.example coordinator.example:7443 RABS_WORKER_STATE_DIR=/var/lib/rabs/durable
+assert_installation client coordinator.example:7443 coordinator.example '' /var/lib/rabs/durable
+pass 'selecting only a journal retains the remote hostname identity'
+
+# Lost settings must not cause a credential update to replace the running
+# service with hostname/default-state settings and forget execution history.
+mv "$CASE_DIR/remote$LAST_STAGE/worker.env" "$CASE_DIR/remote$LAST_STAGE/worker.env.retained"
+OLD_UNIT_HASH=$(sha256sum "$CASE_DIR/remote/etc/systemd/system/rabs-wkr.service")
+OLD_BINARY_HASH=$(sha256sum "$CASE_DIR/remote/usr/local/bin/rabs-wkr")
+run_deploy selected-state-only failure worker.example coordinator.example:7443
+[[ $(sha256sum "$CASE_DIR/remote/etc/systemd/system/rabs-wkr.service") == "$OLD_UNIT_HASH" ]] \
+    || fail 'unreadable prior settings replaced the old service unit'
+[[ $(sha256sum "$CASE_DIR/remote/usr/local/bin/rabs-wkr") == "$OLD_BINARY_HASH" ]] \
+    || fail 'unreadable prior settings replaced the old binary'
+[[ $(grep -c '^restart rabs-wkr.service$' "$CASE_DIR/systemctl.log") == 1 ]] \
+    || fail 'unreadable prior settings restarted the old service'
+pass 'missing prior journal settings refuse before binary replacement or service restart'
 
 run_deploy split-authorities success worker.example coordinator.example:7443 \
     "RABS_WORKER_TLS_CERT=$CERT_DIR/split-client.pem" "RABS_WORKER_TLS_KEY=$CERT_DIR/split-client.key"

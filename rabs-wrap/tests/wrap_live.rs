@@ -15,23 +15,22 @@ fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
 }
 
-/// The rabsd binary lives beside ours in the target dir; build it once
-/// if a fresh checkout hasn't yet.
+#[path = "support/rabsd.rs"]
+mod daemon_binary;
+
+/// Use a prepared binary pair, or a profile-matched Cargo artifact.
 fn rabsd_bin() -> std::path::PathBuf {
-    let path = std::path::Path::new(wrap()).with_file_name("rabsd");
-    if !path.exists() {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
-        assert!(status.success());
-    }
-    path
+    daemon_binary::binary(wrap())
 }
 
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::io::Write;
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(format!("#!/bin/sh\n{body}").as_bytes())
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -95,7 +94,21 @@ fn exec_preserves_non_utf8_argv_and_compiler_path() {
     ];
 
     for (executable, args) in cases {
-        let direct = Command::new(executable).args(&args).output().unwrap();
+        let direct = {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            loop {
+                match Command::new(executable).args(&args).output() {
+                    Err(error)
+                        if (error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            || error.raw_os_error() == Some(26))
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    result => break result.unwrap(),
+                }
+            }
+        };
         assert_eq!(direct.status.code(), Some(23));
         let wrapped = Command::new(wrap())
             .arg(executable)
@@ -302,6 +315,7 @@ fn daemon_dead_fails_open_fast_and_breaker_opens_per_model() {
 #[test]
 fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
     let mut daemon = Command::new(rabsd_bin())
@@ -314,8 +328,17 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
         .spawn()
         .expect("spawn rabsd");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "socket never appeared");
+    while !socket.exists()
+        || !Command::new(rabsd_bin())
+            .arg("--coord-status")
+            .env("RABS_SOCKET_PATH", &socket)
+            .env("RABS_CONFIG", "/nonexistent-rabs-config")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        assert!(Instant::now() < deadline, "daemon never became ready");
         std::thread::sleep(Duration::from_millis(10));
     }
 

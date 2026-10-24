@@ -8,9 +8,11 @@
 
 use std::sync::OnceLock;
 
+mod remote_scoped_launch;
 /// Shared Linux launch and cancellation protocol; callers select their receipt.
-pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = include_str!("remote_process.sh");
+pub use remote_scoped_launch::REMOTE_PROCESS_IDENTITY_SCRIPT;
 
+pub mod admission_preview;
 pub mod admission_recommendation;
 pub mod admission_rejection;
 pub mod admit_preflight;
@@ -44,6 +46,7 @@ pub mod gc_roots;
 pub mod hooks;
 pub mod incident;
 pub mod incident_ledger;
+pub mod isolated_staging;
 pub mod job_identity;
 pub mod job_recovery;
 pub mod log_retention;
@@ -56,6 +59,7 @@ pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
 pub mod placement;
+pub mod pnpm_workspace;
 pub mod pooled_target_key;
 pub mod process_identity;
 pub mod proof_handoff;
@@ -75,6 +79,8 @@ pub mod remote_compilation;
 #[cfg(unix)]
 pub mod remote_verification;
 pub mod repo_updater_contract;
+pub mod restart_admission;
+pub use restart_admission::{MaintenanceOwner, MaintenanceRecovery, RestartAdmissionResponse};
 pub mod rsync_flavor;
 pub mod schema_versions;
 #[cfg(unix)]
@@ -88,9 +94,13 @@ pub mod telemetry_explain;
 pub mod telemetry_freshness;
 pub mod test_change;
 pub mod testing;
+pub mod tool_requirement;
 pub mod toolchain;
 pub mod transfer_hardening;
 pub mod types;
+
+/// Standard-library-only worker guard shared by SSH and direct execution.
+pub const REMOTE_BUILD_DISK_MONITOR_SCRIPT: &str = include_str!("../build_disk_monitor.py");
 pub mod ui;
 pub mod util;
 pub mod worker_config_validation;
@@ -275,8 +285,8 @@ pub use transfer_hardening::{
 };
 pub use types::{
     AffinityConfig, ApiConfig, BoxRole, BuildCancellationMetadata, BuildCancellationWorkerHealth,
-    BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats,
-    CircuitBreakerConfig, CircuitState, CircuitStats, ColorMode, CommandPriority,
+    BuildDiskBudget, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord,
+    BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats, ColorMode, CommandPriority,
     CommandTimingBreakdown, CompilationConfig, CompilationMetrics, CompilationTimer,
     CompilationTimingBreakdown, DashboardConfig, DoctorConfig, DoctorWebhookEndpoint,
     DoctorWebhookFormat, DoctorWebhooksConfig, EnvironmentConfig, ExecutionConfig, FairnessConfig,
@@ -317,7 +327,7 @@ pub use ui::{
 pub use capability_probe::{
     CapabilityRequirement, CapabilityVerdict, EligibilityVerdict, ProbeSpec, ProbedFacts,
     WorkerLiveness, assess_admissibility, assess_worker_eligibility, build_capability_probe_script,
-    parse_capability_probe, remote_worker_binary_path,
+    parse_capability_probe, remote_worker_binary_paths,
 };
 pub use incident::{
     ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,

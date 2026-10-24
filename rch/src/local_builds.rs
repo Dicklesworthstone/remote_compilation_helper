@@ -268,7 +268,7 @@ fn is_compiler_comm(comm: &str) -> bool {
 fn read_comm(proc_dir: &Path) -> io::Result<Option<String>> {
     let raw = match std::fs::read_to_string(proc_dir.join("comm")) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if process_gone(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     let comm = raw.trim();
@@ -279,6 +279,16 @@ fn read_comm(proc_dir: &Path) -> io::Result<Option<String>> {
         ));
     }
     Ok(Some(comm.to_string()))
+}
+
+/// The process exited between the directory listing and this read. Besides
+/// ENOENT, a read racing the exit itself fails with ESRCH; on a busy
+/// dispatcher that aborted the whole scan ("Local build detection
+/// unavailable: No such process (os error 3)").
+#[cfg(any(target_os = "linux", test))]
+fn process_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
 }
 
 #[cfg(target_os = "linux")]
@@ -363,6 +373,15 @@ mod tests {
             comm: "cargo".to_string(),
             exe: None,
         }]
+    }
+
+    #[test]
+    fn a_process_that_exits_mid_scan_is_skipped_not_a_scan_failure() {
+        let esrch = rustix::io::Errno::SRCH.raw_os_error();
+        assert!(process_gone(&io::Error::from_raw_os_error(esrch)));
+        assert!(process_gone(&io::Error::from(io::ErrorKind::NotFound)));
+        let eacces = rustix::io::Errno::ACCESS.raw_os_error();
+        assert!(!process_gone(&io::Error::from_raw_os_error(eacces)));
     }
 
     #[test]

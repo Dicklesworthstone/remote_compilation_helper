@@ -107,11 +107,17 @@ pub struct ReapCycleStats {
 /// [`stale_target_reap::is_safe_reap_base`] in the Rust caller; it is embedded
 /// inside double quotes. The `find -name` globs are double-quoted so they survive
 /// the single-quoted `sh -c '…'` dispatch unchanged.
+///
+/// `low_disk_permille` adds the shared builder's pressure pass (0 = off). The
+/// periodic sweep passes rchd's placement line, so the repo-mirror targets it
+/// owns, most of what a zeroed worker can still reclaim, are evicted until the
+/// worker is back above it.
 fn build_sweep_command(
     escaped_base: &str,
     idle_minutes: u64,
     pooled_idle_minutes: Option<u64>,
     max_cache_kb: Option<u64>,
+    low_disk_permille: u64,
 ) -> String {
     // Delegates to the shared builder (moved to `rch_common::stale_target_reap`
     // for 6dj11's `rch gc`, which must sweep EXACTLY what this periodic sweep
@@ -120,11 +126,12 @@ fn build_sweep_command(
     // optional byte-cap LRU eviction, the depth guards, and the
     // metrics-survive-the-loop file-redirect shape all live there now; the
     // shape tests below still pin the emitted script.
-    stale_target_reap::worker_sweep_command(
+    stale_target_reap::worker_sweep_command_under_pressure(
         escaped_base,
         idle_minutes,
         pooled_idle_minutes,
         max_cache_kb,
+        low_disk_permille,
     )
 }
 
@@ -375,6 +382,9 @@ impl StaleTargetReaper {
                 idle_minutes,
                 pooled_idle_minutes_from_hours(self.config.pooled_idle_hours),
                 max_cache_kb_from_gb(self.config.max_cache_gb),
+                // The same line the cache sweep evicts to: critical placement
+                // ratio plus headroom.
+                crate::cache_cleanup::placement_low_disk_permille(),
             );
 
             debug!(worker = %worker_id, idle_minutes, base = %base, "Starting stale-target sweep");
@@ -514,7 +524,7 @@ mod tests {
 
     #[test]
     fn sweep_command_confines_to_base_and_per_job_globs() {
-        let cmd = build_sweep_command("/data/projects", 720, None, None);
+        let cmd = build_sweep_command("/data/projects", 720, None, None, 0);
         // Depth-robust find at ANY depth under the canonicalized base — NOT a
         // fixed depth-2 `for proj in "$base"/*` glob (which would miss nested
         // workspace-member per-job dirs).
@@ -533,8 +543,9 @@ mod tests {
         // Only the per-job globs are matched.
         assert!(cmd.contains(".rch-target-*-job-*"));
         assert!(cmd.contains(".rch-target-*-pid-*"));
-        // Shared idle predicate (no -type f) is present.
-        assert!(cmd.contains("find \"$d\" -mmin -720 -print -quit"));
+        // Shared, checked idle predicate (no -type f) is present (13da097f).
+        assert!(cmd.contains("if __gc_source_recent_activity \"$d\" 720; then"));
+        assert!(cmd.contains("find \"$1\" -mmin -\"$2\" -print -quit"));
         assert!(!cmd.contains("-type f"));
         // Never a bare `target` glob.
         assert!(!cmd.contains("/target "));

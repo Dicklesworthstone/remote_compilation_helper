@@ -339,7 +339,7 @@ fn inspectable_executable_path(file_name: &str) -> bool {
 ///
 /// `pinned_triple` is the command's explicit `--target <triple>`, if any; see
 /// the module docs for why it selects a different subtree.
-fn in_scope_output_path<'a>(
+pub(super) fn in_scope_output_path<'a>(
     path: &'a str,
     custom_target_sync: bool,
     pinned_triple: Option<&str>,
@@ -465,6 +465,23 @@ pub(super) fn foreign_target_artifacts(
         }
     }
     findings
+}
+
+/// Positive format/ELF CPU evidence from bounded worker-side header reads.
+/// PE and Mach-O CPU evidence remains the post-transfer gate's responsibility;
+/// their leading magic still proves a container mismatch.
+pub(super) fn foreign_artifact_header(header: &[u8], expected_triple: &str) -> bool {
+    let Some(expected) = expected_binary_format(expected_triple) else {
+        return false;
+    };
+    let Some(found) = classify_binary_format(header) else {
+        return false;
+    };
+    found != expected
+        || matches!(
+            (expected_cpu_architecture(expected_triple), elf_cpu_architecture(header)),
+            (Some(expected), Some(found)) if expected != found
+        )
 }
 
 /// Read just enough of a file to classify it. Any I/O error is "no evidence".
@@ -840,6 +857,33 @@ mod tests {
         }
         header[if little_endian { 20 } else { 23 }] = 1;
         header
+    }
+
+    #[test]
+    fn pretransfer_headers_preserve_native_and_intentional_cross_outputs() {
+        let elf = elf_header(62, 2, true);
+        assert!(foreign_artifact_header(&elf, "aarch64-apple-darwin"));
+        assert!(!foreign_artifact_header(&elf, "x86_64-unknown-linux-gnu"));
+        assert!(foreign_artifact_header(&elf, "aarch64-unknown-linux-gnu"));
+        let macho = [0xcf, 0xfa, 0xed, 0xfe];
+        assert!(!foreign_artifact_header(&macho, "aarch64-apple-darwin"));
+        assert!(foreign_artifact_header(&macho, "x86_64-unknown-linux-gnu"));
+        assert!(!foreign_artifact_header(b"archive", "aarch64-apple-darwin"));
+        assert!(!foreign_artifact_header(&elf, "custom.json"));
+        for custom in [false, true] {
+            let prefix = if custom { "" } else { "target/" };
+            let target = "x86_64-unknown-linux-gnu";
+            let requested = format!("{prefix}{target}/debug/deps/test-1234567890abcdef");
+            assert!(in_scope_output_path(&requested, custom, Some(target)).is_some());
+            assert!(!foreign_artifact_header(&elf, target));
+            let host = format!("{prefix}debug/deps/libhost.dylib");
+            assert!(in_scope_output_path(&host, custom, Some(target)).is_none());
+            for n in 0..1040 {
+                let test = format!("{prefix}debug/deps/test_{n}-1234567890abcdef");
+                assert!(in_scope_output_path(&test, custom, None).is_some());
+                assert!(foreign_artifact_header(&elf, "aarch64-apple-darwin"));
+            }
+        }
     }
 
     #[test]

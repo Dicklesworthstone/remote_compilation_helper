@@ -497,6 +497,7 @@ mod tests {
 
     fn sample_status() -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
+            admission: None,
             daemon: DaemonInfoFromApi {
                 pid: 1234,
                 uptime_secs: 3600,
@@ -538,6 +539,7 @@ mod tests {
                 severity: "warning".to_string(),
                 summary: "Worker-2 has high latency".to_string(),
                 remediation: Some("Check network connection".to_string()),
+                worker_id: None,
             }],
             alerts: vec![],
             stats: BuildStatsFromApi {

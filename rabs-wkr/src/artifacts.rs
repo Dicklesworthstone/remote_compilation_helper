@@ -8,10 +8,12 @@
 //! diagnostic-range storage. This is a transport offer, not a CAS publication.
 
 use crate::output::{CapturedStream, MAX_OUTPUT_CHUNK_BYTES, MAX_RETAINED_STREAM_BYTES};
+use crate::source_transfer::DependencyOutputInputs;
 use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
 };
 use rabs_sandbox::canonical_mounts::UnitMount;
+use rabs_sandbox::cargo_artifacts::{self, CargoArtifactMode, CargoArtifactReport};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
@@ -29,20 +31,23 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// A validated, nonempty output contract. No physical path is carried here.
+/// A validated output contract. Cargo may discover its nonempty required set
+/// after compilation; no physical path is carried here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactPlan {
     unit: String,
     files: BTreeSet<String>,
     directories: BTreeSet<String>,
     tree: bool,
+    cargo: Option<CargoArtifactMode>,
+    private_incremental: Option<Vec<String>>,
 }
 
 impl ArtifactPlan {
     /// Reject aliases, traversal, duplicate files and file/directory conflicts
     /// before execution. Path spelling is preserved, never silently normalized.
     pub fn new(unit: String, paths: Vec<String>) -> io::Result<Self> {
-        Self::bounded(unit, paths, MAX_ARTIFACT_FILES)
+        Self::bounded(unit, paths, MAX_ARTIFACT_FILES, false)
     }
 
     /// Opt in to the complete regular-file output tree, with mandatory final
@@ -61,14 +66,42 @@ impl ArtifactPlan {
         Ok(plan)
     }
 
+    /// Cargo supplies hashed target names only after compilation. Its explicit
+    /// JSON contract must be resolved before this plan can capture any output.
+    fn new_cargo_tree(
+        required: Vec<String>,
+        mode: CargoArtifactMode,
+        private_incremental: Option<Vec<String>>,
+    ) -> io::Result<Self> {
+        if !cfg!(target_os = "linux") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cargo artifact tree capture requires Linux",
+            ));
+        }
+        let mut plan = Self::bounded("cargo".to_owned(), required, MAX_ARTIFACT_FILES, true)?;
+        if !plan.files.is_empty() {
+            rabs_sandbox::artifact_tree::validate_tree_names(plan.files())?;
+        }
+        plan.tree = true;
+        plan.cargo = Some(mode);
+        plan.private_incremental = private_incremental;
+        Ok(plan)
+    }
+
     /// A sealed result contains its COMPLETE exact set, not the original tree's
     /// minimum. Rehydration reconstructs only these names and never rediscovers
     /// outputs or permits a caller's exact declaration to exceed its own bound.
     pub(crate) fn from_retained(unit: String, paths: Vec<String>) -> io::Result<Self> {
-        Self::bounded(unit, paths, MAX_TREE_FILES)
+        Self::bounded(unit, paths, MAX_TREE_FILES, false)
     }
 
-    fn bounded(unit: String, paths: Vec<String>, limit: usize) -> io::Result<Self> {
+    fn bounded(
+        unit: String,
+        paths: Vec<String>,
+        limit: usize,
+        allow_empty: bool,
+    ) -> io::Result<Self> {
         if unit.is_empty()
             || unit.len() > 64
             || matches!(unit.as_str(), "." | "..")
@@ -78,7 +111,7 @@ impl ArtifactPlan {
         {
             return Err(invalid("invalid artifact unit"));
         }
-        if paths.is_empty() || paths.len() > limit {
+        if (!allow_empty && paths.is_empty()) || paths.len() > limit {
             return Err(invalid("artifact file count outside its bound"));
         }
         let mut files = BTreeSet::new();
@@ -109,6 +142,8 @@ impl ArtifactPlan {
             files,
             directories,
             tree: false,
+            cargo: None,
+            private_incremental: None,
         })
     }
 
@@ -122,6 +157,29 @@ impl ArtifactPlan {
     /// the full output set is in CapturedArtifacts::manifest, not this minimum.
     pub fn files(&self) -> impl Iterator<Item = &str> {
         self.files.iter().map(String::as_str)
+    }
+
+    pub(crate) const fn cargo_mode(&self) -> Option<CargoArtifactMode> {
+        self.cargo
+    }
+
+    /// A compiler-unit result must declare every file before execution.
+    /// Whole-Cargo tree discovery cannot replace the archive output contract.
+    pub(crate) const fn is_exact(&self) -> bool {
+        !self.tree
+    }
+
+    /// Exact worker-private roots under the explicit incremental Cargo output
+    /// contract. Target-state keys bind this projection separately from mode.
+    pub(crate) fn private_incremental_roots(&self) -> Option<&[String]> {
+        self.private_incremental.as_deref()
+    }
+
+    /// Only descendants of independently derived Cargo incremental roots may
+    /// remain in a private target seed without entering the exported bundle.
+    pub(crate) fn is_private_incremental_file(&self, name: &str) -> bool {
+        self.private_incremental_roots()
+            .is_some_and(|roots| cargo_artifacts::is_private_incremental_file(roots, name))
     }
 }
 
@@ -137,19 +195,48 @@ impl PreparedArtifacts {
     /// Prepare fresh backing and declared parent directories. A later attempt
     /// cannot observe stale output files from an earlier successful compile.
     pub fn new(plan: ArtifactPlan) -> io::Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("rabs-artifacts-")
-            .tempdir()?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rabs-artifacts-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let directory = builder.tempdir()?;
+        Self::with_directory(plan, directory)
+    }
+
+    fn with_directory(plan: ArtifactPlan, directory: tempfile::TempDir) -> io::Result<Self> {
         for relative in &plan.directories {
             fs::create_dir_all(directory.path().join(relative))?;
         }
         Ok(Self { plan, directory })
     }
 
+    /// Stable physical fixture paths model canonical mount destinations without
+    /// pretending a host test has entered the production mount namespace.
+    #[cfg(test)]
+    pub(crate) fn fixture(plan: ArtifactPlan, parent: &Path) -> io::Result<Self> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("target").rand_bytes(0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        Self::with_directory(plan, builder.tempdir_in(parent)?)
+    }
+
     /// Worker-local backing for the canonical mount, not a wire destination.
     #[must_use]
     pub fn backing(&self) -> &Path {
         self.directory.path()
+    }
+
+    /// The execution-owned output contract, including Cargo's dynamic mode.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn plan(&self) -> &ArtifactPlan {
+        &self.plan
     }
 
     /// Reuse D005's canonical output-unit mount, rather than constructing argv.
@@ -167,15 +254,138 @@ impl PreparedArtifacts {
     /// Tree mode captures all regular files and admits only closed internal hard
     /// links, copying aliases independently; it never follows symlinks or mounts.
     pub fn capture(self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
+        self.capture_with_dependency_inputs(None, stopped)
+    }
+
+    /// Resolve Cargo's actual target files after process/drain cleanup, then
+    /// capture the complete tree using the ordinary descriptor-anchored path.
+    /// A caller cannot turn an unresolved Cargo plan into a successful capture.
+    pub(crate) fn capture_with_cargo_output(
+        &self,
+        dependency_inputs: Option<&DependencyOutputInputs>,
+        stdout: impl Read,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        self.capture_cargo_output_at(
+            dependency_inputs,
+            stdout,
+            stopped,
+            &self.plan.virtual_root(),
+        )
+    }
+
+    /// Host fixtures exercise actual Cargo reports at stable physical paths.
+    /// Production always resolves reports against the canonical mount above.
+    #[cfg(test)]
+    pub(crate) fn capture_fixture_cargo_output(
+        &self,
+        stdout: impl Read,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        let root = self
+            .backing()
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF-8 Cargo fixture target"))?;
+        self.capture_cargo_output_at(None, stdout, stopped, root)
+    }
+
+    fn capture_cargo_output_at(
+        &self,
+        dependency_inputs: Option<&DependencyOutputInputs>,
+        stdout: impl Read,
+        stopped: impl Fn() -> bool,
+        output_root: &str,
+    ) -> io::Result<CapturedArtifacts> {
+        let Some(mode) = self.plan.cargo else {
+            return self.capture_with_dependency_inputs(dependency_inputs, stopped);
+        };
+        if dependency_inputs.is_some() || stopped() {
+            return Err(invalid(
+                "Cargo artifact capture interrupted or has dependency-only inputs",
+            ));
+        }
+        let report = CargoArtifactReport::read(stdout, output_root, mode)?;
+        if report
+            .files()
+            .any(|name| self.plan.is_private_incremental_file(name))
+        {
+            return Err(invalid(
+                "Cargo reported an output inside private incremental state",
+            ));
+        }
+        let mut resolved = self.plan.clone();
+        resolved.files.extend(report.files().map(str::to_owned));
+        rabs_sandbox::artifact_tree::validate_tree_names(resolved.files())?;
+        resolved.cargo = None;
+        let mut captured = self.capture_tree(&resolved, stopped)?;
+        report.validate_outputs(
+            captured
+                .files
+                .iter()
+                .map(|(name, file)| (name.as_str(), file.executable)),
+        )?;
+        // Dynamic names constrain capture; they do not change the declaration
+        // admitted by ExecutionControl or the durable request fingerprint.
+        captured.plan = self.plan.clone();
+        Ok(captured)
+    }
+
+    /// A shared Cargo input/output directory contains owned mountpoints for
+    /// retained dependency files. These may never collide with output names,
+    /// become required parent directories, or silently enter a tree result.
+    pub(crate) fn validate_dependency_inputs(
+        &self,
+        inputs: &DependencyOutputInputs,
+    ) -> io::Result<()> {
+        inputs.verify(self.backing())?;
+        for name in inputs.relative_paths() {
+            if self.plan.tree {
+                return Err(invalid(
+                    "shared dependency inputs require an exact artifact declaration",
+                ));
+            }
+            if self.plan.files.contains(name) || self.plan.directories.contains(name) {
+                return Err(invalid("dependency input collides with a declared output"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Exclude only placeholders held by the source owner's verified input
+    /// guard. Arbitrary undeclared files remain errors. The original output
+    /// directory stays owned until both capture and the final guard check end.
+    pub(crate) fn capture_with_dependency_inputs(
+        &self,
+        dependency_inputs: Option<&DependencyOutputInputs>,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        if self.plan.cargo.is_some() {
+            return Err(invalid(
+                "Cargo artifact capture requires its complete JSON output",
+            ));
+        }
+        if let Some(inputs) = dependency_inputs {
+            self.validate_dependency_inputs(inputs)?;
+        }
         if self.plan.tree {
             #[cfg(target_os = "linux")]
-            return self.capture_tree(stopped);
+            {
+                let captured = self.capture_tree(&self.plan, stopped)?;
+                if let Some(inputs) = dependency_inputs {
+                    inputs.verify(self.backing())?;
+                }
+                return Ok(captured);
+            }
             #[cfg(not(target_os = "linux"))]
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "artifact tree capture requires Linux",
             ));
         }
+        let excluded: BTreeSet<_> = dependency_inputs
+            .into_iter()
+            .flat_map(DependencyOutputInputs::relative_paths)
+            .collect();
         let mut pending = vec![PathBuf::new()];
         let mut found = BTreeSet::new();
         let mut entries = 0_usize;
@@ -204,6 +414,9 @@ impl PreparedArtifacts {
                     pending.push(path);
                 } else {
                     regular_private_file(&metadata)?;
+                    if excluded.contains(name) {
+                        continue;
+                    }
                     if !self.plan.files.contains(name) {
                         return Err(invalid(format!("undeclared artifact: {name}")));
                     }
@@ -249,24 +462,51 @@ impl PreparedArtifacts {
                 "artifact capture interrupted",
             ));
         }
-        finish_capture(self.plan.clone(), files)
+        let captured = finish_capture(self.plan.clone(), files)?;
+        if let Some(inputs) = dependency_inputs {
+            inputs.verify(self.backing())?;
+        }
+        Ok(captured)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn capture_tree(
+        &self,
+        _plan: &ArtifactPlan,
+        _stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "artifact tree capture requires Linux",
+        ))
     }
 
     #[cfg(target_os = "linux")]
-    fn capture_tree(self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
+    fn capture_tree(
+        &self,
+        plan: &ArtifactPlan,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<CapturedArtifacts> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         use std::os::unix::fs::PermissionsExt;
 
-        let inventory = TreeInventory::scan(
-            self.backing(),
-            &self.plan.files,
-            MAX_ARTIFACT_BYTES,
-            &stopped,
-        )?;
+        let inventory =
+            TreeInventory::scan(self.backing(), &plan.files, MAX_ARTIFACT_BYTES, &stopped)?;
         let mut files = BTreeMap::new();
+        let mut exported_bytes = 0_u64;
         for name in inventory.names() {
+            // Scan the COMPLETE tree above, including private state, before
+            // reading any payload. Symlinks, mounts, special files, external
+            // hard links and mutation remain errors even in an omitted root.
+            if plan.is_private_incremental_file(name) {
+                continue;
+            }
             let file = inventory.open_file(name)?;
             let metadata = file.metadata()?;
+            exported_bytes = exported_bytes
+                .checked_add(metadata.len())
+                .filter(|bytes| *bytes <= MAX_ARTIFACT_BYTES)
+                .ok_or_else(|| invalid("artifact byte limit exceeded"))?;
             // Retain the same inode for the post-read check even though the
             // copying reader owns its descriptor. No original output is linked.
             let witness = file.try_clone()?;
@@ -287,8 +527,8 @@ impl PreparedArtifacts {
             );
         }
         inventory.verify(&stopped)?;
-        let bundle = finish_capture(self.plan.clone(), files)?;
-        if bundle.total_bytes != inventory.total_bytes() {
+        let bundle = finish_capture(plan.clone(), files)?;
+        if bundle.total_bytes != exported_bytes {
             return Err(invalid("artifact tree changed length during capture"));
         }
         Ok(bundle)
@@ -442,6 +682,10 @@ impl CapturedArtifacts {
             .get(name)
             .map(|file| (file.bytes.len(), file.bytes.sha256(), file.executable))
     }
+
+    pub(crate) fn file_names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
 }
 
 /// Decode a request's optional artifact declaration without accepting any host
@@ -455,7 +699,7 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
     let object = value.as_object().ok_or("artifacts must be an object")?;
     if object
         .keys()
-        .any(|key| key != "unit" && key != "files" && key != "tree")
+        .any(|key| key != "unit" && key != "files" && key != "tree" && key != "cargo")
     {
         return Err("unsupported artifact declaration field".to_owned());
     }
@@ -464,6 +708,9 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
         Some(value) if value.as_str() == Some(TREE_FILES_VERSION) => true,
         Some(_) => return Err("unsupported artifact tree declaration".to_owned()),
     };
+    let cargo = cargo_artifacts::requested(request).map_err(|error| error.to_string())?;
+    let private_incremental =
+        cargo_artifacts::private_incremental_roots(request).map_err(|error| error.to_string())?;
     let unit = value
         .get("unit")
         .and_then(serde_json::Value::as_str)
@@ -471,8 +718,8 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
     let files = value
         .get("files")
         .and_then(serde_json::Value::as_array)
-        .filter(|files| !files.is_empty() && files.len() <= MAX_ARTIFACT_FILES)
-        .ok_or("artifact files must contain 1..=128 names")?;
+        .filter(|files| (cargo.is_some() || !files.is_empty()) && files.len() <= MAX_ARTIFACT_FILES)
+        .ok_or("artifact files require a bounded required set or a Cargo artifact contract")?;
     let paths = files
         .iter()
         .map(|file| {
@@ -481,7 +728,9 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
                 .ok_or_else(|| "artifact names must be strings".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let plan = if tree {
+    let plan = if let Some(mode) = cargo {
+        ArtifactPlan::new_cargo_tree(paths, mode, private_incremental)
+    } else if tree {
         ArtifactPlan::new_tree(unit.to_owned(), paths)
     } else {
         ArtifactPlan::new(unit.to_owned(), paths)
@@ -635,6 +884,246 @@ mod tests {
 
     fn plan(paths: &[&str]) -> ArtifactPlan {
         ArtifactPlan::new("dep".into(), paths.iter().map(|s| (*s).into()).collect()).unwrap()
+    }
+
+    /// Exercise the real transfer seal and source-owner handoff. The guard is
+    /// obtained from production preparation, never constructed from names by
+    /// the capture test. Source and output owners remain alive through capture.
+    fn shared_input_capture(
+        plan: ArtifactPlan,
+    ) -> io::Result<(
+        PreparedArtifacts,
+        crate::source_transfer::SourceOwner,
+        DependencyOutputInputs,
+    )> {
+        use crate::source_transfer::{SourceTransferState, hex};
+        use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
+        use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+        use serde_json::json;
+
+        let inputs = [
+            (
+                "package/src/lib.rs",
+                b"pub fn answer() -> u8 { 42 }\n".as_slice(),
+            ),
+            (
+                "dependencies/0000/libleaf.rmeta",
+                b"retained metadata\0\xff".as_slice(),
+            ),
+            (
+                "dependencies/0000/libarchive.rlib",
+                b"retained full archive\0\xfe".as_slice(),
+            ),
+        ];
+        let manifest = SourceManifest::new(
+            inputs
+                .iter()
+                .map(|(path, bytes)| SourceFile {
+                    path: (*path).to_owned(),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let wire_manifest = json!({
+            "manifest_sha256":hex(&manifest.digest()),
+            "files":inputs.iter().map(|(path, bytes)| json!({
+                "path":path,"bytes":bytes.len(),"sha256":hex(&Sha256::digest(bytes)),
+                "executable":false,
+            })).collect::<Vec<_>>(),
+        });
+        let request_id = 591;
+        let request = json!({
+            "kind":"canonical-exec","request_id":request_id,
+            "source_manifest":wire_manifest,
+        });
+        let mut transfer = SourceTransferState::default();
+        transfer
+            .handle(
+                &json!({
+                    "kind":"source-begin","request_id":request_id,"manifest":wire_manifest,
+                }),
+                true,
+                false,
+            )
+            .unwrap();
+        for (path, bytes) in inputs {
+            transfer
+                .handle(
+                    &json!({
+                        "kind":"source-chunk","request_id":request_id,
+                        "manifest_sha256":hex(&manifest.digest()),"path":path,"offset":0,
+                        "data_hex":hex(bytes),"chunk_sha256":hex(&Sha256::digest(bytes)),
+                    }),
+                    true,
+                    false,
+                )
+                .unwrap();
+        }
+        transfer
+            .handle(
+                &json!({
+                    "kind":"source-seal","request_id":request_id,
+                    "manifest_sha256":hex(&manifest.digest()),
+                }),
+                true,
+                false,
+            )
+            .unwrap();
+        let source = transfer.take_prepared(&request).unwrap().unwrap();
+        let context = DependencyExecContext::new_with_artifacts(
+            "/source/package".to_owned(),
+            "/source/package".to_owned(),
+            "/toolchains/pinned".to_owned(),
+            "/toolchains/pinned/bin/rustc".to_owned(),
+            "/target/deps".to_owned(),
+            vec!["/target/deps".to_owned()],
+            Vec::new(),
+            vec![DependencyArtifactRoot {
+                path: "/target/deps".to_owned(),
+                prefix: "dependencies/0000".to_owned(),
+            }],
+            Vec::new(),
+            [7; 32],
+        )
+        .unwrap();
+        let output = PreparedArtifacts::new(plan)?;
+        let toolchain = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        context.prepare_empty_backings(empty.path()).unwrap();
+        let mut spec = context
+            .namespace(
+                &source.dependency_root(request_id, &context).unwrap(),
+                toolchain.path(),
+                output.backing(),
+                empty.path(),
+                home.path(),
+            )
+            .unwrap();
+        let guard = source.prepare_dependency_output(request_id, &context, &mut spec)?;
+        source.protect_dependency(request_id, &context, &spec)?;
+        Ok((output, source, guard))
+    }
+
+    #[test]
+    fn shared_input_capture_exports_only_declared_outputs_and_keeps_exact_bytes() {
+        let (prepared, _source, guard) =
+            shared_input_capture(plan(&["top.d", "libtop.rmeta"])).unwrap();
+        prepared.validate_dependency_inputs(&guard).unwrap();
+        for name in ["libleaf.rmeta", "libarchive.rlib"] {
+            assert_eq!(fs::read(prepared.backing().join(name)).unwrap(), b"");
+        }
+        let metadata = b"compiled metadata\0\xff";
+        let dep_info = b"libtop.rmeta: src/lib.rs\n";
+        fs::write(prepared.backing().join("libtop.rmeta"), metadata).unwrap();
+        fs::write(prepared.backing().join("top.d"), dep_info).unwrap();
+        let mut captured = prepared
+            .capture_with_dependency_inputs(Some(&guard), || false)
+            .unwrap();
+        assert_eq!(
+            captured.plan().files().collect::<Vec<_>>(),
+            ["libtop.rmeta", "top.d"]
+        );
+        assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            captured.total_bytes(),
+            (metadata.len() + dep_info.len()) as u64
+        );
+        assert_eq!(
+            captured.read_chunk("libtop.rmeta", 0, 128).unwrap(),
+            metadata
+        );
+        assert_eq!(captured.read_chunk("top.d", 0, 128).unwrap(), dep_info);
+        for name in ["libleaf.rmeta", "libarchive.rlib"] {
+            assert!(captured.file_identity(name).is_none());
+            assert!(captured.read_chunk(name, 0, 1).is_err());
+        }
+
+        // Neither a familiar suffix nor an absent guard makes another file
+        // eligible for exclusion from the exact output declaration.
+        for unguarded in [false, true] {
+            let (prepared, _source, guard) = shared_input_capture(plan(&["libtop.rmeta"])).unwrap();
+            fs::write(prepared.backing().join("libtop.rmeta"), metadata).unwrap();
+            if unguarded {
+                assert!(prepared.capture(|| false).is_err());
+            } else {
+                fs::write(prepared.backing().join("libunmapped.rmeta"), b"unexpected").unwrap();
+                assert!(
+                    prepared
+                        .capture_with_dependency_inputs(Some(&guard), || false)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_input_capture_refuses_output_collisions_before_execution() {
+        for name in ["libleaf.rmeta", "libarchive.rlib"] {
+            let (prepared, _source, guard) = shared_input_capture(plan(&[name])).unwrap();
+            guard.verify(prepared.backing()).unwrap();
+            let refused = prepared.validate_dependency_inputs(&guard).unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("collides with a declared output")
+            );
+            assert_eq!(fs::read(prepared.backing().join(name)).unwrap(), b"");
+            assert!(
+                prepared
+                    .capture_with_dependency_inputs(Some(&guard), || false)
+                    .is_err()
+            );
+        }
+        assert!(
+            shared_input_capture(plan(&["libarchive.rlib/nested.out"])).is_err(),
+            "an input file cannot become a declared output parent directory"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let tree =
+                ArtifactPlan::new_tree("dep".to_owned(), vec!["libtop.rmeta".to_owned()]).unwrap();
+            let (prepared, _source, guard) = shared_input_capture(tree).unwrap();
+            assert!(prepared.validate_dependency_inputs(&guard).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_input_capture_detects_placeholder_changes_after_initial_validation() {
+        use std::cell::Cell;
+
+        for replace in [false, true] {
+            let (prepared, _source, guard) = shared_input_capture(plan(&["libtop.rmeta"])).unwrap();
+            fs::write(prepared.backing().join("libtop.rmeta"), b"compiled output").unwrap();
+            let placeholder = prepared.backing().join("libleaf.rmeta");
+            let retained = tempfile::tempdir().unwrap();
+            let mutated = Cell::new(false);
+            // The ordinary cancellation callback supplies a deterministic
+            // interleaving after the guard's initial validation. Cancellation
+            // stays false: only the changed input identity may reject capture.
+            let captured = prepared.capture_with_dependency_inputs(Some(&guard), || {
+                if !mutated.replace(true) {
+                    if replace {
+                        fs::rename(&placeholder, retained.path().join("original-input")).unwrap();
+                        fs::write(&placeholder, b"").unwrap();
+                    } else {
+                        fs::write(&placeholder, b"unexpected replacement bytes").unwrap();
+                    }
+                }
+                false
+            });
+            assert!(mutated.get());
+            let refused = captured.unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("dependency input mountpoint or retained backing changed"),
+                "changed or replaced input escaped the final capture guard: {refused}"
+            );
+        }
     }
 
     #[test]
@@ -974,5 +1463,239 @@ mod tests {
             tree["artifacts"]["tree"] = serde_json::json!(TREE_FILES_VERSION);
             assert!(parse_plan(&tree).unwrap().unwrap().tree);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_capture_requires_reported_outputs_and_keeps_the_full_tree() {
+        use rabs_sandbox::cargo_artifacts::CARGO_ARTIFACTS_VERSION;
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["check", "--workspace", "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":CARGO_ARTIFACTS_VERSION},
+        });
+        let plan = parse_plan(&request).unwrap().unwrap();
+        assert_eq!(plan.cargo, Some(CargoArtifactMode::Compilation));
+        assert!(plan.tree && plan.files.is_empty());
+        let report = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp-123.rmeta\"],\"executable\":null}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+        );
+        for case in 0..4 {
+            let prepared = PreparedArtifacts::new(plan.clone()).unwrap();
+            fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+            fs::write(
+                prepared.backing().join("debug/cargo-owned-extra"),
+                b"keep intermediate",
+            )
+            .unwrap();
+            if case != 1 {
+                fs::write(
+                    prepared.backing().join("debug/deps/libapp-123.rmeta"),
+                    b"compiler metadata",
+                )
+                .unwrap();
+            }
+            if case == 2 {
+                assert!(
+                    prepared.capture(|| false).is_err(),
+                    "unresolved Cargo plan must refuse"
+                );
+                continue;
+            }
+            let stdout = if case == 3 {
+                b"{\"reason\":\"build-finished\",\"success\":true}\n".as_slice()
+            } else {
+                report.as_bytes()
+            };
+            let captured = prepared.capture_with_cargo_output(None, stdout, || false);
+            if case == 0 {
+                let captured = captured.unwrap();
+                assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 2);
+                assert!(captured.file_identity("debug/cargo-owned-extra").is_some());
+                assert!(
+                    captured
+                        .file_identity("debug/deps/libapp-123.rmeta")
+                        .is_some()
+                );
+            } else {
+                assert!(captured.is_err(), "case {case}");
+            }
+        }
+        let mut invalid = request.clone();
+        invalid["args"][0] = serde_json::json!("test");
+        assert!(
+            parse_plan(&invalid).is_err(),
+            "running tests requires a separate execution contract"
+        );
+        invalid = request;
+        invalid["artifacts"]["cargo"] = serde_json::json!("cargo-json-v2");
+        assert!(parse_plan(&invalid).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_incremental_capture_omits_only_exact_state_payloads() {
+        use rabs_sandbox::cargo_artifacts::{
+            CARGO_ARTIFACTS_VERSION, CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+        };
+        for private in [false, true] {
+            let request = serde_json::json!({
+                "program":"/__rabs/toolchain/bin/cargo",
+                "args":["build", "--profile=incremental", "--target=aarch64-unknown-linux-gnu",
+                    "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+                "command_context":{"env":{"CARGO_INCREMENTAL":"1"}},
+                "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[],
+                    "cargo":if private { CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION } else { CARGO_ARTIFACTS_VERSION }},
+            });
+            let prepared = PreparedArtifacts::new(parse_plan(&request).unwrap().unwrap()).unwrap();
+            let public = [
+                (
+                    "aarch64-unknown-linux-gnu/incremental/deps/libapp.rlib",
+                    b"artifact".as_slice(),
+                ),
+                (
+                    "incremental/build/pkg/out/incremental/data",
+                    b"user generated".as_slice(),
+                ),
+                (
+                    "incremental/incremental-data/ordinary",
+                    b"ordinary".as_slice(),
+                ),
+            ];
+            let state = [
+                "incremental/incremental/host/query-cache.bin",
+                "aarch64-unknown-linux-gnu/incremental/incremental/target/work-products.bin",
+            ];
+            for (name, bytes) in public
+                .into_iter()
+                .chain(state.map(|name| (name, b"private compiler state".as_slice())))
+            {
+                let path = prepared.backing().join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, bytes).unwrap();
+            }
+            let report = format!(
+                "{}\n{}\n",
+                serde_json::json!({"reason":"compiler-artifact", "target":{"kind":["lib"]},
+                    "filenames":[format!("/__rabs/out/cargo/{}", public[0].0)], "executable":null}),
+                serde_json::json!({"reason":"build-finished", "success":true}),
+            );
+            let captured = prepared
+                .capture_with_cargo_output(None, report.as_bytes(), || false)
+                .unwrap();
+            for (name, _) in public {
+                assert!(
+                    captured.file_identity(name).is_some(),
+                    "public output {name}"
+                );
+            }
+            for name in state {
+                assert_eq!(captured.file_identity(name).is_none(), private, "{name}");
+                assert!(
+                    prepared.backing().join(name).is_file(),
+                    "private state remains for target retention"
+                );
+            }
+            let public_bytes: u64 = public.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+            assert_eq!(
+                captured.total_bytes(),
+                public_bytes
+                    + if private {
+                        0
+                    } else {
+                        2 * b"private compiler state".len() as u64
+                    }
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_incremental_capture_refuses_hidden_reported_outputs_and_unsafe_state() {
+        use rabs_sandbox::cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION;
+        use std::os::unix::fs::symlink;
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["check", "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+            "command_context":{"env":{"CARGO_INCREMENTAL":"1"}},
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION},
+        });
+        for case in 0..3 {
+            let prepared = PreparedArtifacts::new(parse_plan(&request).unwrap().unwrap()).unwrap();
+            fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+            fs::create_dir_all(prepared.backing().join("debug/incremental/pkg")).unwrap();
+            fs::write(
+                prepared.backing().join("debug/deps/libapp.rmeta"),
+                b"metadata",
+            )
+            .unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("state"), b"unowned").unwrap();
+            let private = prepared.backing().join("debug/incremental/pkg/state");
+            match case {
+                0 => fs::write(&private, b"reported output cannot be hidden").unwrap(),
+                1 => symlink(outside.path().join("state"), &private).unwrap(),
+                _ => fs::hard_link(outside.path().join("state"), &private).unwrap(),
+            }
+            let name = if case == 0 {
+                "debug/incremental/pkg/state"
+            } else {
+                "debug/deps/libapp.rmeta"
+            };
+            let report = format!(
+                "{}\n{}\n",
+                serde_json::json!({"reason":"compiler-artifact", "target":{"kind":["lib"]},
+                    "filenames":[format!("/__rabs/out/cargo/{name}")], "executable":null}),
+                serde_json::json!({"reason":"build-finished", "success":true}),
+            );
+            let error = prepared
+                .capture_with_cargo_output(None, report.as_bytes(), || false)
+                .unwrap_err();
+            if case == 0 {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("reported an output inside private")
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_test_capture_keeps_execution_intent_and_ignores_harness_json() {
+        use std::os::unix::fs::PermissionsExt;
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["test", "--message-format=json", "--target-dir", "/__rabs/out/cargo", "--", "--nocapture"],
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":"cargo-test-json-v1"},
+        });
+        let plan = parse_plan(&request).unwrap().unwrap();
+        assert_eq!(plan.cargo, Some(CargoArtifactMode::TestExecution));
+        let prepared = PreparedArtifacts::new(plan.clone()).unwrap();
+        fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+        let executable = prepared.backing().join("debug/deps/integration-123");
+        fs::write(&executable, b"test executable fixture").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let stdout = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"test\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/debug/deps/integration-123\"],",
+            "\"executable\":\"/__rabs/out/cargo/debug/deps/integration-123\"}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+            "{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n",
+            "{literal unterminated test output",
+        );
+        let captured = prepared
+            .capture_with_cargo_output(None, stdout.as_bytes(), || false)
+            .unwrap();
+        assert_eq!(captured.plan(), &plan);
+        assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 1);
+        assert!(
+            captured
+                .file_identity("debug/deps/integration-123")
+                .is_some()
+        );
     }
 }

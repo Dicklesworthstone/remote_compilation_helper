@@ -625,6 +625,11 @@ mod tests {
         })
     }
     fn open(root: &Path) -> WorkerJournal {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         WorkerJournal::open(root, "worker", "coord:7000").unwrap()
     }
     fn receipt(id: u64) -> Value {

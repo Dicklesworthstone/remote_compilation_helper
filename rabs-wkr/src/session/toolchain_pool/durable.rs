@@ -467,10 +467,15 @@ impl DurableCache {
         let objects = self.root.join(OBJECTS);
         // The pending name records the COMPLETE reservation before any copy.
         // Startup charges it without trusting or adopting partial tree bytes.
-        let staging = tempfile::Builder::new()
-            .prefix(&format!("{PENDING}{}-", name(expected)))
-            .tempdir_in(&objects)?
-            .keep();
+        let prefix = format!("{PENDING}{}-", name(expected));
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let staging = builder.tempdir_in(&objects)?.keep();
         let result = (|| -> io::Result<Option<PreparedToolchain>> {
             let prepared = capture_toolchain(
                 source,

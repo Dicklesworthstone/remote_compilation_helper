@@ -297,6 +297,8 @@ const SIGABRT: i32 = 6;
 /// Boot the shipped daemon over the store and return its output: the
 /// product's own reconcile is the recovery oracle.
 fn reboot(state_dir: &Path) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .args(["--run-for-ms", "1200"])
         .env("RABS_SOCKET_PATH", state_dir.join("rabsd.sock"))
@@ -510,4 +512,376 @@ fn t004_a_retry_after_a_crash_converges_and_never_double_commits() {
             "phase {phase}: retry after a crash must converge on exactly ONE publication"
         );
     }
+}
+
+const WORKER_PHASE_ENV: &str = "RABS_T004_WORKER_PHASE";
+const WORKER_ADDR_ENV: &str = "RABS_T004_WORKER_ADDR";
+const WORKER_PHASE_MID_DELIVERY: &str = "worker-mid-delivery";
+const WORKER_PHASE_MID_RELEASE_ACK: &str = "worker-mid-release-ack";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn drive_worker_to(worker_phase: &str, addr: &str, state_dir: &Path) -> ! {
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut stream = TcpStream::connect(addr).expect("connect worker loopback");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("write timeout");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+
+    let read_frame = |reader: &mut BufReader<TcpStream>| -> Value {
+        let mut line = String::new();
+        assert_ne!(
+            reader.read_line(&mut line).expect("read frame"),
+            0,
+            "receiver disconnected unexpectedly"
+        );
+        serde_json::from_str(&line).expect("parse frame json")
+    };
+
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "kind": "worker-hello",
+            "worker_id": "fixture-worker",
+            "canonical": true,
+            "slots": 1,
+            "boot_generation": 1,
+            "incarnation": "00000000000000000000000000000001",
+            "request_high_water": null,
+            "recovery_protocols": ["request-journal-v1"],
+            "output_transfers": ["ranges-v1"],
+            "artifact_transfers": ["files-v1"]
+        })
+    )
+    .expect("send worker-hello");
+
+    let negotiation = read_frame(&mut reader);
+    assert_eq!(negotiation["output_transfer"], "ranges-v1");
+    let exec_req = read_frame(&mut reader);
+    assert_eq!(exec_req["request_id"], 7);
+
+    let stdout_bytes = b"ok\n";
+    let artifact_bytes = b"A\0\xffB";
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "kind": "exec-result",
+            "request_id": 7,
+            "executed": true,
+            "exit_code": 0,
+            "residual_group_members": 0,
+            "stop_reason": null,
+            "output_transfer": "ranges-v1",
+            "output_ack_required": true,
+            "stdout_bytes": stdout_bytes.len(),
+            "stdout_sha256": sha256_hex(stdout_bytes),
+            "stderr_bytes": 0,
+            "stderr_sha256": sha256_hex(b""),
+            "artifact_transfer": "files-v1",
+            "artifact_ack_required": true,
+            "artifact_manifest": {
+                "unit": "dep",
+                "files": [{
+                    "name": "a",
+                    "bytes": artifact_bytes.len(),
+                    "sha256": sha256_hex(artifact_bytes),
+                    "executable": false
+                }],
+                "total_bytes": artifact_bytes.len(),
+                "manifest_sha256": "548324c3a5c96511944c6ec6af94ee9bbb6683170bb0143f9d99cd192f80bfd6"
+            }
+        })
+    )
+    .expect("send exec-result");
+
+    // Stream stdout chunk.
+    let req_stdout = read_frame(&mut reader);
+    assert_eq!(req_stdout["kind"], "output-read");
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "kind": "output-chunk",
+            "request_id": 7,
+            "stream": "stdout",
+            "offset": 0,
+            "next_offset": stdout_bytes.len(),
+            "total_bytes": stdout_bytes.len(),
+            "sha256": sha256_hex(stdout_bytes),
+            "chunk_sha256": sha256_hex(stdout_bytes),
+            "eof": true,
+            "data_hex": stdout_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        })
+    )
+    .expect("send stdout chunk");
+
+    // Stream stderr chunk.
+    let req_stderr = read_frame(&mut reader);
+    assert_eq!(req_stderr["kind"], "output-read");
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "kind": "output-chunk",
+            "request_id": 7,
+            "stream": "stderr",
+            "offset": 0,
+            "next_offset": 0,
+            "total_bytes": 0,
+            "sha256": sha256_hex(b""),
+            "chunk_sha256": sha256_hex(b""),
+            "eof": true,
+            "data_hex": ""
+        })
+    )
+    .expect("send stderr chunk");
+
+    // Read artifact-read request.
+    let req_artifact = read_frame(&mut reader);
+    assert_eq!(req_artifact["kind"], "artifact-read");
+    if worker_phase == WORKER_PHASE_MID_DELIVERY {
+        die_at(worker_phase, state_dir);
+    }
+
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "kind": "artifact-chunk",
+            "request_id": 7,
+            "name": "a",
+            "offset": 0,
+            "next_offset": artifact_bytes.len(),
+            "total_bytes": artifact_bytes.len(),
+            "sha256": sha256_hex(artifact_bytes),
+            "chunk_sha256": sha256_hex(artifact_bytes),
+            "eof": true,
+            "executable": false,
+            "manifest_sha256": "548324c3a5c96511944c6ec6af94ee9bbb6683170bb0143f9d99cd192f80bfd6",
+            "data_hex": artifact_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        })
+    )
+    .expect("send artifact chunk");
+
+    let out_ack = read_frame(&mut reader);
+    assert_eq!(out_ack["kind"], "output-ack");
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "kind": "output-acknowledged",
+            "request_id": 7,
+            "already_released": false
+        })
+    )
+    .expect("send output-acknowledged");
+
+    let art_ack = read_frame(&mut reader);
+    assert_eq!(art_ack["kind"], "artifact-ack");
+    if worker_phase == WORKER_PHASE_MID_RELEASE_ACK {
+        die_at(worker_phase, state_dir);
+    }
+
+    panic!("unknown worker phase {worker_phase}");
+}
+
+#[test]
+#[ignore = "spawned by the T004 worker-kill matrix parent; aborts by design"]
+fn t004_worker_crash_child() {
+    let (Ok(worker_phase), Ok(addr), Ok(state_dir)) = (
+        std::env::var(WORKER_PHASE_ENV),
+        std::env::var(WORKER_ADDR_ENV),
+        std::env::var(STATE_ENV),
+    ) else {
+        eprintln!("t004_worker_crash_child: unsteered; nothing to do");
+        return;
+    };
+    drive_worker_to(&worker_phase, &addr, &PathBuf::from(state_dir));
+}
+
+#[test]
+fn t004_worker_process_killed_during_artifact_delivery_and_release_ack_converges_cleanly() {
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let spawn_receiver =
+        |root: &Path, delivery_subdir: &str| -> (std::process::Child, String, PathBuf) {
+            let request = json!({
+                "kind": "canonical-exec",
+                "request_id": 7,
+                "program": "fixture-only",
+                "args": [],
+                "toolchain_backing": "/tc",
+                "workspace_backing": "/ws",
+                "artifacts": {"unit": "dep", "files": ["a"]}
+            });
+            let request_path = root.join(format!("{delivery_subdir}-request.json"));
+            std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+            let report_path = root.join(format!("{delivery_subdir}-report.json"));
+            let report = std::fs::File::create(&report_path).unwrap();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_rabsd"))
+                .arg("--worker-exec-loopback")
+                .arg("127.0.0.1:0")
+                .arg("fixture-worker")
+                .arg(&request_path)
+                .arg(root.join(delivery_subdir))
+                .stdout(report)
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn rabsd receiver");
+            let stderr = child.stderr.take().unwrap();
+            let (send_ready, ready) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                let result = reader.read_line(&mut line).map(|_| line);
+                let _ = send_ready.send(result);
+                let mut tail = String::new();
+                let _ = reader.read_to_string(&mut tail);
+            });
+            let line = ready
+                .recv_timeout(Duration::from_secs(5))
+                .expect("listener readiness")
+                .unwrap();
+            let value: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["kind"], "worker-exec-listening");
+            let addr = value["address"].as_str().unwrap().to_owned();
+            (child, addr, report_path)
+        };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().to_path_buf();
+
+    // 1. Kill worker process MID-DELIVERY (before artifact chunk is transferred).
+    let (mut recv_mid, addr_mid, _report_mid) = spawn_receiver(&state_dir, "delivery-mid");
+    let worker_mid = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "t004_worker_crash_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(WORKER_PHASE_ENV, WORKER_PHASE_MID_DELIVERY)
+        .env(WORKER_ADDR_ENV, &addr_mid)
+        .env(STATE_ENV, &state_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn worker mid-delivery child");
+    assert_eq!(worker_mid.status.signal(), Some(SIGABRT));
+    assert!(
+        state_dir
+            .join(format!("reached-{WORKER_PHASE_MID_DELIVERY}"))
+            .exists(),
+        "worker child must reach mid-delivery before aborting"
+    );
+    let recv_mid_status = recv_mid.wait().expect("wait receiver mid-delivery");
+    assert!(
+        !recv_mid_status.success(),
+        "half-delivered artifact set must fail closed on receiver"
+    );
+    assert!(
+        !state_dir.join("delivery-mid/delivery.json").exists(),
+        "partial worker delivery must never finalize delivery.json"
+    );
+
+    // 2. Kill worker process MID-RELEASE-ACK (after all bytes are verified on receiver, before artifact-acknowledged).
+    let (mut recv_ack, addr_ack, report_ack_path) = spawn_receiver(&state_dir, "delivery-ack");
+    let worker_ack = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "t004_worker_crash_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(WORKER_PHASE_ENV, WORKER_PHASE_MID_RELEASE_ACK)
+        .env(WORKER_ADDR_ENV, &addr_ack)
+        .env(STATE_ENV, &state_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn worker mid-ack child");
+    assert_eq!(worker_ack.status.signal(), Some(SIGABRT));
+    assert!(
+        state_dir
+            .join(format!("reached-{WORKER_PHASE_MID_RELEASE_ACK}"))
+            .exists(),
+        "worker child must reach release-ack window before aborting"
+    );
+    let recv_ack_status = recv_ack.wait().expect("wait receiver mid-ack");
+    assert!(
+        recv_ack_status.success(),
+        "verified delivery must succeed even if worker dies during release-ack window"
+    );
+    let report_ack: Value =
+        serde_json::from_slice(&std::fs::read(&report_ack_path).unwrap()).unwrap();
+    assert_eq!(report_ack["acknowledgments_confirmed"], false);
+    assert_eq!(report_ack["acknowledgment_interrupted"], true);
+    assert_eq!(report_ack["reexecute"], false);
+    assert_eq!(
+        std::fs::read(state_dir.join("delivery-ack/artifacts/a")).unwrap(),
+        b"A\0\xffB"
+    );
+
+    // 3. Publish into coordinator CAS and verify redelivery/retry converges on 1 publication and 0 stranded pins.
+    let cas = Arc::new(mount_and_reconcile(&state_dir.join("cas")).expect("mount cas"));
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let authority = coord
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        install_admission_world(&mut *store, &authority);
+    }
+    let (offer, manifest_bytes) = offer_with_manifest_bytes(&authority);
+    store_manifest_object(&cas, &offer, &manifest_bytes);
+    let first_pub = coord
+        .commit_offer(&offer, &sample_expected_descriptor())
+        .expect("commit first offer");
+    assert!(matches!(first_pub, PublicationOutcome::Committed(_)));
+
+    // Redelivery / re-offer under a fresh attempt id converges idempotently without duplicating.
+    let reissue = FixtureAttemptIds {
+        generation: 12,
+        attempt: 21,
+        lease: 31,
+    };
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        install_admission_world_with_ids(&mut *store, &authority, reissue);
+    }
+    let (retry_offer, retry_manifest_bytes) =
+        offer_with_manifest_bytes_with_ids(&authority, reissue);
+    store_manifest_object(&cas, &retry_offer, &retry_manifest_bytes);
+    let second_pub = coord
+        .commit_offer(&retry_offer, &sample_expected_descriptor())
+        .expect("commit redelivered offer");
+    assert_eq!(second_pub, PublicationOutcome::IdempotentEvidenceAppended);
+
+    drop(coord);
+    drop(cas);
+    assert!(
+        reboot(&state_dir).status.success(),
+        "reboot after worker kills"
+    );
+    let mut store = open_store(&state_dir);
+    assert_eq!(publications_for_sample(&mut store).len(), 1);
 }

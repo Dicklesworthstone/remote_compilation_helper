@@ -67,6 +67,30 @@ pub(super) enum SyncClosureMode {
     WorkspaceMetadata,
 }
 
+/// Stable source and artifact locations for a freshly materialized owned closure.
+/// The caller must hold the source-pair lease, require an absent source root,
+/// verify the selected bytes, and retain the complete tree before releasing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OwnedSyncClosureLayout {
+    pub(super) source_root: String,
+    pub(super) pooled_target_name: String,
+    pub(super) plan: Vec<SyncClosurePlanEntry>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum OwnedSyncClosureLayoutError {
+    #[error("invalid owned closure staging base: {0}")]
+    InvalidBase(String),
+    #[error("owned closure requires a valid pooled Cargo target name")]
+    InvalidPoolName,
+    #[error("invalid owned closure plan: {0}")]
+    InvalidPlan(&'static str),
+    #[error("invalid owned closure root {root}: {reason}")]
+    InvalidRoot { root: PathBuf, reason: String },
+    #[error("owned closure roots have overlapping transfer selections: {first} and {second}")]
+    OverlappingRoots { first: PathBuf, second: PathBuf },
+}
+
 /// Outcome of syncing a single closure root during multi-root transfer.
 ///
 /// Used to collect per-root results and enable partial failure diagnostics
@@ -858,6 +882,11 @@ fn map_sync_root_to_remote_root(path: &Path, policy: &PathTopologyPolicy) -> Str
 
     for root in effective_sync_topology_roots(policy) {
         if let Ok(relative) = path.strip_prefix(&root) {
+            // Joining an empty suffix appends a separator. A project at the
+            // topology root must retain its exact canonical authority spelling.
+            if relative.as_os_str().is_empty() {
+                return remote_root.to_string_lossy().to_string();
+            }
             return remote_root.join(relative).to_string_lossy().to_string();
         }
     }
@@ -936,6 +965,198 @@ pub(super) fn build_sync_closure_plan(
             }
         })
         .collect()
+}
+
+/// Potential redundant roots, subject to exact transfer-selection verification.
+/// An ancestor Full root is only a candidate owner: its root-relative filters
+/// may select different files. Never absorb the primary execution directory.
+pub(super) fn source_content_coalescing_candidates(
+    plan: &[SyncClosurePlanEntry],
+) -> Vec<(usize, usize)> {
+    plan.iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.is_primary)
+        .filter_map(|(child, entry)| {
+            plan.iter()
+                .enumerate()
+                .filter(|(parent, owner)| {
+                    *parent != child
+                        && owner.mode == SyncClosureMode::Full
+                        && entry.local_root != owner.local_root
+                        && entry.local_root.starts_with(&owner.local_root)
+                })
+                .min_by_key(|(_, owner)| (owner.local_root.components().count(), &owner.local_root))
+                .map(|(parent, _)| (parent, child))
+        })
+        .collect()
+}
+
+/// Project an exact closure beneath one owned non-Git source container without
+/// flattening sibling dependencies or their enclosing workspace metadata.
+///
+/// Both paths are stable across source edits. The existing pool name already
+/// binds the project, worker, toolchain, target, profile, and features; the new
+/// domain additionally binds the worker base and complete transfer layout. This
+/// migrates artifacts that embedded a different source path without turning
+/// every invocation into a cold build. Content identity belongs to the receipt
+/// and freshness ledger, never to this path key.
+pub(super) fn build_owned_sync_closure_layout(
+    plan: &[SyncClosurePlanEntry],
+    topology_policy: &PathTopologyPolicy,
+    remote_base: &str,
+    legacy_pool_name: &str,
+) -> Result<OwnedSyncClosureLayout, OwnedSyncClosureLayoutError> {
+    use OwnedSyncClosureLayoutError as Error;
+
+    let base = rch_common::types::validate_remote_base(remote_base).map_err(Error::InvalidBase)?;
+    if base.chars().any(char::is_control)
+        || base.contains('\\')
+        || base.split('/').any(|part| part == "." || part == "..")
+    {
+        return Err(Error::InvalidBase("invalid path component".into()));
+    }
+    let base: PathBuf = Path::new(&base).components().collect();
+    let base = base
+        .to_str()
+        .ok_or_else(|| Error::InvalidBase("path is not UTF-8".into()))?;
+    let (pool_prefix, _) = legacy_pool_name
+        .rsplit_once("-pool-")
+        .filter(|(prefix, key)| {
+            prefix.starts_with(".rch-target-")
+                && prefix.len() > ".rch-target-".len()
+                && prefix[".rch-target-".len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+                && key.len() == 32
+                && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or(Error::InvalidPoolName)?;
+    if plan.iter().filter(|entry| entry.is_primary).count() != 1
+        || plan
+            .iter()
+            .any(|entry| entry.is_primary && entry.mode != SyncClosureMode::Full)
+    {
+        return Err(Error::InvalidPlan(
+            "exactly one full primary root is required",
+        ));
+    }
+
+    let mut topology_root = None;
+    let mut entries = Vec::with_capacity(plan.len());
+    for entry in plan {
+        let normalized = normalize_project_path_with_policy(&entry.local_root, topology_policy)
+            .map_err(|error| Error::InvalidRoot {
+                root: entry.local_root.clone(),
+                reason: error.to_string(),
+            })?;
+        if topology_root
+            .as_ref()
+            .is_some_and(|root| root != normalized.canonical_root())
+        {
+            return Err(Error::InvalidPlan(
+                "canonical topology changed during planning",
+            ));
+        }
+        topology_root = Some(normalized.canonical_root().to_path_buf());
+        let relative = normalized
+            .canonical_path()
+            .strip_prefix(normalized.canonical_root())
+            .map_err(|_| Error::InvalidPlan("root escaped its normalized topology"))?;
+        let literal = relative.to_str().ok_or_else(|| Error::InvalidRoot {
+            root: entry.local_root.clone(),
+            reason: "path is not UTF-8".into(),
+        })?;
+        if !normalized.canonical_path().is_dir()
+            || literal.chars().any(char::is_control)
+            || literal.contains('\\')
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(Error::InvalidRoot {
+                root: entry.local_root.clone(),
+                reason: "root must be a directory with literal path components".into(),
+            });
+        }
+        let mut entry = entry.clone();
+        entry.local_root = normalized.canonical_path().to_path_buf();
+        entries.push((relative.to_path_buf(), entry));
+    }
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (index, (ancestor, entry)) in entries.iter().enumerate() {
+        for (descendant, other) in &entries[index + 1..] {
+            let Ok(relative) = descendant.strip_prefix(ancestor) else {
+                continue;
+            };
+            // Metadata ancestors intentionally coexist with package roots. Its
+            // selected .cargo subtree and direct metadata names must not overlap
+            // another root, and a full ancestor already owns every descendant.
+            let metadata_overlap = relative.components().next().is_some_and(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some(
+                        ".cargo"
+                            | "Cargo.toml"
+                            | "Cargo.lock"
+                            | "rust-toolchain"
+                            | "rust-toolchain.toml"
+                    )
+                )
+            });
+            if relative.as_os_str().is_empty()
+                || entry.mode == SyncClosureMode::Full
+                || metadata_overlap
+            {
+                return Err(Error::OverlappingRoots {
+                    first: entry.local_root.clone(),
+                    second: other.local_root.clone(),
+                });
+            }
+        }
+    }
+
+    fn field(hasher: &mut blake3::Hasher, value: &[u8]) {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-source-content-pair-layout-v1\0");
+    field(&mut hasher, base.as_bytes());
+    field(&mut hasher, legacy_pool_name.as_bytes());
+    for (relative, entry) in &entries {
+        field(
+            &mut hasher,
+            relative.to_str().expect("validated UTF-8 path").as_bytes(),
+        );
+        field(
+            &mut hasher,
+            match entry.mode {
+                SyncClosureMode::Full => b"full",
+                SyncClosureMode::WorkspaceMetadata => b"workspace_metadata",
+            },
+        );
+        field(&mut hasher, &[u8::from(entry.is_primary)]);
+    }
+    let key = hasher.finalize().to_hex()[..32].to_string();
+    let source_root = format!("{base}/source-content-pair-{key}");
+    let projected_root = Path::new(&source_root).join("projects");
+    let plan = entries
+        .into_iter()
+        .map(|(relative, mut entry)| {
+            let destination = if relative.as_os_str().is_empty() {
+                projected_root.clone()
+            } else {
+                projected_root.join(relative)
+            };
+            entry.remote_root = destination.to_string_lossy().into_owned();
+            entry
+        })
+        .collect();
+    Ok(OwnedSyncClosureLayout {
+        source_root,
+        pooled_target_name: format!("{pool_prefix}-pool-{key}"),
+        plan,
+    })
 }
 
 pub(super) fn build_sync_closure_manifest(
@@ -1094,6 +1315,303 @@ pub(super) fn dependency_preflight_timeout(check_count: usize) -> Duration {
         .div_ceil(DEPENDENCY_PREFLIGHT_PATHS_PER_TIMEOUT_WINDOW)
         .max(1);
     Duration::from_secs(20).saturating_mul(u32::try_from(windows).unwrap_or(u32::MAX))
+}
+
+#[cfg(all(test, unix))]
+mod owned_layout_tests {
+    use super::*;
+    use rch_common::cargo_path_deps::{
+        SelectedCargoEntry, validate_selected_cargo_path, validate_selected_cargo_tree_at,
+    };
+    use rch_common::test_guard;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    const POOL: &str = ".rch-target-worker-pool-0123456789abcdef0123456789abcdef";
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        PathTopologyPolicy,
+        Vec<SyncClosurePlanEntry>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::create_dir_all(root.join("foreign/crates/member/src")).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let policy = PathTopologyPolicy::new(root.clone(), root.clone());
+        fs::write(
+            root.join("foreign/Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n[workspace.package]\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let plan = build_sync_closure_plan(
+            &[root.join("app"), root.join("foreign/crates/member")],
+            &root.join("app"),
+            "source-stamp-a",
+            &policy,
+        );
+        (temp, policy, plan)
+    }
+
+    #[test]
+    fn owned_layout_preserves_siblings_workspace_metadata_and_manifest_provenance() {
+        let _guard = test_guard!();
+        let (temp, policy, plan) = fixture();
+        let root = policy.canonical_root();
+        let files = [
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nmember = { path = \"../foreign/crates/member\" }\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "pub fn value() -> u32 { member::value() }\n",
+            ),
+            (
+                "foreign/Cargo.toml",
+                "[workspace]\nmembers = [\"crates/member\"]\n[workspace.package]\nedition = \"2021\"\n",
+            ),
+            (
+                "foreign/crates/member/Cargo.toml",
+                "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+            ),
+            (
+                "foreign/crates/member/src/lib.rs",
+                "pub fn value() -> u32 { 7 }\n",
+            ),
+        ];
+        for (relative, contents) in files {
+            fs::write(root.join(relative), contents).unwrap();
+        }
+        fs::create_dir_all(root.join("app/.git")).unwrap();
+        fs::write(root.join("app/.git/HEAD"), "canonical-checkout-sentinel\n").unwrap();
+        let base = temp.path().join("worker/staging");
+        let layout =
+            build_owned_sync_closure_layout(&plan, &policy, base.to_str().unwrap(), POOL).unwrap();
+        assert_eq!(layout.plan.len(), 3);
+        assert!(layout.plan.iter().any(|entry| {
+            entry.mode == SyncClosureMode::WorkspaceMetadata
+                && entry.remote_root == format!("{}/projects/foreign", layout.source_root)
+        }));
+        let mut selected = BTreeMap::new();
+        for (relative, contents) in files {
+            let local = root.join(relative);
+            let entry = layout
+                .plan
+                .iter()
+                .filter(|entry| local.starts_with(&entry.local_root))
+                .max_by_key(|entry| entry.local_root.components().count())
+                .unwrap();
+            let destination =
+                Path::new(&entry.remote_root).join(local.strip_prefix(&entry.local_root).unwrap());
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(&local, &destination).unwrap();
+            assert_eq!(fs::read_to_string(&destination).unwrap(), contents);
+            selected.insert(
+                destination
+                    .strip_prefix(&layout.source_root)
+                    .unwrap()
+                    .to_path_buf(),
+                SelectedCargoEntry::File(
+                    relative
+                        .ends_with("Cargo.toml")
+                        .then(|| contents.to_owned()),
+                ),
+            );
+        }
+        let selected_manifest = Path::new("projects/app/Cargo.toml");
+        validate_selected_cargo_tree_at(&selected, selected_manifest).unwrap();
+        assert_eq!(
+            validate_selected_cargo_path(
+                &selected,
+                Path::new("projects/app/../foreign/crates/member/Cargo.toml"),
+            )
+            .unwrap(),
+            Path::new("projects/foreign/crates/member/Cargo.toml")
+        );
+        let manifest = build_sync_closure_manifest(&layout.plan, &root.join("app"));
+        for entry in &manifest.entries {
+            let original = plan
+                .iter()
+                .find(|original| original.local_root == Path::new(&entry.local_root))
+                .unwrap();
+            assert_eq!(entry.root_hash, original.root_hash);
+            assert_eq!(entry.project_id, original.project_id);
+            assert_eq!(entry.mode, original.mode);
+            assert_eq!(entry.is_primary, original.is_primary);
+            assert!(entry.remote_root.starts_with(&layout.source_root));
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("app/.git/HEAD")).unwrap(),
+            "canonical-checkout-sentinel\n"
+        );
+        assert!(
+            !Path::new(&layout.source_root)
+                .join("projects/app/.git")
+                .exists()
+        );
+        selected.insert(
+            selected_manifest.to_path_buf(),
+            SelectedCargoEntry::File(Some(format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nmember = {{ path = {:?} }}\n",
+                root.join("foreign/crates/member").to_str().unwrap()
+            ))),
+        );
+        assert!(validate_selected_cargo_tree_at(&selected, selected_manifest).is_err());
+    }
+
+    #[test]
+    fn owned_layout_reuses_paths_across_source_edits_and_plan_order() {
+        let _guard = test_guard!();
+        let (_temp, policy, plan) = fixture();
+        let first = build_owned_sync_closure_layout(&plan, &policy, "/tmp/rch", POOL).unwrap();
+        let mut changed = plan.clone();
+        changed.reverse();
+        for entry in &mut changed {
+            entry.root_hash = "source-stamp-b".into();
+        }
+        fs::write(
+            policy.canonical_root().join("app/src/lib.rs"),
+            "pub fn changed() {}\n",
+        )
+        .unwrap();
+        let next = build_owned_sync_closure_layout(&changed, &policy, "/tmp//rch/", POOL).unwrap();
+        assert_eq!(first.source_root, next.source_root);
+        assert_eq!(first.pooled_target_name, next.pooled_target_name);
+        assert_ne!(first.pooled_target_name, POOL);
+        for (before, after) in first.plan.iter().zip(&next.plan) {
+            assert_eq!(before.local_root, after.local_root);
+            assert_eq!(before.remote_root, after.remote_root);
+            assert_eq!(after.root_hash, "source-stamp-b");
+        }
+    }
+
+    #[test]
+    fn owned_layout_key_binds_target_dimensions_worker_base_and_source_projection() {
+        let _guard = test_guard!();
+        let (_temp, policy, plan) = fixture();
+        let first = build_owned_sync_closure_layout(&plan, &policy, "/tmp/rch", POOL).unwrap();
+        let other_pool = ".rch-target-worker-pool-fedcba9876543210fedcba9876543210";
+        let changed_pool =
+            build_owned_sync_closure_layout(&plan, &policy, "/tmp/rch", other_pool).unwrap();
+        let changed_base =
+            build_owned_sync_closure_layout(&plan, &policy, "/data/tmp/rch", POOL).unwrap();
+        let mut selected = plan.clone();
+        selected.retain(|entry| entry.is_primary);
+        let changed_projection =
+            build_owned_sync_closure_layout(&selected, &policy, "/tmp/rch", POOL).unwrap();
+        for changed in [changed_pool, changed_base, changed_projection] {
+            assert_ne!(first.source_root, changed.source_root);
+            assert_ne!(first.pooled_target_name, changed.pooled_target_name);
+        }
+    }
+
+    #[test]
+    fn owned_layout_normalizes_aliases_and_a_symlinked_canonical_root() {
+        let _guard = test_guard!();
+        let (temp, policy, plan) = fixture();
+        let configured = temp.path().join("configured-projects");
+        let alias = temp.path().join("alias-projects");
+        std::os::unix::fs::symlink(policy.canonical_root(), &configured).unwrap();
+        std::os::unix::fs::symlink(policy.canonical_root(), &alias).unwrap();
+        let aliased_policy = PathTopologyPolicy::new(configured, alias.clone());
+        let canonical =
+            build_owned_sync_closure_layout(&plan, &aliased_policy, "/tmp/rch", POOL).unwrap();
+        let mut aliased = plan;
+        for entry in &mut aliased {
+            entry.local_root = alias.join(
+                entry
+                    .local_root
+                    .strip_prefix(policy.canonical_root())
+                    .unwrap(),
+            );
+        }
+        let aliases =
+            build_owned_sync_closure_layout(&aliased, &aliased_policy, "/tmp/rch", POOL).unwrap();
+        assert_eq!(canonical, aliases);
+    }
+
+    #[test]
+    fn owned_layout_rejects_ambiguous_authority_and_invalid_roots() {
+        let _guard = test_guard!();
+        let (temp, policy, plan) = fixture();
+        for base in [
+            "relative",
+            "/tmp",
+            "/tmp/./rch",
+            "/tmp/rch/../other",
+            "/tmp/rch\nother",
+            "/tmp/rch\\other",
+        ] {
+            assert!(
+                matches!(
+                    build_owned_sync_closure_layout(&plan, &policy, base, POOL),
+                    Err(OwnedSyncClosureLayoutError::InvalidBase(_))
+                ),
+                "{base:?}"
+            );
+        }
+        for pool in [
+            ".rch-target-worker-job-1",
+            "../pool",
+            ".rch-target-worker-pool-short",
+            ".rch-target-unsafe/name-pool-0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(
+                matches!(
+                    build_owned_sync_closure_layout(&plan, &policy, "/tmp/rch", pool),
+                    Err(OwnedSyncClosureLayoutError::InvalidPoolName)
+                ),
+                "{pool:?}"
+            );
+        }
+        assert!(matches!(
+            build_owned_sync_closure_layout(&[], &policy, "/tmp/rch", POOL),
+            Err(OwnedSyncClosureLayoutError::InvalidPlan(_))
+        ));
+        let mut invalid = plan.clone();
+        invalid
+            .iter_mut()
+            .find(|entry| entry.is_primary)
+            .unwrap()
+            .local_root = temp.path().to_path_buf();
+        assert!(matches!(
+            build_owned_sync_closure_layout(&invalid, &policy, "/tmp/rch", POOL),
+            Err(OwnedSyncClosureLayoutError::InvalidRoot { .. })
+        ));
+        let mut duplicate = plan.clone();
+        let mut extra = duplicate[0].clone();
+        extra.is_primary = false;
+        duplicate.push(extra);
+        assert!(matches!(
+            build_owned_sync_closure_layout(&duplicate, &policy, "/tmp/rch", POOL),
+            Err(OwnedSyncClosureLayoutError::OverlappingRoots { .. })
+        ));
+        let mut overlapping = plan.clone();
+        overlapping
+            .iter_mut()
+            .find(|entry| entry.mode == SyncClosureMode::WorkspaceMetadata)
+            .unwrap()
+            .mode = SyncClosureMode::Full;
+        assert!(matches!(
+            build_owned_sync_closure_layout(&overlapping, &policy, "/tmp/rch", POOL),
+            Err(OwnedSyncClosureLayoutError::OverlappingRoots { .. })
+        ));
+    }
+
+    #[test]
+    fn owned_layout_handles_a_primary_at_the_topology_root() {
+        let _guard = test_guard!();
+        let (_temp, policy, _) = fixture();
+        let plan = build_sync_closure_plan(&[], policy.canonical_root(), "topology-root", &policy);
+        let layout = build_owned_sync_closure_layout(&plan, &policy, "/tmp/rch", POOL).unwrap();
+        assert_eq!(layout.plan.len(), 1);
+        assert_eq!(
+            layout.plan[0].remote_root,
+            format!("{}/projects", layout.source_root)
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -27,6 +27,25 @@ fn toml_string_literal(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }
 
+/// A prior existence check cannot authorize truncating a concurrently created
+/// file or following a dangling symlink. Overwrite only after the wizard's
+/// explicit confirmation; otherwise exclusive creation preserves all arrivals.
+fn write_configuration(path: &std::path::Path, contents: &str, overwrite: bool) -> Result<bool> {
+    if overwrite {
+        std::fs::write(path, contents)?;
+        return Ok(true);
+    }
+    match std::fs::File::create_new(path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(contents.as_bytes())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Initialize configuration files with optional interactive wizard.
 ///
 /// When `wizard` is true and `use_defaults` is false, prompts the user interactively
@@ -126,9 +145,13 @@ pub fn config_init(ctx: &OutputContext, wizard: bool, use_defaults: bool) -> Res
     };
 
     // Write config.toml
-    if let Some(values) = config_values {
+    let wrote_config = if let Some(values) = config_values {
         let config_content = generate_config_toml(&values);
-        std::fs::write(&config_path, config_content)?;
+        write_configuration(&config_path, &config_content, config_exists)?
+    } else {
+        false
+    };
+    if wrote_config {
         created.push(config_path.display().to_string());
         if !ctx.is_json() {
             println!(
@@ -138,7 +161,7 @@ pub fn config_init(ctx: &OutputContext, wizard: bool, use_defaults: bool) -> Res
                 style.value(&config_path.display().to_string())
             );
         }
-    } else if config_exists {
+    } else {
         already_existed.push(config_path.display().to_string());
         if !ctx.is_json() {
             println!(
@@ -151,9 +174,13 @@ pub fn config_init(ctx: &OutputContext, wizard: bool, use_defaults: bool) -> Res
     }
 
     // Write workers.toml
-    if let Some(workers) = workers.as_ref() {
+    let wrote_workers = if let Some(workers) = workers.as_ref() {
         let workers_content = generate_workers_toml(workers)?;
-        std::fs::write(&workers_path, workers_content)?;
+        write_configuration(&workers_path, &workers_content, workers_exists)?
+    } else {
+        false
+    };
+    if wrote_workers {
         created.push(workers_path.display().to_string());
         if !ctx.is_json() {
             println!(
@@ -163,7 +190,7 @@ pub fn config_init(ctx: &OutputContext, wizard: bool, use_defaults: bool) -> Res
                 style.value(&workers_path.display().to_string())
             );
         }
-    } else if workers_exists {
+    } else {
         already_existed.push(workers_path.display().to_string());
         if !ctx.is_json() {
             println!(
@@ -177,13 +204,13 @@ pub fn config_init(ctx: &OutputContext, wizard: bool, use_defaults: bool) -> Res
 
     // JSON output
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "config init",
             ConfigInitResponse {
                 created,
                 already_existed,
             },
-        ));
+        ))?;
         return Ok(());
     }
 
@@ -229,8 +256,9 @@ fn config_init_simple(
     let mut already_existed = Vec::new();
 
     // Write example config.toml
-    if !config_path.exists() {
+    let wrote_config = if !config_path.exists() {
         let exclude_lines = format_default_exclude_patterns();
+        let socket_literal = toml_string_literal(&rch_common::default_socket_path());
         let config_content = format!(
             r###"# RCH Configuration
 # See documentation for all options
@@ -238,7 +266,7 @@ fn config_init_simple(
 [general]
 enabled = true
 log_level = "info"
-socket_path = "/tmp/rch.sock"
+socket_path = {socket_literal}
 
 [compilation]
 confidence_threshold = 0.85
@@ -250,7 +278,11 @@ exclude_patterns = [
 {exclude_lines}]
 "###
         );
-        std::fs::write(config_path, config_content)?;
+        write_configuration(config_path, &config_content, false)?
+    } else {
+        false
+    };
+    if wrote_config {
         created.push(config_path.display().to_string());
         if !ctx.is_json() {
             println!(
@@ -275,7 +307,7 @@ exclude_patterns = [
     // Write example workers.toml. Note: `identity_file` defaults to
     // `~/.ssh/id_rsa`; if that file doesn't exist, `rch config validate`
     // will flag RCH-E009. Run `rch workers init` once you have real workers.
-    if !workers_path.exists() {
+    let wrote_workers = if !workers_path.exists() {
         let workers_content = r###"# RCH Workers Configuration
 # Define your remote compilation workers here
 
@@ -296,7 +328,11 @@ enabled = true
 # host = "192.168.1.101"
 # ...
 "###;
-        std::fs::write(workers_path, workers_content)?;
+        write_configuration(workers_path, workers_content, false)?
+    } else {
+        false
+    };
+    if wrote_workers {
         created.push(workers_path.display().to_string());
         if !ctx.is_json() {
             println!(
@@ -319,13 +355,13 @@ enabled = true
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "config init",
             ConfigInitResponse {
                 created,
                 already_existed,
             },
-        ));
+        ))?;
         return Ok(());
     }
 
@@ -373,10 +409,11 @@ struct WizardWorker {
 fn collect_config_values(use_defaults: bool, style: &ui::theme::Theme) -> Result<ConfigValues> {
     use dialoguer::{Input, Select};
 
+    let default_socket = rch_common::default_socket_path();
     if use_defaults {
         return Ok(ConfigValues {
             log_level: "info".to_string(),
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: default_socket,
             confidence_threshold: 0.85,
             min_local_time_ms: 2000,
             compression_level: 3,
@@ -399,9 +436,9 @@ fn collect_config_values(use_defaults: bool, style: &ui::theme::Theme) -> Result
     // Socket path
     let socket_path: String = Input::new()
         .with_prompt("Unix socket path")
-        .default("/tmp/rch.sock".to_string())
+        .default(default_socket.clone())
         .interact_text()
-        .unwrap_or_else(|_| "/tmp/rch.sock".to_string());
+        .unwrap_or(default_socket);
 
     println!("\n{}", style.highlight("Compilation Settings"));
     println!();
@@ -644,6 +681,161 @@ fn generate_workers_toml(workers: &[WizardWorker]) -> Result<String> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn exclusive_configuration_creation_preserves_one_real_concurrent_writer() {
+        use std::sync::{Arc, Barrier};
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let path = retained.join("config.toml");
+        let sentinel = retained.join("peer-data");
+        std::fs::write(&sentinel, b"retained peer bytes\n").unwrap();
+        let barrier = Arc::new(Barrier::new(9));
+        let writers = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let contents = format!("writer-{index}\n");
+                    barrier.wait();
+                    let created = write_configuration(&path, &contents, false).unwrap();
+                    (contents, created)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outcomes = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+        let winners = outcomes
+            .iter()
+            .filter(|outcome| outcome.1)
+            .collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), winners[0].0.as_bytes());
+        assert!(!write_configuration(&path, "later initializer\n", false).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), winners[0].0.as_bytes());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"retained peer bytes\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_configuration_creation_preserves_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let path = retained.join("config.toml");
+        let target = retained.join("peer-owned-target");
+        symlink(&target, &path).unwrap();
+        assert!(!path.exists());
+        assert!(!write_configuration(&path, "must not follow link\n", false).unwrap());
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simple_initialization_preserves_files_and_reports_real_delivery_failures() {
+        use crate::ui::context::{ColorChoice, OutputConfig, OutputError, OutputMode};
+        use crate::ui::writer::OutputWriter;
+        use std::os::unix::net::UnixStream;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for existing in [false, true] {
+            for closed in [false, true] {
+                let directory = retained.join(format!("state-{existing}-{closed}"));
+                std::fs::create_dir(&directory).unwrap();
+                let config = directory.join("config.toml");
+                let workers = directory.join("workers.toml");
+                if existing {
+                    // Initialization must preserve even unparsed existing data.
+                    std::fs::write(&config, b"owned configuration bytes\n").unwrap();
+                    std::fs::write(&workers, b"owned worker bytes\n").unwrap();
+                }
+                let output = retained.join(format!("output-{existing}-{closed}"));
+                let stdout = if closed {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    OutputWriter::new(socket, false)
+                } else {
+                    OutputWriter::new(std::fs::File::create_new(&output).unwrap(), false)
+                };
+                let ctx = OutputContext::with_writers(
+                    OutputConfig {
+                        force_mode: Some(OutputMode::Json),
+                        color: ColorChoice::Never,
+                        ..Default::default()
+                    },
+                    stdout,
+                    OutputWriter::stderr(),
+                );
+                let result = config_init_simple(&ctx, &config, &workers);
+                if closed {
+                    let error = result.unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<OutputError>(),
+                        Some(OutputError::Delivery(cause))
+                            if cause.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                    assert!(!output.exists());
+                } else {
+                    result.unwrap();
+                    let report = serde_json::from_slice::<serde_json::Value>(
+                        &std::fs::read(&output).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(report["command"], "config init");
+                    assert_eq!(report["success"], true);
+                    let paths = serde_json::json!([
+                        config.display().to_string(),
+                        workers.display().to_string()
+                    ]);
+                    assert_eq!(
+                        report["data"]["created"],
+                        if existing {
+                            serde_json::json!([])
+                        } else {
+                            paths.clone()
+                        }
+                    );
+                    assert_eq!(
+                        report["data"]["already_existed"],
+                        if existing {
+                            paths
+                        } else {
+                            serde_json::json!([])
+                        }
+                    );
+                }
+                let config_bytes = std::fs::read(&config).unwrap();
+                let worker_bytes = std::fs::read(&workers).unwrap();
+                if existing {
+                    assert_eq!(config_bytes, b"owned configuration bytes\n");
+                    assert_eq!(worker_bytes, b"owned worker bytes\n");
+                } else {
+                    let parsed =
+                        toml::from_str::<toml::Value>(std::str::from_utf8(&config_bytes).unwrap())
+                            .unwrap();
+                    let expected_socket = rch_common::default_socket_path();
+                    assert_eq!(
+                        parsed["general"]["socket_path"].as_str(),
+                        Some(expected_socket.as_str())
+                    );
+                    toml::from_str::<toml::Value>(std::str::from_utf8(&worker_bytes).unwrap())
+                        .unwrap();
+                }
+                assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+                assert!(!write_configuration(&config, "later replacement\n", false).unwrap());
+                assert!(!write_configuration(&workers, "later replacement\n", false).unwrap());
+                assert_eq!(std::fs::read(config).unwrap(), config_bytes);
+                assert_eq!(std::fs::read(workers).unwrap(), worker_bytes);
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
     // generate_config_toml Tests

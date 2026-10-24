@@ -56,6 +56,7 @@ pub struct ConfigDoctorResponse {
 /// - SSH identity file existence and permissions
 /// - Remote path format validation
 /// - Glob pattern syntax
+/// - Built-in transfer exclusions omitted by replacement lists
 /// - File permission issues
 pub fn config_doctor(ctx: &OutputContext) -> Result<()> {
     let mut diagnostics = Vec::new();
@@ -87,6 +88,7 @@ pub fn config_doctor(ctx: &OutputContext) -> Result<()> {
 
     // Check 4: Glob pattern syntax
     check_glob_patterns(&config, &mut diagnostics);
+    check_transfer_defaults(&config, &mut diagnostics);
 
     // Check 5: File permissions
     check_file_permissions(&mut diagnostics);
@@ -148,6 +150,20 @@ fn configured_socket_path(config: &RchConfig) -> PathBuf {
     PathBuf::from(shellexpand::tilde(&config.general.socket_path).into_owned())
 }
 
+fn probe_socket_directory(parent: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // Never open a predictable shared pathname with truncation. Besides
+    // clobbering an existing file, that followed .rch_write_test symlinks and
+    // could block on a FIFO. An anonymous tempfile owns only its own inode,
+    // including when concurrent doctors inspect the same socket directory.
+    let mut probe = tempfile::tempfile_in(parent)?;
+    // Creating an empty inode alone does not detect block quotas or delayed
+    // write failures. Flush only this private probe, never the filesystem.
+    probe.write_all(b"RCH_SOCKET_DIRECTORY_PROBE\n")?;
+    probe.sync_all()
+}
+
 fn check_socket_path(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
     let socket_path = configured_socket_path(config);
 
@@ -162,22 +178,20 @@ fn check_socket_path(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>
                 remediation: Some(format!("Create directory: mkdir -p {}", parent.display())),
             });
         } else {
-            // Check writability by attempting to create a temp file
-            let test_file = parent.join(".rch_write_test");
-            match std::fs::File::create(&test_file) {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&test_file);
-                }
+            match probe_socket_directory(parent) {
+                Ok(()) => {}
                 Err(e) => {
                     diagnostics.push(DoctorDiagnostic {
                         severity: DoctorSeverity::Error,
                         code: "DOC-E011".to_string(),
-                        message: format!("Socket directory is not writable: {}", parent.display()),
-                        detail: Some(e.to_string()),
-                        remediation: Some(format!(
-                            "Fix permissions: chmod u+w {}",
+                        message: format!(
+                            "Socket directory write probe failed: {}",
                             parent.display()
-                        )),
+                        ),
+                        detail: Some(e.to_string()),
+                        remediation: Some(
+                            "Check directory permissions, free space, and user quotas".to_string(),
+                        ),
                     });
                 }
             }
@@ -193,7 +207,7 @@ fn check_socket_path(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>
             message: format!("Socket file exists: {}", socket_path.display()),
             detail: Some("This may be from a running daemon or a stale socket".to_string()),
             remediation: Some(
-                "If daemon is not running, remove with: rm -f <socket_path>".to_string(),
+                "Check ownership with 'rch daemon status' before changing the socket".to_string(),
             ),
         });
     }
@@ -325,6 +339,39 @@ fn check_glob_patterns(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnosti
             });
         }
     }
+}
+
+/// An explicit exclusion list replaces, rather than extends, built-in defaults.
+/// Audit the effective list so old user/project lists cannot silently hide newly
+/// added protections (bd-rqjaj). This is a literal default-presence check, not a
+/// second rsync matcher or a claim that any particular file was transferred.
+fn check_transfer_defaults(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
+    let missing = config.transfer.unacknowledged_omitted_default_excludes();
+    if missing.is_empty() {
+        return;
+    }
+    diagnostics.push(DoctorDiagnostic {
+        severity: DoctorSeverity::Warning,
+        code: "DOC-W041".to_string(),
+        message: format!(
+            "Effective transfer exclusions omit {} built-in default pattern(s)",
+            missing.len()
+        ),
+        // Only built-in pattern names are reported. Do not read source files
+        // or echo unrelated custom patterns, paths, or credential contents.
+        detail: Some(format!(
+            "Missing defaults: {missing:?}. Custom [transfer] exclude_patterns replace \
+             defaults, including later credential and agent-state protections. Other \
+             rules may cover the same files; this is not a transfer inventory."
+        )),
+        remediation: Some(
+            "Review and add the missing patterns to the effective [transfer] exclude_patterns \
+             list, or remove the overriding list to inherit current defaults; list deliberate \
+             omissions in [transfer] exclude_defaults_acknowledged. Check both user and \
+             project configuration. No exclusions or worker files were changed."
+                .to_string(),
+        ),
+    });
 }
 
 fn check_file_permissions(diagnostics: &mut Vec<DoctorDiagnostic>) {
@@ -462,7 +509,7 @@ fn output_doctor_results(ctx: &OutputContext, diagnostics: Vec<DoctorDiagnostic>
     };
 
     if ctx.is_json() {
-        let _ = ctx.json(&response);
+        ctx.json(&response)?;
         if error_count > 0 {
             std::process::exit(1);
         }
@@ -535,6 +582,315 @@ fn output_doctor_results(ctx: &OutputContext, diagnostics: Vec<DoctorDiagnostic>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_defaults_and_reordered_supersets_are_quiet() {
+        let mut config = RchConfig::default();
+        for customized in [false, true] {
+            if customized {
+                config.transfer.exclude_patterns.reverse();
+                config
+                    .transfer
+                    .exclude_patterns
+                    .push("private-fixture/".into());
+                config.transfer.exclude_patterns.push(".env".into());
+            }
+            let original = config.transfer.exclude_patterns.clone();
+            let mut diagnostics = Vec::new();
+            check_transfer_defaults(&config, &mut diagnostics);
+            assert!(diagnostics.is_empty());
+            assert_eq!(config.transfer.exclude_patterns, original);
+        }
+    }
+
+    #[test]
+    fn stale_custom_exclusions_name_credential_and_agent_state_defaults() {
+        let mut config = RchConfig::default();
+        for pattern in [".env", ".ntm/"] {
+            assert!(
+                config
+                    .transfer
+                    .exclude_patterns
+                    .iter()
+                    .any(|p| p == pattern)
+            );
+        }
+        config
+            .transfer
+            .exclude_patterns
+            .retain(|p| p != ".env" && p != ".ntm/");
+        config
+            .transfer
+            .exclude_patterns
+            .push("tenant-private-name".into());
+        let original = config.transfer.exclude_patterns.clone();
+        let mut diagnostics = Vec::new();
+        check_transfer_defaults(&config, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        let warning = &diagnostics[0];
+        assert!(matches!(warning.severity, DoctorSeverity::Warning));
+        assert_eq!(warning.code, "DOC-W041");
+        assert!(warning.message.contains("2 built-in"));
+        let detail = warning.detail.as_deref().unwrap();
+        assert!(detail.contains("\".env\"") && detail.contains("\".ntm/\""));
+        assert!(!detail.contains("tenant-private-name"));
+        assert!(warning.remediation.as_deref().unwrap().contains("project"));
+        assert_eq!(config.transfer.exclude_patterns, original);
+    }
+
+    #[test]
+    fn exclusion_audit_tracks_every_default_without_hardcoded_security_subsets() {
+        let defaults = rch_common::TransferConfig::default().exclude_patterns;
+        assert!(!defaults.is_empty());
+        for omitted in &defaults {
+            let mut config = RchConfig::default();
+            config.transfer.exclude_patterns.retain(|p| p != omitted);
+            let mut diagnostics = Vec::new();
+            check_transfer_defaults(&config, &mut diagnostics);
+            assert_eq!(diagnostics.len(), 1, "{omitted}");
+            assert!(diagnostics[0].message.contains("1 built-in"), "{omitted}");
+            assert!(diagnostics[0].detail.as_deref().unwrap().contains(omitted));
+        }
+    }
+
+    #[test]
+    fn acknowledged_omissions_are_quiet_and_others_still_warn() {
+        let mut config = RchConfig::default();
+        config
+            .transfer
+            .exclude_patterns
+            .retain(|p| p != "*.pem" && p != "*.key" && p != ".env");
+        config.transfer.exclude_defaults_acknowledged = vec!["*.pem".into(), "*.key".into()];
+        let mut diagnostics = Vec::new();
+        check_transfer_defaults(&config, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("1 built-in"));
+        let detail = diagnostics[0].detail.as_deref().unwrap();
+        assert!(detail.contains("\".env\""));
+        assert!(!detail.contains("*.pem") && !detail.contains("*.key"));
+
+        config.transfer.exclude_patterns.push(".env".into());
+        diagnostics.clear();
+        check_transfer_defaults(&config, &mut diagnostics);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn empty_and_alternate_rules_do_not_masquerade_as_default_lists() {
+        for patterns in [Vec::new(), vec!["*".to_string(), "/.env".to_string()]] {
+            let mut config = RchConfig::default();
+            config.transfer.exclude_patterns = patterns.clone();
+            let mut diagnostics = Vec::new();
+            check_transfer_defaults(&config, &mut diagnostics);
+            assert_eq!(diagnostics.len(), 1);
+            assert!(
+                diagnostics[0]
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("not a transfer inventory")
+            );
+            assert_eq!(config.transfer.exclude_patterns, patterns);
+        }
+    }
+
+    #[test]
+    fn socket_probe_never_truncates_or_removes_the_legacy_probe_name() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let legacy = root.join(".rch_write_test");
+        let content = b"pre-existing operator data must survive";
+        std::fs::write(&legacy, content).unwrap();
+        for _ in 0..3 {
+            probe_socket_directory(&root).unwrap();
+            assert_eq!(std::fs::read(&legacy).unwrap(), content);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_probe_does_not_follow_legacy_symlinks_or_modify_hardlinks() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let victim = root.join("operator-state");
+        std::fs::write(&victim, b"retained bytes").unwrap();
+        for linked in [false, true] {
+            let directory = root.join(if linked { "hardlink" } else { "symlink" });
+            std::fs::create_dir(&directory).unwrap();
+            let legacy = directory.join(".rch_write_test");
+            if linked {
+                std::fs::hard_link(&victim, &legacy).unwrap();
+            } else {
+                symlink(&victim, &legacy).unwrap();
+            }
+            let before = std::fs::metadata(&victim).unwrap();
+            probe_socket_directory(&directory).unwrap();
+            let after = std::fs::metadata(&victim).unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"retained bytes");
+            assert_eq!(before.ino(), after.ino());
+            assert_eq!(before.nlink(), after.nlink());
+            assert_eq!(
+                std::fs::symlink_metadata(&legacy)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                !linked
+            );
+        }
+    }
+
+    #[test]
+    fn socket_probe_handles_concurrent_checks_and_non_directory_failures() {
+        let root = tempfile::tempdir().unwrap().keep();
+        std::thread::scope(|scope| {
+            let checks: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| probe_socket_directory(&root)))
+                .collect();
+            for check in checks {
+                check.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let file = root.join("not-a-directory");
+        std::fs::write(&file, b"unchanged").unwrap();
+        assert!(probe_socket_directory(&file).is_err());
+        assert!(probe_socket_directory(&root.join("missing")).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn socket_probe_failures_reach_diagnostics_without_changing_existing_paths() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let existing_file = root.join("file");
+        std::fs::write(&existing_file, b"retain").unwrap();
+        for (parent, expected) in [
+            (root.join("missing"), "DOC-E010"),
+            (existing_file.clone(), "DOC-E011"),
+        ] {
+            let mut config = RchConfig::default();
+            config.general.socket_path = parent.join("rch.sock").to_string_lossy().into_owned();
+            let mut diagnostics = Vec::new();
+            check_socket_path(&config, &mut diagnostics);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected);
+            assert!(matches!(diagnostics[0].severity, DoctorSeverity::Error));
+        }
+        assert_eq!(std::fs::read(existing_file).unwrap(), b"retain");
+        assert!(!root.join("missing").exists());
+    }
+
+    #[test]
+    fn transfer_default_warnings_reach_json_and_toon_without_becoming_errors() {
+        use crate::ui::context::{ColorChoice, OutputConfig, OutputFormat, OutputMode};
+        use crate::ui::writer::OutputWriter;
+
+        let root = tempfile::tempdir().unwrap().keep();
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            let path = root.join(format!("{format:?}.output"));
+            let ctx = OutputContext::with_writers(
+                OutputConfig {
+                    force_mode: Some(OutputMode::Json),
+                    color: ColorChoice::Never,
+                    format,
+                    ..Default::default()
+                },
+                OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false),
+                OutputWriter::stderr(),
+            );
+            let mut config = RchConfig::default();
+            config.transfer.exclude_patterns.retain(|p| p != ".env");
+            let mut diagnostics = Vec::new();
+            check_transfer_defaults(&config, &mut diagnostics);
+            output_doctor_results(&ctx, diagnostics).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let report: serde_json::Value = if format == OutputFormat::Toon {
+                serde_json::from_str(
+                    &toon_rust::toon_to_json(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+                )
+                .unwrap()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            assert_eq!(report["healthy"], true);
+            assert_eq!(report["error_count"].as_f64(), Some(0.0));
+            assert_eq!(report["warning_count"].as_f64(), Some(1.0));
+            assert_eq!(report["diagnostics"][0]["severity"], "warning");
+            assert_eq!(report["diagnostics"][0]["code"], "DOC-W041");
+            assert!(
+                report["diagnostics"][0]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains(".env")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reporter_delivers_formats_and_propagates_real_output_failures() {
+        use crate::ui::context::{
+            ColorChoice, OutputConfig, OutputError, OutputFormat, OutputMode,
+        };
+        use crate::ui::writer::OutputWriter;
+        use std::os::unix::net::UnixStream;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            for closed in [false, true] {
+                let path = retained.join(format!("{format:?}-{closed}.output"));
+                let stdout = if closed {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    OutputWriter::new(socket, false)
+                } else {
+                    OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false)
+                };
+                let ctx = OutputContext::with_writers(
+                    OutputConfig {
+                        force_mode: Some(OutputMode::Json),
+                        color: ColorChoice::Never,
+                        format,
+                        ..Default::default()
+                    },
+                    stdout,
+                    OutputWriter::stderr(),
+                );
+                // Reporter-only test: an empty diagnostic set is not a claim
+                // about actual configuration, daemon or worker health.
+                let result = output_doctor_results(&ctx, Vec::new());
+                if closed {
+                    let error = result.unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<OutputError>(),
+                        Some(OutputError::Delivery(cause))
+                            if cause.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                    assert!(!path.exists());
+                } else {
+                    result.unwrap();
+                    let bytes = std::fs::read(path).unwrap();
+                    let report = if format == OutputFormat::Toon {
+                        serde_json::from_str::<serde_json::Value>(
+                            &toon_rust::toon_to_json(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                    };
+                    assert_eq!(report["healthy"], true);
+                    assert_eq!(report["diagnostics"], serde_json::json!([]));
+                    // TOON decodes every number as f64, so compare numerically.
+                    for count in ["error_count", "warning_count", "info_count"] {
+                        assert_eq!(report[count].as_f64(), Some(0.0), "{format:?} {count}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn configured_socket_path_expands_tilde() {

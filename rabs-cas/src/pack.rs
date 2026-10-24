@@ -269,6 +269,18 @@ impl PackIndex {
                 at: members.last().map(|m| m.key.clone()).unwrap_or_default(),
             });
         }
+        let range_members: Vec<crate::closure_validation::PackMember> = members
+            .iter()
+            .map(|m| crate::closure_validation::PackMember {
+                offset: m.offset,
+                length: m.length,
+            })
+            .collect();
+        if crate::closure_validation::validate_pack_ranges(&range_members, payload_len).is_err() {
+            return Err(PackError::BrokenTiling {
+                at: members.last().map(|m| m.key.clone()).unwrap_or_default(),
+            });
+        }
         Ok(Self {
             members,
             payload_start: index_end,

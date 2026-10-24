@@ -36,7 +36,8 @@ use crate::coord::live::{
     load_manifest,
 };
 use crate::edge::live_facts::{
-    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, read_stable,
+    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard,
+    digest_stable, read_stable,
 };
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
@@ -48,7 +49,8 @@ use rabs_cas::publication::{
 };
 use rabs_key::live_dependency::{
     DependencyActionPlan, LIVE_DEPENDENCY_KEY_EPOCH, LIVE_DEPENDENCY_PROJECTION_EPOCH,
-    LiveDependencyKey, canonicalize_placements, dep_info_closure_violation, render_placements,
+    LiveDependencyKey, canonicalize_placements, check_dependency_cache_read_closure,
+    dep_info_closure_violation, render_placements,
 };
 use rabs_key::output_declarations::OutputClass;
 use rabs_key::typed_digest::compute;
@@ -67,6 +69,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+pub mod remote;
+
+mod capture_pins;
+mod output_capture;
+use capture_pins::CapturePins;
 
 /// Decision-receipt kind binding an action key to its canonical
 /// transcript object. The binding is verified against the committed
@@ -97,8 +105,50 @@ pub struct LiveDependencyRequest {
     pub package: Arc<PackageFacts>,
     /// Exact dependency candidate inventory and identities.
     pub dependencies: Arc<DependencyFacts>,
+    /// The toolchain observation used for this request's key, not a later memo.
+    pub toolchain: ToolchainGuard,
     /// `(path, digest)` of every extern the key covers.
     pub externs: Vec<(String, TypedDigest)>,
+}
+
+impl LiveDependencyRequest {
+    fn verify_read_closure(&self) -> Result<(), String> {
+        check_dependency_cache_read_closure(&self.plan.invocation)
+            .map_err(|refusal| refusal.to_string())?;
+        self.verify_output_contract()
+    }
+
+    /// Remote archive authority comes only from the retained, internally
+    /// constructed validation owner. A caller-supplied descriptor or remote
+    /// policy string alone can never relax the unsandboxed local guard.
+    fn verify_enforced_read_closure(
+        &self,
+        remote: Option<&remote::RemoteValidation>,
+    ) -> Result<(), String> {
+        match remote {
+            Some(remote) => remote.verify_read_closure(self),
+            None => self.verify_read_closure(),
+        }
+    }
+
+    fn verify_output_contract(&self) -> Result<(), String> {
+        let expected = rabs_key::output_derivation::derive_dependency_output_declarations(
+            &self.plan.invocation,
+            &self.plan.host_triple,
+        )
+        .map_err(|error| error.to_string())?;
+        if expected.canonical_bytes() != self.plan.outputs.canonical_bytes() {
+            return Err(
+                "LIVE_DEP_OUTPUTS: declared outputs differ from the compiler invocation".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_toolchain(&self) -> Result<(), String> {
+        self.toolchain
+            .verify_unchanged(Path::new(&self.plan.compiler))
+    }
 }
 
 /// One output now present in the subscriber's out-dir with known bytes.
@@ -112,8 +162,30 @@ pub struct KnownOutput {
     pub digest: TypedDigest,
 }
 
+/// The materializer has returned, so another writer may already have replaced
+/// an output. A fresh metadata signature alone cannot be paired with the old
+/// committed digest: doing so would poison the edge's file-digest memo and key
+/// a later compiler invocation against bytes it never received. Establish both
+/// through the same stable read, or refuse this hit without publishing a memo.
+fn known_installed_output(path: &Path, expected: &TypedDigest) -> Result<KnownOutput, String> {
+    let (sig, digest) = digest_stable(path)
+        .map_err(|error| format!("installed output {}: {error}", path.display()))?;
+    if &digest != expected {
+        return Err(format!(
+            "installed output {} no longer matches its committed object",
+            path.display()
+        ));
+    }
+    Ok(KnownOutput {
+        path: path.to_path_buf(),
+        sig,
+        digest,
+    })
+}
+
 /// The lane's answer to one request.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum LiveDecision {
     /// Every gate passes and the complete output plan is prepared; nothing
     /// is written until the subscriber commits to waiting for the install
@@ -121,6 +193,13 @@ pub enum LiveDecision {
     Hit(PendingServe),
     /// Run the compiler as this admitted attempt, then complete it.
     Execute(LocalAttempt),
+    /// Reserved private worker execution, awaiting subscriber acceptance.
+    Remote(remote::PendingRemote),
+    /// Another subscriber owns this action's dispatch. No execution or
+    /// destination writer was admitted for this request. A bounded follower
+    /// may resubmit its original request; the edge must reobserve its inputs
+    /// and all serving gates rather than treating leader completion as a hit.
+    InFlight,
     /// Run the compiler unobserved (reason code).
     PassThrough(String),
 }
@@ -132,6 +211,7 @@ pub struct PendingServe {
     request: LiveDependencyRequest,
     manifest: CanonicalActionResultManifest,
     canonical_transcript: Vec<u8>,
+    remote_validation: Option<remote::RemoteValidation>,
 }
 
 /// The result of installing an accepted hit.
@@ -152,6 +232,40 @@ pub enum InstallResult {
     Fault(String),
 }
 
+/// Finish only after the synchronous materializer and output verification have
+/// returned. Recheck the SAME package/generated-input observations used for
+/// keying, not a refreshed memo. A local hit has no RemoteValidation to do this
+/// for it. Dependency observations exclude this action's exact declared output
+/// names, so its own writes are permitted without accepting changed inputs.
+fn finish_installation(
+    dependencies: &DependencyFacts,
+    package: &PackageFacts,
+    plan: &DependencyActionPlan,
+    transcript: Vec<u8>,
+    installed: Vec<KnownOutput>,
+) -> InstallResult {
+    if let Err(reason) = package
+        .verify_unchanged(Path::new(&plan.source_root))
+        .and_then(|()| package.verify_generated_disjoint(plan))
+    {
+        // Writes have finished: this is a settled failure, not an unwritten
+        // decline. Return neither the transcript nor known-output identities
+        // under the stale key. Never undo outputs another writer may now own.
+        return InstallResult::Fault(format!(
+            "package inputs changed during installation: {reason}"
+        ));
+    }
+    if let Err(reason) = dependencies.verify_unchanged() {
+        return InstallResult::Fault(format!(
+            "dependency inputs changed during installation: {reason}"
+        ));
+    }
+    InstallResult::Served {
+        transcript,
+        installed,
+    }
+}
+
 impl PendingServe {
     /// The exact action key.
     #[must_use]
@@ -165,8 +279,23 @@ impl PendingServe {
         let plan = &self.request.plan;
         if let Err(reason) = self
             .request
-            .package
-            .verify_unchanged(Path::new(&plan.source_root))
+            .verify_enforced_read_closure(self.remote_validation.as_ref())
+        {
+            return InstallResult::Declined(reason);
+        }
+        if let Some(validation) = &self.remote_validation
+            && let Err(reason) = validation.verify(&self.request)
+        {
+            return InstallResult::Declined(reason);
+        }
+        if let Err(reason) = self
+            .request
+            .verify_toolchain()
+            .and_then(|()| {
+                self.request
+                    .package
+                    .verify_unchanged(Path::new(&plan.source_root))
+            })
             .and_then(|()| self.request.package.verify_generated_disjoint(plan))
             .and_then(|()| self.request.dependencies.verify_unchanged())
         {
@@ -198,19 +327,30 @@ impl PendingServe {
                     };
                     if committed.role == OutputRole::DepInfo {
                         continue;
-                    }
-                    if let Ok(meta) = std::fs::symlink_metadata(path) {
-                        installed.push(KnownOutput {
-                            path: path.clone(),
-                            sig: FileSig::of(&meta),
-                            digest: committed.object.0.clone(),
-                        });
+                    };
+                    match known_installed_output(path, &committed.object.0) {
+                        Ok(output) => installed.push(output),
+                        Err(reason) => return InstallResult::Fault(reason),
                     }
                 }
-                InstallResult::Served {
-                    transcript: render_placements(&self.canonical_transcript, plan),
+                // The synchronous writer has returned. A toolchain update
+                // during installation cannot authorize a skip under the old
+                // key; report a settled failure, never uncertain fallback.
+                if let Err(reason) = self.request.verify_toolchain() {
+                    return InstallResult::Fault(reason);
+                }
+                if let Some(validation) = &self.remote_validation
+                    && let Err(reason) = validation.verify(&self.request)
+                {
+                    return InstallResult::Fault(reason);
+                }
+                finish_installation(
+                    &self.request.dependencies,
+                    &self.request.package,
+                    plan,
+                    render_placements(&self.canonical_transcript, plan),
                     installed,
-                }
+                )
             }
             Ok(other) => InstallResult::Declined(format!("{other:?}")),
             Err(error) => InstallResult::Fault(error.to_string()),
@@ -280,6 +420,58 @@ pub struct CompletionReport {
     pub stderr: Vec<u8>,
 }
 
+/// A complete immutable result, not yet an action publication. Capture has
+/// finished ALL reads from the subscriber's input/output tree. The opaque
+/// owner keeps the attempt alive without a store lock or blocking-lane permit.
+/// Dropping it settles the attempt without publishing, including on disconnect.
+#[derive(Debug)]
+pub struct CapturedLocalAttempt {
+    attempt: ExecutionAttempt,
+    result: CapturedLocalResult,
+}
+
+#[derive(Debug)]
+struct CapturedLocalResult {
+    offer: OfferPreparedActionResult,
+    transcript: ObjectId,
+    manifest_key: String,
+    known: Vec<KnownOutput>,
+    // Retain every captured object while the wrapper acknowledges the handoff.
+    pins: CapturePins,
+}
+
+impl CapturedLocalAttempt {
+    /// Action whose exact outputs were captured.
+    #[must_use]
+    pub fn action_key(&self) -> &TypedDigest {
+        self.attempt.action_key()
+    }
+
+    /// Admitted execution identity, never supplied by the completion report.
+    #[must_use]
+    pub fn attempt_hex(&self) -> String {
+        self.attempt.attempt_hex()
+    }
+
+    /// Content identity of the already durable canonical result manifest.
+    #[must_use]
+    pub fn manifest_key(&self) -> &str {
+        &self.result.manifest_key
+    }
+
+    /// Publish the captured CAS objects through the existing coordinator gate.
+    /// This performs no reads from the subscriber's mutable target or inputs.
+    /// The transport must obtain the capture acknowledgment before calling it.
+    pub fn publish(mut self) -> (CompletionOutcome, Vec<KnownOutput>) {
+        let result = self.attempt.publish_captured(self.result);
+        self.attempt.settle();
+        match result {
+            Ok(outcome) => outcome,
+            Err(reason) => (CompletionOutcome::NotPublished(reason), Vec::new()),
+        }
+    }
+}
+
 /// Coordinator-side handle for the live dependency lane.
 #[derive(Debug, Clone)]
 pub struct LiveDependencyLane {
@@ -312,10 +504,15 @@ fn object_id(bytes: &[u8]) -> Result<TypedDigest, String> {
         .map_err(|error| format!("digest: {error:?}"))
 }
 
-/// Durably store one object. The store lock is held for this object only.
-fn put_bytes(cas: &crate::janitor::store::LiveCas, bytes: &[u8]) -> Result<ObjectId, String> {
+/// Durably store and pin one object under the same per-object store lock.
+fn put_bytes(
+    cas: &crate::janitor::store::LiveCas,
+    bytes: &[u8],
+    pins: &mut CapturePins,
+) -> Result<ObjectId, String> {
     let id = object_id(bytes)?;
     let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+    pins.protect(&mut *store, &id)?;
     put_if_absent(
         cas.layout(),
         &mut *store,
@@ -337,6 +534,7 @@ fn put_bytes(cas: &crate::janitor::store::LiveCas, bytes: &[u8]) -> Result<Objec
 fn put_bundle_root(
     cas: &crate::janitor::store::LiveCas,
     outputs: &[LogicalOutput],
+    pins: &mut CapturePins,
 ) -> Result<(), String> {
     use std::io::Write;
     let bytes = rabs_key::logical_output_map::bundle_root_bytes(outputs)
@@ -346,6 +544,7 @@ fn put_bundle_root(
     // Held through the write and the location record: a concurrent
     // completion of the same result must not race the staging name.
     let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+    pins.protect(&mut *store, &root.0)?;
     if store
         .object_durably_located(&root.0)
         .map_err(|error| format!("{error:?}"))?
@@ -454,6 +653,43 @@ fn load_bound_transcript(
     None
 }
 
+fn verify_canonical_surface_free_of_staging_roots(
+    surface: rabs_sandbox::leak_scanner::Surface,
+    bytes: &[u8],
+    plan: &DependencyActionPlan,
+) -> Result<(), String> {
+    verify_canonical_surface_free_of_roots(surface, bytes, &plan.out_dir, &plan.dependency_dirs)
+}
+
+fn verify_canonical_surface_free_of_roots(
+    surface: rabs_sandbox::leak_scanner::Surface,
+    bytes: &[u8],
+    out_dir: &str,
+    dependency_dirs: &[String],
+) -> Result<(), String> {
+    let hidden = rabs_sandbox::leak_scanner::HiddenWorld {
+        worktree_roots: Vec::new(),
+        user_homes: Vec::new(),
+        staging_roots: std::iter::once(out_dir.to_owned())
+            .chain(
+                dependency_dirs
+                    .iter()
+                    .filter(|root| root.as_str() != out_dir)
+                    .cloned(),
+            )
+            .collect(),
+        identities: Vec::new(),
+        secret_backing_roots: Vec::new(),
+    };
+    let findings = rabs_sandbox::leak_scanner::scan_surface(surface, bytes, &hidden, true);
+    match rabs_sandbox::leak_scanner::disposition(&findings) {
+        rabs_sandbox::leak_scanner::ScanDisposition::CanonicalAuthorityHolds => Ok(()),
+        other => Err(format!(
+            "leak scanner refused {surface:?} after placement canonicalization: {other:?}"
+        )),
+    }
+}
+
 impl LiveDependencyLane {
     /// The lane over a live coordinator.
     #[must_use]
@@ -489,10 +725,18 @@ impl LiveDependencyLane {
     }
 
     /// Preview a hit if a verified, replayable result exists; otherwise
-    /// admit a private execution of exactly this action.
+    /// admit one private execution or report its existing dispatch owner.
+    /// In-flight is not a cache hit: followers retry through this same preview
+    /// and sampling gate, including any additional private verification run.
     #[must_use]
     pub fn decide(&self, request: LiveDependencyRequest) -> LiveDecision {
-        let request = match self.preview(request) {
+        if let Err(reason) = request
+            .verify_read_closure()
+            .and_then(|()| request.verify_toolchain())
+        {
+            return LiveDecision::PassThrough(reason);
+        }
+        let request = match self.preview(request, None) {
             Ok(Ok(pending)) => return LiveDecision::Hit(pending),
             Ok(Err(request)) => request,
             // Preview writes no target file, so the compiler may run; it
@@ -500,7 +744,8 @@ impl LiveDependencyLane {
             Err(reason) => return LiveDecision::PassThrough(format!("serve-fault: {reason}")),
         };
         match self.begin_execution(request) {
-            Ok(attempt) => LiveDecision::Execute(attempt),
+            Ok(Some(attempt)) => LiveDecision::Execute(attempt),
+            Ok(None) => LiveDecision::InFlight,
             Err(reason) => LiveDecision::PassThrough(reason),
         }
     }
@@ -509,7 +754,11 @@ impl LiveDependencyLane {
     fn preview(
         &self,
         request: LiveDependencyRequest,
+        remote_validation: Option<&remote::RemoteValidation>,
     ) -> Result<Result<PendingServe, LiveDependencyRequest>, String> {
+        // Retained codegen publications from an older daemon are immutable
+        // history, not current serving authority. Check before any lookup.
+        request.verify_enforced_read_closure(remote_validation)?;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let key = request.key.action_key.clone();
         let loaded = {
@@ -543,19 +792,36 @@ impl LiveDependencyLane {
                 request,
                 manifest,
                 canonical_transcript,
+                remote_validation: remote_validation.cloned(),
             })),
             Ok(_) => Ok(Err(request)),
             Err(error) => Err(error.to_string()),
         }
     }
 
-    fn begin_execution(&self, request: LiveDependencyRequest) -> Result<LocalAttempt, String> {
+    fn begin_execution(
+        &self,
+        request: LiveDependencyRequest,
+    ) -> Result<Option<LocalAttempt>, String> {
+        let worker = self.local_worker()?;
+        self.begin_execution_on(request, &worker, None)
+            .map(|attempt| attempt.map(LocalAttempt))
+    }
+
+    /// Share singleflight and publication authority without substituting the
+    /// edge-local executor for an authenticated remote worker.
+    fn begin_execution_on(
+        &self,
+        request: LiveDependencyRequest,
+        worker: &WorkerSessionOffer,
+        remote_validation: Option<remote::RemoteValidation>,
+    ) -> Result<Option<ExecutionAttempt>, String> {
+        request.verify_enforced_read_closure(remote_validation.as_ref())?;
         let key = request.key.action_key.clone();
         let refusal = |error: SubmissionRefusal| format!("submission: {error:?}");
         if self.coord.submitted_actor(&key).map_err(refusal)?.is_some() {
-            return Err("in-flight: another subscriber is executing this action".into());
+            return Ok(None);
         }
-        let worker = self.local_worker()?;
         {
             let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
             let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
@@ -594,22 +860,24 @@ impl LiveDependencyLane {
         self.coord
             .submit_action(submission, join, now_micros(), 0)
             .map_err(refusal)?;
-        let serial = self
-            .coord
-            .claim_submitted_dispatch(&key)
-            .map_err(refusal)?
-            .ok_or("in-flight: the dispatch was claimed by another subscriber")?;
-        let mut attempt = LocalAttempt {
+        let Some(serial) = self.coord.claim_submitted_dispatch(&key).map_err(refusal)? else {
+            // The atomic dispatch claim, not the optimistic lookup above,
+            // arbitrates concurrent requests. Losing it means wait, not a
+            // second unobserved compiler run in another subscriber's tree.
+            return Ok(None);
+        };
+        let mut attempt = ExecutionAttempt {
             coord: Arc::clone(&self.coord),
             key,
             serial,
             authority: None,
             request,
+            remote_validation,
             settled: false,
         };
         let authority = self
             .coord
-            .begin_claimed_dispatch(&attempt.key, serial, &worker, LOCAL_LEASE_TTL_MS)
+            .begin_claimed_dispatch(&attempt.key, serial, worker, LOCAL_LEASE_TTL_MS)
             .map_err(refusal)?;
         attempt.authority = Some(authority);
         for state in [
@@ -620,25 +888,62 @@ impl LiveDependencyLane {
         ] {
             attempt.advance(state)?;
         }
-        Ok(attempt)
+        Ok(Some(attempt))
     }
 }
 
 /// One admitted local execution. Dropping it unsettled drains and
-/// finishes the attempt WITHOUT publication: an attempt that never
-/// reported completion can never offer, because offers are only built by
-/// [`LocalAttempt::complete`], which consumes it.
+/// finishes the attempt WITHOUT publication. Capturing consumes this owner
+/// and retains it until the result is published or abandoned.
 #[derive(Debug)]
-pub struct LocalAttempt {
+pub struct LocalAttempt(ExecutionAttempt);
+
+/// A coordinator-owned action attempt bound to its actual admitted executor.
+#[derive(Debug)]
+struct ExecutionAttempt {
     coord: Arc<CoordLive>,
     key: TypedDigest,
     serial: u64,
     authority: Option<AttemptAuthority>,
     request: LiveDependencyRequest,
+    remote_validation: Option<remote::RemoteValidation>,
     settled: bool,
 }
 
 impl LocalAttempt {
+    #[must_use]
+    pub fn execution_env(&self) -> &[(String, String)] {
+        self.0.execution_env()
+    }
+
+    #[must_use]
+    pub fn attempt_hex(&self) -> String {
+        self.0.attempt_hex()
+    }
+
+    #[must_use]
+    pub fn action_key(&self) -> &TypedDigest {
+        self.0.action_key()
+    }
+
+    /// Complete a local execution without a transport handoff.
+    pub fn complete(self, report: &CompletionReport) -> (CompletionOutcome, Vec<KnownOutput>) {
+        match self.capture(report) {
+            Ok(captured) => captured.publish(),
+            Err(reason) => (CompletionOutcome::NotPublished(reason), Vec::new()),
+        }
+    }
+
+    /// Capture caller-owned outputs before acknowledging their custody.
+    pub fn capture(self, report: &CompletionReport) -> Result<CapturedLocalAttempt, String> {
+        let attempt = self.0;
+        let result =
+            attempt.capture_result(report, Path::new(&attempt.request.plan.out_dir), None)?;
+        Ok(CapturedLocalAttempt { attempt, result })
+    }
+}
+
+impl ExecutionAttempt {
     /// The constructed environment the compiler must run with.
     #[must_use]
     pub fn execution_env(&self) -> &[(String, String)] {
@@ -665,6 +970,15 @@ impl LocalAttempt {
         self.coord
             .advance_started_dispatch(&self.key, self.serial, authority, state)
             .map_err(|error| format!("attempt {state:?}: {error:?}"))
+    }
+
+    /// Execution may still be running remotely. Preserve the abandoned claim
+    /// for reconciliation; neither Drop nor caller fallback can invent a drain.
+    fn abandon(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            self.coord.release_dispatch_claim(&self.key, self.serial);
+        }
     }
 
     /// Drain → Finished → complete the dispatch → retire the flight, so
@@ -700,22 +1014,15 @@ impl LocalAttempt {
         }
     }
 
-    /// Complete the attempt from the subscriber's report: harvest, upload
-    /// and offer when the run is publishable, then settle.
-    pub fn complete(mut self, report: &CompletionReport) -> (CompletionOutcome, Vec<KnownOutput>) {
-        let result = self.publish(report);
-        self.settle();
-        match result {
-            Ok(outcome) => outcome,
-            Err(reason) => (CompletionOutcome::NotPublished(reason), Vec::new()),
-        }
-    }
-
     #[allow(clippy::too_many_lines)]
-    fn publish(
+    fn capture_result(
         &self,
         report: &CompletionReport,
-    ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
+        physical_outputs: &Path,
+        remote_receipt: Option<&serde_json::Value>,
+    ) -> Result<CapturedLocalResult, String> {
+        self.request
+            .verify_enforced_read_closure(self.remote_validation.as_ref())?;
         self.advance(AttemptState::ProcessExited)?;
         if report.signal.is_some() || report.exit_code != Some(0) {
             return Err(format!(
@@ -729,6 +1036,7 @@ impl LocalAttempt {
         if report.stderr.len() > MAX_TRANSCRIPT_BYTES {
             return Err("transcript exceeds the class bound".into());
         }
+        self.request.verify_toolchain()?;
         let plan = &self.request.plan;
         self.request
             .package
@@ -736,13 +1044,31 @@ impl LocalAttempt {
         self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
         let input_roots = mappings_for_plan(plan);
-        // Harvest every declared output (and nothing else).
+        let transcript = canonicalize_placements(&report.stderr, plan)?;
+        verify_canonical_surface_free_of_staging_roots(
+            rabs_sandbox::leak_scanner::Surface::CompilerEvents,
+            &transcript,
+            plan,
+        )?;
+        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
+        let authority = self.authority.clone().ok_or("attempt not admitted")?;
+        let mut pins = CapturePins::new(Arc::clone(cas), &authority);
+        let mut logical_outputs = Vec::with_capacity(plan.outputs.declarations.len());
+        let mut known = Vec::new();
+        // Lock order is submissions -> store: never advance while holding
+        // the store. Each output is retained before the next one is read.
+        self.advance(AttemptState::HarvestingOutputs)?;
+        self.advance(AttemptState::UploadingOutputs)?;
+        // Keep only signatures and CAS identities, not a Vec containing every
+        // complete rlib/rmeta. Native outputs stream through private staging
+        // outside the metadata lock. Dep-info still needs the existing bounded
+        // parse/placement rewrite; its bytes are released after that one put.
         let mut harvested = Vec::new();
         for declaration in &plan.outputs.declarations {
-            let path = Path::new(&plan.out_dir).join(&declaration.virtual_path);
-            let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
-                .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
-            let committed_bytes = if declaration.class == OutputClass::DepInfo {
+            let path = physical_outputs.join(&declaration.virtual_path);
+            let (sig, object) = if declaration.class == OutputClass::DepInfo {
+                let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
+                    .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
                 if let Some(violation) = dep_info_closure_violation(plan, &raw, |virtual_path| {
                     input_roots.iter().any(|(logical, visible)| {
                         virtual_path.strip_prefix(&format!("{visible}/")).is_some_and(|relative| {
@@ -754,43 +1080,56 @@ impl LocalAttempt {
                 }) {
                     return Err(format!("closure: {violation}"));
                 }
-                canonicalize_placements(&raw, plan)?
+                let bytes = canonicalize_placements(&raw, plan)?;
+                verify_canonical_surface_free_of_staging_roots(
+                    rabs_sandbox::leak_scanner::Surface::DepInfo,
+                    &bytes,
+                    plan,
+                )?;
+                (sig, put_bytes(cas, &bytes, &mut pins)?)
             } else {
-                raw
+                let captured = output_capture::put_output(cas, &path, MAX_OUTPUT_BYTES, &mut pins)?;
+                let object = ObjectId(captured.digest.clone());
+                let sig = captured.sig;
+                // Private delivery inode signatures do not describe Cargo's
+                // target files. Remember only after a remote install finishes.
+                if remote_receipt.is_none() {
+                    known.push(captured);
+                }
+                (sig, object)
             };
-            harvested.push((declaration, path, sig, committed_bytes));
+            harvested.push((path, sig));
+            logical_outputs.push(LogicalOutput {
+                role: output_role(declaration.class),
+                virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
+                object,
+            });
         }
-        let transcript = canonicalize_placements(&report.stderr, plan)?;
-        self.advance(AttemptState::HarvestingOutputs)?;
-
-        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
-        let authority = self.authority.clone().ok_or("attempt not admitted")?;
-        let mut logical_outputs = Vec::with_capacity(harvested.len());
-        let mut known = Vec::new();
-        // Lock order is submissions -> store everywhere in the coordinator:
-        // never advance the attempt while holding the store.
-        self.advance(AttemptState::UploadingOutputs)?;
+        // Streaming a later artifact must not silently accept a replacement
+        // of an earlier output. This check retains the original identities,
+        // including dep-info, without rereading or retaining the artifact bytes.
+        for (path, sig) in &harvested {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() || FileSig::of(&metadata) != *sig {
+                return Err(format!("output {} changed during capture", path.display()));
+            }
+        }
+        // The complete capture must be from one stable input generation, not
+        // just start with one. After this barrier publication uses CAS only.
+        self.request
+            .package
+            .verify_unchanged(Path::new(&plan.source_root))?;
+        self.request.package.verify_generated_disjoint(plan)?;
+        self.request.dependencies.verify_unchanged()?;
+        self.request.verify_toolchain()?;
         // Each put takes the store lock for itself only: decisions for other
         // compiles must not queue behind a whole completion's fsyncs. The
-        // commit transaction re-verifies the complete durable closure.
+        // pin installed by each put protects the object between those locks
+        // and across the asynchronous acknowledgment. The commit transaction
+        // still re-verifies the complete durable closure.
         let (transcript_id, evidence_parts) = {
-            for (declaration, path, sig, bytes) in &harvested {
-                let object = put_bytes(cas, bytes)?;
-                if declaration.class != OutputClass::DepInfo {
-                    known.push(KnownOutput {
-                        path: path.clone(),
-                        sig: *sig,
-                        digest: object.0.clone(),
-                    });
-                }
-                logical_outputs.push(LogicalOutput {
-                    role: output_role(declaration.class),
-                    virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
-                    object,
-                });
-            }
-            put_bundle_root(cas, &logical_outputs)?;
-            let transcript_id = put_bytes(cas, &transcript)?;
+            put_bundle_root(cas, &logical_outputs, &mut pins)?;
+            let transcript_id = put_bytes(cas, &transcript, &mut pins)?;
             let hex =
                 |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
             let snapshot = serde_json::to_vec(&serde_json::json!({
@@ -805,7 +1144,7 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())?;
             let observed = serde_json::to_vec(&serde_json::json!({
-                "kind": "rabs-live-dependency-observed-inputs-v1",
+                "kind": "rabs-live-dependency-observed-inputs-v2",
                 "externs": self.request.externs.iter()
                     .map(|(path, digest)| serde_json::json!([path, digest_key(digest)]))
                     .collect::<Vec<_>>(),
@@ -813,7 +1152,6 @@ impl LocalAttempt {
                     serde_json::json!({
                         "path": directory.path,
                         "artifacts": directory.artifacts.iter().map(|artifact| serde_json::json!([artifact.path, digest_key(&artifact.content_digest)])).collect::<Vec<_>>(),
-                        "dep_info_names": directory.dep_info_names,
                     })
                 }).collect::<Vec<_>>(),
                 "compiler": plan.compiler,
@@ -826,6 +1164,7 @@ impl LocalAttempt {
                 "stderr_bytes": report.stderr.len(),
                 "stderr": digest_key(&object_id(&report.stderr)?),
                 "stdout_bytes": report.stdout.len(),
+                "remote_delivery": remote_receipt,
             }))
             .map_err(|error| error.to_string())?;
             let provenance = serde_json::to_vec(&serde_json::json!({
@@ -838,10 +1177,10 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())?;
             let parts = [
-                put_bytes(cas, &snapshot)?,
-                put_bytes(cas, &observed)?,
-                put_bytes(cas, &process)?,
-                put_bytes(cas, &provenance)?,
+                put_bytes(cas, &snapshot, &mut pins)?,
+                put_bytes(cas, &observed, &mut pins)?,
+                put_bytes(cas, &process, &mut pins)?,
+                put_bytes(cas, &provenance, &mut pins)?,
             ];
             (transcript_id, parts)
         };
@@ -898,8 +1237,8 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())
         };
-        let manifest_id = put_bytes(cas, &manifest_bytes)?;
-        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?)?;
+        let manifest_id = put_bytes(cas, &manifest_bytes, &mut pins)?;
+        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?, &mut pins)?;
         let offer = OfferPreparedActionResult::build(
             authority,
             stamped.manifest,
@@ -915,7 +1254,31 @@ impl LocalAttempt {
             return Err("re-stamping changed the manifest bytes".into());
         }
         self.advance(AttemptState::PreparedResultOffered)?;
+        Ok(CapturedLocalResult {
+            offer,
+            transcript: transcript_id,
+            manifest_key: digest_key(&manifest_id.0),
+            known,
+            pins,
+        })
+    }
 
+    fn publish_captured(
+        &self,
+        captured: CapturedLocalResult,
+    ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
+        self.request
+            .verify_enforced_read_closure(self.remote_validation.as_ref())?;
+        let CapturedLocalResult {
+            offer,
+            transcript,
+            known,
+            // Keep the owner through commit AND transcript indexing. The
+            // publication/evidence pins are independent of these capture pins.
+            pins: _pins,
+            ..
+        } = captured;
+        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let outcome = match self
             .coord
             .commit_offer(&offer, &self.request.key.descriptor_digest)
@@ -944,15 +1307,460 @@ impl LocalAttempt {
             LIVE_TRANSCRIPT_RECEIPT,
             &digest_key(&self.key),
             0,
-            &digest_key(&transcript_id.0),
+            &digest_key(&transcript.0),
             "canonical stderr transcript of the committed live dependency result",
         );
         Ok((outcome, known))
     }
 }
 
-impl Drop for LocalAttempt {
+impl Drop for ExecutionAttempt {
     fn drop(&mut self) {
         self.settle();
+    }
+}
+
+#[cfg(test)]
+mod installed_output_tests {
+    use super::*;
+    use crate::edge::live_facts::LiveFacts;
+    use crate::janitor::store::{LiveCas, mount_and_reconcile};
+    use rabs_cas::materialization::{
+        MaterializationMode, PlannedActionOutput, materialize_action_outputs_prepared,
+    };
+    use rabs_key::live_dependency::{LiveRustcRequest, plan_dependency_action};
+
+    struct SharedDirectoryInstall {
+        _directory: tempfile::TempDir,
+        input: PathBuf,
+        dependencies: Arc<DependencyFacts>,
+        package: Arc<PackageFacts>,
+        plan: DependencyActionPlan,
+        cas: LiveCas,
+        outputs: Vec<PlannedActionOutput>,
+    }
+
+    impl SharedDirectoryInstall {
+        fn new() -> Self {
+            Self::with_generated(None)
+        }
+
+        fn with_generated(populated: Option<bool>) -> Self {
+            let directory = crate::test_util::private_tempdir();
+            let cargo = directory.path().join("cargo");
+            let package = cargo.join("registry/src/install-index/consumer-1.0.0");
+            let out = directory.path().join("target/debug/deps");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(package.join("lib.rs"), b"pub const VALUE: u32 = 17;").unwrap();
+            let generated = populated.map(|populated| {
+                let root = directory
+                    .path()
+                    .join("target/debug/build/consumer-unit/out");
+                std::fs::create_dir_all(&root).unwrap();
+                if populated {
+                    std::fs::write(root.join("value.rs"), b"pub const GENERATED: u32 = 17;")
+                        .unwrap();
+                }
+                let unit = root.parent().unwrap();
+                std::fs::write(unit.join("output"), b"cargo::rustc-cfg=generated\n").unwrap();
+                std::fs::write(unit.join("root-output"), root.to_str().unwrap()).unwrap();
+                root
+            });
+            let input = out.join("libupstream.rmeta");
+            std::fs::write(&input, b"retained upstream metadata").unwrap();
+            // Old outputs already present are excluded by the plan, just as
+            // their replacements will be after verified materialization.
+            std::fs::write(out.join("libconsumer.rmeta"), b"previous output").unwrap();
+            let argv = vec![
+                "/toolchain/bin/rustc".into(),
+                package.join("lib.rs").to_str().unwrap().into(),
+                "--crate-name=consumer".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--error-format=json".into(),
+                format!("--out-dir={}", out.display()),
+                "-L".into(),
+                format!("dependency={}", out.display()),
+                "--extern".into(),
+                format!("upstream={}", input.display()),
+            ];
+            let mut env = vec![
+                ("CARGO_HOME".into(), cargo.to_str().unwrap().into()),
+                (
+                    "CARGO_MANIFEST_DIR".into(),
+                    package.to_str().unwrap().into(),
+                ),
+                ("CARGO_PKG_NAME".into(), "consumer".into()),
+            ];
+            if let Some(root) = &generated {
+                env.push(("OUT_DIR".into(), root.to_str().unwrap().into()));
+            }
+            let plan = plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package.to_str().unwrap(),
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let facts = LiveFacts::new();
+            let dependencies = facts.dependencies(&plan).unwrap();
+            let package = facts
+                .package(&package, plan.source_kind, generated.as_deref())
+                .unwrap();
+            assert_eq!(dependencies.directories[0].artifacts.len(), 1);
+            let cas = mount_and_reconcile(&directory.path().join("cas")).unwrap();
+            let outputs = plan
+                .outputs
+                .declarations
+                .iter()
+                .map(|declaration| {
+                    let bytes = if declaration.class == OutputClass::DepInfo {
+                        b"libconsumer.rmeta: lib.rs\n".as_slice()
+                    } else {
+                        b"verified replacement metadata".as_slice()
+                    };
+                    let object = object_id(bytes).unwrap();
+                    let mut store = cas.store().lock().unwrap();
+                    put_if_absent(
+                        cas.layout(),
+                        &mut *store,
+                        &object,
+                        &mut &bytes[..],
+                        PutLimits::default(),
+                        DurabilityPolicy::FULL,
+                    )
+                    .unwrap();
+                    PlannedActionOutput {
+                        role: output_role(declaration.class),
+                        virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
+                        object,
+                        destination: out.join(&declaration.virtual_path),
+                    }
+                })
+                .collect();
+            Self {
+                _directory: directory,
+                input,
+                dependencies,
+                package,
+                plan,
+                cas,
+                outputs,
+            }
+        }
+
+        fn install(&self, during_tail: impl Fn()) -> InstallResult {
+            self.package
+                .verify_unchanged(Path::new(&self.plan.source_root))
+                .unwrap();
+            self.package.verify_generated_disjoint(&self.plan).unwrap();
+            self.dependencies.verify_unchanged().unwrap();
+            let mut store = self.cas.store().lock().unwrap();
+            let receipt = materialize_action_outputs_prepared(
+                &mut *store,
+                &self.outputs,
+                MaterializationMode::PrivateCopy,
+                std::time::SystemTime::now(),
+                &|output, _| {
+                    if output.role == OutputRole::DepInfo {
+                        // The actual materializer has installed metadata and
+                        // is still preparing dep-info. Change inputs inside
+                        // this interval without timing-dependent threads.
+                        assert_eq!(
+                            std::fs::read(self.input.with_file_name("libconsumer.rmeta")).unwrap(),
+                            b"verified replacement metadata"
+                        );
+                        during_tail();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(receipt.installed.len(), 2);
+            drop(store);
+            let installed = self
+                .outputs
+                .iter()
+                .filter(|output| output.role != OutputRole::DepInfo)
+                .map(|output| known_installed_output(&output.destination, &output.object).unwrap())
+                .collect();
+            finish_installation(
+                &self.dependencies,
+                &self.package,
+                &self.plan,
+                b"compiler transcript\n".to_vec(),
+                installed,
+            )
+        }
+    }
+
+    #[test]
+    fn materialized_owned_outputs_preserve_shared_dependency_installation() {
+        let fixture = SharedDirectoryInstall::new();
+        let InstallResult::Served {
+            transcript,
+            installed,
+        } = fixture.install(|| {})
+        else {
+            panic!("this action's own declared writes must remain servable");
+        };
+        assert_eq!(transcript, b"compiler transcript\n");
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            std::fs::read(&fixture.input).unwrap(),
+            b"retained upstream metadata"
+        );
+        assert_eq!(
+            std::fs::read(&installed[0].path).unwrap(),
+            b"verified replacement metadata"
+        );
+    }
+
+    #[test]
+    fn dependency_mutation_during_materialization_cannot_return_served() {
+        for change_existing in [true, false] {
+            let fixture = SharedDirectoryInstall::new();
+            let result = fixture.install(|| {
+                let path = if change_existing {
+                    fixture.input.clone()
+                } else {
+                    fixture.input.with_file_name("libnew_candidate.rmeta")
+                };
+                std::fs::write(path, b"dependency changed during installation").unwrap();
+            });
+            assert!(
+                matches!(result, InstallResult::Fault(ref reason)
+                    if reason.contains("dependency inputs changed during installation")),
+                "completed writes with changed inputs must fail, never decline as unwritten or serve: {result:?}"
+            );
+            // The copy completed; rejection means no transcript replay or
+            // known-output memo is returned under the stale dependency key.
+            assert!(
+                fixture
+                    .outputs
+                    .iter()
+                    .all(|output| output.destination.is_file())
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_generated_inputs_remain_servable_after_materialization() {
+        for populated in [false, true] {
+            let fixture = SharedDirectoryInstall::with_generated(Some(populated));
+            let InstallResult::Served {
+                transcript,
+                installed,
+            } = fixture.install(|| {})
+            else {
+                panic!("unchanged generated inputs must remain servable: {populated}");
+            };
+            assert_eq!(transcript, b"compiler transcript\n");
+            assert_eq!(installed.len(), 1);
+            assert_eq!(
+                fixture.package.generated_files.len(),
+                usize::from(populated)
+            );
+        }
+    }
+
+    fn assert_package_installation_fault(fixture: &SharedDirectoryInstall, result: InstallResult) {
+        assert!(
+            matches!(result, InstallResult::Fault(ref reason)
+                if reason.starts_with("package inputs changed during installation:")),
+            "changed package inputs cannot return a transcript or known-output memo: {result:?}"
+        );
+        // The synchronous materializer completed. Neither rollback nor an
+        // unwritten-decline claim is permitted after this frontier.
+        assert!(
+            fixture
+                .outputs
+                .iter()
+                .all(|output| output.destination.is_file())
+        );
+        assert_eq!(
+            std::fs::read(fixture.input.with_file_name("libconsumer.rmeta")).unwrap(),
+            b"verified replacement metadata",
+        );
+        // Isolate the missing package fence: the existing dependency-only
+        // completion gate still accepts these same dependency observations.
+        fixture.dependencies.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn package_mutation_during_materialization_cannot_return_served() {
+        for mutation in ["rewrite", "added", "removed", "same-bytes-replaced"] {
+            let fixture = SharedDirectoryInstall::new();
+            let source = Path::new(&fixture.plan.source_root);
+            let result = fixture.install(|| match mutation {
+                "rewrite" => {
+                    std::fs::write(source.join("lib.rs"), b"pub const VALUE: u32 = 99;").unwrap();
+                }
+                "added" => {
+                    std::fs::write(source.join("introduced.rs"), b"new input").unwrap();
+                }
+                "removed" => {
+                    std::fs::rename(
+                        source.join("lib.rs"),
+                        fixture._directory.path().join("retained-source"),
+                    )
+                    .unwrap();
+                }
+                "same-bytes-replaced" => {
+                    let replacement = fixture._directory.path().join("replacement-source");
+                    std::fs::write(&replacement, std::fs::read(source.join("lib.rs")).unwrap())
+                        .unwrap();
+                    std::fs::rename(
+                        source.join("lib.rs"),
+                        fixture._directory.path().join("old-source"),
+                    )
+                    .unwrap();
+                    std::fs::rename(replacement, source.join("lib.rs")).unwrap();
+                }
+                _ => unreachable!(),
+            });
+            assert_package_installation_fault(&fixture, result);
+        }
+    }
+
+    #[test]
+    fn generated_inputs_and_cargo_records_changed_during_installation_cannot_return_served() {
+        for mutation in ["generated", "added", "removed", "stdout", "root-output"] {
+            let fixture = SharedDirectoryInstall::with_generated(Some(mutation != "added"));
+            let generated = Path::new(fixture.plan.generated_root.as_ref().unwrap());
+            let result = fixture.install(|| match mutation {
+                "generated" => {
+                    std::fs::write(generated.join("value.rs"), b"changed generated input").unwrap();
+                }
+                "added" => {
+                    std::fs::write(generated.join("introduced.rs"), b"formerly absent input")
+                        .unwrap();
+                }
+                "removed" => {
+                    std::fs::rename(
+                        generated.join("value.rs"),
+                        fixture._directory.path().join("retained-generated-input"),
+                    )
+                    .unwrap();
+                }
+                "stdout" => {
+                    std::fs::write(
+                        generated.parent().unwrap().join("output"),
+                        b"cargo::rustc-cfg=changed\n",
+                    )
+                    .unwrap();
+                }
+                "root-output" => {
+                    std::fs::write(
+                        generated.parent().unwrap().join("root-output"),
+                        b"/another/generated/root",
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            });
+            assert_package_installation_fault(&fixture, result);
+        }
+    }
+
+    #[test]
+    fn installed_output_digest_and_signature_describe_the_same_bytes() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        for bytes in [b"".as_slice(), b"compiler output\0\xff\n".as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            let expected = object_id(bytes).unwrap();
+            let known = known_installed_output(&path, &expected).unwrap();
+            assert_eq!(known.path, path);
+            assert_eq!(known.digest, expected);
+            assert_eq!(
+                known.sig,
+                FileSig::of(&std::fs::symlink_metadata(&path).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_after_materialization_cannot_seed_the_old_digest() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = object_id(b"original").unwrap();
+        // Same length, different inode/bytes after materialization returned.
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"replaced").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        assert!(known_installed_output(&path, &object_id(b"replaced").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn in_place_write_after_materialization_cannot_seed_the_old_digest() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rmeta");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = object_id(b"original").unwrap();
+        std::fs::write(&path, b"mutated!").unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        let actual = object_id(b"mutated!").unwrap();
+        assert_eq!(
+            known_installed_output(&path, &actual).unwrap().digest,
+            actual
+        );
+    }
+
+    #[test]
+    fn vanished_and_non_regular_outputs_refuse_instead_of_becoming_served() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        std::fs::write(&path, b"output").unwrap();
+        let expected = object_id(b"output").unwrap();
+        let retained = dir.path().join("retained-output");
+        std::fs::rename(&path, &retained).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        std::fs::create_dir(&path).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("linked-output");
+            std::os::unix::fs::symlink(&retained, &alias).unwrap();
+            assert!(known_installed_output(&alias, &expected).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_surface_leak_scanner_refuses_residual_staging_roots() {
+        let out_dir = "/tmp/agent-a/target/debug/deps";
+        let dep_dirs = vec![
+            out_dir.to_owned(),
+            "/tmp/agent-a/target/debug/build/pkg/out".to_owned(),
+        ];
+        assert!(
+            verify_canonical_surface_free_of_roots(
+                rabs_sandbox::leak_scanner::Surface::DepInfo,
+                b"/__rabs/out/libfoo.d: /__rabs/pkg/src/lib.rs\n",
+                out_dir,
+                &dep_dirs,
+            )
+            .is_ok()
+        );
+        let leaked_out = verify_canonical_surface_free_of_roots(
+            rabs_sandbox::leak_scanner::Surface::DepInfo,
+            b"/tmp/agent-a/target/debug/deps/libfoo.d: /__rabs/pkg/src/lib.rs\n",
+            out_dir,
+            &dep_dirs,
+        );
+        assert!(leaked_out.is_err());
+        let leaked_dep = verify_canonical_surface_free_of_roots(
+            rabs_sandbox::leak_scanner::Surface::CompilerEvents,
+            b"note: searched /tmp/agent-a/target/debug/build/pkg/out\n",
+            out_dir,
+            &dep_dirs,
+        );
+        assert!(leaked_dep.is_err());
     }
 }

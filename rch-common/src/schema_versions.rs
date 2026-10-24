@@ -76,8 +76,10 @@ pub enum SchemaComponent {
 #[must_use]
 pub const fn current_version(component: SchemaComponent) -> &'static str {
     match component {
-        SchemaComponent::DoctorReliability => "1.0.0",
-        SchemaComponent::Status => "1.0.0",
+        // Issue #118 adds fenced admission ownership/recovery evidence to
+        // both envelopes and the admission_closed status posture.
+        SchemaComponent::DoctorReliability => "1.1.0",
+        SchemaComponent::Status => "1.1.0",
         SchemaComponent::RepoUpdaterContract => "1.0.0",
         SchemaComponent::ProcessTriageContract => "1.0.0",
         SchemaComponent::IncidentLedger => "1.0.0",
@@ -161,8 +163,8 @@ mod tests {
     /// both content AND order, so a refactor that reshuffles the constant
     /// surfaces immediately.
     const PINNED_SNAPSHOT: &[(SchemaComponent, &str)] = &[
-        (SchemaComponent::DoctorReliability, "1.0.0"),
-        (SchemaComponent::Status, "1.0.0"),
+        (SchemaComponent::DoctorReliability, "1.1.0"),
+        (SchemaComponent::Status, "1.1.0"),
         (SchemaComponent::RepoUpdaterContract, "1.0.0"),
         (SchemaComponent::ProcessTriageContract, "1.0.0"),
         (SchemaComponent::IncidentLedger, "1.0.0"),

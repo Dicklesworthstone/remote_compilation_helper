@@ -25,9 +25,42 @@ fn test_config_override() -> &'static Mutex<Option<RchConfig>> {
     OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
+/// Serializes tests that set the override. The override is process-global, so
+/// a parallel test's set or reset landed between another test's set and its
+/// read (doctor and status_display socket-path tests flaked in full suites).
+#[cfg(test)]
+fn test_config_override_owner() -> &'static Mutex<()> {
+    static OWNER: Mutex<()> = Mutex::new(());
+    &OWNER
+}
+
+#[cfg(test)]
+thread_local! {
+    static HELD_OVERRIDE: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Setting `Some` makes this thread the override's owner until it sets `None`
+/// or exits; other setters wait. Readers are unchanged.
 #[cfg(test)]
 pub fn set_test_config_override(config: Option<RchConfig>) {
-    *test_config_override().lock().unwrap() = config;
+    HELD_OVERRIDE.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            *held = Some(
+                test_config_override_owner()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+        let release = config.is_none();
+        *test_config_override()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        if release {
+            *held = None;
+        }
+    });
 }
 
 /// Get the user config directory.
@@ -115,12 +148,17 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 //
 // Runtime env and CLI overrides are intentionally applied after cache read.
 // They are not represented in the cache key and must never be memoized.
+//
+// Environment-derived defaults are not memoized either. The built-in
+// `general.socket_path` depends on the process environment
+// (`XDG_RUNTIME_DIR`, then the user cache dir), so the cache records whether
+// that value came from the default and a reader recomputes it (#69).
 
 /// Bumped manually whenever RchConfig (or any nested type) changes shape.
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 3;
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -138,7 +176,44 @@ struct CachedConfig {
     /// Absent source files record zero metadata so a later-appearing file
     /// invalidates the cache.
     source_fingerprints: Vec<SourceFingerprint>,
+    /// No config source set `general.socket_path`: the cached value is the
+    /// built-in default as the writing process computed it. A daemon started
+    /// by `systemd --user` (with `XDG_RUNTIME_DIR`) and an agent shell without
+    /// it resolve different defaults, so the reader recomputes the default
+    /// instead of dialling the writer's socket (#69).
+    socket_path_from_default: bool,
     config: RchConfig,
+}
+
+impl CachedConfig {
+    /// The cached on-disk merge as this process must see it: identical to a
+    /// fresh parse, including environment-derived defaults.
+    fn into_config(self) -> RchConfig {
+        let mut config = self.config;
+        if self.socket_path_from_default {
+            config.general.socket_path = rch_common::default_socket_path();
+        }
+        config
+    }
+}
+
+/// Whether any of these config files sets `general.socket_path`.
+///
+/// Only consulted on a cache miss. A source that cannot be read or parsed
+/// counts as setting it, so the cache keeps the parsed value unchanged.
+fn sources_set_socket_path(paths: &[PathBuf]) -> bool {
+    paths.iter().filter(|path| path.exists()).any(|path| {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return true;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+            return true;
+        };
+        value
+            .get("general")
+            .and_then(|general| general.get("socket_path"))
+            .is_some()
+    })
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -286,13 +361,17 @@ fn try_read_cache() -> Option<RchConfig> {
         bytes = bytes.len(),
         "config.cache.hit",
     );
-    Some(cached.config)
+    Some(cached.into_config())
 }
 
 /// Atomically write the cache via temp+rename so concurrent hooks
 /// never read a torn file. Best-effort: failures are logged and
 /// ignored (the cache is an optimization, never load-bearing).
-fn try_write_cache(config: &RchConfig, source_fingerprints: Vec<SourceFingerprint>) {
+fn try_write_cache(
+    config: &RchConfig,
+    source_fingerprints: Vec<SourceFingerprint>,
+    socket_path_from_default: bool,
+) {
     let Some(path) = cache_file_path() else {
         return;
     };
@@ -310,6 +389,7 @@ fn try_write_cache(config: &RchConfig, source_fingerprints: Vec<SourceFingerprin
     let payload = CachedConfig {
         schema_version: CACHE_SCHEMA_VERSION,
         source_fingerprints,
+        socket_path_from_default,
         config: config.clone(),
     };
     let bytes = match serde_json::to_vec(&payload) {
@@ -407,7 +487,11 @@ fn load_config_uncached_from_paths(
 /// top per invocation.
 pub fn load_config() -> Result<RchConfig> {
     #[cfg(test)]
-    if let Some(config) = test_config_override().lock().unwrap().clone() {
+    if let Some(config) = test_config_override()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         return Ok(config);
     }
 
@@ -420,9 +504,10 @@ pub fn load_config() -> Result<RchConfig> {
     } else {
         let before = current_source_fingerprints();
         let parsed = load_config_uncached()?;
+        let socket_path_from_default = !sources_set_socket_path(&resolved_source_paths());
         let after = current_source_fingerprints();
         if let Some(source_fingerprints) = stable_source_fingerprints(before, after) {
-            try_write_cache(&parsed, source_fingerprints);
+            try_write_cache(&parsed, source_fingerprints, socket_path_from_default);
         } else {
             tracing::debug!(
                 target: "rch::hook::config_cache",
@@ -685,6 +770,7 @@ struct PartialLayer0Config {
     enabled: Option<bool>,
     release_lto_thin: Option<bool>,
     release_codegen_units_1: Option<bool>,
+    debug_line_tables_only: Option<bool>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct PartialGeneralConfig {
@@ -713,6 +799,7 @@ struct PartialCompilationConfig {
     confidence_threshold: Option<f64>,
     min_local_time_ms: Option<u64>,
     remote_speedup_threshold: Option<f64>,
+    local_slots: Option<u32>,
     build_slots: Option<u32>,
     test_slots: Option<u32>,
     check_slots: Option<u32>,
@@ -727,8 +814,11 @@ struct PartialCompilationConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialTransferConfig {
+    retrieval_staging_dir: Option<PathBuf>,
+    retrieval_min_free_bytes: Option<u64>,
     compression_level: Option<u32>,
     exclude_patterns: Option<Vec<String>>,
+    exclude_defaults_acknowledged: Option<Vec<String>>,
     remote_base: Option<String>,
     sync_timeout_ms: Option<u64>,
     source_sync_silence_timeout_secs: Option<u64>,
@@ -753,6 +843,7 @@ struct PartialTransferConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialEnvironmentConfig {
     allowlist: Option<Vec<String>>,
+    forward_cargo_profile_settings: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1026,6 +1117,14 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
 
     if let Err(e) = validate_remote_base(&config.transfer.remote_base) {
         validation.error(format!("transfer.remote_base invalid: {}", e));
+    }
+    if config
+        .transfer
+        .retrieval_staging_dir
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        validation.error("transfer.retrieval_staging_dir must be absolute".to_string());
     }
     if let Some(sync_timeout_ms) = config.transfer.sync_timeout_ms
         && !TransferConfig::valid_sync_timeout_ms(sync_timeout_ms)
@@ -1345,6 +1444,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.confidence_threshold",
         "compilation.min_local_time_ms",
         "compilation.remote_speedup_threshold",
+        "compilation.local_slots",
         "compilation.build_slots",
         "compilation.test_slots",
         "compilation.check_slots",
@@ -1359,10 +1459,12 @@ fn default_sources_map() -> ConfigSourceMap {
         "selection.weights.disk",
         "transfer.compression_level",
         "transfer.exclude_patterns",
+        "transfer.exclude_defaults_acknowledged",
         "transfer.sync_timeout_ms",
         "transfer.source_sync_silence_timeout_secs",
         "transfer.rsync_bin",
         "environment.allowlist",
+        "environment.forward_cargo_profile_settings",
         "circuit.failure_threshold",
         "circuit.success_threshold",
         "circuit.error_rate_threshold",
@@ -1437,6 +1539,10 @@ fn apply_layer(
             source.clone(),
         );
     }
+    if let Some(local_slots) = layer.compilation.local_slots {
+        config.compilation.local_slots = local_slots;
+        set_source(sources, "compilation.local_slots", source.clone());
+    }
     if let Some(build_slots) = layer.compilation.build_slots {
         config.compilation.build_slots = build_slots;
         set_source(sources, "compilation.build_slots", source.clone());
@@ -1499,6 +1605,14 @@ fn apply_layer(
         config.transfer.exclude_patterns = patterns.clone();
         set_source(sources, "transfer.exclude_patterns", source.clone());
     }
+    if let Some(acknowledged) = layer.transfer.exclude_defaults_acknowledged.as_ref() {
+        config.transfer.exclude_defaults_acknowledged = acknowledged.clone();
+        set_source(
+            sources,
+            "transfer.exclude_defaults_acknowledged",
+            source.clone(),
+        );
+    }
     if let Some(remote_base) = layer.transfer.remote_base.as_ref() {
         // Validate and normalize the remote_base path
         match validate_remote_base(remote_base) {
@@ -1549,6 +1663,14 @@ fn apply_layer(
         config.transfer.ssh_control_persist_secs = Some(persist);
         set_source(sources, "transfer.ssh_control_persist_secs", source.clone());
     }
+    if let Some(path) = &layer.transfer.retrieval_staging_dir {
+        config.transfer.retrieval_staging_dir = Some(path.clone());
+        set_source(sources, "transfer.retrieval_staging_dir", source.clone());
+    }
+    if let Some(bytes) = layer.transfer.retrieval_min_free_bytes {
+        config.transfer.retrieval_min_free_bytes = bytes;
+        set_source(sources, "transfer.retrieval_min_free_bytes", source.clone());
+    }
     // Transfer optimization (bd-3hho)
     if let Some(max_mb) = layer.transfer.max_transfer_mb {
         config.transfer.max_transfer_mb = Some(max_mb);
@@ -1598,6 +1720,14 @@ fn apply_layer(
     if let Some(allowlist) = layer.environment.allowlist.as_ref() {
         config.environment.allowlist = allowlist.clone();
         set_source(sources, "environment.allowlist", source.clone());
+    }
+    if let Some(enabled) = layer.environment.forward_cargo_profile_settings {
+        config.environment.forward_cargo_profile_settings = enabled;
+        set_source(
+            sources,
+            "environment.forward_cargo_profile_settings",
+            source.clone(),
+        );
     }
 
     if let Some(failure_threshold) = layer.circuit.failure_threshold {
@@ -1730,6 +1860,10 @@ fn apply_layer(
         config.layer0.release_codegen_units_1 = cgu_1;
         set_source(sources, "layer0.release_codegen_units_1", source.clone());
     }
+    if let Some(line_tables) = layer.layer0.debug_line_tables_only {
+        config.layer0.debug_line_tables_only = line_tables;
+        set_source(sources, "layer0.debug_line_tables_only", source.clone());
+    }
 }
 
 fn set_source(sources: &mut ConfigSourceMap, key: &str, source: ConfigValueSource) {
@@ -1825,6 +1959,11 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
             .release_codegen_units_1
             .clone_from(&overlay.layer0.release_codegen_units_1);
     }
+    if overlay.layer0.debug_line_tables_only != default.layer0.debug_line_tables_only {
+        base.layer0
+            .debug_line_tables_only
+            .clone_from(&overlay.layer0.debug_line_tables_only);
+    }
 
     base
 }
@@ -1871,6 +2010,9 @@ fn merge_compilation(
     }
     if (overlay.remote_speedup_threshold - default.remote_speedup_threshold).abs() > EPSILON {
         base.remote_speedup_threshold = overlay.remote_speedup_threshold;
+    }
+    if overlay.local_slots != default.local_slots {
+        base.local_slots = overlay.local_slots;
     }
     if overlay.build_slots != default.build_slots {
         base.build_slots = overlay.build_slots;
@@ -1953,6 +2095,13 @@ fn merge_transfer(
     }
     if overlay.max_transfer_time_ms != default.max_transfer_time_ms {
         base.max_transfer_time_ms = overlay.max_transfer_time_ms;
+    }
+    if overlay.retrieval_staging_dir != default.retrieval_staging_dir {
+        base.retrieval_staging_dir
+            .clone_from(&overlay.retrieval_staging_dir);
+    }
+    if overlay.retrieval_min_free_bytes != default.retrieval_min_free_bytes {
+        base.retrieval_min_free_bytes = overlay.retrieval_min_free_bytes;
     }
     if overlay.bwlimit_kbps != default.bwlimit_kbps {
         base.bwlimit_kbps = overlay.bwlimit_kbps;
@@ -2122,6 +2271,23 @@ pub fn set_first_run_complete(value: bool) -> Result<()> {
     Ok(())
 }
 
+/// The alias for an ad-hoc `RCH_CANONICAL_PROJECT_ROOT` without an explicit
+/// `RCH_ALIAS_PROJECT_ROOT`: a sibling `<canonical>.rch-alias`, which worker
+/// topology setup creates next to the scratch root (bd-xz7at). `None` when the
+/// override is empty, `/`, or names the canonical root already in effect,
+/// which keeps its configured alias.
+fn derived_scratch_alias_root(
+    canonical_env: Option<&str>,
+    canonical_before: &Path,
+) -> Option<String> {
+    let canonical = shellexpand::tilde(canonical_env?.trim()).into_owned();
+    let canonical = canonical.trim_end_matches('/');
+    if canonical.is_empty() || Path::new(canonical) == canonical_before {
+        return None;
+    }
+    Some(format!("{canonical}.rch-alias"))
+}
+
 fn apply_env_overrides_inner(
     config: &mut RchConfig,
     mut sources: Option<&mut ConfigSourceMap>,
@@ -2264,6 +2430,18 @@ fn apply_env_overrides_inner(
                 sources,
                 "compilation.remote_speedup_threshold",
                 ConfigValueSource::EnvVar("RCH_REMOTE_SPEEDUP_THRESHOLD".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_LOCAL_SLOTS")
+        && let Ok(slots) = val.parse()
+    {
+        config.compilation.local_slots = slots;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.local_slots",
+                ConfigValueSource::EnvVar("RCH_LOCAL_SLOTS".to_string()),
             );
         }
     }
@@ -2441,6 +2619,19 @@ fn apply_env_overrides_inner(
         }
     }
 
+    if let Some(val) = get_env("RCH_FORWARD_CARGO_PROFILE_SETTINGS")
+        && let Some(enabled) = parse_bool(&val)
+    {
+        config.environment.forward_cargo_profile_settings = enabled;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "environment.forward_cargo_profile_settings",
+                ConfigValueSource::EnvVar("RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_string()),
+            );
+        }
+    }
+
     let mut visibility_override: Option<(OutputVisibility, String)> = None;
 
     if let Some(val) = get_env("RCH_QUIET")
@@ -2552,6 +2743,11 @@ fn apply_env_overrides_inner(
     }
 
     // Path topology overrides
+    let canonical_before_env = config
+        .path_topology
+        .to_policy()
+        .canonical_root()
+        .to_path_buf();
     if let Some(val) = get_env("RCH_CANONICAL_PROJECT_ROOT") {
         config.path_topology.canonical_root = Some(val);
         if let Some(ref mut sources) = sources {
@@ -2569,6 +2765,22 @@ fn apply_env_overrides_inner(
                 sources,
                 "path_topology.alias_root",
                 ConfigValueSource::EnvVar("RCH_ALIAS_PROJECT_ROOT".to_string()),
+            );
+        }
+    } else if let Some(alias) = derived_scratch_alias_root(
+        get_env("RCH_CANONICAL_PROJECT_ROOT").as_deref(),
+        &canonical_before_env,
+    ) {
+        // bd-xz7at: worker topology setup makes the alias point at the
+        // canonical root. Keeping `/dp` (already -> /data/projects on workers)
+        // for a scratch canonical root claimed `/dp`, i.e. all of
+        // /data/projects, and was refused as an overlapping source owner.
+        config.path_topology.alias_root = Some(alias);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "path_topology.alias_root",
+                ConfigValueSource::EnvVar("RCH_CANONICAL_PROJECT_ROOT".to_string()),
             );
         }
     }
@@ -3580,6 +3792,47 @@ identity_file = "/tmp/id_ed25519"
         info!("PASS: Default source detected for general.enabled");
     }
 
+    /// bd-rqjaj: a user layer's acknowledged omissions survive a project layer
+    /// that replaces only the exclude list, and are attributed to the user file.
+    #[test]
+    fn exclude_defaults_acknowledged_layers_independently_of_the_exclude_list() {
+        let _guard = test_guard!();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(
+            &user_path,
+            "[transfer]\nexclude_patterns = [\"target/\"]\n\
+             exclude_defaults_acknowledged = [\"*.pem\", \"*.key\"]\n",
+        )
+        .expect("write user config");
+        std::fs::write(
+            &project_path,
+            "[transfer]\nexclude_patterns = [\"target/\", \".env\"]\n",
+        )
+        .expect("write project config");
+        let env_overrides: HashMap<String, String> = HashMap::new();
+
+        let loaded = load_config_with_sources_from_paths(
+            Some(&user_path),
+            Some(&project_path),
+            Some(&env_overrides),
+        )
+        .expect("layered config loads");
+
+        let transfer = &loaded.config.transfer;
+        assert_eq!(transfer.exclude_patterns, ["target/", ".env"]);
+        assert_eq!(transfer.exclude_defaults_acknowledged, ["*.pem", "*.key"]);
+        let omitted = transfer.unacknowledged_omitted_default_excludes();
+        assert!(omitted.iter().any(|pattern| pattern == ".ntm/"));
+        assert!(!omitted.iter().any(|pattern| pattern == ".env"));
+        assert!(!omitted.iter().any(|pattern| pattern == "*.pem"));
+        assert_eq!(
+            loaded.sources.get("transfer.exclude_defaults_acknowledged"),
+            Some(&ConfigValueSource::UserConfig(user_path.clone()))
+        );
+    }
+
     #[test]
     fn test_source_tracking_user_file() {
         let _guard = test_guard!();
@@ -4051,6 +4304,34 @@ max_concurrent_workers = 3
     }
 
     #[test]
+    fn clean_overlay_retrieval_config_layering_and_roundtrip() {
+        let _guard = test_guard!();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(path.path(), "[transfer]\nretrieval_staging_dir = '/mnt/retrieval'\nretrieval_min_free_bytes = 67108864\nmax_transfer_time_ms = 900000\n").unwrap();
+        let config = load_config_uncached_from_paths(Some(path.path()), None).unwrap();
+        assert_eq!(
+            config.transfer.retrieval_staging_dir,
+            Some(PathBuf::from("/mnt/retrieval"))
+        );
+        assert_eq!(config.transfer.retrieval_min_free_bytes, 67108864);
+        assert_eq!(config.transfer.max_transfer_time_ms, Some(900000));
+        let roundtrip: RchConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.transfer.retrieval_staging_dir,
+            config.transfer.retrieval_staging_dir
+        );
+        let old: TransferConfig = toml::from_str("").unwrap();
+        assert!(old.retrieval_staging_dir.is_none());
+        assert_eq!(old.retrieval_min_free_bytes, 0);
+        std::fs::write(
+            path.path(),
+            "[transfer]\nretrieval_staging_dir = 'relative'\n",
+        )
+        .unwrap();
+        assert!(!validate_rch_config_file(path.path()).errors.is_empty());
+    }
+
+    #[test]
     fn test_merge_transfer_remote_base() {
         let _guard = test_guard!();
         info!("TEST: test_merge_transfer_remote_base");
@@ -4260,6 +4541,40 @@ alias_root = "/home/alex/dp"
         );
     }
 
+    /// The `[layer0]` knobs, including bd-hoxgn's `debug_line_tables_only`,
+    /// load from TOML with their sources tracked, and the project layer can
+    /// turn one off again.
+    #[test]
+    fn test_layer0_section_loaded_from_toml() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            "[layer0]\nenabled = true\ndebug_line_tables_only = true\n",
+        )
+        .expect("write user config");
+
+        let loaded = load_config_with_sources_from_paths(Some(&user_path), None, None)
+            .expect("load_config_with_sources_from_paths");
+        assert!(loaded.config.layer0.enabled);
+        assert!(loaded.config.layer0.debug_line_tables_only);
+        assert!(!loaded.config.layer0.release_lto_thin);
+        assert!(matches!(
+            loaded.sources.get("layer0.debug_line_tables_only"),
+            Some(ConfigValueSource::UserConfig(_))
+        ));
+
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(&project_path, "[layer0]\ndebug_line_tables_only = false\n")
+            .expect("write project config");
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), None)
+                .expect("load_config_with_sources_from_paths");
+        assert!(loaded.config.layer0.enabled);
+        assert!(!loaded.config.layer0.debug_line_tables_only);
+    }
+
     /// Regression test for issue #10: env vars must override TOML values.
     /// This was already true at runtime, but the missing PartialRchConfig
     /// field meant the underlying merge order was untested.
@@ -4298,6 +4613,70 @@ canonical_root = "/from/toml"
         assert_eq!(
             source,
             &ConfigValueSource::EnvVar("RCH_CANONICAL_PROJECT_ROOT".to_string())
+        );
+    }
+
+    #[test]
+    fn scratch_canonical_root_gets_its_own_alias_unless_one_is_given() {
+        // bd-xz7at: keeping `/dp` for a scratch canonical root claimed all of
+        // /data/projects on workers and was refused as an overlapping owner.
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            "[path_topology]\ncanonical_root = \"/data/projects\"\nalias_root = \"/dp\"\n",
+        )
+        .expect("write user config");
+        let load = |pairs: &[(&str, &str)]| {
+            let env: HashMap<String, String> = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&env)).expect("load")
+        };
+        let scratch = load(&[("RCH_CANONICAL_PROJECT_ROOT", "/data/tmp/je-flc-test/")]);
+        assert_eq!(
+            scratch.config.path_topology.alias_root.as_deref(),
+            Some("/data/tmp/je-flc-test.rch-alias")
+        );
+        assert_eq!(
+            scratch.sources.get("path_topology.alias_root"),
+            Some(&ConfigValueSource::EnvVar(
+                "RCH_CANONICAL_PROJECT_ROOT".to_string()
+            ))
+        );
+        let explicit = load(&[
+            ("RCH_CANONICAL_PROJECT_ROOT", "/data/tmp/je-flc-test"),
+            ("RCH_ALIAS_PROJECT_ROOT", "/data/tmp/my-alias"),
+        ]);
+        assert_eq!(
+            explicit.config.path_topology.alias_root.as_deref(),
+            Some("/data/tmp/my-alias")
+        );
+        // Naming the canonical root already in effect keeps its alias.
+        let same = load(&[("RCH_CANONICAL_PROJECT_ROOT", "/data/projects")]);
+        assert_eq!(same.config.path_topology.alias_root.as_deref(), Some("/dp"));
+        let unset = load(&[]);
+        assert_eq!(
+            unset.config.path_topology.alias_root.as_deref(),
+            Some("/dp")
+        );
+    }
+
+    #[test]
+    fn derived_scratch_alias_ignores_empty_root_and_unchanged_overrides() {
+        let current = Path::new("/data/projects");
+        assert_eq!(derived_scratch_alias_root(None, current), None);
+        assert_eq!(derived_scratch_alias_root(Some(""), current), None);
+        assert_eq!(derived_scratch_alias_root(Some("/"), current), None);
+        assert_eq!(
+            derived_scratch_alias_root(Some("/data/projects/"), current),
+            None
+        );
+        assert_eq!(
+            derived_scratch_alias_root(Some(" /tmp/scratch-root "), current).as_deref(),
+            Some("/tmp/scratch-root.rch-alias")
         );
     }
 
@@ -4590,6 +4969,75 @@ check_interval_secs = 70
             &ConfigValueSource::EnvVar("RCH_ENV_ALLOWLIST".to_string())
         );
         info!("PASS: RCH_ENV_ALLOWLIST override applied with source tracking");
+    }
+
+    #[test]
+    fn cargo_profile_forwarding_config_defaults_layers_and_environment_precedence() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let user = dir.join("user.toml");
+        let project = dir.join("project.toml");
+        let key = "environment.forward_cargo_profile_settings";
+        let mut environment = HashMap::new();
+        std::fs::write(
+            &user,
+            "[environment]\nallowlist = ['TMPDIR', 'CARGO_TARGET_DIR', 'RUSTUP_TOOLCHAIN']\n",
+        )
+        .unwrap();
+        let original =
+            load_config_with_sources_from_paths(Some(&user), None, Some(&environment)).unwrap();
+        assert!(original.config.environment.forward_cargo_profile_settings);
+        assert_eq!(original.sources.get(key), Some(&ConfigValueSource::Default));
+        std::fs::write(
+            &user,
+            "[environment]\nforward_cargo_profile_settings = false\n",
+        )
+        .unwrap();
+        std::fs::write(&project, "[environment]\nallowlist = ['TMPDIR']\n").unwrap();
+        let layered =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(!layered.config.environment.forward_cargo_profile_settings);
+        assert_eq!(layered.config.environment.allowlist, vec!["TMPDIR"]);
+        std::fs::write(
+            &project,
+            "[environment]\nforward_cargo_profile_settings = true\nallowlist = ['TMPDIR']\n",
+        )
+        .unwrap();
+        let project_enabled =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(
+            project_enabled
+                .config
+                .environment
+                .forward_cargo_profile_settings
+        );
+        environment.insert(
+            "RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_owned(),
+            "false".to_owned(),
+        );
+        let disabled =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(!disabled.config.environment.forward_cargo_profile_settings);
+        assert_eq!(
+            disabled.sources.get(key),
+            Some(&ConfigValueSource::EnvVar(
+                "RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_owned()
+            ))
+        );
+        environment.insert(
+            "RCH_FORWARD_CARGO_PROFILE_SETTINGS".to_owned(),
+            "maybe".to_owned(),
+        );
+        let invalid =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(invalid.config.environment.forward_cargo_profile_settings);
+        let roundtrip: RchConfig =
+            toml::from_str(&toml::to_string(&disabled.config).unwrap()).unwrap();
+        assert!(!roundtrip.environment.forward_cargo_profile_settings);
     }
 
     #[test]
@@ -5931,6 +6379,7 @@ confidence_threshold = 0.80
         // serde will fail this test.
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
+            socket_path_from_default: false,
             source_fingerprints: vec![
                 SourceFingerprint {
                     path: PathBuf::from("/x/a.toml"),
@@ -5959,6 +6408,7 @@ confidence_threshold = 0.80
         let cache_path = dir.path().join("config.cache.json");
         let mut payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION.wrapping_add(1),
+            socket_path_from_default: false,
             source_fingerprints: vec![],
             config: RchConfig::default(),
         };
@@ -6147,6 +6597,7 @@ confidence_threshold = 0.80
         // being removed and pulling massive defaults into the cache file.
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
+            socket_path_from_default: false,
             source_fingerprints: vec![],
             config: RchConfig::default(),
         };
@@ -6169,6 +6620,7 @@ confidence_threshold = 0.80
         let cached_base = RchConfig::default();
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
+            socket_path_from_default: false,
             source_fingerprints: vec![],
             config: cached_base.clone(),
         };
@@ -6188,6 +6640,65 @@ confidence_threshold = 0.80
             runtime_config.general.log_level, "error",
             "runtime env override should still apply after cache lookup"
         );
+    }
+
+    /// #69: a cache written by a process with another environment (say the
+    /// `systemd --user` daemon's, with `XDG_RUNTIME_DIR`) must not hand that
+    /// environment's default socket to this process. A default-derived socket
+    /// is recomputed on read; a configured one is returned as written.
+    #[test]
+    fn cached_default_socket_is_recomputed_for_this_environment() {
+        let mut written = RchConfig::default();
+        written.general.socket_path = "/run/user/4242/another-environment.sock".to_string();
+        written.general.log_level = "debug".to_string();
+        let cached = |socket_path_from_default| CachedConfig {
+            schema_version: CACHE_SCHEMA_VERSION,
+            source_fingerprints: vec![],
+            socket_path_from_default,
+            config: written.clone(),
+        };
+        let roundtrip = |payload: CachedConfig| -> CachedConfig {
+            serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap()
+        };
+
+        let from_default = roundtrip(cached(true)).into_config();
+        assert_eq!(
+            from_default.general.socket_path,
+            rch_common::default_socket_path()
+        );
+        assert_eq!(from_default.general.log_level, "debug");
+
+        let configured = roundtrip(cached(false)).into_config();
+        assert_eq!(
+            configured.general.socket_path,
+            "/run/user/4242/another-environment.sock"
+        );
+    }
+
+    /// #69: only a source that actually sets `general.socket_path` pins it.
+    #[test]
+    fn socket_path_provenance_reads_the_config_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let unrelated = dir.path().join("unrelated.toml");
+        std::fs::write(
+            &unrelated,
+            "[general]\nlog_level = \"debug\"\n\n[transfer]\nsocket_path = \"/not/general\"\n",
+        )
+        .unwrap();
+        let pinned = dir.path().join("pinned.toml");
+        std::fs::write(&pinned, "[general]\nsocket_path = \"/srv/rch.sock\"\n").unwrap();
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "[general\nsocket_path = ").unwrap();
+
+        assert!(!super::sources_set_socket_path(&[]));
+        assert!(!super::sources_set_socket_path(&[
+            missing.clone(),
+            unrelated.clone()
+        ]));
+        assert!(super::sources_set_socket_path(&[unrelated.clone(), pinned]));
+        // Unparsable: keep the parsed value rather than guess a default.
+        assert!(super::sources_set_socket_path(&[missing, broken]));
     }
 
     fn write_project_config(dir: &Path) -> PathBuf {

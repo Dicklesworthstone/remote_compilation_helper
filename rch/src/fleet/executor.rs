@@ -25,7 +25,7 @@ use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
 use rch_common::capability_probe::{
     CapabilityRequirement, CapabilityVerdict, NamedToolProbe, ProbeSpec, assess_admissibility,
-    build_capability_probe_script, parse_capability_probe, remote_worker_binary_path,
+    build_capability_probe_script, parse_capability_probe,
 };
 use rch_common::disk_pressure_report::{
     DiskRootKind, PressureLevel, PressureThresholds, assess_root,
@@ -425,6 +425,25 @@ impl FleetExecutor {
                     return (idx, worker_id, false, DeploymentStatus::Failed);
                 }
 
+                // Guard against clobbering a worker's good binary with one built
+                // for the wrong OS/arch (e.g. pushing a macOS binary onto a
+                // linux/amd64 worker => `Exec format error`). Runs before the
+                // backup and SCP so a mismatch never touches the worker. A proven
+                // mismatch is a skip, not a failure: this controller has no binary
+                // for that worker, and counting it as failed made every Linux
+                // controller report its macOS/Windows workers as failed on every
+                // run, burying real failures (bd-ztpbq).
+                if let Err(e) = ensure_binary_matches_worker(&worker_config, &local_binary).await {
+                    if let Some(reason) = platform_mismatch_skip_reason(&e) {
+                        progress
+                            .worker_skipped_with_notice(&worker_id, &reason)
+                            .await;
+                        return (idx, worker_id, true, DeploymentStatus::Skipped);
+                    }
+                    progress.worker_failed(&worker_id, &format!("{}", e)).await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
                 // Backup phase - create backup of current binary (best-effort, non-fatal)
                 // This runs before upload to capture the existing version
                 let mut previous_artifact_id: Option<String> = None;
@@ -451,15 +470,6 @@ impl FleetExecutor {
 
                 // Upload phase - create remote directory and copy binary
                 progress.set_phase(&worker_id, DeployPhase::Uploading).await;
-
-                // Guard against clobbering a worker's good binary with one built
-                // for the wrong OS/arch (e.g. pushing a macOS binary onto a
-                // linux/amd64 worker => `Exec format error`). Runs before SCP so
-                // a mismatch never overwrites the existing binary.
-                if let Err(e) = ensure_binary_matches_worker(&worker_config, &local_binary).await {
-                    progress.worker_failed(&worker_id, &format!("{}", e)).await;
-                    return (idx, worker_id, false, DeploymentStatus::Failed);
-                }
 
                 // Release-provenance gate (bd-...-7.4): prove this is the
                 // intended artifact for this worker before transfer, and record
@@ -1180,28 +1190,23 @@ fn now_unix_ms() -> u64 {
 // mock-SSH integration tests below.
 
 /// Exact-user/path capability probe spec for a worker's installed `rch-wkr`. The
-/// path is the exact configured binary location (no PATH resolution), matching
-/// the .7.3 exact-user/path validation discipline.
+/// probe tries the fixed locations RCH deploys to (no PATH resolution), matching
+/// the .7.3 exact-user/path validation discipline. Mirrors the daemon
+/// bypass-recovery prober via [`ProbeSpec::for_worker`]; the home-relative
+/// location expands to the configured user's real `$HOME` on the worker.
 fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
-    // Use the ABSOLUTE binary path: the probe script shell-quotes it, so a
-    // literal `~` would never expand and every worker would look like it has a
-    // missing binary (the live-fleet bug the mock tests masked by injecting an
-    // already-expanded path). Mirrors the daemon bypass-recovery prober.
     let declared_os = rch_common::declared_os(&worker.tags);
-    ProbeSpec::new(
-        worker.user.clone(),
-        remote_worker_binary_path(&worker.user, declared_os.as_deref()),
-    )
-    // Declared tool probes ride along: the smoke scenario should see the same
-    // facts selection will, or a worker can pass the smoke check and still be
-    // inadmissible for a `--require-tool` job. Entries that fail validation are
-    // refused at config load, so any that reach here are usable.
-    .with_tools(
-        worker
-            .tools
-            .iter()
-            .filter_map(|tool| NamedToolProbe::try_from(tool).ok()),
-    )
+    ProbeSpec::for_worker(&worker.user, declared_os.as_deref())
+        // Declared tool probes ride along: the smoke scenario should see the same
+        // facts selection will, or a worker can pass the smoke check and still be
+        // inadmissible for a `--require-tool` job. Entries that fail validation are
+        // refused at config load, so any that reach here are usable.
+        .with_tools(
+            worker
+                .tools
+                .iter()
+                .filter_map(|tool| NamedToolProbe::try_from(tool).ok()),
+        )
 }
 
 /// Execute the WorkerCapabilitiesExactUserPath smoke scenario against a worker:
@@ -1225,7 +1230,8 @@ async fn run_smoke_capabilities_with_runner<R: CommandRunner>(
         return Ok(CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::WrongUserPathWorkerBinary,
             detail: format!(
-                "capability probe at {REMOTE_WORKER_BINARY} produced no parseable facts as user {} (binary missing or unreachable)",
+                "capability probe at {} produced no parseable facts as user {} (binary missing or unreachable)",
+                spec.rch_wkr_paths.join(" or "),
                 worker.user
             ),
         });
@@ -1440,6 +1446,19 @@ pub(crate) async fn run_smoke_worker_scenarios(
 /// post-deploy health check stays as the final backstop — but fails loudly on a
 /// *proven* mismatch so a controller never clobbers a worker's good binary with
 /// an `Exec format error` time bomb.
+/// Skip reason for a deploy leg refused by [`ensure_binary_matches_worker`]
+/// because the local binary is proven to be for another OS/arch. `None` for
+/// any other error, which stays a failure.
+fn platform_mismatch_skip_reason(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<FleetError>() {
+        Some(FleetError::BinaryPlatformMismatch { local, worker, .. }) => Some(format!(
+            "worker platform {worker} differs from this controller's binary ({local}); \
+             deploy from a matching controller or release artifact"
+        )),
+        _ => None,
+    }
+}
+
 async fn ensure_binary_matches_worker(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
     let header = match read_binary_header(local_binary) {
         Ok(header) => header,
@@ -2896,6 +2915,26 @@ mod tests {
         assert_eq!(platform.arch, Some(BinaryArch::X86_64));
     }
 
+    #[test]
+    fn platform_mismatch_is_a_skip_with_a_reason_other_errors_are_not() {
+        let mismatch: anyhow::Error = FleetError::BinaryPlatformMismatch {
+            worker_id: "mac-mini-max".to_string(),
+            local: "linux/x86_64".to_string(),
+            worker: "macos/aarch64".to_string(),
+        }
+        .into();
+        let reason = platform_mismatch_skip_reason(&mismatch).expect("mismatch is a skip");
+        assert!(reason.contains("macos/aarch64"), "{reason}");
+        assert!(reason.contains("linux/x86_64"), "{reason}");
+
+        let other: anyhow::Error = FleetError::HealthCheckFailed {
+            reason: "rch-wkr health exited 1".to_string(),
+        }
+        .into();
+        assert!(platform_mismatch_skip_reason(&other).is_none());
+        assert!(platform_mismatch_skip_reason(&anyhow::anyhow!("scp failed")).is_none());
+    }
+
     #[tokio::test]
     async fn ensure_binary_matches_worker_fails_open_on_unreadable_binary() {
         let worker = test_worker_config();
@@ -3458,22 +3497,36 @@ RCH_FACT disk=/var/cache;1048576;10240;900000\n";
         }
     }
 
-    // The smoke capability probe must target an ABSOLUTE binary path. The probe
-    // script single-quotes it, so a literal `~/.local/bin/rch-wkr` would never
-    // expand and EVERY real worker would be rejected as binary-missing (the
-    // live-fleet bug the mock tests masked by injecting an expanded path).
+    // The smoke capability probe targets the locations RCH deploys `rch-wkr` to,
+    // with the home-relative one resolved by the worker's own `$HOME` rather than
+    // a guessed `/home/<user>` (wrong on macOS and for accounts homed elsewhere,
+    // #116). The script must expand it: a single-quoted `~/...` never expands,
+    // which would reject EVERY real worker as binary-missing.
     #[test]
-    fn smoke_capability_probe_spec_uses_absolute_path() {
-        let spec = smoke_capability_probe_spec(&smoke_worker()); // user "rch"
-        assert_eq!(spec.rch_wkr_path, "/home/rch/.local/bin/rch-wkr");
-        assert!(!spec.rch_wkr_path.contains('~'));
-        let root = WorkerConfig {
-            user: "root".to_string(),
+    fn smoke_capability_probe_spec_uses_deployed_locations_under_real_home() {
+        for user in ["rch", "root"] {
+            let worker = WorkerConfig {
+                user: user.to_string(),
+                ..Default::default()
+            };
+            let spec = smoke_capability_probe_spec(&worker);
+            assert_eq!(
+                spec.rch_wkr_paths,
+                ["/usr/local/bin/rch-wkr", "~/.local/bin/rch-wkr"]
+            );
+            let script = build_capability_probe_script(&spec);
+            assert!(script.contains("\"${HOME:-}\"'/.local/bin/rch-wkr'"));
+            assert!(!script.contains("'~/"));
+            assert!(!script.contains("/home/"));
+        }
+        let windows = WorkerConfig {
+            user: "jeffr".to_string(),
+            tags: vec![rch_common::os_tag("windows")],
             ..Default::default()
         };
         assert_eq!(
-            smoke_capability_probe_spec(&root).rch_wkr_path,
-            "/root/.local/bin/rch-wkr"
+            smoke_capability_probe_spec(&windows).rch_wkr_paths,
+            ["/c/Users/jeffr/.local/bin/rch-wkr.exe"]
         );
     }
 

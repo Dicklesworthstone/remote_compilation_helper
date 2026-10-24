@@ -272,54 +272,63 @@ impl TimingHistory {
 
 /// Get the path to the timing history file.
 fn timing_history_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|dir| dir.join("rch").join("timing_history.json"))
+    // Tests record fake projects (`t18-*`). Written to the operator's real
+    // history they read as builds the speed gate learns from, and enough of
+    // them evict real projects from the 500-entry LRU (a full `rch` test run
+    // added 40 on mac-studio, 2026-10-13).
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join(format!(
+            "rch-test-timing-history-{}.json",
+            std::process::id()
+        )))
+    }
+    #[cfg(not(test))]
+    {
+        dirs::cache_dir().map(|dir| dir.join("rch").join("timing_history.json"))
+    }
 }
 
 /// Record a build timing to the history store.
 ///
-/// Updates the in-memory cache immediately, then persists to disk.
-/// Called after a build completes to update the timing history.
-/// This is used by `estimate_timing_for_build` for future predictions.
-///
-/// **Lock-scope discipline (t18):** we acquire the write guard, mutate
-/// the in-memory state, CLONE a snapshot, drop the guard, THEN write
-/// to disk. The original implementation held the write guard across
-/// `save_to_disk()` which serialized every other reader/writer on a
-/// disk-I/O (~50ms on slow disks) — fine when nothing else needed the
-/// cache, catastrophic under any concurrent access. The clone cost is
-/// bounded by `MAX_TIMING_PROJECTS` (500) × `MAX_TIMING_SAMPLES` (20)
-/// = at most ~10K small structs; ~µs vs the lock contention's ms.
+/// Called after a successful build: remote builds by `run_exec`, local builds
+/// by the speed gate's local run. The speed gate (`speed_gate::decide`) reads
+/// these samples back.
 pub(super) fn record_build_timing(
     project: &str,
     kind: Option<CompilationKind>,
     duration_ms: u64,
     remote: bool,
 ) {
-    let cache = timing_cache();
-    // Step 1: mutate in-memory state under the write guard. Snapshot
-    // for disk persistence. Then drop the guard before any I/O.
-    let snapshot = {
-        let mut history = match cache.write() {
-            Ok(g) => g,
-            Err(poison) => {
-                // Poisoned RwLock — another caller panicked while
-                // holding the write guard. Recover the value and
-                // continue; failing here would deny the build a
-                // timing record but isn't worth blocking the user.
-                tracing::warn!(
-                    target: "rch::hook::timing",
-                    "timing cache RwLock poisoned; recovering"
-                );
-                poison.into_inner()
-            }
-        };
-        history.record(project, kind, duration_ms, remote);
-        history.clone()
-        // guard dropped here
-    };
-    // Step 2: persist to disk WITHOUT holding the lock. Other readers
-    // and writers can proceed in parallel with the fsync.
-    snapshot.save_to_disk();
+    // Every `rch exec` is its own process with its own cached copy, so writing
+    // that copy back would drop samples other builds recorded meanwhile
+    // (bd-2spi4 reads these samples). Merge under a cross-process lock:
+    // reload, add this sample, save, refresh the cache. A missing lock only
+    // risks losing a sample, never the build.
+    let _lock = timing_history_path().and_then(|path| {
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .ok()?;
+        file.lock().ok().map(|()| file)
+    });
+    let mut history = TimingHistory::load_from_disk();
+    history.record(project, kind, duration_ms, remote);
+    history.save_to_disk();
+    match timing_cache().write() {
+        Ok(mut cache) => *cache = history,
+        Err(poison) => {
+            tracing::warn!(
+                target: "rch::hook::timing",
+                "timing cache RwLock poisoned; recovering"
+            );
+            *poison.into_inner() = history;
+        }
+    }
 }
 
 /// Timing estimate for offload gating decisions.

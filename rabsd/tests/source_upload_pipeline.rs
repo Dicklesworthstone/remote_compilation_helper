@@ -80,7 +80,7 @@ impl Fixture {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 enum Fault {
     #[default]
     None,
@@ -89,6 +89,14 @@ enum Fault {
     RegressingFirstAck,
     TimeoutFirstAck,
     FailThirdWrite,
+    WrongPathAck,
+    WrongKindAck,
+    MissingOffsetAck,
+    AheadOffsetAck,
+    DuplicateAck,
+    LostAck,
+    LostSealAck,
+    WrongSealAck,
 }
 
 struct ReceiverPeer {
@@ -102,17 +110,23 @@ struct ReceiverPeer {
     pending_bytes: usize,
     maximum_pending: usize,
     maximum_pending_bytes: usize,
-    draining: bool,
-    batches: Vec<usize>,
+    pending_before_send: Vec<usize>,
+    pending_before_ack: Vec<usize>,
     chunks: usize,
     acks: usize,
     fault: Fault,
+    fault_at: usize,
+    fail_write_at: Option<usize>,
+    previous_ack: Option<Value>,
 }
 
 impl ReceiverPeer {
     fn new(fixture: &Fixture) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = tempfile::tempdir().unwrap();
+        fs::set_permissions(owner.path(), fs::Permissions::from_mode(0o700)).unwrap();
         Self {
-            owner: tempfile::tempdir().unwrap(),
+            owner,
             receiver: None,
             files: fixture.files.clone(),
             missing: None,
@@ -122,11 +136,14 @@ impl ReceiverPeer {
             pending_bytes: 0,
             maximum_pending: 0,
             maximum_pending_bytes: 0,
-            draining: false,
-            batches: Vec::new(),
+            pending_before_send: Vec::new(),
+            pending_before_ack: Vec::new(),
             chunks: 0,
             acks: 0,
             fault: Fault::None,
+            fault_at: 1,
+            fail_write_at: None,
+            previous_ack: None,
         }
     }
 
@@ -193,13 +210,10 @@ impl WorkerPeer for ReceiverPeer {
                 self.replies.push_back((reply, 0));
             }
             Some("source-chunk") => {
-                assert!(
-                    !self.draining,
-                    "do not refill before the previous batch drains"
-                );
+                self.pending_before_send.push(self.pending);
                 self.chunks += 1;
                 self.pending += 1;
-                let encoded_size = serde_json::to_vec(frame)?.len();
+                let encoded_size = serde_json::to_vec(frame)?.len() + 1;
                 self.pending_bytes += encoded_size;
                 self.maximum_pending = self.maximum_pending.max(self.pending);
                 self.maximum_pending_bytes = self.maximum_pending_bytes.max(self.pending_bytes);
@@ -225,10 +239,12 @@ impl WorkerPeer for ReceiverPeer {
                     "next_offset":next}),
                     encoded_size,
                 ));
-                if matches!(self.fault, Fault::FailThirdWrite) && self.chunks == 3 {
+                if (matches!(self.fault, Fault::FailThirdWrite) && self.chunks == 3)
+                    || self.fail_write_at == Some(self.chunks)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "possibly accepted third write",
+                        "possibly accepted source write",
                     ));
                 }
             }
@@ -252,16 +268,25 @@ impl WorkerPeer for ReceiverPeer {
             .replies
             .pop_front()
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing source reply"))?;
-        if reply["kind"] == "source-chunk-accepted" {
-            if !self.draining {
-                self.batches.push(self.pending);
-                self.draining = true;
+        if reply["kind"] == "source-ready" && reply["sealed"] == true {
+            match self.fault {
+                Fault::LostSealAck => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "lost seal reply",
+                    ));
+                }
+                Fault::WrongSealAck => reply["sealed"] = json!(false),
+                _ => {}
             }
+        }
+        if reply["kind"] == "source-chunk-accepted" {
+            self.pending_before_ack.push(self.pending);
             self.pending -= 1;
             self.pending_bytes -= bytes;
-            self.draining = self.pending != 0;
             self.acks += 1;
-            if self.acks == 1 {
+            let original = reply.clone();
+            if self.acks == self.fault_at {
                 match self.fault {
                     Fault::ForeignFirstAck => reply["request_id"] = json!(18),
                     Fault::WrongManifestFirstAck => {
@@ -274,9 +299,32 @@ impl WorkerPeer for ReceiverPeer {
                             "absolute upload deadline",
                         ));
                     }
-                    Fault::None | Fault::FailThirdWrite => {}
+                    Fault::WrongPathAck => reply["path"] = json!("unselected.txt"),
+                    Fault::WrongKindAck => reply["kind"] = json!("source-ready"),
+                    Fault::MissingOffsetAck => {
+                        reply.as_object_mut().unwrap().remove("next_offset");
+                    }
+                    Fault::AheadOffsetAck => {
+                        reply["next_offset"] = json!(reply["next_offset"].as_u64().unwrap() + 1);
+                    }
+                    Fault::DuplicateAck => {
+                        reply = self.previous_ack.clone().unwrap_or_else(|| {
+                            json!({"kind":"source-ready", "request_id":17, "sealed":false})
+                        });
+                    }
+                    Fault::LostAck => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "lost chunk reply",
+                        ));
+                    }
+                    Fault::None
+                    | Fault::FailThirdWrite
+                    | Fault::LostSealAck
+                    | Fault::WrongSealAck => {}
                 }
             }
+            self.previous_ack = Some(original);
         }
         Ok(reply)
     }
@@ -294,9 +342,13 @@ fn source_pipeline_batches_small_files_across_file_boundaries() {
     fixture.transfer(&mut peer).unwrap();
     peer.assert_complete();
     assert_eq!(
-        peer.batches,
-        [4, 4, 3],
-        "serial send/ack must not pass this gate"
+        peer.pending_before_ack,
+        [4, 4, 4, 4, 4, 4, 4, 4, 3, 2, 1],
+        "neither serial transfer nor drain-all batches may pass this gate"
+    );
+    assert_eq!(
+        peer.pending_before_send,
+        [0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3]
     );
     assert_eq!(peer.maximum_pending, 4);
     assert_eq!(fixture.request, original);
@@ -315,7 +367,7 @@ fn source_pipeline_uses_captured_binary_chunks_and_drains_the_partial_batch() {
     let mut peer = ReceiverPeer::new(&fixture);
     fixture.transfer(&mut peer).unwrap();
     peer.assert_complete();
-    assert_eq!(peer.batches, [4, 4, 2]);
+    assert_eq!(peer.pending_before_ack, [4, 4, 4, 4, 4, 4, 4, 3, 2, 1]);
     assert_eq!(peer.maximum_pending, 4);
     let offsets: Vec<_> = peer
         .sent
@@ -365,11 +417,11 @@ fn source_pipeline_respects_exact_missing_sets_including_a_completely_warm_trans
             .collect();
         assert_eq!(sent, missing);
         assert_eq!(
-            peer.batches,
+            peer.pending_before_ack,
             if missing.is_empty() {
                 vec![]
             } else {
-                vec![4, 1]
+                vec![4, 4, 3, 2, 1]
             }
         );
     }
@@ -422,4 +474,172 @@ fn source_pipeline_partial_batch_write_burns_negotiation_without_retry() {
     assert_eq!(peer.acks, 0);
     assert!(peer.receiver.as_ref().unwrap().sealed_root().is_none());
     assert!(peer.sent.iter().all(|frame| frame["kind"] != "source-seal"));
+}
+
+#[test]
+fn sliding_source_window_handles_empty_and_short_tails_without_phantom_acks() {
+    for count in 0..=12 {
+        let mut files = BTreeMap::from([("empty".into(), Vec::new())]);
+        files.extend((0..count).map(|index| (format!("src/f{index:02}"), vec![7])));
+        let fixture = Fixture::new(files);
+        let mut peer = ReceiverPeer::new(&fixture);
+        fixture.transfer(&mut peer).unwrap();
+        peer.assert_complete();
+        assert_eq!((peer.chunks, peer.acks), (count, count));
+        assert_eq!(peer.maximum_pending, count.min(4));
+        assert!(peer.pending_before_send.iter().all(|pending| *pending < 4));
+        assert!(peer.pending_before_ack.iter().all(|pending| *pending > 0));
+        // Every send after the initial fill follows exactly one ACK, leaving
+        // three older debts. A drain-all sender instead reaches zero here.
+        assert!(
+            peer.pending_before_send
+                .iter()
+                .skip(4)
+                .all(|pending| *pending == 3)
+        );
+    }
+}
+
+#[test]
+fn cached_and_empty_members_do_not_reset_the_live_source_window() {
+    let fixture = Fixture::new(BTreeMap::from([
+        ("a.bin".into(), vec![0xa5; 2 * MAX_SOURCE_CHUNK + 5]),
+        ("m-cached.bin".into(), vec![0x55; 7777]),
+        ("n-empty".into(), Vec::new()),
+        ("z.bin".into(), vec![0x5a; 4 * MAX_SOURCE_CHUNK + 7]),
+    ]));
+    let request = fixture.request.clone();
+    let mut peer = ReceiverPeer::new(&fixture);
+    peer.missing = Some(BTreeSet::from([
+        "a.bin".into(),
+        "n-empty".into(),
+        "z.bin".into(),
+    ]));
+    fixture.transfer(&mut peer).unwrap();
+    peer.assert_complete();
+    assert_eq!(peer.pending_before_send, [0, 1, 2, 3, 3, 3, 3, 3]);
+    assert_eq!(peer.pending_before_ack, [4, 4, 4, 4, 4, 3, 2, 1]);
+    assert_eq!(fixture.request, request);
+    assert!(
+        peer.sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .all(|frame| frame["path"] == "a.bin" || frame["path"] == "z.bin")
+    );
+    assert!(peer.maximum_pending_bytes < 2 * 1024 * 1024);
+}
+
+#[test]
+fn every_source_ack_failure_stops_refill_and_the_final_drain_without_retry() {
+    let fixture = Fixture::new(
+        (0..9)
+            .map(|index| (format!("src/f{index}"), vec![index as u8; 3]))
+            .collect(),
+    );
+    for fault in [
+        Fault::ForeignFirstAck,
+        Fault::WrongManifestFirstAck,
+        Fault::RegressingFirstAck,
+        Fault::TimeoutFirstAck,
+        Fault::WrongPathAck,
+        Fault::WrongKindAck,
+        Fault::MissingOffsetAck,
+        Fault::AheadOffsetAck,
+        Fault::DuplicateAck,
+        Fault::LostAck,
+    ] {
+        for at in 1..=9 {
+            let mut peer = ReceiverPeer::new(&fixture);
+            peer.fault = fault;
+            peer.fault_at = at;
+            let mut source =
+                SourcePeer::new(&mut peer, &fixture.upload, &fixture.request).unwrap();
+            let hello = json!({"source_transfers":["source-files-v1"]});
+            let grant = json!({"kind":"session-ok"});
+            assert!(source.negotiate(&hello, &grant).is_err(), "{fault:?} at {at}");
+            assert!(
+                source.negotiate(&hello, &grant).is_err(),
+                "failed transfer retried"
+            );
+            // Only the already admitted window may have reached the peer.
+            // The failing reply cannot earn a slot, even in the final drain.
+            assert_eq!(peer.chunks, 9.min(at + 3), "{fault:?} at {at}");
+            assert_eq!(peer.acks, at);
+            assert_eq!(peer.sent.len(), 2 + peer.chunks);
+            assert!(peer.receiver.as_ref().unwrap().sealed_root().is_none());
+            assert!(peer.sent.iter().all(|frame| !matches!(
+                frame["kind"].as_str(),
+                Some("source-seal" | "canonical-exec")
+            )));
+        }
+    }
+}
+
+#[test]
+fn duplicate_ack_for_an_earlier_range_of_the_same_file_cannot_release_credit() {
+    let fixture = Fixture::new(BTreeMap::from([(
+        "src/large.bin".into(),
+        vec![0x7f; MAX_SOURCE_CHUNK * 8 + 1],
+    )]));
+    for at in 2..=9 {
+        let mut peer = ReceiverPeer::new(&fixture);
+        peer.fault = Fault::DuplicateAck;
+        peer.fault_at = at;
+        assert!(fixture.transfer(&mut peer).is_err());
+        assert_eq!(peer.chunks, 9.min(at + 3));
+        assert_eq!(peer.acks, at);
+        assert!(peer.receiver.as_ref().unwrap().sealed_root().is_none());
+        assert!(peer.sent.iter().all(|frame| frame["kind"] != "source-seal"));
+    }
+}
+
+#[test]
+fn partial_source_writes_after_refill_never_retry_or_drain_unconfirmed_debts() {
+    let fixture = Fixture::new(
+        (0..9)
+            .map(|index| (format!("src/f{index}"), vec![index as u8; 3]))
+            .collect(),
+    );
+    for at in 1_usize..=9 {
+        let mut peer = ReceiverPeer::new(&fixture);
+        peer.fail_write_at = Some(at);
+        let mut source = SourcePeer::new(&mut peer, &fixture.upload, &fixture.request).unwrap();
+        let hello = json!({"source_transfers":["source-files-v1"]});
+        let grant = json!({"kind":"session-ok"});
+        assert_eq!(
+            source.negotiate(&hello, &grant).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(source.negotiate(&hello, &grant).is_err());
+        assert_eq!(peer.chunks, at);
+        assert_eq!(peer.acks, at.saturating_sub(4));
+        assert_eq!(peer.sent.len(), 2 + at);
+        assert!(peer.maximum_pending <= 4);
+        assert!(peer.receiver.as_ref().unwrap().sealed_root().is_none());
+        assert!(peer.sent.iter().all(|frame| frame["kind"] != "source-seal"));
+    }
+}
+
+#[test]
+fn a_lost_or_invalid_final_seal_is_not_success_or_a_new_source_negotiation() {
+    let fixture = Fixture::new(
+        (0..9)
+            .map(|index| (format!("src/f{index}"), vec![index as u8; 3]))
+            .collect(),
+    );
+    for fault in [Fault::LostSealAck, Fault::WrongSealAck] {
+        let mut peer = ReceiverPeer::new(&fixture);
+        peer.fault = fault;
+        let mut source = SourcePeer::new(&mut peer, &fixture.upload, &fixture.request).unwrap();
+        let hello = json!({"source_transfers":["source-files-v1"]});
+        let grant = json!({"kind":"session-ok"});
+        assert!(source.negotiate(&hello, &grant).is_err());
+        assert!(source.negotiate(&hello, &grant).is_err());
+        assert_eq!((peer.chunks, peer.acks, peer.pending), (9, 9, 0));
+        // The receiver completed; the caller did NOT receive a valid seal.
+        assert!(peer.receiver.as_ref().unwrap().sealed_root().is_some());
+        assert_eq!(peer.sent.len(), 12);
+        assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
+        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    }
 }

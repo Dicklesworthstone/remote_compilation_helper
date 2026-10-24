@@ -244,6 +244,28 @@ pub enum LinkerRejection {
         /// The triple that was rejected.
         triple: String,
     },
+    /// lld is already this target's default linker: x86_64-unknown-linux-gnu
+    /// links with self-contained rust-lld since Rust 1.90. Selecting it again
+    /// only adds the clang driver hop; measured ~20% slower on rchd's final
+    /// link (bd-k9wg8). wild is still a candidate.
+    AlreadyDefault {
+        /// The version line that would have been selected.
+        candidate: String,
+    },
+}
+
+/// Rust 1.90 made self-contained rust-lld the default linker for
+/// x86_64-unknown-linux-gnu. Reads the first `MAJOR.MINOR.` token of a
+/// `rustc --version` or `rustc -vV` `release:` line.
+fn rust_lld_is_default(rustc_version_line: &str, host_target_triple: &str) -> bool {
+    host_target_triple == "x86_64-unknown-linux-gnu"
+        && rustc_version_line.split_whitespace().find_map(|token| {
+            let mut parts = token.split('.');
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next()?.parse().ok()?;
+            parts.next()?;
+            Some((major, minor))
+        }) >= Some((1, 90))
 }
 
 impl LinkerRejection {
@@ -257,6 +279,9 @@ impl LinkerRejection {
             ),
             Self::UnsupportedHost { triple } => format!(
                 "host {triple} has no linker flag spelling in this pack; system default stays"
+            ),
+            Self::AlreadyDefault { candidate } => format!(
+                "`{candidate}` adds nothing: this target already links with rust-lld by default (Rust 1.90+); system default stays"
             ),
         }
     }
@@ -450,6 +475,13 @@ pub fn assemble(evidence: &PackEvidence) -> Layer0Pack {
         }),
         Some((_, line)) if !evidence.linker_driver_available => {
             Err(LinkerRejection::DriverMissing {
+                candidate: line.clone(),
+            })
+        }
+        Some((LinkerFamily::Lld, line))
+            if rust_lld_is_default(&evidence.rustc_version_line, &evidence.host_target_triple) =>
+        {
+            Err(LinkerRejection::AlreadyDefault {
                 candidate: line.clone(),
             })
         }
@@ -819,8 +851,9 @@ mod tests {
 
     #[test]
     fn threads_and_linker_flags_share_target_array_without_losing_independent_toggle() {
+        // Before Rust 1.90 lld was not the x86_64 Linux default, so it is selectable.
         let mut pack = assemble(&evidence(
-            "rustc 1.100.0-nightly (abc 2026-08-31)",
+            "rustc 1.89.0-nightly (abc 2025-07-01)",
             &["LLD 18.1.0"],
         ));
         let rendered = pack.render_config();
@@ -846,9 +879,9 @@ mod tests {
                 .any(|k| k.id == "linker-wild" && k.enabled)
         );
         assert!(pack.render_config().contains("--ld-path=wild"));
-        // lld alone selects lld.
+        // lld alone selects lld where it is not already the default.
         let pack = assemble(&evidence(
-            "rustc 1.99.0-nightly (abc 2026-07-01)",
+            "rustc 1.89.0-nightly (abc 2025-07-01)",
             &["LLD 18.1.0 (compatible with GNU linkers)"],
         ));
         assert!(pack.knobs.iter().any(|k| k.id == "linker-lld" && k.enabled));
@@ -889,7 +922,7 @@ mod tests {
     #[test]
     fn l0c_linker_selection_needs_a_usable_driver_and_a_known_host() {
         // Detected + driver + ELF host: selected.
-        let mut e = evidence("rustc 1.99.0-nightly (abc 2026-07-01)", &["LLD 18.1.0"]);
+        let mut e = evidence("rustc 1.89.0-nightly (abc 2025-07-01)", &["LLD 18.1.0"]);
         assert!(assemble(&e).render_config().contains("-fuse-ld=lld"));
 
         // Same linker, no clang: the flag cannot be carried, so the pack
@@ -925,6 +958,9 @@ mod tests {
             LinkerRejection::UnsupportedHost {
                 triple: HOST.to_owned(),
             },
+            LinkerRejection::AlreadyDefault {
+                candidate: "LLD 18.1.0".to_owned(),
+            },
         ]
         .iter()
         .map(LinkerRejection::explain)
@@ -934,8 +970,38 @@ mod tests {
                 .iter()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            3
+            4
         );
+    }
+
+    #[test]
+    fn l0c_lld_is_rejected_where_rust_lld_is_already_the_default() {
+        // bd-k9wg8: on rustc 1.100 / x86_64 Linux the stock link already used
+        // rust-lld; the clang+lld knob measured ~20% slower on rchd's link.
+        for rustc in [
+            "rustc 1.90.0 (abc 2025-09-14)",
+            "rustc 1.100.0-nightly (abc 2026-08-31)",
+            "release: 1.100.0-nightly",
+        ] {
+            let pack = assemble(&evidence(rustc, &["LLD 18.1.0"]));
+            let system = pack.knobs.iter().find(|k| k.id == "linker-system").unwrap();
+            assert!(!system.enabled, "{rustc}");
+            assert!(
+                system.fragment.contains("rust-lld by default"),
+                "{rustc}: {system:?}"
+            );
+            assert!(!pack.render_config().contains("fuse-ld"), "{rustc}");
+            // wild is still a different, faster linker there.
+            let pack = assemble(&evidence(rustc, &["LLD 18.1.0", "wild 0.4.0"]));
+            assert!(pack.render_config().contains("--ld-path=wild"), "{rustc}");
+        }
+        // Other ELF hosts keep lld as a real choice.
+        let mut e = evidence("rustc 1.100.0-nightly (abc 2026-08-31)", &["LLD 18.1.0"]);
+        e.host_target_triple = "aarch64-unknown-linux-gnu".to_owned();
+        assert!(assemble(&e).render_config().contains("-fuse-ld=lld"));
+        // An unparseable version line cannot prove the default.
+        let pack = assemble(&evidence("rustc nightly", &["LLD 18.1.0"]));
+        assert!(pack.render_config().contains("-fuse-ld=lld"));
     }
 
     #[test]

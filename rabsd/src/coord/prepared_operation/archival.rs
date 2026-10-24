@@ -8,8 +8,9 @@
 use super::{
     MAX_AUTOMATIC_RECOVERIES, MAX_DETAIL_BYTES, MAX_OPERATIONS, MAX_RECORD_BYTES,
     MAX_RETAINED_BYTES, OperationState, PreparedOperationStore, Record, State, StoredMode, invalid,
-    ordinary_directory, overlap, path_shape, read_bounded, request_digest, require, valid_id,
-    validate_bound_request, validate_spec_shape,
+    ordinary_directory, overlap, path_shape, read_bounded, record_request_digest, require,
+    valid_id, validate_allocation_template, validate_bound_request, validate_record_pool,
+    validate_spec_shape,
 };
 use std::fs::{self, File};
 use std::io;
@@ -52,10 +53,53 @@ pub(super) fn load_record(root: &Path, path: &Path) -> io::Result<Record> {
     let bytes = read_bounded(path, MAX_RECORD_BYTES, true)?;
     let record: Record = serde_json::from_slice(&bytes)?;
     validate_spec_shape(&record.spec)?;
-    validate_bound_request(&record.request)?;
+    validate_record_pool(&record)?;
+    if record.allocation_pending() {
+        validate_allocation_template(&record.request)?;
+        require(
+            record.mode == StoredMode::Execute
+                && !record.execution_may_have_run
+                && record.listen_address.is_none()
+                && record.bound_address.is_none()
+                && record.allocated_request_sha256.is_none()
+                && !matches!(
+                    record.state,
+                    OperationState::Completed | OperationState::Uncertain
+                ),
+            "unallocated operation crossed the execution frontier",
+        )?;
+    } else {
+        validate_bound_request(&record.request)?;
+        require(
+            record.version != 2
+                || (record.request["request_id"]
+                    .as_u64()
+                    .is_some_and(|id| id > 0)
+                    && record.attempt > 0
+                    && (record.state != OperationState::Queued
+                        || record.mode != StoredMode::Execute)),
+            "allocated operation has no actual worker identity",
+        )?;
+        require(
+            if record.version == 2 {
+                use sha2::{Digest, Sha256};
+                record.allocated_request_sha256.as_deref()
+                    == Some(
+                        Sha256::digest(serde_json::to_vec(&record.request)?)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                            .as_str(),
+                    )
+            } else {
+                record.allocated_request_sha256.is_none()
+            },
+            "bound execution request differs from its saved complete fingerprint",
+        )?;
+    }
     require(
-        record.version == 1
-            && record.request_sha256 == request_digest(&record.request)?
+        matches!(record.version, 1 | 2)
+            && record.request_sha256 == record_request_digest(record.version, &record.request)?
             && path.file_stem().and_then(|s| s.to_str()) == Some(record.spec.id.as_str())
             && record.prior_deliveries.len() <= 16
             && record.automatic_recoveries <= MAX_AUTOMATIC_RECOVERIES
@@ -141,11 +185,15 @@ pub(super) fn load_record(root: &Path, path: &Path) -> io::Result<Record> {
                     && record.execution_may_have_run))
             && match record.state {
                 OperationState::Queued => true,
-                OperationState::Running | OperationState::Uncertain => {
-                    record.attempt > 0 && record.execution_may_have_run
+                OperationState::Running => {
+                    record.attempt > 0
+                        && (record.execution_may_have_run || record.allocation_pending())
                 }
+                OperationState::Uncertain => record.attempt > 0 && record.execution_may_have_run,
                 OperationState::Cancelling => {
-                    record.attempt > 0 && record.execution_may_have_run && record.cancel_requested
+                    record.attempt > 0
+                        && (record.execution_may_have_run || record.allocation_pending())
+                        && record.cancel_requested
                 }
                 OperationState::Completed => {
                     record.attempt > 0

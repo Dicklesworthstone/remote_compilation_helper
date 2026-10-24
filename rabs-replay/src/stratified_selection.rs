@@ -202,6 +202,206 @@ pub fn coverage_to_ndjson(sample: &StratifiedSample) -> String {
     .to_string()
 }
 
+/// Audit result for B003 multi-context, multi-repo corpus coverage (`plan §140`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiRepoCorpusAudit {
+    /// Distinct repositories (`cwd_redacted`) observed in the corpus.
+    pub repos: std::collections::BTreeSet<String>,
+    /// Distinct [`rabs_protocol::invocation_record::ToolKind`] contexts present across the corpus.
+    pub tools_present: std::collections::BTreeSet<rabs_protocol::invocation_record::ToolKind>,
+    /// Tool contexts from [`rabs_protocol::invocation_record::ToolKind::ALL`] missing from the corpus.
+    pub missing_tools: Vec<rabs_protocol::invocation_record::ToolKind>,
+    /// Count of malformed NDJSON lines encountered.
+    pub malformed_lines: usize,
+}
+
+impl MultiRepoCorpusAudit {
+    /// Whether the corpus covers at least `min_repos` repositories and all ten
+    /// [`rabs_protocol::invocation_record::ToolKind`] contexts with zero malformed records.
+    #[must_use]
+    pub fn satisfies_b003(&self, min_repos: usize) -> bool {
+        self.malformed_lines == 0
+            && self.repos.len() >= min_repos
+            && self.missing_tools.is_empty()
+            && self.tools_present.len() == rabs_protocol::invocation_record::ToolKind::ALL.len()
+    }
+}
+
+/// Audit a slice of B002 NDJSON corpus lines for B003 multi-repo and 10-context coverage.
+#[must_use]
+pub fn audit_multi_repo_corpus(lines: &[&str]) -> MultiRepoCorpusAudit {
+    use rabs_protocol::invocation_record::ToolKind;
+
+    let mut repos = std::collections::BTreeSet::new();
+    let mut tools_present = std::collections::BTreeSet::new();
+    let mut malformed_lines = 0;
+
+    for raw in lines {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(sk) = stratum_of(trimmed) else {
+            malformed_lines += 1;
+            continue;
+        };
+        let Some(tool_kind) = ToolKind::from_str_name(&sk.tool) else {
+            malformed_lines += 1;
+            continue;
+        };
+        repos.insert(sk.repo);
+        tools_present.insert(tool_kind);
+    }
+
+    let missing_tools = ToolKind::ALL
+        .into_iter()
+        .filter(|tk| !tools_present.contains(tk))
+        .collect();
+
+    MultiRepoCorpusAudit {
+        repos,
+        tools_present,
+        missing_tools,
+        malformed_lines,
+    }
+}
+
+/// Construct the canonical B003 two-repository (`~/work/remote_compilation_helper` and
+/// `~/work/asupersync`) NDJSON corpus with all ten [`rabs_protocol::invocation_record::ToolKind`]
+/// contexts classified via [`rabs_protocol::invocation_record::InvocationRecord::capture_classified`].
+#[must_use]
+pub fn canonical_b003_multi_repo_corpus() -> Vec<String> {
+    use rabs_protocol::invocation_record::{InvocationRecord, NormalizedOutcome};
+    use rabs_protocol::raw_bytes::RawBytes;
+
+    let home = "/home/ubuntu";
+    let repos = [
+        (
+            "/home/ubuntu/work/remote_compilation_helper",
+            "rustc 1.99.0-nightly",
+        ),
+        ("/home/ubuntu/work/asupersync", "nightly-2026-07-27"),
+    ];
+    type InvocationSpec<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], u64);
+    let invocations: &[InvocationSpec<'_>] = &[
+        (
+            &[
+                "rustc",
+                "--edition=2024",
+                "--crate-name",
+                "rabs_key",
+                "src/lib.rs",
+            ],
+            &[],
+            1_450,
+        ),
+        (
+            &[
+                "rustdoc",
+                "--edition=2024",
+                "--crate-name",
+                "rabs_key",
+                "src/lib.rs",
+            ],
+            &[],
+            2_100,
+        ),
+        (
+            &[
+                "cc",
+                "-Wl,--as-needed",
+                "target/debug/deps/rabs_key.o",
+                "-o",
+                "target/debug/librabs_key.so",
+            ],
+            &[],
+            620,
+        ),
+        (
+            &["rustc", "--crate-name", "build_script_build", "build.rs"],
+            &[("CARGO_CRATE_NAME", "build_script_build")],
+            890,
+        ),
+        (
+            &["target/debug/build/zstd-sys-a1b2/build-script-build"],
+            &[
+                ("OUT_DIR", "/tmp/rabs-out"),
+                ("CARGO_MANIFEST_DIR", "/home/ubuntu/work/zstd-sys"),
+            ],
+            410,
+        ),
+        (
+            &[
+                "clang",
+                "-c",
+                "-O2",
+                "csrc/zstd_compress.c",
+                "-o",
+                "zstd_compress.o",
+            ],
+            &[],
+            530,
+        ),
+        (
+            &["clang++", "-c", "-O2", "csrc/shim.cc", "-o", "shim.o"],
+            &[],
+            740,
+        ),
+        (
+            &[
+                "llvm-ar",
+                "crs",
+                "libzstd_shim.a",
+                "zstd_compress.o",
+                "shim.o",
+            ],
+            &[],
+            180,
+        ),
+        (&["cargo", "check", "--workspace"], &[], 12_500),
+        (&["cargo", "nextest", "run", "--workspace"], &[], 64_200),
+    ];
+
+    let mut out = Vec::with_capacity(repos.len() * invocations.len());
+    for (cwd_str, toolchain) in repos {
+        for (argv_strs, extra_env, duration_ms) in invocations {
+            let argv: Vec<RawBytes> = argv_strs.iter().map(|s| RawBytes::from(*s)).collect();
+            let mut env: Vec<(RawBytes, RawBytes)> = vec![(
+                RawBytes::from("RUSTUP_TOOLCHAIN"),
+                RawBytes::from(toolchain),
+            )];
+            for (k, v) in *extra_env {
+                env.push((RawBytes::from(*k), RawBytes::from(*v)));
+            }
+            let record = InvocationRecord::capture_classified(
+                &argv,
+                &env,
+                &RawBytes::from(cwd_str),
+                home,
+                NormalizedOutcome::Exited(0),
+                *duration_ms,
+            )
+            .expect("canonical B003 invocation must classify");
+            out.push(
+                serde_json::json!({
+                    "schema_version": record.schema_version,
+                    "tool": record.tool.as_str(),
+                    "argv_correlation": record.argv_correlation,
+                    "argv_redacted": record.argv_redacted,
+                    "env_correlation": record.env_correlation,
+                    "env_redacted": record.env_redacted,
+                    "cwd_redacted": record.cwd_redacted,
+                    "outcome_kind": "exited",
+                    "outcome_value": 0,
+                    "duration_ms": record.duration_ms,
+                })
+                .to_string(),
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +512,24 @@ mod tests {
             strata.iter().any(|s| s["duration_bucket"] == "sub-second")
                 && strata.iter().any(|s| s["duration_bucket"] == "minutes")
         );
+    }
+
+    #[test]
+    fn b003_multi_repo_corpus_covers_all_ten_tool_contexts_across_two_repos() {
+        let corpus = canonical_b003_multi_repo_corpus();
+        assert_eq!(corpus.len(), 20);
+        let refs: Vec<&str> = corpus.iter().map(String::as_str).collect();
+        let audit = audit_multi_repo_corpus(&refs);
+        assert!(
+            audit.satisfies_b003(2),
+            "B003 corpus must cover >=2 repos and all 10 tool contexts: {audit:?}"
+        );
+        assert!(audit.repos.contains("~/work/remote_compilation_helper"));
+        assert!(audit.repos.contains("~/work/asupersync"));
+
+        // Stratified selection over the 20-record B003 corpus must select all 20 distinct strata.
+        let sample = select_stratified(&refs, 2);
+        assert_eq!(sample.skipped_malformed, 0);
+        assert_eq!(sample.coverage.len(), 20);
     }
 }

@@ -261,6 +261,8 @@ jobs:
           cargo bench -p rch-common --bench remediation_hotpath -- --save-baseline ci
       - name: Verify performance budgets
         run: python3 scripts/check_benchmark_budgets.py
+      - name: Verify RABS corpus regression gates (B013)
+        run: cargo test -p rabs-replay --lib b013_ci_regression_gate_enforces_baseline_and_override_protocol
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:

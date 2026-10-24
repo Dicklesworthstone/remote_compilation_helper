@@ -852,6 +852,7 @@ mod tests {
         recent_builds: Vec<BuildRecordFromApi>,
     ) -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
+            admission: None,
             daemon: DaemonInfoFromApi {
                 pid: 1234,
                 uptime_secs: 3600,
@@ -871,6 +872,7 @@ mod tests {
                 severity: "info".to_string(),
                 summary: "all good".to_string(),
                 remediation: None,
+                worker_id: None,
             }],
             alerts: vec![],
             stats: BuildStatsFromApi {

@@ -17,10 +17,11 @@
 //!
 //! Config: `[rabs]` table in the RCH config file (`$RABS_CONFIG` file
 //! override first, else `~/.config/rch/config.toml`), env overrides
-//! `RABS_SOCKET_PATH`/`RABS_LOG_LEVEL`. UNKNOWN `[rabs]` keys are a
+//! `RABS_SOCKET_PATH`/`RABS_LOG_LEVEL`/`RABS_PREPARED_CONCURRENCY`. UNKNOWN `[rabs]` keys are a
 //! typed refusal, not a silent ignore (config drift must be loud).
 
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, run_daemon};
+use rabsd::coord::prepared_operation::PreparedConcurrency;
 use std::time::{Duration, Instant};
 
 mod prepared_jobs;
@@ -32,11 +33,18 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct RabsConfig {
     socket_path: String,
     log_level: String,
+    /// Bounded, daemon-owned execution and recovery slots for prepared jobs.
+    prepared_concurrency: PreparedConcurrency,
     /// Opt-in live registry/Git dependency lane (bd-k52xe): exact keys,
     /// admitted local executions, evidence-gated serving. Off keeps every
     /// wrapper request in shadow mode (plan §154 rollout: observation →
     /// shadow → opt-in sampled serving).
     live_dependency: bool,
+    /// Running build identity consulted against durable release verdicts (`bd-dockb`).
+    build_identity: String,
+    /// Release authorization mode (`advisory` by default; `required` refuses
+    /// unproven builds).
+    release_authorization: rabs_protocol::release_authorization::ReleaseAuthorizationMode,
 }
 
 impl Default for RabsConfig {
@@ -44,13 +52,40 @@ impl Default for RabsConfig {
         Self {
             socket_path: default_under_home(".cache/rch/rabsd.sock"),
             log_level: "info".to_string(),
+            prepared_concurrency: PreparedConcurrency::default(),
             live_dependency: false,
+            build_identity: rabs_protocol::release_authorization::default_build_identity(),
+            release_authorization:
+                rabs_protocol::release_authorization::ReleaseAuthorizationMode::default(),
         }
     }
 }
 
 fn default_under_home(rel: &str) -> String {
     std::env::var("HOME").map_or_else(|_| format!("/tmp/{rel}"), |h| format!("{h}/{rel}"))
+}
+
+fn parse_release_authorization_mode(
+    raw: &str,
+    source: &str,
+) -> Result<rabs_protocol::release_authorization::ReleaseAuthorizationMode, String> {
+    match raw {
+        "advisory" => Ok(rabs_protocol::release_authorization::ReleaseAuthorizationMode::Advisory),
+        "required" => Ok(rabs_protocol::release_authorization::ReleaseAuthorizationMode::Required),
+        other => Err(format!(
+            "{source}={other:?}: expected \"advisory\" or \"required\""
+        )),
+    }
+}
+
+fn parse_prepared_concurrency(raw: &str, source: &str) -> Result<PreparedConcurrency, String> {
+    let value = raw.parse::<usize>().map_err(|_| {
+        format!(
+            "{source} must be an integer between 1 and {}",
+            PreparedConcurrency::MAX
+        )
+    })?;
+    PreparedConcurrency::new(value).map_err(|error| format!("{source}: {error}"))
 }
 
 /// Parse the `[rabs]` table. Unknown keys refuse loudly.
@@ -75,15 +110,42 @@ fn parse_config(text: &str) -> Result<RabsConfig, String> {
                         .ok_or_else(|| "rabs.log_level must be a string".to_string())?
                         .to_string();
                 }
+                "prepared_concurrency" => {
+                    let value = entry.as_integer().ok_or_else(|| {
+                        "rabs.prepared_concurrency must be an integer".to_string()
+                    })?;
+                    config.prepared_concurrency = parse_prepared_concurrency(
+                        &value.to_string(),
+                        "rabs.prepared_concurrency",
+                    )?;
+                }
                 "live_dependency" => {
                     config.live_dependency = entry
                         .as_bool()
                         .ok_or_else(|| "rabs.live_dependency must be a boolean".to_string())?;
                 }
+                "build_identity" => {
+                    let id = entry
+                        .as_str()
+                        .ok_or_else(|| "rabs.build_identity must be a string".to_string())?
+                        .trim();
+                    if id.is_empty() {
+                        return Err("rabs.build_identity must not be empty".to_string());
+                    }
+                    config.build_identity = id.to_string();
+                }
+                "release_authorization" => {
+                    let raw = entry
+                        .as_str()
+                        .ok_or_else(|| "rabs.release_authorization must be a string".to_string())?;
+                    config.release_authorization =
+                        parse_release_authorization_mode(raw, "rabs.release_authorization")?;
+                }
                 unknown => {
                     return Err(format!(
                         "unknown [rabs] config key {unknown:?} — refusing (config drift \
-                         must be loud); known keys: socket_path, log_level, live_dependency"
+                         must be loud); known keys: socket_path, log_level, prepared_concurrency, live_dependency, \
+                         build_identity, release_authorization"
                     ));
                 }
             }
@@ -105,6 +167,16 @@ fn load_config() -> Result<RabsConfig, String> {
     if let Ok(level) = std::env::var("RABS_LOG_LEVEL") {
         config.log_level = level;
     }
+    match std::env::var("RABS_PREPARED_CONCURRENCY") {
+        Ok(value) => {
+            config.prepared_concurrency =
+                parse_prepared_concurrency(&value, "RABS_PREPARED_CONCURRENCY")?;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("RABS_PREPARED_CONCURRENCY must be valid UTF-8".to_string());
+        }
+    }
     match std::env::var("RABS_LIVE_DEPENDENCY").as_deref() {
         Ok("1" | "true" | "on") => config.live_dependency = true,
         Ok("0" | "false" | "off") => config.live_dependency = false,
@@ -114,6 +186,17 @@ fn load_config() -> Result<RabsConfig, String> {
             ));
         }
         Err(_) => {}
+    }
+    if let Ok(build_id) = std::env::var("RABS_BUILD_ID") {
+        let trimmed = build_id.trim();
+        if trimmed.is_empty() {
+            return Err("RABS_BUILD_ID must not be empty".to_string());
+        }
+        config.build_identity = trimmed.to_string();
+    }
+    if let Ok(mode) = std::env::var("RABS_RELEASE_AUTHORIZATION") {
+        config.release_authorization =
+            parse_release_authorization_mode(&mode, "RABS_RELEASE_AUTHORIZATION")?;
     }
     Ok(config)
 }
@@ -217,7 +300,39 @@ const WORKER_PREPARE_USAGE: &str = "usage: rabsd --worker-prepare <absolute-sour
 /// executable request. Bound it before capture and let the shared preparation
 /// path validate its fields and construct the sole source-manifest identity.
 fn prepare_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value> {
-    use rabsd::coord::source_delivery::prepare_source_bundle;
+    prepare_from_arguments_with(args, |_| Ok(()))
+}
+
+/// The combined TLS build may reserve an ID before the immutable request is
+/// constructed. Standalone preparation keeps exact caller-supplied identities.
+fn prepare_from_arguments_with(
+    args: &[String],
+    before_capture: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>,
+) -> std::io::Result<serde_json::Value> {
+    prepare_from_arguments_using(
+        args,
+        before_capture,
+        rabsd::coord::source_delivery::prepare_source_bundle,
+    )
+}
+
+fn prepare_template_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value> {
+    prepare_from_arguments_using(
+        args,
+        |_| Ok(()),
+        rabsd::coord::source_delivery::prepare_source_template,
+    )
+}
+
+fn prepare_from_arguments_using(
+    args: &[String],
+    before_capture: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>,
+    prepare: impl FnOnce(
+        &std::path::Path,
+        &serde_json::Value,
+        &std::path::Path,
+    ) -> std::io::Result<serde_json::Value>,
+) -> std::io::Result<serde_json::Value> {
     use rabsd::coord::worker_delivery::MAX_FRAME_BYTES;
     use std::io::{self, Read};
     use std::path::Path;
@@ -261,8 +376,9 @@ fn prepare_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value>
             "specification exceeds request bound",
         ));
     }
-    let specification = serde_json::from_slice(&bytes)?;
-    prepare_source_bundle(Path::new(source), &specification, Path::new(destination))
+    let mut specification = serde_json::from_slice(&bytes)?;
+    before_capture(&mut specification)?;
+    prepare(Path::new(source), &specification, Path::new(destination))
 }
 
 /// Preparation has no execution side effects, even on error. Return a single
@@ -318,11 +434,23 @@ fn main() {
                  Execute with --source-root <bundle>/source and <bundle>/request.json, not the old checkout.\n\
                  OPERATOR: rabsd --worker-exec-loopback <127.0.0.1:port> <worker> <request.json> <new-absolute-directory>\n\
                  SECURE: rabsd --worker-exec-tls <IP:port> <worker> <worker-spki-sha256> <request.json> <new-absolute-directory>\n\
-                 BUILD: rabsd --worker-build-tls [--resume] <IP:port> <worker> <worker-spki-sha256> <bundle> <delivery> <outputs>\n\
-                 BUILD LOCAL: rabsd --worker-build-loopback [--resume] <127.0.0.1:port> <worker> <bundle> <delivery> <outputs>\n\
+                 BUILD: rabsd --worker-build-tls [--replay-diagnostics] [--resume] <IP:port> <worker> <worker-spki-sha256> <bundle> <delivery> <outputs>\n\
+                 BUILD LOCAL: rabsd --worker-build-loopback [--replay-diagnostics] [--resume] <127.0.0.1:port> <worker> <bundle> <delivery> <outputs>\n\
                  Build paths are absolute. Successful builds install every verified artifact into a new output tree.\n\
+                 --replay-diagnostics prints verified stdout/stderr on success or failure, with the JSON report on stderr.\n\
                  Repeating a complete build verifies local delivery and outputs without a worker; --resume never executes.\n\
+                 Combined TLS --prepare-from accepts request_id: \"allocate\" in local specifications only.\n\
+                 It durably reserves a worker ID under RABS_STATE_DIR and holds admission through dispatch.\n\
+                 Direct build bundles and result recovery keep their original assigned numeric request IDs.\n\
                  DAEMON JOB: rabsd --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
+                 CAPTURE AND QUEUE: rabsd --job-build --prepare-from <source-root> <spec.json> <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
+                 POOL: rabsd --job-build --prepare-from <source-root> <spec.json> <id32hex> --worker-pool <pool.json> <bundle> <delivery> <outputs>\n\
+                 pool.json is an ordered array of {{address, worker, worker_spki_sha256}} for 1..32 pinned workers.\n\
+                 The daemon selects the least queued/running load once; recovery stays with that worker.\n\
+                 --job-build requires request_id: \"allocate\", captures immutable inputs, queues once, then replays verified diagnostics.\n\
+                 Worker IDs are assigned only when the daemon claims each job. Client exit does not cancel it; use --job-cancel.\n\
+                 Retry admission of that SAME saved template/ID: --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
+                 Retry the SAME pool intent: --job-submit-pool <id32hex> <pool.json> <bundle> <delivery> <outputs>\n\
                  Inspect/cancel: --job-status <id32hex> | --job-cancel <id32hex>\n\
                  Wait and replay diagnostics: --job-wait <id32hex> [timeout-seconds]\n\
                  Follow live NDJSON previews: --job-follow <id32hex> [timeout-seconds]\n\
@@ -337,7 +465,8 @@ fn main() {
                  Runs until SIGTERM/SIGINT; prints the obligation-accounted\n\
                  shutdown receipt (JSON) as its final stdout line.\n\
                  Config: [rabs] table ($RABS_CONFIG or ~/.config/rch/config.toml);\n\
-                 env: RABS_SOCKET_PATH, RABS_LOG_LEVEL."
+                 prepared_concurrency = 4 controls 1..32 owned execution/recovery slots.\n\
+                 env: RABS_SOCKET_PATH, RABS_LOG_LEVEL, RABS_PREPARED_CONCURRENCY."
             );
             return;
         }
@@ -357,7 +486,10 @@ fn main() {
             std::process::exit(worker_exec::run_build_tls(&args[1..]));
         }
         Some(
-            "--job-submit"
+            "--job-build"
+            | "--job-submit"
+            | "--job-submit-allocated"
+            | "--job-submit-pool"
             | "--job-status"
             | "--job-wait"
             | "--job-follow"
@@ -422,9 +554,22 @@ fn main() {
         }
         Some("--check-config") => match load_config() {
             Ok(config) => {
+                let release_mode = match config.release_authorization {
+                    rabs_protocol::release_authorization::ReleaseAuthorizationMode::Advisory => {
+                        "advisory"
+                    }
+                    rabs_protocol::release_authorization::ReleaseAuthorizationMode::Required => {
+                        "required"
+                    }
+                };
                 println!(
-                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\"}}",
-                    config.socket_path, config.log_level
+                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\",\"prepared_concurrency\":{},\"live_dependency\":{},\"build_identity\":\"{}\",\"release_authorization\":\"{}\"}}",
+                    config.socket_path,
+                    config.log_level,
+                    config.prepared_concurrency.get(),
+                    config.live_dependency,
+                    config.build_identity.replace('"', "'"),
+                    release_mode
                 );
                 return;
             }
@@ -462,8 +607,13 @@ fn main() {
         "rabsd-boot",
         &[
             ("version", VERSION),
+            ("build_identity", &config.build_identity),
             ("socket_path", &config.socket_path),
             ("log_level", &config.log_level),
+            (
+                "prepared_concurrency",
+                &config.prepared_concurrency.get().to_string(),
+            ),
             (
                 "live_dependency",
                 if config.live_dependency { "on" } else { "off" },
@@ -489,13 +639,17 @@ fn main() {
     // The live coordinator (S6): shared edge<->coord in-process, with
     // the structural authority split intact — the coord region owns its
     // availability; the edge only consults it.
-    let coord = std::sync::Arc::new(match &mounted {
-        Ok(cas) => rabsd::coord::live::CoordLive::with_cas(std::sync::Arc::clone(cas)),
-        Err(_) => rabsd::coord::live::CoordLive::new(),
-    });
+    let coord = std::sync::Arc::new(
+        match &mounted {
+            Ok(cas) => rabsd::coord::live::CoordLive::with_cas(std::sync::Arc::clone(cas)),
+            Err(_) => rabsd::coord::live::CoordLive::new(),
+        }
+        .with_release_authorization(&config.build_identity, config.release_authorization),
+    );
     let prepared_operations = if mounted.is_ok() {
-        match rabsd::coord::prepared_operation::PreparedOperationStore::open(
+        match rabsd::coord::prepared_operation::PreparedOperationStore::open_with_concurrency(
             &state_dir.join("prepared-operations"),
+            config.prepared_concurrency,
         ) {
             Ok(operations) => Some(operations),
             Err(error) => {

@@ -1,0 +1,200 @@
+diff --git a/rch/src/transfer.rs b/rch/src/transfer.rs
+--- a/rch/src/transfer.rs
++++ b/rch/src/transfer.rs
+@@ -9,4 +9,5 @@
+ mod retrieval_space;
+ #[cfg(all(test, unix))]
+ mod retrieval_space_tests;
++mod source_archive;
+ pub(crate) mod source_content_barrier;
+@@ -3983,8 +3984,17 @@
+-    // Selection runs entirely locally. Windows include-only tar uploads must
+-    // use the same rsync filters as POSIX uploads, without enabling the separate
+-    // remote source-content receipt protocol on Windows.
++    // Selection runs entirely locally. Keep the regular-file-only proof gate,
++    // while ordinary Windows archives also preserve directory and link entries.
+     async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
+         let effective_excludes = self.get_effective_excludes();
++        source_archive::regular_paths(
++            self.enumerate_source_upload_members(&effective_excludes)
++                .await?,
++        )
++    }
++
++    async fn enumerate_source_upload_members(
++        &self,
++        effective_excludes: &[String],
++    ) -> Result<Vec<source_archive::Member>> {
+         let nonexistent_destination = std::env::temp_dir().join(format!(
+             "rch-source-content-enumeration-{}",
+             uuid::Uuid::new_v4()
+@@ -3994,7 +4004,7 @@
+             .arg("--out-format=%i\t%n")
+             .args(capabilities.no_motd_args());
+         add_portable_rsync_archive_args(&mut cmd);
+-        self.append_sync_filter_args(&mut cmd, &effective_excludes);
++        self.append_sync_filter_args(&mut cmd, effective_excludes);
+         cmd.arg(format!("{}/", self.project_root.display()))
+             .arg(format!("{}/", nonexistent_destination.display()));
+         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+@@ -4002,7 +4012,7 @@
+         let output = run_source_content_rsync_capture(
+             cmd,
+             "source-content transfer-universe enumeration",
+-            self.source_sync_attempt_timeout(&effective_excludes),
++            self.source_sync_attempt_timeout(effective_excludes),
+         )
+         .await?;
+         if !output.status.success() {
+@@ -4018,42 +4028,5 @@
+                 String::from_utf8_lossy(&output.stderr).trim()
+             );
+         }
+-
+-        let stdout = std::str::from_utf8(&output.stdout)
+-            .context("source-content enumeration output was not UTF-8")?;
+-        let mut paths = Vec::new();
+-        for line in stdout.lines() {
+-            if line.is_empty() || line.starts_with("created directory ") {
+-                continue;
+-            }
+-            let (itemized, raw_path) = line.split_once('\t').ok_or_else(|| {
+-                anyhow::anyhow!("unexpected source-content enumeration line: {line:?}")
+-            })?;
+-            if itemized.as_bytes().get(1) == Some(&b'd') {
+-                continue;
+-            }
+-            if itemized.as_bytes().get(1) != Some(&b'f') {
+-                anyhow::bail!(
+-                    "source-content proof refuses non-regular rsync item {itemized:?} at {raw_path:?}"
+-                );
+-            }
+-            let relative = raw_path.strip_prefix("./").unwrap_or(raw_path);
+-            if relative.is_empty()
+-                || relative.chars().any(char::is_control)
+-                || Path::new(relative).components().any(|component| {
+-                    matches!(
+-                        component,
+-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+-                    )
+-                })
+-            {
+-                anyhow::bail!("unsafe source-content path emitted by rsync: {raw_path:?}");
+-            }
+-            paths.push(PathBuf::from(relative));
+-        }
+-        paths.sort();
+-        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+-            anyhow::bail!("source-content enumeration emitted duplicate paths");
+-        }
+-        Ok(paths)
++        source_archive::parse_members(&output.stdout)
+     }
+@@ -5292,6 +5265,9 @@
+     async fn selected_source_archive(&self) -> Result<(tempfile::NamedTempFile, u32)> {
+         let paths = self.enumerate_source_upload_files().await?;
++        if self.worker_platform.is_windows() {
++            source_archive::validate_windows_paths(&paths)?;
++        }
+         let files_transferred = u32::try_from(paths.len())
+             .context("selected source archive exceeds file-count limit")?;
+         let project_root = self.project_root.clone();
+         tokio::task::spawn_blocking(move || {
+@@ -5332,6 +5308,6 @@
+-    /// Windows source sync: create the remote dir, then `tar czf -` the project
+-    /// locally (honouring excludes) and pipe it into `tar xzf -` on the worker.
+-    /// Native `tar` on both ends — no rsync, no `C:`-colon path ambiguity.
++    /// Windows source sync uses local rsync selection and literal tar members.
++    /// The worker still requires only tar, not rsync. No existing remote files
++    /// are removed; include-only overlays retain their regular-file-only gate.
+     async fn sync_to_remote_windows(
+         &self,
+         worker: &WorkerConfig,
+@@ -5358,72 +5334,26 @@
+             });
+         }
+ 
+-        // 1. Ensure the remote dir exists. `mkdir -p` under Git's sh accepts the
+-        //    C:/ form. Escape defensively even though our paths have no metachars.
++        // Select before contacting the worker. Both upload variants and source
++        // receipts use append_sync_filter_args, including Cargo package carve-
++        // outs and project configuration. Tar must not interpret rsync patterns.
++        let destination = Self::windows_archive_destination(remote_path)?;
++        let members = self.enumerate_source_upload_members(excludes).await?;
++        let (manifest, files_transferred) = source_archive::manifest(&members).await?;
+         self.run_remote_sh(
+             worker,
+-            &format!("mkdir -p {}", escape(Cow::from(remote_path))),
++            &format!(
++                "mkdir -p {}",
++                escape(Cow::from(remote_path.replace('\\', "/")))
++            ),
+         )
+         .await?;
+-
+-        // 2. local `tar c` | remote `tar x`.
+-        let mut tar = Command::new("tar");
+-        tar.arg("czf").arg("-").arg("-C").arg(&self.project_root);
+-        for ex in excludes {
+-            tar.arg(format!("--exclude={ex}"));
+-        }
+-        tar.arg(".");
+-        tar.stdout(Stdio::piped())
+-            .stderr(Stdio::piped())
+-            .kill_on_drop(true);
+-
+-        let mut ssh = self.worker_ssh_command(worker, &["tar", "xzf", "-", "-C", remote_path]);
+-        ssh.stdin(Stdio::piped())
+-            .stdout(Stdio::piped())
+-            .stderr(Stdio::piped());
+-
+-        let mut tar_child = tar.spawn().context("spawn local tar (windows sync)")?;
+-        let mut ssh_child = ssh.spawn().context("spawn ssh tar x (windows sync)")?;
+-        let mut tar_out = tar_child.stdout.take().context("local tar stdout")?;
+-        let mut tar_err = tar_child.stderr.take();
+-        let mut ssh_in = ssh_child.stdin.take().context("ssh stdin")?;
+-        let pump = tokio::spawn(async move {
+-            let _ = tokio::io::copy(&mut tar_out, &mut ssh_in).await;
+-            drop(ssh_in);
+-        });
+-        // Drain the local tar's stderr concurrently. `ssh_child.wait_with_output`
+-        // blocks until the remote extract finishes; if a chatty tar (many
+-        // per-file warnings) fills its undrained stderr pipe in the meantime it
+-        // stops writing stdout, the pump starves the ssh stdin, and the whole
+-        // transfer deadlocks. We only need the exit status, so discard the text.
+-        let tar_err_drain = tokio::spawn(async move {
+-            if let Some(err) = tar_err.as_mut() {
+-                let _ = tokio::io::copy(err, &mut tokio::io::sink()).await;
+-            }
+-        });
+-        let ssh_out = ssh_child
+-            .wait_with_output()
+-            .await
+-            .context("ssh tar x wait")?;
+-        let tar_status = tar_child.wait().await.context("local tar wait")?;
+-        let _ = pump.await;
+-        let _ = tar_err_drain.await;
+-
+-        if !tar_status.success() {
+-            return Err(anyhow::anyhow!("local tar failed during windows sync"));
+-        }
+-        if !ssh_out.status.success() {
+-            return Err(anyhow::anyhow!(
+-                "remote tar extract failed (exit {:?}): {}",
+-                ssh_out.status.code(),
+-                String::from_utf8_lossy(&ssh_out.stderr)
+-            ));
+-        }
++        let tar = source_archive::tar_command(&self.project_root, manifest.path());
++        let ssh = self.worker_ssh_command(worker, &["tar", "xzf", "-", "-C", &destination]);
++        let bytes_transferred = source_archive::stream(tar, ssh).await?;
+         Ok(SyncResult {
+-            // tar does not report per-file byte/count stats the way rsync does;
+-            // these are used only for logging, so 0 is acceptable here.
+-            bytes_transferred: 0,
+-            files_transferred: 0,
++            bytes_transferred,
++            files_transferred,
+             duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+         })
+     }

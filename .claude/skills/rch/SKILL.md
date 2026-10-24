@@ -12,7 +12,7 @@ description: >-
 
 This skill is the operational layer agents use when that pipeline isn't working — and the much more common case where it *thinks* it's working but is silently building locally. Single principle: **self-resolve before asking the human.** Every recovery path here is one the agent can run alone.
 
-Harmonized against `remote_compilation_helper` main @ `b5c0566` (2026-08-25), workspace **v1.0.58**. The released 1.0.58 binary predates the post-release shim toolchain-wrapper commits; where that matters it is called out.
+Harmonized against `remote_compilation_helper` main @ `b5c0566` (2026-08-25), workspace **v1.0.58**. The released 1.0.58 binary predates the post-release shim toolchain-wrapper commits; where that matters it is called out. Commands and flags were re-checked against the released `rch 2.0.0` (tag `v2.0.0`); the 2.0.0 changes that alter what a command does (`rch gc` previews unless `--apply`, `daemon stop`/`restart` refuse during builds unless `--drain`/`--force`, `rch web --url`) are called out inline.
 
 ---
 
@@ -44,6 +44,60 @@ RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose rch exec -- cargo check --workspace 
 
 ---
 
+## Operating Model: Self-Healing First, No Permanent Fixes for Transient Illness
+
+RCH self-heals. Most "broken RCH" symptoms are transient; the costly failure is an operator making a
+*permanent* change to fix a *temporary* problem, which turns self-healing capacity loss into real loss.
+
+1. **Never edit `workers.toml` to fix transient illness.** A slow, briefly unreachable or probe-failing
+   worker goes into a temporary bypass with probe backoff, gets one canary build when probes recover,
+   and rejoins on its own. Editing or removing it defeats that.
+2. **Never `rch workers disable` for transient illness.** `disable` is permanent operator intent
+   (decommission, maintenance); always give it a `--reason` so the incident ledger records why.
+3. **Never `rm` the daemon socket or `kill` "stale" processes by hand.** `rch daemon restart` or
+   `rch doctor --fix`.
+4. **Diagnose before surgery:** `rch doctor`, `rch status --fleet`, `rch admit "<cmd>"`.
+
+| Situation | Do | Do NOT |
+|---|---|---|
+| Worker slow / flaky / briefly unreachable | nothing; `rch status --fleet` to watch it rejoin | edit `workers.toml`; `rch workers disable` |
+| Worker overloaded | `rch workers drain <id> -y` (reversible), later `rch workers enable <id>` | remove it |
+| Decommission / hardware maintenance | `rch workers disable <id> --reason "..." --drain -y` | leave it silently absent (`--fleet` alerts) |
+
+**Why didn't it offload?** `rch admit "<cmd>"` (or `--json`) gives a stable reason code and next action:
+
+| Code | Meaning | Next action |
+|---|---|---|
+| `RCH-I001` | no admissible workers | `rch status --fleet`: absent vs overloaded vs missing capability |
+| `RCH-I003` | insufficient slots | wait in the queue (`RCH_QUEUE_WHEN_BUSY=1`, the default); don't add workers reflexively |
+| `RCH-I006` | missing runtime/toolchain/target | `rch workers capabilities --refresh`; install it on the worker |
+| `RCH-I008` | telemetry stale | `rch status --remediation`; usually self-heals |
+| `RCH-I011` | local fallback | expected when remote isn't worth it; `RCH_FORCE_REMOTE=1` to try anyway |
+| `RCH-I012` | proof refusal | strict mode refused local fallback (proof lane below) |
+| `RCH-I017` | wrong user/path worker binary | re-run the fleet deploy/validate; don't hand-patch the worker |
+
+**Proof lane:** to prove a build ran remotely, fail-closed and with nothing auto-started underneath:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace
+```
+
+Keep the build as direct argv after `--`: a `bash -lc "... && ..."` wrapper classifies as non-compilation
+and is refused (`RCH-E301`). `RCH_FORCE_REMOTE=1` is the fail-open cousin; `RCH_REQUIRE_REMOTE` wins.
+
+**Where the evidence lives** (under `RCH_STATE_HOME`, else `$XDG_STATE_HOME/rch`, else
+`~/.local/state/rch`, else `/tmp/rch`): the incident ledger `<state>/incidents.jsonl` (`RCH-Innn` with
+context); proof intents `<state>/proofs.jsonl` (or `[remediation.proof] store_path`); E2E test logs
+`target/test-logs/*.jsonl` (`RCH_TEST_LOG_FILE`); daemon logs via `rch daemon logs -n 200`. Read them
+through `rch status --remediation --json`, `rch diagnose "<cmd>" --json` and `rch admit "<cmd>" --json`,
+which share one reason-code vocabulary.
+
+**Validating these behaviors** (in the rch repo): `cargo test -p rch-common --lib incident`,
+`cargo test -p rch-common --lib proof`, `cargo test -p rch-common --test admission_goldens_e2e`, and
+`./scripts/check_rch_skill.sh` (this guidance cannot silently disappear again).
+
+---
+
 ## Quick Start
 
 ```bash
@@ -58,7 +112,7 @@ rch admit "cargo test -p foo"               # read-only admission preflight
 rch diagnose --dry-run "cargo check --workspace --all-targets"
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --workspace --all-targets
 rch self-test --all                         # end-to-end verify
-rch doctor --reliability --scope topology,pressure   # (`ownership` scope is post-1.0.58)
+rch doctor --reliability --scope topology,pressure   # (`ownership` scope: 2.0.0+, not 1.0.58)
 rch doctor --fix --dry-run                  # what doctor would auto-fix
 rch --robot-triage --json                   # agent mega-command
 ```
@@ -92,12 +146,12 @@ Run in order; stop at the first failing stage.
 | Codex / scripts / CI build locally | `rch shim install` on the dispatcher — `references/SHIM.md` |
 | `rch shim status` shows local rustc running | fix PATH order (`~/.rch/shims` first) or re-run `rch shim install` after a `rustup toolchain install` |
 | Daemon not running | `rch daemon start` |
-| Daemon version drift after upgrade | `rch daemon restart -y` — after `rch --json queue \| jq '.data.active_builds\|length'` is 0: restart **interrupts** active builds (`-y` only skips the warning prompt) |
+| Daemon version drift after upgrade | `rch daemon restart -y`, only after `rch --json queue \| jq '.data.active_builds\|length'` is 0: on 1.0.58 restart **interrupts** active builds (`-y` only skips the warning prompt); 2.0.0 refuses while builds are in flight unless `--drain` (wait, `--drain-timeout` 300 s) or `--force` (interrupt) |
 | Socket mismatch / stale daemon state | `rch daemon restart -y` then `rch --json daemon status` |
 | No workers configured | `rch workers discover --add --yes && rch workers setup --all` (or `rch workers init`) |
 | Workers unreachable | `rch workers probe --all`; keys → `references/SSH_KEY_RECOVERY.md` |
 | "all workers unreachable" persists though probes pass | workers are in **temporary bypass**: `rch status --fleet`; they auto-rejoin after N healthy probes + a canary build; `rch workers enable <id>` clears the record |
-| All workers busy | queueing is default (waits 330 s); raise it — `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=900 <cmd>` — or raise `total_slots` |
+| All workers busy | queueing is default: a compilation waits up to the daemon's `[queue] timeout_secs` (300 s), an `rch exec --job` up to 6 h. A longer compile wait needs both that daemon key and `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS`; or raise `total_slots` |
 | `no admissible workers` | `rch admit "<cmd>"` — per-candidate rejection reasons + next action |
 | Requested worker refused (`RCH_WORKER=x`) | the `[RCH-Innn]` line carries a `next_action`; do it — rch never silently swaps workers |
 | Shell-wrapped cargo refused `[RCH-E301]` | never `rch exec -- bash -lc "cargo … && cargo …"`; run separate `rch exec -- cargo …` |
@@ -106,7 +160,7 @@ Run in order; stop at the first failing stage.
 | Want `RUSTFLAGS`/`RUST_LOG` forwarded | `RCH_ENV_ALLOWLIST=RUSTFLAGS,RUST_LOG <cmd>` (`CARGO_TARGET_DIR`/`TMPDIR` are always rewritten on the worker) |
 | Transfer churn / payload too large (`transfer skipped`) | `.rchignore` or `[transfer] exclude_patterns`, then `rch daemon reload` |
 | Path dependency missing remotely | `references/PATH_DEPENDENCIES.md` (`[path_topology]`; `rch sync --force` for stale worker caches) |
-| Sync `Permission denied` under `/data/projects/<repo>` | `ssh <user>@<host> "stat -c '%U:%G %a %n' /data/projects/<repo>"` then fix: `ssh <user>@<host> 'sudo chown -R <user>:<user> /data/projects/<repo> && sudo chmod 775 /data/projects/<repo>'` (a fleet-wide `rch doctor --reliability --scope ownership` probe exists on main only) |
+| Sync `Permission denied` under `/data/projects/<repo>` | `ssh <user>@<host> "stat -c '%U:%G %a %n' /data/projects/<repo>"` then fix: `ssh <user>@<host> 'sudo chown -R <user>:<user> /data/projects/<repo> && sudo chmod 775 /data/projects/<repo>'` (a fleet-wide `rch doctor --reliability --scope ownership` probe exists from 2.0.0; not in 1.0.58) |
 | Worker disk pressure (RCH-E210/211…) | `rch cache status`, `rch gc --dry-run`, then `references/DISK_AND_PRESSURE.md` / `sbh` |
 | Telemetry / SpeedScore broken | `references/TELEMETRY_RECOVERY.md` |
 | Hook says installed but isn't intercepting | `scripts/protocol_test.sh "<cmd>"` |
@@ -161,7 +215,7 @@ If slots are free and nothing is queued, **more machines will not help** — say
 
 These are the questions agents historically ask the human that they should *just answer themselves*. **Do not ask. Do.**
 
-- "Can I restart the daemon?" — Yes, once `rch --json queue | jq '.data.active_builds|length'` is 0. `rch daemon restart -y` does **not** drain: `-y` skips the "N active build(s) will be interrupted" prompt, and the daemon may refuse (`shutdown_blocked`) while builds run. Wait or `rch cancel` first.
+- "Can I restart the daemon?" — Yes, once `rch --json queue | jq '.data.active_builds|length'` is 0. `rch daemon restart -y` does **not** drain: `-y` skips the "N active build(s) will be interrupted" prompt, and the daemon may refuse (`shutdown_blocked`) while builds run. Wait or `rch cancel` first. (2.0.0: restart refuses while builds run; `rch daemon restart --drain` waits for them.)
 - "Can I install the hook / the shim?" — Yes on a dispatcher box (`rch hook install`, `rch shim install`). The shim refuses on a `role = "worker"` box by itself.
 - "The autostart cooldown is blocking me — can I delete the cooldown file?" — Don't; wait `auto_start_cooldown_secs` (30 s) or run `rch daemon start`, which isn't gated by the hook cooldown.
 - "Can I drop the corrupt telemetry db?" — Yes. `references/TELEMETRY_RECOVERY.md`. Telemetry is derived data.
@@ -200,7 +254,7 @@ Every name below is read by 1.0.58 code (`references/CONFIGURATION.md` has the f
 | `RCH_REQUIRE_REMOTE=1` | Fail closed instead of building locally (proof mode). Wins over `RCH_FORCE_REMOTE`. |
 | `RCH_FORCE_REMOTE=1` | Skip local-time/speedup gating, still fail open. |
 | `RCH_QUEUE_WHEN_BUSY` | Wait for a slot instead of local fallback. **Default `1`.** `0` to opt out (benchmarking). |
-| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. **Default 330** — set it higher, not lower, to wait longer. |
+| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. **Default 330; 6 h for `rch exec --job`.** The daemon caps a compilation's wait at `[queue] timeout_secs` (300 s) and a job's at 24 h, so raising this alone lengthens only job waits. |
 | `RCH_WORKER=id[,id]` (alias `RCH_WORKERS`, merged) | Request specific worker(s); inadmissible ⇒ refused with `RCH-Innn` + next action. |
 | `RCH_PRIORITY=low\|normal\|high` | Scheduler hint. |
 | `RCH_ENV_ALLOWLIST=K1,K2` | Forward env vars to the remote build (`RUSTFLAGS`, `RUST_LOG`, …). |
@@ -210,7 +264,7 @@ Every name below is read by 1.0.58 code (`references/CONFIGURATION.md` has the f
 | `RCH_COMPRESSION_LEVEL` | Transfer compression (default 3). (`RCH_TRANSFER_ZSTD_LEVEL` is *not* read.) |
 | `RCH_SSH_SERVER_ALIVE_INTERVAL_SECS` / `RCH_SSH_CONTROL_PERSIST_SECS` | Keepalive (recommend 15) / opt-in ControlMaster (default OFF). |
 | `RCH_LOG_LEVEL=debug` | Diagnostics on stderr; surfaces which fail-open path was taken. |
-| `RCH_SOCKET_PATH` | Daemon socket override. (`RCH_DAEMON_SOCKET` is *not* read.) |
+| `RCH_SOCKET_PATH` | Daemon socket override. (`RCH_DAEMON_SOCKET` is read as an alias only from 2.0.0; `RCH_SOCKET_PATH` wins.) |
 | `RCH_NO_SELF_HEALING=1` / `--no-self-healing` / `--no-hook-auto-start` | Disable autostart/hook re-install for one invocation. |
 | `RCH_ENABLED=0` | Disable rch — only effective in the **process env** of the hook/`rch exec`, not as an inline prefix inside an agent's command. |
 | `RCH_CARGO_WRAPPER_BYPASS=1` | Shim/toolchain-wrapper bypass → real cargo. |
