@@ -1101,11 +1101,20 @@ fn execute_canonical_inner(
         hot_inputs.as_ref(),
         artifact_plan.as_ref(),
     ) {
+        // Hot target state is only constructed for canonical execution, which
+        // already probed host isolation above. The key must bind that proof;
+        // a missing probe refuses instead of hashing an unbound or empty profile.
+        let Some(support) = canonical_support.as_ref() else {
+            let _ = control.retain_outputs(Err(
+                "hot Cargo target state lacks canonical isolation proof".to_owned(),
+            ));
+            return exec_error(request.request_id);
+        };
         let prepared =
-            crate::target_cache::target_key(scope, request, inputs, &spec, &support, plan, grant)
+            crate::target_cache::target_key(scope, request, inputs, &spec, support, plan, grant)
                 .and_then(|key| {
                     let compatible = crate::target_cache::target_compatibility_key(
-                        scope, request, inputs, &spec, &support, plan, grant,
+                        scope, request, inputs, &spec, support, plan, grant,
                     )?;
                     cache.acquire(
                         key,
