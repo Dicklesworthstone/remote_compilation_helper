@@ -12,7 +12,7 @@ umask 077
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DEPLOY_SCRIPT="$SCRIPT_DIR/rabs_fleet_deploy.sh"
-for required in bash openssl install stat cmp sed find sort sha256sum timeout grep head tail wc; do
+for required in bash openssl install stat uname cp ln cmp sed find sort sha256sum timeout grep head tail wc; do
     command -v "$required" >/dev/null || {
         printf 'required test command is unavailable: %s\n' "$required" >&2
         exit 1
@@ -24,8 +24,10 @@ FIXTURE_BIN="$TEST_ROOT/bin"
 CERT_DIR="$TEST_ROOT/credentials with spaces"
 mkdir -p "$FIXTURE_BIN" "$CERT_DIR"
 printf 'Retained fleet deployment test files: %s\n' "$TEST_ROOT"
-export RABS_TEST_REAL_INSTALL
+export RABS_TEST_REAL_INSTALL RABS_TEST_REAL_STAT RABS_TEST_REAL_UNAME
 RABS_TEST_REAL_INSTALL=$(command -v install)
+RABS_TEST_REAL_STAT=$(command -v stat)
+RABS_TEST_REAL_UNAME=$(command -v uname)
 
 # Certificates use distinct real keys. The split-CA case intentionally trusts a
 # coordinator CA different from the CA that signs the worker client identity.
@@ -103,6 +105,11 @@ map_roots() {
     printf '%s' "$text"
 }
 mapped_command=$(map_roots "$remote_command")
+# Invalid-null fixtures redirect only the generated remote shell's device path
+# to a private regular file or symlink. The host /dev/null is never changed.
+if [[ -n ${RABS_TEST_NULL_PATH:-} ]]; then
+    mapped_command=${mapped_command//"/dev/null"/"$RABS_TEST_NULL_PATH"}
+fi
 # A managed EnvironmentFile path is read from the unit as data at activation.
 # Translate that indirect open into the same private filesystem namespace as
 # the literal command paths, without rewriting the saved service/environment.
@@ -128,12 +135,60 @@ SSH
 cat > "$FIXTURE_BIN/bwrap" <<'BWRAP'
 #!/usr/bin/env bash
 set -euo pipefail
+inherited_marker=${RABS_TEST_PROBE_SENTINEL-unset}
+if [[ -z ${RABS_TEST_CASE:-} ]]; then
+    # Production clears the archive probe's environment, retaining only PATH.
+    # Read this fixture's controls beside its per-case executable so that the
+    # real env -i boundary remains exercised rather than bypassed by the test.
+    [[ ${BASH_SOURCE[0]} == */probe-bin/bwrap ]] || exit 95
+    RABS_TEST_CASE=${BASH_SOURCE[0]%/probe-bin/bwrap}
+    mapfile -t controls < "$RABS_TEST_CASE/probe-bwrap-controls"
+    [[ ${#controls[@]} == 2 ]] || exit 95
+    RABS_TEST_BWRAP=${controls[0]}
+    RABS_TEST_BWRAP_DENY=${controls[1]}
+fi
 printf '%s\n' "$*" >> "$RABS_TEST_CASE/bwrap.log"
+printf '%s\n' "$inherited_marker" >> "$RABS_TEST_CASE/bwrap-env.log"
 [[ "${RABS_TEST_BWRAP:-allow}" == allow ]] || exit 1
 for argument do
     [[ "$argument" != "${RABS_TEST_BWRAP_DENY:-}" ]] || exit 1
 done
 BWRAP
+
+cat > "$FIXTURE_BIN/stat" <<'STAT'
+#!/usr/bin/env bash
+set -euo pipefail
+# Only the exact null-device metadata query is controlled. Every deployed
+# permission, ownership and file-state assertion still uses the real stat.
+if [[ $# == 4 && $1 == -c && $2 == '%t:%T' && $3 == -- && $4 == /dev/null ]]; then
+    printf 'NULL\n' >> "$RABS_TEST_CASE/null-stat.log"
+    case "${RABS_TEST_NULL_STAT:-actual}" in
+        wrong-device) printf '1:5\n'; exit 0 ;;
+        changed-after)
+            if [[ $(wc -l < "$RABS_TEST_CASE/null-stat.log") == 1 ]]; then
+                printf '1:3\n'
+            else
+                printf '1:5\n'
+            fi
+            exit 0
+            ;;
+        error) exit 1 ;;
+        actual) ;;
+        *) exit 96 ;;
+    esac
+fi
+exec "$RABS_TEST_REAL_STAT" "$@"
+STAT
+
+cat > "$FIXTURE_BIN/uname" <<'UNAME'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# == 1 && $1 == -s && -n ${RABS_TEST_KERNEL:-} ]]; then
+    printf '%s\n' "$RABS_TEST_KERNEL"
+    exit 0
+fi
+exec "$RABS_TEST_REAL_UNAME" "$@"
+UNAME
 
 cat > "$FIXTURE_BIN/systemctl" <<'SYSTEMCTL'
 #!/usr/bin/env bash
@@ -187,7 +242,7 @@ printf '%s\n' "$*" >> "$RABS_TEST_CASE/worker.log"
 printf 'rabs-wkr 0.0.0-deploy-fixture\n'
 WORKER
 chmod 0755 "$FIXTURE_BIN/ssh" "$FIXTURE_BIN/bwrap" "$FIXTURE_BIN/systemctl" \
-    "$FIXTURE_BIN/install" "$FIXTURE_BIN/chown" "$LOCAL_BIN"
+    "$FIXTURE_BIN/install" "$FIXTURE_BIN/chown" "$FIXTURE_BIN/stat" "$FIXTURE_BIN/uname" "$LOCAL_BIN"
 
 TESTS_PASSED=0
 ATTEMPT=0
@@ -233,7 +288,8 @@ assert_no_private_logs() {
 
 # Extra arguments are environment assignments, never shell source.
 run_deploy() {
-    local name=$1 expected=$2 worker=$3 coordinator=$4 status
+    local name=$1 expected=$2 worker=$3 coordinator=$4 status assignment
+    local probe_bwrap=allow probe_deny=
     local -a shell_flags=()
     shift 4
     [[ "${RABS_TEST_BASH_X:-0}" != 1 ]] || shell_flags+=(-x)
@@ -247,11 +303,23 @@ run_deploy() {
         printf 'existing worker identity and durable state\n' \
             > "$CASE_DIR/remote/root/.local/state/rabs/retained-state"
     fi
+    mkdir -p "$CASE_DIR/probe-bin"
+    cp "$FIXTURE_BIN/bwrap" "$CASE_DIR/probe-bin/bwrap"
+    for assignment in "$@"; do
+        case "$assignment" in
+            RABS_TEST_BWRAP=*) probe_bwrap=${assignment#*=} ;;
+            RABS_TEST_BWRAP_DENY=*) probe_deny=${assignment#*=} ;;
+        esac
+    done
+    printf '%s\n%s\n' "$probe_bwrap" "$probe_deny" > "$CASE_DIR/probe-bwrap-controls"
     snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.before"
     if env -u BASH_ENV -u ENV -u RABS_WORKER_ID -u RABS_WORKER_STATE_DIR \
-        -u RABS_WORKER_TARGET_CACHE_BYTES -u RABS_WORKER_TARGET_CACHE_EPOCH PATH="$FIXTURE_BIN:$PATH" \
+        -u RABS_WORKER_TARGET_CACHE_BYTES -u RABS_WORKER_TARGET_CACHE_EPOCH -u RABS_DEPLOY_CAPABILITY \
+        PATH="$CASE_DIR/probe-bin:$FIXTURE_BIN:$PATH" \
         RABS_TEST_CASE="$CASE_DIR" RABS_TEST_REMOTE_ROOT="$CASE_DIR/remote" \
         RABS_TEST_BWRAP=allow RABS_TEST_BWRAP_DENY= RABS_TEST_FAIL_TLS_TRANSFER=0 \
+        RABS_TEST_NULL_STAT=actual RABS_TEST_NULL_PATH= RABS_TEST_KERNEL= \
+        RABS_TEST_PROBE_SENTINEL=caller-environment \
         RABS_TEST_SYSTEMCTL_FAIL= RABS_TEST_VERSION_FAIL=0 \
         RABS_WORKER_TLS_CA="$CERT_DIR/coordinator-ca.pem" \
         RABS_WORKER_TLS_CERT="$CERT_DIR/client.pem" \
@@ -281,6 +349,19 @@ assert_local_refusal() {
     cmp "$CASE_DIR/attempt-$ATTEMPT.before" "$CASE_DIR/attempt-$ATTEMPT.after" \
         || fail "$1 changed remote files"
     pass "$1"
+}
+
+assert_capability_refusal() {
+    local status=$1 description=$2
+    grep -Fq "\"status\":\"refused:$status\"" "$CASE_STDOUT" \
+        || fail "$description did not identify its capability refusal"
+    [[ $(grep -c '^CALL$' "$CASE_DIR/ssh.log") == 1 ]] \
+        || fail "$description reached a later deployment step"
+    snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.after"
+    cmp "$CASE_DIR/attempt-$ATTEMPT.before" "$CASE_DIR/attempt-$ATTEMPT.after" \
+        || fail "$description wrote deployment files"
+    [[ ! -s "$CASE_DIR/systemctl.log" ]] || fail "$description touched the service"
+    pass "$description"
 }
 
 run_deploy missing-all failure worker.example coordinator.example:7443 \
@@ -345,6 +426,11 @@ for cache_epoch in '.image' '../image' 'image/path' 'image with spaces' 'image%h
         "RABS_WORKER_TARGET_CACHE_EPOCH=$cache_epoch"
     assert_local_refusal 'invalid target-cache runtime epoch cannot reach SSH'
 done
+for capability in '' metadata rlib Canonical 'dependency-rlib ' 'canonical;echo injected' $'dependency-rlib\nExecStart=/bin/false'; do
+    run_deploy "invalid-capability-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        "RABS_DEPLOY_CAPABILITY=$capability"
+    assert_local_refusal 'invalid deployment capability cannot reach SSH'
+done
 
 run_deploy bwrap-refused failure worker.example coordinator.example:7443 RABS_TEST_BWRAP=refuse
 [[ -s "$CASE_DIR/ssh.log" && -s "$CASE_DIR/bwrap.log" ]] || fail 'bwrap gate was not exercised'
@@ -373,6 +459,56 @@ for facet in --proc --dev --tmpfs --unshare-pid --unshare-ipc --unshare-uts --un
         || fail "controlled $facet host must admit the old, insufficient smoke probe"
     pass "$facet failure refuses canonical deployment despite a working root-bind userns"
 done
+
+# Archive admission measures its own namespace. A root-bind-only probe cannot
+# establish these axes; every missing facet must refuse before credentials,
+# binaries, service settings or durable worker history are written.
+for facet in --version --die-with-parent --unshare-user --unshare-pid --unshare-ipc \
+    --unshare-uts --unshare-net --clearenv --dir --dev-bind --tmpfs /tmp /__rabs/tmp; do
+    run_deploy "rlib-refused-$ATTEMPT" failure worker.example coordinator.example:7443 \
+        RABS_DEPLOY_CAPABILITY=dependency-rlib "RABS_TEST_BWRAP_DENY=$facet"
+    assert_capability_refusal bwrap-present-but-dependency-rlib-fails \
+        "$facet failure refuses archive deployment before uploads"
+done
+
+for null_state in wrong-device error changed-after; do
+    run_deploy "rlib-null-$null_state" failure worker.example coordinator.example:7443 \
+        RABS_DEPLOY_CAPABILITY=dependency-rlib "RABS_TEST_NULL_STAT=$null_state"
+    assert_capability_refusal dependency-rlib-invalid-null-device \
+        "archive null identity $null_state refuses before uploads"
+    if [[ "$null_state" == changed-after ]]; then
+        [[ $(wc -l < "$CASE_DIR/bwrap.log") == 2 && $(wc -l < "$CASE_DIR/null-stat.log") == 2 ]] \
+            || fail 'changed null identity was not checked after the archive no-op'
+    else
+        [[ $(wc -l < "$CASE_DIR/bwrap.log") == 1 ]] \
+            || fail 'an invalid null identity reached the archive no-op'
+    fi
+done
+
+REGULAR_NULL="$TEST_ROOT/regular-null"
+printf 'invalid null device must remain untouched\n' > "$REGULAR_NULL"
+run_deploy rlib-regular-null failure worker.example coordinator.example:7443 \
+    RABS_DEPLOY_CAPABILITY=dependency-rlib "RABS_TEST_NULL_PATH=$REGULAR_NULL"
+assert_capability_refusal dependency-rlib-invalid-null-device \
+    'a regular file cannot provide the archive null device'
+grep -Fxq 'invalid null device must remain untouched' "$REGULAR_NULL" \
+    || fail 'archive preflight opened or truncated the invalid null file'
+[[ $(wc -l < "$CASE_DIR/bwrap.log") == 1 ]] \
+    || fail 'the regular null fixture reached the archive no-op'
+
+SYMLINK_NULL="$TEST_ROOT/symlink-null"
+ln -s /dev/null "$SYMLINK_NULL"
+run_deploy rlib-symlink-null failure worker.example coordinator.example:7443 \
+    RABS_DEPLOY_CAPABILITY=dependency-rlib "RABS_TEST_NULL_PATH=$SYMLINK_NULL"
+assert_capability_refusal dependency-rlib-invalid-null-device \
+    'a symlink to the real null device cannot enter archive deployment'
+[[ -L "$SYMLINK_NULL" && $(wc -l < "$CASE_DIR/bwrap.log") == 1 ]] \
+    || fail 'the null symlink was replaced or reached the archive no-op'
+
+run_deploy rlib-non-linux failure worker.example coordinator.example:7443 \
+    RABS_DEPLOY_CAPABILITY=dependency-rlib RABS_TEST_KERNEL=Darwin
+assert_capability_refusal dependency-rlib-requires-linux 'archive deployment requires Linux'
+[[ ! -s "$CASE_DIR/bwrap.log" ]] || fail 'non-Linux archive deployment ran bubblewrap'
 
 run_deploy systemd-unavailable failure worker.example coordinator.example:7443 \
     RABS_TEST_SYSTEMCTL_FAIL=show-environment
@@ -408,6 +544,8 @@ assert_installation() {
     assert_mode "$CASE_DIR/remote$stage/worker.key" 600
     assert_mode "$unit" 644
     assert_mode "$CASE_DIR/remote/usr/local/bin/rabs-wkr" 755
+    ! grep -q 'RABS_DEPLOY_CAPABILITY' "$unit" "$environment_file" \
+        || fail 'deployment admission became a persistent worker capability claim'
     cmp "$CERT_DIR/coordinator-ca.pem" "$CASE_DIR/remote$stage/ca.pem" \
         || fail 'coordinator CA bytes changed in transfer'
     cmp "$CERT_DIR/$client.pem" "$CASE_DIR/remote$stage/worker.pem" \
@@ -474,6 +612,8 @@ assert_installation() {
 
 run_deploy successful success worker.example coordinator.example:7443
 assert_installation client coordinator.example:7443 coordinator.example
+grep -Fq '"status":"canonical-ok"' "$CASE_STDOUT" \
+    || fail 'the default deployment lost its canonical capability requirement'
 FIRST_STAGE=$LAST_STAGE
 pass 'valid credentials transfer exactly, remain private, and route through the installed service'
 
@@ -486,6 +626,54 @@ cmp "$CERT_DIR/client.key" "$CASE_DIR/remote$FIRST_STAGE/worker.key" \
 [[ $(grep -c '^restart rabs-wkr.service$' "$CASE_DIR/systemctl.log") == 2 ]] \
     || fail 'redeployment did not explicitly restart an already-enabled service'
 pass 'redeployment uses a new private generation, restarts, and retains prior state'
+
+assert_archive_probe() {
+    # This is the native archive no-op argv, including its trusted measurement
+    # runtime. Exact comparison prevents extra proc/device/host-root mounts or
+    # a missing namespace, temporary root, clearenv or final working directory.
+    local expected='--die-with-parent --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net --hostname rabs --clearenv --dir /dev --dev-bind /dev/null /dev/null --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache --ro-bind-try /etc/alternatives /etc/alternatives --tmpfs /tmp --tmpfs /__rabs/tmp --chdir /__rabs/tmp -- /usr/bin/true'
+    printf '%s\n' --version "$expected" > "$CASE_DIR/expected-archive-probe"
+    cmp "$CASE_DIR/expected-archive-probe" "$CASE_DIR/bwrap.log" \
+        || fail 'archive deployment probe differs from the native namespace'
+    printf '%s\n' caller-environment unset > "$CASE_DIR/expected-probe-env"
+    cmp "$CASE_DIR/expected-probe-env" "$CASE_DIR/bwrap-env.log" \
+        || fail 'archive namespace probe inherited the caller environment'
+    [[ $(wc -l < "$CASE_DIR/null-stat.log") == 2 ]] \
+        || fail 'archive probe did not validate the null device before and after execution'
+    grep -Fq '"status":"dependency-rlib-ok"' "$CASE_STDOUT" \
+        || fail 'archive deployment did not report its measured capability'
+    ! grep -Fq '"status":"canonical-ok"' "$CASE_STDOUT" \
+        || fail 'archive deployment falsely reported canonical capability'
+}
+
+for facet in --proc --dev; do
+    run_deploy "rlib-without-${facet#--}" success worker.example coordinator.example:7443 \
+        RABS_DEPLOY_CAPABILITY=dependency-rlib "RABS_TEST_BWRAP_DENY=$facet"
+    assert_installation client coordinator.example:7443 coordinator.example
+    assert_archive_probe
+    pass "explicit archive deployment works when the host refuses canonical $facet"
+done
+
+# The admission selection belongs to this invocation alone. Reusing the same
+# managed worker without the variable must require canonical capability again,
+# preserving the successful archive deployment on that refusal.
+run_deploy rlib-without-dev failure worker.example coordinator.example:7443 RABS_TEST_BWRAP_DENY=--dev
+grep -Fq 'refused:bwrap-present-but-canonical-fails' "$CASE_STDOUT" \
+    || fail 'an omitted capability reused the previous archive admission'
+snapshot_remote > "$CASE_DIR/attempt-$ATTEMPT.after"
+cmp "$CASE_DIR/attempt-$ATTEMPT.before" "$CASE_DIR/attempt-$ATTEMPT.after" \
+    || fail 'a later canonical refusal changed the existing archive deployment'
+[[ $(grep -c '^restart rabs-wkr.service$' "$CASE_DIR/systemctl.log") == 1 ]] \
+    || fail 'a later canonical refusal restarted the existing archive worker'
+pass 'archive admission is not persisted and omitted selection still requires canonical isolation'
+
+run_deploy explicit-canonical success worker.example coordinator.example:7443 RABS_DEPLOY_CAPABILITY=canonical
+assert_installation client coordinator.example:7443 coordinator.example
+grep -Fq '"status":"canonical-ok"' "$CASE_STDOUT" \
+    || fail 'explicit canonical deployment reported another capability'
+[[ $(wc -l < "$CASE_DIR/bwrap.log") == 1 && ! -e "$CASE_DIR/null-stat.log" ]] \
+    || fail 'canonical deployment acquired the archive-only gate'
+pass 'explicit canonical selection retains the original namespace requirement'
 
 # The selected TLS identity alone does not set the protocol's worker label.
 # Both the direct worker CLI's identity and its durable journal location must

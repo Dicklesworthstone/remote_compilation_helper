@@ -94,6 +94,27 @@ activation, the script prints the public certificate SPKI SHA-256 to use for
 `RABS_DEPENDENCY_WORKER_SPKI_SHA256`. Successful service startup does not prove
 that the coordinator has accepted a worker session.
 
+Deployment requires the complete canonical namespace by default. For an
+archive worker on a Linux host that cannot mount private procfs, set
+`RABS_DEPLOY_CAPABILITY=dependency-rlib` on the deployment command above.
+The selector accepts only `canonical` or `dependency-rlib`; an empty or unknown
+value refuses locally before contacting SSH. The archive probe measures the
+same user, PID, IPC, UTS and network isolation as native archive execution,
+with a cleared environment, private `/tmp` and `/__rabs/tmp`, and only the
+nonsymlink Linux null character device (major 1, minor 3). It checks the device
+before and after the no-op and never mounts procfs or a general device tree.
+Trusted read-only host runtime files allow the probe's `/usr/bin/true` to run;
+real dependency compilation still requires the separately retained keyed
+runtime and complete captured inputs.
+
+A successful archive probe reports `dependency-rlib-ok`. It does not claim
+canonical or metadata execution support. Probe failures refuse before any
+credential, binary, service or journal changes. The selector applies only to
+that deployment and is not saved in the managed service: an upgrade without
+it requires canonical capability again. The installed worker independently
+measures and advertises its execution modes, and the coordinator still must
+negotiate the requested mode before admitting a compiler invocation.
+
 `RABS_WORKER_ID` and `RABS_WORKER_STATE_DIR` are optional. On a fresh install,
 omitting them preserves the worker's short-hostname identity and default
 durable state layout. During an upgrade, omitted values are copied from the
