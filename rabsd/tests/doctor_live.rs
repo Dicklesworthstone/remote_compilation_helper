@@ -93,3 +93,90 @@ fn doctor_warns_not_fails_when_daemon_is_dead() {
     );
     assert!(out.contains("fail-open"), "{out}");
 }
+
+fn run_state_startup(owner: &std::path::Path, state: &std::path::Path, doctor: bool, mask: &str) {
+    // Keep umask changes inside the child, independent of parallel test threads.
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            "umask \"$1\"; shift; exec \"$@\"",
+            "rabs-state-startup",
+        ])
+        .arg(mask)
+        .arg(env!("CARGO_BIN_EXE_rabsd"));
+    if doctor {
+        command.arg("--doctor");
+    } else {
+        command.args(["--run-for-ms", "250"]);
+    }
+    let output = command
+        .env("RABS_SOCKET_PATH", owner.join("daemon.sock"))
+        .env("RABS_BOOT_MARKER", owner.join("daemon.boot"))
+        .env("RABS_STATE_DIR", state)
+        .env("RABS_BREAKER_FILE", owner.join("absent-breaker"))
+        .env("RABS_CONFIG", "/nonexistent-rabs-config")
+        .output()
+        .expect("run daemon state startup");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "doctor={doctor}, umask={mask}: stdout={stdout}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(if doctor {
+            "\"id\":\"state-dir\",\"severity\":\"ok\""
+        } else {
+            "\"kind\":\"janitor-cas-mounted\""
+        }),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn fresh_daemon_and_doctor_state_is_private_under_permissive_umasks() {
+    use std::os::unix::fs::PermissionsExt;
+    for mask in ["0000", "0002"] {
+        for doctor in [false, true] {
+            let owner = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let state = owner.path().join("new-parent/state");
+            run_state_startup(owner.path(), &state, doctor, mask);
+            for path in [&state, state.parent().unwrap()] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn daemon_and_doctor_preserve_existing_state_permissions_and_contents() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for mode in [0o755, 0o775] {
+        for doctor in [false, true] {
+            let owner = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let state = owner.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(mode)).unwrap();
+            let inode = std::fs::metadata(&state).unwrap().ino();
+            std::fs::write(state.join("existing-state"), b"keep existing evidence").unwrap();
+            run_state_startup(owner.path(), &state, doctor, "0002");
+            let after = std::fs::metadata(&state).unwrap();
+            assert_eq!(after.ino(), inode);
+            assert_eq!(after.permissions().mode() & 0o777, mode);
+            assert_eq!(
+                std::fs::read(state.join("existing-state")).unwrap(),
+                b"keep existing evidence"
+            );
+        }
+    }
+}

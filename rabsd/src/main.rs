@@ -65,6 +65,20 @@ fn default_under_home(rel: &str) -> String {
     std::env::var("HOME").map_or_else(|_| format!("/tmp/{rel}"), |h| format!("{h}/{rel}"))
 }
 
+/// Direct daemon and doctor startup must create the same private state root as
+/// cargo-rabs. Existing permissions remain evidence for the cache admission
+/// checks; creating a directory must never silently repair someone else's root.
+fn prepare_state_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 fn parse_release_authorization_mode(
     raw: &str,
     source: &str,
@@ -242,7 +256,7 @@ fn run_doctor() -> i32 {
         .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
     let state_dir_writable = {
         let dir = std::path::Path::new(&state_dir);
-        std::fs::create_dir_all(dir).is_ok()
+        prepare_state_directory(dir).is_ok()
             && std::fs::write(dir.join(".doctor-probe"), b"ok").is_ok()
             && std::fs::remove_file(dir.join(".doctor-probe")).is_ok()
     };
@@ -634,8 +648,10 @@ fn main() {
     // that may commit (I8/I9/I10) — publishes through it. A failed mount
     // is carried into the janitor region so it still lands in the
     // shutdown receipt as that region's abandoned obligation.
-    let mounted =
-        rabsd::janitor::store::mount_and_reconcile(&state_dir.join("cas")).map(std::sync::Arc::new);
+    let mounted = prepare_state_directory(&state_dir)
+        .map_err(|error| format!("state root {}: {error}", state_dir.display()))
+        .and_then(|()| rabsd::janitor::store::mount_and_reconcile(&state_dir.join("cas")))
+        .map(std::sync::Arc::new);
     // The live coordinator (S6): shared edge<->coord in-process, with
     // the structural authority split intact — the coord region owns its
     // availability; the edge only consults it.

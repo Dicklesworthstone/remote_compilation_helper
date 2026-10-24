@@ -702,17 +702,53 @@ fn main() {
     ));
 }
 
-/// Partial input belongs to the session, not to a disposable read future.
+/// Partial input and coalesced tails belong to the session, not to a disposable
+/// read future. Keep this owner across the admission-to-execution handoff.
 #[derive(Default)]
 struct FrameReader {
     pending: Vec<u8>,
+    scanned: usize,
 }
 
 impl FrameReader {
+    const READ_BYTES: usize = 4096;
+    const READS_PER_YIELD: usize = 32;
+
     async fn read<R: AsyncRead + Unpin>(&mut self, stream: &mut R) -> io::Result<Option<String>> {
-        let mut byte = [0_u8; 1];
+        let mut chunk = [0_u8; Self::READ_BYTES];
+        let mut reads = 0;
         loop {
-            if stream.read(&mut byte).await? == 0 {
+            if let Some(offset) = self.pending[self.scanned..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                let end = self.scanned + offset;
+                if end > MAX_FRAME_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "frame too large",
+                    ));
+                }
+                let tail = self.pending.split_off(end + 1);
+                let mut frame = std::mem::replace(&mut self.pending, tail);
+                frame.truncate(end);
+                self.scanned = 0;
+                return String::from_utf8(frame)
+                    .map(Some)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 frame"));
+            }
+            if self.pending.len() > MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            self.scanned = self.pending.len();
+            // The extra byte permits a newline exactly at the frame limit.
+            // An oversized prefix never causes an unbounded read or allocation.
+            let capacity = chunk.len().min(MAX_FRAME_BYTES + 1 - self.pending.len());
+            let count = stream.read(&mut chunk[..capacity]).await?;
+            if count == 0 {
                 return if self.pending.is_empty() {
                     Ok(None)
                 } else {
@@ -722,18 +758,25 @@ impl FrameReader {
                     ))
                 };
             }
-            if byte[0] == b'\n' {
-                return String::from_utf8(std::mem::take(&mut self.pending))
-                    .map(Some)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 frame"));
+            self.pending.extend_from_slice(&chunk[..count]);
+            reads += 1;
+            if reads == Self::READS_PER_YIELD {
+                // A ready stream still yields to next_event's cancellation,
+                // absolute input deadlines and filesystem/process completions.
+                // All received bytes already belong to this persistent reader.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                reads = 0;
             }
-            if self.pending.len() == MAX_FRAME_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "frame too large",
-                ));
-            }
-            self.pending.push(byte[0]);
         }
     }
 }
@@ -1194,9 +1237,8 @@ where
     .await
 }
 
-/// Production always supplies a durable journal. None is a test seam, never an
-/// IO-failure fallback. Input verification precedes durable admission and lease
-/// arming. Launch MUST retain both input owners through process and drain cleanup.
+/// Session fixtures begin after admission and own no buffered handshake bytes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_session_with_inputs<S, L, H>(
     stream: &mut S,
@@ -1244,9 +1286,64 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_session_with_input_budgets<S, L, H>(
     stream: &mut S,
+    report: &rabs_wkr::session::CapabilityReport,
+    once: bool,
+    journal: Option<&mut WorkerJournal>,
+    artifact_transfer_enabled: bool,
+    source_transfer_enabled: bool,
+    toolchain_transfer_enabled: bool,
+    output_preview_enabled: bool,
+    execution_lease: &ExecutionLeaseSelection,
+    toolchain_reuse_enabled: bool,
+    dependency_mode: Option<DependencyExecutionMode>,
+    input_budgets: InputBudgets,
+    launch: L,
+    heartbeat: H,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    L: FnMut(
+        CanonicalExecRequest,
+        Duration,
+        Option<ArtifactPlan>,
+        Option<SourceOwner>,
+        Option<ToolchainOwner>,
+        Option<(RequestExecutionLeaseIdentity, u64)>,
+    ) -> io::Result<ExecutionTask>,
+    H: FnMut() -> rabs_wkr::session::PressureSample,
+{
+    drive_session_with_reader(
+        stream,
+        FrameReader::default(),
+        report,
+        once,
+        journal,
+        artifact_transfer_enabled,
+        source_transfer_enabled,
+        toolchain_transfer_enabled,
+        output_preview_enabled,
+        execution_lease,
+        toolchain_reuse_enabled,
+        dependency_mode,
+        input_budgets,
+        launch,
+        heartbeat,
+    )
+    .await
+}
+
+/// Production always supplies a durable journal and the admission reader.
+/// None is a test seam, never an IO-failure fallback. Input verification
+/// precedes durable admission and lease arming. Launch MUST retain both input
+/// owners through process and drain cleanup.
+#[allow(clippy::too_many_arguments)]
+async fn drive_session_with_reader<S, L, H>(
+    stream: &mut S,
+    mut reader: FrameReader,
     report: &rabs_wkr::session::CapabilityReport,
     once: bool,
     mut journal: Option<&mut WorkerJournal>,
@@ -1287,7 +1384,6 @@ where
     if dependency_mode.is_some_and(|mode| !report.dependency_modes.contains(&mode)) {
         return Err("dependency execution mode unavailable".to_owned());
     }
-    let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
     let mut last_admitted: Option<u64> = None;
     let mut pending_output: Option<PendingOutput> = None;
@@ -1751,6 +1847,7 @@ async fn session_loop(
     };
     let target_scope =
         rabs_wkr::target_cache::TargetCacheScope::new(&report.worker_id, coordinator, &recipient);
+    let mut reader = FrameReader::default();
     let (
         capture_output,
         capture_artifacts,
@@ -1787,7 +1884,6 @@ async fn session_loop(
             write_frame(&mut stream, &hello.to_string())
                 .await
                 .map_err(|e| format!("hello write: {e}"))?;
-            let mut reader = FrameReader::default();
             let first = reader
                 .read(&mut stream)
                 .await
@@ -1903,8 +1999,9 @@ async fn session_loop(
         journal.authorize_result_recipient(recipient.clone());
     }
     *admitted_at = Some(std::time::Instant::now());
-    let outcome = drive_session_with_inputs(
+    let outcome = drive_session_with_reader(
         &mut stream,
+        reader,
         report,
         once,
         Some(&mut *journal),
@@ -1915,6 +2012,7 @@ async fn session_loop(
         &execution_lease,
         reuse_toolchain,
         dependency_context,
+        InputBudgets::default(),
         |request, timeout, artifacts, source, toolchain, lease| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
@@ -2681,6 +2779,271 @@ mod tests {
                     .kind(),
                 kind
             );
+        }
+    }
+
+    mod frame_reader_tests {
+        use super::*;
+
+        /// Controlled read fragmentation and counters exercise the real reader
+        /// without timing assertions or a throughput claim about this fixture.
+        struct BulkWire {
+            input: Vec<u8>,
+            offset: usize,
+            fragment: usize,
+            reads: usize,
+            largest_read: usize,
+            output: Vec<u8>,
+            flushes: Arc<AtomicUsize>,
+        }
+
+        impl BulkWire {
+            fn new(input: Vec<u8>, fragment: usize) -> Self {
+                assert!(fragment != 0);
+                Self {
+                    input,
+                    offset: 0,
+                    fragment,
+                    reads: 0,
+                    largest_read: 0,
+                    output: Vec::new(),
+                    flushes: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+        }
+
+        impl AsyncRead for BulkWire {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                this.reads += 1;
+                this.largest_read = this.largest_read.max(buffer.remaining());
+                let count = buffer
+                    .remaining()
+                    .min(this.fragment)
+                    .min(this.input.len() - this.offset);
+                buffer.put_slice(&this.input[this.offset..this.offset + count]);
+                this.offset += count;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for BulkWire {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.get_mut().output.extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        #[test]
+        fn compiler_chunk_uses_bounded_reads_instead_of_one_poll_per_byte() {
+            let frame = serde_json::json!({
+                "kind": "toolchain-chunk", "data_hex": "ab".repeat(65_536),
+            })
+            .to_string();
+            let bytes = format!("{frame}\n").into_bytes();
+            let expected_reads = bytes.len().div_ceil(FrameReader::READ_BYTES);
+            let mut wire = BulkWire::new(bytes, FrameReader::READ_BYTES);
+            let mut reader = FrameReader::default();
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some(frame));
+            assert_eq!(wire.reads, expected_reads);
+            assert_eq!(wire.largest_read, FrameReader::READ_BYTES);
+            assert!(reader.pending.is_empty());
+        }
+
+        #[test]
+        fn native_atp_records_are_drained_without_one_tls_flush_per_payload_byte() {
+            use asupersync::bytes::BytesMut;
+            use asupersync::codec::Encoder;
+            use asupersync::net::atp::protocol::codec::AtpFrameCodec;
+            use asupersync::net::atp::protocol::frames::{Frame, FrameType, ProtocolVersion};
+            use rabs_asupersync::worker_transport::JsonAtpStream;
+
+            let frame = serde_json::json!({
+                "kind": "toolchain-chunk", "data_hex": "cd".repeat(65_536),
+            })
+            .to_string();
+            let mut encoded = BytesMut::new();
+            AtpFrameCodec::new()
+                .encode(
+                    Frame::new(
+                        ProtocolVersion::CURRENT,
+                        FrameType::Control,
+                        frame.as_bytes().to_vec(),
+                    )
+                    .unwrap(),
+                    &mut encoded,
+                )
+                .unwrap();
+            let wire = BulkWire::new(encoded.to_vec(), FrameReader::READ_BYTES);
+            let flushes = Arc::clone(&wire.flushes);
+            let mut transport = JsonAtpStream::new(wire);
+            let mut reader = FrameReader::default();
+            let expected_reads = (frame.len() + 1).div_ceil(FrameReader::READ_BYTES);
+            assert_eq!(wait(reader.read(&mut transport)).unwrap(), Some(frame));
+            // The native adapter may yield while decoding the ATP payload.
+            // Its underlying flush count must still scale with chunks, not
+            // the 131,072 hex digits in this ordinary compiler upload record.
+            assert!(flushes.load(Ordering::Relaxed) <= expected_reads + 2);
+        }
+
+        #[test]
+        fn coalesced_frames_and_fragmented_utf8_preserve_exact_records() {
+            let frames = [
+                String::new(),
+                serde_json::json!({"kind":"ping", "label":"雪🦀\nquoted"}).to_string(),
+                "[1,2]".to_owned(),
+                "last".to_owned(),
+            ];
+            let bytes = frames
+                .iter()
+                .map(|frame| format!("{frame}\n"))
+                .collect::<String>()
+                .into_bytes();
+            for fragment in [1, 7, FrameReader::READ_BYTES] {
+                let mut wire = BulkWire::new(bytes.clone(), fragment);
+                let mut reader = FrameReader::default();
+                for frame in &frames {
+                    assert_eq!(wait(reader.read(&mut wire)).unwrap().as_ref(), Some(frame));
+                }
+                if fragment == FrameReader::READ_BYTES {
+                    assert_eq!(wire.reads, 1, "coalesced tails need no further stream read");
+                }
+                assert_eq!(wait(reader.read(&mut wire)).unwrap(), None);
+            }
+            for fragment in [1, FrameReader::READ_BYTES] {
+                let mut wire = BulkWire::new(vec![0xf0, 0x9f, 0xa6, b'\n'], fragment);
+                assert_eq!(
+                    wait(FrameReader::default().read(&mut wire))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidData,
+                );
+            }
+        }
+
+        #[test]
+        fn exact_frame_limit_accepts_terminator_and_preserves_the_next_frame() {
+            let frame = "x".repeat(MAX_FRAME_BYTES);
+            let mut wire = BulkWire::new(
+                format!("{frame}\nnext\n").into_bytes(),
+                FrameReader::READ_BYTES,
+            );
+            let mut reader = FrameReader::default();
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some(frame));
+            assert_eq!(wire.offset, MAX_FRAME_BYTES + 1);
+            assert_eq!(
+                wait(reader.read(&mut wire)).unwrap().as_deref(),
+                Some("next")
+            );
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), None);
+
+            for terminator in [b"".as_slice(), b"\n".as_slice()] {
+                let mut bytes = vec![b'x'; MAX_FRAME_BYTES + 1];
+                bytes.extend_from_slice(terminator);
+                let mut wire = BulkWire::new(bytes, FrameReader::READ_BYTES);
+                let mut reader = FrameReader::default();
+                assert_eq!(
+                    wait(reader.read(&mut wire)).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                );
+                assert_eq!(wire.offset, MAX_FRAME_BYTES + 1);
+                assert_eq!(reader.pending.len(), MAX_FRAME_BYTES + 1);
+            }
+            let mut wire = BulkWire::new(vec![b'x'; MAX_FRAME_BYTES], FrameReader::READ_BYTES);
+            assert_eq!(
+                wait(FrameReader::default().read(&mut wire))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof,
+            );
+        }
+
+        #[test]
+        fn dropping_a_yielded_bulk_read_preserves_its_partial_frame() {
+            let frame = "x".repeat(FrameReader::READ_BYTES * FrameReader::READS_PER_YIELD + 137);
+            let bytes = format!("{frame}\n").into_bytes();
+            let expected_reads = bytes.len().div_ceil(FrameReader::READ_BYTES);
+            let mut wire = BulkWire::new(bytes, FrameReader::READ_BYTES);
+            let mut reader = FrameReader::default();
+            let mut read = Box::pin(reader.read(&mut wire));
+            let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+            assert!(
+                read.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            drop(read);
+            assert_eq!(wire.reads, FrameReader::READS_PER_YIELD);
+            assert!(!reader.pending.is_empty());
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some(frame));
+            assert_eq!(wire.reads, expected_reads);
+        }
+
+        #[test]
+        fn admission_reader_hands_coalesced_commands_to_the_production_driver() {
+            let ack = serde_json::json!({"kind":"session-ok", "session_id":7}).to_string();
+            let mut wire = BulkWire::new(
+                format!(
+                    "{ack}\n{{\"kind\":\"ping\"}}\n{{\"kind\":\"unknown\",\"request_id\":9}}\n"
+                )
+                .into_bytes(),
+                FrameReader::READ_BYTES,
+            );
+            let mut reader = FrameReader::default();
+            assert_eq!(
+                wait(reader.read(&mut wire)).unwrap().as_deref(),
+                Some(ack.as_str())
+            );
+            assert!(session_ack_accepted(&ack));
+            assert_eq!(wire.reads, 1);
+            assert_eq!(wire.offset, wire.input.len());
+            assert!(!reader.pending.is_empty());
+            wait(drive_session_with_reader(
+                &mut wire,
+                reader,
+                &report(),
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                &ExecutionLeaseSelection::default(),
+                false,
+                None,
+                InputBudgets::default(),
+                |_, _, _, _, _, _| panic!("control frames must not launch execution"),
+                pressure,
+            ))
+            .unwrap();
+            let replies: Vec<serde_json::Value> = wire
+                .output
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[0]["kind"], "heartbeat");
+            assert_eq!(replies[1]["kind"], "error");
+            assert_eq!(replies[1]["request_id"], 9);
+            assert_eq!(replies[1]["reason"], "unknown-frame");
         }
     }
 
