@@ -365,15 +365,31 @@ pub(super) fn validate_source_authority_intent(
     Ok(())
 }
 
-fn source_registry_setup(registry: &str) -> String {
+pub(super) fn source_registry_setup(registry: &str) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    // mkdir -p can create more than the final directory. Persist each new
+    // directory entry bottom-up; replacing syncfs must not lose its implicit
+    // ancestor barriers. '/.' follows legitimate ancestor aliases such as
+    // Darwin's /tmp while the registry and record leaves remain no-follow.
+    let mut paths = ["released", "cancelled", "quarantine"]
+        .map(|name| format!("{registry}/{name}"))
+        .to_vec();
+    paths.push(registry.to_owned());
+    paths.extend(
+        Path::new(registry)
+            .ancestors()
+            .skip(1)
+            .map(|parent| parent.join(".").display().to_string()),
+    );
+    let borrowed: Vec<_> = paths.iter().map(String::as_str).collect();
     format!(
         "set -eu; umask 077; registry={registry}; \
          [ ! -L \"$registry\" ]; mkdir -p -- \"$registry\"; \
          for directory in \"$registry/released\" \"$registry/cancelled\" \"$registry/quarantine\"; do \
          [ ! -L \"$directory\" ]; mkdir -p -- \"$directory\"; done; \
-         [ ! -L \"$registry/metadata.lock\" ]; sync -f \"$registry\";\n",
+         [ ! -L \"$registry/metadata.lock\" ]; {sync_registry};\n",
         registry = quote(registry),
+        sync_registry = crate::transfer::file_fsync_command(&borrowed),
     )
 }
 
@@ -844,14 +860,16 @@ pub(super) async fn recover_clean_overlay_source_pair(
          printf '%s\\n' {ready}; IFS= read -r request; \
          [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
          [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
-         printf '%s\\n' {token} > {receipt}; sync -f {receipt}; \
-         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf '%s\\n' {release}",
+         printf '%s\\n' {token} > {receipt}; {flush_receipt}; \
+         printf 'released\\n' > \"$owner\"; {flush_owner}; printf '%s\\n' {release}",
         owner = quote(&owner),
         root = quote(source_root),
         token = quote(token),
         ready = quote(&ready),
         release = quote(&release),
         receipt = quote(&receipt),
+        flush_receipt = source_pair_fsync(&receipt),
+        flush_owner = source_pair_fsync(&owner),
     );
     let command = format!(
         "exec flock -x {} sh -c {}",
@@ -889,8 +907,8 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
          owner={owner}; [ ! -L \"$owner\" ]; \
          if [ -f \"$owner\" ] && [ \"$(cat \"$owner\")\" = \"$token\" ]; \
          then if [ \"$owned\" -eq 1 ]; then printf owned; else \
-         printf '%s\\n' \"$token\" > {receipt}; sync -f {receipt}; \
-         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf unowned; fi; \
+         printf '%s\\n' \"$token\" > {receipt}; {flush_receipt}; \
+         printf 'released\\n' > \"$owner\"; {flush_owner}; printf unowned; fi; \
          else printf unowned; fi",
         registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
         token = quote(token),
@@ -899,6 +917,11 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
             "{lock}.released-{}",
             blake3::hash(token.as_bytes()).to_hex()
         )),
+        flush_receipt = source_pair_fsync(&format!(
+            "{lock}.released-{}",
+            blake3::hash(token.as_bytes()).to_hex()
+        )),
+        flush_owner = source_pair_fsync(&format!("{lock}.owner")),
     );
     let command = format!("flock -x -- {} sh -c {}", quote(&lock), quote(&script));
     let output =
@@ -936,14 +959,16 @@ pub(super) async fn clean_overlay_source_pair_was_released(
     let script = format!(
         "set -eu; [ ! -L {receipt} ]; \
          if [ ! -f {receipt} ]; then printf pending; exit 0; fi; \
-         [ \"$(cat {receipt})\" = {token} ]; [ ! -L {owner} ]; \
+         [ \"$(cat {receipt})\" = {token} ]; {flush_receipt}; [ ! -L {owner} ]; \
          if [ \"$(cat {owner})\" = {token} ]; then \
          [ ! -e {root} ] && [ ! -L {root} ]; \
-         printf 'released\\n' > {owner}; sync -f {owner}; fi; printf released",
+         printf 'released\\n' > {owner}; fi; {flush_owner}; printf released",
         receipt = quote(&receipt),
         token = quote(token),
         owner = quote(&owner),
         root = quote(source_root),
+        flush_receipt = source_pair_fsync(&receipt),
+        flush_owner = source_pair_fsync(&owner),
     );
     let command = format!("flock -x {} sh -c {}", quote(&lock_path), quote(&script));
     let output = run_offload_ssh_command_with_stdin(
@@ -962,6 +987,15 @@ pub(super) async fn clean_overlay_source_pair_was_released(
         b"pending" => Ok(false),
         _ => anyhow::bail!("invalid source-pair release response"),
     }
+}
+
+// Persist the record and its directory entry. A filesystem-wide sync can stall
+// behind unrelated builds; file-only fsync would lose a newly created name.
+fn source_pair_fsync(path: &str) -> String {
+    let parent = std::path::Path::new(path)
+        .parent()
+        .expect("source pair has a parent");
+    crate::transfer::file_fsync_command(&[path, &format!("{}/.", parent.display())])
 }
 
 fn clean_overlay_source_pair_lock_command(
@@ -987,12 +1021,12 @@ fn clean_overlay_source_pair_lock_command(
          echo 'RCH: source pair has an unfinished owner; inspect the prior job or use RCH_DISABLE_TARGET_REUSE=1' >&2; exit 1; fi; \
          if [ -e \"$root\" ] || [ -L \"$root\" ]; then \
          echo 'RCH: source pair has unretired source; refusing reuse' >&2; exit 1; fi; \
-         printf '%s\\n' \"$token\" > \"$owner\"; sync -f \"$owner\"; \
-         sync -f \"$(dirname \"$owner\")\"",
+         printf '%s\\n' \"$token\" > \"$owner\"; {flush_owner}",
         owner = quote(&owner),
         root = quote(source_root),
         token = quote(token),
         registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
+        flush_owner = source_pair_fsync(&owner),
     );
     let script = format!(
         "{setup}flock -x -- {metadata_lock} sh -c {creation}; \
@@ -1000,8 +1034,8 @@ fn clean_overlay_source_pair_lock_command(
          printf '%s\\n' {ready}; IFS= read -r request; \
          [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
          [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
-         printf '%s\\n' {token} > {receipt}; sync -f {receipt}; \
-         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf '%s\\n' {release}",
+         printf '%s\\n' {token} > {receipt}; {flush_receipt}; \
+         printf 'released\\n' > \"$owner\"; {flush_owner}; printf '%s\\n' {release}",
         owner = quote(&owner),
         root = quote(source_root),
         token = quote(token),
@@ -1011,6 +1045,8 @@ fn clean_overlay_source_pair_lock_command(
         setup = source_registry_setup(REMOTE_SOURCE_CLAIM_REGISTRY),
         metadata_lock = quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
         creation = quote(&creation),
+        flush_receipt = source_pair_fsync(&receipt),
+        flush_owner = source_pair_fsync(&owner),
     );
     format!(
         "mkdir -p {} && exec flock -x {} sh -c {}",
@@ -2744,6 +2780,73 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_flushes_only_named_objects_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let python = std::process::Command::new("python3")
+            .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
+        let python = String::from_utf8(python.stdout).unwrap().trim().to_owned();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for mode in ["ok", "registry", "pending"] {
+            let root = retained.join(mode);
+            let bin = root.join("bin");
+            let source = root.join("source with ' quotes");
+            let registry = root.join("registry");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            // Utility sync must never be invoked: uutils may flush the whole
+            // machine even with a file operand. The wrapper otherwise delegates
+            // to real Python and real fsync, injecting only the named failure.
+            std::fs::write(
+                bin.join("sync"),
+                "#!/bin/sh\necho unexpected-global-sync >&2\nexit 97\n",
+            )
+            .unwrap();
+            std::fs::write(bin.join("python3"), format!(
+                r#"#!{python}
+import os, sys
+args = sys.argv[1:]
+if len(args) >= 5 and args[:3] == ['-I', '-S', '-c'] and 'os.fsync(' in args[3]:
+ mode = os.environ['RCH_TEST_FLUSH_MODE']
+ if any((mode == 'registry' and path.endswith('/registry')) or (mode == 'pending' and os.path.basename(path).startswith('.record-write.')) for path in args[4:]):
+  sys.exit(86)
+os.execv({python:?}, [{python:?}] + args)
+"#
+            )).unwrap();
+            for name in ["sync", "python3"] {
+                std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            let roots = vec![source.display().to_string()];
+            let command =
+                source_intent_command(registry.to_str().unwrap(), &roots, "ba01", "acquire")
+                    .unwrap();
+            let output = timeout(
+                Duration::from_secs(10),
+                Command::new("sh")
+                    .args(["-c", &command])
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("RCH_TEST_FLUSH_MODE", mode)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(output.status.success(), mode == "ok", "{mode}: {output:?}");
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("unexpected-global-sync"));
+            let (_, digest) = source_claim_roots(&roots).unwrap();
+            assert_eq!(
+                registry.join(format!("ba01.{digest}.claim")).exists(),
+                mode == "ok"
+            );
+        }
     }
 
     #[cfg(unix)]

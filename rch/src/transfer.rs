@@ -1301,6 +1301,23 @@ fi
     )
 }
 
+/// Sync only these records, including directories. Explicit fsync avoids both
+/// syncfs and uutils versions that silently implement `sync FILE` as sync().
+/// Python is also used by the existing namespace and artifact custody paths.
+/// Missing Python or any failed barrier is an error, never a broad-sync fallback.
+pub(crate) fn file_fsync_command(paths: &[&str]) -> String {
+    let script = "import os, sys\nfor path in sys.argv[1:]:\n fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n try: os.fsync(fd)\n finally: os.close(fd)";
+    format!(
+        "python3 -I -S -c {} {}",
+        escape(Cow::Borrowed(script)),
+        paths
+            .iter()
+            .map(|path| escape(Cow::Borrowed(*path)).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 /// Removes every file the durable supervisor writes beside `path`; the claim
 /// is an empty `mkdir` directory. Succeeds when nothing is left.
 fn recovery_completion_cleanup_script(path: &str) -> String {
@@ -3184,12 +3201,17 @@ impl TransferPipeline {
         // The receipts stay private, but the workload runs under the caller's
         // umask: a leaked 077 made every remote output 0600/0700, and rsync -a
         // carried those modes home.
+        // sync -f uses syncfs, and uutils 0.10 even implements sync FILE as
+        // global sync(). Both can hold a completed job behind unrelated writes.
+        // Call fsync explicitly, including the directory after publication.
         let supervisor = format!(
-            "trap '' HUP; ( {command}\n) </dev/null; s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
+            "trap '' HUP; ( {command}\n) </dev/null; s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && {sync_pending} && mv -f -- {pending} {done} && {sync_directory}; exit \"$s\"",
             identity = quote(identity),
             pending = quote(&format!("{path}.pending")),
             done = quote(path),
-            directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
+            sync_pending = file_fsync_command(&[&format!("{path}.pending")]),
+            sync_directory =
+                file_fsync_command(&[Path::new(path).parent().unwrap().to_str().unwrap()]),
         );
         // The disk/process wrappers already contain quoted scripts. Passing
         // their composition as one more `sh -c` argument can exceed Linux's
@@ -3248,6 +3270,7 @@ impl TransferPipeline {
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
              [ -f {done} ] && [ ! -L {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt; execution outcome remains unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
+             {sync_completion} || {{ printf '%s\\n' 'RCH: completion durability unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -3265,6 +3288,8 @@ impl TransferPipeline {
             identity = quote(identity),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
             stall_ticks = stall_secs * 5,
+            sync_completion =
+                file_fsync_command(&[path, Path::new(path).parent().unwrap().to_str().unwrap()]),
         )
     }
 
@@ -3275,9 +3300,13 @@ impl TransferPipeline {
         let Some((path, identity)) = &self.recovery_completion else {
             return Ok(None);
         };
+        // A rename can be visible before its directory barrier succeeds. A
+        // reconnect must re-establish both barriers before trusting that name.
         let script = format!(
-            "if [ -f {p} ] && [ ! -L {p} ]; then cat -- {p}; fi",
-            p = escape(Cow::from(path.as_str()))
+            "if [ -f {p} ] && [ ! -L {p} ]; then {sync_completion} && cat -- {p}; fi",
+            p = escape(Cow::from(path.as_str())),
+            sync_completion =
+                file_fsync_command(&[path, Path::new(path).parent().unwrap().to_str().unwrap()]),
         );
         let output = tokio::time::timeout(
             Duration::from_secs(10),
@@ -10279,6 +10308,92 @@ mod tests {
         assert!(std::path::Path::new(&receipt).is_file());
     }
 
+    /// A busy filesystem must not become the completion barrier for an
+    /// unrelated job. Exercise the generated supervisor and actual file fsync;
+    /// injected barrier failures must leave even a visible receipt untrusted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_uses_file_sync_and_requires_both_barriers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (case, workload_status, expected) in [
+            ("ok", 0, 0),
+            ("workload_failure", 3, 3),
+            ("pending", 0, 255),
+            ("directory", 0, 255),
+            ("receipt", 0, 255),
+        ] {
+            let root = retained.join(case);
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let global_sync = bin.join("sync");
+            std::fs::write(&global_sync, "#!/bin/sh\nexit 91\n").unwrap();
+            std::fs::set_permissions(&global_sync, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let receipt = root.join("completion");
+            let calls = root.join("sync.calls");
+            let invocations = root.join("invocations");
+            let sync = bin.join("python3");
+            std::fs::write(
+                &sync,
+                "#!/bin/sh\n\
+                 for path do\n\
+                  case \"$path\" in /*) printf '%s\\n' \"$path\" >> \"$RCH_TEST_SYNC_LOG\";; *) continue;; esac\n\
+                  case \"$RCH_TEST_SYNC_FAILURE:$path\" in pending:*.pending) exit 74;; esac\n\
+                  if [ \"$RCH_TEST_SYNC_FAILURE\" = directory ] && [ -d \"$path\" ]; then exit 74; fi\n\
+                  if [ \"$RCH_TEST_SYNC_FAILURE\" = receipt ] && [ \"$path\" = \"$RCH_TEST_RECEIPT\" ]; then exit 74; fi\n\
+                 done\n\
+                 exec /usr/bin/python3 \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let pipeline = TransferPipeline::new(
+                root.clone(),
+                "sync-barrier".into(),
+                "abc123".into(),
+                TransferConfig::default(),
+            )
+            .with_recovery_completion(receipt.to_str().unwrap().into(), "barrier".into());
+            let command = pipeline.durable_execution_command(format!(
+                "printf 'once\\n' >> {}; printf 'rendered\\n'; exit {workload_status}",
+                escape(Cow::from(invocations.to_str().unwrap()))
+            ));
+            let script = root.join("command.sh");
+            std::fs::write(&script, command).unwrap();
+            let output = std::process::Command::new("timeout")
+                .args(["--kill-after=2s", "10s", "sh"])
+                .arg(script)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("RCH_TEST_SYNC_FAILURE", case)
+                .env("RCH_TEST_SYNC_LOG", &calls)
+                .env("RCH_TEST_RECEIPT", &receipt)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{case}: {output:?}");
+            assert_eq!(std::fs::read_to_string(invocations).unwrap(), "once\n");
+            let calls = std::fs::read_to_string(calls).unwrap();
+            assert!(calls.contains("completion.pending"), "{calls}");
+            if expected != 255 {
+                assert_eq!(output.stdout, b"rendered\n");
+                assert_eq!(
+                    std::fs::read_to_string(&receipt).unwrap(),
+                    format!("barrier {workload_status}\n")
+                );
+            } else if case == "pending" {
+                assert!(!receipt.exists());
+            } else {
+                // A failed post-rename barrier must not turn a visible record
+                // into permission to release the job's ownership.
+                assert!(receipt.is_file());
+                assert!(
+                    std::fs::read_to_string(root.join("completion.stderr"))
+                        .unwrap()
+                        .contains("completion durability unconfirmed")
+                );
+            }
+        }
+    }
+
     /// A real shell must start a supervisor larger than Linux MAX_ARG_STRLEN,
     /// without expanding its contents or exposing the script as workload stdin.
     #[cfg(target_os = "linux")]
@@ -10316,11 +10431,22 @@ mod tests {
     async fn durable_execution_composed_disk_budget_preserves_all_outcomes() {
         let _guard = test_guard!();
         let retained = tempfile::tempdir().unwrap().keep();
-        for (index, (workload, status, seconds, refuse)) in [
-            ("printf built > artifact; printf ready", 0, 15, false),
-            ("printf 'compiler failed' >&2; exit 101", 101, 15, false),
-            ("sleep 20", 137, 1, false),
-            ("printf forbidden > artifact", 120, 15, true),
+        for (index, (workload, status, seconds, refusal_floor)) in [
+            ("printf built > artifact; printf ready", 0, 15, None),
+            ("printf 'compiler failed' >&2; exit 101", 101, 15, None),
+            ("sleep 20", 137, 1, None),
+            // The supervisor admits signed-64-bit sizes. An impossible but
+            // valid floor exercises its actual pre-payload disk refusal.
+            (
+                "printf forbidden > artifact",
+                120,
+                15,
+                Some(i64::MAX as u64),
+            ),
+            // Invalid policy input has no supervisor receipt. The outer
+            // wrapper must conservatively refuse replay, not invent proof
+            // that execution never began.
+            ("printf forbidden > artifact", 120, 15, Some(u64::MAX)),
         ]
         .into_iter()
         .enumerate()
@@ -10331,10 +10457,10 @@ mod tests {
             let mut pipeline =
                 disk_budget_test_pipeline(&directory, Some(index as u64 + 1), seconds)
                     .with_recovery_completion(receipt.to_str().unwrap().into(), "composed".into());
-            if refuse {
+            if let Some(min_free_bytes) = refusal_floor {
                 pipeline = pipeline.with_disk_budget(Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 8 << 20,
-                    min_free_bytes: u64::MAX,
+                    min_free_bytes,
                 }));
             }
             let command =
@@ -10366,13 +10492,14 @@ mod tests {
                 std::fs::read_to_string(&receipt).unwrap(),
                 format!("composed {status}\n")
             );
-            if refuse {
+            if let Some(min_free_bytes) = refusal_floor {
                 let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
-                assert!(
-                    !error
+                assert_eq!(
+                    error
                         .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
                         .unwrap()
-                        .started
+                        .started,
+                    min_free_bytes == u64::MAX
                 );
                 assert!(!directory.join("artifact").exists());
             } else {

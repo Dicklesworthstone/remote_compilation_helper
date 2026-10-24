@@ -16,20 +16,25 @@ cancelled="$registry/cancelled/$token.$digest.claim"
 cancelling="$registry/$token.$digest.cancelling"
 
 # This transaction already names every record and containing-directory barrier.
-# GNU sync -f calls syncfs: under the worker-wide registry flock, that waits for
-# unrelated builds' dirty pages on the same filesystem. Use full file fsync
-# instead, preserving both data and metadata and every checked directory sync.
+# GNU sync -f calls syncfs, and uutils 0.10 sync FILE calls global sync(). Both
+# can wait for unrelated builds while holding the worker-wide registry flock.
+# Explicit fsync preserves data, metadata and every checked directory barrier.
 # The local adapter also covers the shared record helpers without changing
-# their GC callers outside this transaction. Topology's -d calls are unchanged.
-# No new utility dependency is introduced; native-Darwin performance remains
-# unqualified. Never retry a failed file sync with a broader/unchecked operation.
+# their GC callers outside this transaction. Topology's -d calls also need a
+# directory fsync, not an implementation-dependent utility invocation. Python
+# is already required by namespace custody. Missing Python fails closed.
 sync() {
     case "${1-}" in
-        -f)
-            [ "$#" -eq 2 ] && [ -n "$2" ] || return 1
-            command sync -- "$2"
+        -f|-d)
+            shift
+            if [ "${1-}" = -- ]; then shift; fi
+            [ "$#" -eq 1 ] && [ -n "$1" ] || return 1
+            python3 -I -S -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try: os.fsync(fd)
+finally: os.close(fd)' "$1"
             ;;
-        *) command sync "$@" ;;
+        *) return 1 ;;
     esac
 }
 
@@ -81,12 +86,13 @@ confirm_topology() {
     sh -c "$1" >/dev/null 2>&1 || refuse 'topology validation failed after initialization'
     while IFS= read -r topology_root; do
         [ -d "$topology_root" ] || refuse 'topology root is not a directory'
-        # fdatasync the root and its parent, not syncfs: the roots live on the
-        # worker's data filesystem, and this runs under the registry flock on
-        # every namespace setup. syncfs flushed every concurrent build's dirty
-        # pages first; on a saturated SSD a few setups queued past the 15 s
-        # budget and were killed (#111, hz3/hz4).
-        sync -d -- "$topology_root" && sync -d -- "$(dirname -- "$topology_root")" \
+        # The validated alias can itself be a symlink. Flush its resolved
+        # directory and its containing directory, then revalidate topology.
+        # The latter persists the alias entry; no-follow record opens remain
+        # mandatory everywhere else in the registry.
+        topology_resolved=$(rch_realpath_m "$topology_root") || refuse 'cannot resolve topology root'
+        topology_parent=$(rch_realpath_m "$(dirname -- "$topology_root")") || refuse 'cannot resolve topology parent'
+        sync -d -- "$topology_resolved" && sync -d -- "$topology_parent" \
             || refuse 'cannot confirm durable topology'
     done <<RCH_TOPOLOGY_ROOTS
 $requested

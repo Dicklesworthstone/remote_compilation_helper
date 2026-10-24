@@ -154,17 +154,12 @@ fn namespace_command(
     // exist in this parent. Every attempt drops its metadata flock before the
     // bounded wait, allowing exact-owner recovery to release the old claim.
     Ok(format!(
-        "set -eu\numask 077\nregistry={registry}\n\
-         [ ! -L \"$registry\" ]\nmkdir -p -- \"$registry\"\n\
-         for directory in \"$registry/released\" \"$registry/cancelled\" \"$registry/quarantine\"; do\n\
-         [ ! -L \"$directory\" ]\nmkdir -p -- \"$directory\"\ndone\n\
-         [ ! -L \"$registry/metadata.lock\" ]\nsync -f \"$registry\"\n\
-         rch_source_attempt() {{ (\nset -eu\n\
+        "{setup}rch_source_attempt() {{ (\nset -eu\n\
          exec flock -x -- \"$registry/metadata.lock\" sh -c {script} \
          rch-source-namespace \"$registry\" {identity} {digest} topology {check} {create} \
          <<'RCH_NAMESPACE_SCOPE'\n{body}RCH_NAMESPACE_SCOPE\n\
          ); }}\nrch_admission_attempts=6\n{ADMISSION}",
-        registry = quote(registry),
+        setup = super::ssh::source_registry_setup(registry),
         script = quote(&registry_script),
         identity = quote(identity),
         check = quote(&paths("check")),
