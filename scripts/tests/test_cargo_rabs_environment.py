@@ -200,6 +200,24 @@ class CanonicalEnvironment(unittest.TestCase):
             saved.append((Path(self.records()[-1]["operation"]) / "spec.json").read_bytes())
         self.assertEqual(saved[0], saved[1])
 
+    def test_incremental_policy_is_explicit_request_state_and_never_an_environment_override(self):
+        self.profile["incremental"] = True
+        self.profile["env"] = {"APP_VERSION":"worker-only"}
+        for ambient in ("0", "1"):
+            with self.subTest(ambient=ambient):
+                status, _, stderr, _ = self.invoke(env=dict(self.env, CARGO_INCREMENTAL=ambient))
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                record = self.records()[-1]
+                self.assertEqual(record["local_environment"]["CARGO_INCREMENTAL"], ambient)
+                self.assertEqual(record["request"]["command_context"]["env"], {
+                    "APP_VERSION":"worker-only", "CARGO_INCREMENTAL":"1",
+                })
+                self.assertEqual(record["request"]["artifacts"]["cargo"], "cargo-private-incremental-json-v1")
+        for value in ("0", "1", ""):
+            with self.subTest(value=value):
+                self.profile["env"] = {"CARGO_INCREMENTAL":value}
+                self.assert_refused()
+
     def test_invalid_objects_names_and_values_refuse_before_operation_creation(self):
         bad = [None, False, 1, [], "A=B", {"": "v"}, {"1BAD":"v"}, {"BAD-NAME":"v"},
                {"A=B":"v"}, {"雪":"v"}, {"A" * 257:"v"}, {"A\0":"v"}, {"A\n":"v"},

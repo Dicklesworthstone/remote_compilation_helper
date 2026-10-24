@@ -330,7 +330,10 @@ def load_canonical_intent(root, canonical_state):
             and "dependency_context" not in request
             and isinstance(artifacts, dict) and artifacts.get("unit") == "cargo"
             and artifacts.get("tree") == "tree-files-v1"
-            and artifacts.get("cargo") in ("cargo-json-v1", "cargo-test-json-v1"),
+            and artifacts.get("cargo") in (
+                "cargo-json-v1", "cargo-test-json-v1",
+                "cargo-private-incremental-json-v1", "cargo-private-incremental-test-json-v1",
+            ),
             "prepared request is not a canonical Cargo operation")
     state_fd = open_directory(state)
     try:

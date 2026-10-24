@@ -200,6 +200,51 @@ class CanonicalRecoveryTests(unittest.TestCase):
         self.assertEqual(self.events()[-1]["argv"][1], "--acknowledge")
         self.assertEqual(len(self.events()), 2)
 
+    def test_private_incremental_contracts_resume_and_acknowledge_the_exact_saved_request(self):
+        self.persisted()
+        previous = self.partial()
+        completed = self.base / "completed"
+        completed.mkdir(mode=0o700)
+        self.put(completed / "delivery.json", {"fixture":"native verifier owns result checks"})
+        original_spec = (self.root / "spec.json").read_bytes()
+        for command, contract in (
+            ("check", "cargo-private-incremental-json-v1"),
+            ("test", "cargo-private-incremental-test-json-v1"),
+        ):
+            with self.subTest(contract=contract):
+                request = json.loads(self.raw)
+                request["args"][0] = command
+                request["artifacts"]["cargo"] = contract
+                request["command_context"] = {
+                    "version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+                    "env":{"CARGO_INCREMENTAL":"1", "PRIVATE":"DO_NOT_PRINT_CANONICAL_REQUEST"},
+                }
+                raw = json.dumps(request, ensure_ascii=False, indent=2).encode()
+                self.put(self.bundle / "request.json", raw)
+                actions = (
+                    (["--resume-to", self.base / (command + "-fresh"), "--no-prefix"], "--resume"),
+                    (["--resume-to", self.base / (command + "-continued")], "--resume-from"),
+                    (["--acknowledge", completed], "--acknowledge"),
+                )
+                for arguments, action in actions:
+                    count = len(self.events())
+                    result = self.invoke(*arguments, explicit=False,
+                        env=dict(self.env, CARGO_INCREMENTAL="0"))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(self.events()), count + 1, "one result-only native handoff")
+                    event = self.events()[-1]
+                    self.assertEqual(event["argv"][:2], ["--worker-exec-tls", action])
+                    if action == "--resume-from":
+                        self.assertEqual(event["argv"][2], str(previous))
+                    self.assertEqual(event["request"], request)
+                    self.assertEqual(event["digest"], hashlib.sha256(raw).hexdigest())
+                    self.assertEqual(event["state"], str(self.state))
+                    self.assertEqual(event["request"]["command_context"]["env"]["CARGO_INCREMENTAL"], "1")
+                    self.assertNotIn(b"DO_NOT_PRINT_CANONICAL_REQUEST", result.stdout + result.stderr)
+                self.assertEqual((self.bundle / "request.json").read_bytes(), raw)
+                self.assertEqual((self.root / "spec.json").read_bytes(), original_spec)
+                self.assertEqual((previous / "diagnostics/stdout").read_bytes(), b"partial\0\xff")
+
     def test_current_launcher_operation_is_accepted_without_reconstructing_worker_arguments(self):
         source, tools, operations = (self.base / name for name in ("source", "tools", "operations"))
         for path in (source, tools / "bin", operations):
@@ -377,6 +422,11 @@ class CanonicalRecoveryTests(unittest.TestCase):
     def test_program_or_artifact_contract_mismatch_refuses_before_native_handoff(self):
         for request in (dict(self.request, program="/bin/sh"), dict(self.request, artifacts=None),
                         dict(self.request, source_manifest=None), dict(self.request, dependency_context={})):
+            self.put(self.bundle / "request.json", request)
+            self.refused(self.invoke("--resume-to", self.base / "new"))
+        for contract in ("cargo-private-incremental-json-v2", "cargo-private-incremental-test-json-v2",
+                         "cargo-private-incremental", "tree-files-v1", None, True):
+            request = dict(self.request, artifacts=dict(self.request["artifacts"], cargo=contract))
             self.put(self.bundle / "request.json", request)
             self.refused(self.invoke("--resume-to", self.base / "new"))
 

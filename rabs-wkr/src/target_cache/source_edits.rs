@@ -978,12 +978,15 @@ fn main() { println!("{}", answer()); }
     pub(super) struct CargoFixture {
         pub(super) root: tempfile::TempDir,
         pub(super) source: PathBuf,
+        incremental: bool,
     }
 
     pub(super) struct Run {
         artifacts: Vec<serde_json::Value>,
         pub(super) output: Option<(Vec<u8>, Vec<u8>)>,
         test_runs: u32,
+        incremental_files: Vec<String>,
+        incremental_reused_files: usize,
     }
 
     impl Run {
@@ -1031,7 +1034,18 @@ fn main() { println!("{}", answer()); }
             write(&source, "dep/src/lib.rs", "pub fn value() -> u32 { 1 }\n");
             write(&source, "src/main.rs", MAIN.replace("OFFSET", "0"));
             write(&source, "build.rs", BUILD.replace("GENERATED", "10"));
-            Self { root, source }
+            Self {
+                root,
+                source,
+                incremental: false,
+            }
+        }
+
+        fn with_incremental() -> Self {
+            Self {
+                incremental: true,
+                ..Self::new()
+            }
         }
 
         pub(super) fn edit(&self, name: &str, bytes: impl AsRef<[u8]>) {
@@ -1060,7 +1074,16 @@ fn main() { println!("{}", answer()); }
             cargo_home: Option<&Path>,
         ) -> Run {
             use rabs_sandbox::cargo_artifacts::{
-                CARGO_ARTIFACTS_VERSION, CARGO_TEST_ARTIFACTS_VERSION,
+                CARGO_ARTIFACTS_VERSION, CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+                CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION, CARGO_TEST_ARTIFACTS_VERSION,
+            };
+            let incremental = if self.incremental { "1" } else { "0" };
+            // This diagnostic flag is test-only. It proves reuse of rustc's
+            // actual prior session, rather than merely Cargo target freshness.
+            let rustflags = if self.incremental {
+                "-C debuginfo=0 -Z incremental-info"
+            } else {
+                "-C debuginfo=0"
             };
             let before = SourceTimes::capture(&input, &|| false).unwrap();
             let original = input.clone();
@@ -1089,7 +1112,11 @@ fn main() { println!("{}", answer()); }
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-                command_context: CommandContext::default(),
+                command_context: CommandContext::new(
+                    "/__rabs/workspace",
+                    vec![("CARGO_INCREMENTAL".into(), incremental.into())],
+                )
+                .unwrap(),
                 dependency_context: None,
                 toolchain_backing: "/fixture/toolchain".into(),
                 toolchain_identity: Some(ToolchainIdentity {
@@ -1100,21 +1127,24 @@ fn main() { println!("{}", answer()); }
                 workspace_backing: "/fixture/source".into(),
                 jobserver_grant: Some(1),
             };
-            let contract = if command == "test" {
-                CARGO_TEST_ARTIFACTS_VERSION
-            } else {
-                CARGO_ARTIFACTS_VERSION
+            let contract = match (self.incremental, command == "test") {
+                (false, false) => CARGO_ARTIFACTS_VERSION,
+                (false, true) => CARGO_TEST_ARTIFACTS_VERSION,
+                (true, false) => CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+                (true, true) => CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION,
             };
             let plan = crate::artifacts::parse_plan(&serde_json::json!({
                 "program":request.program,"args":request.args,
+                "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+                    "env":{"CARGO_INCREMENTAL":incremental}},
                 "artifacts":{"unit":"cargo","files":[],"tree":"tree-files-v1","cargo":contract}
             }))
             .unwrap()
             .unwrap();
             let mut spec = CanonicalNamespaceSpec::new();
             spec.env = vec![
-                ("CARGO_INCREMENTAL".into(), "0".into()),
-                ("RUSTFLAGS".into(), "-C debuginfo=0".into()),
+                ("CARGO_INCREMENTAL".into(), incremental.into()),
+                ("RUSTFLAGS".into(), rustflags.into()),
             ];
             if cargo_home.is_some() {
                 spec.env
@@ -1161,8 +1191,8 @@ fn main() { println!("{}", answer()); }
                 .env_remove("RUSTC_WRAPPER")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                .env("CARGO_INCREMENTAL", "0")
-                .env("RUSTFLAGS", "-C debuginfo=0");
+                .env("CARGO_INCREMENTAL", incremental)
+                .env("RUSTFLAGS", rustflags);
             if let Some(home) = cargo_home {
                 cargo.env("CARGO_HOME", home);
             }
@@ -1184,6 +1214,44 @@ fn main() { println!("{}", answer()); }
             let captured = target
                 .capture_fixture_cargo_output(result.stdout.as_slice(), || false)
                 .unwrap();
+            let incremental_reused_files = String::from_utf8_lossy(&result.stderr)
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("[incremental] session directory: ")?
+                        .strip_suffix(" files hard-linked")?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .sum();
+            let incremental_files = if self.incremental {
+                let tree = rabs_sandbox::artifact_tree::TreeInventory::scan_complete(
+                    target.backing(),
+                    crate::artifacts::MAX_ARTIFACT_BYTES,
+                    &|| false,
+                )
+                .unwrap();
+                let private: Vec<_> = tree
+                    .names()
+                    .filter(|name| target.plan().is_private_incremental_file(name))
+                    .map(str::to_owned)
+                    .collect();
+                for suffix in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+                    assert!(
+                        private.iter().any(|name| name.ends_with(suffix)),
+                        "{private:?}"
+                    );
+                }
+                assert!(
+                    captured
+                        .file_names()
+                        .all(|name| !target.plan().is_private_incremental_file(name)),
+                    "native compiler state must not enter the delivered artifact offer"
+                );
+                assert!(tree.total_bytes() > captured.total_bytes());
+                private
+            } else {
+                Vec::new()
+            };
             let output = (command == "build").then(|| {
                 let path = target.backing().join("debug/edit_app");
                 let ran = Command::new(&path).output().unwrap();
@@ -1212,8 +1280,83 @@ fn main() { println!("{}", answer()); }
                 artifacts,
                 output,
                 test_runs,
+                incremental_files,
+                incremental_reused_files,
             }
         }
+    }
+
+    #[test]
+    fn real_incremental_state_stays_private_and_survives_edits_and_worker_restart() {
+        let fixture = CargoFixture::with_incremental();
+        let disk = private_directory("rabs-real-incremental-target-").unwrap();
+        let capacity = 128 * 1024 * 1024;
+        let cache = Arc::new(
+            TargetCache::open_persistent(capacity, disk.path(), "native-incremental-v1").unwrap(),
+        );
+        let first = fixture.run(&cache, "build", false);
+        assert_eq!(first.output.unwrap().0, b"11\n");
+        assert_eq!(first.incremental_reused_files, 0);
+        assert!(!first.incremental_files.is_empty());
+        {
+            let state = cache.state.lock().unwrap();
+            assert!(
+                first
+                    .incremental_files
+                    .iter()
+                    .all(|name| state.entries[0].tree.files.contains_key(name)),
+                "the retained seed must include every omitted compiler-state file"
+            );
+        }
+        drop(cache);
+
+        // Preserve the uploaded file's old mtime: the real source-edit planner
+        // must invalidate Cargo while rustc still reuses its verified session.
+        fixture.edit("src/main.rs", MAIN.replace("OFFSET", "2"));
+        let cache = Arc::new(
+            TargetCache::open_persistent(capacity, disk.path(), "native-incremental-v1").unwrap(),
+        );
+        let edited = fixture.run(&cache, "build", true);
+        edited.fresh("edit_dep", true);
+        edited.fresh("edit_app", false);
+        assert_eq!(edited.output.unwrap().0, b"13\n");
+        assert!(
+            edited.incremental_reused_files > 0,
+            "rustc did not reuse prior state"
+        );
+        drop(cache);
+
+        fixture.edit("dep/src/lib.rs", "pub fn value() -> u32 { 2 }\n");
+        let cache = Arc::new(
+            TargetCache::open_persistent(capacity, disk.path(), "native-incremental-v1").unwrap(),
+        );
+        let dependent = fixture.run(&cache, "build", true);
+        dependent.fresh("edit_dep", false);
+        dependent.fresh("edit_app", false);
+        assert!(dependent.incremental_reused_files > 0);
+        let expected = dependent.output.unwrap();
+        assert_eq!(expected.0, b"14\n");
+        let rebuilt = fixture.run(
+            &Arc::new(TargetCache::new(capacity).unwrap()),
+            "build",
+            false,
+        );
+        assert_eq!(rebuilt.incremental_reused_files, 0);
+        assert_eq!(
+            rebuilt.output.unwrap(),
+            expected,
+            "incremental and cold outputs differ"
+        );
+        drop(cache);
+
+        let rotated = Arc::new(
+            TargetCache::open_persistent(capacity, disk.path(), "native-incremental-v2").unwrap(),
+        );
+        let cold = fixture.run(&rotated, "build", false);
+        cold.fresh("edit_dep", false);
+        cold.fresh("edit_app", false);
+        assert_eq!(cold.incremental_reused_files, 0);
+        assert_eq!(cold.output.unwrap(), expected);
     }
 
     #[test]

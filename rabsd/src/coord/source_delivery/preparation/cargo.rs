@@ -603,9 +603,10 @@ fn validate_profile_settings(value: &toml::Value, overridden: bool) -> io::Resul
             "panic" if !overridden => value
                 .as_str()
                 .is_some_and(|value| matches!(value, "abort" | "unwind")),
-            // The frontend pins CARGO_INCREMENTAL=0. Config must not enable an
-            // unmodeled incremental input tree for direct prepared requests.
-            "incremental" => value.as_bool() == Some(false),
+            // Cargo owns the setting's precedence. The canonical frontend
+            // supplies an explicit CARGO_INCREMENTAL policy, and enabled state
+            // remains inside the worker's complete private target tree.
+            "incremental" => value.is_bool(),
             "codegen-units" => value
                 .as_integer()
                 .is_some_and(|value| (1..=4096).contains(&value)),
@@ -1487,7 +1488,7 @@ mod tests {
             r#"
                 [profile.dev]
                 debug = "line-tables-only"
-                incremental = false
+                incremental = true
                 [profile.ci]
                 inherits = "release"
                 opt-level = 2
@@ -1505,12 +1506,14 @@ mod tests {
                 opt-level = 0
                 debug = false
                 debug-assertions = true
+                incremental = true
                 [profile.ci.package."*"]
                 opt-level = "s"
                 [profile.ci.package."some-crate:2.1.0"]
                 opt-level = "z"
                 debug = "full"
                 strip = true
+                incremental = false
                 [profile.release-lto]
                 inherits = "ci"
                 lto = true
@@ -1557,7 +1560,9 @@ mod tests {
             "[profile.ci]\ncodegen-units=4097",
             "[profile.ci]\ncodegen-units=1.0",
             "[profile.ci]\nrpath='outside'",
-            "[profile.ci]\nincremental=true",
+            "[profile.ci]\nincremental='true'",
+            "[profile.ci]\nincremental=1",
+            "[profile.ci]\nincremental='/outside/cache'",
             "[profile.ci]\ndir-name='../outside'",
             "[profile.ci]\ncodegen-backend='/outside/backend.so'",
             "[profile.ci]\nrustflags=['--sysroot=/outside']",
@@ -1571,7 +1576,7 @@ mod tests {
             "[profile.ci.build-override]\nlto=true",
             "[profile.ci.build-override]\npanic='abort'",
             "[profile.ci.build-override]\nrpath=true",
-            "[profile.ci.build-override]\nincremental=true",
+            "[profile.ci.build-override]\nincremental={enabled=true}",
         ] {
             let value: toml::Value = toml::from_str(text).unwrap();
             assert!(
