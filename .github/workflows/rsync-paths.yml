@@ -1,0 +1,96 @@
+name: Rsync path arguments
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/transfer.rs'
+      - 'rch-common/src/rsync_flavor.rs'
+      - 'rch-common/src/remote_compilation.rs'
+      - 'rch-common/src/remote_verification.rs'
+      - 'rch-common/src/e2e/verification.rs'
+      - '.github/workflows/rsync-paths.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rsync-paths-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paths:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        # Explicit bash enables pipefail: tee must never hide Cargo failures.
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_NET_RETRY: 2
+      CARGO_HTTP_TIMEOUT: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install real rsync and Rust tools
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y rsync
+          fi
+          # Linux exercises modern rsync; macOS exercises the stock legacy
+          # implementation rather than silently preferring a Homebrew install.
+          echo 'RCH_RSYNC_BIN=/usr/bin/rsync' >> "$GITHUB_ENV"
+          /usr/bin/rsync --version
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting of the rsync transport changes
+        run: |
+          set -euo pipefail
+          rustfmt --check --edition 2024 --config skip_children=true rch/src/transfer.rs rch-common/src/rsync_flavor.rs rch-common/src/remote_compilation.rs rch-common/src/remote_verification.rs rch-common/src/e2e/verification.rs
+          git diff --check
+      # Compile the exact production module, not a reimplementation of its
+      # argument policy. This focused check remains runnable independently of
+      # unrelated workspace dependencies; it does not replace the full-crate
+      # checks and transfer tests in rsync-transport.yml.
+      - name: Test and lint the production rsync module with real shell transport
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rsync-path-tests/src" "$RUNNER_TEMP/rsync-path-evidence"
+          cp rch-common/src/rsync_flavor.rs "$RUNNER_TEMP/rsync-path-tests/src/lib.rs"
+          cat > "$RUNNER_TEMP/rsync-path-tests/Cargo.toml" <<'TOML'
+          [package]
+          name = "rch-rsync-path-validation"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          serde = { version = "1", features = ["derive"] }
+          thiserror = "2"
+          shell-escape = "0.1.5"
+          shellexpand = "3.1.1"
+          [dev-dependencies]
+          tempfile = "3"
+          uuid = { version = "1", features = ["v4"] }
+          TOML
+          cd "$RUNNER_TEMP/rsync-path-tests"
+          # Config-only resolver tests require no environment override. Do not
+          # skip them or change the resolver's environment-first precedence.
+          env -u RCH_RSYNC_BIN cargo test -- --nocapture 2>&1 | tee "$RUNNER_TEMP/rsync-path-evidence/tests.log"
+          # Independently require the real transfer against the native binary,
+          # including stock legacy rsync on macOS even if Homebrew is present.
+          cargo test tests::remote_path_arg_real_rsync_round_trip -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/rsync-path-evidence/native-transport.log"
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/rsync-path-evidence/clippy.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rsync-path-validation-${{ matrix.runner }}-${{ github.sha }}
+          path: ${{ runner.temp }}/rsync-path-evidence
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,58 @@
+name: Managed pool arithmetic
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rabs-scheduler/src/managed_pool.rs'
+      - '.github/workflows/managed-pool.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arithmetic:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      # Compile the unchanged production module in a dependency-free harness.
+      # These focused debug/release checks complement, not replace, workspace CI.
+      - name: Run exact policy in checked and optimized arithmetic modes
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/managed-pool/src" "$RUNNER_TEMP/pool-evidence"
+          cp rabs-scheduler/src/managed_pool.rs "$RUNNER_TEMP/managed-pool/src/lib.rs"
+          cat > "$RUNNER_TEMP/managed-pool/Cargo.toml" <<'TOML'
+          [package]
+          name = "managed-pool-regression"
+          version = "0.0.0"
+          edition = "2024"
+          [workspace]
+          TOML
+          cd "$RUNNER_TEMP/managed-pool"
+          RUSTFLAGS='-C overflow-checks=on' cargo test --offline -- --nocapture 2>&1 | tee "$RUNNER_TEMP/pool-evidence/debug.log"
+          RUSTFLAGS='-C overflow-checks=off' cargo test --offline --release -- --nocapture 2>&1 | tee "$RUNNER_TEMP/pool-evidence/release.log"
+          cargo clippy --offline --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/pool-evidence/clippy.log"
+          cargo fmt -- --check 2>&1 | tee "$RUNNER_TEMP/pool-evidence/fmt.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: managed-pool-${{ matrix.runner }}-${{ github.sha }}
+          path: ${{ runner.temp }}/pool-evidence
+          if-no-files-found: warn
+          retention-days: 7

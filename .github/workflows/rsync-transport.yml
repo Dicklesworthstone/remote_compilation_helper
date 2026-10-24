@@ -1,0 +1,70 @@
+name: Rsync transport regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/transfer.rs'
+      - 'rch-common/src/rsync_flavor.rs'
+      - 'rch-common/src/remote_compilation.rs'
+      - '.github/workflows/rsync-transport.yml'
+  pull_request:
+    paths:
+      - 'rch/src/transfer.rs'
+      - 'rch-common/src/rsync_flavor.rs'
+      - 'rch-common/src/remote_compilation.rs'
+      - '.github/workflows/rsync-transport.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rsync-transport-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 2
+  CARGO_HTTP_TIMEOUT: 30
+  RUSTUP_TOOLCHAIN: nightly-2026-06-06
+
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture the exact source being validated
+        run: git archive --format=tar.gz --output=rsync-source.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsync-source-${{ github.sha }}
+          path: rsync-source.tar.gz
+          retention-days: 1
+
+  rsync:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and identify real rsync
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync
+          rsync --version
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-06
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check transfer targets
+        run: cargo check -p rch --all-targets
+      - name: Run rsync transport tests
+        env:
+          RCH_MOCK_SSH: '1'
+        run: cargo test -p rch --bin rch rsync -- --test-threads=1
+      - name: Lint transfer targets
+        run: cargo clippy -p rch --all-targets -- -D warnings
