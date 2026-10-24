@@ -20,11 +20,12 @@ rabs-wkr --coordinator 10.0.0.1:7091 --worker-id builder \
 Keep the worker's existing TLS and durable admission configuration. The default
 is `0`, which disables target retention. The maximum configured limit is 8 GiB.
 The pool admits at most eight retained or pending seeds, and each complete target
-tree must also fit the existing 1 GiB tree inventory limit. Pending captures count
+tree must also fit its inventory limit: 1 GiB for ordinary output contracts, or
+8 GiB for the explicit private incremental contracts. Pending captures count
 against the pool before copying begins; old unused seeds are evicted when needed.
 The byte limit counts target file payload. Durable metadata has a separate
 16 MiB cap per generation; directory and filesystem allocation overhead also
-remain subject to the existing file and directory count limits.
+remain subject to the applicable bounded file and directory inventory.
 
 `RABS_WORKER_TARGET_CACHE_BYTES` also sets this limit; an explicit CLI value
 takes precedence. Without a runtime epoch the pool belongs to the worker process
@@ -102,7 +103,7 @@ runtime epoch. Tests always execute again.
 
 Only delivered artifacts consume transport payload bytes. The complete tree,
 including omitted compiler state and internal hardlink aliases, still counts
-toward the existing 1 GiB, 4,096-file and 16,384-entry inventory limits and the
+toward an independent 8 GiB, 65,536-file and 131,072-entry private inventory and the
 configured target-pool quota. Its full namespace receives the same symlink,
 hardlink, special-file and mutation checks before any artifact is offered.
 Without worker target retention, an incremental build still runs with fresh

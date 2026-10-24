@@ -32,7 +32,7 @@ mod source_edits;
 
 /// Independent count and byte limits bound retained seeds and in-flight staging.
 pub const MAX_TARGET_CACHE_ENTRIES: usize = 8;
-pub const MAX_TARGET_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const MAX_TARGET_CACHE_BYTES: u64 = rabs_sandbox::artifact_tree::MAX_PRIVATE_TREE_BYTES;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -790,8 +790,15 @@ impl TargetAttempt {
         if SourceTimes::capture(&self.inputs, stopped)? != self.times {
             return Err(invalid("source changed while Cargo was executing"));
         }
-        let inventory =
-            TreeInventory::scan_complete(artifacts.backing(), MAX_ARTIFACT_BYTES, stopped)?;
+        let inventory = if artifacts.plan().private_incremental_roots().is_some() {
+            TreeInventory::scan_complete_private(
+                artifacts.backing(),
+                MAX_TARGET_CACHE_BYTES,
+                stopped,
+            )?
+        } else {
+            TreeInventory::scan_complete(artifacts.backing(), MAX_ARTIFACT_BYTES, stopped)?
+        };
         let Some(reservation) = self.cache.reserve(inventory.total_bytes()) else {
             return Ok(None);
         };
@@ -1067,7 +1074,11 @@ impl TreeSnapshot {
     ) -> io::Result<Option<(Reservation, Self)>> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = captured.file_names().map(str::to_owned).collect();
-        let tree = TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?;
+        let tree = if plan.private_incremental_roots().is_some() {
+            TreeInventory::scan_private(root, &required, MAX_TARGET_CACHE_BYTES, stopped)?
+        } else {
+            TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?
+        };
         // Every ordinary output still belongs to the validated offer. Only
         // the explicit Cargo private-state projection may retain extra files;
         // generic and older Cargo contracts continue to require exact equality.
@@ -1111,7 +1122,8 @@ impl TreeSnapshot {
     fn restore(&self, destination: &Path, stopped: &impl Fn() -> bool) -> io::Result<()> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = self.files.keys().cloned().collect();
-        let tree = TreeInventory::scan(self.directory.path(), &required, self.bytes, stopped)?;
+        let tree =
+            TreeInventory::scan_private(self.directory.path(), &required, self.bytes, stopped)?;
         let (files, directories) = copy_tree(&tree, destination, stopped)?;
         if files != self.files
             || directories != self.directories

@@ -544,11 +544,14 @@ target retention, the command uses fresh private incremental storage.
 
 Incremental compiler state remains on the worker and is excluded from delivered
 artifacts through the explicit contracts described below. It is never a shared
-writable directory or a compiler-result cache hit. The complete private target,
-including incremental state, still has the existing 1 GiB, 4,096-file and
-16,384-entry limits; enabling incremental compilation does not relax those
-limits or silently discard state to fit them. Persistent reuse follows the
-existing worker runtime-epoch and complete-state verification rules. This does
+writable directory or a compiler-result cache hit. Exported artifacts retain
+their 1 GiB, 4,096-file and 16,384-entry limits. The complete private target has
+a separate bounded inventory of at most 8 GiB, 65,536 regular files and 131,072
+entries, so a large incremental directory cannot exhaust the smaller transfer
+quota. The worker validates the entire tree, including omitted state, and
+charges every retained byte against its configured target-cache quota. Unsafe
+private files still refuse capture. Persistent reuse follows the existing
+runtime-epoch and complete-state verification rules. This does
 not enable portable incremental snapshots, skip test execution, or authorize
 broader dependency or workspace action-cache serving.
 

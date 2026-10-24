@@ -8,7 +8,8 @@
 
 use super::*;
 use rabs_sandbox::artifact_tree::{
-    MAX_TREE_ENTRIES, MAX_TREE_FILES, TreeInventory, validate_tree_names,
+    MAX_PRIVATE_TREE_ENTRIES, MAX_PRIVATE_TREE_FILES, MAX_TREE_ENTRIES, TreeInventory,
+    validate_private_tree_names, validate_tree_names,
 };
 use rabs_sandbox::source_transfer::{MAX_SOURCE_FILES, SourceFile};
 use serde_json::{Value, json};
@@ -438,7 +439,7 @@ fn remove_contents(directory: &File, count: &mut usize, depth: usize) -> io::Res
         }
         *count += 1;
         require(
-            *count <= MAX_TREE_ENTRIES + 3,
+            *count <= MAX_PRIVATE_TREE_ENTRIES + 3,
             "target cleanup entry bound exceeded",
         )?;
         let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
@@ -684,9 +685,12 @@ fn mode(value: &Value, directory: bool) -> io::Result<u32> {
     Ok(mode as u32)
 }
 
-fn decode_directories(value: &Value) -> io::Result<BTreeMap<String, StoredDirectory>> {
+fn decode_directories(
+    value: &Value,
+    max_entries: usize,
+) -> io::Result<BTreeMap<String, StoredDirectory>> {
     let mut directories = BTreeMap::new();
-    for value in rows(value, MAX_TREE_ENTRIES + 1)? {
+    for value in rows(value, max_entries + 1)? {
         let row = row(value, 3)?;
         let name = text(&row[0])?;
         if !name.is_empty() {
@@ -711,10 +715,18 @@ fn decode_directories(value: &Value) -> io::Result<BTreeMap<String, StoredDirect
 fn validate_layout<'a>(
     files: impl Iterator<Item = &'a str>,
     directories: &BTreeMap<String, StoredDirectory>,
+    private: bool,
 ) -> io::Result<()> {
-    let names = validate_tree_names(files)?;
+    let (names, max_entries) = if private {
+        (
+            validate_private_tree_names(files)?,
+            MAX_PRIVATE_TREE_ENTRIES,
+        )
+    } else {
+        (validate_tree_names(files)?, MAX_TREE_ENTRIES)
+    };
     require(
-        names.len() + directories.len() <= MAX_TREE_ENTRIES + 1,
+        names.len() + directories.len() <= max_entries + 1,
         "target metadata tree entry bound exceeded",
     )?;
     let mut folded = BTreeMap::new();
@@ -775,11 +787,11 @@ fn decode_seed(payload: &Value, generation: Generation) -> io::Result<Seed> {
     }
     let source_manifest =
         SourceManifest::new(source_files).map_err(|error| invalid(&error.to_string()))?;
-    let source_directories = decode_directories(&payload["source_directories"])?;
-    validate_layout(times.keys().map(String::as_str), &source_directories)?;
+    let source_directories = decode_directories(&payload["source_directories"], MAX_TREE_ENTRIES)?;
+    validate_layout(times.keys().map(String::as_str), &source_directories, false)?;
     let mut files = BTreeMap::new();
     let mut total = 0_u64;
-    for value in rows(&payload["files"], MAX_TREE_FILES)? {
+    for value in rows(&payload["files"], MAX_PRIVATE_TREE_FILES)? {
         let row = row(value, 6)?;
         let name = text(&row[0])?.to_owned();
         let file = StoredFile {
@@ -797,7 +809,7 @@ fn decode_seed(payload: &Value, generation: Generation) -> io::Result<Seed> {
             .checked_add(file.len)
             .ok_or_else(|| invalid("target metadata size overflow"))?;
         require(
-            total <= MAX_ARTIFACT_BYTES && files.insert(name, file).is_none(),
+            total <= MAX_TARGET_CACHE_BYTES && files.insert(name, file).is_none(),
             "duplicate or oversized target file metadata",
         )?;
     }
@@ -805,8 +817,8 @@ fn decode_seed(payload: &Value, generation: Generation) -> io::Result<Seed> {
         number(&payload["bytes"])? == total,
         "target metadata byte count differs",
     )?;
-    let directories = decode_directories(&payload["directories"])?;
-    validate_layout(files.keys().map(String::as_str), &directories)?;
+    let directories = decode_directories(&payload["directories"], MAX_PRIVATE_TREE_ENTRIES)?;
+    validate_layout(files.keys().map(String::as_str), &directories, true)?;
     for (name, file) in &files {
         if let Some(first) = &file.link_to {
             let prior = files
@@ -844,7 +856,7 @@ fn decode_seed(payload: &Value, generation: Generation) -> io::Result<Seed> {
 
 fn verify_tree(snapshot: &TreeSnapshot, sync: bool, stopped: &impl Fn() -> bool) -> io::Result<()> {
     let required = snapshot.files.keys().cloned().collect();
-    let tree = TreeInventory::scan(
+    let tree = TreeInventory::scan_private(
         snapshot.directory.path(),
         &required,
         snapshot.bytes,

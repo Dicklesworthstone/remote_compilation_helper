@@ -492,6 +492,16 @@ fn private_incremental_seed_retains_and_charges_the_complete_target() {
     .unwrap();
     let private = "debug/incremental/unit/session/query-cache.bin";
     fs::write(target.backing().join(private), b"private compiler state").unwrap();
+    let private_files = rabs_sandbox::artifact_tree::MAX_TREE_FILES;
+    for index in 0..private_files {
+        fs::write(
+            target
+                .backing()
+                .join(format!("debug/incremental/unit/session/object{index}")),
+            b"x",
+        )
+        .unwrap();
+    }
     let report = concat!(
         "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
         "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp.rmeta\"],\"executable\":null}\n",
@@ -505,8 +515,9 @@ fn private_incremental_seed_retains_and_charges_the_complete_target() {
         captured.file_names().collect::<Vec<_>>(),
         ["debug/deps/libapp.rmeta"]
     );
-    let total =
-        captured.total_bytes() + fs::metadata(target.backing().join(private)).unwrap().len();
+    let total = captured.total_bytes()
+        + fs::metadata(target.backing().join(private)).unwrap().len()
+        + private_files as u64;
     let too_small = Arc::new(TargetCache::new(total - 1).unwrap());
     let attempt = too_small
         .acquire(
@@ -579,6 +590,14 @@ fn private_incremental_seed_retains_and_charges_the_complete_target() {
         assert_eq!(
             fs::read(root.join(private)).unwrap(),
             b"private compiler state"
+        );
+        assert_eq!(
+            fs::read(root.join(format!(
+                "debug/incremental/unit/session/object{}",
+                private_files - 1
+            )))
+            .unwrap(),
+            b"x"
         );
     }
     fs::write(
