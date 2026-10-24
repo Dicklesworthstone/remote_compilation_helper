@@ -17556,7 +17556,8 @@ fn main() {
         assert!(!script.contains("kill -KILL -- "));
         // Boot/start identity and a process-table observation guard group signals.
         assert!(script.contains("rch_remote_leader_matches || return 43"));
-        assert!(script.contains("ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp="));
+        assert!(script.contains("ps -e -o pid= -o lwp= -o pgid= -o s= -o nlwp="));
+        assert!(script.contains(r#"ps -L -q "$pids" -o pid= -o lwp= -o pgid= -o stat= -o nlwp="#));
         assert!(script.contains("rch_remote_cancel \"$f\" 42 kill"));
         assert!(script.contains("RCH_E104_KILL=verified_dead"));
         assert!(script.contains("RCH_E104_KILL=still_alive"));
