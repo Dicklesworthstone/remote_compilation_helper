@@ -350,6 +350,8 @@ fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
         ),
         ("test", vec!["--package", "test", "--test=integration"]),
         ("build", vec!["--all", "--benches"]),
+        ("build", vec!["--workspace", "--profile", "test"]),
+        ("build", vec!["--workspace", "--profile=dev"]),
     ] {
         let (request, selected) = cargo_request(command, &options);
         assert_eq!(compatible(&request, &selected), expected, "{options:?}");
@@ -364,7 +366,7 @@ fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
         vec!["--workspace", "--features=test"],
         vec!["--workspace", "--features", "build"],
         vec!["--workspace", "--target", "x86_64-unknown-linux-gnu"],
-        vec!["--workspace", "--profile", "test"],
+        vec!["--workspace", "--profile", "custom"],
         vec!["--workspace", "--manifest-path", "member/Cargo.toml"],
     ] {
         let (request, selected) = cargo_request("build", &options);
@@ -659,6 +661,7 @@ fn custom_profiles_reuse_only_the_same_captured_compilation_family() {
             "build",
             vec!["--package=profile_fixture", "--profile", "ci"],
         ),
+        ("build", vec!["--workspace", "--profile=ci"]),
     ] {
         let (request, selected) = cargo_request(command, &options);
         assert_eq!(key(&request, &selected, &input), expected);
@@ -669,7 +672,6 @@ fn custom_profiles_reuse_only_the_same_captured_compilation_family() {
     }
     for options in [
         vec!["--workspace", "--profile", "other"],
-        vec!["--workspace", "--profile=ci"],
         vec!["--workspace", "--release"],
         vec!["--workspace"],
     ] {
@@ -678,7 +680,7 @@ fn custom_profiles_reuse_only_the_same_captured_compilation_family() {
         assert!(changed.is_some());
         assert_ne!(
             changed, expected,
-            "profile spelling and selection remain exact: {options:?}"
+            "distinct compilation profiles cannot share a private family: {options:?}"
         );
     }
     fs::write(

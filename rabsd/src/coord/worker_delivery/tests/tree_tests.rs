@@ -84,6 +84,9 @@ fn cargo_request() -> Value {
 
 fn cargo_fixture(destination: &Path, report: &[u8]) -> Script {
     let (mut peer, _) = tree_fixture(destination, 3);
+    // Private Cargo requests carry an explicit environment. Advertise that
+    // capability in this peer without changing the generic legacy fixture.
+    peer.replies[0]["command_contexts"] = json!([COMMAND_CONTEXT_VERSION]);
     peer.expected_stdout = report.to_vec();
     peer.replies[1]["stdout_bytes"] = json!(report.len());
     peer.replies[1]["stdout_sha256"] = json!(hash(report));
@@ -424,6 +427,30 @@ fn cargo_runtime_delivery_recovery_preserves_opaque_output_and_native_status() {
 }
 
 #[test]
+fn private_cargo_runtime_requires_command_context_capability_before_dispatch() {
+    for command in ["test", "run", "bench"] {
+        for advertised in [
+            Value::Null,
+            json!([]),
+            json!(["env-cwd-v0"]),
+            json!(COMMAND_CONTEXT_VERSION),
+        ] {
+            let request = cargo_runtime_request(command, true);
+            let owner = tempfile::tempdir().unwrap();
+            let destination = owner.path().join("unsupported-context");
+            let mut peer = cargo_fixture(&destination, &cargo_runtime_stdout(command));
+            peer.replies[0]["command_contexts"] = advertised;
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(failure.detail.contains("command context capability"));
+            assert!(!failure.execution_may_have_run);
+            assert!(peer.sent.is_empty());
+            assert!(!destination.exists());
+        }
+    }
+}
+
+#[test]
 fn run_and_bench_resume_retrieves_original_outputs_without_executing_again() {
     for command in ["run", "bench"] {
         for private_incremental in [false, true] {
@@ -432,6 +459,13 @@ fn run_and_bench_resume_retrieves_original_outputs_without_executing_again() {
             let owner = tempfile::tempdir().unwrap();
             let destination = owner.path().join("resumed-runtime");
             let mut peer = cargo_fixture(&destination, &stdout);
+            // A retained result does not need present-day execution support.
+            // Losing canonical/context capability must not trigger reexecution.
+            peer.replies[0]["canonical"] = json!(false);
+            peer.replies[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("command_contexts");
             peer.replies[0]["request_high_water"] = json!(7);
             peer.replies[0]["result_retentions"] = json!([RESULT_RETENTION]);
             peer.replies[1]["resumed"] = json!(true);

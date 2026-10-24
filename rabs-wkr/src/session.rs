@@ -723,6 +723,20 @@ pub fn execute_uploaded_canonical_controlled(
     result
 }
 
+/// Create an attempt-owned root before any compiler or runtime input is written.
+/// Empty search trees must remain private even with a permissive host umask.
+/// The caller keeps the returned owner through process cleanup and output drains.
+fn attempt_private_directory(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
 /// Capture the selected host ELF runtime into independently owned storage.
 /// The caller retains this owner through process cleanup and diagnostic drains;
 /// dependency namespaces never expose the live host /usr tree.
@@ -911,10 +925,7 @@ fn execute_canonical_inner(
     // Hot Cargo state also uses an independent fresh HOME: a prior command's
     // runtime files must not become unkeyed inputs of a later target clone.
     let private_home = if request.dependency_context.is_some() || hot_inputs.is_some() {
-        match tempfile::Builder::new()
-            .prefix("rabs-private-home-")
-            .tempdir()
-        {
+        match attempt_private_directory("rabs-private-home-") {
             Ok(directory) => Some(directory),
             Err(error) => {
                 let _ =
@@ -929,10 +940,7 @@ fn execute_canonical_inner(
         .as_ref()
         .map_or(home_backing, |directory| directory.path());
     let private_cargo_home = if hot_inputs.is_some() {
-        match tempfile::Builder::new()
-            .prefix("rabs-target-cargo-home-")
-            .tempdir()
-        {
+        match attempt_private_directory("rabs-target-cargo-home-") {
             Ok(directory) => Some(directory),
             Err(error) => {
                 let _ = control.retain_outputs(Err(format!("Cargo runtime preparation: {error}")));
@@ -950,10 +958,7 @@ fn execute_canonical_inner(
     // This fresh empty tree is a separate owner: exposing it under writable
     // HOME as well would let a compiler populate a supposedly empty input.
     let dependency_empty = if request.dependency_context.is_some() {
-        match tempfile::Builder::new()
-            .prefix("rabs-dependency-empty-")
-            .tempdir()
-        {
+        match attempt_private_directory("rabs-dependency-empty-") {
             Ok(directory) => Some(directory),
             Err(error) => {
                 let _ =
@@ -1541,6 +1546,70 @@ pub fn admit_worker(
 mod tests {
     use super::*;
     use rabs_protocol::capability_tokens::{CapabilityKind, mint};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attempt_private_directories_exclude_previous_home_and_search_inputs() {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+
+        let prefixes = [
+            "rabs-private-home-",
+            "rabs-target-cargo-home-",
+            "rabs-dependency-empty-",
+        ];
+        let previous = prefixes.map(|prefix| attempt_private_directory(prefix).unwrap());
+        let next = prefixes.map(|prefix| attempt_private_directory(prefix).unwrap());
+        for directory in previous.iter().chain(&next) {
+            let metadata = fs::symlink_metadata(directory.path()).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+        let context = DependencyExecContext::new(
+            "/workspace/package".into(),
+            "/workspace/package".into(),
+            "/toolchains/fixture".into(),
+            "/toolchains/fixture/bin/rustc".into(),
+            "/target/output".into(),
+            vec!["/target/dependencies".into()],
+            Vec::new(),
+            [1; 32],
+        )
+        .unwrap();
+        context.prepare_empty_backings(previous[2].path()).unwrap();
+        context.prepare_empty_backings(next[2].path()).unwrap();
+        let search = |directory: &tempfile::TempDir| {
+            let children = fs::read_dir(directory.path())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(children.len(), 1);
+            children[0].path()
+        };
+        let previous_search = search(&previous[2]);
+        let next_search = search(&next[2]);
+        fs::write(previous[0].path().join("old-home-input"), b"old home").unwrap();
+        fs::write(
+            previous[1].path().join("old-cargo-input"),
+            b"old Cargo home",
+        )
+        .unwrap();
+        fs::write(previous_search.join("old-library.rlib"), b"old archive").unwrap();
+        assert_eq!(fs::read_dir(next[0].path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(next[1].path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&next_search).unwrap().count(), 0);
+
+        // Completing one attempt releases only its owners. Another attempt's
+        // home and declared empty search root must remain independently owned.
+        let next_home = next[0].path().join("active-home-input");
+        fs::write(&next_home, b"still active").unwrap();
+        drop(previous);
+        assert_eq!(fs::read(&next_home).unwrap(), b"still active");
+        assert!(next_search.is_dir());
+        assert_eq!(fs::read_dir(next_search).unwrap().count(), 0);
+    }
 
     fn token() -> CapabilityToken {
         mint(1, CapabilityKind::ExecuteAction, 7, 3, "worker/exec", 100).unwrap()

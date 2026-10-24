@@ -138,7 +138,9 @@ pub struct RootPressure {
     pub path: String,
     /// Byte-capacity pressure.
     pub bytes: PressureLevel,
-    /// Inode-capacity pressure.
+    /// Inode-capacity pressure. `Ok` on a filesystem with no fixed inode pool
+    /// (btrfs), which has nothing to exhaust; `available_inodes` is then
+    /// omitted because the reported zero is not a measurement.
     pub inodes: PressureLevel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_bytes: Option<u64>,
@@ -159,7 +161,9 @@ impl RootPressure {
 /// Assess one root. `facts == None` (the metric was never collected) yields
 /// `Unknown` for both dimensions, so "missing disk metrics" is distinct from a
 /// healthy `Ok`. A zero `total_bytes` is also `Unknown` (df gave no usable
-/// figure); zero available inodes is treated as exhaustion (`Critical`).
+/// figure). Zero available inodes in a fixed inode pool is exhaustion
+/// (`Critical`); a filesystem without a fixed pool (see
+/// [`DiskRootFacts::has_inode_pool`]) has no inode pressure.
 #[must_use]
 pub fn assess_root(
     kind: DiskRootKind,
@@ -192,12 +196,12 @@ pub fn assess_root(
         }
     };
 
-    let inodes = if facts.available_inodes < thresholds.critical_avail_inodes {
-        PressureLevel::Critical
-    } else if facts.available_inodes < thresholds.warning_avail_inodes {
-        PressureLevel::Warning
-    } else {
-        PressureLevel::Ok
+    let available_inodes = facts.free_inodes();
+    let inodes = match available_inodes {
+        None => PressureLevel::Ok,
+        Some(free) if free < thresholds.critical_avail_inodes => PressureLevel::Critical,
+        Some(free) if free < thresholds.warning_avail_inodes => PressureLevel::Warning,
+        Some(_) => PressureLevel::Ok,
     };
 
     RootPressure {
@@ -207,7 +211,7 @@ pub fn assess_root(
         inodes,
         available_bytes: Some(facts.available_bytes),
         total_bytes: Some(facts.total_bytes),
-        available_inodes: Some(facts.available_inodes),
+        available_inodes,
     }
 }
 
@@ -342,6 +346,7 @@ mod tests {
             total_bytes: total,
             available_bytes: avail,
             available_inodes: inodes,
+            total_inodes: None,
         }
     }
 
@@ -410,6 +415,34 @@ mod tests {
         assert_eq!(r.bytes, PressureLevel::Ok);
         assert_eq!(r.inodes, PressureLevel::Critical);
         assert_eq!(r.worst(), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn inode_pressure_follows_a_fixed_pool_and_ignores_a_dynamic_one() {
+        // (f_files, f_ffree) -> inode pressure, with plenty of bytes free.
+        let cases = [
+            (Some(0), 0, PressureLevel::Ok, None),
+            (Some(6_553_600), 0, PressureLevel::Critical, Some(0)),
+            (Some(6_553_600), 9_999, PressureLevel::Critical, Some(9_999)),
+            (
+                Some(6_553_600),
+                50_000,
+                PressureLevel::Warning,
+                Some(50_000),
+            ),
+            (Some(6_553_600), 100_000, PressureLevel::Ok, Some(100_000)),
+            (None, 0, PressureLevel::Critical, Some(0)),
+        ];
+        for (f_files, f_ffree, level, reported) in cases {
+            let root = DiskRootFacts {
+                total_inodes: f_files,
+                ..facts("/data/tmp", 100_000, 90_000, f_ffree)
+            };
+            let r = assess_root(DiskRootKind::TempRoot, Some(&root), &th());
+            assert_eq!(r.inodes, level, "f_files={f_files:?}, f_ffree={f_ffree}");
+            assert_eq!(r.available_inodes, reported);
+            assert_eq!(r.worst(), level);
+        }
     }
 
     #[test]

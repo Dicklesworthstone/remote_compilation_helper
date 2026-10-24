@@ -863,10 +863,6 @@ impl LiveFixture {
         .unwrap();
     }
 
-    fn cargo_check(&self, wrapped: bool) -> CargoRun {
-        self.cargo_compile(wrapped, "check")
-    }
-
     fn cargo_compile(&self, wrapped: bool, subcommand: &str) -> CargoRun {
         assert!(matches!(subcommand, "check" | "build"));
         let number = self.sequence.get();
