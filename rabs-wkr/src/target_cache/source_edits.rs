@@ -21,113 +21,25 @@
 //! successful commands validate their current artifact report.
 
 use super::{Seed, SourceTimes, WorkspaceInputs, checkpoint, invalid};
+use rabs_sandbox::cargo_target::SourceEditPolicy;
+#[cfg(all(test, target_os = "linux"))]
 use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+#[cfg(all(test, target_os = "linux"))]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::time::SystemTime;
 
-fn protected_roots(manifest: &SourceManifest) -> BTreeSet<&Path> {
-    manifest
-        .files()
-        .iter()
-        .filter_map(|file| {
-            let path = Path::new(&file.path);
-            if path.file_name()?.to_str()? == ".cargo-checksum.json" {
-                path.parent()
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn editable(file: &SourceFile, protected: &BTreeSet<&Path>) -> bool {
-    let path = Path::new(&file.path);
-    // This is Cargo's mutable local input tracking, not a new action-input
-    // closure. Retain the resolution/configuration boundary exactly while
-    // allowing data consumed by include_str!/include_bytes! and build scripts
-    // to invalidate their ordinary Cargo fingerprints just like Rust sources.
-    // Git ignore/attribute rules can change Cargo's default package scan and
-    // must not silently change what that scan considers a tracked input.
-    // Keep Clippy configuration exact too: its lint settings must not rely on
-    // Cargo tracking arbitrary data files when selecting a prior Clippy target.
-    if file.executable
-        || path.file_name().is_some_and(|name| {
-            matches!(
-                name.to_str(),
-                Some(
-                    "Cargo.toml"
-                        | "Cargo.lock"
-                        | "rust-toolchain"
-                        | "rust-toolchain.toml"
-                        | "clippy.toml"
-                        | ".clippy.toml"
-                        | ".gitignore"
-                        | ".gitattributes"
-                        | ".gitmodules"
-                )
-            )
-        })
-        || path
-            .components()
-            .any(|part| part.as_os_str() == ".cargo" || part.as_os_str() == ".git")
-    {
-        return false;
-    }
-    !path
-        .ancestors()
-        .skip(1)
-        .any(|parent| protected.contains(parent))
-}
-
 /// A length-framed family digest retains every non-editable input's name, mode
 /// and bytes. Editable source/data membership is checked by the timestamp planner,
 /// not collapsed into an action key: the exact source manifest remains unchanged.
 pub(super) fn identity(inputs: &WorkspaceInputs) -> Option<[u8; 32]> {
-    let mut hash = Sha256::new();
-    if let Some(home) = &inputs.projection {
-        // The projection was admitted with the complete transferred manifest.
-        // A supplied hint cannot hide changed cache bytes or be paired with a
-        // different workspace. Legacy projections have no isolated partition.
-        let workspace = home.workspace_manifest()?;
-        if home.source_digest() != inputs.full_source_digest
-            || workspace.digest() != inputs.manifest.digest()
-        {
-            return None;
-        }
-        hash.update(b"rabs.private-cargo-projected-source-edits.v3\0");
-        for value in [home.version(), home.prefix()] {
-            hash.update((value.len() as u64).to_be_bytes());
-            hash.update(value.as_bytes());
-        }
-        hash.update(home.cache_manifest().digest());
-    } else {
-        if inputs.full_source_digest != inputs.manifest.digest() {
-            return None;
-        }
-        hash.update(b"rabs.private-cargo-source-edits.v3\0");
-    }
-    let protected = protected_roots(&inputs.manifest);
-    let immutable = inputs
-        .manifest
-        .files()
-        .iter()
-        .filter(|file| !editable(file, &protected))
-        .count();
-    hash.update((immutable as u64).to_be_bytes());
-    for file in inputs.manifest.files() {
-        if editable(file, &protected) {
-            continue;
-        }
-        hash.update((file.path.len() as u64).to_be_bytes());
-        hash.update(file.path.as_bytes());
-        hash.update([u8::from(file.executable)]);
-        hash.update(file.len.to_be_bytes());
-        hash.update(file.sha256);
-    }
-    (immutable < inputs.manifest.files().len()).then(|| hash.finalize().into())
+    rabs_sandbox::cargo_target::source_edit_identity(
+        &inputs.manifest,
+        inputs.full_source_digest,
+        inputs.projection.as_deref(),
+    )
 }
 
 /// Compute a timestamp plan before copying. The existing descriptor-anchored
@@ -183,13 +95,13 @@ pub(super) fn timestamps(
             "clock cannot order edited sources after the retained target",
         ));
     }
-    let protected = protected_roots(&inputs.manifest);
-    let old_protected = protected_roots(&seed.source_manifest);
+    let policy = SourceEditPolicy::new(&inputs.manifest);
+    let old_policy = SourceEditPolicy::new(&seed.source_manifest);
     let mut changed = BTreeSet::new();
     for (name, old) in &previous {
         checkpoint(stopped)?;
         if !current.contains_key(name) {
-            if !editable(old, &old_protected) {
+            if !old_policy.is_editable(old) {
                 return Err(invalid("source edit removed an immutable Cargo input"));
             }
             changed.insert(*name);
@@ -205,7 +117,7 @@ pub(super) fn timestamps(
                 continue;
             }
         }
-        if !editable(new, &protected) {
+        if !policy.is_editable(new) {
             return Err(invalid("source edit changed an immutable Cargo input"));
         }
         changed.insert(*name);

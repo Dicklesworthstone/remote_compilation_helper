@@ -267,8 +267,118 @@ fn cargo_locality_preserves_load_priority_then_prefers_the_most_recent_match() {
 }
 
 #[test]
-fn cargo_locality_requires_exact_captured_inputs_and_command_controls() {
-    for change in 0..10 {
+fn cargo_locality_follows_source_edits_and_build_check_test_selections() {
+    for (previous, current) in [
+        ("build", "build"),
+        ("build", "check"),
+        ("check", "test"),
+        ("test", "build"),
+        ("clippy", "clippy"),
+    ] {
+        for exit_code in [0, 101] {
+            let fixture = Fixture::cargo(previous);
+            let store = fixture.open();
+            let original = store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+            completed(
+                store.claim_next().unwrap().unwrap(),
+                9001,
+                exit_code,
+                Value::Null,
+                true,
+            );
+            let source = fixture.root.join("source");
+            fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
+            let mut request = Fixture::cargo_template(current);
+            if current != "clippy" {
+                request["args"].as_array_mut().unwrap().push(json!("--lib"));
+            }
+            let mut next = fixture.spec(2, 2);
+            next.bundle = fixture.root.join("edited-capture");
+            prepare_source_template(&source, &request, &next.bundle).unwrap();
+            let selected = store.submit_allocated_pool(next).unwrap();
+            assert_eq!(selected.worker, "worker-2", "{previous} -> {current}");
+            assert_ne!(selected.request_sha256, original.request_sha256);
+            assert_eq!(selected.request_id, None);
+            assert!(!selected.outputs_installed);
+            let claim = store.claim_next().unwrap().unwrap();
+            assert!(claim.needs_request_allocation());
+            assert_eq!(claim.request()["args"], request["args"]);
+            assert_eq!(claim.request()["artifacts"], request["artifacts"]);
+            let source_file = claim.request()["source_manifest"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["path"] == "lib.rs")
+                .unwrap();
+            let changed_digest = Sha256::digest(b"pub fn value() -> u32 { 43 }\n")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(source_file["sha256"], changed_digest);
+            no_dispatch(claim);
+        }
+    }
+}
+
+#[test]
+fn exact_cargo_locality_precedes_newer_compatible_history_but_load_still_wins() {
+    let fixture = Fixture::cargo("build");
+    let store = fixture.open();
+    store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9001,
+        0,
+        Value::Null,
+        true,
+    );
+    let source = fixture.root.join("source");
+    fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
+    let mut newer = fixture.singleton(2, 1);
+    newer.bundle = fixture.root.join("newer-capture");
+    prepare_source_template(&source, &Fixture::cargo_template("build"), &newer.bundle).unwrap();
+    store.submit_allocated(newer).unwrap();
+    completed(
+        store.claim_next().unwrap().unwrap(),
+        9002,
+        0,
+        Value::Null,
+        true,
+    );
+
+    // The original retained bundle is still exact, even though the live source
+    // now differs. A newer compatible target must not displace that exact hit.
+    let exact = fixture.spec(3, 2);
+    assert_eq!(
+        store.submit_allocated_pool(exact.clone()).unwrap().worker,
+        "worker-2"
+    );
+    let active = store.claim_next().unwrap().unwrap();
+    assert_eq!(
+        store
+            .submit_allocated_pool(fixture.spec(4, 2))
+            .unwrap()
+            .worker,
+        "worker-1",
+        "a loaded exact worker must not displace an idle compatible worker"
+    );
+    store.cancel(&fixture.spec(4, 2).id).unwrap();
+    no_dispatch(active);
+
+    fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 44 }\n").unwrap();
+    let mut edited = fixture.spec(5, 2);
+    edited.bundle = fixture.root.join("latest-capture");
+    prepare_source_template(&source, &Fixture::cargo_template("build"), &edited.bundle).unwrap();
+    assert_eq!(
+        store.submit_allocated_pool(edited).unwrap().worker,
+        "worker-1",
+        "recency breaks ties between compatible targets"
+    );
+}
+
+#[test]
+fn cargo_locality_requires_exact_immutable_inputs_and_command_controls() {
+    for change in 1..10 {
         let fixture = Fixture::cargo("build");
         let store = fixture.open();
         store.submit_allocated(fixture.singleton(1, 2)).unwrap();
@@ -282,7 +392,6 @@ fn cargo_locality_requires_exact_captured_inputs_and_command_controls() {
         let mut request = Fixture::cargo_template("build");
         let source = fixture.root.join("source");
         match change {
-            0 => fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap(),
             1 => fs::write(
                 source.join("Cargo.toml"),
                 b"[package]\nname=\"pool-fixture\"\nversion=\"0.2.0\"\n[lib]\npath=\"lib.rs\"\n",
@@ -312,6 +421,168 @@ fn cargo_locality_requires_exact_captured_inputs_and_command_controls() {
             store.submit_allocated_pool(next).unwrap().worker,
             "worker-1",
             "changed control {change}",
+        );
+    }
+}
+
+#[test]
+fn compatible_cargo_locality_keeps_clippy_lints_selections_and_unknown_arguments_exact() {
+    for change in 0..5 {
+        let fixture = Fixture::cargo("clippy");
+        let store = fixture.open();
+        store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+        completed(
+            store.claim_next().unwrap().unwrap(),
+            9001,
+            0,
+            Value::Null,
+            true,
+        );
+        let mut request = Fixture::cargo_template("clippy");
+        match change {
+            0 => request = Fixture::cargo_template("check"),
+            1 => request["args"].as_array_mut().unwrap().push(json!("--lib")),
+            2 => request["args"].as_array_mut().unwrap().extend([
+                json!("--"),
+                json!("-D"),
+                json!("warnings"),
+            ]),
+            3 => request["args"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("--no-deps")),
+            4 => request["args"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("--future-cargo-option")),
+            _ => unreachable!(),
+        }
+        let source = fixture.root.join("source");
+        fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
+        let mut next = fixture.spec(2, 2);
+        next.bundle = fixture.root.join("changed-clippy-capture");
+        prepare_source_template(&source, &request, &next.bundle).unwrap();
+        assert_eq!(
+            store.submit_allocated_pool(next).unwrap().worker,
+            "worker-1",
+            "changed Clippy control {change}",
+        );
+    }
+}
+
+#[test]
+fn source_edit_locality_binds_isolated_dependency_cache_and_refuses_legacy_projection_edits() {
+    use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, ISOLATED_CARGO_HOME_SOURCE_VERSION};
+
+    for version in [
+        ISOLATED_CARGO_HOME_SOURCE_VERSION,
+        CARGO_HOME_SOURCE_VERSION,
+    ] {
+        for changed_cache in [false, true] {
+            let fixture = Fixture::cargo("build");
+            let source = fixture.root.join("source");
+            let cache_path = "cache/registry/cache/test-index/dependency-0.1.0.crate";
+            fs::create_dir_all(source.join("cache/registry/cache/test-index")).unwrap();
+            fs::write(
+                source.join(cache_path),
+                b"first captured dependency archive",
+            )
+            .unwrap();
+            let mut request = Fixture::cargo_template("build");
+            request["cargo_home"] = json!({"version":version, "prefix":"cache"});
+            request["source_files"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(cache_path));
+            let mut first = fixture.singleton(1, 2);
+            first.bundle = fixture.root.join("first-home-capture");
+            prepare_source_template(&source, &request, &first.bundle).unwrap();
+            let store = fixture.open();
+            store.submit_allocated(first).unwrap();
+            completed(
+                store.claim_next().unwrap().unwrap(),
+                9001,
+                0,
+                Value::Null,
+                true,
+            );
+            fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
+            if changed_cache {
+                fs::write(
+                    source.join(cache_path),
+                    b"changed captured dependency archive",
+                )
+                .unwrap();
+            }
+            let mut next = fixture.spec(2, 2);
+            next.bundle = fixture.root.join("next-home-capture");
+            prepare_source_template(&source, &request, &next.bundle).unwrap();
+            let expected = if version == ISOLATED_CARGO_HOME_SOURCE_VERSION && !changed_cache {
+                "worker-2"
+            } else {
+                "worker-1"
+            };
+            assert_eq!(
+                store.submit_allocated_pool(next).unwrap().worker,
+                expected,
+                "{version}, cache changed: {changed_cache}",
+            );
+        }
+    }
+}
+
+#[test]
+fn source_edit_locality_preserves_private_incremental_policy_across_test_mode() {
+    use rabs_sandbox::cargo_artifacts::{
+        CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+        CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION,
+    };
+
+    for (prior_incremental, next_incremental) in [(true, true), (false, true), (true, false)] {
+        let fixture = Fixture::cargo("build");
+        let source = fixture.root.join("source");
+        let request = |command: &str, incremental: bool| {
+            let mut request = Fixture::cargo_template(command);
+            request["command_context"]["env"]
+                .as_object_mut()
+                .unwrap()
+                .remove("RUSTFLAGS");
+            request["command_context"]["env"]["CARGO_INCREMENTAL"] =
+                json!(if incremental { "1" } else { "0" });
+            if incremental {
+                request["artifacts"]["cargo"] = json!(if command == "test" {
+                    CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION
+                } else {
+                    CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION
+                });
+            }
+            request
+        };
+        let mut first = fixture.singleton(1, 2);
+        first.bundle = fixture.root.join("first-incremental-capture");
+        prepare_source_template(&source, &request("build", prior_incremental), &first.bundle)
+            .unwrap();
+        let store = fixture.open();
+        store.submit_allocated(first).unwrap();
+        completed(
+            store.claim_next().unwrap().unwrap(),
+            9001,
+            0,
+            Value::Null,
+            true,
+        );
+        fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
+        let mut next = fixture.spec(2, 2);
+        next.bundle = fixture.root.join("next-incremental-capture");
+        prepare_source_template(&source, &request("test", next_incremental), &next.bundle).unwrap();
+        assert_eq!(
+            store.submit_allocated_pool(next).unwrap().worker,
+            if prior_incremental == next_incremental {
+                "worker-2"
+            } else {
+                "worker-1"
+            },
+            "incremental {prior_incremental} -> {next_incremental}",
         );
     }
 }
@@ -436,7 +707,7 @@ fn cargo_locality_uses_numeric_history_without_reusing_its_request_id() {
 }
 
 #[test]
-fn cargo_locality_survives_restart_without_reassigning_admitted_or_recovering_jobs() {
+fn compatible_cargo_locality_survives_restart_without_reassigning_admitted_or_recovering_jobs() {
     let fixture = Fixture::cargo("build");
     let store = fixture.open();
     store.submit_allocated(fixture.singleton(1, 2)).unwrap();
@@ -449,7 +720,16 @@ fn cargo_locality_survives_restart_without_reassigning_admitted_or_recovering_jo
     );
     drop(store);
     let store = fixture.open();
-    let selected_spec = fixture.spec(2, 2);
+    let source = fixture.root.join("source");
+    fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
+    let mut selected_spec = fixture.spec(2, 2);
+    selected_spec.bundle = fixture.root.join("after-restart-capture");
+    prepare_source_template(
+        &source,
+        &Fixture::cargo_template("build"),
+        &selected_spec.bundle,
+    )
+    .unwrap();
     let selected = store.submit_allocated_pool(selected_spec.clone()).unwrap();
     assert_eq!(selected.worker, "worker-2");
     let selected_claim = store.claim_next().unwrap().unwrap();

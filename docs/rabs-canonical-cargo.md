@@ -216,16 +216,36 @@ and the bounded queue still apply; listing 32 workers does not itself allocate
 for configuration and status details.
 
 The daemon first chooses by durable job load. Among equally loaded workers it
-prefers the worker that most recently completed the same captured Cargo request,
-then uses the listed order. This locality hint binds the complete source,
-toolchain, command, environment and output contract, along with the worker's
-endpoint, identity and certificate pin. Only the assigned wire request ID is
-normalized. Resolved ordinary failures can also leave useful target state;
-cancelled, stopped, unresolved and never-dispatched jobs cannot supply a hint.
-History is limited to the last 128 queue admissions in the bounded live record
-set. It neither promises that a target is still retained nor authorizes a cache
-hit: the selected worker verifies its own state and executes the current Cargo
-command. Changed source bytes or command controls receive no locality preference.
+prefers a worker that completed the exact captured Cargo request, then one that
+completed a compatible command or source generation. Within each match class,
+the most recently admitted matching job wins; the listed order breaks remaining
+ties. A source edit can therefore return to a worker holding the preceding build's
+private target and incremental state, while a less loaded worker still takes
+priority.
+
+Compatibility uses the same source and command planner as the worker's
+[private target cache](rabs-target-state.md). Ordinary non-executable local
+source and data edits, additions, removals and renames may retain affinity.
+Cargo `build`, `check`, `test --no-run` and `test` can share it across package
+and target selections. Clippy remains a separate family with exact selectors
+and lint controls. Cargo manifests, lockfiles, configuration, executable inputs,
+vendored packages and captured Cargo-home cache contents remain exact, as do
+the toolchain, environment, compilation profile, target, features, job grant,
+output location, required artifacts, private-state projection and other request
+controls. Unknown argument forms retain only
+exact-request preference. Legacy visible-prefix Cargo-home projections retain
+exact-source preference.
+
+A hint requires the same configured endpoint, worker identity and certificate
+pin. Resolved ordinary failures can also leave useful state; cancelled, stopped,
+unresolved and never-dispatched jobs cannot supply a hint. History is limited
+to the last 128 queue admissions in the bounded durable live record set; cold
+archives do not contribute. Reloading those records after a coordinator restart
+can preserve affinity. A worker restart, eviction, disabled target cache or
+changed runtime epoch may still leave that worker cold. The worker independently
+verifies its retained state and executes the original Cargo command, including
+tests; placement alone never authorizes reuse or a compiler skip. The captured
+request, source identity and recovery identity remain exact and unchanged.
 
 Workers whose previous execution remains unresolved are excluded. Selection
 and the original pool intent become

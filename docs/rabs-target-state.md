@@ -110,6 +110,43 @@ private storage, but the next operation has no retained seed to reuse. This
 mode does not transfer incremental snapshots to other workers or authorize
 fine-grained action-cache serving.
 
+## Keep related builds on a warm worker
+
+A canonical Cargo profile with a `workers` array automatically uses recent build
+history to prefer a worker that may hold useful private state. No extra profile
+option is required. The daemon chooses by queued/running job load first. Among
+equally loaded workers, an exact captured request match takes precedence over a
+compatible command or source generation; more recently admitted matching jobs
+win within each class, then the configured worker order breaks ties.
+
+The coordinator and worker share the command normalization and source-edit
+family planner described below. An eligible edit or a build/check/test selection
+change can therefore keep the next build on the worker that ran its predecessor.
+Clippy's separate family preserves its exact selectors and lint controls.
+Non-editable inputs, captured dependency-cache contents, toolchain, environment,
+profile, features, target, job grant, required artifacts and other request
+controls still partition the placement hint. Unknown argument forms keep
+exact-request affinity. Legacy visible-prefix Cargo-home projections keep
+exact-source affinity.
+
+History must match all three configured identities: the coordinator endpoint,
+worker name and certificate pin. Only resolved, dispatched completions with
+normal exit status 0–127 and no cancellation or stop reason qualify. A completed
+compile, lint or test failure may therefore help place the next fixed build.
+Unresolved executions continue to exclude their worker from new placement.
+
+The hint uses the last 128 queue admissions in the daemon's bounded durable live
+records. A coordinator restart can reload those records; archived history does
+not contribute. This records where work ran, not whether a seed is still present.
+Worker eviction, disabled retention, a process-only worker restart or a changed
+runtime epoch can leave the preferred worker cold. Its own exact and compatible
+keys, input verification, timestamp checks and quota decide whether restoration
+is possible. Cargo always runs the current command. The original request and its
+source, allocation and recovery identities are never replaced by this hint.
+
+See [canonical Cargo worker pools](rabs-canonical-cargo.md#place-canonical-cargo-jobs-across-a-worker-pool)
+for configuration. Single-worker profiles continue to use their selected worker.
+
 ## What can reuse a seed
 
 An exact match binds the complete captured source manifest, dependency projection,
