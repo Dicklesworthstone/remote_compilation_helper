@@ -40,6 +40,7 @@ pub struct ArtifactPlan {
     directories: BTreeSet<String>,
     tree: bool,
     cargo: Option<CargoArtifactMode>,
+    private_incremental: Option<Vec<String>>,
 }
 
 impl ArtifactPlan {
@@ -67,7 +68,11 @@ impl ArtifactPlan {
 
     /// Cargo supplies hashed target names only after compilation. Its explicit
     /// JSON contract must be resolved before this plan can capture any output.
-    fn new_cargo_tree(required: Vec<String>, mode: CargoArtifactMode) -> io::Result<Self> {
+    fn new_cargo_tree(
+        required: Vec<String>,
+        mode: CargoArtifactMode,
+        private_incremental: Option<Vec<String>>,
+    ) -> io::Result<Self> {
         if !cfg!(target_os = "linux") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -80,6 +85,7 @@ impl ArtifactPlan {
         }
         plan.tree = true;
         plan.cargo = Some(mode);
+        plan.private_incremental = private_incremental;
         Ok(plan)
     }
 
@@ -137,6 +143,7 @@ impl ArtifactPlan {
             directories,
             tree: false,
             cargo: None,
+            private_incremental: None,
         })
     }
 
@@ -154,6 +161,19 @@ impl ArtifactPlan {
 
     pub(crate) const fn cargo_mode(&self) -> Option<CargoArtifactMode> {
         self.cargo
+    }
+
+    /// Exact worker-private roots under the explicit incremental Cargo output
+    /// contract. Target-state keys bind this projection separately from mode.
+    pub(crate) fn private_incremental_roots(&self) -> Option<&[String]> {
+        self.private_incremental.as_deref()
+    }
+
+    /// Only descendants of independently derived Cargo incremental roots may
+    /// remain in a private target seed without entering the exported bundle.
+    pub(crate) fn is_private_incremental_file(&self, name: &str) -> bool {
+        self.private_incremental_roots()
+            .is_some_and(|roots| cargo_artifacts::is_private_incremental_file(roots, name))
     }
 }
 
@@ -279,6 +299,14 @@ impl PreparedArtifacts {
             ));
         }
         let report = CargoArtifactReport::read(stdout, output_root, mode)?;
+        if report
+            .files()
+            .any(|name| self.plan.is_private_incremental_file(name))
+        {
+            return Err(invalid(
+                "Cargo reported an output inside private incremental state",
+            ));
+        }
         let mut resolved = self.plan.clone();
         resolved.files.extend(report.files().map(str::to_owned));
         rabs_sandbox::artifact_tree::validate_tree_names(resolved.files())?;
@@ -459,9 +487,20 @@ impl PreparedArtifacts {
         let inventory =
             TreeInventory::scan(self.backing(), &plan.files, MAX_ARTIFACT_BYTES, &stopped)?;
         let mut files = BTreeMap::new();
+        let mut exported_bytes = 0_u64;
         for name in inventory.names() {
+            // Scan the COMPLETE tree above, including private state, before
+            // reading any payload. Symlinks, mounts, special files, external
+            // hard links and mutation remain errors even in an omitted root.
+            if plan.is_private_incremental_file(name) {
+                continue;
+            }
             let file = inventory.open_file(name)?;
             let metadata = file.metadata()?;
+            exported_bytes = exported_bytes
+                .checked_add(metadata.len())
+                .filter(|bytes| *bytes <= MAX_ARTIFACT_BYTES)
+                .ok_or_else(|| invalid("artifact byte limit exceeded"))?;
             // Retain the same inode for the post-read check even though the
             // copying reader owns its descriptor. No original output is linked.
             let witness = file.try_clone()?;
@@ -483,7 +522,7 @@ impl PreparedArtifacts {
         }
         inventory.verify(&stopped)?;
         let bundle = finish_capture(plan.clone(), files)?;
-        if bundle.total_bytes != inventory.total_bytes() {
+        if bundle.total_bytes != exported_bytes {
             return Err(invalid("artifact tree changed length during capture"));
         }
         Ok(bundle)
@@ -664,6 +703,8 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
         Some(_) => return Err("unsupported artifact tree declaration".to_owned()),
     };
     let cargo = cargo_artifacts::requested(request).map_err(|error| error.to_string())?;
+    let private_incremental =
+        cargo_artifacts::private_incremental_roots(request).map_err(|error| error.to_string())?;
     let unit = value
         .get("unit")
         .and_then(serde_json::Value::as_str)
@@ -682,7 +723,7 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
         })
         .collect::<Result<Vec<_>, _>>()?;
     let plan = if let Some(mode) = cargo {
-        ArtifactPlan::new_cargo_tree(paths, mode)
+        ArtifactPlan::new_cargo_tree(paths, mode, private_incremental)
     } else if tree {
         ArtifactPlan::new_tree(unit.to_owned(), paths)
     } else {
@@ -1485,6 +1526,135 @@ mod tests {
         invalid = request;
         invalid["artifacts"]["cargo"] = serde_json::json!("cargo-json-v2");
         assert!(parse_plan(&invalid).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_incremental_capture_omits_only_exact_state_payloads() {
+        use rabs_sandbox::cargo_artifacts::{
+            CARGO_ARTIFACTS_VERSION, CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+        };
+        for private in [false, true] {
+            let request = serde_json::json!({
+                "program":"/__rabs/toolchain/bin/cargo",
+                "args":["build", "--profile=incremental", "--target=aarch64-unknown-linux-gnu",
+                    "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+                "command_context":{"env":{"CARGO_INCREMENTAL":"1"}},
+                "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[],
+                    "cargo":if private { CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION } else { CARGO_ARTIFACTS_VERSION }},
+            });
+            let prepared = PreparedArtifacts::new(parse_plan(&request).unwrap().unwrap()).unwrap();
+            let public = [
+                (
+                    "aarch64-unknown-linux-gnu/incremental/deps/libapp.rlib",
+                    b"artifact".as_slice(),
+                ),
+                (
+                    "incremental/build/pkg/out/incremental/data",
+                    b"user generated".as_slice(),
+                ),
+                (
+                    "incremental/incremental-data/ordinary",
+                    b"ordinary".as_slice(),
+                ),
+            ];
+            let state = [
+                "incremental/incremental/host/query-cache.bin",
+                "aarch64-unknown-linux-gnu/incremental/incremental/target/work-products.bin",
+            ];
+            for (name, bytes) in public
+                .into_iter()
+                .chain(state.map(|name| (name, b"private compiler state".as_slice())))
+            {
+                let path = prepared.backing().join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, bytes).unwrap();
+            }
+            let report = format!(
+                "{}\n{}\n",
+                serde_json::json!({"reason":"compiler-artifact", "target":{"kind":["lib"]},
+                    "filenames":[format!("/__rabs/out/cargo/{}", public[0].0)], "executable":null}),
+                serde_json::json!({"reason":"build-finished", "success":true}),
+            );
+            let captured = prepared
+                .capture_with_cargo_output(None, report.as_bytes(), || false)
+                .unwrap();
+            for (name, _) in public {
+                assert!(
+                    captured.file_identity(name).is_some(),
+                    "public output {name}"
+                );
+            }
+            for name in state {
+                assert_eq!(captured.file_identity(name).is_none(), private, "{name}");
+                assert!(
+                    prepared.backing().join(name).is_file(),
+                    "private state remains for target retention"
+                );
+            }
+            let public_bytes: u64 = public.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+            assert_eq!(
+                captured.total_bytes(),
+                public_bytes
+                    + if private {
+                        0
+                    } else {
+                        2 * b"private compiler state".len() as u64
+                    }
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_incremental_capture_refuses_hidden_reported_outputs_and_unsafe_state() {
+        use rabs_sandbox::cargo_artifacts::CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION;
+        use std::os::unix::fs::symlink;
+        let request = serde_json::json!({
+            "program":"/__rabs/toolchain/bin/cargo",
+            "args":["check", "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+            "command_context":{"env":{"CARGO_INCREMENTAL":"1"}},
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[], "cargo":CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION},
+        });
+        for case in 0..3 {
+            let prepared = PreparedArtifacts::new(parse_plan(&request).unwrap().unwrap()).unwrap();
+            fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+            fs::create_dir_all(prepared.backing().join("debug/incremental/pkg")).unwrap();
+            fs::write(
+                prepared.backing().join("debug/deps/libapp.rmeta"),
+                b"metadata",
+            )
+            .unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("state"), b"unowned").unwrap();
+            let private = prepared.backing().join("debug/incremental/pkg/state");
+            match case {
+                0 => fs::write(&private, b"reported output cannot be hidden").unwrap(),
+                1 => symlink(outside.path().join("state"), &private).unwrap(),
+                _ => fs::hard_link(outside.path().join("state"), &private).unwrap(),
+            }
+            let name = if case == 0 {
+                "debug/incremental/pkg/state"
+            } else {
+                "debug/deps/libapp.rmeta"
+            };
+            let report = format!(
+                "{}\n{}\n",
+                serde_json::json!({"reason":"compiler-artifact", "target":{"kind":["lib"]},
+                    "filenames":[format!("/__rabs/out/cargo/{name}")], "executable":null}),
+                serde_json::json!({"reason":"build-finished", "success":true}),
+            );
+            let error = prepared
+                .capture_with_cargo_output(None, report.as_bytes(), || false)
+                .unwrap_err();
+            if case == 0 {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("reported an output inside private")
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

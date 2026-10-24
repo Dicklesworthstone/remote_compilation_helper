@@ -285,7 +285,7 @@ impl Storage {
         self.verify_owner()?;
         let sequence = self
             .next
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| invalid("target cache generation counter overflow"))?;

@@ -260,6 +260,7 @@ struct Declaration {
     unit: String,
     names: BTreeSet<String>,
     tree: bool,
+    private_incremental: Option<Vec<String>>,
 }
 
 fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
@@ -272,6 +273,7 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         Some(_) => return Err(invalid("unsupported artifact tree declaration")),
     };
     let cargo = cargo_artifacts::requested(request)?;
+    let private_incremental = cargo_artifacts::private_incremental_roots(request)?;
     require(
         value
             .as_object()
@@ -321,6 +323,7 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         unit: unit.to_owned(),
         names,
         tree,
+        private_incremental,
     }))
 }
 
@@ -528,6 +531,14 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
         require(rows.len() == expected.names.len(), "artifact set mismatch")?;
         expected.names.clone()
     };
+    if let Some(roots) = &expected.private_incremental {
+        require(
+            names
+                .iter()
+                .all(|name| !cargo_artifacts::is_private_incremental_file(roots, name)),
+            "worker offered private incremental state as a Cargo artifact",
+        )?;
+    }
     let mut files = Vec::new();
     let mut total = 0_u64;
     let mut hasher = Sha256::new();
@@ -605,6 +616,14 @@ pub(crate) fn verify_cargo_artifacts(
     };
     verified_artifact_names(request, artifacts)?;
     let report = CargoArtifactReport::read(stdout, "/__rabs/out/cargo", mode)?;
+    if let Some(roots) = cargo_artifacts::private_incremental_roots(request)? {
+        require(
+            report
+                .files()
+                .all(|name| !cargo_artifacts::is_private_incremental_file(&roots, name)),
+            "Cargo reported an output inside private incremental state",
+        )?;
+    }
     let files = artifacts["files"]
         .as_array()
         .ok_or_else(|| invalid("Cargo artifact manifest"))?

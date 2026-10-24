@@ -213,7 +213,7 @@ fn target_key_description(
     let mut rw: Vec<_> = spec.rw_binds.iter().map(|bind| &bind.visible).collect();
     ro.sort();
     rw.sort();
-    Ok(serde_json::json!({
+    let mut value = serde_json::json!({
         "version":"rabs.private-cargo-target.v1",
         "scope":scope.0,
         "source":inputs.full_source_digest,
@@ -228,7 +228,14 @@ fn target_key_description(
         "required":plan.files().collect::<Vec<_>>(),
         "cargo_mode":format!("{:?}", plan.cargo_mode()),
         "runtime":"fresh-home+captured-or-empty-cargo-home+private-fifo-v1",
-    }))
+    });
+    if let Some(roots) = plan.private_incremental_roots() {
+        // The private tree and the delivered tree have different contracts.
+        // Preserve exact identity for existing full-tree requests, and bind
+        // the explicitly selected projection for private incremental runs.
+        value["cargo_private_incremental_roots"] = serde_json::json!(roots);
+    }
+    Ok(value)
 }
 
 fn compatible_cargo_arguments(
@@ -850,12 +857,18 @@ impl TargetAttempt {
         if SourceTimes::capture(&self.inputs, stopped)? != self.times {
             return Err(invalid("source changed while Cargo was executing"));
         }
-        let Some(reservation) = self.cache.reserve(captured.total_bytes()) else {
+        let Some((reservation, tree)) = TreeSnapshot::capture(
+            &self.cache,
+            artifacts.backing(),
+            artifacts.plan(),
+            captured,
+            stopped,
+        )?
+        else {
             return Ok(None);
         };
-        let tree = TreeSnapshot::capture(&self.cache, artifacts.backing(), captured, stopped)?;
-        if tree.bytes != reservation.bytes {
-            return Err(invalid("target state differs from captured artifacts"));
+        if SourceTimes::capture(&self.inputs, stopped)? != self.times {
+            return Err(invalid("source changed while capturing Cargo target state"));
         }
         let seed = Seed {
             key: self.key,
@@ -1171,24 +1184,37 @@ impl TreeSnapshot {
     }
 
     fn capture(
-        cache: &TargetCache,
+        cache: &Arc<TargetCache>,
         root: &Path,
+        plan: &ArtifactPlan,
         captured: &CapturedArtifacts,
         stopped: &impl Fn() -> bool,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Option<(Reservation, Self)>> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = captured.file_names().map(str::to_owned).collect();
         let tree = TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?;
-        let snapshot = Self::capture_inventory(cache, &tree, stopped)?;
-        if snapshot
-            .files
-            .keys()
-            .map(String::as_str)
+        // Every ordinary output still belongs to the validated offer. Only
+        // the explicit Cargo private-state projection may retain extra files;
+        // generic and older Cargo contracts continue to require exact equality.
+        if tree
+            .names()
+            .filter(|name| !plan.is_private_incremental_file(name))
             .ne(captured.file_names())
         {
             return Err(invalid("target seed differs from validated artifact set"));
         }
-        for (name, file) in &snapshot.files {
+        // Reserve the COMPLETE target before copying, including compiler state
+        // omitted from transport. An output-only reservation would undercount
+        // incremental generations and let them bypass the worker pool quota.
+        let Some(reservation) = cache.reserve(tree.total_bytes()) else {
+            return Ok(None);
+        };
+        let snapshot = Self::capture_inventory(cache, &tree, stopped)?;
+        for name in captured.file_names() {
+            let file = snapshot
+                .files
+                .get(name)
+                .ok_or_else(|| invalid("target seed is missing a validated artifact"))?;
             if captured.file_identity(name)
                 != Some((
                     file.len,
@@ -1199,7 +1225,12 @@ impl TreeSnapshot {
                 return Err(invalid("target seed differs from validated artifact bytes"));
             }
         }
-        Ok(snapshot)
+        if snapshot.bytes != reservation.bytes {
+            return Err(invalid(
+                "target state differs from its complete reservation",
+            ));
+        }
+        Ok(Some((reservation, snapshot)))
     }
 
     fn restore(&self, destination: &Path, stopped: &impl Fn() -> bool) -> io::Result<()> {
@@ -1220,11 +1251,12 @@ impl TreeSnapshot {
 #[cfg(not(target_os = "linux"))]
 impl TreeSnapshot {
     fn capture(
-        _: &TargetCache,
+        _: &Arc<TargetCache>,
         _: &Path,
+        _: &ArtifactPlan,
         _: &CapturedArtifacts,
         _: &impl Fn() -> bool,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Option<(Reservation, Self)>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "target state requires Linux",

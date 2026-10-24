@@ -1,9 +1,11 @@
 //! Cargo-selected output names for canonical build, check, Clippy and tests.
 //!
 //! Cargo owns target selection and hashed output names. Its complete bounded JSON
-//! stream supplies the required artifacts; the existing tree capture must still
-//! retain every output, verify bytes and drain all writers. These messages never
-//! authorize cache publication, compiler skipping or test execution success.
+//! stream supplies the required artifacts. Legacy contracts retain the complete
+//! output tree; the explicit private-incremental contracts omit only precisely
+//! derived compiler-state roots while retaining every reported output. Both
+//! still verify bytes and drain all writers. These messages never authorize
+//! cache publication, compiler skipping or test execution success.
 
 use crate::artifact_tree::{MAX_TREE_FILES, TREE_FILES_VERSION, validate_tree_names};
 use serde_json::Value;
@@ -15,6 +17,12 @@ pub const CARGO_ARTIFACTS_VERSION: &str = "cargo-json-v1";
 /// Test execution has arbitrary program output after Cargo's build-finished.
 /// Its native final process status, never that JSON record, decides success.
 pub const CARGO_TEST_ARTIFACTS_VERSION: &str = "cargo-test-json-v1";
+/// Cargo may retain incremental compiler state privately on the worker. Only
+/// this explicit contract omits its precisely derived roots from delivery.
+pub const CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION: &str = "cargo-private-incremental-json-v1";
+/// The private-state projection with native test execution semantics.
+pub const CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION: &str =
+    "cargo-private-incremental-test-json-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoArtifactMode {
@@ -43,8 +51,12 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         return Ok(None);
     };
     let mode = match contract.as_str() {
-        Some(CARGO_ARTIFACTS_VERSION) => CargoArtifactMode::Compilation,
-        Some(CARGO_TEST_ARTIFACTS_VERSION) => CargoArtifactMode::TestExecution,
+        Some(CARGO_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION) => {
+            CargoArtifactMode::Compilation
+        }
+        Some(CARGO_TEST_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION) => {
+            CargoArtifactMode::TestExecution
+        }
         _ => return Err(invalid("unsupported Cargo artifact contract")),
     };
     if request["artifacts"]["tree"].as_str() != Some(TREE_FILES_VERSION)
@@ -155,7 +167,213 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
     if !format || !target || !matching_command {
         return Err(invalid("incomplete Cargo compilation artifact contract"));
     }
+    if private_incremental_contract(request) {
+        validate_private_incremental_environment(request)?;
+        let roots = derive_private_incremental_roots(&args)?;
+        if request["artifacts"]["files"]
+            .as_array()
+            .is_some_and(|files| {
+                files.iter().any(|name| {
+                    name.as_str()
+                        .is_some_and(|name| is_private_incremental_file(&roots, name))
+                })
+            })
+        {
+            return Err(invalid(
+                "required Cargo artifact is private incremental state",
+            ));
+        }
+    }
     Ok(Some(mode))
+}
+
+fn private_incremental_contract(request: &Value) -> bool {
+    matches!(
+        request["artifacts"]["cargo"].as_str(),
+        Some(
+            CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION
+                | CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION
+        )
+    )
+}
+
+fn validate_private_incremental_environment(request: &Value) -> io::Result<()> {
+    let environment = request["command_context"]["env"]
+        .as_object()
+        .ok_or_else(|| invalid("private incremental Cargo requires an explicit environment"))?;
+    if environment.get("CARGO_INCREMENTAL").and_then(Value::as_str) != Some("1") {
+        return Err(invalid(
+            "private incremental Cargo requires CARGO_INCREMENTAL=1",
+        ));
+    }
+    // The launcher already refuses these controls, but direct native requests
+    // must not redirect Cargo's target/build directories or rustc's incremental
+    // path behind the independently reconstructed output projection.
+    if environment.keys().any(|name| {
+        (name.starts_with("CARGO_") && name != "CARGO_INCREMENTAL")
+            || matches!(
+                name.as_str(),
+                "RUSTFLAGS" | "RUSTDOCFLAGS" | "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER"
+            )
+    }) {
+        return Err(invalid(
+            "private incremental Cargo refuses ambient build controls",
+        ));
+    }
+    Ok(())
+}
+
+/// Reconstruct the worker-private state roots from the original validated
+/// request. Receivers call this independently; no worker-supplied exclusion
+/// list grants authority. Legacy Cargo contracts retain their complete trees.
+pub fn private_incremental_roots(request: &Value) -> io::Result<Option<Vec<String>>> {
+    if requested(request)?.is_none() || !private_incremental_contract(request) {
+        return Ok(None);
+    }
+    let args = request["args"]
+        .as_array()
+        .ok_or_else(|| invalid("Cargo arguments missing"))?
+        .iter()
+        .map(|argument| {
+            argument
+                .as_str()
+                .ok_or_else(|| invalid("Cargo argument missing"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    derive_private_incremental_roots(&args).map(Some)
+}
+
+/// Match descendants of an exact admitted root. A profile, binary, build-script
+/// output or unrelated directory merely named `incremental` is not private.
+pub fn is_private_incremental_file(roots: &[String], name: &str) -> bool {
+    roots.iter().any(|root| {
+        name.strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
+    let mut profile = None;
+    let mut target = None;
+    let mut release = false;
+    let mut test_filter = false;
+    let mut at = 1;
+    while at < args.len() {
+        if args[at] == "--" {
+            // The command validator owns whether this is a test harness or
+            // Clippy lint tail. Neither tail can change Cargo's output layout.
+            break;
+        }
+        let (option, inline) = args[at]
+            .split_once('=')
+            .map_or((args[at], None), |(option, value)| (option, Some(value)));
+        match option {
+            "--profile" | "--target" | "--bin" | "--example" | "--test" | "--bench"
+            | "--package" | "-p" | "--exclude" | "--features" | "-F" | "--color"
+            | "--manifest-path" | "--target-dir" | "--message-format" | "--jobs" | "-j" => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        at += 1;
+                        *args
+                            .get(at)
+                            .ok_or_else(|| invalid("Cargo option requires a value"))?
+                    }
+                };
+                if value.is_empty() || value.starts_with('-') {
+                    return Err(invalid("invalid private incremental Cargo option value"));
+                }
+                if option == "--profile" {
+                    if profile.is_some() || release || !ordinary_name(value, 64) {
+                        return Err(invalid(
+                            "private incremental Cargo requires one literal profile",
+                        ));
+                    }
+                    profile = Some(value);
+                } else if option == "--target" {
+                    // Cargo's special `host-tuple` spelling expands to another
+                    // directory name. Admit the same explicit Linux triples as
+                    // the canonical frontend, never aliases or JSON targets.
+                    if target.is_some()
+                        || !matches!(
+                            value,
+                            "x86_64-unknown-linux-gnu"
+                                | "aarch64-unknown-linux-gnu"
+                                | "x86_64-unknown-linux-musl"
+                                | "aarch64-unknown-linux-musl"
+                        )
+                    {
+                        return Err(invalid(
+                            "private incremental Cargo requires one named target",
+                        ));
+                    }
+                    target = Some(value);
+                }
+            }
+            "--release" | "-r" if inline.is_none() => {
+                if profile.is_some() || release {
+                    return Err(invalid(
+                        "conflicting private incremental Cargo profile selectors",
+                    ));
+                }
+                release = true;
+            }
+            "--workspace"
+            | "--all"
+            | "--lib"
+            | "--bins"
+            | "--examples"
+            | "--tests"
+            | "--benches"
+            | "--all-targets"
+            | "--locked"
+            | "--offline"
+            | "--frozen"
+            | "--all-features"
+            | "--no-default-features"
+            | "--verbose"
+            | "-v"
+            | "-vv"
+            | "--quiet"
+            | "-q"
+            | "--no-run"
+            | "--no-fail-fast"
+            | "--doc"
+            | "--no-deps"
+                if inline.is_none() => {}
+            _ if args[0] == "test" && !args[at].starts_with('-') && !test_filter => {
+                test_filter = true;
+            }
+            _ => {
+                return Err(invalid(
+                    "unsupported private incremental Cargo layout option",
+                ));
+            }
+        }
+        at += 1;
+    }
+    let profile = match profile {
+        Some("dev" | "test") => "debug",
+        Some("release" | "bench") => "release",
+        Some(name) => name,
+        None if release => "release",
+        None => "debug",
+    };
+    let mut roots = vec![format!("{profile}/incremental")];
+    if let Some(target) = target {
+        roots.push(format!("{target}/{profile}/incremental"));
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+fn ordinary_name(value: &str, limit: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= limit
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
 }
 
 /// Only lint controls may cross Clippy's argument separator. In particular,
@@ -421,6 +639,185 @@ mod tests {
                 bytes
             })
             .collect()
+    }
+
+    fn private_request(command: &str, extra: &[&str]) -> Value {
+        let mut args = vec![
+            command,
+            "--message-format=json",
+            "--target-dir",
+            OUTPUT_ROOT,
+        ];
+        args.extend_from_slice(extra);
+        let test = command == "test" && !extra.contains(&"--no-run");
+        json!({
+            "program":if command == "clippy" { "/__rabs/toolchain/bin/cargo-clippy" } else { "/__rabs/toolchain/bin/cargo" },
+            "args":args,
+            "command_context":{"env":{"CARGO_INCREMENTAL":"1", "CARGO":"/__rabs/toolchain/bin/cargo", "RUSTC":"/__rabs/toolchain/bin/rustc"}},
+            "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[],
+                "cargo":if test { CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION } else { CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION }},
+        })
+    }
+
+    #[test]
+    fn private_incremental_contract_derives_only_exact_cargo_roots() {
+        for (arguments, profile) in [
+            (vec![], "debug"),
+            (vec!["--profile=dev"], "debug"),
+            (vec!["--profile", "test"], "debug"),
+            (vec!["--profile=bench"], "release"),
+            (vec!["--profile", "release"], "release"),
+            (vec!["--release"], "release"),
+            (vec!["-r"], "release"),
+            (vec!["--profile", "ci-fast"], "ci-fast"),
+            (vec!["--profile", "incremental"], "incremental"),
+        ] {
+            let mut request = private_request("build", &arguments);
+            let root = format!("{profile}/incremental");
+            assert_eq!(
+                private_incremental_roots(&request).unwrap(),
+                Some(vec![root.clone()])
+            );
+            request["args"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("--target=aarch64-unknown-linux-gnu"));
+            let mut expected = vec![root.clone(), format!("aarch64-unknown-linux-gnu/{root}")];
+            expected.sort();
+            let roots = private_incremental_roots(&request).unwrap().unwrap();
+            assert_eq!(roots, expected);
+            assert!(is_private_incremental_file(
+                &roots,
+                &format!("{root}/crate/session/query-cache.bin")
+            ));
+            for public in [
+                root.clone(),
+                format!("{root}-data/file"),
+                format!("{profile}/build/pkg/out/incremental/data"),
+                "other/incremental/data".into(),
+                "incremental/deps/libapp.rlib".into(),
+            ] {
+                assert!(!is_private_incremental_file(&roots, &public), "{public}");
+            }
+        }
+    }
+
+    #[test]
+    fn private_incremental_contract_preserves_test_and_clippy_argument_boundaries() {
+        let test = private_request(
+            "test",
+            &[
+                "filter",
+                "--",
+                "--profile",
+                "arbitrary-harness-value",
+                "--target=host-tuple",
+            ],
+        );
+        assert_eq!(
+            requested(&test).unwrap(),
+            Some(CargoArtifactMode::TestExecution)
+        );
+        assert_eq!(
+            private_incremental_roots(&test).unwrap(),
+            Some(vec!["debug/incremental".into()])
+        );
+        let compilation = private_request("test", &["--no-run", "--profile=ci"]);
+        assert_eq!(
+            requested(&compilation).unwrap(),
+            Some(CargoArtifactMode::Compilation)
+        );
+        assert_eq!(
+            private_incremental_roots(&compilation).unwrap(),
+            Some(vec!["ci/incremental".into()])
+        );
+        let clippy = private_request("clippy", &["--release", "--", "-D", "clippy::all"]);
+        assert_eq!(
+            requested(&clippy).unwrap(),
+            Some(CargoArtifactMode::Compilation)
+        );
+        assert_eq!(
+            private_incremental_roots(&clippy).unwrap(),
+            Some(vec!["release/incremental".into()])
+        );
+        // A value is consumed according to option arity; it cannot become a
+        // second selector even when its spelling resembles an option.
+        for option in ["--features", "--package", "--color", "--manifest-path"] {
+            assert!(
+                private_incremental_roots(&private_request("build", &[option, "--profile=ci"]))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn private_incremental_contract_refuses_ambiguous_layout_and_environment() {
+        for arguments in [
+            vec!["--profile=ci", "--profile=dev"],
+            vec!["--profile=ci", "--release"],
+            vec!["--release", "--profile=ci"],
+            vec!["--release", "-r"],
+            vec![
+                "--target=x86_64-unknown-linux-gnu",
+                "--target=aarch64-unknown-linux-gnu",
+            ],
+            vec!["--target=host-tuple"],
+            vec!["--target=custom.json"],
+            vec!["--target=../target"],
+            vec!["--profile=../ci"],
+            vec!["--config", "build.target='elsewhere'"],
+            vec!["-Zbuild-dir"],
+            vec!["--build-dir", "/elsewhere"],
+            vec!["--profile"],
+        ] {
+            assert!(
+                private_incremental_roots(&private_request("build", &arguments)).is_err(),
+                "{arguments:?}"
+            );
+        }
+        for value in [
+            Value::Null,
+            json!(0),
+            json!("0"),
+            json!(true),
+            json!("true"),
+        ] {
+            let mut request = private_request("build", &[]);
+            request["command_context"]["env"]["CARGO_INCREMENTAL"] = value;
+            assert!(requested(&request).is_err());
+        }
+        for name in [
+            "CARGO_BUILD_TARGET",
+            "CARGO_BUILD_PROFILE",
+            "CARGO_BUILD_BUILD_DIR",
+            "CARGO_TARGET_DIR",
+            "CARGO_PROFILE_DEV_DIR_NAME",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            let mut request = private_request("build", &[]);
+            request["command_context"]["env"][name] = json!("override");
+            assert!(requested(&request).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn private_incremental_contract_cannot_hide_required_outputs_or_change_legacy_contracts() {
+        let mut request = private_request("build", &[]);
+        request["artifacts"]["files"] = json!(["debug/incremental/pkg/output"]);
+        assert!(requested(&request).is_err());
+        request["artifacts"]["files"] = json!(["debug/build/pkg/out/incremental/output"]);
+        assert!(requested(&request).is_ok());
+        request["artifacts"]["cargo"] = json!(CARGO_ARTIFACTS_VERSION);
+        request["artifacts"]["files"] = json!(["debug/incremental/pkg/output"]);
+        assert_eq!(
+            requested(&request).unwrap(),
+            Some(CargoArtifactMode::Compilation)
+        );
+        assert_eq!(private_incremental_roots(&request).unwrap(), None);
     }
 
     #[test]
