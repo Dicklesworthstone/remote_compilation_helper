@@ -3,6 +3,7 @@ use crate::ui::context::OutputContext;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use rch_common::job_identity::{DurableJobLease, default_job_lease_directory};
+use rch_common::process_identity::OwnerPresence;
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -37,52 +38,8 @@ pub async fn run(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()> 
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum OwnerPresence {
-    Live,
-    Absent,
-    Unknown,
-}
-
-fn owner_from_proc_stat(stat: &str, expected_ticks: u64) -> OwnerPresence {
-    let Some((_, rest)) = stat.rsplit_once(") ") else {
-        return OwnerPresence::Unknown;
-    };
-    let mut fields = rest.split_whitespace();
-    let state = fields.next();
-    let Some(ticks) = fields.nth(18).and_then(|value| value.parse::<u64>().ok()) else {
-        return OwnerPresence::Unknown;
-    };
-    if ticks != expected_ticks || matches!(state, Some("Z" | "X" | "x")) {
-        return OwnerPresence::Absent;
-    }
-    match state {
-        Some("R" | "S" | "D" | "T" | "t" | "K" | "W" | "P" | "I") => OwnerPresence::Live,
-        _ => OwnerPresence::Unknown,
-    }
-}
-
 fn owner_presence(lease: &DurableJobLease) -> OwnerPresence {
-    let Some(ticks) = lease.process_start_ticks else {
-        return OwnerPresence::Unknown;
-    };
-    let Some(boot) = lease.boot_id.as_deref().filter(|boot| !boot.is_empty()) else {
-        return OwnerPresence::Unknown;
-    };
-    let Ok(current_boot) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
-        return OwnerPresence::Unknown;
-    };
-    if current_boot.trim().is_empty() {
-        return OwnerPresence::Unknown;
-    }
-    if current_boot.trim() != boot {
-        return OwnerPresence::Absent;
-    }
-    match std::fs::read_to_string(format!("/proc/{}/stat", lease.wrapper_pid)) {
-        Ok(stat) => owner_from_proc_stat(&stat, ticks),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OwnerPresence::Absent,
-        Err(_) => OwnerPresence::Unknown,
-    }
+    rch_common::process_identity::owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
 }
 
 pub(crate) fn process_matches(lease: &DurableJobLease) -> bool {
@@ -221,6 +178,7 @@ fn same_unfinished_owner_without_recovery(
         && observed.wrapper_pid == latest.wrapper_pid
         && observed.process_start_ticks == latest.process_start_ticks
         && observed.boot_id == latest.boot_id
+        && observed.process_birth == latest.process_birth
         && latest.recovery.is_none()
         && !latest.terminal_acknowledged
 }
@@ -386,8 +344,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             let reply: Value = serde_json::from_str(body)?;
             validate_queued_cancellation(&wrapper_id, &reply)?;
             if reply["status"] == "cancelled_before_start" {
-                writer.record_exit(130)?;
-                writer.acknowledge_terminal()?;
+                writer.confirm_selection_cancelled()?;
             } else if reply["status"] == "cancelled" {
                 let mut identity = lease.identity.clone();
                 identity.admit(
@@ -756,40 +713,29 @@ mod tests {
         assert!(validate_admitted_cancellation(&lease, &reply).is_err());
     }
 
-    fn proc_stat(state: &str, ticks: u64) -> String {
-        // Fields 3 (state) through 22 (starttime); the command deliberately
-        // contains spaces and parentheses, so splitting at the first ')' fails.
-        format!(
-            "123 (rch (wrapper)) {state} {} {ticks}",
-            vec!["0"; 18].join(" ")
-        )
+    #[test]
+    fn unknown_owner_cannot_be_attached_as_a_live_queued_wrapper() {
+        let mut lease = queued_lease();
+        lease.wrapper_pid = std::process::id();
+        assert_eq!(owner_presence(&lease), OwnerPresence::Unknown);
+        assert!(waiting_for_admission(&lease, process_matches(&lease)).is_err());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn owner_observation_distinguishes_live_dead_reused_and_unknown() {
-        assert_eq!(
-            owner_from_proc_stat(&proc_stat("S", 42), 42),
-            OwnerPresence::Live
+    fn native_mac_lease_reload_can_attach_to_its_original_queued_wrapper() {
+        let mut lease = queued_lease();
+        lease.wrapper_pid = std::process::id();
+        lease.process_birth = Some(
+            rch_common::process_identity::current_process_identity().expect("native Darwin birth"),
         );
-        for state in ["Z", "X", "x"] {
-            assert_eq!(
-                owner_from_proc_stat(&proc_stat(state, 42), 42),
-                OwnerPresence::Absent
-            );
-        }
-        assert_eq!(
-            owner_from_proc_stat(&proc_stat("R", 43), 42),
-            OwnerPresence::Absent
-        );
-        assert_eq!(
-            owner_from_proc_stat(&proc_stat("?", 42), 42),
-            OwnerPresence::Unknown
-        );
-        assert_eq!(
-            owner_from_proc_stat("unreadable or truncated", 42),
-            OwnerPresence::Unknown
-        );
-        assert_eq!(owner_presence(&queued_lease()), OwnerPresence::Unknown);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lease.json");
+        std::fs::write(&path, serde_json::to_vec(&lease).unwrap()).unwrap();
+        let restored: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(process_matches(&restored));
+        assert!(waiting_for_admission(&restored, process_matches(&restored)).unwrap());
     }
 
     #[test]
@@ -807,6 +753,11 @@ mod tests {
         assert!(!same_unfinished_owner_without_recovery(&observed, &latest));
         latest = observed.clone();
         latest.wrapper_pid += 1;
+        assert!(!same_unfinished_owner_without_recovery(&observed, &latest));
+        latest = observed.clone();
+        latest.process_birth = rch_common::process_identity::ProcessIdentity::from_record(
+            "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f:darwin:1791280000:123456",
+        );
         assert!(!same_unfinished_owner_without_recovery(&observed, &latest));
     }
 }

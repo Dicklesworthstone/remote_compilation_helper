@@ -24,14 +24,14 @@
 //!
 //! ## Content identity boundary
 //!
-//! V1 entries carry path + length only. Byte-level equality binding
-//! (content digests) lands where hashing lives — the CAS/storage layer
-//! hashes each file under its own domain and extends entries there;
-//! presence-diff semantics here are already complete for the
-//! deletion/tombstone acceptance.
+//! V2 entries require the SHA-256 digest of the complete file bytes as
+//! well as their length. The caller hashes the captured bytes; this
+//! dependency-free schema never reads files or substitutes metadata for
+//! content identity. A same-length edit changes manifest identity and
+//! produces a modification row (bd-2y15k).
 
 /// Schema version for the output tree manifest.
-pub const OUTPUT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const OUTPUT_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Upper bound on manifest entries per section.
 pub const MAX_OUTPUT_ENTRIES: usize = 16384;
@@ -45,21 +45,25 @@ pub struct OutputEntry {
     pub path: Vec<u8>,
     /// File length in bytes at capture time.
     pub len: u64,
+    /// SHA-256 of the complete captured file bytes. This is mandatory:
+    /// missing content identity cannot mean "equal when lengths match".
+    pub content_sha256: [u8; 32],
 }
 
 impl OutputEntry {
     /// Build one entry.
     #[must_use]
-    pub fn new(path: impl Into<Vec<u8>>, len: u64) -> Self {
+    pub fn new(path: impl Into<Vec<u8>>, len: u64, content_sha256: [u8; 32]) -> Self {
         Self {
             path: path.into(),
             len,
+            content_sha256,
         }
     }
 }
 
 /// Which section an entry came from / belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OutputSection {
     /// The build script's OUT_DIR tree.
     OutDir,
@@ -94,6 +98,8 @@ pub struct OutputTreeManifest {
 /// Typed validation refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestValidationError {
+    /// The manifest belongs to another schema version.
+    UnsupportedSchemaVersion(u32),
     /// Entries must ascend by path.
     UnsortedEntries(OutputSection),
     /// Duplicate paths within one section.
@@ -128,6 +134,21 @@ impl OutputTreeManifest {
             OutputSection::OutDir => &self.out_dir_entries,
             OutputSection::OutputCache => &self.cache_entries,
         }
+    }
+
+    /// Validate the current schema and both independently named sections.
+    ///
+    /// # Errors
+    /// Unsupported schema versions, ordering errors, duplicate paths or
+    /// sections that exceed the declared entry bound.
+    pub fn validate(&self) -> Result<(), ManifestValidationError> {
+        if self.schema_version != OUTPUT_MANIFEST_SCHEMA_VERSION {
+            return Err(ManifestValidationError::UnsupportedSchemaVersion(
+                self.schema_version,
+            ));
+        }
+        validate_section(&self.out_dir_entries, OutputSection::OutDir)?;
+        validate_section(&self.cache_entries, OutputSection::OutputCache)
     }
 }
 
@@ -170,14 +191,14 @@ pub enum TreeDeltaRow {
         /// Which section lost it.
         section: OutputSection,
     },
-    /// Same path, different length on the newer capture. (Byte-level
-    /// equality needs content digests — storage-layer extension; length
-    /// change is the V1 observable.)
-    LengthChanged {
+    /// Same section and path, different file length or content digest.
+    Modified {
         /// The new entry.
         new_entry: OutputEntry,
         /// The previous length.
         previous_len: u64,
+        /// The SHA-256 digest from the previous capture.
+        previous_content_sha256: [u8; 32],
         /// Which section changed.
         section: OutputSection,
     },
@@ -186,10 +207,9 @@ pub enum TreeDeltaRow {
 /// Structural delta between two captures of the SAME run's surfaces.
 ///
 /// Deterministic and order-stable: rows are emitted section-by-section
-/// (OutDir first), each section's rows sorted by path — Added/Modified
-/// interleaved by path order, then all Removed tombstones. Nothing is
-/// inferred beyond presence and length: absence of a row means the path
-/// was present in both manifests with equal length.
+/// (OutDir first), each section's rows sorted by path, including
+/// tombstones. Absence of a row means the path was present in the same
+/// section in both manifests with equal length and content digest.
 ///
 /// # Errors
 /// Propagates section validation from either side — diffing corrupt
@@ -200,10 +220,8 @@ pub fn diff_manifests(
 ) -> Result<Vec<TreeDeltaRow>, ManifestValidationError> {
     // Re-validate both sides so a corrupted input cannot fabricate
     // phantom additions or hide real tombstones.
-    validate_section(&before.out_dir_entries, OutputSection::OutDir)?;
-    validate_section(&before.cache_entries, OutputSection::OutputCache)?;
-    validate_section(&after.out_dir_entries, OutputSection::OutDir)?;
-    validate_section(&after.cache_entries, OutputSection::OutputCache)?;
+    before.validate()?;
+    after.validate()?;
 
     let mut rows = Vec::new();
     for (section, old, new) in [
@@ -238,10 +256,11 @@ pub fn diff_manifests(
                         j += 1;
                     }
                     std::cmp::Ordering::Equal => {
-                        if o.len != n.len {
-                            rows.push(TreeDeltaRow::LengthChanged {
+                        if o.len != n.len || o.content_sha256 != n.content_sha256 {
+                            rows.push(TreeDeltaRow::Modified {
                                 new_entry: n.clone(),
                                 previous_len: o.len,
+                                previous_content_sha256: o.content_sha256,
                                 section,
                             });
                         }
@@ -282,7 +301,8 @@ mod tests {
     use super::*;
 
     fn e(path: &str, len: u64) -> OutputEntry {
-        OutputEntry::new(path, len)
+        // Synthetic digest identity: these are schema fixtures, not file captures.
+        OutputEntry::new(path, len, [7; 32])
     }
 
     fn manifest(
@@ -332,19 +352,20 @@ mod tests {
             last_entry: e("sub/nested.bin", 7),
             section: OutputSection::OutDir,
         }));
-        assert!(rows.contains(&TreeDeltaRow::LengthChanged {
+        assert!(rows.contains(&TreeDeltaRow::Modified {
             new_entry: e("gen.rs", 30),
             previous_len: 24,
+            previous_content_sha256: [7; 32],
             section: OutputSection::OutDir,
         }));
         // Identical cache section yields NO rows: absence of a row means
-        // present-with-equal-length on both sides.
+        // present with equal length and digest on both sides.
         assert!(!rows.iter().any(|r| matches!(
             r,
             TreeDeltaRow::Added {
                 section: OutputSection::OutputCache,
                 ..
-            } | TreeDeltaRow::LengthChanged {
+            } | TreeDeltaRow::Modified {
                 section: OutputSection::OutputCache,
                 ..
             }
@@ -370,7 +391,7 @@ mod tests {
                 TreeDeltaRow::Removed { last_entry, .. } => {
                     format!("-{}", String::from_utf8_lossy(&last_entry.path))
                 }
-                TreeDeltaRow::LengthChanged { new_entry, .. } => {
+                TreeDeltaRow::Modified { new_entry, .. } => {
                     format!("~{}", String::from_utf8_lossy(&new_entry.path))
                 }
             })
@@ -391,6 +412,38 @@ mod tests {
     fn n003_identical_manifests_yield_zero_rows() {
         let m = manifest(&[("a", 1)], &[("output", 2)]).expect("valid");
         assert!(diff_manifests(&m, &m).expect("valid").is_empty());
+    }
+
+    #[test]
+    fn n003_equal_length_content_changes_are_explicit_modifications() {
+        let before = manifest(&[("same", 18)], &[("same", 18)]).expect("valid");
+        let mut after = before.clone();
+        after.cache_entries[0].content_sha256 = [8; 32];
+        let rows = diff_manifests(&before, &after).expect("valid");
+        assert_eq!(
+            rows,
+            vec![TreeDeltaRow::Modified {
+                new_entry: after.cache_entries[0].clone(),
+                previous_len: 18,
+                previous_content_sha256: [7; 32],
+                section: OutputSection::OutputCache,
+            }]
+        );
+        assert!(!has_tombstones(&rows));
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn n003_old_schema_is_not_a_content_bound_manifest() {
+        let valid = manifest(&[("a", 1)], &[]).expect("valid");
+        let mut old = valid.clone();
+        old.schema_version = 1;
+        for (before, after) in [(&old, &valid), (&valid, &old)] {
+            assert_eq!(
+                diff_manifests(before, after),
+                Err(ManifestValidationError::UnsupportedSchemaVersion(1))
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::binary_hash::{BinaryHashResult, binaries_equivalent, compute_binary_hash};
+use crate::rsync_flavor::{configure_rsync_remote_args, resolve_rsync_cached};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
 use crate::types::WorkerConfig;
 
@@ -113,7 +114,7 @@ fn sanitize_remote_path_suffix(suffix: &str) -> String {
 }
 
 fn shell_escape_path(path: &Path) -> String {
-    escape(path.to_string_lossy()).into_owned()
+    shell_escape_path_str(&path.to_string_lossy())
 }
 
 fn shell_escape_path_str(path: &str) -> String {
@@ -188,6 +189,10 @@ impl RemoteCompilationTest {
         if let Some(ref identity) = self.worker.identity_file {
             args.push("-i".to_string());
             args.push(identity.to_string_lossy().to_string());
+            if let Some(opts) = crate::ssh_utils::identities_only_args(&identity.to_string_lossy())
+            {
+                args.extend(opts.iter().map(|opt| (*opt).to_string()));
+            }
         }
         args.push(self.worker.ssh_host.clone());
         args
@@ -333,14 +338,21 @@ impl RemoteCompilationTest {
             anyhow::bail!("Remote directory creation failed: {}", stderr);
         }
 
+        let resolved = resolve_rsync_cached(None)?;
         let remote_project_with_slash = format!("{}/", remote_project.display());
         let remote_path = format!(
             "{}:{}",
             self.worker.ssh_host,
-            shell_escape_path_str(&remote_project_with_slash)
+            resolved.flavor.remote_path_arg(&remote_project_with_slash)
         );
 
-        let mut cmd = Command::new("rsync");
+        let mut cmd = Command::new(&resolved.path);
+        configure_rsync_remote_args(cmd.as_std_mut());
+        cmd.arg("--rsync-path").arg(
+            resolved
+                .flavor
+                .remote_path_command("rsync".to_owned(), &remote_project_with_slash),
+        );
         cmd.args([
             "-az",
             "--no-owner",
@@ -401,20 +413,27 @@ impl RemoteCompilationTest {
 
     /// Sync artifacts back from the remote worker.
     async fn rsync_from_worker(&self) -> Result<()> {
+        let resolved = resolve_rsync_cached(None)?;
         let remote_project = self.remote_project_path();
         let remote_release_dir = remote_project.join("target/release");
         let remote_release_with_slash = format!("{}/", remote_release_dir.display());
         let remote_target = format!(
             "{}:{}",
             self.worker.ssh_host,
-            shell_escape_path_str(&remote_release_with_slash)
+            resolved.flavor.remote_path_arg(&remote_release_with_slash)
         );
 
         let local_target = self.test_project.join("target/release_remote/");
         std::fs::create_dir_all(&local_target)
             .context("Failed to create local target directory")?;
 
-        let mut cmd = Command::new("rsync");
+        let mut cmd = Command::new(&resolved.path);
+        configure_rsync_remote_args(cmd.as_std_mut());
+        cmd.arg("--rsync-path").arg(
+            resolved
+                .flavor
+                .remote_path_command("rsync".to_owned(), &remote_release_with_slash),
+        );
         cmd.args(["-az", "--no-owner", "--no-group"]);
 
         if let Some(ssh_option) = self.rsync_ssh_option() {

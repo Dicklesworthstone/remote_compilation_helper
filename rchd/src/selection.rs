@@ -10,7 +10,7 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use crate::admission::AdmissionGate;
-use crate::disk_pressure::PressureState;
+use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection, PressureState};
 use crate::metrics::{
     self,
     latency::{DecisionTimer, DecisionType},
@@ -583,6 +583,8 @@ pub struct WorkerSelector {
     pub audit_log: Arc<RwLock<SelectionAuditLog>>,
     /// Optional admission gate for disk-pressure risk evaluation (bd-vvmd.4.4).
     pub admission_gate: Option<Arc<AdmissionGate>>,
+    /// Same durable ownership ledger used by final API admission.
+    build_history: Option<Arc<crate::history::BuildHistory>>,
     /// Optional repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
     pub repo_convergence: Option<Arc<crate::repo_convergence::RepoConvergenceService>>,
     /// Optional unified reliability aggregator for multi-signal health (bd-vvmd.5.5).
@@ -637,6 +639,7 @@ impl WorkerSelector {
             selection_history: Arc::new(RwLock::new(SelectionHistory::new())),
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
+            build_history: None,
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
@@ -653,6 +656,7 @@ impl WorkerSelector {
             selection_history: Arc::new(RwLock::new(SelectionHistory::new())),
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
+            build_history: None,
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
@@ -663,6 +667,33 @@ impl WorkerSelector {
     /// Set the admission gate for disk-pressure risk evaluation (bd-vvmd.4.4).
     pub fn set_admission_gate(&mut self, gate: Arc<AdmissionGate>) {
         self.admission_gate = Some(gate);
+    }
+
+    pub(crate) fn set_build_history(&mut self, history: Arc<crate::history::BuildHistory>) {
+        self.build_history = Some(history);
+    }
+
+    async fn disk_headroom_failure(
+        &self,
+        worker: &WorkerState,
+        worker_id: &str,
+        request: &SelectionRequest,
+    ) -> Option<DiskHeadroomRejection> {
+        if request.disk_headroom_gib == 0 {
+            return None;
+        }
+        let Some(history) = &self.build_history else {
+            return Some(DiskHeadroomRejection::Unknown);
+        };
+        history
+            .check_disk_headroom(
+                worker_id,
+                &DiskHeadroomAdmission {
+                    requested_gib: request.disk_headroom_gib,
+                    capacity: worker.disk_capacity_observation().await,
+                },
+            )
+            .err()
     }
 
     /// Set the repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
@@ -1175,6 +1206,14 @@ impl WorkerSelector {
         let worker_id = WorkerId::new(&fallback_id);
         let worker = pool.get(&worker_id).await?;
 
+        if self
+            .disk_headroom_failure(&worker, &fallback_id, request)
+            .await
+            .is_some()
+        {
+            return None;
+        }
+
         // The OS gate is a correctness constraint, not a health heuristic, so the
         // affinity fallback must honour it too. It fires precisely when the main
         // path found nothing eligible — exactly when a cached last-success worker
@@ -1483,6 +1522,9 @@ impl WorkerSelector {
             let available_slots = worker.available_slots().await;
             let capabilities = worker.capabilities().await;
             let pressure = worker.pressure_assessment().await;
+            let disk_headroom_failure = self
+                .disk_headroom_failure(&worker, worker_id.as_str(), request)
+                .await;
             let success_rate = self.health_score(&worker).await;
             let active_project_excluded = excluded_worker_ids.contains(worker_id.as_str());
             if active_project_excluded {
@@ -1570,6 +1612,9 @@ impl WorkerSelector {
                         WorkerSelectionDiagnosticDecision::Deny,
                         "worker already has an active build for this project".to_string(),
                     )
+                } else if let Some(failure) = disk_headroom_failure {
+                    push_reason_code(&mut reason_codes, failure.reason_code());
+                    (WorkerSelectionDiagnosticDecision::Deny, failure.to_string())
                 } else if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
                     // Must mirror the gate in `get_eligible_workers`, and sit at
                     // the same point in the ladder (before runtime). Without it
@@ -1954,7 +1999,6 @@ impl WorkerSelector {
                     ssh_pool.as_ref(),
                 )
                 .await?;
-                worker.set_capabilities(capabilities.clone()).await;
                 Some((worker, capabilities))
             }));
         }
@@ -2044,6 +2088,7 @@ impl WorkerSelector {
         let mut capacity_degraded: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut filtered_by_health = 0usize;
         let mut filtered_by_hard_preflight = 0usize;
+        let mut filtered_by_disk_headroom = 0usize;
         let mut filtered_by_component = 0usize;
         // Workers excluded ONLY by the rustup-component gate, kept for the
         // one-shot stale-inventory capability refresh (issue #63(b)).
@@ -2125,6 +2170,18 @@ impl WorkerSelector {
             }
 
             any_has_runtime = true;
+
+            // An explicit disk budget is a hard resource constraint, including
+            // for undersized CPU candidates and every health fail-open list.
+            if let Some(failure) = self
+                .disk_headroom_failure(&worker, worker_id.as_str(), request)
+                .await
+            {
+                debug!("Worker {} excluded: {}", worker_id, failure);
+                filtered_by_disk_headroom += 1;
+                filtered_by_hard_preflight += 1;
+                continue;
+            }
 
             let capabilities = worker.capabilities().await;
             if let Some(reason) = required_tool_capability_mismatch(request, &capabilities) {
@@ -2621,12 +2678,20 @@ impl WorkerSelector {
         if has_preferred && !preferred_without_health.is_empty() {
             return Ok(preferred_without_health);
         }
-        if has_preferred && filtered_by_slots > 0 {
+        if has_preferred && (filtered_by_slots > 0 || filtered_by_active_project > 0) {
             // Returning an empty eligible set maps to AllWorkersBusy in
             // select_with_exclusions. That keeps RCH_QUEUE_WHEN_BUSY polling
             // the same requested allow-set instead of selecting an unrelated
             // worker. If several workers were requested, one busy requested
             // worker is enough to make waiting useful.
+            //
+            // A pinned worker that is already running this project is the
+            // same kind of transient: the one-active-job-per-project-per-worker
+            // guard clears when that job ends. Refusing on the spot made
+            // pinned agents retry in tight loops (~190 refusals/24h on
+            // 2026-09-30, one agent 112 times in 19 min against hz4). The
+            // guard itself is unchanged; the request only waits for it.
+            // Unpinned requests keep their immediate verdict and diagnostics.
             //
             // bd-uw4d8: this branch MUST come before the specific-refusal
             // fall-through below — the bd-iupei allow-set enforcement once
@@ -2652,14 +2717,50 @@ impl WorkerSelector {
             return Ok(eligible);
         }
 
+        // Degrade rather than fall local when the ONLY thing standing between
+        // this request and a healthy available worker is an estimate that
+        // worker can never meet. Deliberately last-resort: every other candidate list —
+        // including the below-health fail-open lists — must be empty first, so
+        // only fully vetted workers with otherwise unusable capacity qualify.
+        //
+        // Two guards keep existing admission contracts intact:
+        //   * `!has_preferred` — an explicit `preferred_workers` pin is an
+        //     allow-set, and "this exact worker is too small" must stay
+        //     terminal rather than quietly running somewhere the caller did
+        //     not ask for.
+        //   * `filtered_by_slots == 0` — if any worker is merely BUSY it can
+        //     still satisfy the request once it drains, so the pool is
+        //     queueable and waiting beats degrading.
+        //
+        // Active-project exclusions apply to individual workers, not the
+        // whole fleet: those workers were skipped before collecting degraded
+        // candidates. A concurrent build on one worker must not prevent using
+        // another safe, free worker (bd-d2jav). Check this before job-mode
+        // queueing as well, since useful capacity is already available.
+        if !has_preferred
+            && filtered_by_slots == 0
+            && eligible.is_empty()
+            && preferred.is_empty()
+            && eligible_without_health.is_empty()
+            && preferred_without_health.is_empty()
+            && !capacity_degraded.is_empty()
+        {
+            debug!(
+                "No available candidate can satisfy estimated_cores={}; degrading to {} worker(s) \
+                 with free capacity below the estimate rather than falling back to local",
+                request.estimated_cores,
+                capacity_degraded.len()
+            );
+            metrics::inc_reliability_error("selection", "capacity_degraded_admission");
+            return Ok(capacity_degraded);
+        }
+
         // bd-g7rpy (GH#27 P4, job mode ONLY): the one-active-job-per-project-
         // per-worker guard means an N-shard `--job` burst can occupy at most
-        // one slot per worker for this project, so a burst larger than the
-        // worker count leaves every otherwise-eligible worker excluded by an
-        // ACTIVE job — a transient state that resolves as those jobs finish.
-        // Returning an empty eligible set maps to AllWorkersBusy upstream,
-        // which keeps RCH_QUEUE_WHEN_BUSY polling (initial admission AND
-        // queue polls) instead of failing excess shards to local execution.
+        // one slot per worker for this project. Once no normal or degraded
+        // candidate remains, active-project exclusions are a transient state
+        // that resolves as those jobs finish. Returning an empty eligible set
+        // maps to AllWorkersBusy upstream, keeping queue polls remote.
         // Compilation requests keep the immediate NoAdmissibleWorkers below.
         if request.job_mode
             && filtered_by_active_project > 0
@@ -2668,42 +2769,6 @@ impl WorkerSelector {
             && preferred_without_health.is_empty()
         {
             return Ok(Vec::new());
-        }
-
-        // Degrade rather than fall local when the ONLY thing standing between
-        // this request and a healthy idle worker is an estimate the fleet can
-        // never meet. Deliberately last-resort: every other candidate list —
-        // including the below-health fail-open lists — must be empty first, so
-        // this can only turn a guaranteed LOCAL build into a remote one.
-        //
-        // Three guards keep existing admission contracts intact:
-        //   * `!has_preferred` — an explicit `preferred_workers` pin is an
-        //     allow-set, and "this exact worker is too small" must stay
-        //     terminal rather than quietly running somewhere the caller did
-        //     not ask for.
-        //   * `filtered_by_slots == 0` — if any worker is merely BUSY it can
-        //     still satisfy the request once it drains, so the pool is
-        //     queueable and waiting beats degrading. Only degrade when nothing
-        //     in the fleet could ever fit.
-        //   * `filtered_by_active_project == 0` — the one-job-per-project-per-
-        //     worker guard is a correctness rule, not a capacity hint.
-        if !has_preferred
-            && filtered_by_slots == 0
-            && filtered_by_active_project == 0
-            && eligible.is_empty()
-            && preferred.is_empty()
-            && eligible_without_health.is_empty()
-            && preferred_without_health.is_empty()
-            && !capacity_degraded.is_empty()
-        {
-            debug!(
-                "No worker can satisfy estimated_cores={}; degrading to {} worker(s) \
-                 with free capacity below the estimate rather than falling back to local",
-                request.estimated_cores,
-                capacity_degraded.len()
-            );
-            metrics::inc_reliability_error("selection", "capacity_degraded_admission");
-            return Ok(capacity_degraded);
         }
 
         // A worker that passed every gate up to slot accounting and is merely
@@ -2746,6 +2811,15 @@ impl WorkerSelector {
                     filtered_by_active_project,
                 ),
                 filtered_by_os_gate,
+            )));
+        }
+
+        if filtered_by_disk_headroom > 0
+            && preferred_without_health.is_empty()
+            && eligible_without_health.is_empty()
+        {
+            return Err(SelectionReason::NoAdmissibleWorkers(format!(
+                "disk_headroom={filtered_by_disk_headroom}"
             )));
         }
 
@@ -4387,6 +4461,7 @@ mod tests {
                 command: None,
                 command_priority: CommandPriority::Normal,
                 estimated_cores: 4,
+                disk_headroom_gib: 0,
                 preferred_workers: vec![],
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
@@ -4423,6 +4498,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::None,
@@ -4484,6 +4560,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::None,
@@ -4538,6 +4615,7 @@ mod tests {
                 command: None,
                 command_priority: CommandPriority::Normal,
                 estimated_cores: 1,
+                disk_headroom_gib: 0,
                 preferred_workers: vec![],
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
@@ -4577,6 +4655,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4602,6 +4681,7 @@ mod tests {
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4656,6 +4736,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4688,6 +4769,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4724,6 +4806,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4764,6 +4847,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4833,6 +4917,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4887,6 +4972,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4930,6 +5016,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -4967,6 +5054,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("preferred")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5000,6 +5088,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("missing")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5038,6 +5127,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5091,6 +5181,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5251,6 +5342,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5290,6 +5382,7 @@ mod tests {
             command: Some(command.to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5342,6 +5435,7 @@ mod tests {
             command: Some("cargo build --target x86_64-pc-windows-msvc".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5455,6 +5549,7 @@ mod tests {
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5501,6 +5596,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5545,6 +5641,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5581,6 +5678,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5646,6 +5744,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("preferred")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5683,6 +5782,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::None,
@@ -5786,6 +5886,7 @@ mod tests {
             command: Some(command.to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: Some(ToolchainInfo {
                 channel: "nightly".to_string(),
@@ -5960,6 +6061,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -5997,6 +6099,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -6055,6 +6158,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -6093,6 +6197,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6146,6 +6251,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6212,6 +6318,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![rch_common::WorkerId::new("pinned-busy")],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6265,6 +6372,7 @@ mod tests {
             command: Some("nix build .#foo".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Nix,
@@ -6302,6 +6410,58 @@ mod tests {
         assert_eq!(selected.config.read().await.id.as_str(), "nix-1");
     }
 
+    /// A request pinned to a worker that already runs this project queues
+    /// (AllWorkersBusy) instead of being refused. The guard still keeps the
+    /// second job off that worker; the request waits until it clears.
+    #[tokio::test]
+    async fn pinned_worker_running_this_project_queues_instead_of_refusing() {
+        let pool = WorkerPool::new();
+        let pinned = make_worker("pinned-rust", 8, 80.0);
+        pinned
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.97.0-nightly".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(pinned).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "frankenterm".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![WorkerId::new("pinned-rust")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+            required_tools: Vec::new(),
+        };
+        let mut excluded_worker_ids = HashSet::new();
+        excluded_worker_ids.insert("pinned-rust".to_string());
+
+        let result = selector
+            .select_with_exclusions(&pool, &request, &excluded_worker_ids)
+            .await;
+        assert!(
+            result.worker.is_none(),
+            "the guard still excludes the worker"
+        );
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+
+        // Once that job ends the same pinned request is admitted.
+        let result = selector
+            .select_with_exclusions(&pool, &request, &HashSet::new())
+            .await;
+        let selected = result
+            .worker
+            .expect("pinned worker is admitted once the project's job ends");
+        assert_eq!(selected.config.read().await.id.as_str(), "pinned-rust");
+    }
+
     #[tokio::test]
     async fn test_active_project_exclusion_preserves_runtime_reason() {
         let pool = WorkerPool::new();
@@ -6325,6 +6485,7 @@ mod tests {
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6416,6 +6577,7 @@ mod tests {
             command: Some("./run_shards.sh".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::None,
@@ -6436,6 +6598,7 @@ mod tests {
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6535,6 +6698,7 @@ mod tests {
             command: Some("cargo test -p rchd --lib".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: Some(ToolchainInfo {
                 channel: "nightly".to_string(),
@@ -6597,6 +6761,7 @@ mod tests {
             command: Some("cargo test --no-run".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6634,6 +6799,7 @@ mod tests {
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6704,6 +6870,7 @@ mod tests {
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 4,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6753,6 +6920,7 @@ mod tests {
             command_priority: CommandPriority::Normal,
             // Larger than any worker's TOTAL slots — unsatisfiable fleet-wide.
             estimated_cores: 4,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6768,6 +6936,405 @@ mod tests {
              degraded candidate instead of silently falling back to local; reason={:?}",
             result.reason
         );
+    }
+
+    async fn active_project_capacity_fixture() -> (WorkerPool, WorkerSelector, SelectionRequest) {
+        let pool = WorkerPool::new();
+        for id in ["active-project", "free-small"] {
+            let worker = make_worker(id, 3, 80.0);
+            prepare_fixture_worker(
+                &worker,
+                Some("1.97.0-nightly"),
+                PressureState::Healthy,
+                "healthy",
+            )
+            .await;
+            let mut caps = worker.capabilities().await;
+            caps.build_disk_free_gb = Some(100.0);
+            caps.build_disk_total_gb = Some(200.0);
+            worker.set_capabilities(caps).await;
+            pool.add_worker_state(worker).await;
+        }
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::new(crate::history::BuildHistory::new(10)),
+            None,
+        );
+        // Even a warm affinity pin must not resurrect the excluded owner.
+        selector
+            .record_success("active-project", "concurrent-project")
+            .await;
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "concurrent-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+            required_tools: Vec::new(),
+        };
+        (pool, selector, request)
+    }
+
+    #[tokio::test]
+    async fn declared_disk_budget_blocks_selection_preview_and_affinity_fallback() {
+        let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+        selector.set_build_history(Arc::new(crate::history::BuildHistory::new(10)));
+        request.estimated_cores = 1;
+        request.disk_headroom_gib = 64;
+        for worker in pool.all_workers().await {
+            let mut caps = worker.capabilities().await;
+            caps.build_disk_free_gb = Some(51.0);
+            caps.build_disk_total_gb = Some(100.0);
+            worker.set_capabilities(caps).await;
+        }
+        let excluded = HashSet::new();
+        for result in [
+            selector
+                .preview_with_exclusions(&pool, &request, &excluded)
+                .await,
+            selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await,
+        ] {
+            assert!(result.worker.is_none());
+            assert_eq!(
+                result.reason,
+                SelectionReason::NoAdmissibleWorkers("disk_headroom=2".into())
+            );
+            let diagnostics = result.diagnostics.unwrap();
+            assert!(diagnostics.workers.iter().all(|worker| {
+                worker
+                    .reason_codes
+                    .iter()
+                    .any(|reason| reason == "disk_headroom_insufficient")
+            }));
+        }
+        assert!(
+            selector
+                .try_fallback(&pool, &request, &excluded)
+                .await
+                .is_none()
+        );
+        request.disk_headroom_gib = 0;
+        assert!(
+            selector.select(&pool, &request).await.worker.is_some(),
+            "undeclared jobs preserve existing admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_disk_budget_counts_other_projects_before_capacity_degrading() {
+        let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        selector.set_build_history(Arc::clone(&history));
+        let worker = pool.get(&WorkerId::new("free-small")).await.unwrap();
+        let active = history
+            .try_start_active_build_with_waiter(
+                "different-project".into(),
+                "free-small".into(),
+                "cargo test".into(),
+                0,
+                Some("disk-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    requested_gib: 64,
+                    capacity: worker.disk_capacity_observation().await,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let excluded = HashSet::from(["active-project".into()]);
+        request.disk_headroom_gib = 37;
+        assert!(
+            selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await
+                .worker
+                .is_none()
+        );
+        request.disk_headroom_gib = 36;
+        assert_eq!(
+            selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str(),
+            "free-small"
+        );
+        request.disk_headroom_gib = 64;
+        selector
+            .record_success("free-small", &request.project)
+            .await;
+        let mut fallback_request = request.clone();
+        fallback_request.estimated_cores = 1;
+        fallback_request.disk_headroom_gib = 36;
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &fallback_request, &excluded)
+                .await
+                .as_deref(),
+            Some("free-small"),
+            "the last-success route must be live before testing its stale-sample fence"
+        );
+        // This probe starts before completion, but its high free-space result
+        // will arrive afterward. Publication time must not make it fresh.
+        let mut in_flight_probe = Some(worker.capability_probe_context().await);
+        let old_capacity = worker.capabilities().await;
+        history
+            .complete_durable(
+                active.id,
+                "free-small",
+                Some("disk-owner"),
+                crate::history::BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.reserved_disk_headroom_gib("free-small"), 0);
+        for delayed_publish in [false, true] {
+            if delayed_publish {
+                assert!(worker.publish_capabilities(
+                    in_flight_probe.take().unwrap(), old_capacity.clone(),
+                ).await);
+            }
+            // Both ordinary and CPU-degraded selection, including diagnostic
+            // previews, must reject the sample predating the released budget.
+            for cores in [1, 4] {
+                request.estimated_cores = cores;
+                for result in [
+                    selector
+                        .preview_with_exclusions(&pool, &request, &excluded)
+                        .await,
+                    selector
+                        .select_with_exclusions(&pool, &request, &excluded)
+                        .await,
+                ] {
+                    assert!(
+                        result.worker.is_none(),
+                        "old capacity admitted after release"
+                    );
+                    let diagnostics = result.diagnostics.unwrap();
+                    let free = diagnostics
+                        .workers
+                        .iter()
+                        .find(|entry| entry.worker_id.as_str() == "free-small")
+                        .unwrap();
+                    assert!(
+                        free.reason_codes
+                            .iter()
+                            .any(|reason| reason == "disk_headroom_stale")
+                    );
+                }
+            }
+            fallback_request.disk_headroom_gib = 64;
+            assert!(
+                selector
+                    .try_fallback(&pool, &fallback_request, &excluded)
+                    .await
+                    .is_none()
+            );
+        }
+        // Completion releases accounting, not the files. A fresh real sample
+        // still has to prove the requested free bytes actually remain.
+        let mut current_capacity = old_capacity.clone();
+        current_capacity.build_disk_free_gb = Some(20.0);
+        worker.set_capabilities(current_capacity).await;
+        assert!(
+            selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await
+                .worker
+                .is_none()
+        );
+        worker.set_capabilities(old_capacity).await;
+        assert!(
+            selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await
+                .worker
+                .is_some()
+        );
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &fallback_request, &excluded)
+                .await
+                .as_deref(),
+            Some("free-small")
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_disk_budget_unknown_history_or_sample_never_fails_open() {
+        let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+        request.disk_headroom_gib = 1;
+        selector.build_history = None;
+        assert!(selector.select(&pool, &request).await.worker.is_none());
+        selector.set_build_history(Arc::new(crate::history::BuildHistory::new(10)));
+        for worker in pool.all_workers().await {
+            let mut caps = worker.capabilities().await;
+            caps.disk_free_gb = None;
+            caps.disk_total_gb = None;
+            caps.build_disk_free_gb = None;
+            caps.build_disk_total_gb = None;
+            worker.set_capabilities(caps).await;
+        }
+        assert!(selector.select(&pool, &request).await.worker.is_none());
+        assert!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_degraded_active_project_sibling_uses_other_free_worker() {
+        for job_mode in [false, true] {
+            let (pool, selector, mut request) = active_project_capacity_fixture().await;
+            request.job_mode = job_mode;
+            let active = pool.get(&WorkerId::new("active-project")).await.unwrap();
+            let small = pool.get(&WorkerId::new("free-small")).await.unwrap();
+            assert!(active.reserve_slots(1).await);
+            // A different project can already occupy part of the small worker.
+            assert!(small.reserve_slots(1).await);
+            let excluded = HashSet::from(["active-project".to_string()]);
+            let preview = selector
+                .preview_with_exclusions(&pool, &request, &excluded)
+                .await;
+            let selected = selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await;
+            for result in [preview, selected] {
+                let worker = result
+                    .worker
+                    .unwrap_or_else(|| panic!("job_mode={job_mode}: {:?}", result.reason));
+                assert_eq!(worker.config.read().await.id.as_str(), "free-small");
+                assert_eq!(worker.available_slots().await, 2);
+            }
+            assert_eq!(
+                active.used_slots(),
+                1,
+                "selection must preserve active ownership"
+            );
+            assert_eq!(
+                small.used_slots(),
+                1,
+                "selection itself must not reserve slots"
+            );
+
+            // Once this worker also owns the project, neither can be reused.
+            let all_active =
+                HashSet::from(["active-project".to_string(), "free-small".to_string()]);
+            let result = selector
+                .select_with_exclusions(&pool, &request, &all_active)
+                .await;
+            assert!(result.worker.is_none());
+            if job_mode {
+                assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+            } else {
+                assert!(matches!(
+                    result.reason,
+                    SelectionReason::NoAdmissibleWorkers(_)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_degraded_active_project_still_queues_for_capable_busy_worker() {
+        for job_mode in [false, true] {
+            let (pool, selector, mut request) = active_project_capacity_fixture().await;
+            request.job_mode = job_mode;
+            let capable = make_worker("capable-busy", 4, 90.0);
+            prepare_fixture_worker(
+                &capable,
+                Some("1.97.0-nightly"),
+                PressureState::Healthy,
+                "healthy",
+            )
+            .await;
+            assert!(capable.reserve_slots(4).await);
+            pool.add_worker_state(capable).await;
+            let excluded = HashSet::from(["active-project".to_string()]);
+            let result = selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await;
+            assert!(
+                result.worker.is_none(),
+                "a capable busy worker preserves queue policy"
+            );
+            assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+
+            let capable = pool.get(&WorkerId::new("capable-busy")).await.unwrap();
+            capable.release_slots(4).await;
+            let result = selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await;
+            assert_eq!(
+                result.worker.unwrap().config.read().await.id.as_str(),
+                "capable-busy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_degraded_active_project_never_bypasses_candidate_gates_or_pins() {
+        for job_mode in [false, true] {
+            for blocker in ["critical", "topology", "runtime", "full", "pin"] {
+                let (pool, selector, mut request) = active_project_capacity_fixture().await;
+                request.job_mode = job_mode;
+                let small = pool.get(&WorkerId::new("free-small")).await.unwrap();
+                match blocker {
+                    "critical" => {
+                        let mut pressure = small.pressure_assessment().await;
+                        pressure.state = PressureState::Critical;
+                        pressure.disk_free_gb = Some(0.0);
+                        pressure.disk_free_ratio = Some(0.0);
+                        small.set_pressure_assessment(pressure).await;
+                    }
+                    "topology" => {
+                        let mut capabilities = small.capabilities().await;
+                        capabilities.projects_root_ok = Some(false);
+                        small.set_capabilities(capabilities).await;
+                    }
+                    "runtime" => {
+                        let mut capabilities = small.capabilities().await;
+                        capabilities.rustc_version = None;
+                        small.set_capabilities(capabilities).await;
+                    }
+                    "full" => assert!(small.reserve_slots(3).await),
+                    "pin" => request.preferred_workers = vec![WorkerId::new("active-project")],
+                    _ => unreachable!(),
+                }
+                let excluded = HashSet::from(["active-project".to_string()]);
+                let result = selector
+                    .select_with_exclusions(&pool, &request, &excluded)
+                    .await;
+                assert!(
+                    result.worker.is_none(),
+                    "job_mode={job_mode}, blocker={blocker}"
+                );
+                assert_eq!(small.used_slots(), if blocker == "full" { 3 } else { 0 });
+            }
+        }
     }
 
     /// Regression: a degraded (undersized) candidate must still clear EVERY
@@ -6820,6 +7387,7 @@ mod tests {
             command: Some("cargo build --release".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 4,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6879,6 +7447,7 @@ mod tests {
             command: Some("cargo build --release".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 4,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6958,6 +7527,7 @@ mod tests {
             command: Some("cargo build --release".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 4,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -6998,6 +7568,7 @@ mod tests {
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -7058,6 +7629,7 @@ mod tests {
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: Some(ToolchainInfo {
                 channel: "nightly".to_string(),
@@ -7120,6 +7692,7 @@ mod tests {
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: Some(ToolchainInfo {
                 channel: "nightly".to_string(),
@@ -7179,6 +7752,7 @@ mod tests {
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -7227,6 +7801,7 @@ mod tests {
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 4,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -7276,6 +7851,7 @@ mod tests {
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 4,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -7336,6 +7912,7 @@ mod tests {
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -7389,6 +7966,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7441,6 +8019,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7479,6 +8058,7 @@ mod tests {
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7522,6 +8102,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7558,6 +8139,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7617,6 +8199,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7658,6 +8241,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("preferred")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7691,6 +8275,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("missing")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7729,6 +8314,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("requested")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7770,6 +8356,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("requested")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7782,13 +8369,15 @@ mod tests {
         let result = selector
             .select_with_exclusions(&pool, &request, &excluded)
             .await;
+        // Never escapes the allow-set to "available". The exclusion is
+        // transient, so the pinned request queues for "requested" rather than
+        // being refused, and the diagnostics still record why it is waiting.
         assert!(result.worker.is_none());
-        assert!(matches!(
-            result.reason,
-            SelectionReason::NoAdmissibleWorkers(ref summary)
-                if summary.contains("active_project_exclusion=1")
-        ));
-        assert!(result.diagnostics.is_some());
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+        let diagnostics = result
+            .diagnostics
+            .expect("a queued pinned request keeps its diagnostics");
+        assert_eq!(diagnostics.active_project_exclusion_count, 1);
     }
 
     #[tokio::test]
@@ -7818,6 +8407,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![WorkerId::new("requested")],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -7870,6 +8460,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -8097,6 +8688,7 @@ mod tests {
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::Rust,
@@ -8150,6 +8742,7 @@ mod tests {
             command: Some("cargo build -j 2".to_string()),
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -8387,6 +8980,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -8416,6 +9010,7 @@ mod tests {
         let request = SelectionRequest {
             project: "project-a".to_string(),
             estimated_cores: 1,
+            disk_headroom_gib: 0,
             job_mode: false,
             command: None,
             command_priority: CommandPriority::Normal,
@@ -8468,6 +9063,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -8515,6 +9111,7 @@ mod tests {
             command: None,
             command_priority: CommandPriority::Normal,
             estimated_cores: 2,
+            disk_headroom_gib: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -8599,6 +9196,7 @@ mod tests {
                         command: None,
                         command_priority: CommandPriority::Normal,
                         estimated_cores,
+                        disk_headroom_gib: 0,
                         preferred_workers: vec![],
                         job_mode: false,
                         toolchain: None,
@@ -9218,6 +9816,7 @@ mod tests {
                 command: Some("cargo build --workspace".to_string()),
                 command_priority: CommandPriority::Normal,
                 estimated_cores: 1,
+                disk_headroom_gib: 0,
                 preferred_workers: vec![],
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
@@ -9282,6 +9881,7 @@ mod tests {
                 command: Some("cargo test".to_string()),
                 command_priority: CommandPriority::Normal,
                 estimated_cores: 1,
+                disk_headroom_gib: 0,
                 preferred_workers: vec![],
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
@@ -9371,6 +9971,7 @@ mod tests {
                 command: Some("cargo test".to_string()),
                 command_priority: CommandPriority::Normal,
                 estimated_cores: 1,
+                disk_headroom_gib: 0,
                 preferred_workers: vec![],
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
@@ -9420,6 +10021,7 @@ mod tests {
                 command: Some("cargo build".to_string()),
                 command_priority: CommandPriority::Normal,
                 estimated_cores: 1,
+                disk_headroom_gib: 0,
                 preferred_workers: vec![],
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),

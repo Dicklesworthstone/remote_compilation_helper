@@ -25,6 +25,7 @@ pub mod delivery_ack;
 pub mod delivery_archive;
 pub mod delivery_recovery;
 pub mod live;
+pub mod live_dependency;
 pub mod prepared_operation;
 pub mod secure_worker_delivery;
 pub mod source_delivery;

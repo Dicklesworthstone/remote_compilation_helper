@@ -128,6 +128,84 @@ impl RsyncFlavor {
         Self::Unknown
     }
 
+    /// Whether the client backslash-escapes shell-active remote arguments.
+    /// This changed in 3.2.4, independently of the 3.1 `--info` flags.
+    /// As with the other capabilities, an unknown banner assumes modern rsync.
+    #[must_use]
+    pub const fn escapes_remote_args(self) -> bool {
+        match self {
+            Self::Rsync {
+                major,
+                minor,
+                patch,
+            } => major > 3 || (major == 3 && (minor > 2 || (minor == 2 && patch >= 4))),
+            Self::OpenRsync { .. } => false,
+            Self::Unknown => true,
+        }
+    }
+
+    /// Encode a validated, literal remote filename for an rsync argv operand.
+    ///
+    /// This is NOT shell-command quoting. With rsync >= 3.2.4, shell quotes
+    /// become filename bytes (issue #91). Pass spaces, colons and quotes through
+    /// for rsync to protect. Literal wildcard paths instead use an inert operand
+    /// paired with [`Self::remote_path_command`]; neither the remote shell nor
+    /// rsync's wildcard/backslash argument handling may select a sibling path.
+    /// Legacy rsync/openrsync still need shell quoting.
+    ///
+    /// Encode the whole path once, after joining any child path and trailing
+    /// slash. Keep the caller's path validation and use shell escaping separately
+    /// for commands such as `--rsync-path='mkdir ... && rsync'`. Commands using
+    /// this encoder must also use [`Self::remote_path_command`] and
+    /// [`configure_rsync_remote_args`].
+    #[must_use]
+    pub fn remote_path_arg(self, path: &str) -> String {
+        if !self.escapes_remote_args() {
+            return shell_escape::escape(std::borrow::Cow::Borrowed(path)).into_owned();
+        }
+        if self.needs_literal_remote_path(path) {
+            return if path.ends_with('/') { "./" } else { "." }.to_string();
+        }
+        path.to_string()
+    }
+
+    fn needs_literal_remote_path(self, path: &str) -> bool {
+        self.escapes_remote_args() && path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+    }
+
+    /// Pair an rsync server command with a literal remote filename operand.
+    /// Ordinary paths need no wrapper. For wildcard paths, replace the inert
+    /// final operand with the quoted literal immediately before server execution.
+    /// This avoids both shell globbing and upstream rsync's inconsistent handling
+    /// of backslash-escaped wildcard operands. No `eval`, secluded/old-args mode,
+    /// remote-version requirement, or change of remote working directory is used.
+    /// All preceding server arguments are retained in their original order.
+    #[must_use]
+    pub fn remote_path_command(self, command: String, path: &str) -> String {
+        if !self.needs_literal_remote_path(path) {
+            return command;
+        }
+        let literal = shell_escape::escape(std::borrow::Cow::Borrowed(path));
+        let script = format!(
+            "rch_argc=$#\n\
+             [ \"$rch_argc\" -gt 0 ] || exit 2\n\
+             while [ \"$rch_argc\" -gt 0 ]; do\n\
+               rch_arg=$1; shift; rch_argc=$((rch_argc - 1))\n\
+               if [ \"$rch_argc\" -eq 0 ]; then\n\
+                 case \"$rch_arg\" in .|./) ;; *) exit 2 ;; esac\n\
+                 set -- \"$@\" {literal}\n\
+               else\n\
+                 set -- \"$@\" \"$rch_arg\"\n\
+               fi\n\
+             done\n\
+             {command} \"$@\""
+        );
+        format!(
+            "sh -c {} rch-rsync-literal-path",
+            shell_escape::escape(std::borrow::Cow::Owned(script))
+        )
+    }
+
     /// Whether this flavour understands rsync 3.1+'s `--info=` family, i.e.
     /// rch's preferred argv works unmodified.
     #[must_use]
@@ -189,6 +267,16 @@ impl RsyncFlavor {
             Self::Unknown => RsyncCapabilities::MODERN,
         }
     }
+}
+
+/// Pin argument handling for this child, without changing the process environment.
+/// Inherited workaround/secluded-args settings must not change how operands from
+/// [`RsyncFlavor::remote_path_arg`] are interpreted. In particular, never enable
+/// `--old-args`, which also disables rsync's extra file-list safety checks.
+pub fn configure_rsync_remote_args(command: &mut Command) {
+    command
+        .env("RSYNC_OLD_ARGS", "0")
+        .env("RSYNC_PROTECT_ARGS", "0");
 }
 
 impl fmt::Display for RsyncFlavor {
@@ -698,6 +786,211 @@ pub fn clear_resolve_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_path_arg_version_boundary_and_plain_path_control() {
+        let versions = [
+            ((2, 6, 9), false),
+            ((3, 0, 9), false),
+            ((3, 1, 3), false),
+            ((3, 2, 3), false),
+            ((3, 2, 4), true),
+            ((3, 2, 7), true),
+            ((3, 4, 1), true),
+            ((4, 0, 0), true),
+        ];
+        for ((major, minor, patch), modern) in versions {
+            let flavor = RsyncFlavor::Rsync {
+                major,
+                minor,
+                patch,
+            };
+            assert_eq!(flavor.escapes_remote_args(), modern, "{flavor}");
+        }
+        assert!(!RsyncFlavor::OpenRsync { protocol: Some(29) }.escapes_remote_args());
+        assert!(RsyncFlavor::Unknown.escapes_remote_args());
+        for (flavor, modern) in [
+            (RsyncFlavor::OpenRsync { protocol: Some(29) }, false),
+            (RsyncFlavor::Unknown, true),
+        ] {
+            assert_eq!(flavor.escapes_remote_args(), modern, "{flavor}");
+            assert_eq!(
+                flavor.remote_path_arg("/data/projects/plain/"),
+                "/data/projects/plain/"
+            );
+            for path in ["/data/projects/p q/", "/data/projects/x:y/"] {
+                let expected = if modern {
+                    path.to_string()
+                } else {
+                    format!("'{path}'")
+                };
+                assert_eq!(flavor.remote_path_arg(path), expected, "{flavor}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_path_arg_preserves_literal_metacharacters() {
+        let flavor = RsyncFlavor::Rsync {
+            major: 3,
+            minor: 2,
+            patch: 4,
+        };
+        for (path, expected) in [
+            ("/data/p'q:x/", "/data/p'q:x/"),
+            (
+                "/data/$(touch marker);$HOME/",
+                "/data/$(touch marker);$HOME/",
+            ),
+            (r"/data/a\b/", r"/data/a\b/"),
+            ("/data/a[1]/", "./"),
+            ("/data/a*?/", "./"),
+            (r"/data/a\[1]/", "./"),
+            ("/data/a*/archive.tar", "."),
+            ("/data/p q/out:x/", "/data/p q/out:x/"),
+        ] {
+            assert_eq!(flavor.remote_path_arg(path), expected);
+        }
+    }
+
+    #[test]
+    fn remote_argument_mode_overrides_are_child_local() {
+        use std::ffi::OsStr;
+
+        let mut command = Command::new("rsync");
+        command
+            .env("RSYNC_OLD_ARGS", "2")
+            .env("RSYNC_PROTECT_ARGS", "1");
+        configure_rsync_remote_args(&mut command);
+        for key in ["RSYNC_OLD_ARGS", "RSYNC_PROTECT_ARGS"] {
+            assert_eq!(
+                command.get_envs().find(|(name, _)| *name == key),
+                Some((OsStr::new(key), Some(OsStr::new("0"))))
+            );
+        }
+    }
+
+    /// Exercise the encoder against real rsync and a real remote shell parser,
+    /// without requiring an SSH server or a configured compilation worker.
+    #[cfg(unix)]
+    #[test]
+    fn remote_path_arg_real_rsync_round_trip() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let resolved = match resolve_rsync_cached(None) {
+            Ok(resolved) => resolved,
+            Err(RsyncResolveError::NotFound) => {
+                eprintln!("skipping real rsync regression: rsync is not installed");
+                return;
+            }
+            Err(error) => panic!("cannot resolve test rsync: {error}"),
+        };
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let rsh = temp.path().join("rsh");
+        // Rsync supplies the host as argv[1]. Like SSH, the transport parses the
+        // remaining command as a shell string, not as already separated argv.
+        std::fs::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n")
+            .expect("write remote shell");
+        std::fs::set_permissions(&rsh, std::fs::Permissions::from_mode(0o700))
+            .expect("executable remote shell");
+        let run = |flags: &[&str], source: &str, destination: &str, remote: &str| {
+            let mut command = Command::new(&resolved.path);
+            command
+                .env("RSYNC_OLD_ARGS", "1")
+                .env("RSYNC_PROTECT_ARGS", "1");
+            configure_rsync_remote_args(&mut command);
+            let output = command
+                .env("LC_ALL", "C")
+                .args(flags)
+                .arg("-e")
+                .arg(shell_escape::escape(rsh.to_string_lossy()).as_ref())
+                .arg("--rsync-path")
+                .arg(resolved.flavor.remote_path_command(
+                    shell_escape::escape(resolved.path.to_string_lossy()).into_owned(),
+                    remote,
+                ))
+                .arg(source)
+                .arg(destination)
+                .output()
+                .expect("run rsync");
+            assert!(
+                output.status.success(),
+                "rsync {flags:?} {source:?} {destination:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let worker = temp.path().join("worker");
+        std::fs::create_dir_all(worker.join("a1")).expect("shadow directory");
+        std::fs::write(worker.join("a1/payload"), "wrong sibling").expect("shadow file");
+        let secret = temp.path().join("outside-secret");
+        std::fs::write(&secret, "must not be retrieved").expect("outside file");
+        for name in ["plain", "p q", "x:y", "a[1]", "a*", r"back\*"] {
+            let source = temp.path().join("source").join(name);
+            let remote = worker.join(name);
+            let local = temp.path().join("retrieved").join(name);
+            std::fs::create_dir_all(&source).expect("source directory");
+            std::fs::create_dir_all(&local).expect("retrieval directory");
+            std::fs::write(source.join("payload"), name).expect("source payload");
+            let remote_raw = format!("{}/", remote.display());
+            let remote_operand =
+                format!("loopback:{}", resolved.flavor.remote_path_arg(&remote_raw));
+            let source_operand = format!("{}/", source.display());
+            run(&["-a"], &source_operand, &remote_operand, &remote_raw);
+            assert_eq!(
+                std::fs::read(remote.join("payload")).unwrap(),
+                name.as_bytes()
+            );
+            let barrier = run(
+                &["-a", "--checksum", "--dry-run", "--itemize-changes"],
+                &source_operand,
+                &remote_operand,
+                &remote_raw,
+            );
+            assert!(barrier.stdout.is_empty(), "no-delta barrier: {name}");
+            symlink(&secret, remote.join("escape-link")).expect("unsafe symlink fixture");
+            run(
+                &["-a", "--safe-links"],
+                &remote_operand,
+                &format!("{}/", local.display()),
+                &remote_raw,
+            );
+            assert_eq!(
+                std::fs::read(local.join("payload")).unwrap(),
+                name.as_bytes()
+            );
+            assert!(std::fs::symlink_metadata(local.join("escape-link")).is_err());
+            let result = remote.join("out p:q");
+            std::fs::create_dir_all(&result).expect("result directory");
+            std::fs::write(result.join("result"), name).expect("result payload");
+            run(
+                &["-a", "--safe-links"],
+                &format!(
+                    "loopback:{}",
+                    resolved
+                        .flavor
+                        .remote_path_arg(&format!("{}/", result.display()))
+                ),
+                &format!("{}/out p:q/", local.display()),
+                &format!("{}/", result.display()),
+            );
+            assert_eq!(
+                std::fs::read(local.join("out p:q/result")).unwrap(),
+                name.as_bytes()
+            );
+            let archive_raw = format!("{}/archive.tar", remote.display());
+            run(
+                &["-a"],
+                source.join("payload").to_str().unwrap(),
+                &format!("loopback:{}", resolved.flavor.remote_path_arg(&archive_raw)),
+                &archive_raw,
+            );
+            assert_eq!(
+                std::fs::read(remote.join("archive.tar")).unwrap(),
+                name.as_bytes()
+            );
+        }
+    }
 
     /// Captured from Homebrew rsync 3.4.1 on macOS.
     const RSYNC_3_4_1: &str = "rsync  version 3.4.1  protocol version 32\n\

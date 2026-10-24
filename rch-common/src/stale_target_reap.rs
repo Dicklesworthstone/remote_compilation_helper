@@ -43,6 +43,94 @@
 
 const SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
 
+/// Shared worker-side record protocol for source admission and GC. Callers
+/// hold the registry metadata flock. Only incomplete *pending* records may be
+/// quarantined: active or cancelling records may already authorize activity.
+/// Private writes stay outside the record globs until their bytes are durable.
+pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"
+rch_claim_name() {
+    __rch_name=${1##*/}; __rch_token=${__rch_name%%.*};
+    __rch_digest=${__rch_name#*.}; __rch_digest=${__rch_digest%%.*};
+    __rch_extension=${__rch_name##*.};
+    case "$__rch_token" in ''|*[!a-f0-9-]*) return 1;; esac;
+    [ "${#__rch_token}" -le 128 ] || return 1;
+    case "$__rch_digest" in *[!a-f0-9]*) return 1;; esac;
+    [ "${#__rch_digest}" -eq 64 ] || return 1;
+    case "$__rch_extension" in claim|pending|cancelling) ;; *) return 1;; esac;
+    [ "$__rch_name" = "$__rch_token.$__rch_digest.$__rch_extension" ];
+};
+rch_claim_content_valid() {
+    [ ! -L "$1" ] && [ -f "$1" ] || return 1;
+    __rch_size=$(wc -c < "$1") || return 1;
+    [ "$__rch_size" -gt 0 ] && [ "$__rch_size" -le 33554432 ] || return 1;
+    __rch_actual=$(sha256sum -- "$1") || return 1;
+    [ "${__rch_actual%% *}" = "$2" ] || return 1;
+    while IFS= read -r __rch_root || [ -n "$__rch_root" ]; do
+        case "$__rch_root" in /*) ;; *) return 1;; esac;
+        case "$__rch_root" in *//*|*/./*|*/../*|*/.|*/..) return 1;; esac;
+        [ "$__rch_root" = / ] || [ "${__rch_root%/}" = "$__rch_root" ] || return 1;
+    done < "$1";
+};
+rch_claim_record_valid() {
+    rch_claim_name "$1" && rch_claim_content_valid "$1" "$__rch_digest";
+};
+rch_claim_quarantine_fence() {
+    # Only our hard-linked fence, with no active grant, is an unowned intent.
+    # Byte similarity alone cannot bless an independent corrupt cancellation.
+    rch_claim_name "$2" || return 1;
+    [ "$__rch_extension" = cancelling ] && [ ! -L "$2" ] && [ -f "$2" ] || return 1;
+    __rch_quarantined="$1/quarantine/$__rch_token.$__rch_digest.pending";
+    [ ! -L "$1/quarantine" ] && [ ! -L "$__rch_quarantined" ] \
+        && [ -f "$__rch_quarantined" ] && [ "$2" -ef "$__rch_quarantined" ] || return 1;
+    for __rch_active in "$1/$__rch_token."*.claim; do
+        [ ! -e "$__rch_active" ] && [ ! -L "$__rch_active" ] || return 1;
+    done;
+    cmp -s "$2" "$__rch_quarantined";
+};
+rch_claim_quarantine_pending() {
+    # A .pending file never grants source activity. Its original filename is
+    # retained permanently: quarantine is an identity fence, not fresh state.
+    rch_claim_name "$2" || return 1;
+    [ "$__rch_extension" = pending ] && [ ! -L "$2" ] && [ -f "$2" ] || return 1;
+    [ ! -L "$1/quarantine" ] || return 1;
+    (umask 077; mkdir -p -- "$1/quarantine") || return 1;
+    __rch_quarantined="$1/quarantine/$__rch_name";
+    [ ! -e "$__rch_quarantined" ] && [ ! -L "$__rch_quarantined" ] || return 1;
+    __rch_fence="$1/$__rch_token.$__rch_digest.cancelling";
+    for __rch_previous in "$1/$__rch_token."*.claim "$1/$__rch_token."*.cancelling \
+        "$1/released/$__rch_token."*.claim "$1/cancelled/$__rch_token."*.claim; do
+        [ -e "$__rch_previous" ] || [ -L "$__rch_previous" ] || continue;
+        # Resume only our own interrupted hard-link-before-rename frontier.
+        [ "$__rch_previous" = "$__rch_fence" ] && [ ! -L "$__rch_previous" ] \
+            && [ "$2" -ef "$__rch_previous" ] || return 1;
+    done;
+    if [ ! -e "$__rch_fence" ]; then
+        ln -- "$2" "$__rch_fence" || return 1;
+    fi;
+    # Old in-flight dispatcher scripts do not know quarantine/. They DO
+    # reject this incomplete cancelling record, so cannot revive the token.
+    sync -f "$1" || return 1;
+    mv -T -- "$2" "$__rch_quarantined" || return 1;
+    sync -f "$1/quarantine" && sync -f "$1" || return 1;
+    printf 'RCH_SOURCE_CLAIM_QUARANTINED %s\n' "$__rch_quarantined" >&2;
+};
+rch_claim_write_atomic() {
+    # The existing workers already require GNU sync -f/sha256sum/realpath.
+    # A failed write/fsync/rename leaves private evidence, never a partially
+    # visible .pending or .cancelling record. No failure path deletes bytes.
+    [ ! -e "$2" ] && [ ! -L "$2" ] || return 1;
+    __rch_temporary=$(mktemp "$1/.record-write.XXXXXXXXXX") || return 1;
+    if ! printf '%s\n' "$4" > "$__rch_temporary" \
+        || ! rch_claim_content_valid "$__rch_temporary" "$3" \
+        || ! sync -f "$__rch_temporary"; then
+        printf 'RCH_SOURCE_CLAIM_WRITE_FAILED %s\n' "$__rch_temporary" >&2;
+        return 1;
+    fi;
+    [ ! -e "$2" ] && [ ! -L "$2" ] || return 1;
+    mv -T -- "$__rch_temporary" "$2" && sync -f "$1";
+};
+"#;
+
 /// The glob patterns matched for reaping. Restricted to per-job / per-pid /
 /// pooled dirs so a bare `target` (or any non-rch dir) is never touched.
 pub const REAP_GLOBS: &[&str] = &[
@@ -273,16 +361,10 @@ __gc_source_records_free() {
     __gc_source_realpath "$1" || return 1; __gc_candidate=$__gc_resolved;
     for __gc_record in "$__gc_source_registry"/*.claim "$__gc_source_registry"/*.pending; do
         [ -e "$__gc_record" ] || [ -L "$__gc_record" ] || continue;
-        [ ! -L "$__gc_record" ] && [ -f "$__gc_record" ] || return 1;
-        __gc_name=${__gc_record##*/}; __gc_token=${__gc_name%%.*};
-        __gc_digest=${__gc_name#*.}; __gc_digest=${__gc_digest%%.*};
-        case "$__gc_token" in ''|*[!a-f0-9-]*) return 1;; esac;
-        case "$__gc_digest" in *[!a-f0-9]*) return 1;; esac;
-        [ "${#__gc_digest}" -eq 64 ] || return 1;
-        __gc_size=$(wc -c < "$__gc_record") || return 1;
-        [ "$__gc_size" -gt 0 ] && [ "$__gc_size" -le 33554432 ] || return 1;
-        __gc_actual=$(sha256sum -- "$__gc_record") || return 1;
-        [ "${__gc_actual%% *}" = "$__gc_digest" ] || return 1;
+        if ! rch_claim_record_valid "$__gc_record"; then
+            rch_claim_quarantine_pending "$__gc_source_registry" "$__gc_record" || return 1;
+            continue;
+        fi;
         while IFS= read -r __gc_root || [ -n "$__gc_root" ]; do
             case "$__gc_root" in /*) ;; *) return 1;; esac;
             case "$__gc_root" in *//*|*/./*|*/../*|*/.|*/..) return 1;; esac;
@@ -316,6 +398,7 @@ __gc_source_end() {
 __gc_source_begin() {
     __gc_reservation="";
     [ ! -L "$__gc_source_registry" ] || return 1;
+    [ ! -L "$__gc_source_registry/quarantine" ] || return 1;
     (umask 077; mkdir -p -- "$__gc_source_registry") || return 1;
     [ ! -L "$__gc_source_registry/metadata.lock" ] || return 1;
     exec 8>"$__gc_source_registry/metadata.lock" || return 1;
@@ -327,14 +410,15 @@ __gc_source_begin() {
     case "$__gc_token" in *[!a-f0-9-]*) __gc_source_end; return 1;; esac;
     [ "${#__gc_token}" -eq 39 ] || { __gc_source_end; return 1; };
     for __gc_previous in "$__gc_source_registry/$__gc_token."* \
-        "$__gc_source_registry/released/$__gc_token."* "$__gc_source_registry/cancelled/$__gc_token."*; do
+        "$__gc_source_registry/released/$__gc_token."* "$__gc_source_registry/cancelled/$__gc_token."* \
+        "$__gc_source_registry/quarantine/$__gc_token."*; do
         if [ -e "$__gc_previous" ] || [ -L "$__gc_previous" ]; then __gc_source_end; return 1; fi;
     done;
     __gc_actual=$(printf '%s\n' "$__gc_candidate" | sha256sum) || { __gc_source_end; return 1; };
     __gc_reservation_digest=${__gc_actual%% *};
     __gc_pending="$__gc_source_registry/$__gc_token.$__gc_reservation_digest.pending";
-    if ! (umask 077; set -C; printf '%s\n' "$__gc_candidate" > "$__gc_pending") \
-        || ! sync -f "$__gc_pending"; then __gc_source_end; return 1; fi;
+    if ! rch_claim_write_atomic "$__gc_source_registry" "$__gc_pending" \
+        "$__gc_reservation_digest" "$__gc_candidate"; then __gc_source_end; return 1; fi;
     __gc_active="$__gc_source_registry/$__gc_token.$__gc_reservation_digest.claim";
     if ! mv -- "$__gc_pending" "$__gc_active" || ! sync -f "$__gc_source_registry"; then
         __gc_source_end; return 1;
@@ -343,7 +427,7 @@ __gc_source_begin() {
 };
 "#;
     format!(
-        "__gc_source_registry={}; {GATE}",
+        "__gc_source_registry={}; {SOURCE_CLAIM_RECORD_HELPERS}\n{GATE}",
         shell_escape::escape(registry.into())
     )
 }
@@ -1290,6 +1374,43 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
     collect_paths_command_with_registry(targets, SOURCE_CLAIM_REGISTRY)
 }
 
+/// Why `target` may not be embedded in a removal command, or `None` if it may.
+///
+/// [`collect_paths_command`] refuses a batch containing any such target. Callers
+/// screen targets with this first and report each rejected one as a skip, so a
+/// single unembeddable path (e.g. `…/worker volume/…`, which contains a space)
+/// cannot abort a whole worker's collection (bd-kr4qb).
+#[must_use]
+pub fn collect_target_rejection(target: &GcCollectTarget) -> Option<String> {
+    if !is_safe_reap_path(&target.path) {
+        return Some(format!(
+            "refusing to collect {:?}: not an absolute, `..`-free, metacharacter-free path at \
+             least two levels deep",
+            target.path
+        ));
+    }
+    if GcClass::from_path(&target.path) == GcClass::Unrecognized {
+        return Some(format!(
+            "refusing to collect {:?}: basename is not an rch-managed runtime dir",
+            target.path
+        ));
+    }
+    if target.idle_minutes == 0 {
+        return Some(format!(
+            "refusing to collect {:?}: a zero idle window would remove a live dir",
+            target.path
+        ));
+    }
+    if !target
+        .trigger
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Some(format!("invalid trigger tag {:?}", target.trigger));
+    }
+    None
+}
+
 fn collect_paths_command_with_registry(
     targets: &[GcCollectTarget],
     registry: &str,
@@ -1299,31 +1420,8 @@ fn collect_paths_command_with_registry(
     }
     let mut list = String::new();
     for target in targets {
-        if !is_safe_reap_path(&target.path) {
-            return Err(format!(
-                "refusing to collect {:?}: not an absolute, `..`-free, metacharacter-free path at \
-                 least two levels deep",
-                target.path
-            ));
-        }
-        if GcClass::from_path(&target.path) == GcClass::Unrecognized {
-            return Err(format!(
-                "refusing to collect {:?}: basename is not an rch-managed runtime dir",
-                target.path
-            ));
-        }
-        if target.idle_minutes == 0 {
-            return Err(format!(
-                "refusing to collect {:?}: a zero idle window would remove a live dir",
-                target.path
-            ));
-        }
-        if !target
-            .trigger
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
-            return Err(format!("invalid trigger tag {:?}", target.trigger));
+        if let Some(rejection) = collect_target_rejection(target) {
+            return Err(rejection);
         }
         list.push_str(&format!(
             " \"{}:{}:{}\"",
@@ -1399,6 +1497,132 @@ pub fn parse_gc_skips(stdout: &str) -> Vec<GcSkip> {
             })
         })
         .collect()
+}
+
+/// A stale-target GC reservation (`fc-*.claim`) younger than this is never
+/// judged abandoned (bd-gyehj).
+pub const ABANDONED_GC_CLAIM_MIN_MINUTES: u64 = 6 * 60;
+
+/// Report, and with `apply` release, abandoned GC reservations on a worker.
+///
+/// A GC supervisor that dies between `__gc_source_begin` and
+/// `__gc_source_end` (ssh timeout, kill, OOM, reboot) leaves its `fc-*.claim`
+/// behind, and it fences every build of that tree from then on. The claim is
+/// kept on purpose after a KILL, because the `rm` child may still be deleting
+/// (see [`source_claim_gate_fragment`]), so a free metadata lock does not
+/// prove the deletion is over. A claim counts as abandoned only when, under
+/// the registry's metadata lock, all of these hold:
+/// - it is at least `min_age_minutes` old;
+/// - its record is intact (regular file, digest matches);
+/// - no process has its cwd, root or an open descriptor at or under the path;
+/// - no process's argv names the path.
+///
+/// Release is the move to `released/` that `__gc_source_end` performs.
+/// Emits `RCH_GC_CLAIMS <status>` once, then one
+/// `RCH_GC_CLAIM <verdict> <reason> <age_minutes> <name> <path>` per claim.
+#[must_use]
+pub fn abandoned_gc_claims_command(apply: bool) -> String {
+    abandoned_gc_claims_command_with_registry(
+        apply,
+        SOURCE_CLAIM_REGISTRY,
+        ABANDONED_GC_CLAIM_MIN_MINUTES,
+    )
+}
+
+/// [`abandoned_gc_claims_command`] against an explicit registry and age.
+#[must_use]
+pub fn abandoned_gc_claims_command_with_registry(
+    apply: bool,
+    registry: &str,
+    min_age_minutes: u64,
+) -> String {
+    let registry = shell_escape::escape(registry.into());
+    let apply = u8::from(apply);
+    format!(
+        r#"r={registry}; min={min_age_minutes}; apply={apply};
+if [ ! -d "$r" ] || [ -L "$r" ]; then printf 'RCH_GC_CLAIMS none\n'; exit 0; fi;
+if [ -L "$r/metadata.lock" ]; then printf 'RCH_GC_CLAIMS unsafe-lock\n'; exit 0; fi;
+if ! command -v flock >/dev/null 2>&1; then printf 'RCH_GC_CLAIMS no-flock\n'; exit 0; fi;
+exec 8>"$r/metadata.lock" || exit 1;
+if ! flock -x -w 30 8; then printf 'RCH_GC_CLAIMS busy\n'; exit 0; fi;
+if [ ! -d /proc/self/fd ]; then printf 'RCH_GC_CLAIMS no-proc\n'; exit 0; fi;
+refs=$(mktemp) && args=$(mktemp) || exit 1;
+trap 'rm -f -- "$refs" "$args"' EXIT;
+find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 -printf '%l\n' 2>/dev/null | grep '^/' | sort -u > "$refs";
+for p in /proc/[0-9]*; do tr '\0' ' ' 2>/dev/null < "$p/cmdline"; echo; done > "$args";
+printf 'RCH_GC_CLAIMS ok\n';
+now=$(date +%s);
+for c in "$r"/fc-*.claim; do
+  [ -e "$c" ] || [ -L "$c" ] || continue;
+  n=${{c##*/}}; p=-; age=0; v=keep;
+  if [ -L "$c" ] || [ ! -f "$c" ]; then why=unsafe-record;
+  else
+    m=$(stat -c %Y -- "$c" 2>/dev/null) || m=$now; age=$(( (now - m) / 60 ));
+    p=$(head -n 1 -- "$c"); d=${{n#*.}}; d=${{d%%.*}}; a=$(sha256sum -- "$c");
+    if [ "${{a%% *}}" != "$d" ] || [ -z "$p" ]; then why=unsafe-record;
+    elif [ "$age" -lt "$min" ]; then why=young;
+    elif awk -v p="$p/" -v q="$p" 'index($0,p)==1 || $0==q {{f=1; exit}} END{{exit !f}}' "$refs"; then why=open-handle;
+    elif grep -qF -- "$p" "$args"; then why=live-process;
+    elif [ "$apply" = 1 ]; then
+      dest="$r/released/$n";
+      if [ ! -L "$r/released" ] && mkdir -p -- "$r/released" && [ ! -e "$dest" ] && [ ! -L "$dest" ] \
+        && mv -- "$c" "$dest" && sync -f "$dest" && sync -f "$r/released"; then v=released; why=abandoned;
+      else why=release-failed; fi;
+    else v=would-release; why=abandoned; fi;
+  fi;
+  printf 'RCH_GC_CLAIM %s %s %s %s %s\n' "$v" "$why" "$age" "$n" "$p";
+done;
+sync -f "$r" 2>/dev/null || :;
+"#
+    )
+}
+
+/// One `RCH_GC_CLAIM` line from [`abandoned_gc_claims_command`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcClaimReport {
+    /// `keep`, `would-release` or `released`.
+    pub verdict: String,
+    pub reason: String,
+    pub age_minutes: u64,
+    pub name: String,
+    /// The claimed tree, `-` when the record could not be read.
+    pub path: String,
+}
+
+/// Parse the claims scan: its `RCH_GC_CLAIMS` status (absent when the script
+/// never reached it) and every claim line.
+#[must_use]
+pub fn parse_gc_claim_reports(stdout: &str) -> (Option<String>, Vec<GcClaimReport>) {
+    let mut status = None;
+    let mut claims = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("RCH_GC_CLAIMS ") {
+            status = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("RCH_GC_CLAIM ") {
+            let mut parts = rest.splitn(5, ' ');
+            let (Some(verdict), Some(reason), Some(age), Some(name), Some(path)) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                continue;
+            };
+            let Ok(age_minutes) = age.parse() else {
+                continue;
+            };
+            claims.push(GcClaimReport {
+                verdict: verdict.to_string(),
+                reason: reason.to_string(),
+                age_minutes,
+                name: name.to_string(),
+                path: path.to_string(),
+            });
+        }
+    }
+    (status, claims)
 }
 
 /// The roots one enumeration/sweep run actually looked at, as reported by the
@@ -1856,6 +2080,37 @@ mod tests {
             ..good.clone()
         };
         assert!(collect_paths_command(&[zero]).is_err());
+    }
+
+    #[test]
+    fn collect_target_rejection_screens_unembeddable_paths_individually() {
+        // bd-kr4qb: `…/worker volume/…` (a space) must be rejected on its own,
+        // so callers can skip it and still collect every other target.
+        let good = GcCollectTarget {
+            path: POOL.to_string(),
+            idle_minutes: 10_080,
+            trigger: "pooled-ttl",
+        };
+        let spaced = GcCollectTarget {
+            path: "/data/tmp/rch/repo/.rch-tmp/.tmp8xieom/worker volume/.rch-target-w-pool-a"
+                .to_string(),
+            ..good.clone()
+        };
+        assert_eq!(collect_target_rejection(&good), None);
+        let reason = collect_target_rejection(&spaced).expect("space must be rejected");
+        assert!(reason.contains("metacharacter-free"), "{reason}");
+        // The rejection is exactly what fails the batch...
+        assert_eq!(
+            collect_paths_command(&[good.clone(), spaced.clone()]),
+            Err(reason)
+        );
+        // ...so screening it out leaves a collectable batch.
+        let screened: Vec<GcCollectTarget> = [good, spaced]
+            .into_iter()
+            .filter(|t| collect_target_rejection(t).is_none())
+            .collect();
+        assert_eq!(screened.len(), 1);
+        assert!(collect_paths_command(&screened).is_ok());
     }
 
     #[test]
@@ -2673,7 +2928,9 @@ mod tests {
         std::fs::create_dir_all(&scratch).unwrap();
         let candidate = base.join("repo/.rch-target-w-job-unclaimed");
         source_gc_fixture_dir(&candidate);
-        let record = source_gc_fixture_claim(&registry, &tmp.path().join("other"), "aa", "pending");
+        // Active corruption may hide an acknowledged source owner. It must
+        // keep blocking GC even though incomplete pending writes can retire.
+        let record = source_gc_fixture_claim(&registry, &tmp.path().join("other"), "aa", "claim");
         std::fs::write(record, b"/truncated").unwrap();
         let output = std::process::Command::new("sh")
             .arg("-c")
@@ -2696,6 +2953,153 @@ mod tests {
                 .iter()
                 .any(|skip| skip.reason == "source-ownership")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_gc_quarantines_incomplete_pending_and_preserves_real_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let registry = tmp.path().join("claims");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let active = base.join("active/.rch-target-w-job-active");
+        let pending = base.join("pending/.rch-target-w-job-pending");
+        let free = base.join("free/.rch-target-w-job-free");
+        for candidate in [&active, &pending, &free] {
+            source_gc_fixture_dir(candidate);
+        }
+        let held = source_gc_fixture_claim(&registry, &active, "ca01", "claim");
+        let ready = source_gc_fixture_claim(&registry, &pending, "ca02", "pending");
+        let mut corrupt = Vec::new();
+        for (token, bytes) in [("ca03", b"".as_slice()), ("ca04", b"/truncated".as_slice())] {
+            let path = source_gc_fixture_claim(&registry, &free, token, "pending");
+            std::fs::write(&path, bytes).unwrap();
+            corrupt.push((path, bytes));
+        }
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &worker_sweep_command_with_registry(
+                    base.to_str().unwrap(),
+                    60,
+                    None,
+                    None,
+                    registry.to_str().unwrap(),
+                ),
+            ])
+            .env("TMPDIR", &scratch)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(active.join("artifact.o").is_file());
+        assert!(pending.join("artifact.o").is_file());
+        assert!(held.is_file());
+        assert!(ready.is_file());
+        assert!(
+            !free.exists(),
+            "a failed ungranted write must not poison all GC"
+        );
+        assert_eq!(
+            parse_worker_reap_metrics(&String::from_utf8_lossy(&output.stdout))
+                .unwrap()
+                .0,
+            1
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches("RCH_SOURCE_CLAIM_QUARANTINED")
+                .count(),
+            2
+        );
+        for (path, bytes) in corrupt {
+            assert!(!path.exists());
+            assert_eq!(
+                std::fs::read(registry.join("quarantine").join(path.file_name().unwrap())).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_gc_failed_claim_write_keeps_candidate_and_partial_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        let candidate = tmp.path().join("projects/repo/.rch-target-w-job-free");
+        source_gc_fixture_dir(&candidate);
+        let gate = source_claim_gate_fragment(registry.to_str().unwrap());
+        let script = format!(
+            "{gate}\nif __gc_source_begin {}; then __gc_source_end; printf admitted; else printf refused; fi",
+            shell_escape::escape(candidate.to_string_lossy()),
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("trap '' XFSZ; ulimit -f 0; {script}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"refused");
+        assert!(candidate.join("artifact.o").is_file());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_SOURCE_CLAIM_WRITE_FAILED"));
+        let names: Vec<_> = std::fs::read_dir(&registry)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.starts_with(".record-write.")));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.ends_with(".pending") || name.ends_with(".claim"))
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"admitted");
+        assert_eq!(
+            std::fs::read_dir(registry.join("released"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_claim_atomic_rename_failure_preserves_private_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        std::fs::create_dir(&registry).unwrap();
+        // The destination's missing parent makes the real rename fail after
+        // the real file write and fsync have completed.
+        let destination = registry.join("missing/record.pending");
+        let script = format!(
+            "{SOURCE_CLAIM_RECORD_HELPERS}\nset -eu; registry=$1; destination=$2; \
+             digest=$(printf '/source\\n' | sha256sum); digest=${{digest%% *}}; \
+             rch_claim_write_atomic \"$registry\" \"$destination\" \"$digest\" /source",
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script, "claim-rename-fixture"])
+            .arg(&registry)
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!destination.exists());
+        let retained: Vec<_> = std::fs::read_dir(&registry)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert!(
+            retained[0]
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".record-write.")
+        );
+        assert_eq!(std::fs::read(retained[0].path()).unwrap(), b"/source\n");
     }
 
     #[cfg(target_os = "linux")]
@@ -2852,6 +3256,27 @@ mod tests {
                 );
             }
             assert!(candidate.exists());
+            let release_claims = || {
+                let script =
+                    abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0);
+                let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let (status, claims) =
+                    parse_gc_claim_reports(&String::from_utf8_lossy(&output.stdout));
+                assert_eq!(status.as_deref(), Some("ok"), "{output:?}");
+                claims
+            };
+            if signal == "-KILL" {
+                // bd-gyehj: the orphaned rm still names the tree, so the
+                // operator release must keep the claim while it runs.
+                let claims = release_claims();
+                assert_eq!(claims.len(), 1, "{claims:?}");
+                assert_eq!(claims[0].verdict, "keep", "{claims:?}");
+                assert!(
+                    ["open-handle", "live-process"].contains(&claims[0].reason.as_str()),
+                    "{claims:?}"
+                );
+            }
             std::fs::write(resume, b"continue").unwrap();
             if signal == "-HUP" {
                 assert!(child.wait().unwrap().success());
@@ -2868,6 +3293,20 @@ mod tests {
                         .is_some_and(|extension| extension == "claim")),
                     "an interrupted GC claim must remain after its unobserved child completes"
                 );
+                // Once nothing references the tree, the release retires it
+                // exactly as __gc_source_end would.
+                let mut claims = release_claims();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while claims.first().is_some_and(|c| c.verdict == "keep")
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    claims = release_claims();
+                }
+                assert_eq!(claims.len(), 1, "{claims:?}");
+                assert_eq!(claims[0].verdict, "released", "{claims:?}");
+                assert!(registry.join("released").join(&claims[0].name).is_file());
+                assert!(release_claims().is_empty());
             }
             assert!(!candidate.exists());
             assert!(
@@ -2875,6 +3314,100 @@ mod tests {
                 "metadata lock was not released after deletion"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_gc_claims_respect_age_integrity_and_live_references() {
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        let tree = tmp.path().join(".rch-target-w-pool-stranded");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let record = format!("{}\n", tree.display());
+        let staged = tmp.path().join("record");
+        std::fs::write(&staged, &record).unwrap();
+        let digest = String::from_utf8(
+            Command::new("sha256sum")
+                .arg(&staged)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+        let name = format!("fc-00000000-0000-4000-8000-000000000001.{digest}.claim");
+        let claim = registry.join(&name);
+        std::fs::write(&claim, &record).unwrap();
+        let scan = |apply: bool, min_age: u64| {
+            let script = abandoned_gc_claims_command_with_registry(
+                apply,
+                registry.to_str().unwrap(),
+                min_age,
+            );
+            let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let (status, claims) = parse_gc_claim_reports(&String::from_utf8_lossy(&output.stdout));
+            assert_eq!(status.as_deref(), Some("ok"), "{output:?}");
+            claims
+        };
+        let only = |claims: Vec<GcClaimReport>| {
+            assert_eq!(claims.len(), 1, "{claims:?}");
+            (claims[0].verdict.clone(), claims[0].reason.clone())
+        };
+
+        assert_eq!(only(scan(true, 60)), ("keep".into(), "young".into()));
+        assert_eq!(
+            only(scan(false, 0)),
+            ("would-release".into(), "abandoned".into())
+        );
+        assert!(claim.is_file(), "a preview must not release");
+
+        let mut holder = Command::new("sleep")
+            .arg("30")
+            .current_dir(&tree)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let held = only(scan(true, 0));
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        assert_eq!(held, ("keep".into(), "open-handle".into()));
+
+        std::fs::write(&claim, b"/tampered\n").unwrap();
+        assert_eq!(only(scan(true, 0)), ("keep".into(), "unsafe-record".into()));
+        std::fs::write(&claim, &record).unwrap();
+
+        let released = scan(true, 0);
+        assert_eq!(released[0].path, tree.display().to_string());
+        assert_eq!(only(released), ("released".into(), "abandoned".into()));
+        assert!(!claim.exists());
+        assert!(registry.join("released").join(&name).is_file());
+    }
+
+    #[test]
+    fn gc_claim_report_lines_parse_with_spaces_in_the_path() {
+        let (status, claims) = parse_gc_claim_reports(
+            "noise\nRCH_GC_CLAIMS ok\nRCH_GC_CLAIM keep young 12 fc-a.b.claim /data/my dir\n\
+             RCH_GC_CLAIM keep x notanumber fc-c.d.claim /p\nRCH_GC_CLAIM short\n",
+        );
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(
+            claims,
+            vec![GcClaimReport {
+                verdict: "keep".into(),
+                reason: "young".into(),
+                age_minutes: 12,
+                name: "fc-a.b.claim".into(),
+                path: "/data/my dir".into(),
+            }]
+        );
+        assert_eq!(parse_gc_claim_reports("").0, None);
     }
 
     /// `rch gc --dry-run` enumerates; the real run sweeps. If enumerate cannot

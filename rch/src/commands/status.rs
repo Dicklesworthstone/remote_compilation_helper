@@ -490,6 +490,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             &socket_path,
             &project,
             estimated_cores,
+            config.compilation.disk_headroom_gib,
             command,
             toolchain.as_ref(),
             required_runtime,

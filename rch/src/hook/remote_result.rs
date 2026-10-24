@@ -43,6 +43,8 @@ pub(super) struct RemoteExecutionResult {
     /// Per declared-result-dir collection outcome (bd-p0yoo), for the
     /// machine-readable envelope (bd-uoh4x). Empty when no dirs declared.
     pub(super) result_dirs: Vec<ExecResultDirStat>,
+    /// Actual source/output filesystems that must recover after a disk fault.
+    pub(super) disk_roots: Vec<String>,
 }
 
 /// Collection outcome of one declared job result directory (bd-uoh4x).
@@ -351,7 +353,14 @@ pub(super) fn remote_failure_is_worker_fault(stderr: &str, exit_code: i32) -> bo
         || detect_worker_system_dependency_failure(stderr, exit_code).is_some()
         || is_signal_killed(exit_code).is_some_and(is_cpu_capability_signal)
         || wrapped_cpu_capability_signal(exit_code, stderr).is_some()
-        || stderr.contains("No space left on device")
+        || remote_failure_is_disk_full(stderr, exit_code)
+}
+
+/// Only failed remote executions can establish disk exhaustion. A successful
+/// test that prints an ENOSPC fixture must not quarantine its worker. Compiler
+/// diagnostics alongside a disk error do not make that exhausted disk usable.
+pub(super) fn remote_failure_is_disk_full(stderr: &str, exit_code: i32) -> bool {
+    exit_code != 0 && rch_common::disk_pressure_report::mentions_disk_full(stderr)
 }
 
 /// Topology-specific Cargo workspace inheritance failure under remote roots.

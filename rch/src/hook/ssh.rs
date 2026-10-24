@@ -198,6 +198,34 @@ fn source_authority_lock_paths(authority_roots: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The canonical spelling `source_authority_lock_plan` demands: a trailing `/`,
+/// doubled `/` and `.` components removed (bd-4d1hs).
+///
+/// A project path given as `/data/tmp/landing/c9-beads/` reached the durable
+/// lease verbatim. The lock plan then refused it, the wrapper died before
+/// preparing, and `rch jobs recover` refused the same recorded root forever, so
+/// the slot reservation was never returned. Anything not merely mis-spelled
+/// (relative, `..`, control bytes, non-UTF-8) is returned unchanged so the lock
+/// plan still rejects it loudly.
+pub(crate) fn canonical_source_authority_root(root: &str) -> String {
+    let path = Path::new(root);
+    if !path.is_absolute()
+        || root.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return root.to_string();
+    }
+    path.components()
+        .collect::<PathBuf>()
+        .to_str()
+        .map_or_else(|| root.to_string(), str::to_string)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceAuthorityLockSpec {
     path: String,
@@ -330,7 +358,7 @@ fn source_registry_setup(registry: &str) -> String {
     format!(
         "set -eu; umask 077; registry={registry}; \
          [ ! -L \"$registry\" ]; mkdir -p -- \"$registry\"; \
-         for directory in \"$registry/released\" \"$registry/cancelled\"; do \
+         for directory in \"$registry/released\" \"$registry/cancelled\" \"$registry/quarantine\"; do \
          [ ! -L \"$directory\" ]; mkdir -p -- \"$directory\"; done; \
          [ ! -L \"$registry/metadata.lock\" ]; sync -f \"$registry\";\n",
         registry = quote(registry),
@@ -344,10 +372,15 @@ fn source_registry_invocation(
     operation: &str,
 ) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let script = format!(
+        "{}\n{}",
+        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+        SOURCE_CLAIM_REGISTRY,
+    );
     format!(
         "flock -x -- {lock} sh -c {script} rch-source-registry {registry} {identity} {digest} {operation}",
         lock = quote(&format!("{registry}/metadata.lock")),
-        script = quote(SOURCE_CLAIM_REGISTRY),
+        script = quote(&script),
         registry = quote(registry),
         identity = quote(identity),
         digest = quote(digest),
@@ -483,6 +516,53 @@ fn source_intent_command(
         "{}{invocation} <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
         source_registry_setup(registry),
     ))
+}
+
+/// Probe whether a started remote execution is gone for good. Every activity
+/// under a source grant (the build supervisor and its descendants) inherits
+/// the grant's activity-lock descriptor, so while any of it lives the lock is
+/// held. Holding that lock ourselves and still finding no completion receipt
+/// proves the execution died without one and never will write it. A
+/// registry that no longer exists (worker reboot cleared /tmp) proves the
+/// same. Prints exactly one of RCH_EXEC_ACTIVE, RCH_EXEC_COMPLETED,
+/// RCH_EXEC_LOST.
+fn remote_execution_probe_script(
+    registry: &str,
+    identity: &str,
+    receipt: &str,
+) -> anyhow::Result<String> {
+    validate_source_identity(identity)?;
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    Ok(format!(
+        "[ -d {registry} ] || {{ echo RCH_EXEC_LOST; exit 0; }}; \
+         flock -n {lock} sh -c 'if [ -e \"$1\" ] || [ -L \"$1\" ]; then echo RCH_EXEC_COMPLETED; \
+         else echo RCH_EXEC_LOST; fi' rch-exec-probe {receipt} || echo RCH_EXEC_ACTIVE",
+        registry = quote(registry),
+        lock = quote(&format!("{registry}/{identity}.activity.lock")),
+        receipt = quote(receipt),
+    ))
+}
+
+/// True only when the probe proves the execution is lost (see
+/// [`remote_execution_probe_script`]); any other answer or error keeps the
+/// conservative "not complete yet" verdict.
+pub(super) async fn remote_execution_lost(
+    worker: &WorkerConfig,
+    identity: &str,
+    receipt: &str,
+) -> anyhow::Result<bool> {
+    let script = remote_execution_probe_script(REMOTE_SOURCE_CLAIM_REGISTRY, identity, receipt)?;
+    let output = run_offload_ssh_command_with_stdin(
+        worker,
+        "sh -s",
+        script.as_bytes(),
+        Duration::from_secs(15),
+    )
+    .await?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "RCH_EXEC_LOST"))
 }
 
 /// Reconcile an exact release after completed retrieval. This grants no source
@@ -914,6 +994,9 @@ async fn spawn_source_authority_lock(
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-i").arg(identity_file.as_ref());
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+        cmd.args(opts);
+    }
     cmd.arg(&destination);
     let (remote_arg, stdin_bootstrap) =
         source_authority_lock_transport(WorkerPlatform::from_worker(worker), remote_cmd);
@@ -1119,6 +1202,9 @@ async fn run_offload_ssh_command_with_optional_stdin(
         timeout_duration.as_secs().max(1)
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+        cmd.args(opts);
+    }
     cmd.arg(&destination);
     cmd.arg(build_remote_shell_command(
         WorkerPlatform::from_worker(worker),
@@ -1875,6 +1961,25 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     }
 
     #[test]
+    fn canonical_source_authority_root_repairs_only_benign_spellings() {
+        // bd-4d1hs: the exact root a dead fleet lease recorded.
+        let recorded = "/data/tmp/landing/c9-beads/";
+        assert!(source_authority_lock_plan(&[recorded.into()], false).is_err());
+        let canonical = canonical_source_authority_root(recorded);
+        assert_eq!(canonical, "/data/tmp/landing/c9-beads");
+        assert!(source_authority_lock_plan(&[canonical], false).is_ok());
+
+        assert_eq!(canonical_source_authority_root("/a//b/./c/"), "/a/b/c");
+        assert_eq!(canonical_source_authority_root("/"), "/");
+        assert_eq!(canonical_source_authority_root("/a/b"), "/a/b");
+        // Not merely mis-spelled: left as-is so the lock plan still refuses it.
+        for unsafe_root in ["relative/dir/", "/a/../b/", "/a/b\n"] {
+            assert_eq!(canonical_source_authority_root(unsafe_root), unsafe_root);
+            assert!(source_authority_lock_plan(&[unsafe_root.into()], false).is_err());
+        }
+    }
+
+    #[test]
     fn source_authority_hierarchy_uses_one_order_and_strongest_mode() {
         let forward =
             source_authority_lock_plan(&["/a/child".into(), "/b/child".into(), "/a".into()], true)
@@ -1912,6 +2017,70 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             paired,
             exclusive_source_locks(&[source_authority_lock_path("/private/child")])
         );
+    }
+
+    /// A started execution is "lost" only when its activity lock is free and
+    /// no receipt exists (or the whole registry is gone); a held lock means it
+    /// is still running and a receipt means it completed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_execution_probe_distinguishes_active_completed_and_lost() {
+        use std::process::{Command, Stdio};
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        std::fs::create_dir(&registry).unwrap();
+        let identity = "0123456789abcdef0123456789abcdef";
+        let receipt = tmp.path().join("recovery-1-id");
+        let probe = |registry: &Path| {
+            let script = remote_execution_probe_script(
+                registry.to_str().unwrap(),
+                identity,
+                receipt.to_str().unwrap(),
+            )
+            .unwrap();
+            let output = Command::new("sh").arg("-c").arg(script).output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+
+        assert_eq!(probe(&registry), "RCH_EXEC_LOST", "free lock, no receipt");
+        assert_eq!(
+            probe(&tmp.path().join("absent")),
+            "RCH_EXEC_LOST",
+            "registry gone"
+        );
+
+        let lock = registry.join(format!("{identity}.activity.lock"));
+        // One process holds the lock (the shell execs into sleep, keeping fd
+        // 9), so killing it frees the lock. `flock <file> sleep` would leave
+        // the lock with the surviving sleep child: the very inheritance the
+        // probe relies on to see a live execution.
+        let mut holder = Command::new("sh")
+            .arg("-c")
+            .arg("exec 9>\"$1\" && flock -x 9 && exec sleep 30")
+            .arg("lock-holder")
+            .arg(&lock)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while Command::new("flock")
+            .args(["-n"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(std::time::Instant::now() < deadline, "holder never locked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(probe(&registry), "RCH_EXEC_ACTIVE", "lock held");
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+
+        std::fs::write(&receipt, "id 0\n").unwrap();
+        assert_eq!(probe(&registry), "RCH_EXEC_COMPLETED", "receipt present");
     }
 
     #[cfg(target_os = "linux")]
@@ -1982,6 +2151,277 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .output()
             .await
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_quarantines_incomplete_pending_without_resurrection() {
+        use std::os::unix::fs::MetadataExt;
+        async fn legacy_preflight(registry: &Path, token: &str, marker: &Path) {
+            // Preserve the old script's identity preflight, before any
+            // acquire/recover/cancel branch. The full old script is also
+            // exercised during review; this small compatibility contract
+            // keeps its size/hash refusal guards committed without a copy
+            // of the whole superseded implementation.
+            let old_preflight = r#"
+set -eu; registry=$1; token=$2; marker=$3
+for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
+    "$registry/$token."*.cancelling "$registry/released/$token."*.claim \
+    "$registry/cancelled/$token."*.claim; do
+    [ -e "$previous" ] || [ -L "$previous" ] || continue
+    [ ! -L "$previous" ] && [ -f "$previous" ] || exit 73
+    size=$(wc -c < "$previous")
+    [ "$size" -gt 0 ] && [ "$size" -le 33554432 ] || exit 73
+    name=${previous##*/}; record_digest=${name#*.}; record_digest=${record_digest%%.*}
+    actual=$(sha256sum -- "$previous")
+    [ "${actual%% *}" = "$record_digest" ] || exit 73
+done
+printf 'legacy identity escaped its fence\n' > "$marker"
+"#;
+            let output = Command::new("flock")
+                .arg("-x")
+                .arg(registry.join("metadata.lock"))
+                .args(["sh", "-c", old_preflight, "legacy-registry-preflight"])
+                .arg(registry)
+                .arg(token)
+                .arg(marker)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert_eq!(output.status.code(), Some(73));
+            assert!(
+                !marker.exists(),
+                "delayed legacy admission crossed its identity fence"
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir(&registry).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
+        let damaged = [
+            ("aa01", b"".as_slice()),
+            ("aa02", b"/truncated".as_slice()),
+            ("aa06", b"/interrupted".as_slice()),
+        ];
+        for (token, bytes) in damaged {
+            let pending = registry.join(format!("{token}.{digest}.pending"));
+            std::fs::write(&pending, bytes).unwrap();
+            if token == "aa06" {
+                // Restart after the durable fence but before quarantine's
+                // rename. Only this exact hard link may resume that frontier.
+                std::fs::hard_link(
+                    &pending,
+                    registry.join(format!("{token}.{digest}.cancelling")),
+                )
+                .unwrap();
+            }
+        }
+        // Both admissions reach the real metadata flock concurrently. Exactly
+        // one receives this source closure after the failed writes are fenced.
+        let (first, second) = tokio::join!(
+            test_source_intent(&registry, &roots, "aa03", "acquire"),
+            test_source_intent(&registry, &roots, "aa04", "acquire"),
+        );
+        assert_ne!(first.status.success(), second.status.success());
+        let (winner, success, failure) = if first.status.success() {
+            ("aa03", first, second)
+        } else {
+            ("aa04", second, first)
+        };
+        assert!(String::from_utf8_lossy(&success.stderr).contains("RCH_SOURCE_CLAIM_QUARANTINED"));
+        assert!(String::from_utf8_lossy(&failure.stderr).contains("overlapping"));
+        for (token, bytes) in damaged {
+            let name = format!("{token}.{digest}.pending");
+            assert!(!registry.join(&name).exists());
+            assert_eq!(
+                std::fs::read(registry.join("quarantine").join(&name)).unwrap(),
+                bytes
+            );
+            let fence = registry.join(format!("{token}.{digest}.cancelling"));
+            assert_eq!(
+                std::fs::metadata(&fence).unwrap().ino(),
+                std::fs::metadata(registry.join("quarantine").join(&name))
+                    .unwrap()
+                    .ino(),
+                "legacy scripts must see the same malformed record as a cancellation fence",
+            );
+            let legacy_marker = directory.path().join(format!("escaped-{token}"));
+            legacy_preflight(&registry, token, &legacy_marker).await;
+            for operation in ["acquire", "recover"] {
+                let output = test_source_intent(&registry, &roots, token, operation).await;
+                assert_eq!(output.status.code(), Some(73));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("quarantined"));
+            }
+            let changed = vec![directory.path().join("different").display().to_string()];
+            assert_eq!(
+                test_source_intent(&registry, &changed, token, "cancel")
+                    .await
+                    .status
+                    .code(),
+                Some(73)
+            );
+            let cancelled = test_source_intent(&registry, &roots, token, "cancel").await;
+            assert!(cancelled.status.success(), "{cancelled:?}");
+            assert_eq!(cancelled.stdout, b"unowned");
+            assert_eq!(
+                std::fs::read_to_string(
+                    registry
+                        .join("cancelled")
+                        .join(format!("{token}.{digest}.claim"))
+                )
+                .unwrap(),
+                contents,
+            );
+            assert!(
+                !test_source_intent(&registry, &roots, token, "acquire")
+                    .await
+                    .status
+                    .success()
+            );
+            legacy_preflight(&registry, token, &legacy_marker).await;
+        }
+        assert!(
+            test_source_intent(&registry, &roots, winner, "release")
+                .await
+                .status
+                .success()
+        );
+        assert!(
+            test_source_intent(&registry, &roots, "aa05", "acquire")
+                .await
+                .status
+                .success()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_does_not_bless_unrelated_corrupt_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir_all(registry.join("quarantine")).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (_, digest) = source_claim_roots(&roots).unwrap();
+        let quarantined = registry
+            .join("quarantine")
+            .join(format!("ad01.{digest}.pending"));
+        let cancelling = registry.join(format!("ad01.{digest}.cancelling"));
+        std::fs::write(&quarantined, b"/truncated").unwrap();
+        std::fs::write(&cancelling, b"/truncated").unwrap();
+        let output = test_source_intent(&registry, &roots, "ad01", "cancel").await;
+        assert_eq!(output.status.code(), Some(73));
+        assert!(
+            !registry
+                .join("cancelled")
+                .join(format!("ad01.{digest}.claim"))
+                .exists()
+        );
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"/truncated");
+        assert_eq!(std::fs::read(cancelling).unwrap(), b"/truncated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_write_failure_keeps_partial_bytes_private() {
+        for limit in [0, 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let registry = directory.path().join("registry");
+            // Real EFBIG from RLIMIT_FSIZE exercises zero-byte and truncated
+            // writes, without a mocked printf, filesystem, sync, or rename.
+            let roots = vec![format!(
+                "{}/{}source",
+                directory.path().display(),
+                "nested/".repeat(400)
+            )];
+            let (_, digest) = source_claim_roots(&roots).unwrap();
+            let script =
+                source_intent_command(registry.to_str().unwrap(), &roots, "bb01", "acquire")
+                    .unwrap();
+            let output = Command::new("sh")
+                .args(["-c", &format!("trap '' XFSZ; ulimit -f {limit}; {script}")])
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "write limit must cause a real failure"
+            );
+            assert!(!registry.join(format!("bb01.{digest}.pending")).exists());
+            assert!(!registry.join(format!("bb01.{digest}.claim")).exists());
+            let private: Vec<_> = std::fs::read_dir(&registry)
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".record-write.")
+                })
+                .collect();
+            assert_eq!(private.len(), 1, "retain the failed bytes for inspection");
+            let size = private[0].metadata().unwrap().len();
+            assert_eq!(size == 0, limit == 0);
+            assert!(size < roots[0].len() as u64);
+            let other = vec![directory.path().join("other").display().to_string()];
+            assert!(
+                test_source_intent(&registry, &other, "bb02", "acquire")
+                    .await
+                    .status
+                    .success()
+            );
+            let cancelled = test_source_intent(&registry, &roots, "bb01", "cancel").await;
+            assert!(cancelled.status.success(), "{cancelled:?}");
+            assert_eq!(cancelled.stdout, b"unowned");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
+        assert!(
+            test_source_intent(&registry, &roots, "bc01", "acquire")
+                .await
+                .status
+                .success()
+        );
+        let script =
+            source_intent_command(registry.to_str().unwrap(), &roots, "bc01", "cancel").unwrap();
+        let output = Command::new("sh")
+            .args(["-c", &format!("trap '' XFSZ; ulimit -f 0; {script}")])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!registry.join(format!("bc01.{digest}.cancelling")).exists());
+        assert_eq!(
+            std::fs::read_to_string(registry.join(format!("bc01.{digest}.claim"))).unwrap(),
+            contents
+        );
+        assert!(
+            !test_source_intent(&registry, &roots, "bc02", "acquire")
+                .await
+                .status
+                .success()
+        );
+        let cancelled = test_source_intent(&registry, &roots, "bc01", "cancel").await;
+        assert!(cancelled.status.success());
+        assert_eq!(cancelled.stdout, b"owned");
+        assert!(
+            test_source_intent(&registry, &roots, "bc01", "finish-cancel")
+                .await
+                .status
+                .success()
+        );
+        assert!(
+            test_source_intent(&registry, &roots, "bc02", "acquire")
+                .await
+                .status
+                .success()
+        );
     }
 
     #[cfg(target_os = "linux")]

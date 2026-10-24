@@ -465,7 +465,12 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     /// no live process rooted at it. A gate that cannot be evaluated counts as
     /// "in use" — an error never makes a dir eligible.
     ///
-    /// Nothing is removed without `--apply`.
+    /// It also lists stale-target GC reservations (`fc-*.claim`) left by a GC
+    /// run that died mid-removal; each one fences its tree for every build.
+    /// One is released only when it is over 6h old and no process has a cwd,
+    /// root, open descriptor or argv at or under its tree.
+    ///
+    /// Nothing is removed or released without `--apply`.
     #[command(after_help = r#"EXAMPLES:
     rch gc                                  # Preview on every worker (default)
     rch gc --workers hz2 --json             # Preview one worker, JSON verdicts
@@ -4896,8 +4901,22 @@ async fn handle_gc(
         let mut apply_error: Option<String> = None;
         let mut timed_out = false;
         let mut unknown_batch_paths: Vec<String> = Vec::new();
-        if apply && !targets.is_empty() {
-            for (batch_index, batch) in targets.chunks(GC_COLLECT_BATCH).enumerate() {
+        // One target that cannot be embedded in a remote command (a space in an
+        // ancestor dir, say) used to fail the whole batch, so the worker
+        // collected nothing (bd-kr4qb). Report each such target as a skip and
+        // collect the rest.
+        let mut embeddable: Vec<reap::GcCollectTarget> = Vec::with_capacity(targets.len());
+        for target in &targets {
+            match reap::collect_target_rejection(target) {
+                Some(reason) if apply => skipped.push(serde_json::json!({
+                    "path": target.path, "trigger": target.trigger, "reason": reason,
+                })),
+                Some(_) => {}
+                None => embeddable.push(target.clone()),
+            }
+        }
+        if apply && !embeddable.is_empty() {
+            for (batch_index, batch) in embeddable.chunks(GC_COLLECT_BATCH).enumerate() {
                 let command = match reap::collect_paths_command(batch) {
                     Ok(command) => command,
                     Err(e) => {
@@ -4960,6 +4979,42 @@ async fn handle_gc(
             }
         }
 
+        // Stranded GC reservations fence their tree for every build (bd-gyehj).
+        // Their scan never fails the worker's dir report; its error is shown.
+        let gc_claims = match run_gc_surface_command(
+            worker,
+            &reap::abandoned_gc_claims_command(apply),
+            deadline,
+            &mut output_budget,
+        )
+        .await
+        {
+            Ok(result) if result.success() => {
+                let (status, claims) = reap::parse_gc_claim_reports(&result.stdout);
+                serde_json::json!({
+                    "status": status.unwrap_or_else(|| "no-report".to_string()),
+                    "min_age_minutes": reap::ABANDONED_GC_CLAIM_MIN_MINUTES,
+                    "claims": claims
+                        .iter()
+                        .map(|c| serde_json::json!({
+                            "name": c.name, "path": c.path, "age_minutes": c.age_minutes,
+                            "verdict": c.verdict, "reason": c.reason,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            }
+            Ok(result) => serde_json::json!({
+                "status": "error",
+                "error": format!("claims scan exited {}: {}", result.exit_code, result.stderr.trim()),
+                "claims": [],
+            }),
+            Err(e) => serde_json::json!({
+                "status": "error",
+                "error": format!("claims scan: {e}"),
+                "claims": [],
+            }),
+        };
+
         let dirs: Vec<serde_json::Value> = decisions
             .iter()
             .map(|d| {
@@ -5005,6 +5060,7 @@ async fn handle_gc(
             "entries": removed_paths,
             "rm_errors": rm_errors,
             "skipped": skipped,
+            "gc_claims": gc_claims,
         })
     });
     let worker_reports =
@@ -5198,6 +5254,7 @@ async fn handle_gc(
                     report["would_free_kb"].as_u64().unwrap_or(0) / 1024,
                 );
             }
+            print_gc_claims(&report["gc_claims"], style);
         }
     }
 
@@ -5212,6 +5269,45 @@ async fn handle_gc(
         .into());
     }
     Ok(())
+}
+
+/// Text view of one worker's `gc_claims` report. Silent when the worker has
+/// no GC reservations at all.
+fn print_gc_claims(report: &serde_json::Value, style: &ui::Theme) {
+    let claims = report["claims"].as_array().map_or(&[][..], Vec::as_slice);
+    match report["status"].as_str() {
+        Some("ok" | "none") if claims.is_empty() => return,
+        Some("ok") => {}
+        Some("error") => {
+            println!(
+                "    {} GC reservations not checked: {}",
+                style.muted("!"),
+                report["error"].as_str().unwrap_or("?")
+            );
+            return;
+        }
+        other => {
+            println!(
+                "    {} GC reservations not checked: {}",
+                style.muted("!"),
+                other.unwrap_or("no report")
+            );
+            return;
+        }
+    }
+    println!(
+        "    GC reservations (abandoned = older than {}h, nothing references the tree):",
+        report["min_age_minutes"].as_u64().unwrap_or(0) / 60
+    );
+    for claim in claims {
+        println!(
+            "      {:<13} {:<14} {:>5}h  {}",
+            claim["verdict"].as_str().unwrap_or("?"),
+            claim["reason"].as_str().unwrap_or("?"),
+            claim["age_minutes"].as_u64().unwrap_or(0) / 60,
+            claim["path"].as_str().unwrap_or("?"),
+        );
+    }
 }
 
 /// Run one remote command on a worker over a throwaway SSH session.

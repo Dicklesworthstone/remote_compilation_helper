@@ -21,6 +21,83 @@ const MAX_DAEMON_STATUS_BYTES: usize = 1024;
 #[error("worker selection outcome is unconfirmed; do not retry selection or execute locally")]
 pub(super) struct SelectionOutcomeUnconfirmed;
 
+fn selection_transport_disconnected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
+}
+
+/// The only allowed post-dispatch recovery is an explicitly different endpoint
+/// that cannot create a fresh selection. Older daemons reject this exact route.
+/// Retry connection establishment while the daemon restarts, but dispatch only
+/// once: losing the resumed reply can mean that admission already succeeded.
+async fn resume_queued_selection(
+    socket_path: &str,
+    query: &str,
+    deadline: tokio::time::Instant,
+    disk_headroom_gib: u32,
+) -> anyhow::Result<SelectionResponse> {
+    let result = async {
+        let stream = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "queued recovery exceeded original selection deadline"
+            );
+            match timeout(
+                daemon_io_timeout().min(remaining),
+                UnixStream::connect(socket_path),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => break stream,
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => anyhow::bail!("queued recovery connection timed out"),
+            }
+        };
+        let (reader, mut writer) = stream.into_split();
+        let route = selection_route(disk_headroom_gib, true);
+        let request = format!("GET {route}?{query}\n");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "queued recovery exceeded original selection deadline"
+        );
+        timeout(
+            remaining,
+            exchange_selection_request(
+                reader,
+                &mut writer,
+                request.as_bytes(),
+                daemon_io_timeout().min(remaining),
+                remaining,
+                false,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("queued recovery exceeded original selection deadline"))?
+    }
+    .await;
+    result.map_err(|error| error.context(SelectionOutcomeUnconfirmed))
+}
+
 /// Everything after dispatch is ambiguous until a complete response is parsed.
 /// Keep this boundary around both writing and reading: a failed flush can follow
 /// a fully delivered request. Connect/preflight errors occur before this helper.
@@ -95,6 +172,13 @@ pub(super) async fn read_daemon_body<R: tokio::io::AsyncRead + Unpin>(
         .map_err(|_| {
             anyhow::anyhow!("Daemon response timed out after {}ms", budget.as_millis())
         })??;
+    if response.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "daemon disconnected without a response",
+        )
+        .into());
+    }
     anyhow::ensure!(
         response.len() <= MAX_RESPONSE_BYTES,
         "Daemon response exceeded {} byte limit",
@@ -242,6 +326,7 @@ pub(crate) async fn query_daemon(
     socket_path: &str,
     project: &str,
     cores: u32,
+    disk_headroom_gib: u32,
     command: &str,
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
@@ -258,6 +343,7 @@ pub(crate) async fn query_daemon(
         socket_path,
         project,
         cores,
+        disk_headroom_gib,
         command,
         toolchain,
         required_runtime,
@@ -282,6 +368,7 @@ pub(crate) async fn query_daemon_dry_run(
     socket_path: &str,
     project: &str,
     cores: u32,
+    disk_headroom_gib: u32,
     command: &str,
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
@@ -291,6 +378,7 @@ pub(crate) async fn query_daemon_dry_run(
         socket_path,
         project,
         cores,
+        disk_headroom_gib,
         command,
         toolchain,
         required_runtime,
@@ -312,6 +400,7 @@ async fn query_daemon_with_mode(
     socket_path: &str,
     project: &str,
     cores: u32,
+    disk_headroom_gib: u32,
     command: &str,
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
@@ -362,6 +451,9 @@ async fn query_daemon_with_mode(
 
     // Build query string
     let mut query = format!("project={}&cores={}", urlencoding_encode(project), cores);
+    if disk_headroom_gib > 0 {
+        query.push_str(&format!("&disk_headroom_gib={disk_headroom_gib}"));
+    }
     query.push_str(&format!("&command={}", urlencoding_encode(command)));
 
     if let Some(tc) = toolchain
@@ -446,16 +538,48 @@ async fn query_daemon_with_mode(
     }
 
     // Bound writes independently from the longer, queue-aware response wait.
-    let request = format!("GET /select-worker?{}\n", query);
-    let response = exchange_selection_request(
-        reader,
-        &mut writer,
-        request.as_bytes(),
-        daemon_io_timeout(),
-        daemon_response_timeout(wait_for_worker),
-        dry_run,
+    let route = selection_route(disk_headroom_gib, false);
+    let request = format!("GET {route}?{query}\n");
+    let response_budget = daemon_response_timeout(wait_for_worker);
+    let deadline = tokio::time::Instant::now() + response_budget;
+    let result = timeout(
+        response_budget,
+        exchange_selection_request(
+            reader,
+            &mut writer,
+            request.as_bytes(),
+            daemon_io_timeout(),
+            response_budget,
+            dry_run,
+        ),
     )
-    .await?;
+    .await
+    .unwrap_or_else(|_| {
+        let error = anyhow::anyhow!("selection exceeded original response deadline");
+        Err(if dry_run {
+            error
+        } else {
+            error.context(SelectionOutcomeUnconfirmed)
+        })
+    });
+    let response = match result {
+        Ok(response) => response,
+        Err(error)
+            if wait_for_worker
+                && !dry_run
+                && hook_pid.is_some_and(|pid| pid > 1)
+                && local_wrapper_id.is_some_and(|id| {
+                    id.starts_with(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
+                })
+                && selection_transport_disconnected(&error) =>
+        {
+            // The query is byte-identical, including the original timeout,
+            // worker pins and toolchain/tool constraints. The daemon checks
+            // these against durable queue ownership before selecting.
+            resume_queued_selection(socket_path, &query, deadline, disk_headroom_gib).await?
+        }
+        Err(error) => return Err(error),
+    };
 
     if let Some(worker) = response.worker.as_ref()
         && !selected_worker_is_requested(&worker.id, preferred_workers)
@@ -509,6 +633,18 @@ async fn query_daemon_with_mode(
     Ok(response)
 }
 
+/// Positive budgets use an exact route that older daemons cannot admit.
+/// Merely adding a query parameter would let an older daemon ignore the hard
+/// requirement and reserve a worker without accounting for any disk budget.
+fn selection_route(disk_headroom_gib: u32, resume: bool) -> &'static str {
+    match (disk_headroom_gib > 0, resume) {
+        (false, false) => "/select-worker",
+        (false, true) => "/select-worker/resume-queued",
+        (true, false) => "/select-worker/disk-budget",
+        (true, true) => "/select-worker/resume-queued/disk-budget",
+    }
+}
+
 /// Release reserved slots on a worker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn release_worker(
@@ -533,6 +669,8 @@ pub(crate) async fn release_worker(
         timing,
         local_wrapper_id,
         false,
+        false,
+        &[],
     )
     .await
 }
@@ -540,7 +678,8 @@ pub(crate) async fn release_worker(
 /// [`release_worker`] for a completed remote run, also telling the daemon
 /// whether the failure blamed the worker (`worker_fault`, see
 /// `remote_failure_is_worker_fault`). The daemon then records no cache warmth
-/// for it. Older daemons ignore the unknown query parameter.
+/// for it. Confirmed disk exhaustion also enters temporary bypass until the
+/// recovery service measures headroom. Older daemons ignore unknown parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn release_worker_with_fault(
     socket_path: &str,
@@ -553,6 +692,8 @@ pub(crate) async fn release_worker_with_fault(
     timing: Option<&CommandTimingBreakdown>,
     local_wrapper_id: Option<&str>,
     worker_fault: bool,
+    worker_disk_full: bool,
+    worker_disk_roots: &[String],
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
@@ -592,6 +733,13 @@ pub(crate) async fn release_worker_with_fault(
     if worker_fault {
         request.push_str("&worker_fault=1");
     }
+    if worker_disk_full {
+        request.push_str("&worker_disk_full=1");
+        request.push_str(&format!(
+            "&worker_disk_roots={}",
+            urlencoding_encode(&serde_json::to_string(worker_disk_roots)?)
+        ));
+    }
     request.push('\n');
 
     // Add timing breakdown as JSON body if present
@@ -602,13 +750,14 @@ pub(crate) async fn release_worker_with_fault(
         request.push('\n');
     }
 
-    write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout())
+    let io_timeout = release_io_timeout_from(daemon_io_timeout());
+    write_daemon_request(&mut writer, request.as_bytes(), io_timeout)
         .await
         .context("release was not acknowledged")?;
 
     // The daemon writes its HTTP status only after processing the release.
     // A complete, bounded acknowledgement is required before publishing success.
-    read_daemon_ack(reader, daemon_io_timeout())
+    read_daemon_ack(reader, io_timeout)
         .await
         .context("release was not acknowledged")
 }
@@ -745,6 +894,18 @@ fn daemon_io_timeout() -> Duration {
     daemon_io_timeout_from(std::env::var("RCH_DAEMON_TIMEOUT_MS").ok().as_deref())
 }
 
+/// Floor for the release request write and acknowledgement read. A missed
+/// release ack fails a build closed even when its command already succeeded,
+/// so the hook waits out a daemon stalled by host load (5s acks were missed at
+/// load ~110 on 2026-10-01) rather than reporting a finished build as failed.
+/// Waiting is safe: the daemon acks only after processing, and a repeated
+/// release of a terminal build is a no-op.
+const RELEASE_ACK_MIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn release_io_timeout_from(io_timeout: Duration) -> Duration {
+    io_timeout.max(RELEASE_ACK_MIN_TIMEOUT)
+}
+
 fn parse_timeout_secs(raw: &str) -> Option<u64> {
     raw.trim().parse::<u64>().ok().filter(|secs| *secs > 0)
 }
@@ -854,6 +1015,7 @@ mod bounded_ipc_tests {
                     path.to_str().unwrap(),
                     "project",
                     1,
+                    0,
                     "cargo build",
                     toolchain.as_ref(),
                     RequiredRuntime::Rust,
@@ -884,6 +1046,7 @@ mod bounded_ipc_tests {
                 path.to_str().unwrap(),
                 "project",
                 1,
+                0,
                 "cargo build",
                 toolchain.as_ref(),
                 RequiredRuntime::Rust,
@@ -950,6 +1113,7 @@ mod bounded_ipc_tests {
             path.to_str().unwrap(),
             "project",
             1,
+            0,
             "cargo build",
             Some(&info),
             RequiredRuntime::Rust,
@@ -1036,11 +1200,61 @@ mod bounded_ipc_tests {
         }
     }
 
+    #[test]
+    fn release_ack_budget_outlasts_ordinary_daemon_io() {
+        let default = daemon_io_timeout_from(None);
+        assert!(release_io_timeout_from(default) > default);
+        assert_eq!(
+            release_io_timeout_from(Duration::from_millis(100)),
+            RELEASE_ACK_MIN_TIMEOUT
+        );
+        assert_eq!(
+            release_io_timeout_from(Duration::from_secs(120)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[tokio::test]
+    async fn release_ack_slower_than_ordinary_daemon_io_still_succeeds() {
+        // A daemon stalled by host load acks after the 5s ordinary IO budget;
+        // the finished build must not be failed closed for it.
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("ipc.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut request = String::new();
+            BufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            tokio::time::sleep(daemon_io_timeout_from(None) + Duration::from_secs(1)).await;
+            writer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+        };
+        let worker = WorkerId::new("ipc-test");
+        let client = release_worker(
+            path.to_str().unwrap(),
+            &worker,
+            1,
+            Some(42),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (result, ()) = tokio::join!(client, server);
+        result.expect("a slow but complete ack is an acknowledgement");
+    }
+
     #[tokio::test]
     async fn release_carries_the_worker_fault_flag_only_when_set() {
         // Review of GH #81: the daemon withholds cache warmth for a failure
         // the hook blamed on the worker, so the flag must reach the wire.
-        for worker_fault in [true, false] {
+        for (worker_fault, worker_disk_full) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let root = tempfile::tempdir().unwrap().keep();
             let path = root.join("ipc.sock");
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -1067,6 +1281,8 @@ mod bounded_ipc_tests {
                 None,
                 None,
                 worker_fault,
+                worker_disk_full,
+                &[],
             );
             let (result, request) = timeout(Duration::from_secs(2), async {
                 tokio::join!(client, server)
@@ -1081,6 +1297,11 @@ mod bounded_ipc_tests {
             assert_eq!(
                 request.contains("&worker_fault=1"),
                 worker_fault,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_disk_full=1"),
+                worker_disk_full,
                 "{request}"
             );
         }

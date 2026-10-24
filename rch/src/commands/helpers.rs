@@ -745,7 +745,10 @@ pub async fn send_daemon_command(command: &str) -> Result<String> {
 }
 
 #[cfg(unix)]
-async fn send_daemon_command_to_socket(socket_path: &Path, command: &str) -> Result<String> {
+pub(crate) async fn send_daemon_command_to_socket(
+    socket_path: &Path,
+    command: &str,
+) -> Result<String> {
     let stream = tokio::time::timeout(
         DAEMON_COMMAND_CONNECT_TIMEOUT,
         UnixStream::connect(socket_path),

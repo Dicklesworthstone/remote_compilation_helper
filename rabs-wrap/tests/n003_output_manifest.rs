@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use rabs_protocol::output_manifest::{
     OutputEntry, OutputSection, OutputTreeManifest, TreeDeltaRow, diff_manifests, has_tombstones,
 };
+use sha2::{Digest, Sha256};
 
 const FIXTURE_NAME: &str = "n003_probe";
 /// Deletion victim: present in OUT_DIR, deliberately NOT referenced by
@@ -57,12 +58,12 @@ fn n003_output_manifest_captures_tree_and_names_deletions() {
     let raw_cache = walk_cache_files(&run_dir);
     assert_eq!(
         before.section(OutputSection::OutDir),
-        sorted_entries(&raw_out),
+        raw_out,
         "OUT_DIR section must be complete"
     );
     assert_eq!(
         before.section(OutputSection::OutputCache),
-        sorted_entries(&raw_cache),
+        raw_cache,
         "cache section must be complete"
     );
 
@@ -240,77 +241,82 @@ fn find_run_dir(project: &Path) -> Option<PathBuf> {
 
 // --- Tree walking ------------------------------------------------------------
 
-/// Recursively collect `(rel_path, len)` for every FILE under `root`,
-/// prefixed with `prefix`.
-fn walk_files(root: &Path, prefix: &str) -> Vec<(Vec<u8>, u64)> {
+/// Recursively capture every regular file under `root`, including the
+/// SHA-256 of its complete bytes, with paths prefixed by `prefix`.
+fn walk_files(root: &Path, prefix: &str) -> Vec<OutputEntry> {
     let mut out = Vec::new();
     visit_files(root, prefix.as_bytes(), &mut out);
-    out.sort();
+    out.sort_by(|left, right| left.path.cmp(&right.path));
     out
 }
 
-fn visit_files(dir: &Path, rel: &[u8], out: &mut Vec<(Vec<u8>, u64)>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn visit_files(dir: &Path, rel: &[u8], out: &mut Vec<OutputEntry>) {
+    assert!(
+        fs::symlink_metadata(dir)
+            .expect("inspect capture directory")
+            .file_type()
+            .is_dir(),
+        "capture directory must not be a symlink: {}",
+        dir.display()
+    );
+    for entry in fs::read_dir(dir).expect("read complete capture directory") {
+        let entry = entry.expect("read every directory entry");
         let p = entry.path();
         let name = entry.file_name();
         let mut child_rel = rel.to_vec();
         child_rel.push(b'/');
         child_rel.extend_from_slice(name.as_encoded_bytes());
-        if p.is_dir() {
+        if entry.file_type().expect("inspect directory entry").is_dir() {
             visit_files(&p, &child_rel, out);
-        } else if let Ok(meta) = p.metadata() {
-            out.push((child_rel, meta.len()));
+        } else {
+            out.push(capture_file(&p, child_rel));
         }
     }
+}
+
+fn capture_file(path: &Path, relative_path: Vec<u8>) -> OutputEntry {
+    assert!(
+        fs::symlink_metadata(path)
+            .expect("inspect captured file")
+            .file_type()
+            .is_file(),
+        "only regular files can be captured: {}",
+        path.display()
+    );
+    let bytes = fs::read(path).expect("read every captured file completely");
+    OutputEntry::new(
+        relative_path,
+        u64::try_from(bytes.len()).expect("captured byte length fits u64"),
+        Sha256::digest(&bytes).into(),
+    )
 }
 
 /// Cache-section capture: every FILE directly at the run root (flat
 /// vintage: `output`, `stderr`, …), plus nested-vintage `run/` files
 /// prefixed `run/`. The `out/` subtree belongs to the OUT_DIR section.
-fn walk_cache_files(run_dir: &Path) -> Vec<(Vec<u8>, u64)> {
+fn walk_cache_files(run_dir: &Path) -> Vec<OutputEntry> {
     let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(run_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let name = entry.file_name();
-            if p.is_file() {
-                out.push((
-                    name.as_encoded_bytes().to_vec(),
-                    p.metadata().map(|m| m.len()).unwrap_or(0),
-                ));
-            } else if name == "run" {
-                // Nested vintage: cargo cache files live under run/.
-                if let Ok(nested) = fs::read_dir(&p) {
-                    for n in nested.flatten() {
-                        let np = n.path();
-                        if np.is_file() {
-                            let mut rel = b"run/".to_vec();
-                            rel.extend_from_slice(n.file_name().as_encoded_bytes());
-                            out.push((rel, np.metadata().map(|m| m.len()).unwrap_or(0)));
-                        }
-                    }
-                }
+    for entry in fs::read_dir(run_dir).expect("read complete cache directory") {
+        let entry = entry.expect("read every cache directory entry");
+        let p = entry.path();
+        let name = entry.file_name();
+        if entry.file_type().expect("inspect cache entry").is_dir() {
+            if name == "run" {
+                visit_files(&p, b"run", &mut out);
             }
+        } else {
+            out.push(capture_file(&p, name.as_encoded_bytes().to_vec()));
         }
     }
-    out.sort();
+    out.sort_by(|left, right| left.path.cmp(&right.path));
     out
-}
-
-fn sorted_entries(raw: &[(Vec<u8>, u64)]) -> Vec<OutputEntry> {
-    raw.iter()
-        .map(|(p, l)| OutputEntry::new(p.clone(), *l))
-        .collect()
 }
 
 /// Capture one complete manifest from the run dir.
 fn capture_manifest(run_dir: &Path) -> OutputTreeManifest {
     OutputTreeManifest::new(
-        sorted_entries(&walk_files(&run_dir.join("out"), "out")),
-        sorted_entries(&walk_cache_files(run_dir)),
+        walk_files(&run_dir.join("out"), "out"),
+        walk_cache_files(run_dir),
     )
     .expect("walked trees are sorted and unique")
 }

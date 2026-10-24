@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::binary_hash::{BinaryHashResult, binaries_equivalent, compute_binary_hash};
+use crate::rsync_flavor::{configure_rsync_remote_args, resolve_rsync_cached};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
 use crate::types::WorkerConfig;
 
@@ -455,7 +456,14 @@ impl RemoteCompilationTest {
         }
 
         // Build rsync command
-        let mut cmd = Command::new("rsync");
+        let resolved = resolve_rsync_cached(None)?;
+        let mut cmd = Command::new(&resolved.path);
+        configure_rsync_remote_args(&mut cmd);
+        cmd.arg("--rsync-path").arg(
+            resolved
+                .flavor
+                .remote_path_command("rsync".to_owned(), &remote_path.to_string_lossy()),
+        );
         cmd.args([
             "-az",
             "--no-owner",
@@ -476,7 +484,11 @@ impl RemoteCompilationTest {
         let src = format!("{}/", self.project_path.display());
         let dest = format!(
             "{}@{}:{}",
-            self.worker.user, self.worker.host, escaped_remote_path
+            self.worker.user,
+            self.worker.host,
+            resolved
+                .flavor
+                .remote_path_arg(&remote_path.to_string_lossy())
         );
         cmd.args([&src, &dest]);
 
@@ -510,7 +522,9 @@ impl RemoteCompilationTest {
             "debug"
         };
 
-        let mut cmd = Command::new("rsync");
+        let resolved = resolve_rsync_cached(None)?;
+        let mut cmd = Command::new(&resolved.path);
+        configure_rsync_remote_args(&mut cmd);
         cmd.args([
             "-az",
             "--no-owner",
@@ -528,9 +542,16 @@ impl RemoteCompilationTest {
             "{}@{}:{}",
             self.worker.user,
             self.worker.host,
-            shell_escape_str(&remote_target_dir_with_slash)
+            resolved
+                .flavor
+                .remote_path_arg(&remote_target_dir_with_slash)
         );
         let local_target = format!("{}/", local_artifact_dir.display());
+        cmd.arg("--rsync-path").arg(
+            resolved
+                .flavor
+                .remote_path_command("rsync".to_owned(), &remote_target_dir_with_slash),
+        );
         cmd.args([&remote_target, &local_target]);
 
         debug!("Running rsync from worker: {:?}", cmd);

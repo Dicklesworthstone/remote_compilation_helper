@@ -26,10 +26,10 @@ use rabs_action::capability_probe::{
     classify_rustc_probe, decide, tiny_probe_key,
 };
 use rabs_protocol::failure_post_state::{
-    LiveOperationDecision, ParityResult, PreservationCapabilities, decide_live_operation,
-    verify_preserved_parity,
+    LiveOperationDecision, ParityResult, PreservationCapabilities, PreservedOutput,
+    decide_live_operation, verify_preserved_parity,
 };
-use rabs_protocol::output_manifest::{OutputEntry, OutputTreeManifest};
+use rabs_protocol::output_manifest::{OutputEntry, OutputSection, OutputTreeManifest};
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
 fn args(items: &[&str]) -> Vec<String> {
@@ -45,7 +45,14 @@ fn d(domain: &'static str, tag: u8) -> TypedDigest {
 }
 
 fn entry(path: &str, len: u64) -> OutputEntry {
-    OutputEntry::new(path.as_bytes().to_vec(), len)
+    OutputEntry::new(path.as_bytes().to_vec(), len, [7; 32])
+}
+
+fn preserved(section: OutputSection, path: &str, len: u64) -> PreservedOutput {
+    PreservedOutput {
+        section,
+        entry: entry(path, len),
+    }
 }
 
 /// The post-state a STOCK failed build script leaves behind: partial
@@ -106,7 +113,10 @@ fn t034_missing_observed_partials_break_parity_and_are_enumerated() {
 
     match verify_preserved_parity(&live, &observed) {
         ParityResult::Diverged { missing, extra } => {
-            assert_eq!(missing, vec![entry("out/sub/b.rmeta", 3)]);
+            assert_eq!(
+                missing,
+                vec![preserved(OutputSection::OutDir, "out/sub/b.rmeta", 3)]
+            );
             assert!(extra.is_empty());
         }
         other => panic!("expected enumerated divergence, got {other:?}"),
@@ -129,17 +139,21 @@ fn t034_ghosts_length_drift_and_cache_section_divergences_are_enumerated() {
     match verify_preserved_parity(&live, &observed) {
         ParityResult::Diverged { missing, extra } => {
             // Missing = what stock saw and the retry will not.
-            assert!(missing.contains(&entry("out/a.o", 12)));
-            assert!(missing.contains(&entry("output", 5)));
-            assert!(missing.contains(&entry("invoked.timestamp", 8)));
+            assert!(missing.contains(&preserved(OutputSection::OutDir, "out/a.o", 12)));
+            assert!(missing.contains(&preserved(OutputSection::OutputCache, "output", 5)));
+            assert!(missing.contains(&preserved(
+                OutputSection::OutputCache,
+                "invoked.timestamp",
+                8
+            )));
             // Extra = ghosts the retry sees that stock never produced.
-            assert!(extra.contains(&entry("out/ghost.tmp", 1)));
-            assert!(extra.contains(&entry("out/a.o", 13)));
-            assert!(extra.contains(&entry("output", 6)));
-            // Ordering discipline: path-then-length in BOTH directions.
-            let sorted = |v: &[OutputEntry]| {
+            assert!(extra.contains(&preserved(OutputSection::OutDir, "out/ghost.tmp", 1)));
+            assert!(extra.contains(&preserved(OutputSection::OutDir, "out/a.o", 13)));
+            assert!(extra.contains(&preserved(OutputSection::OutputCache, "output", 6)));
+            // Ordering discipline: section-then-path in BOTH directions.
+            let sorted = |v: &[PreservedOutput]| {
                 v.windows(2)
-                    .all(|w| (w[0].path.clone(), w[0].len) <= (w[1].path.clone(), w[1].len))
+                    .all(|w| (w[0].section, &w[0].entry.path) <= (w[1].section, &w[1].entry.path))
             };
             assert!(sorted(&missing));
             assert!(sorted(&extra));

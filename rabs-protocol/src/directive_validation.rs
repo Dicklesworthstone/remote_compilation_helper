@@ -430,7 +430,7 @@ mod tests {
         OutputTreeManifest::new(
             entries
                 .iter()
-                .map(|(p, l)| OutputEntry::new(*p, *l))
+                .map(|(p, l)| OutputEntry::new(*p, *l, [7; 32]))
                 .collect(),
             Vec::new(),
         )

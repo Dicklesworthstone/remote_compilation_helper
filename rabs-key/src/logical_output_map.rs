@@ -44,6 +44,14 @@ pub const fn role_tag(role: OutputRole) -> u32 {
 /// `None` for an empty map (the deterministic-failure form).
 #[must_use]
 pub fn compute_bundle_root(outputs: &[LogicalOutput]) -> Option<ObjectId> {
+    bundle_root_bytes(outputs).map(|bytes| ObjectId(compute(DOMAIN_ARTIFACT_BUNDLE_ROOT, &bytes)))
+}
+
+/// The canonical bytes the bundle root names (`compute_bundle_root` is
+/// their digest). A store that must hold the root as a located object
+/// persists exactly these bytes. `None` for an empty map.
+#[must_use]
+pub fn bundle_root_bytes(outputs: &[LogicalOutput]) -> Option<Vec<u8>> {
     if outputs.is_empty() {
         return None;
     }
@@ -62,10 +70,7 @@ pub fn compute_bundle_root(outputs: &[LogicalOutput]) -> Option<ObjectId> {
             .str(row.object.0.domain)
             .bytes(&row.object.0.bytes);
     }
-    Some(ObjectId(compute(
-        DOMAIN_ARTIFACT_BUNDLE_ROOT,
-        &enc.finish(),
-    )))
+    Some(enc.finish())
 }
 
 /// Why a manifest's bundle root was rejected.

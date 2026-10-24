@@ -131,7 +131,7 @@ impl BuildHeartbeatLoop {
                                 && status["status"] == "completed"
                             {
                                 let code = status["record"]["exit_code"].as_i64().and_then(|n| i32::try_from(n).ok()).unwrap_or(130);
-                                if lease.record_exit(code).and_then(|()| lease.acknowledge_terminal()).is_ok() {
+                                if lease.acknowledge_observed_completion(&evidence, code).is_ok() {
                                     std::process::exit(code);
                                 }
                             }

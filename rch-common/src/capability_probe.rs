@@ -294,12 +294,20 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
         ));
     }
     // Disk roots: path;total_kb;avail_kb;avail_inodes (df -Pk and df -Pi).
+    // A configured future build directory may not exist yet. Measure its
+    // closest existing ancestor, preserving the requested root in the fact,
+    // so disk recovery can require evidence for every configured location.
     for root in &spec.disk_roots {
         let q = shq(root);
         s.push_str(&format!(
-            "if [ -d {q} ]; then \
-               b=$(df -Pk {q} 2>/dev/null | awk 'NR==2{{print $2\";\"$4}}'); \
-               i=$(df -Pi {q} 2>/dev/null | awk 'NR==2{{print $4}}'); \
+            "rp={q}; \
+             while [ ! -e \"$rp\" ] && [ ! -L \"$rp\" ]; do \
+               parent=$(dirname -- \"$rp\") || break; \
+               [ \"$parent\" != \"$rp\" ] || break; rp=$parent; \
+             done; \
+             if [ -d \"$rp\" ]; then \
+               b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{print $2\";\"$4}}'); \
+               i=$(df -Pi \"$rp\" 2>/dev/null | awk 'NR==2{{print $4}}'); \
                printf '%sdisk=%s;%s;%s\\n' \"$P\" {q} \"$b\" \"$i\"; \
              fi; "
         ));
@@ -1037,6 +1045,47 @@ mod tests {
         assert!(script.contains("df -Pi"));
         // Quoted disk root.
         assert!(script.contains("'/data/tmp'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_disk_probe_measures_future_roots_without_creating_them() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("worker's build volume");
+        std::fs::create_dir(&parent).unwrap();
+        let future = parent.join("not-created/cargo-target");
+        let not_directory = root.path().join("file");
+        std::fs::write(&not_directory, b"not a build root").unwrap();
+        let mut spec = ProbeSpec::new("probe", "/not-installed/rch-wkr");
+        spec.disk_roots = vec![
+            parent.to_str().unwrap().to_owned(),
+            future.to_str().unwrap().to_owned(),
+            not_directory.to_str().unwrap().to_owned(),
+        ];
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(build_capability_probe_script(&spec))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let facts = parse_capability_probe(std::str::from_utf8(&output.stdout).unwrap());
+        assert_eq!(facts.disk_roots.len(), 2, "{:?}", facts.disk_roots);
+        assert_eq!(facts.disk_roots[0].path, spec.disk_roots[0]);
+        assert_eq!(facts.disk_roots[1].path, spec.disk_roots[1]);
+        assert!(facts.disk_roots[0].total_bytes > 0);
+        assert_eq!(
+            facts.disk_roots[0].total_bytes,
+            facts.disk_roots[1].total_bytes
+        );
+        assert!(
+            !future.exists(),
+            "a read-only disk probe must not create build directories"
+        );
+        assert_eq!(std::fs::read(&not_directory).unwrap(), b"not a build root");
     }
 
     fn good_output() -> &'static str {

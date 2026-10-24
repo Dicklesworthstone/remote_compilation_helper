@@ -1,15 +1,121 @@
-//! Explicit direct-compiler outputs, relative to the project sync root.
+//! Direct-compiler outputs, relative to the project sync root.
 //!
 //! Cargo's target-directory convention does not apply to direct compilers.
-//! Resolve primary outputs only when the command names every emission. Native
-//! GCC/Clang selections include depfiles and Clang -MJ fragments. Never
+//! Explicit Rustc selections require names for every emission. Native GCC/Clang
+//! contracts also cover ordinary POSIX a.out/object/assembly defaults, while
+//! named selections include depfiles and Clang -MJ fragments. Never
 //! infer crate names from source filenames or transfer an arbitrary --out-dir
 //! tree: crate attributes and target specifications can change implicit names.
-//! Unsupported commands retain the caller's existing selection policy. This is
-//! retrieval selection, not a cache-publication or output-completeness proof.
+//! Unsupported commands retain the caller's existing selection policy. Native
+//! contracts are persisted and checked before publication; Rustc's explicit
+//! selection alone is not an output-completeness or cache-publication proof.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
+
+/// Every file a supported native command promises to its caller. Persist this
+/// before execution: neither a stale destination nor one returned object can
+/// stand in for another required object or dependency sidecar.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NativeOutputContract {
+    pub(crate) required_files: BTreeSet<PathBuf>,
+}
+
+impl NativeOutputContract {
+    fn from_paths(paths: impl IntoIterator<Item = String>) -> Option<Self> {
+        let mut required_files = BTreeSet::new();
+        for path in paths {
+            literal_file_pattern(&path)?;
+            let normalized: PathBuf = Path::new(&path)
+                .components()
+                .filter(|part| *part != Component::CurDir)
+                .collect();
+            required_files.insert(normalized);
+        }
+        (!required_files.is_empty()).then_some(Self { required_files })
+    }
+
+    pub(crate) fn patterns(&self) -> anyhow::Result<Vec<String>> {
+        anyhow::ensure!(
+            !self.required_files.is_empty(),
+            "empty native output contract"
+        );
+        self.required_files
+            .iter()
+            .map(|path| {
+                let text = path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("non-UTF-8 native output"))?;
+                anyhow::ensure!(
+                    path.components()
+                        .all(|part| matches!(part, Component::Normal(_))),
+                    "native output must be a normalized relative path: {}",
+                    path.display()
+                );
+                literal_file_pattern(text)
+                    .ok_or_else(|| anyhow::anyhow!("invalid native output path: {text}"))
+            })
+            .collect()
+    }
+
+    /// Require regular files below real directories in the owned stage. Never
+    /// follow an output symlink or accept the pre-existing local destination.
+    pub(crate) fn verify_staged(&self, stage: &Path) -> anyhow::Result<()> {
+        use anyhow::Context;
+        self.patterns()?;
+        let root = std::fs::symlink_metadata(stage).context("native output stage is missing")?;
+        anyhow::ensure!(
+            root.is_dir() && !root.file_type().is_symlink(),
+            "invalid native output stage"
+        );
+        for relative in &self.required_files {
+            let mut path = stage.to_owned();
+            let mut components = relative.components().peekable();
+            while let Some(component) = components.next() {
+                path.push(component.as_os_str());
+                let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+                    format!("required native output is missing: {}", path.display())
+                })?;
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink()
+                        && if components.peek().is_some() {
+                            metadata.is_dir()
+                        } else {
+                            metadata.is_file()
+                        },
+                    "required native output is not a regular file below directories: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Implicit filenames are a property of the selected worker's compiler, not
+/// the dispatcher. Callers enable defaults only on a POSIX worker; explicit
+/// target/architecture options still decline implicit filename inference.
+pub(crate) fn native_output_contract(
+    kind: Option<rch_common::CompilationKind>,
+    command: &str,
+    posix_defaults: bool,
+) -> Option<NativeOutputContract> {
+    match kind? {
+        rch_common::CompilationKind::Gcc => {
+            c_family_outputs(command, &["gcc", "cc"], false, posix_defaults)
+        }
+        rch_common::CompilationKind::Gpp => {
+            c_family_outputs(command, &["g++", "c++"], false, posix_defaults)
+        }
+        rch_common::CompilationKind::Clang => {
+            c_family_outputs(command, &["clang"], true, posix_defaults)
+        }
+        rch_common::CompilationKind::Clangpp => {
+            c_family_outputs(command, &["clang++"], true, posix_defaults)
+        }
+        _ => None,
+    }
+}
 
 pub(super) fn patterns(
     kind: Option<rch_common::CompilationKind>,
@@ -479,6 +585,17 @@ fn c_plain_option(option: &str) -> bool {
 /// modes, raw subtool options, debug sidecars and response files retain the
 /// previous policy; they are not an exact selection.
 fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<Vec<String>> {
+    c_family_outputs(command, compilers, clang, false)?
+        .patterns()
+        .ok()
+}
+
+fn c_family_outputs(
+    command: &str,
+    compilers: &[&str],
+    clang: bool,
+    posix_defaults: bool,
+) -> Option<NativeOutputContract> {
     let args = compiler_arguments(command, compilers)?;
     if args.iter().any(|arg| arg.starts_with('@')) {
         return None;
@@ -488,14 +605,16 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
     let mut depfile: Option<String> = None;
     let mut database: Option<String> = None;
     let mut dependencies = false;
-    let mut inputs = 0;
-    let mut source = None;
+    let mut sources = Vec::new();
     let mut language_override = false;
+    let mut target_override = false;
+    let mut compile_only = false;
+    let mut assembly_only = false;
+    let mut llvm_emission = false;
     while let Some(arg) = iter.next() {
         if arg == "--" {
             for input in iter {
-                source = Some(input.as_str());
-                inputs += 1;
+                sources.push(input.as_str());
             }
             break;
         }
@@ -534,8 +653,15 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
             }
         } else if matches!(arg.as_str(), "-MD" | "-MMD") {
             dependencies = true;
+        } else if arg == "-c" {
+            compile_only = true;
+        } else if arg == "-S" {
+            assembly_only = true;
+        } else if arg == "-emit-llvm" {
+            llvm_emission = true;
         } else if c_value_option(arg) {
             language_override |= arg == "-x";
+            target_override |= matches!(arg.as_str(), "-target" | "--target" | "-arch");
             iter.next()?;
         } else if c_plain_option(arg)
             || ["-I", "-L", "-l", "-D", "-U", "-B", "-MT", "-MQ"]
@@ -547,12 +673,71 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
         {
             // A flag's operand is opaque even when it looks like -o or -MF.
             language_override |= arg.starts_with("-x=");
+            target_override |= arg.starts_with("-target=")
+                || arg.starts_with("--target=")
+                || arg.starts_with("-arch=")
+                || arg.starts_with("-march=")
+                || arg.starts_with("-mtune=")
+                || arg.starts_with("-mcpu=")
+                || arg.starts_with("-mabi=")
+                || matches!(arg.as_str(), "-m32" | "-m64");
         } else if arg.starts_with('-') || arg.starts_with('@') || arg.is_empty() {
             return None;
         } else {
-            source = Some(arg.as_str());
-            inputs += 1;
+            sources.push(arg.as_str());
         }
+    }
+    let inputs = sources.len();
+    if output.is_none() {
+        if !posix_defaults
+            || inputs == 0
+            || language_override
+            || target_override
+            || llvm_emission
+            || dependencies
+            || depfile.is_some()
+            || database.is_some()
+            || compile_only && assembly_only
+        {
+            return None;
+        }
+        let ordinary_source = |source: &str| {
+            Path::new(source)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    matches!(
+                        ext,
+                        "c" | "C" | "cc" | "cp" | "cpp" | "CPP" | "cxx" | "c++" | "m" | "M" | "mm"
+                    )
+                })
+        };
+        if compile_only || assembly_only {
+            let extension = if compile_only { "o" } else { "s" };
+            let mut outputs = BTreeSet::new();
+            for source in sources {
+                if !ordinary_source(source) {
+                    return None;
+                }
+                let name = Path::new(source).file_name()?.to_str()?;
+                let (stem, _) = name.rsplit_once('.')?;
+                let output = format!("{stem}.{extension}");
+                if !outputs.insert(output) {
+                    return None;
+                }
+            }
+            return NativeOutputContract::from_paths(outputs);
+        }
+        if !sources.iter().all(|source| {
+            ordinary_source(source)
+                || Path::new(source)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| matches!(ext, "o" | "a" | "so" | "dylib"))
+        }) {
+            return None;
+        }
+        return NativeOutputContract::from_paths(["a.out".to_owned()]);
     }
     let output = output?;
     // '-' is mode-specific in native drivers (stdout in some modes, a real
@@ -560,12 +745,12 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
     if inputs == 0 || output == "-" || !dependencies && depfile.is_some() {
         return None;
     }
-    let mut patterns = BTreeSet::from([literal_file_pattern(&output)?]);
+    let mut paths = BTreeSet::from([output.clone()]);
     if dependencies && depfile.is_none() {
         if inputs != 1 || language_override {
             return None;
         }
-        let extension = Path::new(source?).extension()?.to_str()?;
+        let extension = Path::new(sources[0]).extension()?.to_str()?;
         if !matches!(
             extension,
             "c" | "C" | "cc" | "cp" | "cpp" | "CPP" | "cxx" | "c++" | "m" | "M" | "mm"
@@ -586,20 +771,132 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
     if let Some(depfile) = depfile
         && depfile != "-"
     {
-        patterns.insert(literal_file_pattern(&depfile)?);
+        paths.insert(depfile);
     }
     if let Some(database) = database
         && database != "-"
     {
         // Clang -MJ - emits a database fragment on stdout, not a file '-'.
-        patterns.insert(literal_file_pattern(&database)?);
+        paths.insert(database);
     }
-    Some(patterns.into_iter().collect())
+    NativeOutputContract::from_paths(paths)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_implicit_outputs_are_enumerated_per_source_and_selected_worker() {
+        use rch_common::CompilationKind;
+        for (kind, driver) in [
+            (CompilationKind::Gcc, "gcc"),
+            (CompilationKind::Gpp, "g++"),
+            (CompilationKind::Clang, "clang"),
+            (CompilationKind::Clangpp, "clang++"),
+        ] {
+            for (args, expected) in [
+                ("main.c support.o", vec!["a.out"]),
+                ("-O2 -c main.c src/helper.cpp", vec!["helper.o", "main.o"]),
+                ("-S main.c src/helper.cpp", vec!["helper.s", "main.s"]),
+                ("-c 'src/odd[1]*?.c'", vec!["odd[[]1[]][*][?].o"]),
+            ] {
+                let command = format!("{driver} {args}");
+                let contract = native_output_contract(Some(kind), &command, true).unwrap();
+                assert_eq!(contract.patterns().unwrap(), expected, "{command}");
+                assert!(
+                    native_output_contract(Some(kind), &command, false).is_none(),
+                    "implicit filenames must not be inferred for another worker platform"
+                );
+            }
+            for args in [
+                "-c src/same.c other/same.c",
+                "-S -c main.c",
+                "-E main.c",
+                "-fsyntax-only main.c",
+                "-x c main.c",
+                "--target=x86_64-pc-windows-gnu main.c",
+                "-target x86_64-apple-darwin main.c",
+                "-arch arm64 main.c",
+                "-m32 main.c",
+                "-march=native main.c",
+                "-mtune=generic main.c",
+                "-mcpu=power9 main.c",
+                "-mabi=ms main.c",
+                "-emit-llvm -c main.c",
+                "-MMD main.c",
+                "-MD -MF named.d main.c",
+                "-MJ fragment.json main.c",
+                "-c objects.o",
+                "header.h",
+                "@arguments",
+                "*.c",
+                "-save-temps main.c",
+                "-gsplit-dwarf main.c",
+                "-Wl,-o,other main.c",
+            ] {
+                let command = format!("{driver} {args}");
+                assert!(
+                    native_output_contract(Some(kind), &command, true).is_none(),
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_explicit_contract_keeps_raw_paths_and_all_sidecars() {
+        use rch_common::CompilationKind;
+        let contract = native_output_contract(Some(CompilationKind::Clang),
+            "clang -c main.c -o './products/item[1]*?.o' -MMD -MF reports/input.d -MJ reports/compile.json", false).unwrap();
+        assert_eq!(
+            contract.required_files,
+            BTreeSet::from([
+                PathBuf::from("products/item[1]*?.o"),
+                PathBuf::from("reports/input.d"),
+                PathBuf::from("reports/compile.json"),
+            ])
+        );
+        assert_eq!(
+            contract.patterns().unwrap(),
+            vec![
+                "products/item[[]1[]][*][?].o",
+                "reports/compile.json",
+                "reports/input.d"
+            ]
+        );
+        let restored: NativeOutputContract =
+            serde_json::from_slice(&serde_json::to_vec(&contract).unwrap()).unwrap();
+        assert_eq!(restored, contract);
+        for path in ["../outside", "/absolute", "", "bad\npath"] {
+            let invalid = NativeOutputContract {
+                required_files: BTreeSet::from([PathBuf::from(path)]),
+            };
+            assert!(invalid.patterns().is_err(), "{path:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_required_output_symlinks_and_directories_cannot_satisfy_delivery() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let contract = NativeOutputContract::from_paths(["products/output.o".into()]).unwrap();
+        let stage = root.path().join("stage");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("output.o"), b"not owned by stage").unwrap();
+        symlink(&outside, stage.join("products")).unwrap();
+        assert!(contract.verify_staged(&stage).is_err());
+        let stage = root.path().join("regular");
+        std::fs::create_dir_all(stage.join("products/output.o")).unwrap();
+        assert!(contract.verify_staged(&stage).is_err());
+        let stage = root.path().join("file-link");
+        std::fs::create_dir_all(stage.join("products")).unwrap();
+        symlink(outside.join("output.o"), stage.join("products/output.o")).unwrap();
+        assert!(contract.verify_staged(&stage).is_err());
+    }
 
     fn selected(command: &str) -> Vec<String> {
         rustc_patterns(command).unwrap_or_else(|| panic!("missing explicit plan: {command}"))

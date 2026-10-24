@@ -1125,6 +1125,9 @@ fn benchmark_ssh_command(
     cmd.arg("-o")
         .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
     cmd.arg("-i").arg(&identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&identity_file) {
+        cmd.args(opts);
+    }
     cmd.arg(format!("{}@{}", worker.user, worker.host));
     // Windows workers keep the plain call, matching the build path, which also
     // skips `timeout` there: depending on which `sh` the session resolves,

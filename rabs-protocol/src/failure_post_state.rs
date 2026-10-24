@@ -9,7 +9,8 @@
 //!
 //! - **PRESERVE**: when RABS drives the live operation, the exact
 //!   observed failure post-state must be what the retry sees — byte-
-//!   for-byte the same PATH SET (and lengths) stock would have left.
+//!   for-byte the same section, path, length and content identity stock
+//!   would have left.
 //!   [`verify_preserved_parity`] is the checker.
 //! - **OR EXECUTE LOCALLY**: when exact preservation cannot be
 //!   guaranteed by available capabilities, refuse to drive the live
@@ -21,10 +22,13 @@
 //!
 //! Zero deps; pure comparison like everything in this crate.
 
-use crate::output_manifest::{OutputEntry, OutputSection, OutputTreeManifest};
+use crate::output_manifest::{
+    ManifestValidationError, OutputEntry, OutputSection, OutputTreeManifest, TreeDeltaRow,
+    diff_manifests,
+};
 
 /// Whether the executor can stage an EXACT tree (create listed files
-/// with listed lengths, apply deletions) into the operation destination
+/// with their captured bytes, apply deletions) into the operation destination
 /// atomically. Capability, not ambition: false forces local fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreservationCapabilities {
@@ -61,18 +65,28 @@ pub const fn decide_live_operation(
 /// post-state (what stock left behind).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParityResult {
-    /// Path sets and lengths match exactly: the live retry will observe
-    /// precisely what stock observed.
+    /// Sections, paths, lengths and content digests match exactly.
     Identical,
+    /// Invalid manifests cannot establish preservation parity.
+    InvalidManifest(ManifestValidationError),
     /// Divergence, fully enumerated (both directions, sorted).
     Diverged {
         /// In OBSERVED but missing from LIVE (stock saw them; retry
         /// will not).
-        missing: Vec<OutputEntry>,
+        missing: Vec<PreservedOutput>,
         /// In LIVE but absent from OBSERVED (retry sees ghosts stock
         /// never produced).
-        extra: Vec<OutputEntry>,
+        extra: Vec<PreservedOutput>,
     },
+}
+
+/// One missing or unexpected captured output, retaining its section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedOutput {
+    /// The independently owned filesystem surface.
+    pub section: OutputSection,
+    /// Captured path, file length and content digest.
+    pub entry: OutputEntry,
 }
 
 impl ParityResult {
@@ -85,60 +99,51 @@ impl ParityResult {
 
 /// Compare the LIVE post-state against the OBSERVED failure post-state
 /// across BOTH sections (a divergence on either surface breaks retry
-/// parity). Both directions enumerated; ordering is path-then-length.
-fn entries(manifest: &OutputTreeManifest) -> Vec<OutputEntry> {
-    let mut e: Vec<OutputEntry> = manifest
-        .section(OutputSection::OutDir)
-        .iter()
-        .chain(manifest.section(OutputSection::OutputCache))
-        .cloned()
-        .collect();
-    e.sort_by(|a, b| a.path.cmp(&b.path).then(a.len.cmp(&b.len)));
-    e
-}
-
+/// parity). Both directions enumerated; ordering is section-then-path.
 #[must_use]
 pub fn verify_preserved_parity(
     live: &OutputTreeManifest,
     observed_failure: &OutputTreeManifest,
 ) -> ParityResult {
-    let live_e = entries(live);
-    let obs_e = entries(observed_failure);
-
+    let rows = match diff_manifests(observed_failure, live) {
+        Ok(rows) => rows,
+        Err(error) => return ParityResult::InvalidManifest(error),
+    };
     let mut missing = Vec::new();
     let mut extra = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < obs_e.len() || j < live_e.len() {
-        match (obs_e.get(i), live_e.get(j)) {
-            (Some(o), Some(l)) => match o.path.cmp(&l.path) {
-                std::cmp::Ordering::Less => {
-                    missing.push(o.clone());
-                    i += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    extra.push(l.clone());
-                    j += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    if o.len != l.len {
-                        // Same path, different bytes-length: the stock
-                        // version is MISSING and the live one EXTRA.
-                        missing.push(o.clone());
-                        extra.push(l.clone());
-                    }
-                    i += 1;
-                    j += 1;
-                }
-            },
-            (Some(o), None) => {
-                missing.push(o.clone());
-                i += 1;
+    for row in rows {
+        match row {
+            TreeDeltaRow::Added { entry, section } => {
+                extra.push(PreservedOutput { section, entry });
             }
-            (None, Some(l)) => {
-                extra.push(l.clone());
-                j += 1;
+            TreeDeltaRow::Removed {
+                last_entry,
+                section,
+            } => {
+                missing.push(PreservedOutput {
+                    section,
+                    entry: last_entry,
+                });
             }
-            (None, None) => break,
+            TreeDeltaRow::Modified {
+                new_entry,
+                previous_len,
+                previous_content_sha256,
+                section,
+            } => {
+                missing.push(PreservedOutput {
+                    section,
+                    entry: OutputEntry::new(
+                        new_entry.path.clone(),
+                        previous_len,
+                        previous_content_sha256,
+                    ),
+                });
+                extra.push(PreservedOutput {
+                    section,
+                    entry: new_entry,
+                });
+            }
         }
     }
 
@@ -155,10 +160,12 @@ mod tests {
 
     fn m(out: &[(&str, u64)], cache: &[(&str, u64)]) -> OutputTreeManifest {
         OutputTreeManifest::new(
-            out.iter().map(|(p, l)| OutputEntry::new(*p, *l)).collect(),
+            out.iter()
+                .map(|(p, l)| OutputEntry::new(*p, *l, [7; 32]))
+                .collect(),
             cache
                 .iter()
-                .map(|(p, l)| OutputEntry::new(*p, *l))
+                .map(|(p, l)| OutputEntry::new(*p, *l, [7; 32]))
                 .collect(),
         )
         .expect("valid")
@@ -193,9 +200,11 @@ mod tests {
         match verify_preserved_parity(&live, &observed) {
             ParityResult::Diverged { missing, extra } => {
                 assert_eq!(missing.len(), 1);
-                assert_eq!(missing[0].path, b"out/partial_one.rs");
+                assert_eq!(missing[0].section, OutputSection::OutDir);
+                assert_eq!(missing[0].entry.path, b"out/partial_one.rs");
                 assert_eq!(extra.len(), 1);
-                assert_eq!(extra[0].path, b"out/ghost.dat");
+                assert_eq!(extra[0].section, OutputSection::OutDir);
+                assert_eq!(extra[0].entry.path, b"out/ghost.dat");
             }
             other => panic!("expected divergence, got {other:?}"),
         }
@@ -210,9 +219,9 @@ mod tests {
         match verify_preserved_parity(&live, &observed) {
             ParityResult::Diverged { missing, extra } => {
                 assert_eq!(missing.len(), 1);
-                assert_eq!(missing[0].len, 10);
+                assert_eq!(missing[0].entry.len, 10);
                 assert_eq!(extra.len(), 1);
-                assert_eq!(extra[0].len, 99);
+                assert_eq!(extra[0].entry.len, 99);
             }
             other => panic!("expected divergence, got {other:?}"),
         }
@@ -235,5 +244,55 @@ mod tests {
         let observed = m(&[("out/gen.rs", 26)], &[("output", 100)]);
         let live = m(&[("out/gen.rs", 26)], &[("output", 200)]);
         assert!(!verify_preserved_parity(&live, &observed).is_parity());
+    }
+
+    #[test]
+    fn n013_same_length_content_drift_names_both_versions() {
+        let observed = m(&[("generated", 18)], &[("generated", 18)]);
+        let mut live = observed.clone();
+        live.cache_entries[0].content_sha256 = [8; 32];
+        assert_eq!(
+            verify_preserved_parity(&live, &observed),
+            ParityResult::Diverged {
+                missing: vec![PreservedOutput {
+                    section: OutputSection::OutputCache,
+                    entry: observed.cache_entries[0].clone(),
+                }],
+                extra: vec![PreservedOutput {
+                    section: OutputSection::OutputCache,
+                    entry: live.cache_entries[0].clone(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn n013_moving_identical_bytes_between_sections_breaks_parity() {
+        let observed = m(&[("same", 18)], &[]);
+        let live = m(&[], &[("same", 18)]);
+        assert_eq!(
+            verify_preserved_parity(&live, &observed),
+            ParityResult::Diverged {
+                missing: vec![PreservedOutput {
+                    section: OutputSection::OutDir,
+                    entry: observed.out_dir_entries[0].clone(),
+                }],
+                extra: vec![PreservedOutput {
+                    section: OutputSection::OutputCache,
+                    entry: live.cache_entries[0].clone(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn n013_old_schema_cannot_establish_parity() {
+        let observed = m(&[("same", 18)], &[]);
+        let mut live = observed.clone();
+        live.schema_version = 1;
+        assert_eq!(
+            verify_preserved_parity(&live, &observed),
+            ParityResult::InvalidManifest(ManifestValidationError::UnsupportedSchemaVersion(1))
+        );
     }
 }

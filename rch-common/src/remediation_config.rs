@@ -161,12 +161,17 @@ pub const DEFAULT_SMOKE_ITERATIONS: usize = 20;
 pub const DEFAULT_SMOKE_SEED: u64 = 42;
 
 /// Absolute path prefixes RCH treats as managed/standard (no operator warning).
-const RCH_MANAGED_ROOT_PREFIXES: &[&str] = &["/tmp/rch", "/tmp", "/data/projects", "/dp"];
+const RCH_MANAGED_ROOT_PREFIXES: &[&str] =
+    &["/tmp/rch", "/tmp", "/data/tmp/rch", "/data/projects", "/dp"];
 
 /// Default disk roots whose capacity/inodes the recovery probe reports.
 #[must_use]
 fn default_disk_roots() -> Vec<String> {
-    vec!["/tmp".to_string(), "/tmp/rch".to_string()]
+    vec![
+        "/tmp".to_string(),
+        "/tmp/rch".to_string(),
+        crate::types::default_remote_base(),
+    ]
 }
 
 // ── Top-level policy ─────────────────────────────────────────────────────────

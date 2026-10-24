@@ -14,6 +14,7 @@ use crate::binary_hash::{
 };
 use crate::gc_roots::{remote_cargo_home_base_prelude, remote_cargo_home_expr};
 use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
+use crate::rsync_flavor::{RsyncFlavor, configure_rsync_remote_args, resolve_rsync_cached};
 use crate::ssh::{SshClient, SshOptions};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
 use crate::types::WorkerConfig;
@@ -419,14 +420,14 @@ impl RemoteCompilationTest {
     }
 
     /// Get the remote artifact source for rsync retrieval.
-    fn remote_artifact_source(&self, profile: &str) -> String {
+    fn remote_artifact_source(&self, profile: &str, flavor: RsyncFlavor) -> String {
         let remote_path = self.remote_project_path();
         let remote_target = format!("{}/target/{profile}/", remote_path.trim_end_matches('/'));
         format!(
             "{}@{}:{}",
             self.worker.user,
             self.worker.host,
-            escape(Cow::from(remote_target))
+            flavor.remote_path_arg(&remote_target)
         )
     }
 
@@ -499,7 +500,9 @@ impl RemoteCompilationTest {
             let rsync = MockRsync::new(MockRsyncConfig::from_env());
             let destination = format!(
                 "{}@{}:{}",
-                self.worker.user, self.worker.host, escaped_remote_path
+                self.worker.user,
+                self.worker.host,
+                RsyncFlavor::Unknown.remote_path_arg(&remote_path)
             );
             rsync
                 .sync_to_remote(&self.test_project.display().to_string(), &destination, &[])
@@ -527,16 +530,25 @@ impl RemoteCompilationTest {
             bail!("Failed to create remote directory: {}", mkdir_result.stderr);
         }
 
+        let resolved = resolve_rsync_cached(None)?;
         let destination = format!(
             "{}@{}:{}",
-            self.worker.user, self.worker.host, escaped_remote_path
+            self.worker.user,
+            self.worker.host,
+            resolved.flavor.remote_path_arg(&remote_path)
         );
 
         let identity_file = shellexpand::tilde(&self.worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
-        let mut cmd = Command::new("rsync");
+        let mut cmd = Command::new(&resolved.path);
+        configure_rsync_remote_args(cmd.as_std_mut());
         cmd.arg("-az")
+            .arg("--rsync-path")
+            .arg(
+                resolved
+                    .flavor
+                    .remote_path_command("rsync".to_owned(), &remote_path),
+            )
             .arg("--no-owner")
             .arg("--no-group")
             .arg("--delete")
@@ -546,8 +558,8 @@ impl RemoteCompilationTest {
             .arg(".git/")
             .arg("-e")
             .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                escaped_identity
+                "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+                crate::ssh_utils::identity_shell_args(identity_file.as_ref())
             ))
             .arg(format!("{}/", self.test_project.display()))
             .arg(&destination)
@@ -672,26 +684,37 @@ impl RemoteCompilationTest {
 
         if use_mock_transport(&self.worker) {
             let rsync = MockRsync::new(MockRsyncConfig::from_env());
-            let remote_target = self.remote_artifact_source(profile);
+            let remote_target = self.remote_artifact_source(profile, RsyncFlavor::Unknown);
             rsync
                 .retrieve_artifacts(&remote_target, &local_dest.display().to_string(), &[])
                 .await?;
             return Ok(());
         }
 
-        let remote_target = self.remote_artifact_source(profile);
+        let resolved = resolve_rsync_cached(None)?;
+        let remote_target = self.remote_artifact_source(profile, resolved.flavor);
+        let raw_target = format!(
+            "{}/target/{profile}/",
+            self.remote_project_path().trim_end_matches('/')
+        );
 
         let identity_file = shellexpand::tilde(&self.worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
-        let mut cmd = Command::new("rsync");
+        let mut cmd = Command::new(&resolved.path);
+        configure_rsync_remote_args(cmd.as_std_mut());
         cmd.arg("-az")
+            .arg("--rsync-path")
+            .arg(
+                resolved
+                    .flavor
+                    .remote_path_command("rsync".to_owned(), &raw_target),
+            )
             .arg("--no-owner")
             .arg("--no-group")
             .arg("-e")
             .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                escaped_identity
+                "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+                crate::ssh_utils::identity_shell_args(identity_file.as_ref())
             ))
             .arg(&remote_target)
             .arg(format!("{}/", local_dest.display()))
@@ -1350,10 +1373,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_compilation_test_artifact_source_quotes_remote_base() {
+    fn remote_compilation_test_artifact_source_uses_rsync_argument_mode() {
         let _guard = test_guard!();
-        let logger =
-            TestLogger::for_test("remote_compilation_test_artifact_source_quotes_remote_base");
+        let logger = TestLogger::for_test("remote_compilation_test_artifact_source_argument_mode");
 
         let worker = WorkerConfig {
             id: WorkerId::new("w1"),
@@ -1366,19 +1388,24 @@ mod tests {
 
         let mut test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"))
             .with_remote_path_suffix("run-1");
-        test.remote_base = "/tmp/rch self test".to_string();
-
-        let source = test.remote_artifact_source("release");
-        logger.log_with_data(
-            TestPhase::Verify,
-            "Computed quoted artifact source",
-            serde_json::json!({ "source": &source }),
-        );
-
-        assert_eq!(
-            source,
-            "user@host:'/tmp/rch self test/project-run-1/target/release/'"
-        );
+        for base in ["/tmp/plain", "/tmp/p q", "/tmp/x:y"] {
+            test.remote_base = base.to_string();
+            let target = format!("{base}/project-run-1/target/release/");
+            assert_eq!(
+                test.remote_artifact_source("release", RsyncFlavor::Unknown),
+                format!("user@host:{target}")
+            );
+            let legacy = RsyncFlavor::OpenRsync { protocol: Some(29) };
+            let expected = if base == "/tmp/plain" {
+                target
+            } else {
+                format!("'{target}'")
+            };
+            assert_eq!(
+                test.remote_artifact_source("release", legacy),
+                format!("user@host:{expected}")
+            );
+        }
 
         logger.pass();
     }

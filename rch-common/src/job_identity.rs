@@ -210,6 +210,10 @@ pub struct DurableJobLease {
     /// Linux boot identifier, when available, to disambiguate PID reuse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
+    /// Native process birth identity. Older Linux journals use the two fields
+    /// above; old macOS journals without this evidence remain unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_birth: Option<crate::process_identity::ProcessIdentity>,
     /// Current operator-facing lifecycle state.
     pub state: JobLifecycleState,
     /// Current remote pipeline phase or `admission` before a worker is selected.
@@ -257,6 +261,7 @@ impl DurableJobLease {
             wrapper_pid,
             process_start_ticks,
             boot_id,
+            process_birth: None,
             state: JobLifecycleState::Queued,
             phase: "admission".to_string(),
             worker_id: None,
@@ -268,6 +273,22 @@ impl DurableJobLease {
             recovery: None,
             exit_code: None,
         }
+    }
+
+    /// Prefer explicit native evidence. An invalid new field must never fall
+    /// back to otherwise plausible legacy fields from a different owner.
+    pub fn owner_identity(&self) -> Option<crate::process_identity::ProcessIdentity> {
+        use crate::process_identity::{ProcessIdentity, ProcessStart};
+        let identity = match &self.process_birth {
+            Some(identity) => identity.clone(),
+            None => ProcessIdentity {
+                boot_id: self.boot_id.clone()?,
+                start: ProcessStart::Linux {
+                    ticks: self.process_start_ticks?,
+                },
+            },
+        };
+        identity.is_valid().then_some(identity)
     }
 
     /// Record an admission from the daemon.
@@ -518,5 +539,40 @@ mod tests {
         let json = serde_json::to_string(&lease).expect("serialize");
         assert!(json.contains("command_fingerprint"));
         assert!(!json.contains("command\":"));
+    }
+
+    #[test]
+    fn legacy_linux_and_native_darwin_leases_keep_precise_owner_identity() {
+        use crate::process_identity::{ProcessIdentity, ProcessStart};
+        let boot = "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f";
+        let mut lease = DurableJobLease::new(
+            JobIdentity::new_local(),
+            42,
+            Some(99),
+            Some(boot.into()),
+            1,
+            false,
+            true,
+            "blake3:abc".into(),
+        );
+        let bytes = serde_json::to_vec(&lease).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("process_birth"));
+        let legacy: DurableJobLease = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            legacy.owner_identity().unwrap().start,
+            ProcessStart::Linux { ticks: 99 }
+        );
+
+        lease.process_birth =
+            ProcessIdentity::from_record(&format!("{boot}:darwin:1791280000:123456"));
+        let restored: DurableJobLease =
+            serde_json::from_slice(&serde_json::to_vec(&lease).unwrap()).unwrap();
+        assert_eq!(restored.owner_identity(), lease.process_birth);
+        assert_ne!(restored.owner_identity(), legacy.owner_identity());
+        lease.process_birth.as_mut().unwrap().boot_id = "not-a-boot".into();
+        assert!(
+            lease.owner_identity().is_none(),
+            "invalid explicit evidence must not fall back to valid legacy fields"
+        );
     }
 }

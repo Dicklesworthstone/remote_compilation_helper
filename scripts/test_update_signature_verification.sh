@@ -12,7 +12,9 @@ Usage:
   scripts/test_update_signature_verification.sh [--help]
 
 What it checks (each assertion -> one PASS/FAIL line):
-  run/cargo_test                          All update::verify::tests pass.
+  published_key/matches_updater           Published minisign key matches the updater's trust root.
+  run/cargo_test                          All update::verify tests, including minisign, pass.
+  run/install_authorization              Unsigned updates cannot reach installation by default.
   coverage/valid                          >=1 test covers valid-signature acceptance.
   coverage/invalid                        >=1 test covers invalid-signature rejection.
   coverage/missing                        >=1 test covers missing-signature handling.
@@ -64,15 +66,65 @@ print(json.dumps({
 
 emit setup begin INFO "log=$LOG_FILE test_log=$TEST_LOG root=$PROJECT_ROOT"
 
-# 1. Run the targeted unit tests for signature verification
-emit run begin INFO "filter=update::verify::tests"
+# The repository key is what external installers use; accepting it as a valid
+# minisign key is insufficient if it differs from the updater's pinned signer.
+# Check the exact payload and little-endian key id, not just its comment (#89).
+if python3 - "$PROJECT_ROOT" <<'PY'
+import base64
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+document = (root / ".github/rch-minisign.pub").read_text(encoding="utf-8").splitlines()
+require(len(document) == 2, "published key must contain one comment and one key")
+keys = re.findall(
+    r'const\s+RELEASE_MINISIGN_PUBLIC_KEY\s*:\s*&str\s*=\s*"([A-Za-z0-9+/=]+)"\s*;',
+    (root / "rch/src/update/verify.rs").read_text(encoding="utf-8"),
+)
+require(len(keys) == 1, "updater must pin one unambiguous release key")
+published = base64.b64decode(document[1], validate=True)
+pinned = base64.b64decode(keys[0], validate=True)
+require(len(published) == 42 and published[:2] == b"Ed", "invalid minisign public key")
+require(published == pinned, "published minisign key differs from updater trust root")
+key_id = int.from_bytes(published[2:10], "little")
+require(document[0] == f"untrusted comment: minisign public key {key_id:016X}", "published key id mismatch")
+print(f"Published release key matches updater: {key_id:016X}")
+PY
+then
+    PASS=$((PASS + 1))
+    emit published_key matches_updater PASS
+else
+    FAIL=$((FAIL + 1))
+    emit published_key matches_updater FAIL
+fi
+
+# 1. Run both signature implementations. The old ::tests filter silently
+# excluded ::minisign_tests, which covers the actual release archive verifier.
+emit run begin INFO "filter=update::verify::"
 cd "$PROJECT_ROOT"
-if cargo test -p rch --bin rch update::verify::tests -- --nocapture >>"$TEST_LOG" 2>&1; then
+if cargo test -p rch --bin rch update::verify:: -- --nocapture >>"$TEST_LOG" 2>&1; then
     PASS=$((PASS + 1))
     emit run cargo_test PASS
 else
     FAIL=$((FAIL + 1))
     emit run cargo_test FAIL
+fi
+
+# Missing signature metadata must not bypass a verifier by preventing it from
+# running. Exercise the installation decision as well as cryptographic checks.
+emit run begin INFO "filter=update::tests::update_verification_"
+if cargo test -p rch --bin rch update::tests::update_verification_ -- --nocapture >>"$TEST_LOG" 2>&1; then
+    PASS=$((PASS + 1))
+    emit run install_authorization PASS
+else
+    FAIL=$((FAIL + 1))
+    emit run install_authorization FAIL
 fi
 
 # 2. Verify each of the 4 sub-criteria has at least one named test

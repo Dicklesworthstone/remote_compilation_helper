@@ -376,6 +376,9 @@ pub(super) async fn get_remote_version(worker: &WorkerConfig) -> Result<String> 
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-i").arg(&worker.identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+        cmd.args(opts);
+    }
 
     let target = format!("{}@{}", worker.user, worker.host);
     cmd.arg(&target);
@@ -431,6 +434,9 @@ pub(super) async fn deploy_via_scp(
         mkdir_cmd.arg("-o").arg("BatchMode=yes");
         mkdir_cmd.arg("-o").arg("ConnectTimeout=10");
         mkdir_cmd.arg("-i").arg(&worker.identity_file);
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+            mkdir_cmd.args(opts);
+        }
 
         mkdir_cmd.arg(&target);
         mkdir_cmd.arg(remote_mkdir_command(dir)?);
@@ -446,6 +452,9 @@ pub(super) async fn deploy_via_scp(
         scp_cmd.arg("-o").arg("BatchMode=yes");
         scp_cmd.arg("-o").arg("ConnectTimeout=30");
         scp_cmd.arg("-i").arg(&worker.identity_file);
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+            scp_cmd.args(opts);
+        }
         scp_cmd.arg(local_binary);
 
         let remote_target = scp_remote_target(worker, remote_path);
@@ -459,6 +468,9 @@ pub(super) async fn deploy_via_scp(
             chmod_cmd.arg("-o").arg("BatchMode=yes");
             chmod_cmd.arg("-o").arg("ConnectTimeout=10");
             chmod_cmd.arg("-i").arg(&worker.identity_file);
+            if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+                chmod_cmd.args(opts);
+            }
             chmod_cmd.arg(&target);
             chmod_cmd.arg(remote_chmod_command(remote_path)?);
 

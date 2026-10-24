@@ -144,6 +144,11 @@ pub struct SelectionRequest {
     pub command_priority: CommandPriority,
     /// Estimated CPU cores needed for this compilation.
     pub estimated_cores: u32,
+    /// Additional free GiB required on the worker's reported build filesystem.
+    /// A positive value is a hard admission budget, retained by the daemon for
+    /// this build's lifetime; zero leaves disk admission to the ordinary policy.
+    #[serde(default, skip_serializing_if = "disk_headroom_disabled")]
+    pub disk_headroom_gib: u32,
     /// Preferred worker IDs (e.g., from project config).
     #[serde(default)]
     pub preferred_workers: Vec<WorkerId>,
@@ -178,6 +183,10 @@ pub struct SelectionRequest {
     /// Process ID of the hook (for active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
+}
+
+fn disk_headroom_disabled(gib: &u32) -> bool {
+    *gib == 0
 }
 
 /// Reason for worker selection result.
@@ -697,6 +706,15 @@ pub struct ReleaseRequest {
     /// daemon records no cache warmth for it (review of GH #81).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_fault: bool,
+    /// The failed remote command reported exhausted disk space or quota.
+    /// After matching the durable build owner, the daemon temporarily bypasses
+    /// this worker until fresh recovery probes establish disk headroom.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_disk_full: bool,
+    /// Actual remote source and output roots used by the failed attempt.
+    /// Recovery must measure these filesystems as well as configured roots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_disk_roots: Vec<String>,
 }
 
 /// Build execution phase for daemon heartbeat tracking.
@@ -2521,6 +2539,13 @@ pub struct CompilationConfig {
     /// These are typically faster and use fewer resources.
     #[serde(default = "default_check_slots")]
     pub check_slots: u32,
+    /// Per-build additional free-space budget on the worker's reported build
+    /// filesystem, in GiB. Include expected output growth and a safety margin.
+    /// Zero (default) disables this explicit budget. Positive budgets require
+    /// a fresh disk observation and are held in durable daemon ownership until
+    /// completion. They are admission accounting, not filesystem quotas.
+    #[serde(default)]
+    pub disk_headroom_gib: u32,
     /// Timeout in seconds for build commands.
     /// Build commands (cargo build, gcc, etc.) typically complete faster than tests.
     #[serde(default = "default_build_timeout")]
@@ -2667,6 +2692,7 @@ impl Default for CompilationConfig {
             build_slots: default_build_slots(),
             test_slots: default_test_slots(),
             check_slots: default_check_slots(),
+            disk_headroom_gib: 0,
             build_timeout_sec: default_build_timeout(),
             test_timeout_sec: default_test_timeout(),
             bun_timeout_sec: default_bun_timeout(),

@@ -140,6 +140,28 @@ fn max_cache_kb_from_gb(max_cache_gb: u32) -> Option<u64> {
     (max_cache_gb != 0).then(|| u64::from(max_cache_gb) * 1024 * 1024)
 }
 
+/// Upper bound on one worker's sweep. The default SSH command timeout (300s)
+/// is too short for a `du`/`find` walk over hundreds of target dirs on a worker
+/// whose disk is saturated by builds (bd-mz7qk), so the sweep gets half the
+/// reap interval, clamped to [5min, 30min] so the next cycle never overlaps it.
+fn sweep_timeout(interval_mins: u64) -> Duration {
+    Duration::from_secs((interval_mins.saturating_mul(30)).clamp(300, 1800))
+}
+
+/// Run the sweep at idle CPU and IO priority so a slow scan yields to the
+/// builds it shares the disk with. `ionice` is Linux-only; fall back to `nice`.
+fn deprioritized(cmd: &str) -> String {
+    let quoted = shell_single_quote(cmd);
+    format!(
+        "if command -v ionice >/dev/null 2>&1; then nice -n 19 ionice -c3 sh -c {quoted}; \
+         else nice -n 19 sh -c {quoted}; fi"
+    )
+}
+
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 fn parse_reap_metrics(stdout: &str) -> Option<ReapMetrics> {
     let (removed, freed_kb) = stale_target_reap::parse_worker_reap_metrics(stdout)?;
     Some(ReapMetrics {
@@ -197,14 +219,13 @@ impl StaleTargetReaper {
         config: &rch_common::WorkerConfig,
         command: &str,
     ) -> anyhow::Result<rch_common::CommandResult> {
+        let timeout = sweep_timeout(self.config.interval_mins);
         if let Some(pool) = &self.ssh_pool {
-            return pool
-                .run_with_timeout(config, command, self.ssh_options.command_timeout)
-                .await;
+            return pool.run_with_timeout(config, command, timeout).await;
         }
         let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
         ssh_client.connect().await?;
-        let result = ssh_client.execute(command).await;
+        let result = ssh_client.execute_with_timeout(command, timeout).await;
         let _ = ssh_client.disconnect().await;
         result
     }
@@ -358,7 +379,7 @@ impl StaleTargetReaper {
 
             debug!(worker = %worker_id, idle_minutes, base = %base, "Starting stale-target sweep");
 
-            let result = self.run_remote(&config, &cmd).await;
+            let result = self.run_remote(&config, &deprioritized(&cmd)).await;
             let result = result?;
             ensure_sweep_command_success(&result)?;
 
@@ -417,6 +438,35 @@ fn log_reap_audit(worker_id: &WorkerId, stdout: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_timeout_outlasts_default_ssh_timeout_and_never_overlaps_next_cycle() {
+        // bd-mz7qk: the 300s SSH default cut sweeps short on IO-saturated workers.
+        assert_eq!(sweep_timeout(60), Duration::from_secs(1800));
+        assert_eq!(sweep_timeout(120), Duration::from_secs(1800));
+        assert_eq!(sweep_timeout(20), Duration::from_secs(600));
+        assert_eq!(sweep_timeout(1), Duration::from_secs(300));
+        assert_eq!(sweep_timeout(0), Duration::from_secs(300));
+        for mins in [10, 20, 30, 60, 240] {
+            assert!(sweep_timeout(mins) < Duration::from_secs(mins * 60));
+        }
+    }
+
+    #[test]
+    fn deprioritized_sweep_runs_the_command_verbatim() {
+        let cmd = "x='it'\\''s'; printf 'M removed=%s\\n' \"$x\"; echo \"done\"";
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(deprioritized(cmd))
+            .output()
+            .expect("run sh");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "M removed=it's\ndone\n"
+        );
+        assert!(deprioritized(cmd).contains("nice -n 19"));
+    }
 
     /// The production sweep bound to an empty registry under the fixture.
     /// Offloaded, the fixture lives inside the source root this very test
