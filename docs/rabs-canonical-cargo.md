@@ -2,9 +2,10 @@
 
 `cargo rabs --rabs-canonical PROFILE.json -- build --workspace` connects ordinary
 Cargo workspace builds to RABS's existing canonical worker path. The same path
-supports `check`, `clippy`, `test`, and `test --no-run`, with Cargo selecting the
-requested libraries, binaries, examples and test executables. Ordinary `test` runs those
-tests on the selected worker and returns Cargo's final exit status:
+supports `check`, `clippy`, `test`, `run`, and `bench`, with Cargo selecting the
+requested libraries, binaries, examples and test or benchmark executables.
+`test --no-run` and `bench --no-run` compile without running those executables.
+Execution commands run on the selected worker and return Cargo's final exit status:
 
 1. The launcher validates explicit source, toolchain, worker or worker pool, and destination
    intent and creates a new private operation directory.
@@ -20,8 +21,8 @@ tests on the selected worker and returns Cargo's final exit status:
    identify its actual outputs; both peers verify those files against the complete
    captured output tree. Successful results install into a new private directory.
 5. After complete verified delivery, the native driver replays the exact retained
-   Cargo/test stdout and stderr. Native operation reports are written to stderr.
-   A failing test keeps its nonzero status and diagnostics; it does not install a
+   Cargo/program stdout and stderr. Native operation reports are written to stderr.
+   A failing program keeps its nonzero status and diagnostics; it does not install a
    successful artifact result or retry locally.
 
 This is the canonical **Cargo driver**, not a wrapper-only path rewrite. The
@@ -32,7 +33,7 @@ are reused. The existing scheduler, transport and artifact installer remain in
 control of every operation.
 
 **This profile is execution-only.** It does not publish an action-cache result,
-serve a compiler or test-result cache hit, distribute individual rustc units, enable the local dependency
+serve a compiler, program or benchmark-result cache hit, distribute individual rustc units, enable the local dependency
 lane, or share a cache across workers. It does not make an unsandboxed local
 cache key equivalent to a canonical execution. Those remain separate integration
 and qualification tasks. Unlike `--rabs-remote`, this path does not invoke RCH.
@@ -226,7 +227,7 @@ priority.
 Compatibility uses the same source and command planner as the worker's
 [private target cache](rabs-target-state.md). Ordinary non-executable local
 source and data edits, additions, removals and renames may retain affinity.
-Cargo `build`, `check`, `test --no-run` and `test` can share it across package
+Cargo `build`, `check`, `test`, `run` and `bench` can share it across package
 and target selections. Clippy remains a separate family with exact selectors
 and lint controls. Cargo manifests, lockfiles, configuration, executable inputs,
 vendored packages and captured Cargo-home cache contents remain exact, as do
@@ -235,6 +236,13 @@ output location, required artifacts, private-state projection and other request
 controls. Unknown argument forms retain only
 exact-request preference. Legacy visible-prefix Cargo-home projections retain
 exact-source preference.
+
+Profiles still partition that hint: an ordinary `build` and `run` use debug,
+whereas ordinary `bench` uses release. `build --release` can prepare the release
+family for a later `bench`; benchmark filters and program arguments do not change
+compilation compatibility. Every requested program still executes. Pool affinity
+does not establish comparable benchmark hardware or load; select a fixed worker
+and control its runtime conditions when comparing measurements.
 
 A hint requires the same configured endpoint, worker identity and certificate
 pin. Resolved ordinary failures can also leave useful state; cancelled, stopped,
@@ -281,9 +289,9 @@ A reconnecting worker can opt into bounded private target reuse with
 for a 1 GiB pool. Identical captured inputs and
 compilation settings may seed the next execution's private target directory,
 allowing Cargo to skip compilation it considers fresh. An exact invocation is
-preferred; compatible `build`, `check`, `test --no-run` and `test` commands can
+preferred; compatible `build`, `check`, `test`, `run` and `bench` commands can
 share a target when their other compilation settings match. Cargo still executes
-each current request, including its selected tests and harness arguments.
+each current request, including its selected programs and runtime arguments.
 Ordinary local source and data edits can retain compiled dependencies: changed
 inputs and their surviving ancestor directories receive timestamps newer than
 the retained target, and Cargo applies its own freshness checks. Embedded text
@@ -292,9 +300,9 @@ manifests, lockfiles, configuration, executable inputs, immutable dependency
 sources, environment, toolchain, feature, or effective job-grant changes still
 start with a fresh target.
 
-A completed ordinary compiler or test failure can also retain its private
+A completed ordinary compiler, test, run or benchmark failure can also retain its private
 target after verified process cleanup. The next request executes Cargo again
-and returns its own outcome; a failing test is never converted into a cache hit
+and returns its own outcome; a failing program is never converted into a cache hit
 or a successful artifact delivery. Cancellation, uncertain cleanup, native
 launcher signal termination and unsafe partial trees cannot publish reusable
 target state.
@@ -526,8 +534,8 @@ add this Boolean field to the canonical JSON profile:
 "incremental": true
 ```
 
-The launcher supplies `CARGO_INCREMENTAL=1` for `build`, `check`, `clippy`, and
-`test`, including `test --no-run`. Omitting the field or setting it to `false`
+The launcher supplies `CARGO_INCREMENTAL=1` for `build`, `check`, `clippy`, `test`,
+`run`, and `bench`, including both `--no-run` forms. Omitting the field or setting it to `false`
 keeps `CARGO_INCREMENTAL=0`. This is an explicit operation policy: it overrides
 the incremental settings of captured Cargo profiles, including release and
 custom profiles. Ambient dispatcher values and arbitrary `env` overrides cannot
@@ -552,12 +560,12 @@ quota. The worker validates the entire tree, including omitted state, and
 charges every retained byte against its configured target-cache quota. Unsafe
 private files still refuse capture. Persistent reuse follows the existing
 runtime-epoch and complete-state verification rules. This does
-not enable portable incremental snapshots, skip test execution, or authorize
+not enable portable incremental snapshots, skip program execution, or authorize
 broader dependency or workspace action-cache serving.
 
 ## Supported command contract
 
-The first command must be `build`, `check`, `clippy`, or `test`. For example:
+The first command must be `build`, `check`, `clippy`, `test`, `run`, or `bench`. For example:
 
 ```sh
 cargo rabs --rabs-canonical PROFILE.json -- build --workspace
@@ -570,15 +578,23 @@ cargo rabs --rabs-canonical PROFILE.json -- test --doc
 cargo rabs --rabs-canonical PROFILE.json -- build -p app --bin app --release
 cargo rabs --rabs-canonical PROFILE.json -- build --workspace --profile production
 cargo rabs --rabs-canonical PROFILE.json -- test --profile ci --no-run
+cargo rabs --rabs-canonical PROFILE.json -- run --bin app -- 'argument with spaces'
+cargo rabs --rabs-canonical PROFILE.json -- run --example demo --release -- --help
+cargo rabs --rabs-canonical PROFILE.json -- bench --bench measured --no-run
+cargo rabs --rabs-canonical PROFILE.json -- bench --bench measured selected -- --exact
 ```
 
 `--profile NAME` and `--profile=NAME` select a captured manifest or configuration
-profile for `build`, `check`, `clippy` and `test`. Supply one profile, without
+profile for all six supported commands. Supply one profile, without
 `--release` or `-r`. Names are 1–64 ASCII letters, digits, underscores or hyphens,
 starting with a letter or digit. The launcher preserves the exact arguments and
-lets Cargo resolve the profile. Warm target reuse retains the profile selection
-and captured configuration as compilation controls: a different profile or
-changed profile settings cannot reuse the same compatible target family.
+lets Cargo resolve the profile. Warm target reuse keeps debug, release and named
+custom profile families separate. The built-in `dev`/`test` profiles share the
+debug family; `release`/`bench` share the release family. Cargo rechecks each
+unit's actual compilation settings, and captured configuration remains exact.
+Clippy preserves its own profile selection in a separate lint family.
+`bench` uses Cargo's bench/release profile by default. Cargo's benchmark command
+does not accept `--release` or `-r`; use `--profile` for another profile.
 
 Cargo owns package and target selection, including its normal defaults when no
 selection option is supplied. Supported selectors are `--workspace`,
@@ -592,6 +608,19 @@ arguments are not interpreted as Cargo flags; required Cargo controls are
 inserted before the delimiter. Cargo remains responsible for selection,
 doctests, ignored tests, list/help modes and the final process exit. The captured
 toolchain must contain `rustdoc` when the selected command needs it.
+
+`run` selects at most one package and one literal `--bin NAME` or `--example NAME`.
+With no target selector, Cargo resolves the package's default executable. Program
+arguments must follow `--` and are preserved exactly, including empty strings,
+Unicode and values resembling launcher or Cargo options. Workspace-wide or plural
+target selectors are not meaningful for this single-executable command and refuse.
+
+`bench` accepts the package/target selectors, one benchmark-name filter,
+`--no-fail-fast`, and the exact benchmark arguments after `--`. `bench --no-run`
+uses the compilation contract and returns executables without running them;
+runtime arguments and filters require execution. Cargo owns harness selection,
+including `harness = false`, and the final exit status. Every benchmark invocation
+executes again, even when all compilation units are fresh.
 
 `clippy` supports the same package, target and feature selections, plus
 `--no-deps`. After its `--` delimiter, it accepts bounded lint controls: `-A`,
@@ -616,7 +645,7 @@ not install a cross-compiler. Cargo remains responsible for package/feature
 resolution and may reject an otherwise syntactically supported request.
 
 The profile owns `--manifest-path`, `--target-dir` and `--message-format=json`.
-Target JSON, `--config`, unstable Cargo flags, `+toolchain`, `run`,
+Target JSON, `--config`, unstable Cargo flags, `+toolchain`,
 test-harness arguments on compilation-only commands, arguments other than the
 supported lint controls after Clippy's delimiter, and unknown Cargo options
 refuse before preparation. The selected toolchain also supplies local Cargo metadata probes; a
@@ -632,9 +661,10 @@ applies. This is an explicitly selected canonical build profile, not transparent
 preservation of the dispatcher's execution environment. TLS credentials remain
 local to the transport process. The worker retains ownership of its jobserver;
 this frontend does not send the dispatcher's descriptor numbers to another host.
-Tests execute under the same isolated network and read-only source namespace as
+Tests, programs and benchmarks execute with closed stdin under the same isolated
+network and read-only source namespace as
 the build; their writes must use admitted output/home/temporary paths. The
-profile does not claim equivalence to tests relying on the dispatcher's network,
+profile does not claim equivalence to programs relying on the dispatcher's network,
 credentials, mutable checkout or other ambient state.
 
 The optional profile field `jobserver_grant` requests an integer from 1 to 4096
@@ -647,24 +677,31 @@ jobserver token. The worker keeps that grant through process-group cleanup.
 
 ## Outputs, failure and recovery
 
-The explicit `artifacts.cargo = "cargo-json-v1"` compilation contract and
-`artifacts.cargo = "cargo-test-json-v1"` test-execution contract augment
-`tree-files-v1`. Old endpoints reject the new test contract rather than treating
-tests as compilation-only work. With `incremental: true`, the launcher instead
-selects `cargo-private-incremental-json-v1` for compilation or
-`cargo-private-incremental-test-json-v1` for test execution. Both require matching
-native support; older endpoints refuse the unknown contract before execution.
+The explicit `artifacts.cargo` contract augments `tree-files-v1`:
+
+| Operation | Ordinary contract | Private incremental contract |
+|---|---|---|
+| Build, check, lint, test/bench `--no-run` | `cargo-json-v1` | `cargo-private-incremental-json-v1` |
+| Test | `cargo-test-json-v1` | `cargo-private-incremental-test-json-v1` |
+| Run | `cargo-run-json-v1` | `cargo-private-incremental-run-json-v1` |
+| Bench | `cargo-bench-json-v1` | `cargo-private-incremental-bench-json-v1` |
+
+The launcher selects the private column for `incremental: true`. Each contract
+requires matching native support; older endpoints refuse an unknown contract
+before execution. The contract must match the actual Cargo command and its
+execution or `--no-run` mode.
 The launcher's `files` minimum is empty because it does not guess
 hashed library, metadata, executable or target-triple paths. After Cargo exits
 successfully and its writers have drained, the worker requires a complete
 `compiler-artifact` / `build-finished` report with at least one ordinary target.
-For test execution, `build-finished` ends only Cargo's compilation report. Later
-stdout belongs to the test programs and is retained byte-for-byte, including
+For test, run and bench execution, `build-finished` ends only Cargo's compilation report. Later
+stdout belongs to the programs and is retained byte-for-byte, including
 JSON-shaped records, binary bytes and unterminated lines. It cannot add outputs
 or change the compilation report. **Only the native final Cargo exit status can
 make the complete operation successful.** A passing compilation followed by a
-test failure retains the failure and diagnostics without offering successful
-artifacts. There is no test-result cache or inferred test-pass count.
+program failure retains the failure and diagnostics without offering successful
+artifacts. Run requires exactly one reported non-build-script executable; bench
+requires at least one. There is no cached runtime outcome or inferred test-pass count.
 
 Every reported output must exist beneath `/__rabs/out/cargo`, and each reported
 executable must retain executable mode. The ordinary contracts capture the entire
@@ -696,11 +733,11 @@ execution receipt. Source/toolchain capture and verified delivery stay with
 `rabsd`; the launcher does not parse a success-looking stdout line into authority.
 
 The canonical launcher selects native `--replay-diagnostics`. **stdout contains
-the exact verified Cargo/test stdout**, and the matching stderr bytes are replayed
-to stderr. Test execution therefore produces Cargo JSON followed by ordinary
-test output; stdout is not promised to be a pure JSON stream. The native
+the exact verified Cargo/program stdout**, and the matching stderr bytes are replayed
+to stderr. Execution therefore produces Cargo JSON followed by ordinary
+program output; stdout is not promised to be a pure JSON stream. The native
 worker-build result report and launcher operation-location message go to stderr.
-Replay happens after complete verified delivery, including on compiler/test
+Replay happens after complete verified delivery, including on compiler/program
 failure; this is not live output streaming. Both streams are verified and
 retained privately before any replay. Their individual byte order is preserved;
 no historical ordering between independently captured stdout/stderr is invented.
@@ -758,7 +795,10 @@ inventory, executes the produced application and integration-test binary, and
 checks that a real compiler error cannot become a successful report. Further
 real Cargo tests execute a selected integration test, preserve deliberately
 JSON-shaped harness output, return a failing test's exit 101 despite successful
-compilation, and execute a documentation example with rustdoc. The real Clippy
+compilation, and execute a documentation example with rustdoc. Native run and
+benchmark fixtures cover custom runtime arguments, opaque binary/JSON-shaped
+stdout, actual failure statuses, benchmark `--no-run`, release-profile output
+discovery and private incremental state. The real Clippy
 fixture uses captured toolchain companions with Rust tools absent from PATH,
 checks warning-only success and denied-lint exit 101, and then checks a clean
 workspace with all targets, all features and warnings denied. Its successful
@@ -813,7 +853,17 @@ RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
   cargo test -p rabsd --test cargo_vendor_prepare \
     registry::cargo_selected_workspace_outputs_survive_native_tls_and_offline_recovery \
     -- --ignored --nocapture
+
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test prepared_operation_live \
+    actual_canonical_cargo_ --locked -- --ignored --nocapture
 ```
+
+The run/bench authenticated fixtures compare each native exit and runtime output
+with stock Cargo for cold compilation, a warm program failure, and successful
+execution after a source edit. They restart the worker between phases and check
+retained private incremental files, reuse of the unchanged path dependency,
+recompilation of the edited source, and exclusion of private state from delivery.
 
 Before rollout, run that full path using one pinned revision and compare output
 bytes and compiler failures to the explicit canonical baseline. Input preparation

@@ -1,11 +1,11 @@
-//! Cargo-selected output names for canonical build, check, Clippy and tests.
+//! Cargo-selected output names for canonical compilation, tests, runs and benches.
 //!
 //! Cargo owns target selection and hashed output names. Its complete bounded JSON
 //! stream supplies the required artifacts. Legacy contracts retain the complete
 //! output tree; the explicit private-incremental contracts omit only precisely
 //! derived compiler-state roots while retaining every reported output. Both
 //! still verify bytes and drain all writers. These messages never authorize
-//! cache publication, compiler skipping or test execution success.
+//! cache publication, compiler skipping or runtime execution success.
 
 use crate::artifact_tree::{MAX_TREE_FILES, TREE_FILES_VERSION, validate_tree_names};
 use serde_json::Value;
@@ -17,17 +17,37 @@ pub const CARGO_ARTIFACTS_VERSION: &str = "cargo-json-v1";
 /// Test execution has arbitrary program output after Cargo's build-finished.
 /// Its native final process status, never that JSON record, decides success.
 pub const CARGO_TEST_ARTIFACTS_VERSION: &str = "cargo-test-json-v1";
+/// Cargo builds one selected executable, then runs it with an opaque argv tail.
+pub const CARGO_RUN_ARTIFACTS_VERSION: &str = "cargo-run-json-v1";
+/// Cargo builds benchmarks, then their native execution decides success.
+pub const CARGO_BENCH_ARTIFACTS_VERSION: &str = "cargo-bench-json-v1";
 /// Cargo may retain incremental compiler state privately on the worker. Only
 /// this explicit contract omits its precisely derived roots from delivery.
 pub const CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION: &str = "cargo-private-incremental-json-v1";
 /// The private-state projection with native test execution semantics.
 pub const CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION: &str =
     "cargo-private-incremental-test-json-v1";
+/// A run may keep compiler state on the worker while returning actual products.
+pub const CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION: &str =
+    "cargo-private-incremental-run-json-v1";
+/// Benchmarks use the same private-state projection with their own profile.
+pub const CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION: &str =
+    "cargo-private-incremental-bench-json-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoArtifactMode {
     Compilation,
     TestExecution,
+    RunExecution,
+    BenchExecution,
+}
+
+impl CargoArtifactMode {
+    /// Whether stdout after Cargo's build-finished belongs to executed programs.
+    #[must_use]
+    pub const fn is_execution(self) -> bool {
+        !matches!(self, Self::Compilation)
+    }
 }
 /// Bound the whole stream, including non-JSON output from procedural macros.
 pub const MAX_CARGO_REPORT_BYTES: u64 = 64 * 1024 * 1024;
@@ -40,7 +60,7 @@ fn invalid(message: &str) -> io::Error {
 }
 
 /// Validate the command as well as the version before execution admission.
-/// The version distinguishes compilation-only output from tests' arbitrary
+/// The version distinguishes compilation-only output from programs' arbitrary
 /// stdout after build-finished. The caller separately validates artifact names
 /// and the final native process status before offering a successful result.
 pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
@@ -56,6 +76,12 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         }
         Some(CARGO_TEST_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION) => {
             CargoArtifactMode::TestExecution
+        }
+        Some(CARGO_RUN_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION) => {
+            CargoArtifactMode::RunExecution
+        }
+        Some(CARGO_BENCH_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION) => {
+            CargoArtifactMode::BenchExecution
         }
         _ => return Err(invalid("unsupported Cargo artifact contract")),
     };
@@ -77,9 +103,12 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         })
         .collect::<io::Result<Vec<_>>>()?;
     let command = args[0];
-    if !matches!(command, "build" | "check" | "clippy" | "test") {
+    if !matches!(
+        command,
+        "build" | "check" | "clippy" | "test" | "run" | "bench"
+    ) {
         return Err(invalid(
-            "Cargo artifact contract requires build, check, clippy or test",
+            "Cargo artifact contract requires build, check, clippy, test, run or bench",
         ));
     }
     // cargo-clippy is an external Cargo command. Naming its retained binary
@@ -108,9 +137,9 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
             validate_clippy_lints(&args[at + 1..])?;
             break;
         }
-        // Every remaining byte belongs to the selected test harness. In
+        // Every remaining byte belongs to the selected executable/harness. In
         // particular --no-run/--help/--target-dir here are not Cargo options.
-        if args[at] == "--" && mode == CargoArtifactMode::TestExecution {
+        if args[at] == "--" && mode.is_execution() {
             break;
         }
         let (option, inline) = args[at]
@@ -143,7 +172,12 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
                     target = true;
                 }
             }
-            "--no-run" if inline.is_none() && command == "test" && !no_run => no_run = true,
+            "--no-run" if inline.is_none() && matches!(command, "test" | "bench") && !no_run => {
+                no_run = true;
+            }
+            "--release" | "-r" if command == "bench" => {
+                return Err(invalid("Cargo bench selects its profile with --profile"));
+            }
             "--fix" | "--allow-dirty" | "--allow-staged" | "--allow-no-vcs" | "--explain"
                 if command == "clippy" =>
             {
@@ -161,8 +195,12 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         at += 1;
     }
     let matching_command = match mode {
-        CargoArtifactMode::Compilation => command != "test" || no_run,
+        CargoArtifactMode::Compilation => {
+            command != "run" && (!matches!(command, "test" | "bench") || no_run)
+        }
         CargoArtifactMode::TestExecution => command == "test" && !no_run,
+        CargoArtifactMode::RunExecution => command == "run" && !no_run,
+        CargoArtifactMode::BenchExecution => command == "bench" && !no_run,
     };
     if !format || !target || !matching_command {
         return Err(invalid("incomplete Cargo compilation artifact contract"));
@@ -193,6 +231,8 @@ fn private_incremental_contract(request: &Value) -> bool {
         Some(
             CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION
                 | CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION
+                | CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION
+                | CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION
         )
     )
 }
@@ -260,8 +300,8 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
     let mut at = 1;
     while at < args.len() {
         if args[at] == "--" {
-            // The command validator owns whether this is a test harness or
-            // Clippy lint tail. Neither tail can change Cargo's output layout.
+            // The command validator owns this runtime or Clippy lint tail.
+            // Neither tail can change Cargo's output layout.
             break;
         }
         let (option, inline) = args[at]
@@ -310,7 +350,7 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
                     target = Some(value);
                 }
             }
-            "--release" | "-r" if inline.is_none() => {
+            "--release" | "-r" if inline.is_none() && args[0] != "bench" => {
                 if profile.is_some() || release {
                     return Err(invalid(
                         "conflicting private incremental Cargo profile selectors",
@@ -341,7 +381,10 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
             | "--doc"
             | "--no-deps"
                 if inline.is_none() => {}
-            _ if args[0] == "test" && !args[at].starts_with('-') && !test_filter => {
+            _ if matches!(args[0], "test" | "bench")
+                && !args[at].starts_with('-')
+                && !test_filter =>
+            {
                 test_filter = true;
             }
             _ => {
@@ -356,7 +399,7 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
         Some("dev" | "test") => "debug",
         Some("release" | "bench") => "release",
         Some(name) => name,
-        None if release => "release",
+        None if release || args[0] == "bench" => "release",
         None => "debug",
     };
     let mut roots = vec![format!("{profile}/incremental")];
@@ -442,7 +485,7 @@ impl CargoArtifactReport {
     /// Read Cargo's actual stdout, preserving unrelated output in its original
     /// diagnostic stream. Non-JSON lines are allowed, as Cargo cannot control
     /// procedural macro stdout. Malformed JSON-shaped records fail closed in
-    /// the compilation report; test output after build-finished stays opaque.
+    /// the compilation report; runtime output after build-finished stays opaque.
     pub fn read(reader: impl Read, output_root: &str, mode: CargoArtifactMode) -> io::Result<Self> {
         if !output_root.starts_with('/') || output_root.ends_with('/') {
             return Err(invalid("Cargo output root must be an absolute directory"));
@@ -453,16 +496,17 @@ impl CargoArtifactReport {
         let mut total = 0_u64;
         let mut files = BTreeSet::new();
         let mut executables = BTreeSet::new();
+        let mut runtime_executables = BTreeSet::new();
         let mut finished = false;
         let mut compiled_target = false;
         let mut artifact_messages = 0_usize;
         loop {
-            if finished && mode == CargoArtifactMode::TestExecution {
-                // Stock Cargo emits build-finished before starting test
+            if finished && mode.is_execution() {
+                // Stock Cargo emits build-finished before starting runtime
                 // programs. Their stdout is opaque: even a JSON-shaped record
                 // or an unterminated/long line cannot add an artifact or change
                 // compilation success. Still consume and bound the entire
-                // verified stream without buffering an arbitrary test line.
+                // verified stream without buffering an arbitrary runtime line.
                 loop {
                     let available = reader.fill_buf()?;
                     if available.is_empty() {
@@ -557,6 +601,9 @@ impl CargoArtifactReport {
                             if !names.contains(&executable) {
                                 return Err(invalid("Cargo executable is not in its artifact set"));
                             }
+                            if !kinds.iter().any(|kind| kind == "custom-build") {
+                                runtime_executables.insert(executable.clone());
+                            }
                             executables.insert(executable);
                         }
                         None => return Err(invalid("Cargo artifact executable field is missing")),
@@ -572,6 +619,13 @@ impl CargoArtifactReport {
         if !finished || !compiled_target {
             return Err(invalid(
                 "Cargo did not complete a real non-build-script target",
+            ));
+        }
+        if (mode == CargoArtifactMode::RunExecution && runtime_executables.len() != 1)
+            || (mode == CargoArtifactMode::BenchExecution && runtime_executables.is_empty())
+        {
+            return Err(invalid(
+                "Cargo did not report the selected runtime executable",
             ));
         }
         validate_tree_names(files.iter().map(String::as_str))?;
@@ -649,13 +703,22 @@ mod tests {
             OUTPUT_ROOT,
         ];
         args.extend_from_slice(extra);
-        let test = command == "test" && !extra.contains(&"--no-run");
+        let no_run = extra
+            .iter()
+            .take_while(|argument| **argument != "--")
+            .any(|argument| *argument == "--no-run");
+        let contract = match command {
+            "test" if !no_run => CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION,
+            "run" => CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION,
+            "bench" if !no_run => CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION,
+            _ => CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+        };
         json!({
             "program":if command == "clippy" { "/__rabs/toolchain/bin/cargo-clippy" } else { "/__rabs/toolchain/bin/cargo" },
             "args":args,
             "command_context":{"env":{"CARGO_INCREMENTAL":"1", "CARGO":"/__rabs/toolchain/bin/cargo", "RUSTC":"/__rabs/toolchain/bin/rustc"}},
             "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[],
-                "cargo":if test { CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION } else { CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION }},
+                "cargo":contract},
         })
     }
 
@@ -751,6 +814,70 @@ mod tests {
     }
 
     #[test]
+    fn private_run_and_bench_projection_follows_the_compilation_profile_only() {
+        for (command, extra, mode, profile) in [
+            (
+                "run",
+                vec!["--bin=app", "--", "--no-run", "--profile=release"],
+                CargoArtifactMode::RunExecution,
+                "debug",
+            ),
+            (
+                "run",
+                vec!["--profile=ci", "--example=demo", "--", "--target=outside"],
+                CargoArtifactMode::RunExecution,
+                "ci",
+            ),
+            (
+                "bench",
+                vec!["filtered_case", "--", "--no-run", "--profile=dev"],
+                CargoArtifactMode::BenchExecution,
+                "release",
+            ),
+            (
+                "bench",
+                vec!["--no-run", "--bench=measured"],
+                CargoArtifactMode::Compilation,
+                "release",
+            ),
+            (
+                "bench",
+                vec!["--profile=dev", "--bench=measured"],
+                CargoArtifactMode::BenchExecution,
+                "debug",
+            ),
+            (
+                "bench",
+                vec![
+                    "--no-run",
+                    "--profile=ci",
+                    "--target=x86_64-unknown-linux-gnu",
+                ],
+                CargoArtifactMode::Compilation,
+                "ci",
+            ),
+        ] {
+            let request = private_request(command, &extra);
+            assert_eq!(requested(&request).unwrap(), Some(mode), "{request}");
+            let mut roots = vec![format!("{profile}/incremental")];
+            if extra.contains(&"--target=x86_64-unknown-linux-gnu") {
+                roots.push(format!("x86_64-unknown-linux-gnu/{profile}/incremental"));
+            }
+            roots.sort();
+            assert_eq!(private_incremental_roots(&request).unwrap(), Some(roots));
+        }
+        for (command, extra) in [
+            ("run", vec!["--no-run"]),
+            ("run", vec!["program-argument-without-delimiter"]),
+            ("bench", vec!["--release"]),
+            ("bench", vec!["-r"]),
+            ("bench", vec!["--no-run", "--", "runtime-argument"]),
+        ] {
+            assert!(requested(&private_request(command, &extra)).is_err());
+        }
+    }
+
+    #[test]
     fn private_incremental_contract_refuses_ambiguous_layout_and_environment() {
         for arguments in [
             vec!["--profile=ci", "--profile=dev"],
@@ -830,10 +957,10 @@ mod tests {
             requested(&base).unwrap(),
             Some(CargoArtifactMode::Compilation)
         );
-        for command in ["check", "test"] {
+        for command in ["check", "test", "bench"] {
             let mut request = base.clone();
             request["args"][0] = json!(command);
-            if command == "test" {
+            if matches!(command, "test" | "bench") {
                 assert!(requested(&request).is_err());
                 request["args"]
                     .as_array_mut()
@@ -1047,7 +1174,72 @@ mod tests {
     }
 
     #[test]
-    fn test_stdout_cannot_change_the_completed_cargo_artifact_report() {
+    fn run_and_bench_require_their_own_contracts_and_leave_runtime_argv_opaque() {
+        for (command, contract, mode) in [
+            (
+                "run",
+                CARGO_RUN_ARTIFACTS_VERSION,
+                CargoArtifactMode::RunExecution,
+            ),
+            (
+                "bench",
+                CARGO_BENCH_ARTIFACTS_VERSION,
+                CargoArtifactMode::BenchExecution,
+            ),
+        ] {
+            let base = json!({"program":"/__rabs/toolchain/bin/cargo",
+                "args":[command, "--message-format=json", "--target-dir", OUTPUT_ROOT],
+                "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION,
+                    "files":[], "cargo":contract}});
+            assert_eq!(requested(&base).unwrap(), Some(mode));
+            for mismatched in [
+                CARGO_ARTIFACTS_VERSION,
+                CARGO_TEST_ARTIFACTS_VERSION,
+                if command == "run" {
+                    CARGO_BENCH_ARTIFACTS_VERSION
+                } else {
+                    CARGO_RUN_ARTIFACTS_VERSION
+                },
+            ] {
+                let mut request = base.clone();
+                request["artifacts"]["cargo"] = json!(mismatched);
+                assert!(requested(&request).is_err());
+            }
+            let mut runtime = base.clone();
+            runtime["args"].as_array_mut().unwrap().extend(
+                [
+                    "--",
+                    "--no-run",
+                    "--help",
+                    "--target-dir=/elsewhere",
+                    "--message-format=human",
+                    "--release",
+                ]
+                .map(|argument| json!(argument)),
+            );
+            assert_eq!(requested(&runtime).unwrap(), Some(mode));
+            let mut no_run = base.clone();
+            no_run["args"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("--no-run"));
+            assert!(requested(&no_run).is_err());
+            no_run["artifacts"]["cargo"] = json!(CARGO_ARTIFACTS_VERSION);
+            assert_eq!(requested(&no_run).is_ok(), command == "bench");
+            let mut late_controls = base;
+            late_controls["args"] = json!([
+                command,
+                "--",
+                "--message-format=json",
+                "--target-dir",
+                OUTPUT_ROOT
+            ]);
+            assert!(requested(&late_controls).is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_stdout_cannot_change_the_completed_cargo_artifact_report() {
         let prefix = stream(&[
             record(
                 "test",
@@ -1063,16 +1255,18 @@ mod tests {
             b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n".as_slice(),
             b"\xff\x00unterminated test stdout".as_slice(),
         ] {
-            let report = CargoArtifactReport::read(
-                prefix.as_slice().chain(tail),
-                "/out",
+            for mode in [
                 CargoArtifactMode::TestExecution,
-            )
-            .unwrap();
-            assert_eq!(report.files().collect::<Vec<_>>(), ["deps/integration-123"]);
-            report
-                .validate_outputs([("deps/integration-123", true)])
-                .unwrap();
+                CargoArtifactMode::RunExecution,
+                CargoArtifactMode::BenchExecution,
+            ] {
+                let report =
+                    CargoArtifactReport::read(prefix.as_slice().chain(tail), "/out", mode).unwrap();
+                assert_eq!(report.files().collect::<Vec<_>>(), ["deps/integration-123"]);
+                report
+                    .validate_outputs([("deps/integration-123", true)])
+                    .unwrap();
+            }
         }
         assert!(
             CargoArtifactReport::read(
@@ -1130,6 +1324,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn run_and_bench_require_real_runtime_executable_outputs() {
+        let no_program = stream(&[
+            record(
+                "custom-build",
+                &["/out/build/helper"],
+                Some("/out/build/helper"),
+            ),
+            record("lib", &["/out/deps/libdep.rlib"], None),
+            json!({"reason":"build-finished", "success":true}),
+        ]);
+        for mode in [
+            CargoArtifactMode::RunExecution,
+            CargoArtifactMode::BenchExecution,
+        ] {
+            assert!(CargoArtifactReport::read(no_program.as_slice(), "/out", mode).is_err());
+        }
+        let two_programs = stream(&[
+            record("bin", &["/out/app"], Some("/out/app")),
+            record(
+                "bench",
+                &["/out/deps/measured-123"],
+                Some("/out/deps/measured-123"),
+            ),
+            json!({"reason":"build-finished", "success":true}),
+        ]);
+        assert!(
+            CargoArtifactReport::read(
+                two_programs.as_slice(),
+                "/out",
+                CargoArtifactMode::RunExecution
+            )
+            .is_err()
+        );
+        let report = CargoArtifactReport::read(
+            two_programs.as_slice(),
+            "/out",
+            CargoArtifactMode::BenchExecution,
+        )
+        .unwrap();
+        assert!(
+            report
+                .validate_outputs([("app", true), ("deps/measured-123", false)])
+                .is_err()
+        );
+        report
+            .validate_outputs([("app", true), ("deps/measured-123", true)])
+            .unwrap();
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Real Cargo output discovery for workspace builds, checks, Clippy and tests.
+//! Real Cargo output discovery for compilation, tests, programs and benchmarks.
 //! Stock local Cargo and an opt-in canonical namespace exercise production
 //! JSON/tree validation. Neither substitutes for worker/TLS integration or
 //! authorizes cache serving.
@@ -835,6 +835,224 @@ fn deliberate_failure() { panic!("intentional test failure after successful comp
         }
         inventory.verify(&|| false).unwrap();
     }
+}
+
+#[test]
+fn real_cargo_run_keeps_program_arguments_and_reports_native_failure() {
+    let (owner, root, home, tools) = workspace_fixture();
+    fs::write(
+        root.join("app/src/main.rs"),
+        r#"fn main() {
+    assert_eq!(artifact_library::VALUE, 42);
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    println!("run-arguments={args:?}");
+    println!("{{\"reason\":\"compiler-artifact\",\"filenames\":[\"/unowned/run-fake\"]}}");
+    println!("{{\"reason\":\"build-finished\",\"success\":false}}");
+    eprintln!("run-program-stderr");
+    if args.iter().any(|arg| arg == "--fail") { std::process::exit(23); }
+}
+"#,
+    )
+    .unwrap();
+    let output_root = owner.path().join("run-execution-output");
+    fs::create_dir(&output_root).unwrap();
+    fs::set_permissions(&output_root, fs::Permissions::from_mode(0o700)).unwrap();
+    for successful in [true, false] {
+        let mut command = cargo(&tools, &root, &home);
+        command
+            .env("CARGO_INCREMENTAL", "1")
+            .args([
+                "run",
+                "--package=artifact_app",
+                "--bin=artifact_app",
+                "--locked",
+                "--offline",
+                "--message-format=json",
+                "--target-dir",
+            ])
+            .arg(&output_root)
+            .args(["--", "two words", "--no-run", "--message-format=json"]);
+        if !successful {
+            command.arg("--fail");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if successful { 0 } else { 23 }),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A successful compilation report never overrides the native program
+        // exit status. Worker integration separately denies failed delivery.
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            CargoArtifactMode::RunExecution,
+        )
+        .unwrap();
+        let required = validated_products(&output_root, &report);
+        assert!(required.contains("debug/artifact_app"));
+        assert!(required.iter().any(|name| name.ends_with(".rlib")));
+        assert!(!required.iter().any(|name| name.contains("run-fake")));
+        assert!(output_root.join("debug/incremental").is_dir());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let finished = stdout.find("\"reason\":\"build-finished\"").unwrap();
+        let ran = stdout.find("run-arguments=").unwrap();
+        assert!(finished < ran);
+        assert!(stdout.contains("\"two words\", \"--no-run\", \"--message-format=json\""));
+        assert!(stdout.contains("/unowned/run-fake"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("run-program-stderr"));
+        assert!(
+            CargoArtifactReport::read(
+                output.stdout.as_slice(),
+                output_root.to_str().unwrap(),
+                CargoArtifactMode::Compilation,
+            )
+            .is_err()
+        );
+        if !successful {
+            assert_compilation_fresh(&output.stdout, "artifact_app");
+            assert_compilation_fresh(&output.stdout, "artifact_library");
+        }
+    }
+}
+
+#[test]
+fn real_cargo_bench_no_run_and_execution_keep_the_default_release_profile() {
+    let (owner, root, home, tools) = workspace_fixture();
+    let manifest = root.join("app/Cargo.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\n[[bench]]\nname='measured'\nharness=false\n",
+            fs::read_to_string(&manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::create_dir(root.join("app/benches")).unwrap();
+    fs::write(
+        root.join("app/benches/measured.rs"),
+        r#"fn main() {
+    assert_eq!(artifact_library::VALUE, 42);
+    std::fs::write(std::env::var_os("RABS_BENCH_MARKER").unwrap(), "executed").unwrap();
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    println!("bench-arguments={args:?}");
+    println!("{{\"reason\":\"compiler-artifact\",\"filenames\":[\"/unowned/bench-fake\"]}}");
+    println!("{{\"reason\":\"build-finished\",\"success\":false}}");
+    eprintln!("bench-program-stderr");
+    if args.iter().any(|arg| arg == "--fail") { std::process::exit(29); }
+}
+"#,
+    )
+    .unwrap();
+    let output_root = owner.path().join("bench-execution-output");
+    fs::create_dir(&output_root).unwrap();
+    fs::set_permissions(&output_root, fs::Permissions::from_mode(0o700)).unwrap();
+    for (iteration, no_run, successful) in [(0, true, true), (1, false, true), (2, false, false)] {
+        let marker = owner.path().join(format!("benchmark-ran-{iteration}"));
+        let mut command = cargo(&tools, &root, &home);
+        command
+            .env("CARGO_INCREMENTAL", "1")
+            .env("RABS_BENCH_MARKER", &marker)
+            .args([
+                "bench",
+                "--package=artifact_app",
+                "--bench=measured",
+                "--locked",
+                "--offline",
+                "--message-format=json",
+                "--target-dir",
+            ])
+            .arg(&output_root);
+        if no_run {
+            command.arg("--no-run");
+        } else {
+            command.args(["--", "two words", "--no-run", "--profile=dev"]);
+            if !successful {
+                command.arg("--fail");
+            }
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            successful,
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(marker.exists(), !no_run, "Cargo must honor --no-run");
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            if no_run {
+                CargoArtifactMode::Compilation
+            } else {
+                CargoArtifactMode::BenchExecution
+            },
+        )
+        .unwrap();
+        let required = validated_products(&output_root, &report);
+        assert!(
+            required.iter().any(|name| {
+                Path::new(name)
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("measured-"))
+            }),
+            "Cargo benchmark outputs: {required:?}"
+        );
+        assert!(required.iter().all(|name| name.starts_with("release/")));
+        assert!(!required.iter().any(|name| name.contains("bench-fake")));
+        assert!(output_root.join("release/incremental").is_dir());
+        if !no_run {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let finished = stdout.find("\"reason\":\"build-finished\"").unwrap();
+            let ran = stdout.find("bench-arguments=").unwrap();
+            assert!(finished < ran);
+            assert!(stdout.contains("\"two words\", \"--no-run\", \"--profile=dev\""));
+            assert!(stdout.contains("/unowned/bench-fake"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("bench-program-stderr"));
+            assert_compilation_fresh(&output.stdout, "measured");
+            assert_compilation_fresh(&output.stdout, "artifact_library");
+        }
+        if !successful {
+            assert_eq!(output.status.code(), Some(29));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("exit status: 29"));
+        }
+    }
+}
+
+fn validated_products(output_root: &Path, report: &CargoArtifactReport) -> BTreeSet<String> {
+    let required = report.files().map(str::to_owned).collect::<BTreeSet<_>>();
+    let inventory =
+        TreeInventory::scan(output_root, &required, 128 * 1024 * 1024, &|| false).unwrap();
+    report
+        .validate_outputs(inventory.names().map(|name| {
+            let executable = fs::metadata(output_root.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111
+                != 0;
+            (name, executable)
+        }))
+        .unwrap();
+    inventory.verify(&|| false).unwrap();
+    required
+}
+
+fn assert_compilation_fresh(stdout: &[u8], name: &str) {
+    let artifacts = stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .take_while(|value| value["reason"] != "build-finished")
+        .filter(|value| value["reason"] == "compiler-artifact" && value["target"]["name"] == name)
+        .collect::<Vec<_>>();
+    assert!(!artifacts.is_empty(), "Cargo did not report {name}");
+    assert!(
+        artifacts.iter().all(|artifact| artifact["fresh"] == true),
+        "Cargo recompiled {name}: {artifacts:?}"
+    );
 }
 
 #[test]

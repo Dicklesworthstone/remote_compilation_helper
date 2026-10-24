@@ -1,10 +1,10 @@
 # Worker-local Cargo target state
 
 The canonical worker can retain Cargo target trees after successful builds or
-ordinary completed compile, lint or test failures, then seed later builds with
+ordinary completed compile, lint or program failures, then seed later builds with
 independently owned copies. Cargo or Clippy executes on every request and
 decides which compilation steps are fresh. This accelerates repeated commands,
-ordinary build/check/test transitions, changes to package or target selection,
+ordinary build/check/test/run/bench transitions, changes to package or target selection,
 and Clippy runs across local source and data edits. Every request still executes
 its current command and verifies its current result.
 
@@ -85,8 +85,9 @@ setting. The default and `false` keep `CARGO_INCREMENTAL=0`. Both values enter
 the actual command environment and select different target families; changing
 the toolchain, compilation profile or other keyed controls still starts cold.
 
-The explicit `cargo-private-incremental-json-v1` and
-`cargo-private-incremental-test-json-v1` output contracts keep compiler state
+The explicit `cargo-private-incremental-json-v1`,
+`cargo-private-incremental-test-json-v1`, `cargo-private-incremental-run-json-v1`
+and `cargo-private-incremental-bench-json-v1` output contracts keep compiler state
 under the selected profile's `incremental` directory on the worker. An explicit
 target triple also selects that target's profile directory. The worker and
 coordinator derive these exact paths independently. A similarly named binary,
@@ -99,7 +100,7 @@ query-cache and work products. A new execution receives its own writable copy;
 the retained seed and concurrent attempts share no writable inodes. Cargo and
 rustc validate that state during the current command. Normal edits can reuse
 it, and persistent mode can retain it across worker restarts under the same
-runtime epoch. Tests always execute again.
+runtime epoch. Requested tests, programs and benchmarks always execute again.
 
 Only delivered artifacts consume transport payload bytes. The complete tree,
 including omitted compiler state and internal hardlink aliases, still counts
@@ -121,7 +122,7 @@ compatible command or source generation; more recently admitted matching jobs
 win within each class, then the configured worker order breaks ties.
 
 The coordinator and worker share the command normalization and source-edit
-family planner described below. An eligible edit or a build/check/test selection
+family planner described below. An eligible edit or a build/check/test/run/bench selection
 change can therefore keep the next build on the worker that ran its predecessor.
 Clippy's separate family preserves its exact selectors and lint controls.
 Non-editable inputs, captured dependency-cache contents, toolchain, environment,
@@ -133,7 +134,7 @@ exact-source affinity.
 History must match all three configured identities: the coordinator endpoint,
 worker name and certificate pin. Only resolved, dispatched completions with
 normal exit status 0–127 and no cancellation or stop reason qualify. A completed
-compile, lint or test failure may therefore help place the next fixed build.
+compile, lint or program failure may therefore help place the next fixed build.
 Unresolved executions continue to exclude their worker from new placement.
 
 The hint uses the last 128 queue admissions in the daemon's bounded durable live
@@ -161,13 +162,13 @@ Changing a captured dependency, environment value, feature flag, toolchain,
 output location or required files, or effective job grant starts with a fresh
 target. The restricted local input edit family below is the only exception
 to exact source bytes. An identical invocation can reuse its prior target while Cargo
-still runs the requested command, including test executables for `cargo test`.
+still runs the requested command, including the selected test, program or benchmark.
 
 An exact invocation match is preferred. Otherwise, ordinary `build`, `check`,
-`test --no-run`, and `test` commands may select the most recent compatible
+`test`, `run`, and `bench` commands, including test/bench `--no-run`, may select the most recent compatible
 target. Compilation settings and non-editable captured inputs remain exact. The
-command name, test execution switch, test filter, failure policy, and arguments
-after the test harness separator do not fragment this optional target pool.
+command name, execution switch, test/benchmark filter, failure policy, and arguments
+after the runtime separator do not fragment this optional target pool.
 Package selectors (`--package`/`-p`, `--workspace`/`--all`, `--exclude`) and target
 selectors (`--lib`, `--bin`, `--example`, `--test`, `--bench`, their plural forms,
 and `--all-targets`) may also change. Cargo still receives every original
@@ -184,10 +185,18 @@ Every invocation reports and verifies its own diagnostics, exit status and
 cancellation outcome. Successful invocations also require their current
 artifact report.
 
+The same rule lets `cargo build` seed a later `cargo run` without suppressing
+program execution. `bench` defaults to release, so its compatible family can use
+`build --release` or `bench --no-run` state, while an ordinary debug build stays
+separate. Explicit profiles still participate in the family key. Program arguments
+remain exact in the original request and recovery identity even when they do not
+affect this optional compilation seed. Benchmark measurements are never cached;
+select and control the worker hardware and load for performance comparisons.
+
 Selecting one workspace library and later selecting a binary or example can
 therefore reuse their shared dependencies while compiling the newly requested
 target. Switching to a different package never serves the earlier package's
-artifact report. A selected test still runs its harness and returns its current
+artifact report. A selected program still runs and returns its current
 failure even when all compilation steps are fresh.
 
 Canonical Clippy has its own compatibility family. Repeated Clippy invocations
@@ -199,7 +208,7 @@ dependency fresh when that package becomes a selected lint target. Keeping its
 selectors exact ensures the newly selected package actually receives its lints.
 Changing an allow/deny level also starts with a fresh target; the current Clippy
 process must recheck affected units and report any current lint failure. Cargo
-build/check/test targets and Clippy targets use separate families.
+build/check/test/run/bench targets and Clippy targets use separate families.
 
 The worker gives each eligible execution a fresh HOME and a captured or empty
 Cargo home. Its jobserver has a stable canonical FIFO name but a new private
@@ -258,19 +267,19 @@ Directory mode changes and empty-directory changes unrelated to the admitted
 source/data membership changes also refuse optional restoration.
 
 Cargo or Clippy still runs and decides which local units/dependents to rebuild
-or relint. Tests run again even when their compiled state can be reused. The
+or relint. Programs run again even when their compiled state can be reused. The
 exact invocation key, current source manifest, output checks and final completion
 fence remain unchanged. This is not a cross-source action-cache hit or cached
-test outcome.
+program outcome.
 
-### Reuse after a failed compile, lint or test
+### Reuse after a failed compile, lint or program
 
 A normally exited Cargo or Clippy command with status 1–127 can leave useful
 completed dependencies even when another crate does not compile, a lint is denied
-or a test fails. The worker can retain that complete private target tree and
+or a test, application or benchmark fails. The worker can retain that complete private target tree and
 restore it for the next command. Cargo reads its own fingerprints, rebuilds
-unfinished or changed units, and executes the requested tests again. A repeated
-failing test command still returns its nonzero status and current diagnostics;
+unfinished or changed units, and executes the requested programs again. A repeated
+failing command still returns its nonzero status and current diagnostics;
 fixing the source can reuse completed dependencies without treating the earlier
 failure as a successful result.
 

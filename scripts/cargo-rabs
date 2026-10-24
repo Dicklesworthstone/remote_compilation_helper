@@ -62,7 +62,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-no-start        Only use an already-running daemon.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
-  --rabs-canonical FILE  Build, check, lint or test through a canonical worker.
+  --rabs-canonical FILE  Build, check, lint, test, run or bench on a canonical worker.
   --rabs-recover DIR     Recover a retained canonical operation; never execute it again.
   --help                Show this help without starting a daemon or Cargo.
 
@@ -72,11 +72,13 @@ build pipeline in one process handoff. See docs/rabs-canonical-cargo.md for the
 explicit upload boundary, profile and worker connection setup. This Linux-only
 profile uses a captured toolchain, explicit worker environment and new output tree;
 it is not transparent local-path replay, per-action scheduling or cache serving.
-Builds, checks, Clippy and tests accept ordinary workspace/target selection.
+Builds, checks, Clippy, tests and benches accept ordinary workspace/target selection.
 Clippy accepts lint controls after -- and uses the captured cargo-clippy/driver.
-Test filters and arguments after -- are preserved; --no-run remains compilation-only.
+Run selects one binary or example; program arguments follow -- unchanged.
+Test/bench filters and arguments after -- are preserved; --no-run is compilation-only.
+Bench uses Cargo's release profile by default; --profile selects another profile.
 Cargo's artifact reports identify the required real outputs in the captured tree.
-Test execution success requires Cargo's final exit, never build-finished alone.
+Execution success requires Cargo's final exit, never build-finished alone.
 Profiles may select an existing vendor tree or an explicit cargo_home_source
 for checksum-verified, locked crates.io dependencies from the offline cache.
 An optional env object supplies literal build-script, env!/option_env! and test
@@ -87,8 +89,8 @@ Cargo, loader, jobserver and RABS/RCH control variables remain reserved. These
 values do not reconfigure the local preparing driver or its TLS credentials.
 Cargo metadata may run locally; builds never do. No local/RCH fallback or
 automatic execution retry occurs. After complete verified delivery, the native
-driver replays Cargo/test stdout and stderr exactly and sends its result report
-to stderr. Test stdout may include arbitrary harness output after Cargo's JSON.
+driver replays Cargo/program stdout and stderr exactly and sends its result report
+to stderr. Runtime stdout may include arbitrary bytes after Cargo's JSON.
 Direct mode durably allocates each new worker request ID under the same
 RABS_STATE_DIR; keep that state across builds. spec.json and operation.json
 record allocation intent, not an assigned ID. Its prepared bundle/request.json
@@ -1392,14 +1394,14 @@ def canonical_clippy_lints(args):
 
 
 def canonical_build_arguments(args):
-    """Preserve Cargo compilation/lint/test intent and bounded trailing arguments.
+    """Preserve Cargo compilation and execution intent with bounded arguments.
 
     Cargo's JSON reports supply actual library, metadata, binary and test names,
     including toolchain-specific intermediate and target-triple layouts.
     """
     import re
-    if not args or args[0] not in ("build", "check", "clippy", "test") or len(args) > 256:
-        raise SetupError("canonical mode requires build, check, clippy or test")
+    if not args or args[0] not in ("build", "check", "clippy", "test", "run", "bench") or len(args) > 256:
+        raise SetupError("canonical mode requires build, check, clippy, test, run or bench")
     if any(not isinstance(arg, str) or len(arg) > 4096 or "\0" in arg for arg in args):
         raise SetupError("canonical Cargo arguments exceed their bounds")
     try:
@@ -1414,14 +1416,15 @@ def canonical_build_arguments(args):
     workspace = False
     excluded = False
     test_filter = False
+    packages = 0
     selections = set()
     at = 1
     while at < len(args):
         if args[at] == "--":
             if args[0] == "clippy":
                 canonical_clippy_lints(args[at + 1:])
-            elif args[0] != "test" or no_run:
-                raise SetupError("test-harness arguments require canonical test execution")
+            elif args[0] not in ("test", "run", "bench") or no_run:
+                raise SetupError("program arguments require canonical test, run or bench execution")
             # The remaining bounded UTF-8 arguments belong to the program,
             # including strings that look like Cargo or launcher options.
             break
@@ -1440,6 +1443,12 @@ def canonical_build_arguments(args):
                         or (option, value) in selections or len(selections) >= 128):
                     raise SetupError("canonical target names must be unique literal names")
                 selections.add((option, value))
+                if args[0] == "run" and (option not in ("--bin", "--example") or len(selections) != 1):
+                    raise SetupError("canonical run selects one binary or example")
+            elif option in ("--package", "-p"):
+                packages += 1
+                if args[0] == "run" and packages > 1:
+                    raise SetupError("canonical run selects at most one package")
             elif option == "--target":
                 if target is not None or value not in (
                     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
@@ -1457,28 +1466,34 @@ def canonical_build_arguments(args):
                     raise SetupError("canonical Cargo requires one literal profile without --release")
                 profile = value
         elif not separator and option in ("--release", "-r"):
+            if args[0] == "bench":
+                raise SetupError("canonical bench defaults to release; use --profile to select a profile")
             if profile is not None:
                 raise SetupError("canonical Cargo --release conflicts with --profile")
             release = True
-        elif not separator and option == "--no-run" and args[0] == "test" and not no_run:
+        elif not separator and option == "--no-run" and args[0] in ("test", "bench") and not no_run:
             no_run = True
-        elif not separator and option == "--workspace":
+        elif not separator and option == "--workspace" and args[0] != "run":
             workspace = True
-        elif not separator and option in ("--no-fail-fast", "--doc") and args[0] == "test":
+        elif not separator and option == "--no-fail-fast" and args[0] in ("test", "bench"):
+            pass
+        elif not separator and option == "--doc" and args[0] == "test":
             pass
         elif not separator and option == "--no-deps" and args[0] == "clippy":
             pass
         elif not separator and option in ("--locked", "--offline", "--frozen", "--all-features",
-                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q",
-                                          "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets"):
+                                          "--no-default-features", "--verbose", "-v", "-vv", "--quiet", "-q"):
             pass
-        elif args[0] == "test" and not args[at].startswith("-") and not test_filter:
+        elif (not separator and args[0] != "run"
+              and option in ("--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets")):
+            pass
+        elif args[0] in ("test", "bench") and not args[at].startswith("-") and not test_filter:
             test_filter = True
         else:
             raise SetupError("unsupported canonical Cargo argument: " + args[at])
         at += 1
     if no_run and (test_filter or "--doc" in args):
-        raise SetupError("test filters and --doc require canonical test execution")
+        raise SetupError("filters and --doc require canonical execution without --no-run")
     if excluded and not workspace:
         raise SetupError("canonical --exclude requires --workspace")
     return list(args), []
@@ -1500,7 +1515,7 @@ def canonical_invocation(profile_path, args, env):
     separator = cargo_args.index("--") if "--" in cargo_args else len(cargo_args)
     trailing_args = cargo_args[separator:]
     cargo_args = cargo_args[:separator]
-    test_execution = cargo_args[0] == "test" and "--no-run" not in cargo_args
+    execution = cargo_args[0] if cargo_args[0] in ("test", "run", "bench") and "--no-run" not in cargo_args else None
     clippy = cargo_args[0] == "clippy"
     required_tools = ("cargo", "rustc", "cargo-clippy", "clippy-driver") if clippy else ("cargo", "rustc")
     profile = canonical_profile(profile_path, required_tools)
@@ -1520,9 +1535,9 @@ def canonical_invocation(profile_path, args, env):
         # The matching native contract retains compiler state privately and
         # excludes only its verified incremental roots from artifact delivery.
         # Older peers must refuse this distinct contract before execution.
-        artifact_contract = "cargo-private-incremental-test-json-v1" if test_execution else "cargo-private-incremental-json-v1"
+        artifact_contract = "cargo-private-incremental-" + (execution + "-" if execution else "") + "json-v1"
     else:
-        artifact_contract = "cargo-test-json-v1" if test_execution else "cargo-json-v1"
+        artifact_contract = "cargo-" + (execution + "-" if execution else "") + "json-v1"
     import secrets
     specification = {
         # This is LOCAL preparation intent. The combined TLS driver reserves a

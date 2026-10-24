@@ -332,7 +332,9 @@ def load_canonical_intent(root, canonical_state):
             and artifacts.get("tree") == "tree-files-v1"
             and artifacts.get("cargo") in (
                 "cargo-json-v1", "cargo-test-json-v1",
+                "cargo-run-json-v1", "cargo-bench-json-v1",
                 "cargo-private-incremental-json-v1", "cargo-private-incremental-test-json-v1",
+                "cargo-private-incremental-run-json-v1", "cargo-private-incremental-bench-json-v1",
             ),
             "prepared request is not a canonical Cargo operation")
     state_fd = open_directory(state)
