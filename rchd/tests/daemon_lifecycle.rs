@@ -314,6 +314,10 @@ mod maintenance_integration {
         use nix::sys::signal::Signal;
         const OPERATOR: &str = r#"
 import json, os, pathlib, signal, socket, sys, uuid
+# A detached test run (nohup, `&`) inherits SIGINT ignored, and Python then
+# never raises KeyboardInterrupt. Model an interactive operator explicitly.
+signal.signal(signal.SIGINT, signal.default_int_handler)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
 endpoint, ready_name, lease = sys.argv[1:]
 boot = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
 start = int(pathlib.Path('/proc/self/stat').read_text().rpartition(')')[2].split()[19])
