@@ -220,13 +220,17 @@ pub fn remote_worker_binary_paths(user: &str, declared_os: Option<&str>) -> Vec<
 /// sit to the right of where a one-word filesystem name puts them.
 ///
 /// The counts start at the first field after the name that begins three count
-/// fields (a number, `-` where df has no figure, or a negative available
-/// figure) followed by a capacity field (`N%` or `-`). Taking merely the first
-/// number misreads a name with a numeric word, such as a CIFS share
-/// `//nas/Backup 2024`, whose `2024` became the size. A line without that
-/// shape falls back to the first number or `-`, and then to no shift.
-const DF_COUNT_SHIFT: &str = "s=-1; m=\"^(-?[0-9]+|-)$\"; \
-    for(c=2;c+3<=NF;c++) if($c~m&&$(c+1)~m&&$(c+2)~m&&$(c+3)~/^([0-9]+%|-)$/){s=c-2; break}; \
+/// fields followed by a capacity field: three numbers (the available figure
+/// may be negative) and `N%` or `-`, or, where df has no figures at all, four
+/// `-`. Taking merely the first number misreads a name with a numeric word,
+/// such as a CIFS share `//nas/Backup 2024`, whose `2024` became the size. The
+/// counts are all numbers or all `-`, never a mix: otherwise Git Bash's
+/// figureless `df -Pi` line for a numbered name (`D:/Backup 2024 - - - - /d`)
+/// matched at the name's `2024`, which became the inode pool. A line without
+/// either shape falls back to the first number or `-`, and then to no shift.
+const DF_COUNT_SHIFT: &str = "s=-1; n=\"^-?[0-9]+$\"; \
+    for(c=2;c+3<=NF;c++) if(($c~n&&$(c+1)~n&&$(c+2)~n&&$(c+3)~/^([0-9]+%|-)$/) \
+    ||($c==\"-\"&&$(c+1)==\"-\"&&$(c+2)==\"-\"&&$(c+3)==\"-\")){s=c-2; break}; \
     if(s<0) for(c=2;c<=NF;c++) if($c~/^([0-9]+|-)$/){s=c-2; break}; \
     if(s<0) s=0;";
 
@@ -1233,6 +1237,8 @@ case "$FAKE_DF:$1" in
   gitbash-spaced-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nC:/Program Files/Git - - - - /\n' ;;
   numbered-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n//nas/Backup 2024 1000000 400000 600000 40%% /mnt/backup\n' ;;
   numbered-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n//nas/Backup 2024 655360 100 655260 1%% /mnt/backup\n' ;;
+  gitbash-numbered-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nD:/Backup 2024 498443260 290000000 208443260 59%% /d\n' ;;
+  gitbash-numbered-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nD:/Backup 2024 - - - - /d\n' ;;
   spaced-mount:-Pk) printf 'Filesystem     1024-blocks       Used Available Capacity  Mounted on\n/dev/disk9s1     17160192   16666636    449384    98%%   /Volumes/My Build Disk\n' ;;
   spaced-mount:-Pi) printf 'Filesystem     512-blocks       Used Available Capacity iused      ifree %%iused  Mounted on\n/dev/disk9s1     34320384   33333272    898768    98%%  604947    4493840   12%%   /Volumes/My Build Disk\n' ;;
   *:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mapper/root 2000000 400000 1600000 20%% /data\n' ;;
@@ -1361,6 +1367,26 @@ esac
             (numbered[0].available_inodes, numbered[0].total_inodes),
             (655_260, Some(655_360))
         );
+        // The same numeric word before Git Bash's figureless inode columns is
+        // not a count either: a number followed by `-` is not a count group,
+        // so the root still reads as having no inode pool rather than a
+        // 2024-inode pool with none free, which looks exhausted.
+        let gitbash_numbered = probe("gitbash-numbered-name");
+        assert_eq!(
+            (
+                gitbash_numbered[0].total_bytes,
+                gitbash_numbered[0].available_bytes
+            ),
+            (498_443_260 * 1024, 208_443_260 * 1024)
+        );
+        assert_eq!(
+            (
+                gitbash_numbered[0].available_inodes,
+                gitbash_numbered[0].total_inodes
+            ),
+            (0, Some(0))
+        );
+        assert_eq!(gitbash_numbered[0].free_inodes(), None);
         // A mount point with spaces is the last column and shifts nothing.
         let spaced_mount = probe("spaced-mount");
         assert_eq!(
