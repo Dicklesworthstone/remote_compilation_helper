@@ -233,6 +233,140 @@ pub fn observe_path(path: &std::path::Path) -> std::io::Result<MetadataObservati
     })
 }
 
+/// One directory enumeration observed during action execution (`E028`, risk `R93`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedDirectoryReaddir {
+    /// Canonical virtual directory path enumerated.
+    pub directory_path: String,
+    /// Exact sequence of entry names returned by `getdents64`/`readdir`.
+    pub raw_readdir_order: Vec<Vec<u8>>,
+    /// Whether the action consumed the raw `readdir` order without sorting
+    /// (e.g. passing `readdir` stream directly into archive/codegen/link order).
+    pub action_consumed_unsorted_order: bool,
+    /// Host-local stat/dirent metadata fields observed by the action beyond
+    /// portable content/type/exec-bit (e.g. `"st_ino"`, `"st_dev"`, `"st_mtime"`).
+    pub observed_volatile_metadata_fields: Vec<String>,
+}
+
+/// Materializer/filesystem capability for reproducing `readdir` order (`E028`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializerReaddirClass {
+    /// Virtual/FUSE/canonical overlay that always serves lexicographically
+    /// sorted directory entries regardless of backing filesystem.
+    CanonicalSortedOverlay,
+    /// Pinned materializer + filesystem image class proven to reproduce the
+    /// recorded raw `readdir` sequence.
+    PinnedFilesystemClass {
+        /// Stable identifier for the materializer/filesystem class.
+        class_tag: String,
+    },
+    /// Unpinned native host filesystem (`ext4` HTree, `xfs`, `apfs`, `tmpfs`)
+    /// whose raw `readdir` order is host/inode-allocation dependent.
+    NativeHostFilesystem,
+}
+
+/// Authority and portability decision for directory order & metadata (`E028`, `R93`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectoryOrderDisposition {
+    /// Action only depends on set membership (sorted `DirectoryEnumeration`)
+    /// and portable metadata (`ObjectProfile`), or runs under `CanonicalSortedOverlay`
+    /// with no volatile stat fields.
+    PortableDeterministic,
+    /// Action depends on raw `readdir` order, which is recorded in the closure
+    /// and restricted to the proven materializer/filesystem class.
+    RestrictedToMaterializerClass {
+        /// The materializer/filesystem class required to replay or serve.
+        required_class_tag: String,
+        /// Recorded `(directory_path, raw_readdir_order)` closure entries.
+        recorded_raw_order: Vec<(String, Vec<Vec<u8>>)>,
+    },
+    /// Action depends on unvirtualized volatile metadata (`st_ino`, `st_mtime`, …)
+    /// or raw `readdir` order on an unpinned native filesystem; classified
+    /// nonportable/volatile and denied shared cache authority.
+    ClassifiedVolatile {
+        /// Explicit diagnostic reason naming the directory and field/order sensitivity.
+        reason: String,
+        /// Resulting volatility effect class.
+        effect_class: rabs_protocol::volatility::EffectClass,
+    },
+}
+
+/// Classify observable directory order and metadata fields (`E028`, risk `R93`).
+#[must_use]
+pub fn classify_directory_order_and_metadata(
+    observations: &[ObservedDirectoryReaddir],
+    materializer: &MaterializerReaddirClass,
+) -> DirectoryOrderDisposition {
+    for obs in observations {
+        if let Some(field) = obs.observed_volatile_metadata_fields.first() {
+            return DirectoryOrderDisposition::ClassifiedVolatile {
+                reason: format!(
+                    "directory '{}' observed nonportable metadata field '{field}' (R93)",
+                    obs.directory_path
+                ),
+                effect_class: rabs_protocol::volatility::EffectClass::HostIdentitySensitive,
+            };
+        }
+    }
+
+    let mut order_sensitive: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    for obs in observations {
+        let mut sorted = obs.raw_readdir_order.clone();
+        sorted.sort_unstable();
+        let raw_differs_from_sorted = obs.raw_readdir_order != sorted;
+        if obs.action_consumed_unsorted_order && raw_differs_from_sorted {
+            order_sensitive.push((obs.directory_path.clone(), obs.raw_readdir_order.clone()));
+        } else if obs.action_consumed_unsorted_order
+            && matches!(materializer, MaterializerReaddirClass::NativeHostFilesystem)
+        {
+            // Even if a particular run happened to yield sorted entries on a
+            // native filesystem, an action that consumes unsorted readdir
+            // order without a deterministic overlay or pinned class is
+            // sensitive to native readdir drift.
+            order_sensitive.push((obs.directory_path.clone(), obs.raw_readdir_order.clone()));
+        }
+    }
+
+    if order_sensitive.is_empty() {
+        return DirectoryOrderDisposition::PortableDeterministic;
+    }
+
+    match materializer {
+        MaterializerReaddirClass::CanonicalSortedOverlay => {
+            // CanonicalSortedOverlay enforces sorted readdir order; if the raw
+            // observation already came from the canonical sorted overlay, it is
+            // portable across all CanonicalSortedOverlay workers.
+            if order_sensitive.iter().all(|(_, raw)| {
+                let mut s = raw.clone();
+                s.sort_unstable();
+                *raw == s
+            }) {
+                DirectoryOrderDisposition::PortableDeterministic
+            } else {
+                DirectoryOrderDisposition::RestrictedToMaterializerClass {
+                    required_class_tag: "canonical-sorted-overlay.v1".to_string(),
+                    recorded_raw_order: order_sensitive,
+                }
+            }
+        }
+        MaterializerReaddirClass::PinnedFilesystemClass { class_tag } => {
+            DirectoryOrderDisposition::RestrictedToMaterializerClass {
+                required_class_tag: class_tag.clone(),
+                recorded_raw_order: order_sensitive,
+            }
+        }
+        MaterializerReaddirClass::NativeHostFilesystem => {
+            let first_dir = &order_sensitive[0].0;
+            DirectoryOrderDisposition::ClassifiedVolatile {
+                reason: format!(
+                    "directory '{first_dir}' raw readdir order is observable on unpinned native filesystem (R93)"
+                ),
+                effect_class: rabs_protocol::volatility::EffectClass::Nondeterministic,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +542,75 @@ mod tests {
             );
             assert_eq!(violations, Vec::new());
         }
+    }
+
+    #[test]
+    fn e028_order_sensitive_and_volatile_metadata_fixtures_are_detected_and_restricted() {
+        let sorted_consumer = ObservedDirectoryReaddir {
+            directory_path: "/__rabs/workspace/src".into(),
+            raw_readdir_order: vec![b"z.rs".to_vec(), b"a.rs".to_vec()],
+            action_consumed_unsorted_order: false,
+            observed_volatile_metadata_fields: Vec::new(),
+        };
+        assert_eq!(
+            classify_directory_order_and_metadata(
+                std::slice::from_ref(&sorted_consumer),
+                &MaterializerReaddirClass::NativeHostFilesystem,
+            ),
+            DirectoryOrderDisposition::PortableDeterministic
+        );
+
+        // Order-sensitive consumer on an unpinned native filesystem -> ClassifiedVolatile.
+        let unsorted_consumer = ObservedDirectoryReaddir {
+            directory_path: "/__rabs/workspace/c_sources".into(),
+            raw_readdir_order: vec![b"z.c".to_vec(), b"a.c".to_vec()],
+            action_consumed_unsorted_order: true,
+            observed_volatile_metadata_fields: Vec::new(),
+        };
+        assert!(matches!(
+            classify_directory_order_and_metadata(
+                std::slice::from_ref(&unsorted_consumer),
+                &MaterializerReaddirClass::NativeHostFilesystem,
+            ),
+            DirectoryOrderDisposition::ClassifiedVolatile {
+                effect_class: rabs_protocol::volatility::EffectClass::Nondeterministic,
+                ..
+            }
+        ));
+
+        // Order-sensitive consumer under a pinned filesystem class -> RestrictedToMaterializerClass.
+        assert_eq!(
+            classify_directory_order_and_metadata(
+                std::slice::from_ref(&unsorted_consumer),
+                &MaterializerReaddirClass::PinnedFilesystemClass {
+                    class_tag: "erofs-deterministic.v1".into(),
+                },
+            ),
+            DirectoryOrderDisposition::RestrictedToMaterializerClass {
+                required_class_tag: "erofs-deterministic.v1".into(),
+                recorded_raw_order: vec![(
+                    "/__rabs/workspace/c_sources".into(),
+                    vec![b"z.c".to_vec(), b"a.c".to_vec()],
+                )],
+            }
+        );
+
+        // Volatile metadata observation (e.g., st_ino / st_mtime) -> ClassifiedVolatile even under CanonicalSortedOverlay.
+        let ino_consumer = ObservedDirectoryReaddir {
+            directory_path: "/__rabs/workspace/src".into(),
+            raw_readdir_order: vec![b"a.rs".to_vec(), b"z.rs".to_vec()],
+            action_consumed_unsorted_order: false,
+            observed_volatile_metadata_fields: vec!["st_ino".into()],
+        };
+        assert!(matches!(
+            classify_directory_order_and_metadata(
+                &[ino_consumer],
+                &MaterializerReaddirClass::CanonicalSortedOverlay,
+            ),
+            DirectoryOrderDisposition::ClassifiedVolatile {
+                effect_class: rabs_protocol::volatility::EffectClass::HostIdentitySensitive,
+                ..
+            }
+        ));
     }
 }

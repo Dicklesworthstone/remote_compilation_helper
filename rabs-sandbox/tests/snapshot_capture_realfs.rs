@@ -415,3 +415,73 @@ fn executable_mode_changes_snapshot_identity_without_changing_bytes() {
         after.provenance("workspace")
     );
 }
+
+#[test]
+fn t018_realfs_negative_dependency_mutations_invalidate_captured_closure() {
+    use rabs_sandbox::observation::{
+        NegativeDependencyInvalidation, ObservationRecord,
+        evaluate_negative_dependencies_against_tree,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture_tree(dir.path());
+
+    // Capture initial coherent snapshot where `src/optional_feature.rs` does not exist
+    // and `src/` only contains `lib.rs`.
+    let initial = capture_coherent(CaptureConfig::generation_scan(), "workspace", |_a, _p| {
+        scan_directory(dir.path(), false)
+    })
+    .unwrap();
+
+    let obs = ObservationRecord {
+        failed_opens: vec!["src/optional_feature.rs".into()],
+        ..ObservationRecord::default()
+    };
+    let negdeps = obs.to_negative_dependency_set(&[("src".into(), vec!["src/lib.rs".into()])], &[]);
+
+    let snapshot_to_tree_state = |m: &rabs_sandbox::snapshot_capture::SnapshotManifest| {
+        let existing: BTreeSet<String> = m.members.keys().cloned().collect();
+        let src_entries: Vec<String> = m
+            .members
+            .keys()
+            .filter(|k| k.starts_with("src/") && *k != "src")
+            .cloned()
+            .collect();
+        let listings = BTreeMap::from([("src".to_string(), src_entries)]);
+        (existing, listings)
+    };
+
+    let (existing0, listings0) = snapshot_to_tree_state(&initial);
+    assert!(
+        evaluate_negative_dependencies_against_tree(&negdeps, &existing0, &listings0).is_empty()
+    );
+
+    // Mutate the real directory: create `src/optional_feature.rs` (satisfies failed open AND changes `src` listing).
+    write(
+        dir.path(),
+        "src/optional_feature.rs",
+        "pub const ENABLED: bool = true;\n",
+    );
+    let after = capture_coherent(CaptureConfig::generation_scan(), "workspace", |_a, _p| {
+        scan_directory(dir.path(), false)
+    })
+    .unwrap();
+    assert_ne!(initial.manifest_sha256, after.manifest_sha256);
+
+    let (existing1, listings1) = snapshot_to_tree_state(&after);
+    let invalidations =
+        evaluate_negative_dependencies_against_tree(&negdeps, &existing1, &listings1);
+    assert!(
+        invalidations.contains(&NegativeDependencyInvalidation::NewlyPresentPath {
+            virtual_path: "src/optional_feature.rs".into(),
+        })
+    );
+    assert!(
+        invalidations.contains(&NegativeDependencyInvalidation::ListingChanged {
+            pattern: "src".into(),
+            expected: vec!["src/lib.rs".into()],
+            actual: vec!["src/lib.rs".into(), "src/optional_feature.rs".into()],
+        })
+    );
+}
