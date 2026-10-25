@@ -216,6 +216,20 @@ pub fn remote_worker_binary_paths(user: &str, declared_os: Option<&str>) -> Vec<
     ]
 }
 
+/// Awk statements that set `s`, how far a `df -P` data line's count columns
+/// sit to the right of where a one-word filesystem name puts them.
+///
+/// The counts start at the first field after the name that begins three count
+/// fields (a number, `-` where df has no figure, or a negative available
+/// figure) followed by a capacity field (`N%` or `-`). Taking merely the first
+/// number misreads a name with a numeric word, such as a CIFS share
+/// `//nas/Backup 2024`, whose `2024` became the size. A line without that
+/// shape falls back to the first number or `-`, and then to no shift.
+const DF_COUNT_SHIFT: &str = "s=-1; m=\"^(-?[0-9]+|-)$\"; \
+    for(c=2;c+3<=NF;c++) if($c~m&&$(c+1)~m&&$(c+2)~m&&$(c+3)~/^([0-9]+%|-)$/){s=c-2; break}; \
+    if(s<0) for(c=2;c<=NF;c++) if($c~/^([0-9]+|-)$/){s=c-2; break}; \
+    if(s<0) s=0;";
+
 /// Build the capability-probe shell script. It is intentionally fail-soft:
 /// every probe that errors simply omits its fact line, so a missing rustup or a
 /// broken binary shows up as *absent facts* (capability), never as a script
@@ -353,13 +367,13 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     // Column numbers count from the first count column, not from the line
     // start: a filesystem name can contain spaces (macOS `map auto_home`, Git
     // Bash `C:/Program Files/Git`, a Windows temp dir under a user name with
-    // a space), which shifts every column to the right. The first field after
-    // the name that is a number, or `-` where df has no figure, is where the
-    // counts start. A mount point with spaces is the last column and shifts
-    // nothing.
+    // a space), which shifts every column to the right. See `DF_COUNT_SHIFT`
+    // for how the first count column is found. A mount point with spaces is
+    // the last column and shifts nothing.
     // A configured future build directory may not exist yet. Measure its
     // closest existing ancestor, preserving the requested root in the fact,
     // so disk recovery can require evidence for every configured location.
+    let shift = DF_COUNT_SHIFT;
     for root in &spec.disk_roots {
         let q = shq(root);
         s.push_str(&format!(
@@ -369,12 +383,11 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
                [ \"$parent\" != \"$rp\" ] || break; rp=$parent; \
              done; \
              if [ -d \"$rp\" ]; then \
-               b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{s=0; \
-                 for(c=2;c<=NF;c++) if($c~/^([0-9]+|-)$/){{s=c-2; break}}; \
+               b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{{shift} \
                  print $(2+s)\";\"$(4+s)}}'); \
                i=$(df -Pi \"$rp\" 2>/dev/null | awk 'NR==1{{for(c=1;c<=NF;c++){{h=tolower($c); \
                  if(h==\"iused\")u=c; else if(h==\"ifree\")f=c; else if(h==\"inodes\")t=c}}}} \
-                 NR==2{{s=0; for(c=2;c<=NF;c++) if($c~/^([0-9]+|-)$/){{s=c-2; break}}; \
+                 NR==2{{{shift} \
                  if(u&&f&&!t)printf \"%s;%.0f\\n\",$(f+s),$(u+s)+$(f+s); \
                  else print $(4+s)\";\"$(2+s)}}'); \
                if [ -n \"$b\" ]; then \
@@ -1218,6 +1231,8 @@ case "$FAKE_DF:$1" in
   macos-spaced-name:-Pi) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused  Mounted on\ndevices -- file:///Data/ 2147483648 0 2147483648 0%% 600000 1400000 30%%   /Users/someone/DeviceFS\n' ;;
   gitbash-spaced-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nC:/Program Files/Git 498443260 290000000 208443260 59%% /\n' ;;
   gitbash-spaced-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nC:/Program Files/Git - - - - /\n' ;;
+  numbered-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n//nas/Backup 2024 1000000 400000 600000 40%% /mnt/backup\n' ;;
+  numbered-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n//nas/Backup 2024 655360 100 655260 1%% /mnt/backup\n' ;;
   spaced-mount:-Pk) printf 'Filesystem     1024-blocks       Used Available Capacity  Mounted on\n/dev/disk9s1     17160192   16666636    449384    98%%   /Volumes/My Build Disk\n' ;;
   spaced-mount:-Pi) printf 'Filesystem     512-blocks       Used Available Capacity iused      ifree %%iused  Mounted on\n/dev/disk9s1     34320384   33333272    898768    98%%  604947    4493840   12%%   /Volumes/My Build Disk\n' ;;
   *:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mapper/root 2000000 400000 1600000 20%% /data\n' ;;
@@ -1335,6 +1350,17 @@ esac
         );
         assert_eq!(gitbash[0].total_inodes, Some(0));
         assert!(gitbash[0].meets_inode_floor(10_000));
+        // A numeric word in the name is not the first count: the counts are
+        // the three figures before the capacity column.
+        let numbered = probe("numbered-name");
+        assert_eq!(
+            (numbered[0].total_bytes, numbered[0].available_bytes),
+            (1_000_000 * 1024, 600_000 * 1024)
+        );
+        assert_eq!(
+            (numbered[0].available_inodes, numbered[0].total_inodes),
+            (655_260, Some(655_360))
+        );
         // A mount point with spaces is the last column and shifts nothing.
         let spaced_mount = probe("spaced-mount");
         assert_eq!(
