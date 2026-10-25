@@ -2317,6 +2317,9 @@ impl RecoverySession {
                     .phases
                     .iter()
                     .any(|phase| phase.output_gate && !phase.complete))
+            || (self.recipe.exit_code == Some(0)
+                && self.recipe.returned == Some(EXIT_ARTIFACT_TRANSFER_FAILED)
+                && self.recipe.phases.iter().any(|phase| !phase.complete))
     }
     async fn discard_completion_receipts(&self) {
         // Retained source custody protects the original completion too. Keep
@@ -2706,6 +2709,137 @@ async fn recover_job_with_daemon(
     Ok(exit)
 }
 
+async fn retire_already_released_source_grant(
+    session: &mut RecoverySession,
+    writer: &DurableLeaseWriter,
+    daemon: &mut impl AsyncFnMut(&str) -> anyhow::Result<String>,
+    observed_exit: Option<i32>,
+) -> anyhow::Result<i32> {
+    if let Some(exit) = observed_exit {
+        session.completed(exit)?;
+    }
+    let retired_exit = if result_recovery::has_missing_results(&session.recipe) {
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if let Some(existing) = writer.snapshot().exit_code.filter(|code| *code != 0) {
+        existing
+    } else if observed_exit == Some(0) || session.recipe.exit_code == Some(0) {
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else {
+        observed_exit
+            .or(session.recipe.exit_code)
+            .unwrap_or(EXIT_BUILD_ERROR)
+    };
+    tracing::warn!(
+        identity = %session.recipe.identity,
+        worker = %session.recipe.worker.id,
+        ?observed_exit,
+        retired_exit,
+        "source grant was already released before outputs were returned; retiring lease without reopening worker paths"
+    );
+    if !session.recipe.tree_retired {
+        session.tree_retired()?;
+    }
+    if !session.recipe.pair_released {
+        session.pair_released()?;
+    }
+    if !session.recipe.sources_released {
+        session.sources_released()?;
+    }
+    session.returned(retired_exit)?;
+    session.retired()?;
+    session.discard_completion_receipts().await;
+    writer.record_exit(retired_exit)?;
+    recovery_completion::finish(writer, daemon).await?;
+    Ok(retired_exit)
+}
+
+async fn settle_already_released_source_grant(
+    session: &mut RecoverySession,
+    writer: &DurableLeaseWriter,
+    daemon: &mut impl AsyncFnMut(&str) -> anyhow::Result<String>,
+    observed_exit: Option<i32>,
+) -> anyhow::Result<Option<i32>> {
+    if session.recipe.returned.is_some()
+        || session.recipe.source_roots.is_empty()
+        || (session.recipe.retained_root.is_some() && !session.recipe.tree_retired)
+    {
+        return Ok(None);
+    }
+    let worker = session.recipe.worker.clone();
+    if !session.recipe.sources_released
+        && !super::super::ssh::remote_source_authority_was_released(
+            &worker,
+            &session.recipe.source_roots,
+            &session.recipe.identity,
+        )
+        .await?
+    {
+        return Ok(None);
+    }
+    if !session.recipe.pair_released
+        && let Some((root, token)) = session.recipe.pair.clone()
+        && !super::super::ssh::clean_overlay_source_pair_was_released(&worker, &root, &token)
+            .await?
+    {
+        return Ok(None);
+    }
+    retire_already_released_source_grant(session, writer, daemon, observed_exit)
+        .await
+        .map(Some)
+}
+
+/// Whether a local `session.publish` error in detached recovery (`recover_owned_job_with_daemon`)
+/// is a permanent local output-tree / `.rch-return` refusal that cannot improve on retry.
+///
+/// Transient or environmental errors (cancellation, lock contention, alias race while waiting
+/// for the lock, storage exhaustion, or journal write failures) return `false` so recovery
+/// keeps the source claim and remains retryable. Permanent local output-tree refusals
+/// (e.g. a dangling symlink in `phase.local`, a pre-`96ca9bf3` `0644` `.rch-return-<id>`
+/// temporary, a symlinked ancestor inside the output root, or conflicting local ownership)
+/// return `true` so `recover_owned_job_with_daemon` can retire the build as
+/// `EXIT_ARTIFACT_TRANSFER_FAILED`, release the worker source claim, and retain the staged
+/// outputs locally (`bd-7e3bt`).
+fn publication_failure_is_terminal_in_recovery(error: &anyhow::Error) -> bool {
+    if error.is::<publication_runtime::PublicationCancelled>() {
+        return false;
+    }
+    let detail = format!("{error:#}");
+    const TERMINAL_REFUSALS: &[&str] = &[
+        "cannot resolve existing output root entry ",
+        "output publication root has a non-directory component:",
+        "output publication requires a Unix directory path:",
+        "retained output is not a private partial copy or a complete correctly-permissioned copy",
+        "retained publication copy is not the exact staged prefix",
+        "publication copy identity, length, permissions or links changed",
+        "publication copy directory changed",
+        "retained publication prefix changed during validation",
+        "publication copy changed before writable open",
+        "retained temporary is not a regular file",
+        "retained output temporary is not a regular file:",
+        "retained output temporary permissions or links changed:",
+        "retained output temporary permissions changed",
+        "held retained temporary permissions differ from staged output",
+        "prepared output is not a regular file",
+        "prepared output identity, permissions or links changed",
+        "prepared output bytes changed:",
+        "prepared output length changed",
+        "output ownership changed at ",
+        "interrupted output publication cannot prove ownership at ",
+        "output changed while publishing ",
+        "output is not a regular file:",
+        "output ancestor is a symlink:",
+        "output ancestor is not a directory:",
+        "output ancestor escaped its phase root",
+        "output parent is not a directory",
+        "output publication requires a root-relative file path",
+        "internal source archive has a pending publication",
+        "outside the artifact policy",
+    ];
+    TERMINAL_REFUSALS
+        .iter()
+        .any(|needle| detail.contains(needle))
+}
+
 async fn recover_owned_job_with_daemon(
     writer: &DurableLeaseWriter,
     mut daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
@@ -2761,6 +2895,12 @@ async fn recover_owned_job_with_daemon(
         recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(exit);
     }
+    if session.recipe.sources_released
+        && (session.recipe.pair.is_none() || session.recipe.pair_released)
+        && (session.recipe.retained_root.is_none() || session.recipe.tree_retired)
+    {
+        return retire_already_released_source_grant(&mut session, writer, &mut daemon, None).await;
+    }
     let worker = session.recipe.worker.clone();
     let base = TransferPipeline::new(
         session.recipe.project_root.clone(),
@@ -2782,6 +2922,12 @@ async fn recover_owned_job_with_daemon(
             )
             .await?
         {
+            if let Some(retired_exit) =
+                settle_already_released_source_grant(&mut session, writer, &mut daemon, None)
+                    .await?
+            {
+                return Ok(retired_exit);
+            }
             tracing::warn!(
                 identity = %session.recipe.identity,
                 worker = %worker.id,
@@ -2821,6 +2967,11 @@ async fn recover_owned_job_with_daemon(
         writer.record_exit(EXIT_BUILD_ERROR)?;
         recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(EXIT_BUILD_ERROR);
+    }
+    if let Some(retired_exit) =
+        settle_already_released_source_grant(&mut session, writer, &mut daemon, Some(exit)).await?
+    {
+        return Ok(retired_exit);
     }
     let mut pair = if let Some((root, token)) = &session.recipe.pair {
         Some(
@@ -3064,7 +3215,18 @@ async fn recover_owned_job_with_daemon(
                 }
             }
         }
-        session.publish(&phase.name).await?;
+        if let Err(error) = session.publish(&phase.name).await {
+            if !publication_failure_is_terminal_in_recovery(&error) {
+                return Err(error);
+            }
+            eprintln!(
+                "[RCH] recovered output publication refused ({}): {error:#}; \
+                 treating the recovered build as failed (exit {EXIT_ARTIFACT_TRANSFER_FAILED})",
+                phase.name
+            );
+            exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+            break;
+        }
     }
     // Publication is the durable terminal boundary. Retirement can be retried
     // independently and must never cause a second output write.
@@ -6337,6 +6499,172 @@ mod tests {
                 .set_recovery(serde_json::to_value(changed).unwrap())
                 .unwrap();
             assert!(load_recipe(&writer).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn already_released_source_grant_settles_without_reopening_worker_paths() {
+        let _guard = test_guard!();
+        for (observed_exit, expected_exit) in [
+            (None, EXIT_BUILD_ERROR),
+            (Some(0), EXIT_ARTIFACT_TRANSFER_FAILED),
+            (Some(101), 101),
+        ] {
+            let mut wrapper = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+            let wrapper_pid = wrapper.id();
+            assert!(wrapper.wait().unwrap().success());
+
+            let (_directory, writer, worker) = preparation_fixture();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&writer).unwrap(),
+                writer: writer.clone(),
+            };
+            session.recipe.prepared = true;
+            session.starting_execution().unwrap();
+            {
+                let mut lease = session.writer.lease.lock().unwrap();
+                lease.wrapper_pid = wrapper_pid;
+                lease.process_start_ticks = None;
+                lease.boot_id = None;
+                lease.process_birth = None;
+            }
+            session.persist().unwrap();
+            let wrapper_id = session.writer.snapshot().identity.local_wrapper_id;
+            let worker_id = worker.id.as_str().to_owned();
+            let owned = recovery_owner::claim(&session.writer).await.unwrap();
+            let mut claimed_session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            let mut daemon = async |_request: &str| {
+                Ok(format!(
+                    "HTTP/1.1 200 OK\r\n\r\n{}",
+                    serde_json::json!({
+                        "status": "completed",
+                        "local_wrapper_id": wrapper_id,
+                        "record": {
+                            "id": 41,
+                            "worker_id": worker_id,
+                            "exit_code": expected_exit
+                        }
+                    })
+                ))
+            };
+            let retired = retire_already_released_source_grant(
+                &mut claimed_session,
+                &owned,
+                &mut daemon,
+                observed_exit,
+            )
+            .await
+            .unwrap();
+            assert_eq!(retired, expected_exit);
+            let settled_lease = owned.snapshot();
+            assert!(settled_lease.terminal_acknowledged);
+            assert_eq!(settled_lease.exit_code, Some(expected_exit));
+            let settled_recipe = load_recipe(&owned).unwrap();
+            assert!(settled_recipe.tree_retired);
+            assert!(settled_recipe.pair_released);
+            assert!(settled_recipe.sources_released);
+            assert!(settled_recipe.retired);
+            assert_eq!(settled_recipe.returned, Some(expected_exit));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permanent_local_publication_refusals_are_classified_terminal_in_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_guard!();
+
+        // 1. Dangling symlink in output root path (Class 2: e.g. /data -> absent)
+        {
+            let (directory, _stage_owner, mut session) = publication_fixture();
+            let dangling = directory.path().join("dangling-data");
+            std::os::unix::fs::symlink(directory.path().join("missing-mount"), &dangling).unwrap();
+            session.recipe.phases[0].local = dangling.join("projects/frankenterm/target");
+            let stage = session.stage(0);
+            std::fs::create_dir_all(stage.join("build")).unwrap();
+            std::fs::write(stage.join("build/app"), b"compiled artifact").unwrap();
+            session.persist().unwrap();
+
+            let err = session.publish("project").await.unwrap_err();
+            assert!(
+                publication_failure_is_terminal_in_recovery(&err),
+                "dangling output root symlink must be terminal in recovery: {err:#}"
+            );
+        }
+
+        // 2. Pre-96ca9bf3 0644 .rch-return-<id> partial temporary (Class 3)
+        {
+            let (_directory, _stage_owner, mut session) = publication_fixture();
+            let local = session.recipe.project_root.clone();
+            let stage = session.stage(0);
+            std::fs::create_dir_all(local.join("build")).unwrap();
+            std::fs::create_dir_all(stage.join("build")).unwrap();
+            std::fs::write(stage.join("build/app"), b"complete staged binary payload").unwrap();
+            let legacy_temp = local
+                .join("build")
+                .join(format!(".rch-return-{}", session.recipe.identity));
+            std::fs::write(&legacy_temp, b"complete").unwrap();
+            std::fs::set_permissions(&legacy_temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+            session.persist().unwrap();
+
+            let err = session.publish("project").await.unwrap_err();
+            assert!(
+                publication_failure_is_terminal_in_recovery(&err),
+                "0644 partial .rch-return temporary must be terminal in recovery: {err:#}"
+            );
+            assert!(
+                session
+                    .returned(EXIT_ARTIFACT_TRANSFER_FAILED)
+                    .map(|()| {
+                        session.recipe.exit_code = Some(0);
+                        session.retain_failed_delivery_evidence()
+                    })
+                    .unwrap(),
+                "terminal failed delivery in recovery must retain staged outputs"
+            );
+        }
+
+        // 3. Symlinked output ancestor inside output root
+        {
+            let (directory, _stage_owner, mut session) = publication_fixture();
+            let local = session.recipe.project_root.clone();
+            let elsewhere = directory.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, local.join("build")).unwrap();
+            let stage = session.stage(0);
+            std::fs::create_dir_all(stage.join("build")).unwrap();
+            std::fs::write(stage.join("build/app"), b"output").unwrap();
+            session.persist().unwrap();
+
+            let err = session.publish("project").await.unwrap_err();
+            assert!(
+                publication_failure_is_terminal_in_recovery(&err),
+                "symlinked output ancestor must be terminal in recovery: {err:#}"
+            );
+        }
+
+        // 4. Retryable errors (cancellation, lock contention, storage full) must NOT be terminal
+        for retryable in [
+            anyhow::Error::new(publication_runtime::PublicationCancelled),
+            anyhow::anyhow!(
+                "output publication into /tmp/target is held by another wrapper: Resource temporarily unavailable"
+            ),
+            anyhow::anyhow!(
+                "output root changed while waiting for publication ownership: /tmp/target; journal retained"
+            ),
+            anyhow::anyhow!(
+                "insufficient controller publication storage: need 4096 additional bytes, available 0; staged output and retained copy remain retryable"
+            ),
+        ] {
+            assert!(
+                !publication_failure_is_terminal_in_recovery(&retryable),
+                "retryable error was misclassified as terminal: {retryable:#}"
+            );
         }
     }
 }

@@ -51,10 +51,10 @@ fn deadline(budget: Duration) -> io::Result<Instant> {
 }
 fn check_deadline(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
-        Err(io::Error::new(
+        Err(worker_transport_error(io::Error::new(
             io::ErrorKind::TimedOut,
             "worker exchange deadline exceeded",
-        ))
+        )))
     } else {
         Ok(())
     }
@@ -284,7 +284,7 @@ fn accept_one(listener: &TcpListener, budget: Duration) -> io::Result<TcpStream>
                 std::thread::sleep(POLL_INTERVAL)
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(worker_transport_error(error)),
         }
     }
 }
@@ -381,17 +381,17 @@ impl WorkerPeer for TcpPeer {
             check_deadline(self.until)?;
             match self.stream.write(&bytes[offset..]) {
                 Ok(0) => {
-                    return Err(io::Error::new(
+                    return Err(worker_transport_error(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "worker frame made no progress",
-                    ));
+                    )));
                 }
                 Ok(n) => offset += n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(POLL_INTERVAL)
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(worker_transport_error(error)),
             }
         }
         Ok(())
@@ -414,21 +414,21 @@ impl WorkerPeer for TcpPeer {
             let capacity = bytes.len().min(MAX_FRAME_BYTES + 1 - self.buffered.len());
             match self.stream.read(&mut bytes[..capacity]) {
                 Ok(0) => {
-                    return Err(io::Error::new(
+                    return Err(worker_transport_error(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         if self.buffered.is_empty() {
                             "worker disconnected before response"
                         } else {
                             "truncated worker frame"
                         },
-                    ));
+                    )));
                 }
                 Ok(n) => self.buffered.extend_from_slice(&bytes[..n]),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(POLL_INTERVAL)
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(worker_transport_error(error)),
             }
         }
     }

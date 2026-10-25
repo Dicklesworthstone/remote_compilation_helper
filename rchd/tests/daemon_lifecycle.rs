@@ -26,15 +26,33 @@ fn project_root() -> PathBuf {
     manifest_dir.parent().unwrap().to_path_buf()
 }
 
+/// Get the resolved Cargo target directory for this test run
+fn cargo_target_dir() -> PathBuf {
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        let path = PathBuf::from(target_dir);
+        if path.is_absolute() {
+            return path;
+        }
+        return project_root().join(path);
+    }
+    let compiled = PathBuf::from(env!("CARGO_BIN_EXE_rchd"));
+    for ancestor in compiled.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some("debug")
+            && let Some(target_dir) = ancestor.parent()
+        {
+            return target_dir.to_path_buf();
+        }
+    }
+    project_root().join("target")
+}
+
 /// Get the path to the rchd binary
 fn rchd_binary_path() -> PathBuf {
-    // Respect CARGO_TARGET_DIR if set, otherwise use default target/debug
-    let target_dir = if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        PathBuf::from(target_dir)
-    } else {
-        project_root().join("target")
-    };
-    target_dir.join("debug").join("rchd")
+    let compiled = PathBuf::from(env!("CARGO_BIN_EXE_rchd"));
+    if compiled.is_file() {
+        return compiled;
+    }
+    cargo_target_dir().join("debug").join("rchd")
 }
 
 /// Send a request to the daemon via Unix socket and get the response body
@@ -145,6 +163,39 @@ mod maintenance_integration {
         }
     }
 
+    fn ensure_rch_cli() -> &'static Path {
+        static RCH_CLI: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        RCH_CLI
+            .get_or_init(|| {
+                let target_dir = cargo_target_dir();
+                let cli = target_dir.join("debug").join("rch");
+                if cli.is_file() {
+                    return cli;
+                }
+                // Avoid deadlocking on `<target_dir>/debug/.cargo-lock` held by
+                // the parent `cargo test` process when `daemon_lifecycle` is
+                // invoked without a prior `cargo build --bin rch`.
+                let helper_target = target_dir.join("rch-cli-target");
+                let helper_cli = helper_target.join("debug").join("rch");
+                if !helper_cli.is_file() {
+                    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+                    let _ = Command::new(cargo)
+                        .current_dir(project_root())
+                        .env("CARGO_TARGET_DIR", &helper_target)
+                        .env("CARGO_BUILD_BUILD_DIR", &helper_target)
+                        .args(["build", "-p", "rch", "--bin", "rch", "--quiet"])
+                        .status();
+                }
+                assert!(
+                    helper_cli.is_file(),
+                    "build the rch CLI before Linux lifecycle tests: {}",
+                    cli.display()
+                );
+                helper_cli
+            })
+            .as_path()
+    }
+
     struct Fixture {
         daemon: OwnedChild,
         root: tempfile::TempDir,
@@ -240,13 +291,8 @@ mod maintenance_integration {
         }
 
         fn cli(&self, args: &[&str]) -> OwnedChild {
-            let cli = rchd_binary_path().with_file_name("rch");
-            assert!(
-                cli.is_file(),
-                "build the rch CLI before Linux lifecycle tests: {}",
-                cli.display()
-            );
-            let child = Self::command(self.root.path(), &self.socket, &cli)
+            let cli = ensure_rch_cli();
+            let child = Self::command(self.root.path(), &self.socket, cli)
                 .args(["--json", "--no-self-healing"])
                 .args(args)
                 .stdout(Stdio::piped())
@@ -349,6 +395,9 @@ ready = pathlib.Path(ready_name)
 pending = ready.with_suffix('.pending')
 pending.write_text(json.dumps(renewed))
 pending.replace(ready)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT, signal.SIGTERM])
+signal.signal(signal.SIGINT, signal.default_int_handler)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
 while True:
     signal.pause()
 "#;
@@ -484,6 +533,7 @@ while True:
     #[test]
     fn linux_interrupted_drains_reopen_without_releasing_concurrent_maintenance() {
         use nix::sys::signal::Signal;
+        let _ = ensure_rch_cli();
         let fixture = Fixture::new();
         fixture.write_lease(&fixture.lease(false));
         for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGKILL] {

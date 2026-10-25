@@ -500,6 +500,40 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             emit(ctx, &report)?;
             return Ok(());
         }
+        if !cancel
+            && recover
+            && lease.identity.remote_build_id.is_none()
+            && lease.worker_id.is_none()
+            && lease.recovery.is_none()
+            && owner_presence(&lease) == OwnerPresence::Absent
+        {
+            anyhow::ensure!(
+                crate::hook::daemon_absence_is_conclusive(&lease, crate::hook::unix_ms_now()),
+                "original wrapper is absent before daemon admission; acknowledgement waits until the lease is 24h old"
+            );
+            let latest_writer = within_job_deadline(
+                deadline,
+                "terminal journal ownership",
+                writer.claim_recovery(),
+            )
+            .await?;
+            if !settle_absent_pre_admission(&lease, &latest_writer, crate::hook::unix_ms_now())? {
+                wait_for_job_poll(deadline).await?;
+                continue;
+            }
+            let settled = latest_writer.snapshot();
+            emit(
+                ctx,
+                &json!({
+                    "status": "failed_before_admission",
+                    "identity": settled.identity,
+                    "exit_code": null,
+                    "terminal_acknowledged": true,
+                    "admission": null,
+                }),
+            )?;
+            return Ok(());
+        }
         if !cancel && waiting_for_admission(&lease, process_matches(&lease))? {
             wait_for_job_poll(deadline).await?;
             continue;
@@ -725,6 +759,24 @@ fn settle_absent_not_found_without_recovery(
     writer.record_exit(code)?;
     writer.acknowledge_terminal()?;
     Ok(Some(code))
+}
+
+#[cfg(unix)]
+fn settle_absent_pre_admission(
+    observed: &DurableJobLease,
+    writer: &crate::hook::DurableLeaseWriter,
+    now_unix_ms: u64,
+) -> Result<bool> {
+    let latest = writer.snapshot();
+    if !same_unfinished_owner_without_recovery(observed, &latest) {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        latest.identity.remote_build_id.is_none() && latest.worker_id.is_none(),
+        "pre-admission recovery cannot retire an admitted lease"
+    );
+    writer.settle_abandoned_pre_admission(now_unix_ms)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1600,5 +1652,58 @@ mod tests {
         let settled = writer.snapshot();
         assert!(settled.terminal_acknowledged);
         assert_eq!(settled.exit_code, Some(101));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_admission_dead_lease_waits_24h_then_settles_failed_before_admission() {
+        for phase in [
+            "queued",
+            "selection_pending",
+            "selection_unconfirmed",
+            "restart_admission_wait",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let writer = crate::hook::DurableLeaseWriter::create_in(
+                directory.path(),
+                "cargo test",
+                true,
+                false,
+            )
+            .unwrap();
+            writer.heartbeat(phase).unwrap();
+            let observed = writer.snapshot();
+            let heartbeat = observed.heartbeat_unix_ms;
+            let twenty_four_hours_ms = 24 * 60 * 60 * 1000;
+
+            let premature = settle_absent_pre_admission(
+                &observed,
+                &writer,
+                heartbeat + twenty_four_hours_ms - 1,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{premature:#}").contains("waits until the lease is 24h old"),
+                "{phase}: {premature:#}"
+            );
+            assert!(!writer.snapshot().terminal_acknowledged);
+            assert_eq!(
+                writer.snapshot().state,
+                rch_common::job_identity::JobLifecycleState::Queued
+            );
+
+            let settled_ok =
+                settle_absent_pre_admission(&observed, &writer, heartbeat + twenty_four_hours_ms)
+                    .unwrap();
+            assert!(settled_ok, "{phase}");
+            let settled = writer.snapshot();
+            assert!(settled.terminal_acknowledged);
+            assert_eq!(settled.exit_code, None);
+            assert_eq!(settled.phase, "failed_before_admission");
+            assert_eq!(
+                settled.state,
+                rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission
+            );
+        }
     }
 }

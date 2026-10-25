@@ -83,6 +83,8 @@ use rabs_protocol::serving::{
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
+use rabs_scheduler::acquisition_order::{GrantRefusal, RootGrant, TransferableToken};
+use rabs_scheduler::fairness::{FairQueue, TenantKey};
 use rabs_scheduler::speculation_brownout::{
     BrownoutDecision, PressureBand, SpeculationProvenance, WorkCategory, band, decide,
 };
@@ -1142,6 +1144,120 @@ pub const GIT_PREWARM_RECEIPT_KIND: &str = "q007_git_prewarm_event";
 /// prewarm publication is promoted (`rabsd::coord::live`).
 pub const CI_CANONICAL_PREWARM_RECEIPT_KIND: &str = "q008_ci_canonical_prewarm";
 
+/// Durable `decision_receipts` kind written whenever the live Cargo root-permit
+/// broker admits, refuses, or completes a Cargo root (`bd-d4uqa` / `T016`).
+pub const CARGO_ROOT_BROKER_RECEIPT_KIND: &str = "cargo_root_permit_broker";
+
+/// Receipt emitted when a Cargo build request is enqueued in the live root-permit broker (`bd-d4uqa`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootEnqueueReceipt {
+    /// Owning tenant across fairness dimensions.
+    pub tenant: TenantKey,
+    /// Unique Cargo root invocation identifier.
+    pub root_id: String,
+    /// Enqueue tick.
+    pub enqueued_at: u64,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Receipt emitted when the live Cargo root-permit broker grants a root permit (`bd-d4uqa` / `T016`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootGrantReceipt {
+    /// Owning tenant.
+    pub tenant: TenantKey,
+    /// Granted Cargo root invocation identifier.
+    pub root_id: String,
+    /// Granted root capacity `C` (`1` implicit + `C - 1` transferable jobserver tokens).
+    pub capacity: u32,
+    /// Enqueue-to-grant wait time in ticks.
+    pub wait_ticks: u64,
+    /// Active Cargo roots after this grant (`<= max_concurrent_cargo_roots`).
+    pub active_cargo_roots: u32,
+    /// Configured ceiling on concurrent Cargo roots (`T016`).
+    pub max_concurrent_cargo_roots: u32,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Receipt emitted when an active Cargo root completes and releases its root grant (`bd-d4uqa`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootCompletionReceipt {
+    /// Completed Cargo root invocation identifier.
+    pub root_id: String,
+    /// Active Cargo roots remaining after completion.
+    pub active_cargo_roots: u32,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Live telemetry snapshot for the coordinator's Cargo root-permit broker (`bd-d4uqa` / `T016`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootBrokerTelemetry {
+    /// Maximum concurrent Cargo roots allowed by policy (`T016`).
+    pub max_concurrent_cargo_roots: u32,
+    /// Per-root capacity `C` (`1` implicit + `C - 1` transferable tokens).
+    pub per_root_capacity: u32,
+    /// Currently active Cargo roots holding an open `RootGrant`.
+    pub active_cargo_roots: u32,
+    /// High-water mark of active Cargo roots observed (`must be <= max_concurrent_cargo_roots`).
+    pub peak_active_cargo_roots: u32,
+    /// Requests currently waiting in the weighted fair queue.
+    pub queued_requests: u64,
+    /// Total requests enqueued.
+    pub total_enqueued: u64,
+    /// Total root permits granted.
+    pub total_granted: u64,
+    /// Total root permits completed and released.
+    pub total_completed: u64,
+    /// Total admission attempts deferred/refused because `active_cargo_roots == max_concurrent_cargo_roots`.
+    pub total_root_cap_refusals: u64,
+    /// Hard starvation bound in ticks configured on the `FairQueue`.
+    pub starvation_bound: u64,
+    /// Worst observed enqueue-to-grant lag per agent (`agent -> max_wait_ticks`).
+    pub worst_lag_by_agent: BTreeMap<String, u64>,
+    /// Count of granted items whose wait exceeded `starvation_bound`.
+    pub starvation_violations: u64,
+    /// Service order of granted `root_id`s for deterministic replay auditing.
+    pub granted_order: Vec<String>,
+}
+
+struct CargoRootBrokerState {
+    max_concurrent_cargo_roots: u32,
+    per_root_capacity: u32,
+    queue: FairQueue,
+    queued_count: u64,
+    active_grants: BTreeMap<String, RootGrant>,
+    peak_active_cargo_roots: u32,
+    total_enqueued: u64,
+    total_granted: u64,
+    total_completed: u64,
+    total_root_cap_refusals: u64,
+    worst_lag_by_agent: BTreeMap<String, u64>,
+    starvation_violations: u64,
+    granted_order: Vec<String>,
+}
+
+impl Default for CargoRootBrokerState {
+    fn default() -> Self {
+        Self {
+            max_concurrent_cargo_roots: 4,
+            per_root_capacity: 4,
+            queue: FairQueue::new(64, 16),
+            queued_count: 0,
+            active_grants: BTreeMap::new(),
+            peak_active_cargo_roots: 0,
+            total_enqueued: 0,
+            total_granted: 0,
+            total_completed: 0,
+            total_root_cap_refusals: 0,
+            worst_lag_by_agent: BTreeMap::new(),
+            starvation_violations: 0,
+            granted_order: Vec::new(),
+        }
+    }
+}
+
 /// Git / workspace lifecycle event triggering prewarm (bead Q007; plan §15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitPrewarmEventKind {
@@ -1331,6 +1447,7 @@ pub struct CoordLive {
     speculation_runs: Mutex<Vec<SpeculationRunRecord>>,
     speculation_gate: Mutex<SpeculationGateState>,
     prewarm_state: Mutex<PrewarmCoordinatorState>,
+    cargo_root_broker: Mutex<CargoRootBrokerState>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -2270,6 +2387,322 @@ impl CoordLive {
                 required_tier,
             })
         }
+    }
+
+    /// Configure the live Cargo root-permit broker and weighted fair queue (`bd-d4uqa` / `T016`).
+    pub fn configure_cargo_root_broker(
+        &self,
+        max_concurrent_cargo_roots: u32,
+        per_root_capacity: u32,
+        starvation_bound: u64,
+        deadline_window: u64,
+    ) -> Result<(), SubmissionRefusal> {
+        if max_concurrent_cargo_roots == 0 || per_root_capacity == 0 {
+            return Err(SubmissionRefusal::Admission(
+                "cargo root broker capacities must be non-zero".to_owned(),
+            ));
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        broker.max_concurrent_cargo_roots = max_concurrent_cargo_roots;
+        broker.per_root_capacity = per_root_capacity;
+        broker.queue = FairQueue::new(starvation_bound, deadline_window);
+        broker.queued_count = 0;
+        broker.active_grants.clear();
+        broker.peak_active_cargo_roots = 0;
+        broker.total_enqueued = 0;
+        broker.total_granted = 0;
+        broker.total_completed = 0;
+        broker.total_root_cap_refusals = 0;
+        broker.worst_lag_by_agent.clear();
+        broker.starvation_violations = 0;
+        broker.granted_order.clear();
+        Ok(())
+    }
+
+    /// Set a tenant's scheduling weight in the live Cargo root-permit broker (`bd-d4uqa`).
+    pub fn set_cargo_root_tenant_weight(
+        &self,
+        tenant: TenantKey,
+        weight: u64,
+    ) -> Result<(), SubmissionRefusal> {
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        broker.queue.set_weight(tenant, weight);
+        Ok(())
+    }
+
+    /// Enqueue a Cargo root request into the live coordinator's weighted fair queue (`bd-d4uqa`).
+    pub fn enqueue_cargo_root_request(
+        &self,
+        tenant: TenantKey,
+        root_id: &str,
+        cost: u64,
+        now_tick: u64,
+        deadline: Option<u64>,
+    ) -> Result<CargoRootEnqueueReceipt, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() || self.authority().is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        if root_id.is_empty() {
+            return Err(SubmissionRefusal::Admission(
+                "root_id must not be empty".to_owned(),
+            ));
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        broker
+            .queue
+            .enqueue(tenant.clone(), root_id, cost, now_tick, deadline);
+        broker.queued_count = broker.queued_count.saturating_add(1);
+        broker.total_enqueued = broker.total_enqueued.saturating_add(1);
+        drop(broker);
+
+        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(cas) = self.cas.as_ref() {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    CARGO_ROOT_BROKER_RECEIPT_KIND,
+                    root_id,
+                    receipt_seq,
+                    "enqueued",
+                    &format!(
+                        "agent={} project={} ci={} cost={} tick={}",
+                        tenant.agent, tenant.project, tenant.ci, cost, now_tick
+                    ),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("broker enqueue receipt: {error:?}"))
+                })?;
+        }
+        Ok(CargoRootEnqueueReceipt {
+            tenant,
+            root_id: root_id.to_owned(),
+            enqueued_at: now_tick,
+            receipt_seq,
+        })
+    }
+
+    /// Admit the next Cargo root from the weighted fair queue if active root capacity permits (`bd-d4uqa` / `T016`).
+    ///
+    /// Enforces `active_cargo_roots <= max_concurrent_cargo_roots`: when at capacity, records a
+    /// durable `"root_cap_reached"` receipt and returns `Ok(None)` without opening a grant.
+    pub fn admit_next_cargo_root(
+        &self,
+        now_tick: u64,
+    ) -> Result<Option<CargoRootGrantReceipt>, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() || self.authority().is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let active_count = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
+        if active_count >= broker.max_concurrent_cargo_roots {
+            broker.total_root_cap_refusals = broker.total_root_cap_refusals.saturating_add(1);
+            let max_roots = broker.max_concurrent_cargo_roots;
+            drop(broker);
+
+            let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            if let Some(cas) = self.cas.as_ref() {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| SubmissionRefusal::Unavailable)?;
+                store
+                    .record_decision_receipt(
+                        CARGO_ROOT_BROKER_RECEIPT_KIND,
+                        "broker_capacity_gate",
+                        receipt_seq,
+                        "root_cap_reached",
+                        &format!(
+                            "active_cargo_roots={active_count} max_concurrent_cargo_roots={max_roots} tick={now_tick}"
+                        ),
+                    )
+                    .map_err(|error| {
+                        SubmissionRefusal::Admission(format!(
+                            "broker cap refusal receipt: {error:?}"
+                        ))
+                    })?;
+            }
+            return Ok(None);
+        }
+
+        let Some(item) = broker.queue.dequeue(now_tick) else {
+            return Ok(None);
+        };
+        broker.queued_count = broker.queued_count.saturating_sub(1);
+        let capacity = broker.per_root_capacity;
+        let grant = RootGrant::open(capacity).map_err(|error| {
+            SubmissionRefusal::Admission(format!("root grant open failed: {error:?}"))
+        })?;
+        let root_id = item.label.clone();
+        broker.active_grants.insert(root_id.clone(), grant);
+        let new_active = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
+        if new_active > broker.peak_active_cargo_roots {
+            broker.peak_active_cargo_roots = new_active;
+        }
+        let wait_ticks = now_tick.saturating_sub(item.enqueued_at);
+        if wait_ticks > broker.queue.starvation_bound {
+            broker.starvation_violations = broker.starvation_violations.saturating_add(1);
+        }
+        broker
+            .worst_lag_by_agent
+            .entry(item.tenant.agent.clone())
+            .and_modify(|worst| *worst = (*worst).max(wait_ticks))
+            .or_insert(wait_ticks);
+        broker.total_granted = broker.total_granted.saturating_add(1);
+        broker.granted_order.push(root_id.clone());
+        let max_roots = broker.max_concurrent_cargo_roots;
+        drop(broker);
+
+        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(cas) = self.cas.as_ref() {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    CARGO_ROOT_BROKER_RECEIPT_KIND,
+                    &root_id,
+                    receipt_seq,
+                    "root_granted",
+                    &format!(
+                        "agent={} capacity={} wait_ticks={} active={}/{}",
+                        item.tenant.agent, capacity, wait_ticks, new_active, max_roots
+                    ),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("broker grant receipt: {error:?}"))
+                })?;
+        }
+
+        Ok(Some(CargoRootGrantReceipt {
+            tenant: item.tenant,
+            root_id,
+            capacity,
+            wait_ticks,
+            active_cargo_roots: new_active,
+            max_concurrent_cargo_roots: max_roots,
+            receipt_seq,
+        }))
+    }
+
+    /// Issue one transferable jobserver token from an active Cargo root's `C - 1` budget (`bd-d4uqa`).
+    pub fn issue_cargo_jobserver_token(
+        &self,
+        root_id: &str,
+    ) -> Result<Result<TransferableToken, GrantRefusal>, SubmissionRefusal> {
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let Some(grant) = broker.active_grants.get_mut(root_id) else {
+            return Ok(Err(GrantRefusal::GrantClosed));
+        };
+        Ok(grant.issue_transferable())
+    }
+
+    /// Release one transferable jobserver token back to an active Cargo root (`bd-d4uqa`).
+    pub fn release_cargo_jobserver_token(
+        &self,
+        root_id: &str,
+        token: &TransferableToken,
+    ) -> Result<Result<(), GrantRefusal>, SubmissionRefusal> {
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let Some(grant) = broker.active_grants.get_mut(root_id) else {
+            return Ok(Err(GrantRefusal::GrantClosed));
+        };
+        Ok(grant.release(token))
+    }
+
+    /// Complete an active Cargo root, closing its `RootGrant` and freeing one root slot (`bd-d4uqa`).
+    pub fn complete_cargo_root(
+        &self,
+        root_id: &str,
+        now_tick: u64,
+    ) -> Result<CargoRootCompletionReceipt, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() || self.authority().is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let Some(mut grant) = broker.active_grants.remove(root_id) else {
+            return Err(SubmissionRefusal::Admission(format!(
+                "unknown or already completed cargo root: {root_id}"
+            )));
+        };
+        grant.close();
+        broker.total_completed = broker.total_completed.saturating_add(1);
+        let remaining = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
+        drop(broker);
+
+        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(cas) = self.cas.as_ref() {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    CARGO_ROOT_BROKER_RECEIPT_KIND,
+                    root_id,
+                    receipt_seq,
+                    "root_completed",
+                    &format!("remaining_active={remaining} tick={now_tick}"),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("broker completion receipt: {error:?}"))
+                })?;
+        }
+
+        Ok(CargoRootCompletionReceipt {
+            root_id: root_id.to_owned(),
+            active_cargo_roots: remaining,
+            receipt_seq,
+        })
+    }
+
+    /// Snapshot live telemetry for the Cargo root-permit broker (`bd-d4uqa` / `T016`).
+    pub fn cargo_root_broker_telemetry(
+        &self,
+    ) -> Result<CargoRootBrokerTelemetry, SubmissionRefusal> {
+        let broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        Ok(CargoRootBrokerTelemetry {
+            max_concurrent_cargo_roots: broker.max_concurrent_cargo_roots,
+            per_root_capacity: broker.per_root_capacity,
+            active_cargo_roots: u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX),
+            peak_active_cargo_roots: broker.peak_active_cargo_roots,
+            queued_requests: broker.queued_count,
+            total_enqueued: broker.total_enqueued,
+            total_granted: broker.total_granted,
+            total_completed: broker.total_completed,
+            total_root_cap_refusals: broker.total_root_cap_refusals,
+            starvation_bound: broker.queue.starvation_bound,
+            worst_lag_by_agent: broker.worst_lag_by_agent.clone(),
+            starvation_violations: broker.starvation_violations,
+            granted_order: broker.granted_order.clone(),
+        })
     }
 
     fn optional_admitted(&self) -> Result<bool, SubmissionRefusal> {
@@ -5420,5 +5853,159 @@ mod tests {
             actor_after.slot(),
             rabs_action::state_machines::PublicationSlotState::Absent
         );
+    }
+
+    #[test]
+    fn bd_d4uqa_live_cargo_root_broker_fifteen_agent_storm_bounds_roots_and_starvation_with_receipts()
+     {
+        let (_state, coord) = submission_coordinator();
+        let starvation_bound = 64_u64;
+        let max_roots = 4_u32;
+        let per_root_capacity = 4_u32;
+        coord
+            .configure_cargo_root_broker(max_roots, per_root_capacity, starvation_bound, 16)
+            .unwrap();
+
+        let tenants: Vec<TenantKey> = (0..15)
+            .map(|i| TenantKey {
+                agent: format!("agent-{i:02}"),
+                project: format!("repo-{i:02}"),
+                ci: i % 5 == 0,
+            })
+            .collect();
+        // Give agent-00 a higher weight (4) to verify weighted fairness in live coordinator service order.
+        coord
+            .set_cargo_root_tenant_weight(tenants[0].clone(), 4)
+            .unwrap();
+
+        // Schedule 15 agents x 6 Cargo roots = 90 roots across staggered ticks.
+        let mut arrivals: BTreeMap<u64, Vec<(usize, String)>> = BTreeMap::new();
+        for (j, tenant) in tenants.iter().enumerate() {
+            for round in 0..6_u64 {
+                let tick = round * 30 + (j as u64) * 2;
+                arrivals
+                    .entry(tick)
+                    .or_default()
+                    .push((j, format!("{}/cargo-root-{round}", tenant.agent)));
+            }
+        }
+
+        let total_expected = 90_usize;
+        let mut active_queue: std::collections::VecDeque<(String, u64)> =
+            std::collections::VecDeque::new();
+        let mut completed = 0_usize;
+        let mut tick = 0_u64;
+
+        while completed < total_expected {
+            // Complete any active root whose 3-tick compile window finished.
+            while let Some((front_id, finish_tick)) = active_queue.front().cloned() {
+                if tick >= finish_tick {
+                    active_queue.pop_front();
+                    let comp = coord.complete_cargo_root(&front_id, tick).unwrap();
+                    assert!(comp.active_cargo_roots < max_roots);
+                    completed += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(batch) = arrivals.remove(&tick) {
+                for (j, root_id) in batch {
+                    coord
+                        .enqueue_cargo_root_request(tenants[j].clone(), &root_id, 100, tick, None)
+                        .unwrap();
+                }
+            }
+
+            // Attempt to admit up to max_roots + 1 times to exercise both normal grants and the T016 cap refusal.
+            for _ in 0..=max_roots {
+                if let Some(grant_receipt) = coord.admit_next_cargo_root(tick).unwrap() {
+                    assert!(
+                        grant_receipt.active_cargo_roots <= max_roots,
+                        "T016: active Cargo roots must never exceed granted ceiling"
+                    );
+                    assert_eq!(grant_receipt.capacity, per_root_capacity);
+
+                    // Exercise C-1 transferable jobserver tokens on the live root.
+                    let tok1 = coord
+                        .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                        .unwrap()
+                        .unwrap();
+                    let tok2 = coord
+                        .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                        .unwrap()
+                        .unwrap();
+                    let tok3 = coord
+                        .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                        .unwrap()
+                        .unwrap();
+                    // 4th transferable token on capacity=4 must be refused as TransferablesExhausted.
+                    assert_eq!(
+                        coord
+                            .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                            .unwrap(),
+                        Err(GrantRefusal::TransferablesExhausted {
+                            outstanding: 3,
+                            capacity: 4
+                        })
+                    );
+                    coord
+                        .release_cargo_jobserver_token(&grant_receipt.root_id, &tok1)
+                        .unwrap()
+                        .unwrap();
+                    coord
+                        .release_cargo_jobserver_token(&grant_receipt.root_id, &tok2)
+                        .unwrap()
+                        .unwrap();
+                    coord
+                        .release_cargo_jobserver_token(&grant_receipt.root_id, &tok3)
+                        .unwrap()
+                        .unwrap();
+
+                    active_queue.push_back((grant_receipt.root_id, tick + 3));
+                } else {
+                    break;
+                }
+            }
+
+            tick += 1;
+        }
+
+        let telemetry = coord.cargo_root_broker_telemetry().unwrap();
+        assert_eq!(telemetry.total_enqueued, 90);
+        assert_eq!(telemetry.total_granted, 90);
+        assert_eq!(telemetry.total_completed, 90);
+        assert_eq!(telemetry.active_cargo_roots, 0);
+        assert!(telemetry.peak_active_cargo_roots <= max_roots);
+        assert!(telemetry.peak_active_cargo_roots > 1);
+        assert_eq!(
+            telemetry.starvation_violations, 0,
+            "no starvation beyond policy bound ({starvation_bound} ticks): {:?}",
+            telemetry.worst_lag_by_agent
+        );
+
+        // Verify durable telemetry receipts in SQLite `decision_receipts`.
+        let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+        let rows = store
+            .query(
+                "SELECT decision FROM decision_receipts WHERE kind = ?1",
+                &[SqlValue::Text(CARGO_ROOT_BROKER_RECEIPT_KIND.to_owned())],
+            )
+            .unwrap();
+        let enqueued_receipts = rows
+            .iter()
+            .filter(|r| matches!(r.as_slice(), [SqlValue::Text(d)] if d == "enqueued"))
+            .count();
+        let granted_receipts = rows
+            .iter()
+            .filter(|r| matches!(r.as_slice(), [SqlValue::Text(d)] if d == "root_granted"))
+            .count();
+        let completed_receipts = rows
+            .iter()
+            .filter(|r| matches!(r.as_slice(), [SqlValue::Text(d)] if d == "root_completed"))
+            .count();
+        assert_eq!(enqueued_receipts, 90);
+        assert_eq!(granted_receipts, 90);
+        assert_eq!(completed_receipts, 90);
     }
 }

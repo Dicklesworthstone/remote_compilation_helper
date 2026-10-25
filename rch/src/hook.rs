@@ -2348,6 +2348,32 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
+    /// Settle a pre-admission lease whose owner process is gone after the 24h
+    /// daemon-absence window (`bd-7e3bt`). Unlike `confirm_failed_before_admission`,
+    /// which requires an immediate daemon refusal on the live path, this requires
+    /// `daemon_absence_is_conclusive` and also settles abandoned `selection_pending`
+    /// or `selection_unconfirmed` journals.
+    pub(crate) fn settle_abandoned_pre_admission(&self, now_unix_ms: u64) -> anyhow::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            lease.identity.remote_build_id.is_none()
+                && lease.worker_id.is_none()
+                && lease.recovery.is_none()
+                && lease.exit_code.is_none()
+                && !lease.terminal_acknowledged,
+            "pre-admission recovery cannot retire an admitted or completed lease"
+        );
+        anyhow::ensure!(
+            daemon_absence_is_conclusive(&lease, now_unix_ms),
+            "original wrapper is absent before daemon admission; acknowledgement waits until the lease is 24h old"
+        );
+        let mut next = lease.clone();
+        next.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
+        next.heartbeat("failed_before_admission", now_unix_ms);
+        next.terminal_acknowledged = true;
+        self.publish_transition(&mut lease, next)
+    }
+
     /// Only a wrapper with no outstanding selection or remote ownership may
     /// advertise that it is waiting outside restart admission. This phase is
     /// used by the daemon to exclude new arrivals from the work being drained.

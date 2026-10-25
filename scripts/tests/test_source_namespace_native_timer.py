@@ -44,7 +44,10 @@ class NativeTimerTests(unittest.TestCase):
         self.tmp.mkdir()
         for name in ("mktemp", "ps", "head", "grep", "mkfifo", "wc", "cmp",
                      "cat", "mv", "rm", "rmdir", "sleep"):
-            executable = shutil.which(name)
+            # uutils cat (Ubuntu 25.10+ /usr/bin/cat) calls F_SETPIPE_SZ(1 MiB)
+            # on pipe outputs, overriding the test's 4 KiB pipe backpressure pin.
+            executable = (shutil.which("gnucat") or shutil.which("gcat") or shutil.which("cat")
+                          if name == "cat" else shutil.which(name))
             self.assertIsNotNone(executable, name)
             (self.tools / name).symlink_to(executable)
         (self.tools / "sh").symlink_to(SHELL)
