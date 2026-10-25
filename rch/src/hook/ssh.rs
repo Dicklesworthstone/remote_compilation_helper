@@ -1426,7 +1426,8 @@ pub(super) fn remote_preflight_topology_policy(
     remote_base: &str,
     dispatch_closure_roots: &[PathBuf],
 ) -> anyhow::Result<PathTopologyPolicy> {
-    if !clean_overlay && !source_content_receipt {
+    let off_root = !clean_overlay && !source_content_receipt && controller_policy.is_off_root();
+    if !clean_overlay && !source_content_receipt && !off_root {
         return Ok(controller_policy.clone());
     }
 
@@ -1435,7 +1436,14 @@ pub(super) fn remote_preflight_topology_policy(
     if remote_base.chars().any(char::is_control) || remote_base.contains('\\') {
         anyhow::bail!("isolated staging base contains an invalid path character");
     }
-    let staging_root = PathBuf::from(remote_base);
+    let staging_root = PathBuf::from(&remote_base);
+    let required_parent = if off_root {
+        controller_policy
+            .offroot_worker_canonical_root(&remote_base)
+            .map_err(|error| anyhow::anyhow!("invalid off-root staging base: {error}"))?
+    } else {
+        staging_root.clone()
+    };
     if dispatch_closure_roots.is_empty() {
         anyhow::bail!("isolated staging preflight requires a planned source root");
     }
@@ -1449,7 +1457,7 @@ pub(super) fn remote_preflight_topology_policy(
         {
             anyhow::bail!("invalid isolated source destination: {}", root.display());
         }
-        let relative = root.strip_prefix(&staging_root).ok().filter(|relative| {
+        let relative = root.strip_prefix(&required_parent).ok().filter(|relative| {
             !relative.as_os_str().is_empty()
                 && relative
                     .components()
@@ -1459,11 +1467,11 @@ pub(super) fn remote_preflight_topology_policy(
             anyhow::bail!(
                 "isolated source destination {} is not a strict descendant of staging base {}",
                 root.display(),
-                staging_root.display()
+                required_parent.display()
             );
         }
     }
-    // No worker-global alias is required for an invocation-owned source tree.
+    // No worker-global alias is required for an invocation-owned or off-root source tree.
     Ok(PathTopologyPolicy::new(staging_root.clone(), staging_root))
 }
 

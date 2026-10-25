@@ -1107,6 +1107,16 @@ async fn execute_remote_compilation_inner(
     let project_lane = worker.project_lane;
     let ordinary_mirror =
         clean_overlay.is_none() && !owned_source_content_pair && source_content_build_id.is_none();
+    if ordinary_mirror && !worker_is_windows && topology_policy.is_off_root() {
+        for entry in &mut sync_plan {
+            entry.remote_root = super::dependency_closure::map_offroot_sync_root_to_remote_root(
+                &entry.local_root,
+                &entry.project_id,
+                topology_policy,
+                &transfer_config.remote_base,
+            )?;
+        }
+    }
     if project_lane > 0 && ordinary_mirror && !worker_is_windows {
         for entry in &mut sync_plan {
             entry.remote_root = project_lane_remote_root(&entry.remote_root, project_lane);
@@ -1498,7 +1508,11 @@ async fn execute_remote_compilation_inner(
     // job's source grant and cannot prepare any of its selected destinations.
     // A lane's roots are private mirrors, never the canonical checkouts the
     // repo updater converges (bd-sgvod).
-    if clean_overlay.is_none() && !source_content_receipt && project_lane == 0 {
+    if clean_overlay.is_none()
+        && !source_content_receipt
+        && project_lane == 0
+        && !topology_policy.is_off_root()
+    {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
             &sync_roots,

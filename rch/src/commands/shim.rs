@@ -79,7 +79,11 @@ use crate::ui::theme::StatusIndicator;
 ///
 /// `8` routes package verification and explicit publish dry-runs through RCH.
 /// Actual publication and ambiguous/non-verification arguments remain local.
-const SHIM_VERSION: &str = "8";
+///
+/// `9` refuses a bare caller-set `RCH_CARGO_WRAPPER_BYPASS=1` when
+/// `RCH_REQUIRE_REMOTE` is enabled unless accompanied by `RCH_CARGO_WRAPPER_ORIGIN=rch`
+/// (bd-h6y17), preventing agents from bypassing RCH on dispatchers via env var.
+const SHIM_VERSION: &str = "9";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -141,6 +145,7 @@ export RCH_QUEUE_WHEN_BUSY
 ///     it is normalized to `cargo clippy ...` and offloaded.
 fn cargo_clippy_shim_body(require_remote: bool) -> String {
     let offload = shim_offload(require_remote, "cargo clippy");
+    let default_require_remote = if require_remote { "1" } else { "0" };
     format!(
         r##"#!/bin/sh
 # rch cargo-clippy shim — MANAGED FILE, edit via `rch shim install`.
@@ -163,9 +168,21 @@ exec_local() {{
   exec "$REAL" "$@"
 }}
 # Loop-break + fail-open, identical contract to the cargo shim.
-if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ] \
+if [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ] \
    || ! command -v rch >/dev/null 2>&1 || [ ! -x "$REAL" ]; then
   exec_local "$@"
+fi
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ]; then
+  if [ "${{RCH_CARGO_WRAPPER_ORIGIN:-}}" = "rch" ]; then
+    exec_local "$@"
+  fi
+  case "${{RCH_REQUIRE_REMOTE-{default_require_remote}}}" in
+    ""|0|false|FALSE|no|NO|off|OFF)
+      exec_local "$@" ;;
+    *)
+      echo "rch shim: refusing caller-set RCH_CARGO_WRAPPER_BYPASS=1 while RCH_REQUIRE_REMOTE is enabled; set [general] force_local = true in .rch/config.toml for repos that must build locally" >&2
+      exit 1 ;;
+  esac
 fi
 # Invoked BY cargo as a subcommand (`cargo-clippy clippy ...`): the outer cargo
 # already made the offload decision, so never re-enter rch here.
@@ -177,6 +194,7 @@ fi
 "##,
         marker = SHIM_MARKER,
         version = SHIM_VERSION,
+        default_require_remote = default_require_remote,
         offload = offload,
     )
 }
@@ -189,6 +207,7 @@ fi
 /// A dispatcher box wants fail-closed; that is the default on install.
 fn cargo_shim_body(require_remote: bool) -> String {
     let offload = shim_offload(require_remote, "cargo");
+    let default_require_remote = if require_remote { "1" } else { "0" };
     format!(
         r##"#!/bin/sh
 # rch cargo shim — MANAGED FILE, edit via `rch shim install`.
@@ -268,7 +287,8 @@ exec_local() {{
         exit 127
       fi
       RCH_CARGO_WRAPPER_BYPASS=1
-      export RCH_CARGO_WRAPPER_BYPASS
+      RCH_CARGO_WRAPPER_ORIGIN=rch
+      export RCH_CARGO_WRAPPER_BYPASS RCH_CARGO_WRAPPER_ORIGIN
       exec rustup run "$selected_toolchain" cargo "$@" ;;
   esac
   resolve_real
@@ -284,10 +304,22 @@ exec_local() {{
   esac
   exec "$REAL" "$@"
 }}
-# Loop-break: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local-fallback exec.
-# Also fail open if rch is unavailable — never block a build.
-if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || ! command -v rch >/dev/null 2>&1; then
+# Loop-break: rch sets RCH_CARGO_WRAPPER_BYPASS=1 + RCH_CARGO_WRAPPER_ORIGIN=rch
+# on its own local-fallback exec. Also fail open if rch is unavailable.
+if ! command -v rch >/dev/null 2>&1; then
   exec_local "$@"
+fi
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ]; then
+  if [ "${{RCH_CARGO_WRAPPER_ORIGIN:-}}" = "rch" ]; then
+    exec_local "$@"
+  fi
+  case "${{RCH_REQUIRE_REMOTE-{default_require_remote}}}" in
+    ""|0|false|FALSE|no|NO|off|OFF)
+      exec_local "$@" ;;
+    *)
+      echo "rch shim: refusing caller-set RCH_CARGO_WRAPPER_BYPASS=1 while RCH_REQUIRE_REMOTE is enabled; set [general] force_local = true in .rch/config.toml for repos that must build locally" >&2
+      exit 1 ;;
+  esac
 fi
 # Explicit operator escape hatch: force this one build local.
 if [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ]; then
@@ -402,6 +434,7 @@ esac
 "##,
         marker = SHIM_MARKER,
         version = SHIM_VERSION,
+        default_require_remote = default_require_remote,
         offload = offload,
     )
 }
@@ -538,7 +571,12 @@ fn cargo_interception_in(path: &std::ffi::OsStr, shim: &Path, cwd: &Path) -> Int
 /// fallback, so a bypassed build resolves rustc/clippy-driver from THAT
 /// toolchain instead of the rustup proxy's default — mirroring the tiered
 /// resolution of shim v4 (same 2026-08-30 nightly-renamed-cargo incident).
-const TOOLCHAIN_WRAP_VERSION: &str = "3";
+///
+/// `4` requires `RCH_CARGO_WRAPPER_ORIGIN=rch` on `RCH_CARGO_WRAPPER_BYPASS=1`
+/// before bypassing `$SHIM` when `$SHIM` is installed, so a bare caller-set
+/// `RCH_CARGO_WRAPPER_BYPASS=1` on an absolute toolchain cargo still passes
+/// through `$SHIM`'s `RCH_REQUIRE_REMOTE` gate (bd-h6y17).
+const TOOLCHAIN_WRAP_VERSION: &str = "4";
 
 /// Marker identifying an rch-managed toolchain wrapper (vs. the real binary).
 const TOOLCHAIN_MARKER: &str = "# rch-toolchain-wrap-version:";
@@ -604,9 +642,13 @@ exec_local() {{
   export PATH
   exec "$REAL" "$@"
 }}
-# Loop-break + fail-open: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local
-# fallback exec. Never block a build if the shim or rch is missing.
-if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ ! -x "$SHIM" ] || ! command -v rch >/dev/null 2>&1; then
+# Loop-break + fail-open: rch sets RCH_CARGO_WRAPPER_BYPASS=1 +
+# RCH_CARGO_WRAPPER_ORIGIN=rch on its own local fallback exec. Never block a
+# build if the shim or rch is missing.
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] && [ "${{RCH_CARGO_WRAPPER_ORIGIN:-}}" = "rch" ]; then
+  exec_local "$@"
+fi
+if [ ! -x "$SHIM" ] || ! command -v rch >/dev/null 2>&1; then
   exec_local "$@"
 fi
 # Preserve toolchain identity through any local fallback.
@@ -1440,22 +1482,25 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
     #[cfg(unix)]
     #[test]
     fn packaging_escape_hatches_keep_the_local_toolchain() {
-        for (key, value) in [
-            ("RCH_CARGO_WRAPPER_BYPASS", "1"),
-            ("RCH_SHIM_LOCAL_IDE", "1"),
-            ("RUSTC_WORKSPACE_WRAPPER", "/fake/clippy-driver"),
+        for cause in [
+            vec![
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+            ],
+            vec![("RCH_SHIM_LOCAL_IDE", "1")],
+            vec![("RUSTC_WORKSPACE_WRAPPER", "/fake/clippy-driver")],
         ] {
             let args = ["publish", "--dry-run"];
-            let output = packaging_invocation(true, &args, &[(key, value)], true);
+            let output = packaging_invocation(true, &args, &cause, true);
             assert!(output.status.success());
             let fields = packaging_fields(&output);
-            assert_eq!(fields[0], "real-cargo", "{key}");
+            assert_eq!(fields[0], "real-cargo", "{cause:?}");
             assert_eq!(&fields[6..], &args);
             let args = ["+nightly", "publish", "--dry-run"];
-            let output = packaging_invocation(true, &args, &[(key, value)], true);
+            let output = packaging_invocation(true, &args, &cause, true);
             assert!(output.status.success());
             let fields = packaging_fields(&output);
-            assert_eq!(fields[0], "rustup", "{key}");
+            assert_eq!(fields[0], "rustup", "{cause:?}");
             assert_eq!(
                 &fields[6..],
                 &["run", "nightly", "cargo", "publish", "--dry-run"]
@@ -1635,6 +1680,7 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
         cmd.args(args)
             .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
             .env_remove("RCH_CARGO_WRAPPER_BYPASS")
+            .env_remove("RCH_CARGO_WRAPPER_ORIGIN")
             .env_remove("RCH_SHIM_LOCAL_IDE")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("RCH_REAL_CARGO")
@@ -1727,7 +1773,13 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
     fn local_fallbacks_cap_parallelism() {
         let body = cargo_shim_body(true);
         for (args, env) in [
-            (vec!["build"], vec![("RCH_CARGO_WRAPPER_BYPASS", "1")]),
+            (
+                vec!["build"],
+                vec![
+                    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+                ],
+            ),
             (vec!["build"], vec![("RCH_SHIM_LOCAL_IDE", "1")]),
             (
                 vec!["check"],
@@ -1776,6 +1828,7 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
             &["build"],
             &[
                 ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
                 ("CARGO_BUILD_JOBS", "64"),
             ],
         );
@@ -1787,6 +1840,7 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
             &["build"],
             &[
                 ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
                 ("RCH_LOCAL_MAX_JOBS", "16"),
             ],
         );
@@ -1799,7 +1853,13 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
     fn clippy_shim_local_paths_cap_parallelism() {
         let body = cargo_clippy_shim_body(true);
         for (args, env) in [
-            (vec!["--version"], vec![("RCH_CARGO_WRAPPER_BYPASS", "1")]),
+            (
+                vec!["--version"],
+                vec![
+                    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+                ],
+            ),
             // Invoked BY cargo as a subcommand: outer cargo already decided.
             (vec!["clippy", "--workspace"], vec![]),
         ] {
@@ -1847,16 +1907,21 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
             "$(false)",
         ];
         for cause in [
-            ("RCH_CARGO_WRAPPER_BYPASS", "1"),
-            ("RCH_SHIM_LOCAL_IDE", "1"),
-            ("RUSTC_WORKSPACE_WRAPPER", "/clippy-driver"),
+            vec![
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+            ],
+            vec![("RCH_SHIM_LOCAL_IDE", "1")],
+            vec![("RUSTC_WORKSPACE_WRAPPER", "/clippy-driver")],
         ] {
             for (setting, cap) in [
                 (("RCH_LOCAL_MAX_JOBS", "8"), "8"),
                 (("RCH_LOCAL_MAX_JOBS", "3"), "3"),
                 (("CARGO_BUILD_JOBS", "19"), "19"),
             ] {
-                let out = selected_local_output(&args, &[cause, setting]);
+                let mut extras = cause.clone();
+                extras.push(setting);
+                let out = selected_local_output(&args, &extras);
                 assert!(out.status.success(), "{cause:?}: {:?}", out.stderr);
                 let mut expected = vec!["1", cap, "run", "nightly", "cargo"];
                 expected.extend_from_slice(&args[1..]);
@@ -2373,15 +2438,18 @@ exit "${STUB_RCH_EXIT:-0}"
     #[cfg(unix)]
     #[test]
     fn explicit_local_controls_still_bypass_prefixed_builds() {
-        for control in [
-            "RCH_CARGO_WRAPPER_BYPASS",
-            "RCH_SHIM_LOCAL_IDE",
-            "RUSTC_WORKSPACE_WRAPPER",
+        for controls in [
+            vec![
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+            ],
+            vec![("RCH_SHIM_LOCAL_IDE", "1")],
+            vec![("RUSTC_WORKSPACE_WRAPPER", "1")],
         ] {
             let output = record_shim(
                 &cargo_shim_body(true),
                 &argv_bytes(&["+nightly", "--offline", "build"]),
-                &[(control, "1")],
+                &controls,
             );
             assert!(output.status.success());
             assert_eq!(&recorded_fields(&output)[..2], &[b"LOCAL".as_slice(), b"8"]);
@@ -2725,9 +2793,62 @@ esac
             &body,
             "cargo",
             &["build"],
-            &[("RCH_CARGO_WRAPPER_BYPASS", "1")],
+            &[
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+            ],
         );
         assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn caller_set_wrapper_bypass_is_refused_when_require_remote_is_enabled() {
+        for (body, args) in [
+            (cargo_shim_body(true), vec!["test"]),
+            (cargo_clippy_shim_body(true), vec!["--all-targets"]),
+        ] {
+            let out = record_shim(
+                &body,
+                &argv_bytes(&args),
+                &[("RCH_CARGO_WRAPPER_BYPASS", "1")],
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "bare caller bypass must fail closed"
+            );
+            assert!(out.stdout.is_empty(), "neither rch nor real cargo may run");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("refusing caller-set RCH_CARGO_WRAPPER_BYPASS=1"),
+                "stderr: {stderr}"
+            );
+            assert!(
+                stderr.contains("force_local = true"),
+                "stderr should point to .rch/config.toml: {stderr}"
+            );
+        }
+
+        // Fail-open shim (`--allow-local`) honors bare bypass unless caller sets RCH_REQUIRE_REMOTE=1.
+        let open_body = cargo_shim_body(false);
+        let allowed = record_shim(
+            &open_body,
+            &argv_bytes(&["test"]),
+            &[("RCH_CARGO_WRAPPER_BYPASS", "1")],
+        );
+        assert!(allowed.status.success());
+        assert_eq!(recorded_fields(&allowed)[0], b"LOCAL");
+
+        let refused = record_shim(
+            &open_body,
+            &argv_bytes(&["test"]),
+            &[
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_REQUIRE_REMOTE", "1"),
+            ],
+        );
+        assert_eq!(refused.status.code(), Some(1));
     }
 
     /// A direct `cargo-clippy` call is the leak; it must offload.

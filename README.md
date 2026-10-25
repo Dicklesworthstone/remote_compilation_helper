@@ -1097,7 +1097,7 @@ On Linux boxes configured with `[general] role = "dispatcher"`, status and docto
 also report unmanaged local Cargo/rustc processes. The warning remains visible
 while those processes run, including when the daemon is unavailable. Check
 `rch shim status`, PATH order, and absolute-path toolchain Cargo invocations.
-Processes carrying `RCH_CARGO_WRAPPER_BYPASS=1` or descended from `rch` are excluded.
+Processes descended from `rch` or carrying `rch`'s internal local-fallback marker (`RCH_CARGO_WRAPPER_BYPASS=1` with `RCH_CARGO_WRAPPER_ORIGIN=rch`) are excluded; a bare caller-set `RCH_CARGO_WRAPPER_BYPASS=1` is not excluded.
 
 An alarm event is logged once per observed episode and clears after a successful
 scan finds no unmanaged compiler processes. Status and doctor share a locked

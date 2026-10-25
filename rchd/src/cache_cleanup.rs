@@ -303,10 +303,17 @@ fn build_cleanup_command_with_source_guard(
          {source_transaction}\n\
          candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
          if [ \"$low_disk\" -eq 1 ]; then \
-           find \"$base\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null \
-             | sort -n | sed 's/^[^ ]* //' > \"$candidates\"; \
+           {{ \
+             find \"$base\" -mindepth 2 -maxdepth 2 -type d ! -path \"$base/offroot/*\" -printf '%T@ %p\\n' 2>/dev/null; \
+             if [ -d \"$base/offroot\" ]; then \
+               find \"$base/offroot\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null; \
+             fi; \
+           }} | sort -n | sed 's/^[^ ]* //' > \"$candidates\"; \
          else \
-           find \"$base\" -mindepth 2 -maxdepth 2 -type d -mmin +\"$max_age_minutes\" -print 2>/dev/null > \"$candidates\"; \
+           find \"$base\" -mindepth 2 -maxdepth 2 -type d ! -path \"$base/offroot/*\" -mmin +\"$max_age_minutes\" -print 2>/dev/null > \"$candidates\"; \
+           if [ -d \"$base/offroot\" ]; then \
+             find \"$base/offroot\" -mindepth 2 -maxdepth 2 -type d -mmin +\"$max_age_minutes\" -print 2>/dev/null >> \"$candidates\"; \
+           fi; \
          fi; \
          while IFS= read -r dir; do \
            [ -z \"$dir\" ] && continue; \
@@ -367,6 +374,9 @@ fn build_cleanup_command_with_source_guard(
            fi; \
          done < \"$candidates\"; \
          rm -f \"$candidates\"; \
+         if [ -d \"$base/offroot\" ]; then \
+           find \"$base/offroot\" -mindepth 1 -maxdepth 1 -type d -empty -exec rmdir -- {{}} + 2>/dev/null || :; \
+         fi; \
          after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
          printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
@@ -2218,5 +2228,51 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         );
         assert!(stderr.contains(".rch-target-pool-survivor"), "{stderr}");
         assert!(stderr.contains(".rch-target-pool-husk"), "{stderr}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_command_reaps_idle_offroot_mirror_and_keeps_active_or_protected_offroot_mirror() {
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        let idle_parent = base.path().join("offroot").join("0123456789abcdef");
+        let idle_mirror = idle_parent.join("idle-clone");
+        std::fs::create_dir_all(idle_mirror.join("src")).expect("idle mirror");
+        let old_file = idle_mirror.join("src/lib.rs");
+        std::fs::write(&old_file, "pub fn old() {}\n").expect("write old file");
+        age_record(&old_file);
+        age_dir(&idle_mirror);
+
+        let kept_parent = base.path().join("offroot").join("fedcba9876543210");
+        let active_mirror = kept_parent.join("active-clone");
+        std::fs::create_dir_all(active_mirror.join("src")).expect("active mirror");
+        std::fs::write(active_mirror.join("src/lib.rs"), "pub fn active() {}\n")
+            .expect("write recent file");
+        age_dir(&active_mirror);
+
+        let protected_mirror = kept_parent.join("protected-clone");
+        std::fs::create_dir_all(protected_mirror.join("src")).expect("protected mirror");
+        let protected_file = protected_mirror.join("src/lib.rs");
+        std::fs::write(&protected_file, "pub fn protected() {}\n").expect("write protected file");
+        age_record(&protected_file);
+        std::fs::write(protected_mirror.join(".sbh-protect"), "hold\n").expect("write sbh protect");
+        age_dir(&protected_mirror);
+
+        let (stdout, stderr, code) = run_sweep(base.path(), &[]);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        assert!(stdout.contains("removed=1"), "{stdout}{stderr}");
+        assert!(!idle_mirror.exists(), "idle offroot mirror must be reaped");
+        assert!(
+            !idle_parent.exists(),
+            "empty offroot hash parent must be pruned"
+        );
+        assert!(
+            active_mirror.exists(),
+            "offroot mirror with recent activity must be kept"
+        );
+        assert!(
+            protected_mirror.exists(),
+            "offroot mirror with .sbh-protect must be kept"
+        );
     }
 }

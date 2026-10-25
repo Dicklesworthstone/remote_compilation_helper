@@ -1147,6 +1147,14 @@ fn local_fallback_command_bypasses_cargo_wrapper() {
         has_bypass,
         "local fallback must bypass the PATH cargo wrapper to avoid recursive rch exec"
     );
+    let has_origin = command.get_envs().any(|(key, value)| {
+        key == std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_ENV)
+            && value == Some(std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_RCH))
+    });
+    assert!(
+        has_origin,
+        "local fallback must stamp RCH_CARGO_WRAPPER_ORIGIN=rch so the strict shim accepts it"
+    );
 
     let args = command.get_args().collect::<Vec<_>>();
     assert_eq!(

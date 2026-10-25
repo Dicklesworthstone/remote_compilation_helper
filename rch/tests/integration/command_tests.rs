@@ -179,9 +179,13 @@ fn dispatcher_local_build_warning_reaches_status_doctor_and_watch_without_daemon
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         if managed {
-            command.env("RCH_CARGO_WRAPPER_BYPASS", "1");
+            command
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch");
         } else {
-            command.env_remove("RCH_CARGO_WRAPPER_BYPASS");
+            command
+                .env_remove("RCH_CARGO_WRAPPER_BYPASS")
+                .env_remove("RCH_CARGO_WRAPPER_ORIGIN");
         }
         let mut child = HeldChild(command.spawn().expect("spawn real cargo login"));
         let deadline = Instant::now() + Duration::from_secs(10);

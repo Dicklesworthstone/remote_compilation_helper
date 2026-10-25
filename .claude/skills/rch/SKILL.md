@@ -266,8 +266,7 @@ Every name below is read by 1.0.58 code (`references/CONFIGURATION.md` has the f
 | `RCH_LOG_LEVEL=debug` | Diagnostics on stderr; surfaces which fail-open path was taken. |
 | `RCH_SOCKET_PATH` | Daemon socket override. (`RCH_DAEMON_SOCKET` is read as an alias only from 2.0.0; `RCH_SOCKET_PATH` wins.) |
 | `RCH_NO_SELF_HEALING=1` / `--no-self-healing` / `--no-hook-auto-start` | Disable autostart/hook re-install for one invocation. |
-| `RCH_ENABLED=0` | Disable rch — only effective in the **process env** of the hook/`rch exec`, not as an inline prefix inside an agent's command. |
-| `RCH_CARGO_WRAPPER_BYPASS=1` | Shim/toolchain-wrapper bypass → real cargo. |
+| `RCH_ENABLED=0` | Disable rch — only effective in the **process env** of the hook/`rch exec`, not as an inline prefix inside an agent's command. For intentional per-project local builds, set `[general] force_local = true` in `.rch/config.toml`. |
 | `RCH_OUTPUT_FORMAT=json\|toon`, `RCH_JSON=1` | Machine output. |
 | `RCH_CANONICAL_PROJECT_ROOT` / `RCH_ALIAS_PROJECT_ROOT` | Override `[path_topology]` roots. |
 

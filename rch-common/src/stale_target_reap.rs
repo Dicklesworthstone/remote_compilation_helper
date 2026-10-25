@@ -435,7 +435,7 @@ pub fn source_claim_gc_guard_fragment() -> String {
 pub const RETAINED_SOURCE_GC_GUARD: &str = r#"
 rch_retained_source_gc_hold() {
     case "$1" in /*) ;; *) return 2;; esac
-    if rch_retained_marker=$(find "$1" -name '.rch-retention-v1' -print -quit); then
+    if rch_retained_marker=$(find "$1" \( -name '.rch-retention-v1' -o -name '.sbh-protect' \) -print -quit); then
         if [ -n "$rch_retained_marker" ]; then return 0; fi
     else
         printf 'RCH_CLEANUP_RETENTION_UNKNOWN dir=%s\n' "$1" >&2
@@ -450,6 +450,8 @@ rch_retained_source_gc_hold() {
         # still cannot rule a marker out.
         rch_retained_marker=${rch_retained_parent%/}/.rch-retention-v1
         if [ -e "$rch_retained_marker" ] || [ -L "$rch_retained_marker" ]; then return 0; fi
+        rch_sbh_marker=${rch_retained_parent%/}/.sbh-protect
+        if [ -e "$rch_sbh_marker" ] || [ -L "$rch_sbh_marker" ]; then return 0; fi
         if [ ! -d "$rch_retained_parent" ] || [ ! -x "$rch_retained_parent" ]; then
             printf 'RCH_CLEANUP_RETENTION_UNKNOWN dir=%s ancestor=%s\n' \
                 "$1" "$rch_retained_parent" >&2

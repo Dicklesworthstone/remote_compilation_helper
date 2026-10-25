@@ -1406,6 +1406,7 @@ mod managed_build_dir_tests {
                 .env("RUSTC", cargo_bin.join("rustc"))
                 .env("RUSTUP_AUTO_INSTALL", "0")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env("LC_ALL", "C")
                 .output()
                 .expect("GNU timeout and the fixture's native Cargo must be available");
@@ -2118,6 +2119,7 @@ mod managed_build_dir_tests {
                 .env("RUSTFLAGS", "")
                 .env("RUSTUP_AUTO_INSTALL", "0")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env_remove("RUSTUP_TOOLCHAIN")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .env_remove("CARGO_BUILD_RUSTC")
@@ -2390,6 +2392,7 @@ mod managed_build_dir_tests {
             .env("CARGO_TARGET_DIR", root.path().join("target"))
             .env("RCH_BUILD_SOURCE", "ambient")
             .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .output()
             .unwrap();
@@ -2603,6 +2606,7 @@ mod managed_build_dir_tests {
                 .env("RUSTFLAGS", "")
                 .env("RUSTUP_AUTO_INSTALL", "0")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env_remove("RUSTUP_TOOLCHAIN")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .env_remove("CARGO_BUILD_RUSTC")
@@ -2633,7 +2637,7 @@ mod managed_build_dir_tests {
         }
 
         let env_i_command = format!(
-            "env -i PATH={} HOME={} RUSTC={} CARGO_HOME={} CARGO_TARGET_DIR={} RUSTUP_AUTO_INSTALL=0 RCH_CARGO_WRAPPER_BYPASS=1 {} run --quiet --offline --jobs 1",
+            "env -i PATH={} HOME={} RUSTC={} CARGO_HOME={} CARGO_TARGET_DIR={} RUSTUP_AUTO_INSTALL=0 RCH_CARGO_WRAPPER_BYPASS=1 RCH_CARGO_WRAPPER_ORIGIN=rch {} run --quiet --offline --jobs 1",
             shell_words::quote(path.to_str().unwrap()),
             shell_words::quote(root.to_str().unwrap()),
             shell_words::quote(rustc.to_str().unwrap()),

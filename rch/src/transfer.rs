@@ -1774,7 +1774,10 @@ const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
 /// same variable on rch's own local re-exec. The shim checks it before anything
 /// else, so it short-circuits regardless of how the remote-required intent
 /// reached the worker.
-const REMOTE_LOOP_BREAK_ENV: (&str, &str) = ("RCH_CARGO_WRAPPER_BYPASS", "1");
+const REMOTE_LOOP_BREAK_ENVS: &[(&str, &str)] = &[
+    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+];
 const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     ("core.*", "core.[0-9]*"),
     (".core.*", ".core.[0-9]*"),
@@ -4250,13 +4253,12 @@ impl TransferPipeline {
             applied.push(key.to_string());
         }
 
-        // Remote loop-break (see REMOTE_LOOP_BREAK_ENV): stop the worker's own
+        // Remote loop-break (see REMOTE_LOOP_BREAK_ENVS): stop the worker's own
         // cargo shim from offloading the job onward. Injected unconditionally
         // and last-wins over a forwarded value, because a caller that exported
         // RCH_CARGO_WRAPPER_BYPASS=0 locally must not be able to re-arm the
         // shim on the worker and reintroduce the bounce.
-        {
-            let (key, value) = REMOTE_LOOP_BREAK_ENV;
+        for &(key, value) in REMOTE_LOOP_BREAK_ENVS {
             if let Some(escaped) = shell_escape_value(value) {
                 let assignment_prefix = format!("{key}=");
                 parts.retain(|part| !part.starts_with(&assignment_prefix));
@@ -16241,7 +16243,8 @@ Number of files transferred: 42
             .env_remove("CARGO_BUILD_BUILD_DIR")
             // Nested compiles execute on the worker running this RCH-offloaded
             // test, through its real Cargo rather than recursively offloading.
-            .env("RCH_CARGO_WRAPPER_BYPASS", "1");
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "rch");
         if checksum {
             command.arg("-Zchecksum-freshness");
         }
@@ -16991,6 +16994,7 @@ fn main() {
                 .env("CARGO_TARGET_DIR", &pool)
                 .env_remove("CARGO_BUILD_BUILD_DIR")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env("RCH_FRESHNESS_BUILD_COUNT", &counter)
                 .env("RCH_EXPECTED_EFFECT", expected)
                 .output()

@@ -1286,6 +1286,11 @@ pub struct PathTopologyConfig {
     /// Defaults to `/dp` when absent.
     #[serde(default)]
     pub alias_root: Option<String>,
+
+    /// Whether `canonical_root` was overridden by an ad-hoc `RCH_CANONICAL_PROJECT_ROOT`
+    /// environment variable that differs from the configured canonical root (bd-5edh1).
+    #[serde(skip)]
+    pub off_root: bool,
 }
 
 impl PathTopologyConfig {
@@ -1311,6 +1316,7 @@ impl PathTopologyConfig {
             PathBuf::from(canonical),
             PathBuf::from(alias),
         )
+        .with_off_root(self.off_root)
     }
 }
 

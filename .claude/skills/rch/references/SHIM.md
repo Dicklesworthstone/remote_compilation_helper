@@ -145,31 +145,28 @@ as "not intercepted" — it is fine.
 Inline env prefixes inside an agent's Bash command do **not** bypass the hook —
 `RCH_ENABLED=0 cargo build` is rewritten to `rch exec -- RCH_ENABLED=0 cargo
 build` (verified against 1.0.58). The hook reads its *own* process environment
-and the config files, not the command text. Two independent interceptors have to be told separately, because
-`general.force_local` is honored **only by the hook path** (`process_hook`) —
-`rch exec`, which is what the shim invokes, never reads it:
+and the config files, not the command text. Both the hook (`process_hook`) and
+the shim (`rch exec`) honor `.rch/config.toml`:
 
 ```toml
-# .rch/config.toml (project-scoped; remove afterwards) — stops the HOOK from rewriting
+# .rch/config.toml (project-scoped; remove afterwards)
 [general]
 force_local = true
 ```
 
 ```bash
-# the inline var stops the SHIM (and rustup toolchain wrappers) — they exec the real cargo
-RCH_CARGO_WRAPPER_BYPASS=1 cargo build --release
+cargo build --release
 file target/release/<binary>          # confirm it is a binary for THIS host, not a Linux ELF synced back
 ```
 
-No `[RCH]` line is printed in this case (the shim bypass never runs rch, and
-the hook's own `[RCH] local (force_local)` line only appears when the harness
-env/config sets `output.visibility`), so verify with `file`/`--version` on the
-artifact or `rch shim status` (`local_builds_running`) rather than by grepping.
+Do **not** prefix agent commands with `RCH_CARGO_WRAPPER_BYPASS=1`: that
+variable is `rch`'s internal loop-break and is refused by the shim and
+toolchain wrappers whenever `RCH_REQUIRE_REMOTE=1` is active unless paired with
+`rch`'s own local-fallback marker.
 
-Outside an agent harness (plain shell, CI), `export RCH_ENABLED=false` in the
-process environment disables the hook/`rch exec` for that shell;
-`RCH_CARGO_WRAPPER_BYPASS=1` still needs to be set for the shim. `RCH_DISABLED`,
-`RCH_BYPASS` and `RCH_FORCE_LOCAL` do not exist.
+Outside an agent harness (plain interactive shell without `RCH_REQUIRE_REMOTE`),
+`export RCH_ENABLED=false` in the process environment disables the hook/`rch exec`
+for that shell. `RCH_DISABLED`, `RCH_BYPASS` and `RCH_FORCE_LOCAL` do not exist.
 
 ## Rules
 

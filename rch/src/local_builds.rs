@@ -196,6 +196,9 @@ fn update_alarm_state(file: &mut File, active: bool) -> io::Result<Option<AlarmT
 
 /// Env var rch sets on its own local-fallback execs.
 pub const MANAGED_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
+/// Companion origin marker emitted by `rch` alongside `RCH_CARGO_WRAPPER_BYPASS=1`.
+pub const MANAGED_BYPASS_ORIGIN_ENV: &str = "RCH_CARGO_WRAPPER_ORIGIN";
+pub const MANAGED_BYPASS_ORIGIN_RCH: &str = "rch";
 
 /// Bounded PPID walk: /proc ancestry cycles would hang the scan.
 #[cfg(target_os = "linux")]
@@ -307,14 +310,24 @@ fn is_rch_managed(proc_root: &Path, pid: i32) -> bool {
     ancestry_has_rch(proc_root, pid)
 }
 
-/// NUL-separated environ contains the same enabled value as the cargo shim.
+/// NUL-separated environ contains both `RCH_CARGO_WRAPPER_BYPASS=1` and
+/// `RCH_CARGO_WRAPPER_ORIGIN=rch` (an `rch`-managed fallback, not a bare
+/// caller-set `RCH_CARGO_WRAPPER_BYPASS=1`).
 #[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn environ_has_bypass(environ_path: &Path) -> bool {
     std::fs::read(environ_path)
         .map(|env| {
-            env.split(|&b| b == 0)
-                .any(|entry| entry == b"RCH_CARGO_WRAPPER_BYPASS=1")
+            let mut has_bypass = false;
+            let mut has_origin = false;
+            for entry in env.split(|&b| b == 0) {
+                if entry == b"RCH_CARGO_WRAPPER_BYPASS=1" {
+                    has_bypass = true;
+                } else if entry == b"RCH_CARGO_WRAPPER_ORIGIN=rch" {
+                    has_origin = true;
+                }
+            }
+            has_bypass && has_origin
         })
         .unwrap_or(false)
 }
@@ -629,20 +642,37 @@ mod tests {
         let path = dir.path().join("environ");
         std::fs::write(
             &path,
-            b"PATH=/usr/bin\0RCH_CARGO_WRAPPER_BYPASS=1\0HOME=/home/u\0",
+            b"PATH=/usr/bin\0RCH_CARGO_WRAPPER_BYPASS=1\0RCH_CARGO_WRAPPER_ORIGIN=rch\0HOME=/home/u\0",
         )
         .expect("write");
         assert!(environ_has_bypass(&path));
+
+        // Bare caller-set RCH_CARGO_WRAPPER_BYPASS=1 without RCH_CARGO_WRAPPER_ORIGIN=rch
+        // must NOT suppress the dispatcher local-build alarm (bd-h6y17).
+        std::fs::write(
+            &path,
+            b"PATH=/usr/bin\0RCH_CARGO_WRAPPER_BYPASS=1\0HOME=/home/u\0",
+        )
+        .expect("rewrite bare bypass");
+        assert!(!environ_has_bypass(&path));
 
         std::fs::write(&path, b"PATH=/usr/bin\0HOME=/home/u\0").expect("rewrite");
         assert!(!environ_has_bypass(&path));
 
         // Prefix collisions must not match (different var entirely).
-        std::fs::write(&path, b"RCH_CARGO_WRAPPER_BYPASSX=1\0").expect("rewrite2");
+        std::fs::write(
+            &path,
+            b"RCH_CARGO_WRAPPER_BYPASSX=1\0RCH_CARGO_WRAPPER_ORIGIN=rch\0",
+        )
+        .expect("rewrite2");
         assert!(!environ_has_bypass(&path));
 
         for value in ["0", "", "10", "true"] {
-            std::fs::write(&path, format!("RCH_CARGO_WRAPPER_BYPASS={value}\0")).unwrap();
+            std::fs::write(
+                &path,
+                format!("RCH_CARGO_WRAPPER_BYPASS={value}\0RCH_CARGO_WRAPPER_ORIGIN=rch\0"),
+            )
+            .unwrap();
             assert!(
                 !environ_has_bypass(&path),
                 "disabled bypass value {value:?}"
@@ -724,12 +754,14 @@ mod tests {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             if managed {
-                cmd.env(MANAGED_BYPASS_ENV, "1");
+                cmd.env(MANAGED_BYPASS_ENV, "1")
+                    .env(MANAGED_BYPASS_ORIGIN_ENV, MANAGED_BYPASS_ORIGIN_RCH);
             } else {
                 // The harness itself may carry rch's local-fallback
                 // bypass marker; children inherit it and would read as
                 // managed. Strip it for the unmanaged case.
-                cmd.env_remove(MANAGED_BYPASS_ENV);
+                cmd.env_remove(MANAGED_BYPASS_ENV)
+                    .env_remove(MANAGED_BYPASS_ORIGIN_ENV);
             }
             cmd.spawn().expect("spawn real cargo")
         };
