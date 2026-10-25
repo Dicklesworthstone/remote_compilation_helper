@@ -343,6 +343,13 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     // is exhausted; both report zero free inodes. A failed `df -Pk` emits no
     // line, and a failed `df -Pi` leaves both inode fields empty, so the field
     // count never shifts.
+    // GNU and BusyBox `df -Pi` print only inode columns (`Filesystem Inodes
+    // IUsed IFree IUse% Mounted on`, headers possibly localized), so free
+    // inodes are column 4 and the pool size column 2. macOS/BSD `df -Pi`
+    // keeps the 512-byte block columns and appends `iused ifree %iused`, where
+    // columns 4 and 2 are free and total blocks; that layout is recognized by
+    // its `iused`/`ifree` headers without an `Inodes` header, and its pool size
+    // is `iused + ifree` (statvfs `f_files`).
     // A configured future build directory may not exist yet. Measure its
     // closest existing ancestor, preserving the requested root in the fact,
     // so disk recovery can require evidence for every configured location.
@@ -356,7 +363,9 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
              done; \
              if [ -d \"$rp\" ]; then \
                b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{print $2\";\"$4}}'); \
-               i=$(df -Pi \"$rp\" 2>/dev/null | awk 'NR==2{{print $4\";\"$2}}'); \
+               i=$(df -Pi \"$rp\" 2>/dev/null | awk 'NR==1{{for(c=1;c<=NF;c++){{h=tolower($c); \
+                 if(h==\"iused\")u=c; else if(h==\"ifree\")f=c; else if(h==\"inodes\")t=c}}}} \
+                 NR==2{{if(u&&f&&!t)printf \"%s;%.0f\\n\",$f,$u+$f; else print $4\";\"$2}}'); \
                if [ -n \"$b\" ]; then \
                  printf '%sdisk=%s;%s;%s\\n' \"$P\" {q} \"$b\" \"${{i:-;}}\"; \
                fi; \
@@ -1123,8 +1132,10 @@ mod tests {
         assert!(script.contains("bun --version"));
         assert!(script.contains("df -Pk"));
         assert!(script.contains("df -Pi"));
-        // Free inodes and the inode pool size, in that order.
-        assert!(script.contains("NR==2{print $4\";\"$2}"));
+        // Free inodes and the inode pool size, in that order, positionally
+        // for GNU/BusyBox `df -Pi` (column layouts are covered by
+        // `live_disk_probe_records_the_inode_pool_size_from_df`).
+        assert!(script.contains("print $4\";\"$2"));
         // Quoted disk root.
         assert!(script.contains("'/data/tmp'"));
     }
@@ -1193,6 +1204,10 @@ case "$FAKE_DF:$1" in
   *:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mapper/root 2000000 400000 1600000 20%% /data\n' ;;
   btrfs:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/mapper/root 0 0 0 - /data\n' ;;
   ext4:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/sda1 6553600 6553588 12 100%% /data\n' ;;
+  localized:-Pi) printf 'Dateisystem Inodes IBenutzt IFrei IBenutzt%% Eingehaengt auf\n/dev/mapper/root 0 0 0 - /data\n' ;;
+  busybox:-Pi) printf 'Filesystem Inodes Used Available Use%% Mounted on\n/dev/root 6553600 6553588 12 100%% /data\n' ;;
+  macos:-Pi) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/disk3s5 7805228320 7389863304 359512896 96%% 48157628 1797564480 3%% /data\n' ;;
+  macos-full:-Pi) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/disk4s1 2000000 1999000 1000 100%% 999990 10 100%% /data\n' ;;
   *) exit 1 ;;
 esac
 "#,
@@ -1239,6 +1254,36 @@ esac
             (12, Some(6_553_600))
         );
         assert!(!ext4[0].meets_inode_floor(10_000));
+
+        // GNU `df` translates its headers; the GNU layout is still read
+        // positionally.
+        let localized = probe("localized");
+        assert_eq!(
+            (localized[0].available_inodes, localized[0].total_inodes),
+            (0, Some(0))
+        );
+        let busybox = probe("busybox");
+        assert_eq!(
+            (busybox[0].available_inodes, busybox[0].total_inodes),
+            (12, Some(6_553_600))
+        );
+
+        // macOS/BSD `df -Pi` keeps the 512-byte block columns ahead of
+        // `iused ifree`: free blocks must not be read as free inodes, nor
+        // total blocks as the pool size.
+        let macos = probe("macos");
+        assert_eq!(macos[0].available_bytes, 1_600_000 * 1024);
+        assert_eq!(
+            (macos[0].available_inodes, macos[0].total_inodes),
+            (1_797_564_480, Some(48_157_628 + 1_797_564_480))
+        );
+        assert!(macos[0].meets_inode_floor(10_000));
+        let macos_full = probe("macos-full");
+        assert_eq!(
+            (macos_full[0].available_inodes, macos_full[0].total_inodes),
+            (10, Some(1_000_000))
+        );
+        assert!(!macos_full[0].meets_inode_floor(10_000));
 
         // A failed `df -Pi` leaves the inode fields empty without shifting the
         // byte fields, and the unmeasured zero still fails the floor.
