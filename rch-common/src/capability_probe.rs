@@ -350,6 +350,13 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     // columns 4 and 2 are free and total blocks; that layout is recognized by
     // its `iused`/`ifree` headers without an `Inodes` header, and its pool size
     // is `iused + ifree` (statvfs `f_files`).
+    // Column numbers count from the first count column, not from the line
+    // start: a filesystem name can contain spaces (macOS `map auto_home`, Git
+    // Bash `C:/Program Files/Git`, a Windows temp dir under a user name with
+    // a space), which shifts every column to the right. The first field after
+    // the name that is a number, or `-` where df has no figure, is where the
+    // counts start. A mount point with spaces is the last column and shifts
+    // nothing.
     // A configured future build directory may not exist yet. Measure its
     // closest existing ancestor, preserving the requested root in the fact,
     // so disk recovery can require evidence for every configured location.
@@ -362,10 +369,14 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
                [ \"$parent\" != \"$rp\" ] || break; rp=$parent; \
              done; \
              if [ -d \"$rp\" ]; then \
-               b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{print $2\";\"$4}}'); \
+               b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{s=0; \
+                 for(c=2;c<=NF;c++) if($c~/^([0-9]+|-)$/){{s=c-2; break}}; \
+                 print $(2+s)\";\"$(4+s)}}'); \
                i=$(df -Pi \"$rp\" 2>/dev/null | awk 'NR==1{{for(c=1;c<=NF;c++){{h=tolower($c); \
                  if(h==\"iused\")u=c; else if(h==\"ifree\")f=c; else if(h==\"inodes\")t=c}}}} \
-                 NR==2{{if(u&&f&&!t)printf \"%s;%.0f\\n\",$f,$u+$f; else print $4\";\"$2}}'); \
+                 NR==2{{s=0; for(c=2;c<=NF;c++) if($c~/^([0-9]+|-)$/){{s=c-2; break}}; \
+                 if(u&&f&&!t)printf \"%s;%.0f\\n\",$(f+s),$(u+s)+$(f+s); \
+                 else print $(4+s)\";\"$(2+s)}}'); \
                if [ -n \"$b\" ]; then \
                  printf '%sdisk=%s;%s;%s\\n' \"$P\" {q} \"$b\" \"${{i:-;}}\"; \
                fi; \
@@ -1135,7 +1146,7 @@ mod tests {
         // Free inodes and the inode pool size, in that order, positionally
         // for GNU/BusyBox `df -Pi` (column layouts are covered by
         // `live_disk_probe_records_the_inode_pool_size_from_df`).
-        assert!(script.contains("print $4\";\"$2"));
+        assert!(script.contains("print $(4+s)\";\"$(2+s)"));
         // Quoted disk root.
         assert!(script.contains("'/data/tmp'"));
     }
@@ -1201,6 +1212,14 @@ mod tests {
             r#"#!/bin/sh
 case "$FAKE_DF:$1" in
   nodf:*) exit 1 ;;
+  macos-autofs:-Pk) printf 'Filesystem    1024-blocks Used Available Capacity  Mounted on\nmap auto_home           0    0         0   100%%    /System/Volumes/Data/home\n' ;;
+  macos-autofs:-Pi) printf 'Filesystem    512-blocks Used Available Capacity iused ifree %%iused  Mounted on\nmap auto_home          0    0         0   100%%       0     0     -   /System/Volumes/Data/home\n' ;;
+  macos-spaced-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity  Mounted on\ndevices -- file:///Data/ 1073741824 0 1073741824 0%%    /Users/someone/DeviceFS\n' ;;
+  macos-spaced-name:-Pi) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused  Mounted on\ndevices -- file:///Data/ 2147483648 0 2147483648 0%% 600000 1400000 30%%   /Users/someone/DeviceFS\n' ;;
+  gitbash-spaced-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nC:/Program Files/Git 498443260 290000000 208443260 59%% /\n' ;;
+  gitbash-spaced-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nC:/Program Files/Git - - - - /\n' ;;
+  spaced-mount:-Pk) printf 'Filesystem     1024-blocks       Used Available Capacity  Mounted on\n/dev/disk9s1     17160192   16666636    449384    98%%   /Volumes/My Build Disk\n' ;;
+  spaced-mount:-Pi) printf 'Filesystem     512-blocks       Used Available Capacity iused      ifree %%iused  Mounted on\n/dev/disk9s1     34320384   33333272    898768    98%%  604947    4493840   12%%   /Volumes/My Build Disk\n' ;;
   *:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mapper/root 2000000 400000 1600000 20%% /data\n' ;;
   btrfs:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/mapper/root 0 0 0 - /data\n' ;;
   ext4:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/sda1 6553600 6553588 12 100%% /data\n' ;;
@@ -1284,6 +1303,51 @@ esac
             (10, Some(1_000_000))
         );
         assert!(!macos_full[0].meets_inode_floor(10_000));
+
+        // A filesystem name with spaces shifts every column right. Read from
+        // the first count column, the macOS autofs map reports no blocks and
+        // no inode pool instead of the word `auto_home` as its size and a
+        // made-up exhausted pool of 100 (its `100%` capacity) ...
+        let autofs = probe("macos-autofs");
+        assert_eq!(autofs.len(), 1, "{autofs:?}");
+        assert_eq!((autofs[0].total_bytes, autofs[0].available_bytes), (0, 0));
+        assert_eq!(
+            (autofs[0].available_inodes, autofs[0].total_inodes),
+            (0, Some(0))
+        );
+        // ... a three-word name still yields its real figures ...
+        let spaced = probe("macos-spaced-name");
+        assert_eq!(
+            (spaced[0].total_bytes, spaced[0].available_bytes),
+            (1_073_741_824 * 1024, 1_073_741_824 * 1024)
+        );
+        assert_eq!(
+            (spaced[0].available_inodes, spaced[0].total_inodes),
+            (1_400_000, Some(2_000_000))
+        );
+        // ... and Git Bash's `C:/Program Files/Git`, which has no inode
+        // figures, is a filesystem without a pool rather than an unmeasured
+        // one that fails the floor.
+        let gitbash = probe("gitbash-spaced-name");
+        assert_eq!(
+            (gitbash[0].total_bytes, gitbash[0].available_bytes),
+            (498_443_260 * 1024, 208_443_260 * 1024)
+        );
+        assert_eq!(gitbash[0].total_inodes, Some(0));
+        assert!(gitbash[0].meets_inode_floor(10_000));
+        // A mount point with spaces is the last column and shifts nothing.
+        let spaced_mount = probe("spaced-mount");
+        assert_eq!(
+            (spaced_mount[0].total_bytes, spaced_mount[0].available_bytes),
+            (17_160_192 * 1024, 449_384 * 1024)
+        );
+        assert_eq!(
+            (
+                spaced_mount[0].available_inodes,
+                spaced_mount[0].total_inodes
+            ),
+            (4_493_840, Some(604_947 + 4_493_840))
+        );
 
         // A failed `df -Pi` leaves the inode fields empty without shifting the
         // byte fields, and the unmeasured zero still fails the floor.
