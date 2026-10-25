@@ -61,5 +61,37 @@ rch_source_registry_health() (
                 || refuse_registry_health "$directory" readback
         ) || exit 74
     done
+    df_available() {
+        {
+            IFS= read -r _ || return 1
+            read -r _ total _ avail _ || return 1
+        } <<RCH_DF_OUTPUT
+$1
+RCH_DF_OUTPUT
+        if [ "${2-}" = inodes ]; then
+            case "$total" in ''|0|*[!0-9]*) return 1 ;; esac
+        fi
+        case "$avail" in ''|*[!0-9]*) return 1 ;; esac
+        printf '%s\n' "$avail"
+    }
+
+    min_free_kb=${RCH_REGISTRY_MIN_FREE_KB:-65536}
+    case "$min_free_kb" in ''|*[!0-9]*) min_free_kb=65536 ;; esac
+    min_free_inodes=${RCH_REGISTRY_MIN_FREE_INODES:-1024}
+    case "$min_free_inodes" in ''|*[!0-9]*) min_free_inodes=1024 ;; esac
+    df_kb_out=$(df -Pk -- "$registry" 2>/dev/null) || df_kb_out=
+    free_kb=$(df_available "$df_kb_out" blocks) || free_kb=
+    df_inodes_out=$(df -Pi -- "$registry" 2>/dev/null) || df_inodes_out=
+    free_inodes=$(df_available "$df_inodes_out" inodes) || free_inodes=
+    if { [ -n "$free_kb" ] && [ "$free_kb" -lt "$min_free_kb" ]; } \
+        || { [ -n "$free_inodes" ] && [ "$free_inodes" -lt "$min_free_inodes" ]; }; then
+        free_bytes=unknown
+        if [ -n "$free_kb" ]; then
+            free_bytes=$((free_kb * 1024))
+        fi
+        printf 'RCH_SOURCE_REGISTRY_DEGRADED %s: free_bytes=%s free_kb=%s free_inodes=%s\n' \
+            "$registry" "$free_bytes" "${free_kb:-unknown}" "${free_inodes:-unknown}" >&2
+        exit 75
+    fi
     printf 'health_check\n'
 )

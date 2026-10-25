@@ -629,6 +629,50 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assertFalse(list(self.registry.glob("aa.*.claim")))
         self.assertFalse(list(self.registry.glob("aa.*.pending")))
 
+    def test_legacy_registry_compatibility_window_and_unwritable_tmp_isolation(self):
+        legacy = self.root / "legacy-tmp-registry"
+        legacy.mkdir()
+        legacy_roots = [self.root / "legacy-held"]
+        legacy_claim = legacy / ("99." + digest(legacy_roots) + ".claim")
+        legacy_claim.write_bytes(body(legacy_roots))
+        # Simulate a quota-exhausted / unwritable /tmp registry directory.
+        legacy.chmod(0o500)
+        self.addCleanup(lambda: legacy.chmod(0o700))
+        env = {**self.env, "RCH_LEGACY_SOURCE_CLAIM_REGISTRY": str(legacy)}
+
+        overlap = self.transact("aa", [self.root / "legacy-held/sub"], "try-acquire", env=env)
+        self.assertEqual(overlap.returncode, 75, overlap.stderr.decode(errors="replace"))
+        self.assertIn(b"unfinished overlapping source owner", overlap.stderr)
+
+        disjoint = [self.root / "var-tmp-project"]
+        self.assert_granted(self.transact("bb", disjoint, "acquire", env=env))
+        self.assert_granted(self.transact("bb", disjoint, "release", env=env))
+
+    def test_terminal_claim_retention_prunes_old_receipts_and_headroom_reserves_release(self):
+        old_roots = [self.root / "old-project"]
+        old_released = self.registry / "released" / ("01." + digest(old_roots) + ".claim")
+        old_cancelled = self.registry / "cancelled" / ("02." + digest(old_roots) + ".claim")
+        fresh_released = self.registry / "released" / ("03." + digest(old_roots) + ".claim")
+        for path in (old_released, old_cancelled, fresh_released):
+            path.write_bytes(body(old_roots))
+        two_days_ago = 1_000_000
+        os.utime(old_released, (two_days_ago, two_days_ago))
+        os.utime(old_cancelled, (two_days_ago, two_days_ago))
+
+        active_roots = [self.root / "active-project"]
+        self.assert_granted(self.transact("aa", active_roots, "acquire"))
+        self.assertFalse(old_released.exists())
+        self.assertFalse(old_cancelled.exists())
+        self.assertTrue(fresh_released.exists())
+
+        low_headroom_env = {**self.env, "RCH_REGISTRY_MIN_FREE_KB": "999999999999"}
+        refused = self.transact("bb", [self.root / "new-project"], "acquire", env=low_headroom_env)
+        self.assert_refused(refused)
+        self.assertIn(b"RCH_SOURCE_CLAIM_WRITE_FAILED", refused.stderr)
+        self.assertIn(b"below reserved headroom", refused.stderr)
+        # In-flight claims can still release using the reserved headroom.
+        self.assert_granted(self.transact("aa", active_roots, "release", env=low_headroom_env))
+
 
 @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
 class SourceClaimRegistryBashTests(SourceClaimRegistryTests):

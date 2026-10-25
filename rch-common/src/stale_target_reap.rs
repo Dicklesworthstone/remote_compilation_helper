@@ -41,7 +41,7 @@
 //! with admission. A completed build may retain its outputs for recovery long
 //! after its processes and mtimes go quiet; its active claim still forbids GC.
 
-const SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
+const SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 
 /// Retirement failure leaves ambiguous durable ownership. Stop the entire
 /// supervisor before another candidate or successful metrics can hide it.
@@ -510,6 +510,26 @@ __gc_source_records_free() {
             case "$__gc_root" in "$__gc_candidate"/*) return 3;; esac;
         done < "$__gc_record";
     done;
+    __gc_legacy_registry=${RCH_LEGACY_SOURCE_CLAIM_REGISTRY-};
+    if [ -z "$__gc_legacy_registry" ] && [ "$__gc_source_registry" = "/var/tmp/rch-source-authority-locks/claims-v1" ]; then
+        __gc_legacy_registry="/tmp/rch-source-authority-locks/claims-v1";
+    fi;
+    if [ -n "$__gc_legacy_registry" ] && [ "$__gc_legacy_registry" != "$__gc_source_registry" ] \
+        && [ ! -L "$__gc_legacy_registry" ] && [ -d "$__gc_legacy_registry" ]; then
+        for __gc_record in "$__gc_legacy_registry"/*.claim "$__gc_legacy_registry"/*.pending; do
+            [ -e "$__gc_record" ] || [ -L "$__gc_record" ] || continue;
+            rch_claim_record_valid "$__gc_record" || continue;
+            while IFS= read -r __gc_root || [ -n "$__gc_root" ]; do
+                case "$__gc_root" in /*) ;; *) return 2;; esac;
+                case "$__gc_root" in *//*|*/./*|*/../*|*/.|*/..) return 2;; esac;
+                [ "$__gc_root" = / ] || [ "${__gc_root%/}" = "$__gc_root" ] || return 2;
+                __gc_source_realpath "$__gc_root" || return 2; __gc_root=$__gc_resolved;
+                [ "$__gc_root" != / ] && [ "$__gc_candidate" != / ] || return 2;
+                case "$__gc_candidate" in "$__gc_root"|"$__gc_root"/*) return 3;; esac;
+                case "$__gc_root" in "$__gc_candidate"/*) return 3;; esac;
+            done < "$__gc_record";
+        done;
+    fi;
 };
 __gc_source_end() {
     if [ -n "${__gc_reservation-}" ]; then
@@ -526,6 +546,13 @@ __gc_source_end() {
             || ! sync -f "$__gc_source_registry/released" || ! sync -f "$__gc_source_registry"; then
             exec 8>&-; return 1;
         fi;
+        __gc_retention_minutes=${RCH_SOURCE_CLAIM_RETENTION_MINUTES:-1440};
+        case "$__gc_retention_minutes" in ''|*[!0-9]*) __gc_retention_minutes=1440;; esac;
+        for __gc_tdir in "$__gc_source_registry/released" "$__gc_source_registry/cancelled"; do
+            [ ! -L "$__gc_tdir" ] && [ -d "$__gc_tdir" ] || continue;
+            find "$__gc_tdir" -maxdepth 1 -type f -name '*.claim' \
+                ! -name "${__gc_reservation##*/}" -mmin +"$__gc_retention_minutes" -delete 2>/dev/null || true;
+        done;
         __gc_reservation="";
     fi;
     exec 8>&-;
@@ -4151,7 +4178,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             std::fs::create_dir(&bin).unwrap();
             source_gc_fixture_dir(&candidate);
             let remover = bin.join("rm");
-            std::fs::write(&remover, b"#!/bin/sh\nexec 8>&-\n: > \"$RCH_GC_TEST_READY\"\ni=0\nwhile [ ! -e \"$RCH_GC_TEST_RESUME\" ]; do i=$((i+1)); [ \"$i\" -lt 1000 ] || exit 9; sleep 0.01; done\nexec /bin/rm \"$@\"\n").unwrap();
+            std::fs::write(&remover, b"#!/bin/sh\nexec 8>&-\n: > \"$RCH_GC_TEST_READY\"\ni=0\nwhile [ ! -e \"$RCH_GC_TEST_RESUME\" ]; do i=$((i+1)); [ \"$i\" -lt 6000 ] || exit 9; sleep 0.01; done\nexec /bin/rm \"$@\"\n").unwrap();
             std::fs::set_permissions(&remover, std::fs::Permissions::from_mode(0o755)).unwrap();
             let script = format!(
                 "{} __gc_source_begin \"$1\" || exit 1; rm -rf -- \"$1\"; __gc_source_end;",

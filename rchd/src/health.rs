@@ -540,17 +540,27 @@ impl HealthMonitor {
                     // is command-class evidence (issue #48). Successful real
                     // probes now execute storage operations too, so they can
                     // supply command-class recovery rather than just liveness.
-                    let (previous_circuit_state, new_circuit_state) = if result.command_failure
-                        || result.healthy
-                    {
-                        worker
-                            .record_command_outcome(result.healthy, &config.circuit)
-                            .await
-                    } else {
-                        worker
-                            .record_health_check(result.healthy, result.transient, &config.circuit)
-                            .await
-                    };
+                    let (previous_circuit_state, new_circuit_state) =
+                        if registry_health::is_degraded(&result) {
+                            // Storage probe writes succeeded, but registry filesystem headroom is
+                            // low. Surface Degraded status and the diagnostic warning without
+                            // tripping the command-failure circuit breaker into Open (bd-3n17z).
+                            worker
+                                .record_health_check(true, false, &config.circuit)
+                                .await
+                        } else if result.command_failure || result.healthy {
+                            worker
+                                .record_command_outcome(result.healthy, &config.circuit)
+                                .await
+                        } else {
+                            worker
+                                .record_health_check(
+                                    result.healthy,
+                                    result.transient,
+                                    &config.circuit,
+                                )
+                                .await
+                        };
 
                     if result.healthy {
                         worker.set_last_latency_ms(Some(result.response_time_ms));

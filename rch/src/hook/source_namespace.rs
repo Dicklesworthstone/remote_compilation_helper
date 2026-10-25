@@ -15,7 +15,7 @@ use anyhow::Context as _;
 use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 
-const REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
+const REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 const PATHS: &str = include_str!("source_namespace_paths.sh");
 const ADMISSION: &str = include_str!("source_claim_admission.sh");
 const CLAIMS: &str = include_str!("source_claim_registry.sh");

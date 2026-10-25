@@ -14,6 +14,10 @@ pending="$registry/$token.$digest.pending"
 released="$registry/released/$token.$digest.claim"
 cancelled="$registry/cancelled/$token.$digest.claim"
 cancelling="$registry/$token.$digest.cancelling"
+legacy_registry=${RCH_LEGACY_SOURCE_CLAIM_REGISTRY-}
+if [ -z "$legacy_registry" ] && [ "$registry" = "/var/tmp/rch-source-authority-locks/claims-v1" ]; then
+    legacy_registry="/tmp/rch-source-authority-locks/claims-v1"
+fi
 
 # This transaction already names every record and containing-directory barrier.
 # GNU sync -f calls syncfs, and uutils 0.10 sync FILE calls global sync(). Both
@@ -295,6 +299,33 @@ ${held##*/}"
             check_held_claim_batch
         fi
     done
+    if [ -n "${legacy_registry-}" ] && [ "$legacy_registry" != "$registry" ] \
+        && [ ! -L "$legacy_registry" ] && [ -d "$legacy_registry" ]; then
+        for held in "$legacy_registry"/*.claim "$legacy_registry"/*.pending; do
+            [ -e "$held" ] || [ -L "$held" ] || continue
+            case "$held" in *.pending)
+                rch_claim_record_valid "$held" || continue
+                ;;
+            esac
+            validate_record "$held"
+            case "${held##*/}" in "$token".*)
+                [ "$operation" = recover ] || refuse 'source identity already claimed'
+                matches_request "$held"
+                continue
+                ;;
+            esac
+            if [ -z "$held_claim_names" ]; then
+                held_claim_names=$held
+            else
+                held_claim_names="$held_claim_names
+$held"
+            fi
+            held_batch_count=$((held_batch_count + 1))
+            if [ "$held_batch_count" -eq "$held_batch_limit" ]; then
+                check_held_claim_batch
+            fi
+        done
+    fi
     if [ "$held_batch_count" -gt 0 ]; then
         check_held_claim_batch
     fi
@@ -319,16 +350,65 @@ emit_held_claim_roots() {
         # Individual framing prevents an unterminated/empty record from being
         # hidden by concatenation with the next owner's roots. The outer end
         # marker is emitted ONLY if every read/resolution succeeds.
+        case "$held_name" in
+            /*) held_path=$held_name ;;
+            *) held_path="$registry/$held_name" ;;
+        esac
         printf 'RCH_HELD_RECORD_BEGIN\n' || return 1
         case "$1" in
-            lexical) LC_ALL=C tr '\000' '\r' < "$registry/$held_name" || return 1 ;;
-            physical) physical_roots < "$registry/$held_name" || return 1 ;;
+            lexical) LC_ALL=C tr '\000' '\r' < "$held_path" || return 1 ;;
+            physical) physical_roots < "$held_path" || return 1 ;;
             *) return 1 ;;
         esac
         printf 'RCH_HELD_RECORD_END\n' || return 1
     done <<RCH_HELD_CLAIM_NAMES
 $held_claim_names
 RCH_HELD_CLAIM_NAMES
+}
+
+prune_terminal_claims() {
+    retention_minutes=${RCH_SOURCE_CLAIM_RETENTION_MINUTES:-1440}
+    case "$retention_minutes" in
+        ''|*[!0-9]*) retention_minutes=1440 ;;
+    esac
+    for terminal_dir in "$registry/released" "$registry/cancelled"; do
+        [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ] || continue
+        find "$terminal_dir" -maxdepth 1 -type f -name '*.claim' \
+            ! -name "$token.*" -mmin +"$retention_minutes" -delete 2>/dev/null || true
+    done
+}
+
+df_available() {
+    {
+        IFS= read -r _ || return 1
+        read -r _ total _ avail _ || return 1
+    } <<RCH_DF_OUTPUT
+$1
+RCH_DF_OUTPUT
+    if [ "${2-}" = inodes ]; then
+        case "$total" in ''|0|*[!0-9]*) return 1 ;; esac
+    fi
+    case "$avail" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$avail"
+}
+
+check_registry_headroom() {
+    min_free_kb=${RCH_REGISTRY_MIN_FREE_KB:-4096}
+    case "$min_free_kb" in ''|*[!0-9]*) min_free_kb=4096 ;; esac
+    min_free_inodes=${RCH_REGISTRY_MIN_FREE_INODES:-256}
+    case "$min_free_inodes" in ''|*[!0-9]*) min_free_inodes=256 ;; esac
+    df_kb_out=$(df -Pk -- "$registry" 2>/dev/null) || df_kb_out=
+    free_kb=$(df_available "$df_kb_out" blocks) || free_kb=
+    if [ -n "$free_kb" ] && [ "$free_kb" -lt "$min_free_kb" ]; then
+        printf 'RCH_SOURCE_CLAIM_WRITE_FAILED %s/.headroom-free-kb-%s\n' "$registry" "$free_kb" >&2
+        refuse 'source claim registry below reserved headroom'
+    fi
+    df_inodes_out=$(df -Pi -- "$registry" 2>/dev/null) || df_inodes_out=
+    free_inodes=$(df_available "$df_inodes_out" inodes) || free_inodes=
+    if [ -n "$free_inodes" ] && [ "$free_inodes" -lt "$min_free_inodes" ]; then
+        printf 'RCH_SOURCE_CLAIM_WRITE_FAILED %s/.headroom-free-inodes-%s\n' "$registry" "$free_inodes" >&2
+        refuse 'source claim registry below reserved inode headroom'
+    fi
 }
 
 # rch <= 2.1.16 created .cancelling with a plain `set -C` redirect, so a full
@@ -479,6 +559,7 @@ if [ "$operation" = finish-cancel ]; then
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'unfinished claim transition'
     mv -- "$active" "$cancelled"
     confirm_durable_record "$cancelled"
+    prune_terminal_claims
     exit 0
 fi
 
@@ -526,6 +607,7 @@ if [ "$operation" = release ]; then
     [ ! -e "$released" ] && [ ! -L "$released" ] || refuse 'duplicate release receipt'
     mv -- "$active" "$released"
     confirm_durable_record "$released"
+    prune_terminal_claims
     exit 0
 fi
 
@@ -612,6 +694,8 @@ if [ "$operation" = recover ]; then
 else
     [ ! -e "$active" ] && [ ! -L "$active" ] || refuse 'source grant already exists'
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'pending source grant already exists'
+    prune_terminal_claims
+    check_registry_headroom
     rch_claim_write_atomic "$registry" "$pending" "$digest" "$requested" || refuse 'cannot persist source claim'
     matches_request "$pending"
 fi

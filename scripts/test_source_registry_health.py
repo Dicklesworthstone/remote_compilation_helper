@@ -255,6 +255,14 @@ class SourceRegistryHealthTests(unittest.TestCase):
         self.registry.parent.mkdir(mode=0o500)
         self.assert_refused(self.run_probe(user=65534), b"mkdir")
 
+    def test_low_headroom_reports_degraded_with_free_bytes_and_inodes(self) -> None:
+        result = self.run_probe("RCH_REGISTRY_MIN_FREE_KB=999999999999")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertIn(b"RCH_SOURCE_REGISTRY_DEGRADED", result.stderr)
+        self.assertIn(b"free_bytes=", result.stderr)
+        self.assertIn(b"free_inodes=", result.stderr)
+        self.assertFalse(list(self.root.rglob(".health-probe.*")))
+
 
 if __name__ == "__main__":
     unittest.main()
