@@ -2002,6 +2002,129 @@ pub fn parse_gc_claim_reports(stdout: &str) -> (Option<String>, Vec<GcClaimRepor
     (status, claims)
 }
 
+/// One `RCH_GC_RETAINED` line from [`retained_source_trees_census_command`].
+///
+/// Retained `source-content-pair-<key>.retained-<identity>` trees are NEVER
+/// deleted automatically (bd-psywj); this census reports their size, age,
+/// marker status, and whether any active/pending source claim still references
+/// them so operators can inspect them in `rch gc --retained`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedSourceReport {
+    /// `keep` (when an active/pending claim references the tree) or
+    /// `unclaimed-preview` (read-only operator preview; never auto-deleted).
+    pub verdict: String,
+    /// `active-claim`, `retention-v1`, or `missing-marker`.
+    pub reason: String,
+    pub age_minutes: u64,
+    pub kb: u64,
+    pub path: String,
+}
+
+/// Build a read-only shell command that enumerates retained
+/// `source-content-pair-*.retained-*` trees directly under `escaped_base` and
+/// checks whether any active or pending source claim references each tree.
+///
+/// This command is strictly read-only and never deletes directories or claim
+/// files.
+#[must_use]
+pub fn retained_source_trees_census_command(escaped_base: &str) -> String {
+    retained_source_trees_census_command_with_registry(escaped_base, SOURCE_CLAIM_REGISTRY)
+}
+
+/// [`retained_source_trees_census_command`] against an explicit claim registry.
+#[must_use]
+pub fn retained_source_trees_census_command_with_registry(
+    escaped_base: &str,
+    registry: &str,
+) -> String {
+    if !is_safe_reap_base(escaped_base) {
+        return "printf 'RCH_GC_RETAINED_SOURCES skipped-invalid\\n'".to_string();
+    }
+    let registry = shell_escape::escape(registry.into());
+    format!(
+        r#"base="{escaped_base}"; r={registry};
+if [ ! -d "$base" ] || [ -L "$base" ]; then printf 'RCH_GC_RETAINED_SOURCES none\n'; exit 0; fi;
+base_real=$(cd "$base" 2>/dev/null && pwd -P);
+if [ -z "$base_real" ]; then printf 'RCH_GC_RETAINED_SOURCES unresolvable\n'; exit 0; fi;
+case "$base_real" in /*/*) ;; *) printf 'RCH_GC_RETAINED_SOURCES skipped-shallow\n'; exit 0;; esac;
+printf 'RCH_GC_RETAINED_SOURCES ok\n';
+now=$(date +%s);
+legacy_r="";
+if [ "$r" = "/var/tmp/rch-source-authority-locks/claims-v1" ]; then
+  legacy_r="/tmp/rch-source-authority-locks/claims-v1";
+fi;
+for d in "$base_real"/source-content-pair-*.retained-*; do
+  [ -d "$d" ] && [ ! -L "$d" ] || continue;
+  m=$(stat -c %Y -- "$d" 2>/dev/null) || m=$now;
+  age=$(( (now - m) / 60 ));
+  [ "$age" -lt 0 ] && age=0;
+  kb=$(du -sk -- "$d" 2>/dev/null | awk '{{print $1}}');
+  [ -z "$kb" ] && kb=0;
+  if [ -e "$d/.rch-retention-v1" ] || [ -L "$d/.rch-retention-v1" ]; then
+    marker=retention-v1;
+  else
+    marker=missing-marker;
+  fi;
+  id=${{d##*.retained-}};
+  claimed=0;
+  for reg in "$r" "$legacy_r"; do
+    [ -n "$reg" ] && [ -d "$reg" ] && [ ! -L "$reg" ] || continue;
+    for c in "$reg/$id".*.claim "$reg/$id".*.pending "$reg"/*.claim "$reg"/*.pending; do
+      [ -f "$c" ] && [ ! -L "$c" ] || continue;
+      case "${{c##*/}}" in
+        "$id".*.claim|"$id".*.pending) claimed=1; break;;
+      esac;
+      if grep -qFx -- "$d" "$c" 2>/dev/null; then claimed=1; break; fi;
+    done;
+    [ "$claimed" -eq 1 ] && break;
+  done;
+  if [ "$claimed" -eq 1 ]; then
+    v=keep; why=active-claim;
+  else
+    v=unclaimed-preview; why=$marker;
+  fi;
+  printf 'RCH_GC_RETAINED %s %s %s %s %s\n' "$v" "$why" "$age" "$kb" "$d";
+done;
+"#
+    )
+}
+
+/// Parse the retained-source census output (`RCH_GC_RETAINED_SOURCES <status>`
+/// and `RCH_GC_RETAINED <verdict> <reason> <age_minutes> <kb> <path>`).
+#[must_use]
+pub fn parse_retained_source_reports(stdout: &str) -> (Option<String>, Vec<RetainedSourceReport>) {
+    let mut status = None;
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("RCH_GC_RETAINED_SOURCES ") {
+            status = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("RCH_GC_RETAINED ") {
+            let mut parts = rest.splitn(5, ' ');
+            let (Some(verdict), Some(reason), Some(age), Some(kb), Some(path)) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                continue;
+            };
+            let (Ok(age_minutes), Ok(kb)) = (age.parse(), kb.parse()) else {
+                continue;
+            };
+            entries.push(RetainedSourceReport {
+                verdict: verdict.to_string(),
+                reason: reason.to_string(),
+                age_minutes,
+                kb,
+                path: path.to_string(),
+            });
+        }
+    }
+    (status, entries)
+}
+
 /// The roots one enumeration/sweep run actually looked at, as reported by the
 /// script itself (`RCH_GC_ROOT <kind> <path>`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4598,5 +4721,72 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert_eq!(errors[0].trigger, "cap");
         assert_eq!(errors[0].path, "/data/projects/r/.rch-target-w-pool-x");
         assert!(errors[0].message.contains("Permission denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_source_trees_census_reports_claimed_and_unclaimed_without_deleting() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("rch-base");
+        let registry = tmp.path().join("claims-v1");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+
+        let unclaimed = base.join("source-content-pair-aaaa1111.retained-101-deadbeef");
+        std::fs::create_dir_all(&unclaimed).unwrap();
+        std::fs::write(unclaimed.join(".rch-retention-v1"), b"retained\n").unwrap();
+        std::fs::write(unclaimed.join("payload.bin"), vec![b'x'; 4096]).unwrap();
+
+        let claimed = base.join("source-content-pair-bbbb2222.retained-202-cafef00d");
+        std::fs::create_dir_all(&claimed).unwrap();
+        std::fs::write(claimed.join(".rch-retention-v1"), b"retained\n").unwrap();
+        std::fs::write(
+            registry.join("202-cafef00d.0123456789abcdef.claim"),
+            format!("{}\n", claimed.display()),
+        )
+        .unwrap();
+
+        let cmd = retained_source_trees_census_command_with_registry(
+            base.to_str().unwrap(),
+            registry.to_str().unwrap(),
+        );
+        assert!(
+            !cmd.contains("rm ") && !cmd.contains("rmdir") && !cmd.contains("-delete"),
+            "retained source census must be strictly read-only: {cmd}"
+        );
+
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .expect("retained source census should execute");
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (status, reports) = parse_retained_source_reports(&stdout);
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(reports.len(), 2, "stdout: {stdout}");
+
+        let unclaimed_canon = std::fs::canonicalize(&unclaimed).unwrap();
+        let claimed_canon = std::fs::canonicalize(&claimed).unwrap();
+        let unclaimed_entry = reports
+            .iter()
+            .find(|r| std::path::Path::new(&r.path) == unclaimed_canon)
+            .expect("unclaimed entry present");
+        assert_eq!(unclaimed_entry.verdict, "unclaimed-preview");
+        assert_eq!(unclaimed_entry.reason, "retention-v1");
+        assert!(unclaimed_entry.kb > 0);
+
+        let claimed_entry = reports
+            .iter()
+            .find(|r| std::path::Path::new(&r.path) == claimed_canon)
+            .expect("claimed entry present");
+        assert_eq!(claimed_entry.verdict, "keep");
+        assert_eq!(claimed_entry.reason, "active-claim");
+
+        // Both directories must still exist intact after the census.
+        assert!(unclaimed.exists());
+        assert!(claimed.exists());
     }
 }

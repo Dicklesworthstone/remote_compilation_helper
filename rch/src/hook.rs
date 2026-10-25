@@ -248,6 +248,23 @@ fn selection_project_for_execution(
     format!("{project}::clean-overlay::{}", &suffix[..16])
 }
 
+/// Return a per-job selection identity for a `--source-content-receipt`
+/// read-only `cargo fmt --check` run (bd-k90ud).
+///
+/// Like `--clean-overlay`, a receipt-backed `cargo fmt --check` materializes an
+/// isolated remote source container (`source-content-<build_id>-<hash>`) rather
+/// than mutating the shared mirror, and requires the worker's `rustfmt`
+/// component gate in `rchd`.
+fn selection_project_for_source_content_fmt_check(project: &str, job_nonce: uuid::Uuid) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-source-content-fmt-selection-project-v1\0");
+    hasher.update(project.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(job_nonce.as_bytes());
+    let suffix = hasher.finalize().to_hex();
+    format!("{project}::clean-overlay::{}", &suffix[..16])
+}
+
 static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
 static AUTOSTART_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -3720,6 +3737,14 @@ fn is_clean_overlay_cargo_fmt_check(command_parts: &[String]) -> bool {
     subcommand == "fmt" && parts.any(|part| part == "--check")
 }
 
+fn is_isolated_source_cargo_fmt_check(
+    clean_overlay: bool,
+    source_content_receipt: bool,
+    command_parts: &[String],
+) -> bool {
+    (clean_overlay || source_content_receipt) && is_clean_overlay_cargo_fmt_check(command_parts)
+}
+
 #[allow(clippy::too_many_arguments)] // Pipeline wiring favors explicit params
 pub async fn run_exec(
     base: Option<String>,
@@ -3836,7 +3861,8 @@ pub async fn run_exec(
     } else {
         classify_command(&command)
     };
-    let clean_overlay_fmt_check = clean_overlay && is_clean_overlay_cargo_fmt_check(&command_parts);
+    let clean_overlay_fmt_check =
+        is_isolated_source_cargo_fmt_check(clean_overlay, source_content_receipt, &command_parts);
     if !classification.is_compilation && !clean_overlay_fmt_check {
         // This should not normally happen because the hook only rewrites
         // compilations. Preserve the ordinary local behavior, but honor
@@ -4027,11 +4053,11 @@ pub async fn run_exec(
         )
         .await?;
     }
-    let selection_project = selection_project_for_execution(
-        &project,
-        clean_overlay_spec.as_ref(),
-        uuid::Uuid::new_v4(),
-    );
+    let selection_project = if clean_overlay_spec.is_none() && clean_overlay_fmt_check {
+        selection_project_for_source_content_fmt_check(&project, uuid::Uuid::new_v4())
+    } else {
+        selection_project_for_execution(&project, clean_overlay_spec.as_ref(), uuid::Uuid::new_v4())
+    };
     // Issue #63: `--job` bypasses classification (kind = Job), so the request
     // used to carry NO toolchain even for a delegated `cargo clippy` — and the
     // daemon's clippy component gate then fail-closed EVERY worker as

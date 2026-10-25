@@ -1055,6 +1055,38 @@ fn clean_overlay_fmt_check_allowlist_is_exact_and_read_only() {
 }
 
 #[test]
+fn source_content_receipt_admits_read_only_cargo_fmt_check_with_isolated_selection_id() {
+    let _guard = test_guard!();
+    let fmt_check = vec![
+        "cargo".to_string(),
+        "fmt".to_string(),
+        "--all".to_string(),
+        "--check".to_string(),
+    ];
+    let fmt_mutate = vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()];
+
+    assert!(!is_isolated_source_cargo_fmt_check(
+        false, false, &fmt_check
+    ));
+    assert!(is_isolated_source_cargo_fmt_check(true, false, &fmt_check));
+    assert!(is_isolated_source_cargo_fmt_check(false, true, &fmt_check));
+    assert!(is_isolated_source_cargo_fmt_check(true, true, &fmt_check));
+    assert!(!is_isolated_source_cargo_fmt_check(
+        false,
+        true,
+        &fmt_mutate
+    ));
+
+    let first =
+        selection_project_for_source_content_fmt_check("frankentui", uuid::Uuid::from_u128(1));
+    let second =
+        selection_project_for_source_content_fmt_check("frankentui", uuid::Uuid::from_u128(2));
+    assert!(first.starts_with("frankentui::clean-overlay::"));
+    assert_eq!(first.len(), "frankentui::clean-overlay::".len() + 16);
+    assert_ne!(first, second);
+}
+
+#[test]
 fn join_exec_command_preserves_space_bearing_arg() {
     let _guard = test_guard!();
     // The outer shell merges `--features='foo bar'` into one argv

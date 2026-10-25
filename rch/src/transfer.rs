@@ -781,6 +781,7 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".rch_dep_fingerprint.json",
     ".rch_dep_fingerprint.json.tmp",
     ".rch_prepare_logs/",
+    ".rch_last_used",
 ];
 // Host-local language environments are neither source nor portable build
 // inputs.  They commonly contain absolute symlinks (for example
@@ -16073,6 +16074,10 @@ Number of files transferred: 42
         assert!(
             excludes.iter().any(|e| e == ".rch-go/"),
             "effective excludes must include .rch-go/: {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == ".rch_last_used"),
+            "effective excludes must include .rch_last_used: {excludes:?}"
         );
     }
 
