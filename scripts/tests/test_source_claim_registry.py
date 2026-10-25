@@ -13,6 +13,7 @@ import random
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -28,7 +29,6 @@ FLOCK_NO_FORK = ["--no-fork"] if FLOCK and b"util-linux" in subprocess.run(
     check=False).stdout else []
 AWK = shutil.which("awk")
 REALPATH = shutil.which("realpath")
-SYNC = shutil.which("sync")
 
 
 def body(roots):
@@ -97,12 +97,35 @@ class SourceClaimRegistryTests(unittest.TestCase):
                               timeout=10, check=False)
 
     def tool_env(self, name, program):
+        return self.tools_env({name: program})
+
+    def tools_env(self, tools):
         directory = self.root / ("tools-" + str(len(list(self.root.glob("tools-*")))))
         directory.mkdir()
-        tool = directory / name
-        tool.write_text("#!/bin/sh\n" + program + "\n")
-        tool.chmod(0o700)
+        for name, program in tools.items():
+            tool = directory / name
+            tool.write_text("#!/bin/sh\n" + program + "\n")
+            tool.chmod(0o700)
         return {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
+
+    def barrier_env(self, program):
+        # The registry fsyncs each record and directory itself through a
+        # `python3 -c` adapter, never the sync utility (GNU syncfs and uutils'
+        # global sync wait on unrelated builds under the registry lock). Fake
+        # that adapter: `program` sees the barrier path as $1 and fails the
+        # barrier by exiting nonzero; otherwise the real fsync runs. A call to
+        # the utility itself leaves a marker (see assert_no_sync_utility).
+        return self.tools_env({
+            "python3": ('case "${4-}" in *os.fsync*)\n'
+                        "  barrier() {\n" + program + "\n  }\n"
+                        '  barrier "$5" || exit\n'
+                        "esac\nexec " + shlex.quote(sys.executable) + ' "$@"'),
+            "sync": "touch " + shlex.quote(str(self.root / "sync-utility-called")) + "\nexit 97",
+        })
+
+    def assert_no_sync_utility(self):
+        self.assertFalse((self.root / "sync-utility-called").exists(),
+                         "no whole-filesystem sync under the registry lock")
 
     def test_cartesian_reference_matches_component_index(self):
         rng = random.Random(67031)
@@ -314,12 +337,11 @@ class SourceClaimRegistryTests(unittest.TestCase):
                 process.communicate(timeout=5)
 
     def fail_sync_after_move(self, destination):
-        # Real writes and renames run. Only sync reports an injected failure
-        # after the destination appears: the lost-durability-ack frontier.
-        return self.tool_env("sync", 'if [ -e {} ]; then\n'
-                             '  printf "injected post-rename sync failure\\n" >&2\n'
-                             '  exit 91\nfi\nexec {} "$@"'.format(
-                                 shlex.quote(str(destination)), shlex.quote(SYNC)))
+        # Real writes and renames run. Only the fsync barrier reports an injected
+        # failure after the destination appears: the lost-durability-ack frontier.
+        return self.barrier_env('if [ -e {} ]; then\n'
+                                '  printf "injected post-rename sync failure\\n" >&2\n'
+                                '  exit 91\nfi'.format(shlex.quote(str(destination))))
 
     def assert_unconfirmed(self, result):
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -415,8 +437,8 @@ class SourceClaimRegistryTests(unittest.TestCase):
             receipt = self.registry / state / (token + "." + digest(roots) + ".claim")
             before = (receipt.stat().st_ino, receipt.read_bytes())
             for path in (receipt, receipt.parent, self.registry):
-                env = self.tool_env("sync", 'if [ "$2" = {} ]; then exit 91; fi\n'
-                                    'exec {} "$@"'.format(shlex.quote(str(path)), shlex.quote(SYNC)))
+                env = self.barrier_env('if [ "$1" = {} ]; then exit 91; fi'.format(
+                    shlex.quote(str(path))))
                 for operation in operations:
                     with self.subTest(state=state, path=path, operation=operation):
                         self.assert_unconfirmed(self.transact(token, roots, operation, env))
@@ -563,9 +585,8 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_refused(self.transact("cc", roots))
 
     def test_registry_durability_syncs_records_and_directories_not_filesystems(self):
-        trace = self.root / "sync-arguments"
-        env = self.tool_env("sync", 'printf "%s\\000" "$@" >> {}\nexec {} "$@"'.format(
-            shlex.quote(str(trace)), shlex.quote(SYNC)))
+        trace = self.root / "barrier-paths"
+        env = self.barrier_env('printf "%s\\000" "$1" >> {}'.format(shlex.quote(str(trace))))
         cancelled_roots = [self.root / "cancelled-project"]
         for operation in ("acquire", "recover", "cancel", "finish-cancel", "cancelled"):
             self.assert_granted(self.transact("aa", cancelled_roots, operation, env))
@@ -580,15 +601,14 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_granted(self.transact("ee", [self.root / "other-project"], "acquire", env))
         self.assert_granted(self.transact("dd", quarantined_roots, "cancel", env))
 
-        # Observe the real utility's arguments, then execute it. Every record
-        # barrier includes metadata (not -d) and is file-scoped (not -f).
-        # This includes calls originating in the shared record helpers.
+        # Observe each path the real fsync then receives: one record or
+        # directory, data and metadata, never a filesystem-wide flush. This
+        # includes calls originating in the shared record helpers.
+        self.assert_no_sync_utility()
         arguments = trace.read_bytes().split(b"\0")
         self.assertEqual(arguments.pop(), b"")
-        self.assertEqual(len(arguments) % 2, 0)
         paths = set()
-        for option, path in zip(arguments[::2], arguments[1::2]):
-            self.assertEqual(option, b"--", "no whole-filesystem sync under the registry lock")
+        for path in arguments:
             path = Path(os.fsdecode(path))
             self.assertTrue(path == self.registry or self.registry in path.parents)
             paths.add(path)
@@ -602,10 +622,10 @@ class SourceClaimRegistryTests(unittest.TestCase):
                         "private record bytes must be synced before publication")
 
     def test_failed_file_sync_never_falls_back_to_a_global_flush_or_grants(self):
-        env = self.tool_env("sync", 'if [ "$1" = -- ]; then exit 91; fi\nexec {} "$@"'.format(
-            shlex.quote(SYNC)))
+        env = self.barrier_env("exit 91")
         result = self.transact("aa", [self.root / "project"], env=env)
         self.assert_unconfirmed(result)
+        self.assert_no_sync_utility()
         self.assertFalse(list(self.registry.glob("aa.*.claim")))
         self.assertFalse(list(self.registry.glob("aa.*.pending")))
 

@@ -24,6 +24,13 @@ CONTROL = Path(os.environ.get("RCH_TEST_SOURCE_NAMESPACE_CONTROL",
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 PYTHON = sys.executable
 READY = b"RCH_TOPOLOGY_OK\n"
+# uutils cat (Ubuntu 25.10+ /usr/bin/cat) enlarges its output pipe for a splice
+# fast path, so a pinned 4 KiB pipe never stalls it. The stalled-delivery test
+# needs GNU cat, g-prefixed where uutils is the default.
+GNU_CAT = next((path for path in map(shutil.which, ("gnucat", "gcat", "cat"))
+                if path and b"GNU coreutils" in subprocess.run(
+                    [path, "--version"], capture_output=True, timeout=3, check=False).stdout),
+               None)
 
 
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"),
@@ -294,6 +301,11 @@ class NativeTimerTests(unittest.TestCase):
             process.stderr.close()
 
     def test_stalled_diagnostic_delivery_is_bounded_and_withholds_readiness(self):
+        if GNU_CAT is None:
+            self.skipTest("no GNU cat: uutils cat resizes the pipe instead of stalling")
+        gnu_cat = self.tools / "cat.gnu"
+        gnu_cat.symlink_to(GNU_CAT)
+        os.replace(gnu_cat, self.tools / "cat")
         process = subprocess.Popen([SHELL, "-c", self.script], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    env=self.env)

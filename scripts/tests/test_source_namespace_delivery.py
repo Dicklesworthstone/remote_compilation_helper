@@ -23,6 +23,13 @@ CONTROL = Path(os.environ.get("RCH_TEST_SOURCE_NAMESPACE_CONTROL",
                              REPO / "rch/src/hook/source_namespace_control.sh"))
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 GNU_TIMEOUT = shutil.which("gnutimeout") or shutil.which("gtimeout") or shutil.which("timeout")
+# uutils cat (Ubuntu 25.10+ /usr/bin/cat) enlarges its output pipe for a splice
+# fast path, so a pinned 4 KiB pipe never stalls it and no deadline is reached.
+# Backpressure needs GNU cat, g-prefixed where uutils is the default.
+GNU_CAT = next((path for path in map(shutil.which, ("gnucat", "gcat", "cat"))
+                if path and b"GNU coreutils" in subprocess.run(
+                    [path, "--version"], capture_output=True, timeout=3, check=False).stdout),
+               None)
 READY = b"RCH_TOPOLOGY_OK\n"
 
 
@@ -34,11 +41,17 @@ class NamespaceDeliveryTests(unittest.TestCase):
                                  timeout=3, check=False)
         if b"GNU coreutils" not in version.stdout:
             self.skipTest("the discovered timer is not GNU timeout")
+        if GNU_CAT is None:
+            self.skipTest("no GNU cat: uutils cat resizes the pipe instead of stalling")
         self.root = Path(tempfile.mkdtemp(prefix="rch-namespace-delivery-"))
         self.tools = self.root / "tools"
         self.tools.mkdir()
         (self.tools / "gnutimeout").symlink_to(GNU_TIMEOUT)
         (self.tools / "sh").symlink_to(SHELL)
+        # A script, not a symlink: term_resistant_delivery rewrites this file.
+        cat = self.tools / "cat"
+        cat.write_text("#!/bin/sh\nexec " + shlex.quote(GNU_CAT) + ' "$@"\n')
+        cat.chmod(0o700)
         self.tmp = self.root / "tmp"
         self.tmp.mkdir()
         self.env = {**os.environ, "PATH": str(self.tools) + os.pathsep + os.environ["PATH"],
@@ -52,7 +65,7 @@ class NamespaceDeliveryTests(unittest.TestCase):
         self.writer_pid = self.root / "delivery.pid"
         self.env["RCH_TEST_DELIVERY_PID"] = str(self.writer_pid)
         cat.write_text("#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" > \"$RCH_TEST_DELIVERY_PID\"\nexec " +
-                       shlex.quote(shutil.which("cat")) + ' "$@"\n')
+                       shlex.quote(GNU_CAT) + ' "$@"\n')
         cat.chmod(0o700)
 
     def test_stalled_stderr_does_not_block_observer_after_timer_exit(self):

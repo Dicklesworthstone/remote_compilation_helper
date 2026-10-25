@@ -308,7 +308,10 @@ class InventoryTests(unittest.TestCase):
         self.assert_status(f.transact("bb", roots, "release"), 0)
         receipt = next((f.registry / "released").glob("bb.*.claim"))
         before = (receipt.stat().st_ino, receipt.read_bytes())
-        f.tools("sync", "exit 91")
+        # The registry's barriers are fsyncs through its `python3 -c` adapter,
+        # not the sync utility: fail every one of them.
+        f.tools("python3", 'case "${4-}" in *os.fsync*) exit 91 ;; esac\nexec '
+                + shlex.quote(sys.executable) + ' "$@"')
         result = f.transact("bb", roots, "released")
         self.assert_status(result, 73)
         self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
