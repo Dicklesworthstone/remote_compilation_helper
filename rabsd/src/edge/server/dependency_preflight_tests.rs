@@ -56,10 +56,7 @@ fn consumed_dynamic_artifacts_refuse_before_any_host_facts() {
             let expected = LiveRefusal::ProcMacroDependency(path.clone());
             assert_eq!(rejection(request), Some(expected.clone()));
             for host in HOSTS {
-                assert_eq!(
-                    plan_dependency_action(request, host),
-                    Err(expected.clone())
-                );
+                assert_eq!(plan_dependency_action(request, host), Err(expected.clone()));
             }
         }
     }

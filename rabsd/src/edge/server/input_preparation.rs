@@ -15,6 +15,7 @@ use std::sync::Arc;
 pub(super) enum InputMiss {
     Package(FactsMiss),
     Dependencies(FactsMiss),
+    PackageAndDependenciesPending,
 }
 
 pub(super) fn observe(
@@ -54,6 +55,9 @@ fn join_observations<P, D>(
     let dependencies = observe_dependencies();
     match (package, dependencies) {
         (_, Err(miss @ FactsMiss::Refused(_))) => Err(InputMiss::Dependencies(miss)),
+        (Err(FactsMiss::Pending), Err(FactsMiss::Pending)) => {
+            Err(InputMiss::PackageAndDependenciesPending)
+        }
         (Err(miss), _) => Err(InputMiss::Package(miss)),
         (Ok(_), Err(miss)) => Err(InputMiss::Dependencies(miss)),
         (Ok(package), Ok(dependencies)) => Ok((package, dependencies)),
@@ -77,7 +81,10 @@ mod tests {
             true,
         );
         assert_eq!(calls.get(), 1);
-        assert!(matches!(result, Err(InputMiss::Package(FactsMiss::Pending))));
+        assert!(matches!(
+            result,
+            Err(InputMiss::PackageAndDependenciesPending)
+        ));
     }
 
     #[test]
@@ -92,7 +99,10 @@ mod tests {
             true,
         );
         assert_eq!(calls.get(), 1);
-        assert!(matches!(result, Err(InputMiss::Package(FactsMiss::Pending))));
+        assert!(matches!(
+            result,
+            Err(InputMiss::Package(FactsMiss::Pending))
+        ));
     }
 
     #[test]
@@ -132,17 +142,17 @@ mod tests {
             || panic!("a legacy caller has already declined waiting"),
             false,
         );
-        assert!(matches!(result, Err(InputMiss::Package(FactsMiss::Pending))));
+        assert!(matches!(
+            result,
+            Err(InputMiss::Package(FactsMiss::Pending))
+        ));
     }
 
     #[test]
     fn ready_package_still_waits_for_dependencies_and_propagates_refusals() {
         for may_wait in [false, true] {
-            let pending = join_observations::<_, ()>(
-                Ok("package"),
-                || Err(FactsMiss::Pending),
-                may_wait,
-            );
+            let pending =
+                join_observations::<_, ()>(Ok("package"), || Err(FactsMiss::Pending), may_wait);
             assert!(matches!(
                 pending,
                 Err(InputMiss::Dependencies(FactsMiss::Pending))

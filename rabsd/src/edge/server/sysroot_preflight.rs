@@ -68,7 +68,11 @@ mod tests {
 
     #[test]
     fn implicit_and_explicit_native_roots_keep_the_full_observation_path() {
-        for compiler in ["/toolchain/bin/rustc", "/a toolchain/bin/rustc", "/bin/rustc"] {
+        for compiler in [
+            "/toolchain/bin/rustc",
+            "/a toolchain/bin/rustc",
+            "/bin/rustc",
+        ] {
             let root = compiler.strip_suffix("/bin/rustc").unwrap();
             let root = if root.is_empty() { "/" } else { root };
             let joined = format!("--sysroot={root}");
@@ -113,14 +117,24 @@ mod tests {
         for options in [
             vec!["--remap-path-prefix=/source=--sysroot=/alternate"],
             vec!["--remap-path-prefix", "--sysroot=/alternate"],
-            vec!["--check-cfg", "cfg(feature,values(\"--sysroot=/alternate\"))"],
+            vec![
+                "--check-cfg",
+                "cfg(feature,values(\"--sysroot=/alternate\"))",
+            ],
         ] {
-            assert_eq!(rejection(&invocation("/toolchain/bin/rustc", &options)), None);
+            assert_eq!(
+                rejection(&invocation("/toolchain/bin/rustc", &options)),
+                None
+            );
         }
         assert!(
             rejection(&invocation(
                 "/toolchain/bin/rustc",
-                &["--remap-path-prefix", "/source=/mapped", "--sysroot=/alternate"],
+                &[
+                    "--remap-path-prefix",
+                    "/source=/mapped",
+                    "--sysroot=/alternate"
+                ],
             ))
             .is_some()
         );

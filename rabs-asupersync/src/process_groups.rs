@@ -190,6 +190,7 @@ impl ManagedProcessGroup {
                     Some(_) => {}
                     None => {
                         if !probe.iter().any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
+                            && leader_in_own_pgrp(pgid) != Some(true)
                             // Recheck exit: the first scan may have raced the
                             // leader becoming a zombie (filtered by the scan).
                             && leader.try_wait()?.is_none()
@@ -507,6 +508,23 @@ pub fn reap_residuals(pgid: u32) -> u32 {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MILLIS));
     }
     members_from_proc(pgid).len() as u32
+}
+
+/// Check `/proc/<pgid>/stat` directly for the group leader's `pgrp`.
+///
+/// A multi-threaded leader (such as `rustc -vV`) that calls `exit_group` while
+/// `/proc` is being scanned may already be in state `Z` (`EXIT_ZOMBIE`, which
+/// [`members_from_proc`] filters out) while `waitpid(..., WNOHANG)` still
+/// returns `None` (`delay_group_leader` in `kernel/exit.c` while a subthread
+/// finishes `do_exit`). Reading `/proc/<pgid>/stat` directly verifies that the
+/// kernel placed the leader in `pgrp == pgid` regardless of zombie state.
+#[cfg(target_os = "linux")]
+fn leader_in_own_pgrp(pgid: u32) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pgid}/stat")).ok()?;
+    let (_, rest) = split_stat_fields(&stat)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let member_pgrp = fields.get(2)?.parse::<u32>().ok()?;
+    Some(member_pgrp == pgid)
 }
 
 /// Snapshot every process whose pgid equals `pgid`, from `/proc`.

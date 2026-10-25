@@ -390,6 +390,16 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     };
     let (package, dependencies) = match input_preparation::observe(&live.facts, &plan, may_wait) {
         Ok(observed) => observed,
+        Err(input_preparation::InputMiss::PackageAndDependenciesPending) => {
+            log(
+                "preparing",
+                &[
+                    ("crate", unit),
+                    ("reason", PendingFacts::Dependencies.reason()),
+                ],
+            );
+            return preparing(unit, PendingFacts::Package);
+        }
         Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
             return preparing(unit, PendingFacts::Package);
         }

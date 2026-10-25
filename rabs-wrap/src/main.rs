@@ -397,8 +397,15 @@ fn try_lock_breaker(path: &str) -> Option<std::fs::File> {
         .mode(0o600)
         .open(format!("{path}.lock"))
         .ok()?;
-    lock.try_lock().ok()?;
-    Some(lock)
+    for attempt in 0..20 {
+        if lock.try_lock().is_ok() {
+            return Some(lock);
+        }
+        if attempt < 19 {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+    None
 }
 
 /// Publish one complete record with atomic rename. The caller owns the
@@ -507,7 +514,7 @@ fn read_reply_bounded(reader: &mut BufReader<ConsultStream>, max_bytes: u64) -> 
 /// artifact on the request path; they get a larger (but still bounded)
 /// decision budget than a shadow consult. `RABS_LIVE_DECISION_MS`
 /// overrides it.
-const LIVE_DECISION_TIMEOUT_MS: u32 = 2_000;
+const LIVE_DECISION_TIMEOUT_MS: u32 = 15_000;
 /// A served reply carries the transcript (hex): bounded far above any
 /// capped-lint dependency transcript the daemon publishes.
 const MAX_LIVE_REPLY_BYTES: u64 = 4 * 1024 * 1024;
@@ -927,11 +934,16 @@ fn observe_with_breaker(
         }
         _ => {
             // Fold this outcome into the CURRENT record: concurrent attempts
-            // each contribute (success resets, failures count). A contended
-            // record is skipped — the breaker is advisory, never a queue.
-            if let Some(_guard) = try_lock_breaker(path) {
+            // each contribute (success resets, failures count). Skip lock and
+            // disk churn when a healthy attempt observes an already-fresh state.
+            if (attempt != AttemptOutcome::Succeeded || load_state(path) != BreakerState::fresh())
+                && let Some(_guard) = try_lock_breaker(path)
+            {
                 let current = load_state(path);
-                let _ = store_state(path, &on_outcome(&policy, &current, attempt, now_ms()));
+                let next = on_outcome(&policy, &current, attempt, now_ms());
+                if next != current {
+                    let _ = store_state(path, &next);
+                }
             }
         }
     }
