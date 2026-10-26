@@ -441,11 +441,13 @@ fn main() {
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
                  CANONICAL LOCAL: rabsd --canonical-check-local <profile.json>\n\
-                 Captures source/toolchain, then runs cargo check --lib --offline --locked at canonical paths.\n\
+                 Captures source/toolchain, then runs selected cargo check --offline --locked at canonical paths.\n\
                  profile version canonical-check-local-v1 requires source_root, toolchain_root, state_root,\n\
                  operation_root and wrapper absolute paths; state/operation roots must already be private (0700).\n\
                  Optional manifest (Cargo.toml), vendor or cargo_home_source, jobs (1), timeout_seconds (1800).\n\
-                 Linux namespace support and a graph without build scripts/proc macros are required.\n\
+                 Optional selection chooses packages, features and check targets; absent selection means --lib.\n\
+                 Linux namespaces and nightly Cargo unit-graph planning are required.\n\
+                 The selected units must not execute build scripts/proc macros; inactive targets are allowed.\n\
                  External dependency metadata uses the evidence-gated cache; workspace crates compile normally.\n\
                  This mode honors the configured build identity and release authorization policy.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\

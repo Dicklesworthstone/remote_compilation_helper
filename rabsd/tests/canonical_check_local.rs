@@ -52,7 +52,7 @@ fn source(root: &Path, value: u32) {
     write(
         root,
         "Cargo.toml",
-        "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ncanonical_dep='=1.0.0'\n",
+        "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ncanonical_dep='=1.0.0'\noptional_build={path='optional-build',optional=true}\n[dev-dependencies]\ndev_macro={path='dev-macro'}\n",
     );
     write(
         root,
@@ -64,6 +64,23 @@ fn source(root: &Path, value: u32) {
         ".cargo/config.toml",
         "[source.crates-io]\nreplace-with='vendored-sources'\n[source.vendored-sources]\ndirectory='vendor'\n",
     );
+    write(
+        root,
+        "optional-build/Cargo.toml",
+        "[package]\nname='optional_build'\nversion='1.0.0'\nedition='2021'\n",
+    );
+    write(root, "optional-build/src/lib.rs", "pub fn unused() {}\n");
+    write(
+        root,
+        "optional-build/build.rs",
+        "fn main() { panic!(\"inactive build script must never execute\"); }\n",
+    );
+    write(
+        root,
+        "dev-macro/Cargo.toml",
+        "[package]\nname='dev_macro'\nversion='1.0.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+    );
+    write(root, "dev-macro/src/lib.rs", "extern crate proc_macro;\n");
     let leaf_source = format!("pub fn answer()->u32 {{ {value} }}\n");
     let leaf = vendor(
         root,
@@ -94,7 +111,7 @@ fn source(root: &Path, value: u32) {
         root,
         "Cargo.lock",
         format!(
-            "version=4\n\n[[package]]\nname='canonical_app'\nversion='0.1.0'\ndependencies=['canonical_dep']\n\n[[package]]\nname='canonical_dep'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{dep}'\ndependencies=['canonical_leaf']\n\n[[package]]\nname='canonical_leaf'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{leaf}'\n"
+            "version=4\n\n[[package]]\nname='canonical_app'\nversion='0.1.0'\ndependencies=['canonical_dep','dev_macro','optional_build']\n\n[[package]]\nname='canonical_dep'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{dep}'\ndependencies=['canonical_leaf']\n\n[[package]]\nname='canonical_leaf'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{leaf}'\n\n[[package]]\nname='dev_macro'\nversion='1.0.0'\n\n[[package]]\nname='optional_build'\nversion='1.0.0'\n"
         ),
     );
 }
@@ -297,22 +314,31 @@ fn canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_
         "stale changed-source hit: {output}"
     );
 
-    write(
-        &second,
-        "build.rs",
-        "fn main() { panic!(\"build scripts must never run in this profile\"); }\n",
-    );
-    let (code, events, output) = run(owner.path(), 6, &profile);
-    assert_ne!(code, 0, "executor-bearing graph was admitted: {output}");
-    assert!(
-        output.contains("without build scripts or procedural macros"),
-        "{output}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| event["kind"] == "canonical-check-started")
-    );
+    // Inactive optional and development executors did not block the actual
+    // library checks above. Selecting either executor must still refuse before
+    // exposing the dependency cache endpoint or executing its project code.
+    for (number, selection) in [
+        (6, json!({"lib":true, "features":["optional_build"]})),
+        (7, json!({"tests":true})),
+    ] {
+        profile["selection"] = selection;
+        let (code, events, output) = run(owner.path(), number, &profile);
+        assert_ne!(code, 0, "executor-bearing graph was admitted: {output}");
+        assert!(
+            output.contains("build scripts or procedural macros"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("inactive build script must never execute"),
+            "{output}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "canonical-check-started"),
+            "selected executor reached cache admission: {output}"
+        );
+    }
     assert!(
         fs::read_dir(owner.path().join("ops"))
             .unwrap()

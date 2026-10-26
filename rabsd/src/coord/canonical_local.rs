@@ -1,12 +1,13 @@
 //! Local canonical Cargo execution connected to the coordinator's rustc cache.
 //!
-//! This explicit profile runs `cargo check --lib --offline --locked` against
+//! This explicit profile runs a selected `cargo check --offline --locked` against
 //! captured inputs and a captured toolchain. Cargo itself runs at canonical
 //! paths, so unit hashes and rustc arguments are stable across checkouts. A
 //! fresh operation-scoped socket admits only rustc requests; the persistent
 //! CAS and the ordinary daemon socket are never visible to the build.
 //!
-//! The initial graph must contain no build scripts or procedural macros.
+//! The actual selected Cargo unit graph must contain no build scripts or
+//! procedural macros. Inactive package targets do not grant code execution.
 //! Eligible external dependency metadata uses the existing evidence-gated
 //! lane. Workspace crates and unsupported rustc invocations still compile
 //! normally in the namespace; this does not promote a workspace cache class.
@@ -28,10 +29,10 @@ use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{
     CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
 };
+use rabs_sandbox::cargo_check::{CheckSelection, validate_check_unit_graph};
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -48,9 +49,8 @@ const RUSTC: &str = "/__rabs/toolchain/bin/rustc";
 const TARGET: &str = "/__rabs/out/cargo";
 const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
-const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHECK_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_GRAPH_PACKAGES: usize = 16_384;
 
 /// All host locations are selected by the operator, not by Cargo or a wrapper
 /// request. State and operation parents must be owned, private directories.
@@ -68,6 +68,9 @@ struct Profile {
     manifest: String,
     vendor: Option<String>,
     cargo_home_source: Option<PathBuf>,
+    /// An absent field retains the original library-only profile. An explicit
+    /// empty selection uses Cargo's ordinary default members and targets.
+    selection: Option<CheckSelection>,
     #[serde(default = "default_jobs")]
     jobs: u32,
     #[serde(default = "default_timeout")]
@@ -202,6 +205,7 @@ impl Profile {
             (1..=7200).contains(&self.timeout_seconds),
             "timeout_seconds must be between 1 and 7200",
         )?;
+        self.check_args()?;
         require(
             relative_member(&self.manifest),
             "manifest must be an ordinary relative path",
@@ -280,10 +284,12 @@ impl Profile {
         cwd
     }
 
-    fn check_args(&self) -> Vec<String> {
-        vec![
-            "check".into(),
-            "--lib".into(),
+    fn check_args(&self) -> io::Result<Vec<String>> {
+        let mut args = match &self.selection {
+            Some(selection) => selection.cargo_arguments()?,
+            None => vec!["check".into(), "--lib".into()],
+        };
+        args.extend([
             "--offline".into(),
             "--locked".into(),
             "--manifest-path".into(),
@@ -291,10 +297,11 @@ impl Profile {
             "--message-format=json".into(),
             "--jobs".into(),
             self.jobs.to_string(),
-        ]
+        ]);
+        Ok(args)
     }
 
-    fn source_specification(&self) -> Value {
+    fn source_specification(&self) -> io::Result<Value> {
         let mut source = json!({"manifest":self.manifest});
         if let Some(vendor) = &self.vendor {
             source["vendor"] = json!(vendor);
@@ -302,13 +309,13 @@ impl Profile {
         if let Some(home) = &self.cargo_home_source {
             source["cargo_home_source"] = json!(home);
         }
-        json!({
+        Ok(json!({
             "kind":"canonical-exec", "request_id":1, "program":CARGO,
-            "args":self.check_args(), "toolchain_source":self.toolchain_root,
+            "args":self.check_args()?, "toolchain_source":self.toolchain_root,
             "cargo_source":source,
             "command_context":{"version":"env-cwd-v1", "cwd":self.cwd(),
                 "env":{"CARGO_INCREMENTAL":"0", "CARGO_TARGET_DIR":TARGET, "RUSTC":RUSTC}}
-        })
+        }))
     }
 }
 
@@ -345,7 +352,7 @@ pub fn run_profile_with_release(
     let bundle = owner.path().join("bundle");
     let (_report, source) = super::source_delivery::prepare_local_bundle(
         &profile.source_root,
-        &profile.source_specification(),
+        &profile.source_specification()?,
         &bundle,
     )?;
     let (_, request_bytes) = read_stable(
@@ -406,34 +413,60 @@ pub fn run_profile_with_release(
     // bind obscure its protection in the namespace builder's mount ordering.
     make_read_only(&mut spec, "/__rabs/workspace")?;
     make_read_only(&mut spec, "/__rabs/home")?;
+    let paths = CanonicalPaths::new(
+        owner.clone(),
+        vec![
+            ("/__rabs/workspace".into(), workspace),
+            ("/__rabs/cargo-home".into(), cargo_root),
+            ("/__rabs/toolchain".into(), toolchain),
+            (TARGET.into(), target_root),
+            ("/__rabs/home".into(), home_root.clone()),
+        ],
+    )
+    .map_err(io::Error::other)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let timeout = Duration::from_secs(profile.timeout_seconds);
-    let metadata_args = vec![
-        "metadata".into(),
-        "--offline".into(),
-        "--locked".into(),
-        "--all-features".into(),
-        "--format-version=1".into(),
-        "--manifest-path".into(),
-        profile.manifest_path(),
-    ];
-    let metadata = execute(
+    let check_args = profile.check_args()?;
+    // Ask the captured Cargo for the exact units this check would compile.
+    // Metadata's package list includes inactive optional/dev targets and cannot
+    // establish which build scripts or proc macros a selected check executes.
+    // The unit-graph query does not compile/run units, and the cache endpoint
+    // does not exist yet. Unsupported Cargo versions fail closed here.
+    let mut graph_args = check_args.clone();
+    graph_args.extend([
+        "--unit-graph".into(),
+        "-Z".into(),
+        "unstable-options".into(),
+    ]);
+    let planned = execute(
         &spec,
         &support,
-        &metadata_args,
-        &owner.path().join("metadata-drain"),
-        MAX_METADATA_BYTES,
+        &graph_args,
+        &owner.path().join("unit-graph-drain"),
+        MAX_GRAPH_BYTES,
         timeout,
         &stopped,
     )?;
-    if !metadata.status.success() {
-        replay(&metadata)?;
+    if !planned.status.success() {
+        replay(&planned)?;
         return Err(invalid(
-            "captured Cargo metadata failed; no rustc cache endpoint was started",
+            "captured Cargo unit planning failed (nightly Cargo with --unit-graph is required); no rustc cache endpoint was started",
         ));
     }
-    let graph: Value = serde_json::from_reader(metadata.stdout.reader()?)?;
-    validate_pure_graph(&graph)?;
+    let graph: Value = serde_json::from_reader(planned.stdout.reader()?)?;
+    let graph = validate_check_unit_graph(&graph)?;
+    for path in graph.source_paths() {
+        let path = Path::new(path);
+        require(
+            path.starts_with("/__rabs/workspace") || path.starts_with("/__rabs/cargo-home"),
+            "selected Cargo target source is outside the captured source roots",
+        )?;
+        let physical = paths.physical(path).map_err(io::Error::other)?;
+        require(
+            fs::symlink_metadata(physical)?.is_file(),
+            "selected Cargo target source must be a captured ordinary file",
+        )?;
+    }
 
     // Only after graph admission can this exact wrapper and scoped endpoint
     // enter the namespace. Neither is selected by a source/config/env hint.
@@ -447,17 +480,6 @@ pub fn run_profile_with_release(
         socket.as_os_str().as_encoded_bytes().len() < 108,
         "operation_root is too long for the owned Unix socket (choose a shorter path)",
     )?;
-    let paths = CanonicalPaths::new(
-        owner.clone(),
-        vec![
-            ("/__rabs/workspace".into(), workspace),
-            ("/__rabs/cargo-home".into(), cargo_root),
-            ("/__rabs/toolchain".into(), toolchain),
-            (TARGET.into(), target_root),
-            ("/__rabs/home".into(), home_root),
-        ],
-    )
-    .map_err(io::Error::other)?;
     let mounted = Arc::new(
         crate::janitor::store::mount_and_reconcile(&state.root.join("cas"))
             .map_err(io::Error::other)?,
@@ -509,12 +531,14 @@ pub fn run_profile_with_release(
         "{}",
         json!({"kind":"canonical-check-started", "version":PROFILE_VERSION,
         "namespace":"canonical", "cache_scope":"external-dependency-metadata",
-        "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"]})
+        "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
+        "selected_units":graph.units, "selected_packages":graph.packages,
+        "selected_roots":graph.roots})
     );
     let result = execute(
         &spec,
         &support,
-        &profile.check_args(),
+        &check_args,
         &owner.path().join("check-drain"),
         MAX_CHECK_BYTES,
         timeout,
@@ -571,59 +595,6 @@ fn capture_wrapper(source: &Path, destination: &Path) -> io::Result<()> {
     file.write_all(&bytes)?;
     file.sync_all()?;
     fs::set_permissions(destination, fs::Permissions::from_mode(0o500))?;
-    Ok(())
-}
-
-fn validate_pure_graph(graph: &Value) -> io::Result<()> {
-    require(
-        graph["version"] == 1,
-        "unsupported captured Cargo metadata version",
-    )?;
-    let packages = graph["packages"]
-        .as_array()
-        .filter(|packages| !packages.is_empty() && packages.len() <= MAX_GRAPH_PACKAGES)
-        .ok_or_else(|| invalid("captured Cargo metadata has no packages"))?;
-    let mut ids = BTreeSet::new();
-    for package in packages {
-        let id = package["id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| invalid("captured Cargo package identity missing"))?;
-        require(ids.insert(id), "duplicate captured Cargo package")?;
-        let targets = package["targets"]
-            .as_array()
-            .filter(|targets| !targets.is_empty())
-            .ok_or_else(|| invalid("captured Cargo package targets missing"))?;
-        for target in targets {
-            for field in ["kind", "crate_types"] {
-                let kinds = target[field]
-                    .as_array()
-                    .filter(|kinds| !kinds.is_empty())
-                    .ok_or_else(|| invalid("captured Cargo target kind missing"))?;
-                for kind in kinds {
-                    let kind = kind
-                        .as_str()
-                        .ok_or_else(|| invalid("invalid Cargo target kind"))?;
-                    require(
-                        !matches!(kind, "custom-build" | "proc-macro"),
-                        "canonical local check currently requires a graph without build scripts or procedural macros",
-                    )?;
-                }
-            }
-        }
-    }
-    let nodes = graph["resolve"]["nodes"]
-        .as_array()
-        .filter(|nodes| !nodes.is_empty() && nodes.len() <= MAX_GRAPH_PACKAGES)
-        .ok_or_else(|| {
-            invalid("captured Cargo metadata must include its resolved dependency graph")
-        })?;
-    for node in nodes {
-        require(
-            node["id"].as_str().is_some_and(|id| ids.contains(id)),
-            "resolved Cargo graph references an absent package",
-        )?;
-    }
     Ok(())
 }
 
@@ -775,32 +746,7 @@ fn wait_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn graph(kind: &str) -> Value {
-        json!({"version":1, "packages":[{"id":"fixture", "targets":[{
-            "kind":[kind], "crate_types":["lib"]}]}], "resolve":{"nodes":[{"id":"fixture"}]}})
-    }
-
-    #[test]
-    fn graph_admission_requires_complete_metadata_and_excludes_code_executors() {
-        assert!(validate_pure_graph(&graph("lib")).is_ok());
-        for kind in ["custom-build", "proc-macro"] {
-            assert!(validate_pure_graph(&graph(kind)).is_err());
-        }
-        let mut incomplete = graph("lib");
-        incomplete["resolve"] = Value::Null;
-        assert!(validate_pure_graph(&incomplete).is_err());
-        let mut absent = graph("lib");
-        absent["resolve"]["nodes"][0]["id"] = json!("absent");
-        assert!(validate_pure_graph(&absent).is_err());
-        let mut hidden = graph("lib");
-        hidden["packages"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"id":"optional",
-            "targets":[{"kind":["proc-macro"], "crate_types":["proc-macro"]}]}));
-        assert!(validate_pure_graph(&hidden).is_err());
-    }
+    use std::collections::BTreeSet;
 
     #[test]
     fn readonly_home_and_source_leave_only_cargo_state_and_outputs_writable() {
@@ -871,7 +817,7 @@ mod tests {
             ("app/Cargo.toml", "/__rabs/workspace/app"),
         ] {
             profile.manifest = manifest.into();
-            let specification = profile.source_specification();
+            let specification = profile.source_specification().unwrap();
             assert_eq!(specification["command_context"]["cwd"], expected);
             let context = &specification["command_context"];
             let environment = context["env"]
@@ -888,6 +834,66 @@ mod tests {
                 .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn selected_checks_keep_driver_owned_control_arguments_and_legacy_library_default() {
+        let mut profile: Profile = serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "source_root":"/source", "toolchain_root":"/toolchain",
+            "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
+        }))
+        .unwrap();
+        assert_eq!(&profile.check_args().unwrap()[..2], ["check", "--lib"]);
+        profile.selection = Some(CheckSelection::default());
+        assert!(
+            !profile
+                .check_args()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--lib")
+        );
+        profile.selection = Some(
+            serde_json::from_value(json!({
+                "workspace":true, "packages":["app"], "features":["app/fast"],
+                "no_default_features":true, "tests":true
+            }))
+            .unwrap(),
+        );
+        profile.manifest = "workspace/Cargo.toml".into();
+        profile.jobs = 4;
+        let specification = profile.source_specification().unwrap();
+        assert_eq!(
+            specification["args"],
+            json!([
+                "check",
+                "--workspace",
+                "--no-default-features",
+                "--tests",
+                "--package",
+                "app",
+                "--features",
+                "app/fast",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+                "/__rabs/workspace/workspace/Cargo.toml",
+                "--message-format=json",
+                "--jobs",
+                "4"
+            ])
+        );
+        assert_eq!(specification["command_context"]["env"]["RUSTC"], RUSTC);
+        assert_eq!(
+            specification["command_context"]["env"]["CARGO_TARGET_DIR"],
+            TARGET
+        );
+        profile
+            .selection
+            .as_mut()
+            .unwrap()
+            .features
+            .push("--config=bad".into());
+        assert!(profile.source_specification().is_err());
     }
 
     #[test]

@@ -117,6 +117,11 @@ jobs:
         run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
       - name: Run wrapper unit and real socket delivery regressions
         run: cargo test -p rabs-wrap --bin rabs-wrap --test live_protocol --locked
+      - name: Selected Cargo check planning with the actual captured-toolchain interface
+        run: |
+          cargo test -p rabs-sandbox --lib cargo_check --locked
+          cargo test -p rabs-sandbox --test cargo_check --locked -- --nocapture
+          cargo clippy -p rabs-sandbox --lib --test cargo_check --locked -- -D warnings
       - name: Lint the tested wrapper targets
         run: cargo clippy -p rabs-wrap --bin rabs-wrap --test live_protocol --locked -- -D warnings
 
