@@ -20,7 +20,8 @@ use rabs_protocol::result_identity::TypedDigest;
 
 use super::{
     DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveDependencyKey, LiveRefusal,
-    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path, within,
+    PlannedExtern, ToolchainFacts, canonical_cargo_dependency_key, live_dependency_key, plain_path,
+    plain_path_in_profile, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
@@ -35,6 +36,11 @@ use crate::typed_digest::compute;
 pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v2";
 /// Isolation policy domain for the remote metadata dependency class.
 pub const REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str = "rabs.remote-leaf.isolation.v1";
+/// Canonical Cargo planning and closed worker execution form a distinct lane.
+/// Neither ordinary worker receipts nor local canonical checks supply its
+/// evidence, even when source bytes and compiler options happen to match.
+pub const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str =
+    "rabs.canonical-cargo-remote-dependency.isolation.v1";
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
@@ -81,6 +87,17 @@ pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
     exact private output capture, runtime/input revalidation, authenticated delivery \
     and coordinator-only publication; full-result readiness";
 
+const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-remote-metadata-v1: canonical-dependency-exec-v1 negotiated \
+    separately from dependency-exec-v7; coordinator-owned canonical Cargo \
+    planning and retained logical-to-physical mappings; exact canonical rustc \
+    argv, cwd, environment and replay bytes; external registry, Git or checked \
+    directory-source metadata and dep-info only; closed worker package, complete \
+    toolchain and candidate inventories with independently matched retained ELF \
+    runtime; no outer Cargo workspace, complete Cargo home or coordinator control \
+    socket mounted; existing authenticated delivery, input revalidation, closure, \
+    sampling and release authorization remain required; no workspace, archive, \
+    generated-input, build-script or proc-macro authority";
+
 /// Output and isolation class selected from a bounded compiler invocation.
 /// This is not execution or serving authority: the caller must enforce the
 /// matching worker context and retain every observed input through completion.
@@ -120,6 +137,18 @@ pub fn remote_dependency_output_class(
 pub fn remote_dependency_isolation_policy(
     plan: &DependencyActionPlan,
 ) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    if plan.canonical_cargo {
+        super::canonical_cargo::canonical_layout(plan)?;
+        let mut policy = CanonicalEncoder::new();
+        policy
+            .str(CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE)
+            .str(REMOTE_DEPENDENCY_ISOLATION_PROFILE)
+            .str(plan.source_kind.as_str());
+        return Ok(compute(
+            CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN,
+            &policy.finish(),
+        ));
+    }
     let profile = match remote_dependency_output_class(&plan.invocation)? {
         RemoteDependencyOutputClass::Metadata => REMOTE_DEPENDENCY_ISOLATION_PROFILE,
         RemoteDependencyOutputClass::Rlib => REMOTE_RLIB_ISOLATION_PROFILE,
@@ -224,7 +253,8 @@ fn loader_paths(
     plan: &DependencyActionPlan,
     toolchain_root: &str,
 ) -> Result<(Vec<String>, Vec<String>), RemoteDependencyRefusal> {
-    if !plain_path(toolchain_root)
+    if !plain_path_in_profile(toolchain_root, plan.canonical_cargo)
+        || (plan.canonical_cargo && toolchain_root != "/__rabs/toolchain")
         || plan.compiler != format!("{toolchain_root}/bin/rustc")
         || plan.invocation.compiler_argv0 != plan.compiler
     {
@@ -259,7 +289,7 @@ fn loader_paths(
             continue;
         }
         for entry in value.split(':') {
-            if !plain_path(entry) {
+            if !plain_path_in_profile(entry, plan.canonical_cargo) {
                 return Err(RemoteDependencyRefusal::LoaderEnvironment(
                     "LD_LIBRARY_PATH contains an empty, relative or unrepresentable entry".into(),
                 ));
@@ -269,14 +299,19 @@ fn loader_paths(
             } else if within(entry, toolchain_root) {
                 search_paths.push(entry[toolchain_root.len() + 1..].to_owned());
             } else {
-                if overlaps(entry, toolchain_root)
-                    || overlaps(entry, &plan.source_root)
-                    || [
+                let reserved = if plan.canonical_cargo {
+                    entry != "/__rabs/out/cargo" && !within(entry, "/__rabs/out/cargo")
+                } else {
+                    [
                         "/__rabs", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc",
                         "/dev", "/sys", "/run",
                     ]
                     .iter()
                     .any(|reserved| overlaps(entry, reserved))
+                };
+                if overlaps(entry, toolchain_root)
+                    || overlaps(entry, &plan.source_root)
+                    || reserved
                     || within(entry, &plan.out_dir)
                     || plan.dependency_dirs.iter().any(|root| within(entry, root))
                     || plan
@@ -312,6 +347,9 @@ pub fn remote_dependency_shape(
     directories: &[DependencyDirectoryFact],
     toolchain_root: &str,
 ) -> Result<(), RemoteDependencyRefusal> {
+    if plan.canonical_cargo {
+        super::canonical_cargo::canonical_layout(plan)?;
+    }
     if directories.len() != plan.dependency_dirs.len()
         || plan
             .dependency_dirs
@@ -473,14 +511,25 @@ pub fn remote_dependency_key(
     }
     remote_dependency_shape(plan, directories, toolchain_root)?;
     let externs = remote_extern_facts(plan, directories)?;
-    let mut key = live_dependency_key(
-        plan,
-        toolchain,
-        &externs,
-        directories,
-        build_script_output,
-        inputs,
-    )?;
+    let mut key = if plan.canonical_cargo {
+        canonical_cargo_dependency_key(
+            plan,
+            toolchain,
+            &externs,
+            directories,
+            build_script_output,
+            inputs,
+        )?
+    } else {
+        live_dependency_key(
+            plan,
+            toolchain,
+            &externs,
+            directories,
+            build_script_output,
+            inputs,
+        )?
+    };
     let output_class = remote_dependency_output_class(&plan.invocation)?;
     if output_class == RemoteDependencyOutputClass::Rlib {
         // An assembler `.incbin` can mention the original dependency/output
@@ -680,6 +729,142 @@ mod tests {
         plan.outputs =
             derive_dependency_output_declarations(&plan.invocation, &plan.host_triple).unwrap();
         plan
+    }
+
+    fn canonical_plan(out_dir: &str) -> DependencyActionPlan {
+        let package = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
+        let argv = [
+            "/__rabs/toolchain/bin/rustc".to_owned(),
+            "--crate-name=leaf".into(),
+            "--crate-type=lib".into(),
+            "--edition=2021".into(),
+            format!("{package}/src/lib.rs"),
+            "--error-format=json".into(),
+            "--json=artifacts".into(),
+            "--emit=dep-info,metadata".into(),
+            "--cap-lints=allow".into(),
+            format!("--out-dir={out_dir}"),
+            "-L".into(),
+            format!("dependency={out_dir}"),
+        ];
+        let env = [
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            ("CARGO_MANIFEST_DIR".into(), package.into()),
+            ("CARGO_PKG_NAME".into(), "leaf".into()),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!("{out_dir}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
+            ),
+        ];
+        super::super::plan_canonical_cargo_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package,
+                env: &env,
+            },
+            "x86_64-unknown-linux-gnu",
+            None,
+        )
+        .unwrap()
+    }
+
+    fn canonical_key(
+        plan: &DependencyActionPlan,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_dependency_key(
+            plan,
+            &toolchain(),
+            &directories(plan),
+            &inputs(plan),
+            None,
+            "/__rabs/toolchain",
+            &[41; 32],
+            &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+    }
+
+    #[test]
+    fn canonical_remote_metadata_has_separate_authority_and_exact_replay_identity() {
+        let plan = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let remote = canonical_key(&plan).unwrap();
+        let local = canonical_cargo_dependency_key(
+            &plan,
+            &toolchain(),
+            &[],
+            &directories(&plan),
+            None,
+            &inputs(&plan),
+        )
+        .unwrap();
+        let ordinary = key(&super::tests::plan(OUTPUT), b"runtime");
+        assert_eq!(
+            remote.descriptor.sandbox_semantic_policy.domain,
+            CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN
+        );
+        assert_ne!(remote.action_key, local.action_key);
+        assert_ne!(remote.action_key, ordinary.action_key);
+        assert_ne!(
+            remote.descriptor.sandbox_semantic_policy,
+            ordinary.descriptor.sandbox_semantic_policy
+        );
+        assert_eq!(
+            remote.action_key,
+            compute_action_key(&remote.descriptor).final_key
+        );
+        assert_eq!(
+            remote.descriptor_digest,
+            descriptor_digest(&descriptor_canonical_bytes(&remote.descriptor))
+        );
+        let moved = canonical_plan("/__rabs/out/cargo/debug/other-deps");
+        assert_ne!(remote.action_key, canonical_key(&moved).unwrap().action_key);
+        assert_eq!(
+            remote_loader_search_paths(&plan, "/__rabs/toolchain").unwrap(),
+            ["lib"]
+        );
+        assert_eq!(
+            remote_empty_loader_directories(&plan, "/__rabs/toolchain").unwrap(),
+            ["/__rabs/out/cargo/debug", "/__rabs/out/cargo/debug/deps"]
+        );
+    }
+
+    #[test]
+    fn canonical_remote_context_cannot_borrow_archive_generated_or_host_path_authority() {
+        let original = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let mut archive = original.clone();
+        archive.invocation.emit = vec!["dep-info".into(), "link".into()];
+        archive.outputs =
+            derive_dependency_output_declarations(&archive.invocation, &archive.host_triple)
+                .unwrap();
+        assert!(canonical_key(&archive).is_err());
+        assert!(remote_dependency_isolation_policy(&archive).is_err());
+        let mut generated = original.clone();
+        generated.generated_root = Some("/__rabs/out/cargo/debug/build/leaf/out".into());
+        generated
+            .execution_env
+            .push(("OUT_DIR".into(), generated.generated_root.clone().unwrap()));
+        assert!(canonical_key(&generated).is_err());
+        let mut ordinary = original.clone();
+        ordinary.canonical_cargo = false;
+        assert!(canonical_key(&ordinary).is_err());
+        assert!(remote_dependency_shape(&original, &directories(&original), TOOLCHAIN).is_err());
+        for directory in [
+            "/__rabs/home/control",
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/out",
+            "/__rabs/out/cargo-other/debug",
+            "/usr/lib",
+            "/work/target/debug",
+        ] {
+            let mut plan = original.clone();
+            plan.execution_env
+                .iter_mut()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1 = directory.to_owned();
+            assert!(canonical_key(&plan).is_err(), "loader alias {directory}");
+        }
     }
 
     #[test]

@@ -19,7 +19,9 @@ use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
-use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode};
+use rabs_sandbox::dependency_context::{
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
 use rabs_wkr::artifacts::{
@@ -64,6 +66,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
 const OUTPUT_TRANSFER: &str = "ranges-v1";
 const INPUT_DEADLINE_EXCEEDED: &str = "input-upload-deadline-exceeded";
+
+/// A mode alone does not identify the namespace's path semantics. Preserve the
+/// exact version selected by authenticated admission until each request has
+/// been checked, before accepting input ownership or advancing the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DependencySelection {
+    version: &'static str,
+    mode: DependencyExecutionMode,
+}
 
 /// These are whole-phase limits, never idle timers refreshed by progress.
 /// Tests inject short budgets into the production session driver; wire peers
@@ -1251,7 +1262,7 @@ async fn drive_session_with_inputs<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
-    dependency_mode: Option<DependencyExecutionMode>,
+    dependency_mode: Option<DependencySelection>,
     launch: L,
     heartbeat: H,
 ) -> Result<(), String>
@@ -1299,7 +1310,7 @@ async fn drive_session_with_input_budgets<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
-    dependency_mode: Option<DependencyExecutionMode>,
+    dependency_mode: Option<DependencySelection>,
     input_budgets: InputBudgets,
     launch: L,
     heartbeat: H,
@@ -1353,7 +1364,7 @@ async fn drive_session_with_reader<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
-    dependency_mode: Option<DependencyExecutionMode>,
+    dependency_mode: Option<DependencySelection>,
     input_budgets: InputBudgets,
     mut launch: L,
     mut heartbeat: H,
@@ -1381,7 +1392,7 @@ where
                 .to_owned(),
         );
     }
-    if dependency_mode.is_some_and(|mode| !report.dependency_modes.contains(&mode)) {
+    if dependency_mode.is_some_and(|selected| !report.dependency_modes.contains(&selected.mode)) {
         return Err("dependency execution mode unavailable".to_owned());
     }
     let mut active: Option<ExecutionTask> = None;
@@ -1767,7 +1778,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
-        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION],
+        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION],
         "dependency_execution_modes": report.dependency_modes.iter()
             .map(|mode| mode.as_str()).collect::<Vec<_>>(),
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
@@ -2135,13 +2146,23 @@ fn dependency_context_selection(
     artifacts: bool,
     source: bool,
     toolchain: bool,
-) -> Result<Option<DependencyExecutionMode>, String> {
+) -> Result<Option<DependencySelection>, String> {
     let value: serde_json::Value =
         serde_json::from_str(frame).map_err(|error| error.to_string())?;
     match value.get("dependency_context") {
         None if value.get("dependency_execution_mode").is_none() => Ok(None),
         None => Err("dependency execution mode requires a versioned context".to_owned()),
-        Some(selected) if selected.as_str() == Some(DEPENDENCY_CONTEXT_VERSION) => {
+        Some(selected)
+            if matches!(
+                selected.as_str(),
+                Some(DEPENDENCY_CONTEXT_VERSION | CANONICAL_DEPENDENCY_CONTEXT_VERSION)
+            ) =>
+        {
+            let version = if selected.as_str() == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) {
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION
+            } else {
+                DEPENDENCY_CONTEXT_VERSION
+            };
             let mode = match value
                 .get("dependency_execution_mode")
                 .and_then(serde_json::Value::as_str)
@@ -2150,6 +2171,11 @@ fn dependency_context_selection(
                 Some("rlib") => DependencyExecutionMode::Rlib,
                 _ => return Err("unsupported dependency_execution_mode selection".to_owned()),
             };
+            if version == CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                && mode != DependencyExecutionMode::Metadata
+            {
+                return Err("canonical dependency execution requires metadata mode".to_owned());
+            }
             if !supported.contains(&mode) {
                 return Err("dependency execution mode unavailable".to_owned());
             }
@@ -2159,7 +2185,7 @@ fn dependency_context_selection(
                         .to_owned(),
                 );
             }
-            Ok(Some(mode))
+            Ok(Some(DependencySelection { version, mode }))
         }
         Some(_) => Err("unsupported dependency_context selection".to_owned()),
     }
@@ -2171,11 +2197,15 @@ fn dependency_context_selection(
 fn validate_execution_selection(
     request: &CanonicalExecRequest,
     report: &rabs_wkr::session::CapabilityReport,
-    selected: Option<DependencyExecutionMode>,
+    selected: Option<DependencySelection>,
 ) -> Result<(), String> {
     match (request.dependency_context.as_ref(), selected) {
-        (Some(context), Some(mode))
-            if context.execution_mode() == mode && report.dependency_modes.contains(&mode) =>
+        (Some(context), Some(selected)) if context.version() != selected.version => {
+            Err("dependency context version does not match negotiation".to_owned())
+        }
+        (Some(context), Some(selected))
+            if context.execution_mode() == selected.mode
+                && report.dependency_modes.contains(&selected.mode) =>
         {
             Ok(())
         }

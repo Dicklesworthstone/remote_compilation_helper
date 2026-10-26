@@ -928,8 +928,9 @@ missing locked dependencies available offline.
 Workspace members, primary packages and unsupported compiler requests compile
 normally inside the namespace. Their results do not enter the dependency cache.
 The supported cache class remains external dependency `metadata` plus `dep-info`;
-workspace publication, generated inputs, archive/codegen caching and per-rustc
-remote dispatch require their own admission and qualification work.
+eligible units can execute locally or on an explicitly configured authenticated
+dependency worker. Workspace publication, generated inputs and canonical
+archive/codegen caching require their own admission and qualification work.
 
 ### Create and run the local profile
 
@@ -1020,6 +1021,61 @@ serving, prepared-job and administrative messages. Logical compiler paths are
 translated to backing files only through the coordinator's retained mount
 capability; a wrapper-supplied path or environment flag cannot construct one.
 
+### Send canonical dependency checks to workers
+
+The local Cargo driver also accepts the existing pinned dependency-worker
+configuration from its operator environment. With no worker configuration it
+keeps the local lane. To use workers, install matching `rabsd`, `rabs-wrap` and
+`rabs-wkr` binaries and provision the mutual-TLS credentials described in
+[live dependency worker setup](rabs-worker-delivery.md#run-the-live-cargo-dependency-worker).
+Run the worker's normal outward reconnect loop against the configured listener,
+then launch the same canonical profile:
+
+```sh
+RABS_COORD_TLS_CA=/credentials/ca.pem \
+RABS_COORD_TLS_CERT=/credentials/coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/coordinator.key \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_SPKI_SHA256 \
+  cargo rabs --rabs-canonical-local ./canonical-check.json -- check --lib
+```
+
+Replace the address, paths and pin with the deployment's actual values. The
+listener belongs to the coordinator; the worker connects to it. A configured
+pool uses `RABS_DEPENDENCY_WORKERS_JSON` instead of the three singleton fields,
+with the same existing 1–32 worker bound and per-worker certificate pins. Partial,
+mixed or invalid explicit settings refuse startup. Credentials and transport
+state remain outside the Cargo namespace; no normal daemon needs to be started
+for this operation-owned coordinator.
+
+The worker must explicitly advertise `canonical-dependency-exec-v1` and metadata
+execution support. Both peers retain that exact version and mode through
+authenticated admission. An older worker cannot silently reinterpret the request
+as ordinary-path dependency execution. The worker receives only the retained
+package, exact dependency candidates and captured toolchain. It retains its own
+runtime and verifies it against the keyed runtime cohort, then creates private
+output and HOME trees. The outer Cargo workspace, Cargo home,
+control socket and persistent CAS are not exposed to that compiler.
+
+Cargo's `/__rabs/...` names remain unchanged in compiler arguments, environment,
+dep-info, output declarations and action keys. Only coordinator file observation
+and final output installation use retained physical backing paths. Runtime and
+complete-toolchain checks are repeated through publication and installation, and
+the ordinary worker runtime-compatibility requirements still apply. This
+canonical remote class has a separate key policy from both ordinary remote work
+and local canonical execution; existing local samples do not promote remote hits.
+
+Cold results use the existing private execution and verified delivery path, then
+require the wrapper's manifest-specific acceptance before installation. Repeated
+eligible requests earn cache replay through the existing differential-sampling
+and release-authorization gates. `remote-offer`, `rabsd-remote-dependency-admitted`
+and the worker's durable receipts distinguish real dispatch from local fallback.
+An incompatible worker or a refused action does not gain publication authority;
+fallback after dispatch still requires verified completion of remote execution.
+Workspace/primary crates continue to compile under Cargo, and the selected-graph
+build-script/procedural-macro gate remains in force.
+
 ### Persistent reuse and command results
 
 The driver owns `state_root/canonical-check-v1`, including its CAS and exclusive
@@ -1099,9 +1155,30 @@ must compile, while explicitly selecting either executor must refuse the graph
 before the cache endpoint is exposed. The test
 does not inject publication rows or verification samples. An ignored test or a
 namespace-support refusal is not end-to-end success evidence; run this test on a
-capable host before enabling the profile operationally. This bounded local bridge
-does not complete the remote worker, workspace-cache or performance qualification
-tasks described above.
+capable host before enabling the profile operationally.
+
+The remote bridge has a separate opt-in fixture using the actual native worker,
+mutual TLS, captured Cargo/rustc and durable worker request receipts:
+
+```sh
+cargo build -p rabsd -p rabs-wrap -p rabs-wkr --locked
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktrees \
+    -- --ignored --exact --nocapture
+```
+
+This requires OpenSSL and full canonical namespace support. It requires three
+completed remote compilations of each of two dependencies, then verifies that a
+relocated check serves both from cache without advancing the worker's execution
+receipts. A changed dependency must produce the changed metadata consumed by a
+compile-time check in the root package. Selecting a build script must refuse
+before either cache admission or another worker execution. It does not inject
+cache rows, samples or delivery receipts. Merely adding or ignoring this fixture
+is not native execution evidence; run it on a capable host to qualify the new
+canonical remote path. Neither bridge test establishes workspace caching,
+canonical archive execution or a performance improvement.
 
 ### Select local Cargo units from the Cargo command line
 

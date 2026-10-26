@@ -141,6 +141,21 @@ impl LiveEdge {
             None => Ok(PathBuf::from(path)),
         }
     }
+
+    /// An operator-configured worker pool may execute the dependency units of
+    /// this local Cargo operation. Its context is keyed separately from both
+    /// ordinary remote work and local canonical execution. Project environment
+    /// and wrapper frames cannot create this pool or select its TLS identity.
+    pub(crate) fn canonical_configured(
+        lane: LiveDependencyLane,
+        paths: Arc<CanonicalPaths>,
+        state: &Path,
+    ) -> Result<Self, String> {
+        let mut live = Self::canonical(lane, paths);
+        live.remote = RemoteDependencies::from_canonical_environment(state)
+            .map_err(|error| error.to_string())?;
+        Ok(live)
+    }
 }
 
 impl LiveEdge {
@@ -547,16 +562,22 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }
         }
     }
-    let key_result = if let Some(paths) = &live.canonical {
-        let canonical_directories = match paths.dependency_facts(&dependencies.directories) {
+    // Observations retain physical paths; keys and the worker context use only
+    // Cargo's namespace-visible names, never this operation's backing roots.
+    let key_directories = if let Some(paths) = &live.canonical {
+        match paths.dependency_facts(&dependencies.directories) {
             Ok(directories) => directories,
             Err(reason) => return refuse(&reason),
-        };
+        }
+    } else {
+        dependencies.directories.clone()
+    };
+    let key_result = if live.canonical.is_some() {
         rabs_key::live_dependency::canonical_cargo_dependency_key(
             &plan,
             &toolchain,
             &externs,
-            &canonical_directories,
+            &key_directories,
             package.build_script_output.as_deref(),
             &inputs,
         )
@@ -565,7 +586,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             &mut plan,
             &toolchain,
             &externs,
-            &dependencies.directories,
+            &key_directories,
             &package,
             &inputs,
             live.reuse_empty_out_dir,
@@ -615,10 +636,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 &plan,
                 &toolchain,
                 &toolchain_guard,
-                &dependencies.directories,
+                &key_directories,
                 &inputs,
                 package.build_script_output.as_deref(),
                 &parsed.argv,
+                live.canonical.as_deref(),
             ) {
                 Ok(Some((remote_key, invocation))) => {
                     key = remote_key;

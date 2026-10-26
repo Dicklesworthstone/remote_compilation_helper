@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
 pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v7";
+/// Separately negotiated canonical Cargo metadata execution. This is not a
+/// pathname-based extension of the original-path context: both peers must
+/// select this version before canonical aliases can enter a compiler view.
+pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v1";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -245,6 +249,7 @@ pub struct DependencyArtifactRoot {
 /// Physical source, toolchain, output and jobserver backings never appear here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyExecContext {
+    canonical_cargo: bool,
     execution_mode: DependencyExecutionMode,
     source_root: String,
     generated_root: Option<String>,
@@ -296,6 +301,18 @@ fn valid_alias(value: &str) -> bool {
         ]
         .iter()
         .any(|reserved| overlaps(Path::new(value), Path::new(reserved)))
+}
+
+fn canonical_descendant(value: &str, root: &str) -> bool {
+    normalized_absolute(value) && value != root && Path::new(value).starts_with(root)
+}
+
+fn canonical_alias(value: &str) -> bool {
+    value == layout::TOOLCHAIN
+        || value == "/__rabs/out/cargo"
+        || [layout::WORKSPACE, layout::CARGO_HOME, "/__rabs/out/cargo"]
+            .iter()
+            .any(|root| canonical_descendant(value, root))
 }
 
 impl DependencyExecContext {
@@ -402,12 +419,112 @@ impl DependencyExecContext {
         compiler: String,
         out_dir: String,
         dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        generated_root: Option<String>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_in_profile(
+            false,
+            source_root,
+            cwd,
+            toolchain_root,
+            compiler,
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            generated_root,
+            env,
+            runtime_cohort_sha256,
+        )
+    }
+
+    /// Retain a canonical Cargo dependency's exact visible names while giving
+    /// its compiler only the selected package, toolchain and candidate bytes.
+    /// The complete outer Cargo workspace, Cargo home and control socket are
+    /// never mounted. The driver owns path admission; this constructor grants
+    /// neither caller-filesystem access nor cache/publication authority.
+    ///
+    /// Only metadata execution is admitted. Generated inputs, archives and
+    /// arbitrary canonical mount aliases require a separate execution policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_canonical_cargo_metadata(
+        source_root: String,
+        cwd: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_in_profile(
+            true,
+            source_root,
+            cwd,
+            layout::TOOLCHAIN.to_owned(),
+            format!("{}/bin/rustc", layout::TOOLCHAIN),
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            None,
+            env,
+            runtime_cohort_sha256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_in_profile(
+        canonical_cargo: bool,
+        source_root: String,
+        cwd: String,
+        toolchain_root: String,
+        compiler: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
         mut loader_dirs: Vec<String>,
         mut artifact_roots: Vec<DependencyArtifactRoot>,
         generated_root: Option<String>,
         mut env: Vec<(String, String)>,
         runtime_cohort_sha256: [u8; 32],
     ) -> Result<Self, DependencyContextError> {
+        if canonical_cargo {
+            let environment = |name: &str| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            if ![layout::WORKSPACE, layout::CARGO_HOME]
+                .iter()
+                .any(|root| canonical_descendant(&source_root, root))
+                || toolchain_root != layout::TOOLCHAIN
+                || generated_root.is_some()
+                || !canonical_descendant(&out_dir, "/__rabs/out/cargo")
+                || dependency_dirs
+                    .iter()
+                    .any(|root| !canonical_descendant(root, "/__rabs/out/cargo"))
+                || loader_dirs.iter().any(|root| {
+                    root != "/__rabs/out/cargo" && !canonical_descendant(root, "/__rabs/out/cargo")
+                })
+                || environment("HOME") != Some(layout::HOME)
+                || environment("CARGO_HOME") != Some(layout::CARGO_HOME)
+                || environment("CARGO_MANIFEST_DIR") != Some(cwd.as_str())
+            {
+                return Err(invalid(
+                    "canonical dependency context has an invalid Cargo layout",
+                ));
+            }
+        }
+        let valid_alias = |value: &str| {
+            if canonical_cargo {
+                canonical_alias(value)
+            } else {
+                valid_alias(value)
+            }
+        };
         let roots: Vec<_> = [&source_root, &toolchain_root, &out_dir]
             .into_iter()
             .chain(generated_root.iter())
@@ -534,6 +651,7 @@ impl DependencyExecContext {
         }
         env.sort_by(|left, right| left.0.cmp(&right.0));
         let context = Self {
+            canonical_cargo,
             execution_mode: DependencyExecutionMode::Metadata,
             source_root,
             generated_root,
@@ -550,6 +668,20 @@ impl DependencyExecContext {
         // Validate even when runtime observation is deferred until acquisition.
         context.loader_search_paths(Path::new(&context.toolchain_root))?;
         Ok(context)
+    }
+
+    /// Exact wire version selected for this validated path profile.
+    pub const fn version(&self) -> &'static str {
+        if self.canonical_cargo {
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION
+        } else {
+            DEPENDENCY_CONTEXT_VERSION
+        }
+    }
+
+    /// Whether names came from a canonical Cargo planning namespace.
+    pub const fn canonical_cargo(&self) -> bool {
+        self.canonical_cargo
     }
 
     /// Select the independently negotiated output class after path validation.
@@ -779,6 +911,11 @@ pub fn build_dependency_argv(
     program: &str,
     args: &[String],
 ) -> Result<NamespaceLaunch, IsolationError> {
+    if context.canonical_cargo() && context.execution_mode() != DependencyExecutionMode::Metadata {
+        return Err(IsolationError::InvalidSpec {
+            reason: "canonical dependency execution admits metadata only".into(),
+        });
+    }
     support.require_mode(context.execution_mode())?;
     let refuse = || IsolationError::InvalidSpec {
         reason: "dependency namespace differs from its validated context".to_owned(),
@@ -938,6 +1075,224 @@ pub fn build_dependency_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CANONICAL_SOURCE: &str = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
+    const CANONICAL_OUTPUT: &str = "/__rabs/out/cargo/debug/deps";
+
+    fn canonical_context() -> DependencyExecContext {
+        DependencyExecContext::new_canonical_cargo_metadata(
+            CANONICAL_SOURCE.into(),
+            CANONICAL_SOURCE.into(),
+            CANONICAL_OUTPUT.into(),
+            vec![CANONICAL_OUTPUT.into()],
+            vec!["/__rabs/out/cargo/debug".into()],
+            Vec::new(),
+            vec![
+                ("HOME".into(), layout::HOME.into()),
+                ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+                ("CARGO_MANIFEST_DIR".into(), CANONICAL_SOURCE.into()),
+                (
+                    "LD_LIBRARY_PATH".into(),
+                    format!("{CANONICAL_OUTPUT}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
+                ),
+            ],
+            [0; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_dependency_context_is_explicit_and_mounts_only_one_package() {
+        let context = canonical_context();
+        assert!(context.canonical_cargo());
+        assert_eq!(context.version(), CANONICAL_DEPENDENCY_CONTEXT_VERSION);
+        assert_eq!(context.execution_mode(), DependencyExecutionMode::Metadata);
+        assert!(context.generated_root().is_none());
+        assert!(
+            DependencyExecContext::new_with_artifacts(
+                context.source_root.clone(),
+                context.cwd.clone(),
+                context.toolchain_root.clone(),
+                context.compiler.clone(),
+                context.out_dir.clone(),
+                context.dependency_dirs.clone(),
+                context.loader_dirs.clone(),
+                context.artifact_roots.clone(),
+                context.env.clone(),
+                context.runtime_cohort_sha256,
+            )
+            .is_err(),
+            "ordinary dependency-exec-v7 cannot reinterpret canonical paths"
+        );
+        let spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let ro: BTreeSet<_> = spec
+            .ro_binds
+            .iter()
+            .map(|bind| bind.visible.as_path())
+            .collect();
+        assert_eq!(
+            ro,
+            BTreeSet::from([
+                Path::new(CANONICAL_SOURCE),
+                Path::new(layout::TOOLCHAIN),
+                Path::new("/__rabs/out/cargo/debug"),
+            ])
+        );
+        assert_eq!(
+            spec.rw_binds,
+            [
+                Bind::new("/private/output", CANONICAL_OUTPUT),
+                Bind::new("/private/home", layout::HOME),
+            ]
+        );
+        assert_eq!(
+            context
+                .loader_search_paths(Path::new("/private/toolchain"))
+                .unwrap(),
+            [PathBuf::from("/private/toolchain/lib")]
+        );
+    }
+
+    #[test]
+    fn canonical_dependency_layout_cannot_expose_outer_driver_or_host_roots() {
+        let original = canonical_context();
+        let validate = |context: DependencyExecContext| {
+            DependencyExecContext::new_canonical_cargo_metadata(
+                context.source_root,
+                context.cwd,
+                context.out_dir,
+                context.dependency_dirs,
+                context.loader_dirs,
+                context.artifact_roots,
+                context.env,
+                context.runtime_cohort_sha256,
+            )
+        };
+        for root in [
+            "/__rabs",
+            layout::WORKSPACE,
+            layout::CARGO_HOME,
+            "/__rabs/home/control",
+            "/__rabs/cargo-home-other/package",
+            "/tmp/package",
+            "/__rabs/workspace/vendor/../other",
+        ] {
+            let mut context = original.clone();
+            context.source_root = root.into();
+            context.cwd = root.into();
+            context
+                .env
+                .iter_mut()
+                .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+                .unwrap()
+                .1 = root.into();
+            assert!(validate(context).is_err(), "source root {root}");
+        }
+        for root in [
+            "/__rabs/out",
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo-other/deps",
+            "/tmp/deps",
+        ] {
+            let mut context = original.clone();
+            context.out_dir = root.into();
+            context.dependency_dirs = vec![root.into()];
+            assert!(validate(context).is_err(), "output root {root}");
+        }
+        for root in [
+            layout::WORKSPACE,
+            layout::CARGO_HOME,
+            "/__rabs/home/control",
+            "/__rabs/out",
+            "/usr/lib",
+        ] {
+            let mut context = original.clone();
+            context.loader_dirs.push(root.into());
+            assert!(validate(context).is_err(), "loader root {root}");
+        }
+        for (name, value) in [
+            ("HOME", "/home/user"),
+            ("CARGO_HOME", "/home/user/.cargo"),
+            ("OUT_DIR", "/__rabs/out/cargo/debug/generated"),
+        ] {
+            let mut context = original.clone();
+            context.env.retain(|(key, _)| key != name);
+            context.env.push((name.into(), value.into()));
+            assert!(validate(context).is_err(), "environment {name}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_dependency_namespace_preserves_paths_and_refuses_extra_mounts_and_codegen() {
+        let mut context = canonical_context();
+        let mut spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
+        let support = fixture_support(DependencyExecutionMode::Metadata);
+        let args = vec![
+            format!("{CANONICAL_SOURCE}/src/lib.rs"),
+            "--emit=dep-info,metadata".into(),
+        ];
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &args,
+        )
+        .unwrap();
+        assert!(launch.boundary.mounts_closed_view);
+        assert!(!launch.boundary.host_usr_ro);
+        let argv = launch
+            .argv
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(argv.ends_with(&[context.compiler(), args[0].as_str(), args[1].as_str()]));
+        for visible in [
+            layout::WORKSPACE,
+            layout::CARGO_HOME,
+            "/__rabs/home/control",
+        ] {
+            let mut extra = spec.clone();
+            extra
+                .ro_binds
+                .push(Bind::new("/private/outer-driver", visible));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &extra,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &args
+                )
+                .is_err()
+            );
+        }
+        let archive = context.with_execution_mode(DependencyExecutionMode::Rlib);
+        assert!(matches!(
+            build_dependency_argv(&archive, &spec, &runtime.runtime, &fixture_support(DependencyExecutionMode::Rlib), archive.compiler(), &args),
+            Err(IsolationError::InvalidSpec { reason }) if reason.contains("metadata only")
+        ));
+    }
 
     // Pure namespace-construction fixtures, never kernel capability evidence.
     fn fixture_support(mode: DependencyExecutionMode) -> DependencyIsolationSupport {

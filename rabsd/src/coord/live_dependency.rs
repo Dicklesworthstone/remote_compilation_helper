@@ -111,7 +111,8 @@ pub struct LiveDependencyRequest {
     /// `(path, digest)` of every extern the key covers.
     pub externs: Vec<(String, TypedDigest)>,
     /// Driver-owned namespace/backing capability. Ordinary wrapper requests
-    /// cannot construct it, and remote execution never inherits it.
+    /// cannot construct it. Remote requests carry only the logical context;
+    /// this owner remains on the coordinator for observation and installation.
     pub canonical_paths: Option<Arc<canonical::CanonicalPaths>>,
 }
 
@@ -132,8 +133,8 @@ impl LiveDependencyRequest {
         &self,
         remote: Option<&remote::RemoteValidation>,
     ) -> Result<(), String> {
-        if remote.is_some() && self.canonical_paths.is_some() {
-            return Err("canonical local execution cannot borrow remote authority".into());
+        if self.plan.canonical_cargo != self.canonical_paths.is_some() {
+            return Err("canonical compiler plan lacks its retained driver capability".into());
         }
         match remote {
             Some(remote) => remote.verify_read_closure(self),

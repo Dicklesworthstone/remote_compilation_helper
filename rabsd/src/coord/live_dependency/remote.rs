@@ -7,6 +7,7 @@
 //! manifest-specific wrapper acknowledgment. A transport-loss result never
 //! declares an unobserved remote compiler drained.
 
+use super::canonical::CanonicalPaths;
 use super::{
     CanonicalActionResultManifest, CompletionOutcome, CompletionReport, CoordLive,
     DependencyActionPlan, ExecutionAttempt, InstallResult, LiveDecision, LiveDependencyKey,
@@ -30,8 +31,8 @@ use rabs_protocol::generation::AttemptAuthority;
 use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::OutputRole;
 use rabs_sandbox::dependency_context::{
-    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
-    DependencyExecutionMode,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot,
+    DependencyExecContext, DependencyExecutionMode,
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
@@ -299,6 +300,7 @@ pub(super) struct RemoteValidation {
     runtime: TypedDigest,
     loader: LoaderDirectoryWitness,
     execution_mode: DependencyExecutionMode,
+    canonical_cargo: bool,
     action_key: TypedDigest,
 }
 
@@ -310,13 +312,19 @@ impl RemoteValidation {
         if self.action_key != request.key.action_key {
             return Err("remote closure witness belongs to another action".into());
         }
+        if self.canonical_cargo != request.plan.canonical_cargo
+            || self.canonical_cargo != request.canonical_paths.is_some()
+        {
+            return Err("remote context differs from the retained Cargo namespace".into());
+        }
         request.verify_output_contract()?;
-        let toolchain = request
-            .toolchain
-            .sysroot()
-            .to_str()
-            .ok_or("remote closure has a non-UTF-8 toolchain root")?;
-        remote_dependency_shape(&request.plan, &request.dependencies.directories, toolchain)
+        let toolchain =
+            visible_toolchain_root(&request.toolchain, request.canonical_paths.as_deref())?;
+        let directories = match &request.canonical_paths {
+            Some(paths) => paths.dependency_facts(&request.dependencies.directories)?,
+            None => request.dependencies.directories.clone(),
+        };
+        remote_dependency_shape(&request.plan, &directories, &toolchain)
             .map_err(|error| error.to_string())?;
         verify_execution_policy(&request.plan, &request.key, self.execution_mode)
     }
@@ -344,7 +352,8 @@ impl RemoteValidation {
         // after synchronous materialization. Checking only runtime/toolchain
         // state would allow changed source, OUT_DIR or Cargo run records to
         // authorize a compiler skip under the earlier input generation.
-        verify_package_generation(&request.package, &request.plan)
+        let physical = request.io_plan()?;
+        verify_package_generation(&request.package, &physical)
     }
 }
 
@@ -388,6 +397,19 @@ impl RemoteDependencies {
     /// No variables selects the ordinary local lane. Partial or invalid explicit
     /// configuration refuses daemon startup instead of silently disabling it.
     pub fn from_environment(state: &Path) -> io::Result<Option<Arc<Self>>> {
+        Self::from_environment_with_context(state, DEPENDENCY_CONTEXT_VERSION)
+    }
+
+    /// The canonical driver owns both the logical-path capability and this
+    /// explicit operator configuration. Wrapper input cannot enable the pool.
+    pub(crate) fn from_canonical_environment(state: &Path) -> io::Result<Option<Arc<Self>>> {
+        Self::from_environment_with_context(state, CANONICAL_DEPENDENCY_CONTEXT_VERSION)
+    }
+
+    fn from_environment_with_context(
+        state: &Path,
+        context_version: &str,
+    ) -> io::Result<Option<Arc<Self>>> {
         let optional = |name: &str| -> io::Result<Option<String>> {
             match std::env::var(name) {
                 Ok(value) => Ok(Some(value)),
@@ -425,10 +447,12 @@ impl RemoteDependencies {
                 .map(Arc::new)
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let mut configuration = configured.value();
+        configuration["dependency_context"] = json!(context_version);
         Ok(Some(Arc::new(Self {
             workers: DependencyWorkerPool::new(workers),
             state,
-            configuration: configured.value(),
+            configuration,
             toolchain: Mutex::new(None),
         })))
     }
@@ -459,34 +483,43 @@ impl RemoteDependencies {
         inputs: &ActionInputManifest,
         build_script_output: Option<&[u8]>,
         argv: &[String],
+        canonical: Option<&CanonicalPaths>,
     ) -> Result<Option<(LiveDependencyKey, RemoteInvocation)>, String> {
+        if plan.canonical_cargo != canonical.is_some() {
+            return Err("remote canonical key requires its retained driver capability".into());
+        }
         if argv.first().map(String::as_str) != Some(plan.compiler.as_str()) {
             return Err("remote argv does not name the observed compiler".into());
         }
-        guard.verify_unchanged(Path::new(&plan.compiler))?;
+        let physical = match canonical {
+            Some(paths) => std::borrow::Cow::Owned(paths.project_plan(plan)?),
+            None => std::borrow::Cow::Borrowed(plan),
+        };
+        guard.verify_unchanged(Path::new(&physical.compiler))?;
         let root = guard.sysroot();
-        let visible_root = root.to_str().ok_or("non-UTF-8 original toolchain root")?;
-        remote_dependency_shape(plan, directories, visible_root)
+        let visible_root = visible_toolchain_root(guard, canonical)?;
+        remote_dependency_shape(plan, directories, &visible_root)
             .map_err(|error| error.to_string())?;
         // Derive resource intent before copying a complete compiler tree. An
         // unrepresentable or differently keyed invocation cannot request work.
         dependency_execution_grant(plan, argv)?;
-        let empty_loader = remote_empty_loader_directories(plan, visible_root)
+        let empty_loader = remote_empty_loader_directories(plan, &visible_root)
             .map_err(|error| error.to_string())?;
-        let loader_witness = observe_loader_directories(&empty_loader, || false)
+        let physical_empty_loader = physical_paths(&empty_loader, canonical)?;
+        let loader_witness = observe_loader_directories(&physical_empty_loader, || false)
             .map_err(|error| format!("original loader directories: {error}"))?;
-        let Some(retained) = self.retained_toolchain(guard, Path::new(&plan.compiler))? else {
+        let Some(retained) = self.retained_toolchain(guard, Path::new(&physical.compiler))? else {
             return Ok(None);
         };
         // Probe the compiler's complete original lookup order. The worker may
         // omit independently witnessed private aliases from its physical probe,
         // but the source observation must preserve loader selection and errors.
-        let loader = original_loader_search_paths(plan);
+        let loader = original_loader_search_paths(plan, canonical)?;
         let runtime = observe_runtime_cohort(
-            Path::new(&plan.compiler),
+            Path::new(&physical.compiler),
             root,
             &loader,
-            Path::new(&plan.out_dir),
+            Path::new(&physical.out_dir),
         )
         .map_err(|error| format!("edge runtime cohort: {error}"))?;
         let key = remote_dependency_key(
@@ -495,7 +528,7 @@ impl RemoteDependencies {
             directories,
             inputs,
             build_script_output,
-            visible_root,
+            &visible_root,
             &retained.image.identity().sha256,
             &runtime,
         )
@@ -514,26 +547,39 @@ impl RemoteDependencies {
                 prefix: format!("dependencies/{index:04}"),
             })
             .collect();
-        let context = DependencyExecContext::new_with_generated_artifacts(
-            plan.source_root.clone(),
-            plan.cwd.clone(),
-            visible_root.to_owned(),
-            plan.compiler.clone(),
-            plan.out_dir.clone(),
-            plan.dependency_dirs.clone(),
-            loader_witness.directories().to_vec(),
-            artifact_roots,
-            plan.generated_root.clone(),
-            plan.execution_env.clone(),
-            runtime_bytes,
-        )
+        let context = if plan.canonical_cargo {
+            DependencyExecContext::new_canonical_cargo_metadata(
+                plan.source_root.clone(),
+                plan.cwd.clone(),
+                plan.out_dir.clone(),
+                plan.dependency_dirs.clone(),
+                empty_loader,
+                artifact_roots,
+                plan.execution_env.clone(),
+                runtime_bytes,
+            )
+        } else {
+            DependencyExecContext::new_with_generated_artifacts(
+                plan.source_root.clone(),
+                plan.cwd.clone(),
+                visible_root,
+                plan.compiler.clone(),
+                plan.out_dir.clone(),
+                plan.dependency_dirs.clone(),
+                empty_loader,
+                artifact_roots,
+                plan.generated_root.clone(),
+                plan.execution_env.clone(),
+                runtime_bytes,
+            )
+        }
         .map_err(|error| error.to_string())?
         .with_execution_mode(execution_mode(plan)?);
         verify_execution_policy(plan, &key, context.execution_mode())?;
         loader_witness.verify_absence(|| false).map_err(|error| {
             format!("original loader directories changed during keying: {error}")
         })?;
-        guard.verify_unchanged(Path::new(&plan.compiler))?;
+        guard.verify_unchanged(Path::new(&physical.compiler))?;
         retained
             .image
             .verify_source_unchanged(root, || false)
@@ -543,6 +589,7 @@ impl RemoteDependencies {
             runtime,
             loader: loader_witness,
             execution_mode: context.execution_mode(),
+            canonical_cargo: context.canonical_cargo(),
             action_key: key.action_key.clone(),
         };
         Ok(Some((
@@ -790,7 +837,7 @@ impl PendingRemote {
             .record_request(
                 &wire,
                 &rabs_cas::metadata_store::digest_key(&request.key.action_key),
-                &reservation.worker_configuration(),
+                &reservation.worker_configuration(invocation.context.version()),
             )
             .map_err(|error| settled(format!("persist remote recovery request: {error}")))?;
         let selected_worker = reservation.worker().to_owned();
@@ -1023,7 +1070,9 @@ fn dependency_execution_request(
     request_id: u64,
 ) -> Result<Value, String> {
     let grant = dependency_execution_grant(plan, argv)?;
-    if context.execution_mode() != execution_mode(plan)? {
+    if context.execution_mode() != execution_mode(plan)?
+        || context.canonical_cargo() != plan.canonical_cargo
+    {
         return Err("worker context does not enforce this dependency output class".into());
     }
     Ok(json!({
@@ -1041,7 +1090,7 @@ fn dependency_execution_request(
 
 fn context_value(context: &DependencyExecContext) -> Value {
     json!({
-        "version":DEPENDENCY_CONTEXT_VERSION,
+        "version":context.version(),
         "execution_mode":context.execution_mode().as_str(),
         "source_root":context.source_root(), "cwd":context.cwd(),
         "generated_root":context.generated_root(),
@@ -1095,7 +1144,8 @@ impl Drop for AdmittedRemote {
 
 fn verify_request(request: &LiveDependencyRequest) -> Result<(), String> {
     request.verify_toolchain()?;
-    verify_package_generation(&request.package, &request.plan)?;
+    let physical = request.io_plan()?;
+    verify_package_generation(&request.package, &physical)?;
     request.dependencies.verify_unchanged()
 }
 
@@ -1111,12 +1161,57 @@ fn verify_package_generation(
 
 /// The plan has already rejected ambiguous loader entries. Keep their exact
 /// spelling and order, including non-toolchain roots whose absence is guarded.
-fn original_loader_search_paths(plan: &DependencyActionPlan) -> Vec<PathBuf> {
-    plan.execution_env
+fn original_loader_search_paths(
+    plan: &DependencyActionPlan,
+    canonical: Option<&CanonicalPaths>,
+) -> Result<Vec<PathBuf>, String> {
+    let paths = plan
+        .execution_env
         .iter()
         .find(|(name, _)| name == "LD_LIBRARY_PATH")
-        .map(|(_, value)| value.split(':').map(PathBuf::from).collect())
-        .unwrap_or_default()
+        .map(|(_, value)| value.split(':').map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(physical_paths(&paths, canonical)?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// Project only coordinator I/O names. These paths never enter a key, upload
+/// context, compiler argv or environment. Every translation revalidates the
+/// driver-owned roots and refuses symlink aliases through CanonicalPaths.
+fn physical_paths(
+    paths: &[String],
+    canonical: Option<&CanonicalPaths>,
+) -> Result<Vec<String>, String> {
+    paths
+        .iter()
+        .map(|path| match canonical {
+            Some(mapping) => mapping
+                .physical(Path::new(path))?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "non-UTF-8 canonical backing path".to_owned()),
+            None => Ok(path.clone()),
+        })
+        .collect()
+}
+
+fn visible_toolchain_root(
+    guard: &ToolchainGuard,
+    canonical: Option<&CanonicalPaths>,
+) -> Result<String, String> {
+    let root = guard.sysroot();
+    if let Some(paths) = canonical {
+        if paths.logical(root)? != Path::new("/__rabs/toolchain") {
+            return Err("observed compiler is outside the captured canonical toolchain".into());
+        }
+        Ok("/__rabs/toolchain".into())
+    } else {
+        root.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "non-UTF-8 original toolchain root".into())
+    }
 }
 
 fn verify_runtime(request: &LiveDependencyRequest, expected: &TypedDigest) -> Result<(), String> {
@@ -1125,12 +1220,13 @@ fn verify_runtime(request: &LiveDependencyRequest, expected: &TypedDigest) -> Re
     // declared outputs and still detects changed inputs after those writes.
     request.verify_toolchain()?;
     let root = request.toolchain.sysroot();
-    let loader = original_loader_search_paths(&request.plan);
+    let physical = request.io_plan()?;
+    let loader = original_loader_search_paths(&request.plan, request.canonical_paths.as_deref())?;
     let actual = observe_runtime_cohort(
-        Path::new(&request.plan.compiler),
+        Path::new(&physical.compiler),
         root,
         &loader,
-        Path::new(&request.plan.out_dir),
+        Path::new(&physical.out_dir),
     )
     .map_err(|error| format!("edge runtime revalidation: {error}"))?;
     if &actual != expected {
@@ -1210,10 +1306,14 @@ impl PendingRemoteInstall {
             return InstallResult::Declined(reason);
         }
         let plan = &request.plan;
+        let physical = match request.io_plan() {
+            Ok(physical) => physical,
+            Err(reason) => return InstallResult::Declined(reason),
+        };
         match self.attempt.coord.serve_produced_result(
             &self.attempt.key,
             &self.manifest_key,
-            Path::new(&plan.out_dir),
+            Path::new(&physical.out_dir),
             &expected_outputs(plan),
             now_micros(),
         ) {
@@ -1251,7 +1351,7 @@ impl PendingRemoteInstall {
                 super::finish_installation(
                     &request.dependencies,
                     &request.package,
-                    plan,
+                    &physical,
                     render_compiler_transcript(&self.canonical_transcript, plan),
                     installed,
                 )
@@ -1523,14 +1623,21 @@ mod worker_pool_tests {
         let mut expected = endpoint(2);
         expected["remote_protocol"] = json!(1);
         expected["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
-        assert_eq!(selected.0.worker_configuration(), expected);
+        assert_eq!(
+            selected.0.worker_configuration(DEPENDENCY_CONTEXT_VERSION),
+            expected
+        );
 
         let request = json!({"kind":"canonical-exec", "request_id":17,
             "program":"/toolchain/bin/rustc", "args":["src/lib.rs"]});
         let action_key = rabs_cas::metadata_store::digest_key(&key(2));
         let mut directory = recovery::ResultDirectory::new(state.path()).unwrap();
         directory
-            .record_request(&request, &action_key, &selected.0.worker_configuration())
+            .record_request(
+                &request,
+                &action_key,
+                &selected.0.worker_configuration(DEPENDENCY_CONTEXT_VERSION),
+            )
             .unwrap();
         let retained = directory.path().to_path_buf();
         drop(directory);
@@ -1941,6 +2048,151 @@ mod execution_resource_tests {
                 17,
             )
         }
+
+        fn canonical() -> Self {
+            let package = "/__rabs/cargo-home/registry/src/index/parallel-1.0.0";
+            let output = "/__rabs/out/cargo/debug/deps";
+            let argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                format!("{package}/src/lib.rs"),
+                "--crate-name=parallel".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--error-format=json".into(),
+                "--json=artifacts".into(),
+                format!("--out-dir={output}"),
+                "-L".into(),
+                format!("dependency={output}"),
+            ];
+            let env = vec![
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                ("CARGO_MANIFEST_DIR".into(), package.into()),
+                ("CARGO_PKG_NAME".into(), "parallel".into()),
+                (
+                    "LD_LIBRARY_PATH".into(),
+                    format!("{output}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
+                ),
+            ];
+            let plan = rabs_key::live_dependency::plan_canonical_cargo_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package,
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+                None,
+            )
+            .unwrap();
+            let context = DependencyExecContext::new_canonical_cargo_metadata(
+                plan.source_root.clone(),
+                plan.cwd.clone(),
+                plan.out_dir.clone(),
+                plan.dependency_dirs.clone(),
+                remote_empty_loader_directories(&plan, "/__rabs/toolchain").unwrap(),
+                Vec::new(),
+                plan.execution_env.clone(),
+                [0x11; 32],
+            )
+            .unwrap();
+            Self {
+                argv,
+                plan,
+                context,
+                toolchain: ToolchainIdentity {
+                    sha256: [0x22; 32],
+                    files: 2,
+                    bytes: 100,
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_request_binds_its_context_without_translating_compiler_names() {
+        let mut fixture = Fixture::canonical();
+        let request = fixture.request().unwrap();
+        assert_eq!(request["program"], "/__rabs/toolchain/bin/rustc");
+        assert_eq!(request["args"], json!(fixture.argv[1..]));
+        assert_eq!(
+            request["dependency_context"]["version"],
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION
+        );
+        assert_eq!(request["dependency_context"]["execution_mode"], "metadata");
+        assert_eq!(
+            request["dependency_context"]["out_dir"],
+            "/__rabs/out/cargo/debug/deps"
+        );
+        assert_eq!(
+            request["dependency_context"]["env"],
+            json!(fixture.plan.execution_env)
+        );
+        assert_eq!(
+            request["artifacts"]["files"],
+            json!(fixture.plan.output_names())
+        );
+        fixture.plan.canonical_cargo = false;
+        assert!(
+            fixture.request().is_err(),
+            "canonical context authorized an ordinary plan"
+        );
+        let mut ordinary = Fixture::new(&[]);
+        ordinary.plan.canonical_cargo = true;
+        assert!(
+            ordinary.request().is_err(),
+            "ordinary context authorized a canonical plan"
+        );
+    }
+
+    #[test]
+    fn canonical_runtime_io_uses_retained_roots_without_changing_the_wire_request() {
+        use std::os::unix::fs::DirBuilderExt;
+        let owner = Arc::new(crate::test_util::private_tempdir());
+        let roots = [
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/toolchain",
+            "/__rabs/out/cargo",
+            "/__rabs/home",
+        ];
+        let mappings = roots
+            .into_iter()
+            .enumerate()
+            .map(|(index, visible)| {
+                let backing = owner.path().join(index.to_string());
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&backing)
+                    .unwrap();
+                (PathBuf::from(visible), backing)
+            })
+            .collect();
+        let paths = CanonicalPaths::new(Arc::clone(&owner), mappings).unwrap();
+        let fixture = Fixture::canonical();
+        let before = fixture.request().unwrap();
+        let observed = original_loader_search_paths(&fixture.plan, Some(&paths)).unwrap();
+        assert_eq!(
+            observed,
+            [
+                owner.path().join("3/debug/deps"),
+                owner.path().join("3/debug"),
+                owner.path().join("2/lib")
+            ]
+        );
+        assert_eq!(fixture.request().unwrap(), before);
+        assert!(
+            !serde_json::to_string(&before)
+                .unwrap()
+                .contains(owner.path().to_str().unwrap())
+        );
+        assert!(physical_paths(&["/unowned/lib".into()], Some(&paths)).is_err());
+        std::fs::rename(owner.path().join("3"), owner.path().join("retained-target")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(owner.path().join("3"))
+            .unwrap();
+        assert!(original_loader_search_paths(&fixture.plan, Some(&paths)).is_err());
     }
 
     #[test]

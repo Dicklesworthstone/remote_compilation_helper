@@ -18,7 +18,7 @@ use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
     ArtifactByteCache, DEFAULT_ARTIFACT_CACHE_BYTES, DEFAULT_ARTIFACT_CACHE_ENTRIES, Delivery,
     DeliveryFailure, DeliveryMode, MAX_ARTIFACT_CACHE_BYTES, MAX_ARTIFACT_CACHE_ENTRIES,
-    ResumePeer, ResumeSource, WorkerAuthentication, WorkerPeer, negotiated_dependency_mode,
+    ResumePeer, ResumeSource, WorkerAuthentication, WorkerPeer, negotiated_dependency_context,
     receive_operation, transport_interrupted, validate_request, worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -388,18 +388,17 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         // A dependency context changes mounts, argv and environment, so sending
         // one without an explicit negotiated selection could execute different
         // code. Refuse before the challenge, input upload or live action hook.
-        let dependency_mode =
-            negotiated_dependency_mode(hello, &self.expected_operation, self.mode)?;
+        let dependency_context =
+            negotiated_dependency_context(hello, &self.expected_operation, self.mode)?;
         require(
             match (
                 grant.get("dependency_context"),
                 grant.get("dependency_execution_mode"),
             ) {
                 (None, None) => true,
-                (Some(context), Some(mode)) => {
-                    context == DEPENDENCY_CONTEXT_VERSION
-                        && dependency_mode.is_some_and(|selected| mode == selected.as_str())
-                }
+                (Some(context), Some(mode)) => dependency_context.is_some_and(|selected| {
+                    context == selected.version && mode == selected.mode.as_str()
+                }),
                 _ => false,
             },
             "dependency context was not authorized by this execution session",
@@ -479,7 +478,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 current_seq: 1,
                 required_capability: CapabilityKind::ExecuteAction,
                 require_canonical: self.mode == DeliveryMode::Execute
-                    && dependency_mode != Some(DependencyExecutionMode::Rlib),
+                    && dependency_context
+                        .is_none_or(|selected| selected.mode != DependencyExecutionMode::Rlib),
                 limits: DEFAULT_LIMITS,
                 max_sequence_buffer: 1,
             },
@@ -522,9 +522,9 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         if let Some(lease) = execution_lease {
             grant["execution_lease"] = lease;
         }
-        if let Some(mode) = dependency_mode {
-            grant["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
-            grant["dependency_execution_mode"] = json!(mode.as_str());
+        if let Some(selected) = dependency_context {
+            grant["dependency_context"] = json!(selected.version);
+            grant["dependency_execution_mode"] = json!(selected.mode.as_str());
         }
         if self.mode == DeliveryMode::Execute
             && hello["output_previews"]
@@ -2371,6 +2371,80 @@ mod tests {
                 assert!(
                     peer.inner.sent.is_empty(),
                     "refusal must precede challenge and upload"
+                );
+                assert!(peer.send(&request).is_err());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_dependency_authenticated_grant_retains_the_requested_path_policy() {
+        use rabs_sandbox::dependency_context::CANONICAL_DEPENDENCY_CONTEXT_VERSION;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (offered_version, grant_version, accepted) in [
+            (CANONICAL_DEPENDENCY_CONTEXT_VERSION, None, true),
+            (
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION),
+                true,
+            ),
+            (DEPENDENCY_CONTEXT_VERSION, None, false),
+            (
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                Some(DEPENDENCY_CONTEXT_VERSION),
+                false,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, mut request, mut script) = toolchain_fixture(root.path(), false);
+            request["dependency_context"] = json!({
+                "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION, "execution_mode":"metadata"
+            });
+            request["artifacts"] = json!({"unit":"dep", "files":["a"]});
+            script.replies[0]["dependency_contexts"] = json!([offered_version]);
+            script.replies[0]["dependency_execution_modes"] = json!(["metadata"]);
+            let mut grant = grant();
+            if let Some(version) = grant_version {
+                grant["dependency_context"] = json!(version);
+                grant["dependency_execution_mode"] = json!("metadata");
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap()
+                .with_admission_hook(Some(Box::new(move |_| {
+                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })));
+            let hello = peer.receive().unwrap();
+            let result = peer.negotiate(&hello, &grant);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "offered={offered_version} selected={grant_version:?}: {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(accepted));
+            if accepted {
+                assert_eq!(
+                    peer.inner.sent[1]["dependency_context"],
+                    CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                );
+                assert_eq!(peer.inner.sent[1]["dependency_execution_mode"], "metadata");
+                assert!(
+                    peer.inner
+                        .sent
+                        .iter()
+                        .any(|frame| frame["kind"] == "source-begin")
+                );
+                peer.send(&request).unwrap();
+                assert_eq!(peer.inner.sent.last().unwrap(), &request);
+            } else {
+                assert!(
+                    peer.inner.sent.is_empty(),
+                    "refuse before challenge or upload"
                 );
                 assert!(peer.send(&request).is_err());
             }
