@@ -72,10 +72,10 @@ It runs the captured nightly Cargo and rustc through rabsd's operation-owned
 canonical check driver. The profile version is canonical-check-local-v1; see
 docs/rabs-canonical-cargo.md for its explicit source, toolchain, state, operation
 and wrapper paths. With no Cargo arguments this mode selects ordinary `check`.
-Package, workspace, feature, target-kind/named-target and release selection are
-accepted. These command arguments replace the profile's selection, including an
-empty selection for ordinary `check`; the selected manifest and jobs come from
-the profile. Cargo's actual unit graph determines admission before the cache
+Package, workspace, feature, target-kind/named-target, built-in compilation target
+and compilation profile selection are accepted. These command arguments replace
+the profile's selection, including an empty selection for ordinary `check`; the
+selected manifest and jobs come from the profile. Cargo's actual unit graph determines admission before the cache
 endpoint is exposed. Only supported external metadata dependencies may earn a
 compiler skip; workspace units still compile. Build scripts and procedural
 macros required by the selected units currently refuse this mode.
@@ -1678,6 +1678,7 @@ LOCAL_CHECK_FLAGS = {
 LOCAL_CHECK_VALUES = {
     "--package": "packages", "--exclude": "exclude", "--features": "features",
     "--bin": "bin", "--test": "test", "--example": "example", "--bench": "bench",
+    "--target": "target",
 }
 
 
@@ -1706,7 +1707,7 @@ def canonical_local_selection(args):
         elif args[at].startswith(("-p", "-F")) and not args[at].startswith("--"):
             option = "--package" if args[at].startswith("-p") else "--features"
             separator, value = "=", args[at][2:]
-        if option not in LOCAL_CHECK_VALUES:
+        if option not in LOCAL_CHECK_VALUES and option != "--profile":
             raise SetupError("unsupported local canonical Cargo argument: " + args[at])
         if not separator:
             at += 1
@@ -1720,18 +1721,32 @@ def canonical_local_selection(args):
         if (not value_bytes or len(value_bytes) > 1024 or value.startswith("-")
                 or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
             raise SetupError("invalid local canonical Cargo selection value")
-        selection.setdefault(LOCAL_CHECK_VALUES[option], []).append(value)
-        if sum(len(selection.get(field, [])) for field in LOCAL_CHECK_VALUES.values()) > 128:
+        if option in ("--target", "--profile") and (
+                not value.isascii() or not value[0].isalnum()
+                or any(not (char.isalnum() or char in "-_") for char in value)):
+            raise SetupError("local canonical " + option + " requires a name, not a file or target specification")
+        if option == "--profile":
+            if "profile" in selection:
+                raise SetupError("local canonical --profile may be specified only once")
+            selection["profile"] = value
+        else:
+            selection.setdefault(LOCAL_CHECK_VALUES[option], []).append(value)
+        count = sum(len(selection.get(field, [])) for field in LOCAL_CHECK_VALUES.values())
+        if count + int("profile" in selection) > 128:
             raise SetupError("local canonical selection has too many values")
         at += 1
     if selection.get("exclude") and not selection.get("workspace"):
         raise SetupError("local canonical --exclude requires --workspace")
+    if selection.get("release") and "profile" in selection:
+        raise SetupError("local canonical --release conflicts with --profile")
     # This is the native deterministic check prefix, including option bytes.
     size = len("check")
     size += sum(len(option) for option, field in LOCAL_CHECK_FLAGS.items() if selection.get(field))
     size += sum(len(option) + len(value.encode("utf-8"))
                 for option, field in LOCAL_CHECK_VALUES.items()
                 for value in selection.get(field, []))
+    if "profile" in selection:
+        size += len("--profile") + len(selection["profile"].encode("utf-8"))
     if size > 16 * 1024:
         raise SetupError("local canonical selection exceeds its argument byte budget")
     return selection
@@ -1783,7 +1798,7 @@ def canonical_local_profile(path):
         raise SetupError("local canonical wrapper must be outside source, state and operation roots")
     if profile.get("selection") is not None:
         selection = profile["selection"]
-        allowed = set(LOCAL_CHECK_FLAGS.values()) | set(LOCAL_CHECK_VALUES.values())
+        allowed = set(LOCAL_CHECK_FLAGS.values()) | set(LOCAL_CHECK_VALUES.values()) | {"profile"}
         if type(selection) is not dict or selection.keys() - allowed:
             raise SetupError("invalid local canonical profile selection fields")
         original_args = ["check"]
@@ -1798,6 +1813,10 @@ def canonical_local_profile(path):
                     raise SetupError("local canonical selection " + field + " must be a string array")
                 for value in selection[field]:
                     original_args.extend((option, value))
+        if selection.get("profile") is not None:
+            if type(selection["profile"]) is not str:
+                raise SetupError("local canonical selection profile must be a string or null")
+            original_args.extend(("--profile", selection["profile"]))
         canonical_local_selection(original_args)
     return profile
 

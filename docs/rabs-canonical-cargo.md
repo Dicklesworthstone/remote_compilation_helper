@@ -974,8 +974,10 @@ Omitting `selection` retains the original `check --lib` behavior. Setting
 `"selection": {}` uses Cargo's ordinary default members and targets. A selection
 can specify `workspace`, `packages`, `exclude`, `features`, `all_features`,
 `no_default_features`, `lib`, `bins`, `tests`, `examples`, `benches`, `all_targets`,
-the named-target arrays `bin`, `test`, `example`, `bench`, and `release`.
-Exclusions require workspace selection. For example:
+the named-target arrays `bin`, `test`, `example`, `bench`, the compilation-target
+array `target`, and either `release` or the optional profile-name string `profile`.
+An empty `target` and absent or null `profile` retain Cargo's defaults. Exclusions
+require workspace selection. For example:
 
 ```json
 "selection": {
@@ -989,7 +991,12 @@ Exclusions require workspace selection. For example:
 Cargo resolves package/feature names and target availability itself. These fields
 cannot supply another command, compiler, environment, configuration file,
 manifest, output directory or arbitrary unstable option. A test target selection
-type-checks tests; it does not execute their harnesses.
+type-checks tests; it does not execute their harnesses. Compilation targets and
+profile names contain only ASCII letters, digits, hyphens and underscores, start
+with a letter or digit, and are at most 1,024 bytes. JSON target specifications
+and paths are not admitted. `host-tuple` selects the captured Cargo's host target;
+required target libraries must already exist in the captured toolchain. Cargo
+validates profile existence and inheritance in the captured workspace.
 
 The job count accepts 1–4096 and the canonical graph/check timeout accepts 1–7200
 seconds. A purely local graph omits `vendor`. A registry/Git cache profile uses
@@ -1106,6 +1113,8 @@ cargo rabs --rabs-canonical-local ./canonical-check.json -- check
 cargo rabs --rabs-canonical-local ./canonical-check.json -- check --workspace --all-targets
 cargo rabs --rabs-canonical-local ./canonical-check.json -- check -p app --bin server \
   --no-default-features --features app/http --release
+cargo rabs --rabs-canonical-local ./canonical-check.json -- check -p core --lib \
+  --target wasm32-unknown-unknown --target host-tuple --profile dev
 ```
 
 Omitting the Cargo arguments selects `check`. Explicit command-line selection
@@ -1121,10 +1130,17 @@ source and toolchain roots, job budget, timeout, state directory and wrapper.
 | Features | `-F` / `--features`, `--all-features`, `--no-default-features` |
 | Target kinds | `--lib`, `--bins`, `--tests`, `--examples`, `--benches`, `--all-targets` |
 | Named targets | `--bin`, `--test`, `--example`, `--bench` |
-| Compilation profile | `--release` / `-r` |
+| Compilation targets | Repeated `--target` with built-in target names or `host-tuple` |
+| Compilation profile | `--release` / `-r`, or one `--profile NAME` |
 
 Value options accept separate arguments and `--option=value`; `-pPACKAGE` and
-`-FFEATURES` are also accepted. Repeated value options retain every literal value.
+`-FFEATURES` are also accepted. Repeated array-valued options retain every literal
+value in order. `--profile` occurs at most once and cannot be combined with
+`--release` or `-r`. Target and profile names use the same restricted name syntax
+as the native profile above; neither can select a JSON target specification or
+another file. All array entries and the optional profile together share the
+128-value limit and the selected check arguments' 16 KiB byte budget, including
+option names. Each individual value is limited to 1,024 UTF-8 bytes.
 Cargo interprets package specifications and comma/space-separated feature lists.
 The native driver constructs both its nonexecuting unit-graph query and the
 subsequent check from the same selection. It requires a captured nightly Cargo
@@ -1137,7 +1153,7 @@ approved source boundary or authorize generated-input caching.
 This command accepts `check` only. The native driver supplies locked/offline
 mode, canonical compiler and output locations, and JSON diagnostics. Arguments
 that would override them, including `--config`, `--manifest-path`, `--target-dir`,
-`--message-format`, `-Z`, `--target`, `--profile`, or arguments after a second
+`--message-format`, `-Z`, or arguments after a second
 `--`, are refused. Set `jobs` and `manifest` in the profile. Launcher modes and
 local root-admission settings cannot be combined with this mode.
 

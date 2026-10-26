@@ -179,6 +179,45 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(self.records()[0]["profile"]["manifest"], "member/Cargo.toml")
         self.assertEqual(self.records()[0]["profile"]["jobs"], 3)
 
+    def test_compilation_targets_and_named_profile_reach_the_retained_native_profile(self):
+        args = ["check", "--package", "app", "--lib", "--target", "wasm32-unknown-unknown",
+                "--target=aarch64-unknown-linux-gnu", "--target", "host-tuple",
+                "--profile=check_fast", "--features", "app/portable"]
+        status, _, stderr, _ = self.invoke(args)
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        self.assertEqual(self.records()[0]["profile"]["selection"], {
+            "packages": ["app"], "lib": True,
+            "target": ["wasm32-unknown-unknown", "aarch64-unknown-linux-gnu", "host-tuple"],
+            "profile": "check_fast", "features": ["app/portable"],
+        })
+        status, _, stderr, _ = self.invoke(["check", "--target=host-tuple", "-r"])
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        self.assertEqual(self.records()[1]["profile"]["selection"], {
+            "target": ["host-tuple"], "release": True,
+        })
+        for profile in ("dev", "release", "test", "bench", "check-fast"):
+            self.assertEqual(launcher.canonical_local_selection(["check", "--profile", profile]),
+                             {"profile": profile})
+
+    def test_saved_targets_and_profile_are_validated_then_replaced_by_command_selection(self):
+        self.profile["selection"] = {"target": ["wasm32-unknown-unknown"], "profile": "check-fast"}
+        self.save()
+        original = self.profile_path.read_bytes()
+        status, _, stderr, _ = self.invoke(["check", "--target", "host-tuple", "--profile", "dev"])
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        self.assertEqual(self.records()[0]["profile"]["selection"], {
+            "target": ["host-tuple"], "profile": "dev",
+        })
+        self.assertEqual(self.profile_path.read_bytes(), original)
+        status, _, stderr, _ = self.invoke(["check"])
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        self.assertEqual(self.records()[1]["profile"]["selection"], {})
+        self.profile["selection"] = {"target": [], "profile": None}
+        self.save()
+        status, _, stderr, _ = self.invoke(["check"])
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        self.assertEqual(self.records()[2]["profile"]["selection"], {})
+
     def test_signal_exit_and_inherited_file_descriptors_survive_exec(self):
         read_fd, write_fd = os.pipe()
         try:
@@ -203,7 +242,7 @@ class CanonicalLocalCargo(unittest.TestCase):
             ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
             ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
             ["check", "--message-format=json"], ["check", "-Zunstable-options"],
-            ["check", "--target=x86_64-unknown-linux-gnu"], ["check", "--profile=custom"],
+            ["check", "--target=/tmp/custom.json"], ["check", "--profile=../custom"],
             ["check", "--jobs=2"], ["check", "--", "--help"],
             ["check", "--exclude", "unselected"], ["check", "--package"],
             ["check", "--features="], ["check", "--bin", "--lib"],
@@ -215,12 +254,47 @@ class CanonicalLocalCargo(unittest.TestCase):
             with self.subTest(args=args):
                 self.assert_refused(args)
 
+    def test_target_specs_profile_paths_conflicts_and_duplicate_profiles_refuse_before_handoff(self):
+        for option in ("--target", "--profile"):
+            for value in ("", "custom.json", "./custom", "/tmp/custom", "../custom",
+                          "spec/custom", "C:\\spec\\target.json", "host tuple", "targét",
+                          ".", "..", "_custom", "target=host", "--config=other"):
+                with self.subTest(option=option, value=value):
+                    self.assert_refused(["check", option + "=" + value])
+        for args in (
+            ["check", "--target"], ["check", "--profile"],
+            ["check", "--profile=dev", "--release"],
+            ["check", "-r", "--profile=dev"],
+            ["check", "--profile=dev", "--profile=release"],
+            ["check", "--profile=dev", "--profile=dev"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+
     def test_selection_limits_include_all_fields_utf8_bytes_and_option_bytes(self):
         exact = ["check"] + [item for _ in range(128) for item in ("-F", "a")]
         self.assertEqual(len(launcher.canonical_local_selection(exact)["features"]), 128)
         self.assert_refused(exact + ["--bin", "one-more"])
         self.assert_refused(["check", "--features", "雪" * 342])
         self.assert_refused(["check"] + [item for _ in range(16) for item in ("-F", "a" * 1024)])
+
+    def test_compilation_targets_and_profile_share_native_value_and_byte_budgets(self):
+        exact = ["check"] + [item for _ in range(128) for item in ("--target", "host-tuple")]
+        self.assertEqual(len(launcher.canonical_local_selection(exact)["target"]), 128)
+        self.assert_refused(exact + ["--profile", "dev"])
+        profile = exact[:-2] + ["--profile", "dev"]
+        self.assertEqual(len(launcher.canonical_local_selection(profile)["target"]), 127)
+        self.assert_refused(profile + ["--features", "one-more"])
+        for option in ("--target", "--profile"):
+            with self.subTest(option=option):
+                field = "target" if option == "--target" else "profile"
+                expected = ["a" * 1024] if field == "target" else "a" * 1024
+                self.assertEqual(launcher.canonical_local_selection(["check", option, "a" * 1024])[field], expected)
+                self.assert_refused(["check", option, "a" * 1025])
+        near = ["check"] + [item for _ in range(16) for item in ("--features", "a" * 1000)]
+        self.assertEqual(len(launcher.canonical_local_selection(near)["features"]), 16)
+        self.assert_refused(near + ["--profile", "a" * 1000])
+        self.assert_refused(["check"] + [item for _ in range(16) for item in ("--target", "a" * 1024)])
 
     def test_strict_profile_refusals_never_create_retained_intent(self):
         original = dict(self.profile)
@@ -231,6 +305,13 @@ class CanonicalLocalCargo(unittest.TestCase):
             {"selection": {"lib": "true"}}, {"selection": {"features": "feature"}},
             {"selection": {"features": ["--config=other"]}},
             {"selection": {"exclude": ["package"]}},
+            {"selection": {"target": "host-tuple"}},
+            {"selection": {"target": None}}, {"selection": {"target": [True]}},
+            {"selection": {"target": ["/tmp/custom.json"]}},
+            {"selection": {"profile": ["dev"]}}, {"selection": {"profile": True}},
+            {"selection": {"profile": {"inherits": "release"}}},
+            {"selection": {"profile": "custom.json"}},
+            {"selection": {"profile": "dev", "release": True}},
             {"vendor": "vendor", "cargo_home_source": str(self.root)},
         ):
             with self.subTest(change=change):
