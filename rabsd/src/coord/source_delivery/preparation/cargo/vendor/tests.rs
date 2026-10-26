@@ -384,6 +384,32 @@ fn vendor_config_refuses_ambient_layers_aliases_and_escaping_directories() {
 }
 
 #[test]
+fn unrelated_cargo_configs_remain_data_without_adding_vendor_configuration_layers() {
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path());
+    write(
+        root.path(),
+        "app/tests/fixtures/broken/.cargo/config.toml",
+        "malformed fixture config ]\n",
+    );
+    write(
+        root.path(),
+        "sibling/.cargo/config.toml",
+        "[build]\nrustc-wrapper='/rabs-forbidden-fixture-wrapper'\n",
+    );
+    verify(root.path()).unwrap();
+
+    // The same config becomes authoritative when it lies on the selected
+    // invocation's ancestor chain; the vendor lane still refuses extra layers.
+    write(
+        root.path(),
+        ".cargo/config.toml",
+        "[build]\nrustc-wrapper='/rabs-forbidden-active-wrapper'\n",
+    );
+    assert!(verify(root.path()).is_err());
+}
+
+#[test]
 fn checksums_require_every_file_exactly_once_with_no_missing_extra_or_changed_member() {
     for case in 0..8 {
         let root = tempfile::tempdir().unwrap();

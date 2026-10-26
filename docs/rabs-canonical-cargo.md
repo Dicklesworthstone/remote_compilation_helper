@@ -101,6 +101,20 @@ closure. Unsupported configuration, escaping local dependencies and symlink
 sources refuse preparation; there is no fallback that uploads a larger guessed
 set.
 
+Preparation follows the selected workspace and its resolved local dependency
+paths when validating Cargo control files. A repository can contain unrelated
+workspaces, deliberately invalid manifest/lockfile fixtures, and inactive nested
+Cargo configurations without those files preventing a build. They remain in the
+complete captured source tree, byte for byte. Selecting one of those manifests
+or reaching it through an active dependency makes its declarations subject to
+the normal checks. Workspace inheritance, automatic path members, optional and
+target-specific dependencies, and member development dependencies are included;
+foreign workspaces contribute only the inheritance and dependencies Cargo uses.
+Only the selected workspace's lockfile and configurations on the invocation's
+ancestor chain govern preparation. Workspace globs followed by `..` are refused
+because Cargo expands the glob before traversing the parent; ordinary contained
+`../sibling` paths remain supported.
+
 ### Submit canonical builds to the running daemon
 
 Add an explicit local socket to the same profile to use durable background job

@@ -415,6 +415,37 @@ impl AutomaticFixture {
 #[test]
 fn automatic_cargo_closure_builds_retained_optional_build_dev_and_target_dependencies() {
     let fixture = AutomaticFixture::new();
+    // These are inputs to repository tests, not Cargo control files for the
+    // selected app. Preserve them byte-for-byte without interpreting them as
+    // another workspace or allowing their configuration to control planning.
+    let fixture_data = [
+        (
+            "app/tests/fixtures/invalid/Cargo.toml",
+            "deliberately malformed Cargo fixture ]\n",
+        ),
+        (
+            "app/tests/fixtures/invalid/Cargo.lock",
+            "deliberately malformed lock fixture ]\n",
+        ),
+        (
+            "app/tests/fixtures/invalid/.cargo/config.toml",
+            "[build]\nrustc-wrapper='/rabs-must-never-run-fixture-wrapper'\n",
+        ),
+        (
+            "unrelated/Cargo.toml",
+            "[package]\nname='unrelated'\nversion='0.1.0'\n[workspace]\n[dependencies]\nx={path='/rabs-uncaptured-fixture-path'}\n",
+        ),
+        ("dep/Cargo.lock", "unused dependency lock fixture ]\n"),
+        (
+            "dep/.cargo/config.toml",
+            "[build]\nrustc-wrapper='/rabs-must-never-run-member-wrapper'\n",
+        ),
+    ];
+    for (path, bytes) in fixture_data {
+        let path = fixture.source.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
     let (bundle, status, stdout, stderr) = fixture.prepare("automatic", &fixture.spec);
     assert!(
         status.success(),
@@ -430,6 +461,9 @@ fn automatic_cargo_closure_builds_retained_optional_build_dev_and_target_depende
     assert_eq!(request["args"], fixture.spec["args"]);
     assert_eq!(request["command_context"], fixture.spec["command_context"]);
     let source = bundle.join("source");
+    for (path, bytes) in fixture_data {
+        assert_eq!(fs::read(source.join(path)).unwrap(), bytes.as_bytes());
+    }
     for path in [
         "Cargo.lock",
         "Cargo.toml",
@@ -510,6 +544,78 @@ fn automatic_cargo_virtual_workspace_and_nontrivial_anchor_layout_are_supported(
     assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
     assert!(bundle.join("request.json").is_file());
     assert!(bundle.join("source/app/build-input.txt").is_file());
+}
+
+#[test]
+fn automatic_cargo_fixture_becomes_a_checked_input_when_selected() {
+    let fixture = AutomaticFixture::new();
+    let selected = "app/tests/fixtures/invalid/Cargo.toml";
+    fs::create_dir_all(fixture.source.join(selected).parent().unwrap()).unwrap();
+    fs::write(
+        fixture.source.join(selected),
+        "malformed selected manifest ]\n",
+    )
+    .unwrap();
+    let mut spec = fixture.spec.clone();
+    spec["cargo_source"]["manifest"] = json!(selected);
+    spec["command_context"]["cwd"] = json!("/__rabs/workspace/app/tests/fixtures/invalid");
+    let (bundle, status, _, stderr) = fixture.prepare("selected-fixture", &spec);
+    assert!(
+        !status.success(),
+        "a selected malformed fixture must refuse"
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("malformed Cargo graph manifest"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!bundle.join("request.json").exists());
+}
+
+#[test]
+fn automatic_cargo_foreign_workspace_inheritance_keeps_unrelated_members_as_data() {
+    let fixture = AutomaticFixture::new();
+    fs::write(
+        fixture.source.join("app/Cargo.toml"),
+        "[package]\nname='auto_app'\nversion='0.1.0'\nedition='2021'\nbuild=false\n[workspace]\n[dependencies]\nleaf={path='../foreign/leaf'}\n[workspace.dependencies]\nunused={path='missing'}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.source.join("app/src/main.rs"),
+        "fn main() { println!(\"{}\", leaf::ANSWER); }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.source.join("app/Cargo.lock"),
+        "version=4\n[[package]]\nname='auto_app'\nversion='0.1.0'\ndependencies=['leaf']\n[[package]]\nname='leaf'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    for (path, contents) in [
+        (
+            "foreign/Cargo.toml",
+            "[workspace]\nmembers=['leaf','bad']\n[workspace.package]\nversion='0.1.0'\n[workspace.dependencies]\nunused={path='missing'}\n",
+        ),
+        (
+            "foreign/leaf/Cargo.toml",
+            "[package]\nname='leaf'\nversion.workspace=true\nedition='2021'\n[dev-dependencies]\nunused={path='../missing-dev'}\n",
+        ),
+        ("foreign/leaf/src/lib.rs", "pub const ANSWER: u32 = 42;\n"),
+        (
+            "foreign/bad/Cargo.toml",
+            "malformed unrelated workspace member ]\n",
+        ),
+    ] {
+        let path = fixture.source.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    let (bundle, status, _, stderr) = fixture.prepare("foreign-workspace", &fixture.spec);
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    assert!(bundle.join("request.json").is_file());
+    assert_eq!(
+        fs::read(bundle.join("source/foreign/bad/Cargo.toml")).unwrap(),
+        b"malformed unrelated workspace member ]\n"
+    );
 }
 
 #[test]

@@ -7,6 +7,7 @@
 //! relative layout. No descriptor, cache authority, or compiler result is minted.
 
 mod git;
+mod graph;
 mod registry;
 mod vendor;
 
@@ -314,96 +315,97 @@ fn validate_capture(
                 files.len() <= MAX_SOURCE_FILES,
                 "Cargo source anchor exceeds the file-count bound",
             )?;
-            // Vendor packages were checked as complete checksum-covered trees.
-            // Their nested test Cargo.toml/config/lock fixtures are ordinary data,
-            // not independent workspace roots for the planning command.
-            if vendor.is_some_and(|vendor| vendor.contains(path)) {
-                continue;
-            }
-            if is_cargo_config(Path::new(path)) {
-                if let Some(vendor) = vendor {
-                    // The vendor adapter validates its one source-replacement
-                    // config, including the shared compiler settings below.
-                    require(
-                        vendor.allows_config(path),
-                        "vendor preparation does not admit another Cargo config layer",
-                    )?;
-                } else {
-                    let bytes = image
-                        .file_bytes("workspace", path)
-                        .filter(|bytes| bytes.len() <= OUTPUT_LIMIT as usize)
-                        .ok_or_else(|| invalid("missing or oversized captured Cargo config"))?;
-                    let text = std::str::from_utf8(bytes)
-                        .map_err(|_| invalid("captured Cargo config is not UTF-8"))?;
-                    let value = toml::from_str(text)
-                        .map_err(|_| invalid("malformed captured Cargo config"))?;
-                    let base = Path::new(path)
-                        .parent()
-                        .and_then(Path::parent)
-                        .ok_or_else(|| invalid("invalid captured Cargo config path"))?;
-                    if cached_registry {
-                        registry::validate_cargo_config(&value, base)?;
-                    } else {
-                        validate_cargo_config(&value, base, false)?;
-                    }
-                }
-            }
-            if Path::new(path)
-                .file_name()
-                .is_some_and(|name| name == "Cargo.toml")
-            {
-                let text = std::str::from_utf8(
-                    image
-                        .file_bytes("workspace", path)
-                        .filter(|bytes| bytes.len() <= OUTPUT_LIMIT as usize)
-                        .ok_or_else(|| invalid("missing captured Cargo manifest"))?,
-                )
-                .map_err(|_| invalid("Cargo manifest is not UTF-8"))?;
-                let value: toml::Value = toml::from_str(text).map_err(|error| {
-                    invalid(&format!("captured Cargo manifest {path}: {error}"))
-                })?;
-                validate_manifest_paths_with_cache(
-                    Path::new(path).parent().unwrap_or(Path::new("")),
-                    &value,
-                    vendor.map(|vendor| &vendor.sources),
-                    false,
-                    cached_registry,
-                )?;
-            }
-            if Path::new(path)
-                .file_name()
-                .is_some_and(|name| name == "Cargo.lock")
-            {
-                let text = std::str::from_utf8(
-                    image
-                        .file_bytes("workspace", path)
-                        .filter(|bytes| bytes.len() <= OUTPUT_LIMIT as usize)
-                        .ok_or_else(|| invalid("missing captured Cargo lockfile"))?,
-                )
-                .map_err(|_| invalid("Cargo lockfile is not UTF-8"))?;
-                let lock: toml::Value = toml::from_str(text).map_err(|error| {
-                    invalid(&format!("captured Cargo lockfile {path}: {error}"))
-                })?;
-                if let Some(vendor) = vendor {
-                    vendor.validate_lock_sources(&lock)?;
-                } else if cached_registry {
-                    registry::validate_lock_sources(&lock)?;
-                } else if let Some(packages) = lock.get("package").and_then(toml::Value::as_array) {
-                    require(
-                        packages
-                            .iter()
-                            .all(|package| package.get("source").is_none()),
-                        "automatic Cargo source preparation requires a lockfile containing only local packages",
-                    )?;
-                }
-            }
         }
     }
     require(
         files.iter().any(|path| path == manifest),
         "Cargo manifest is absent from the captured anchor",
     )?;
+    // The approved anchor is the complete upload boundary, not a declaration
+    // that every fixture named Cargo.toml belongs to this command. Discover the
+    // control-file closure before Cargo runs, retaining all other files as data.
+    // Relevant path declarations are checked before metadata can follow them.
+    let controls = graph::ControlInputs::discover(image, manifest, vendor, cached_registry)?;
+    let configs = active_cargo_configs(image, manifest)?;
+    for path in &files {
+        if configs.contains(path) {
+            if let Some(vendor) = vendor {
+                // The vendor adapter validates its one source-replacement
+                // config, including the shared compiler settings below.
+                require(
+                    vendor.allows_config(path),
+                    "vendor preparation does not admit another Cargo config layer",
+                )?;
+            } else {
+                let bytes = image
+                    .file_bytes("workspace", path)
+                    .filter(|bytes| bytes.len() <= OUTPUT_LIMIT as usize)
+                    .ok_or_else(|| invalid("missing or oversized captured Cargo config"))?;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| invalid("captured Cargo config is not UTF-8"))?;
+                let value =
+                    toml::from_str(text).map_err(|_| invalid("malformed captured Cargo config"))?;
+                let base = Path::new(path)
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| invalid("invalid captured Cargo config path"))?;
+                if cached_registry {
+                    registry::validate_cargo_config(&value, base)?;
+                } else {
+                    validate_cargo_config(&value, base, false)?;
+                }
+            }
+        }
+        if path == &controls.lock {
+            let text = std::str::from_utf8(
+                image
+                    .file_bytes("workspace", path)
+                    .filter(|bytes| bytes.len() <= OUTPUT_LIMIT as usize)
+                    .ok_or_else(|| invalid("missing captured Cargo lockfile"))?,
+            )
+            .map_err(|_| invalid("Cargo lockfile is not UTF-8"))?;
+            let lock: toml::Value = toml::from_str(text)
+                .map_err(|error| invalid(&format!("captured Cargo lockfile {path}: {error}")))?;
+            if let Some(vendor) = vendor {
+                vendor.validate_lock_sources(&lock)?;
+            } else if cached_registry {
+                registry::validate_lock_sources(&lock)?;
+            } else if let Some(packages) = lock.get("package").and_then(toml::Value::as_array) {
+                require(
+                    packages
+                        .iter()
+                        .all(|package| package.get("source").is_none()),
+                    "automatic Cargo source preparation requires a lockfile containing only local packages",
+                )?;
+            }
+        }
+    }
     Ok(files)
+}
+
+/// Cargo discovers configuration from the invocation cwd upward, even when the
+/// selected manifest belongs to a parent workspace. Configurations in member,
+/// fixture or sibling directories outside that ancestor chain are source data.
+fn active_cargo_configs(
+    image: &SealedSourceSnapshot,
+    manifest: &str,
+) -> io::Result<BTreeSet<String>> {
+    let captured = image
+        .manifest("workspace")
+        .ok_or_else(|| invalid("missing captured Cargo anchor"))?;
+    let cwd = Path::new(manifest)
+        .parent()
+        .ok_or_else(|| invalid("Cargo manifest parent missing"))?;
+    Ok(captured
+        .members
+        .iter()
+        .filter(|(_, kind)| matches!(kind, MemberKind::Regular { .. }))
+        .filter_map(|(path, _)| {
+            let file = Path::new(path);
+            let base = file.parent()?.parent()?;
+            (is_cargo_config(file) && cwd.starts_with(base)).then(|| path.clone())
+        })
+        .collect())
 }
 
 fn is_cargo_config(path: &Path) -> bool {

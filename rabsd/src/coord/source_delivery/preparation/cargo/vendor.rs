@@ -5,7 +5,9 @@
 //! tree, its checksum files, the selected workspace lock, and the resolved paths.
 //! The source-replacement configuration is preserved, never generated or rewritten.
 
-use super::{MAX_PACKAGES, OUTPUT_LIMIT, contained_relative, invalid, is_cargo_config, require};
+use super::{
+    MAX_PACKAGES, OUTPUT_LIMIT, active_cargo_configs, contained_relative, invalid, require,
+};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::MAX_SOURCE_FILES;
 use serde::Deserialize;
@@ -428,7 +430,7 @@ impl VendoredSources {
         let captured = image
             .manifest("workspace")
             .ok_or_else(|| invalid("missing captured Cargo anchor"))?;
-        let mut configs = Vec::new();
+        let mut configs: Vec<_> = active_cargo_configs(image, manifest)?.into_iter().collect();
         let mut file_count = 0_usize;
         let mut members: BTreeMap<String, BTreeMap<String, &str>> = BTreeMap::new();
         let prefix = format!("{directory}/");
@@ -462,8 +464,6 @@ impl VendoredSources {
                     members.len() <= MAX_PACKAGES,
                     "vendor package count exceeds its bound",
                 )?;
-            } else if is_cargo_config(Path::new(path)) {
-                configs.push(path.clone());
             }
         }
         require(
@@ -472,7 +472,7 @@ impl VendoredSources {
         )?;
         require(
             configs.len() == 1,
-            "vendor preparation requires one captured source-replacement config and no other Cargo config layers",
+            "vendor preparation requires one active source-replacement config and no other active Cargo config layers",
         )?;
         let config = configs
             .pop()
