@@ -10,9 +10,9 @@ use std::process::{Command, Output};
 
 use rabs_key::live_dependency::{
     DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
-    LiveRustcRequest, PlannedExtern, ToolchainFacts, canonicalize_out_dir, canonicalize_placements,
-    dep_info_closure_violation, live_dependency_key, plan_dependency_action, render_out_dir,
-    render_placements,
+    LiveRustcRequest, PlannedExtern, ToolchainFacts, canonicalize_compiler_transcript,
+    canonicalize_out_dir, canonicalize_placements, dep_info_closure_violation, live_dependency_key,
+    plan_dependency_action, render_out_dir, render_placements,
 };
 
 // A transparent recorder around the actual compiler Cargo selected. The
@@ -424,8 +424,8 @@ fn main() {
     .unwrap();
     assert_eq!(baseline, actual_key(&repeat_plan, &toolchain));
     assert_eq!(
-        canonicalize_placements(&recorded.stderr, &plan).unwrap(),
-        canonicalize_placements(&repeat.stderr, &repeat_plan).unwrap()
+        canonicalize_compiler_transcript(&recorded.stderr, &plan).unwrap(),
+        canonicalize_compiler_transcript(&repeat.stderr, &repeat_plan).unwrap()
     );
     for name in plan.output_names() {
         let original = std::fs::read(Path::new(&plan.out_dir).join(&name)).unwrap();
@@ -764,8 +764,8 @@ fn actual_cargo_dependency_chain_reuses_complete_keys_across_target_directories(
             "complete key differs for real Cargo request {index}"
         );
         assert_eq!(
-            canonicalize_placements(&request_a.stderr, a).unwrap(),
-            canonicalize_placements(&request_b.stderr, b).unwrap()
+            canonicalize_compiler_transcript(&request_a.stderr, a).unwrap(),
+            canonicalize_compiler_transcript(&request_b.stderr, b).unwrap()
         );
         for name in a.output_names() {
             let left = std::fs::read(Path::new(&a.out_dir).join(&name)).unwrap();

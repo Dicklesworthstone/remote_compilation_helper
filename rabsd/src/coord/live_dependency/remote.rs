@@ -11,8 +11,8 @@ use super::{
     CanonicalActionResultManifest, CompletionOutcome, CompletionReport, CoordLive,
     DependencyActionPlan, ExecutionAttempt, InstallResult, LiveDecision, LiveDependencyKey,
     LiveDependencyLane, LiveDependencyRequest, MAX_TRANSCRIPT_BYTES, Path, PathBuf, ServeOutcome,
-    ToolchainGuard, TypedDigest, WorkerSessionOffer, canonicalize_placements, expected_outputs,
-    known_installed_output, now_micros, read_stable, render_placements,
+    ToolchainGuard, TypedDigest, WorkerSessionOffer, canonicalize_compiler_transcript,
+    expected_outputs, known_installed_output, now_micros, read_stable, render_compiler_transcript,
 };
 use crate::coord::remote_dependency_transport::{
     RemoteDependencyReservation, RemoteDependencyTransport,
@@ -941,8 +941,9 @@ impl PendingRemote {
             .map_err(settled)?;
         let manifest = captured.offer.manifest.clone();
         let manifest_key = captured.manifest_key.clone();
-        let canonical_transcript = canonicalize_placements(&report.stderr, &attempt.request.plan)
-            .map_err(|e| settled(e.to_owned()))?;
+        let canonical_transcript =
+            canonicalize_compiler_transcript(&report.stderr, &attempt.request.plan)
+                .map_err(|e| settled(e.to_owned()))?;
         // Capture streams can take time. Recheck the complete original dataset
         // and measured runtime after them, before crossing publication.
         invocation
@@ -1251,7 +1252,7 @@ impl PendingRemoteInstall {
                     &request.dependencies,
                     &request.package,
                     plan,
-                    render_placements(&self.canonical_transcript, plan),
+                    render_compiler_transcript(&self.canonical_transcript, plan),
                     installed,
                 )
             }

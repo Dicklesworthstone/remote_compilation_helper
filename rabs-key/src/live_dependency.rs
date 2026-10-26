@@ -63,8 +63,8 @@
 //!   [`CANONICAL_OUT_DIR`]; ordered dependency search directories and
 //!   `--extern` paths use distinct canonical roots before keying. rustc does not embed the out-dir
 //!   in `.rlib`/`.rmeta` bytes (pinned by a real-rustc test); dep-info and
-//!   the JSON artifact notifications do mention it, and are canonicalized
-//!   by [`canonicalize_out_dir`] / rendered back by [`render_out_dir`].
+//!   the JSON artifact notifications do mention it, and use separate bounded
+//!   [`canonicalize_placements`] / [`canonicalize_compiler_transcript`] adapters.
 //!   Dependency-root mentions in diagnostics are refused instead of rewritten.
 //!   Every other path (source, cwd, `--remap-path-prefix`, `--sysroot`)
 //!   is keyed as given — local-host serving only (`SubscriberPathPreserving`).
@@ -108,11 +108,12 @@ use crate::typed_digest::compute;
 
 pub mod remote;
 
-/// Key epoch of the live dependency class. Epoch 4 refuses dynamic search-path
-/// candidates that may supply transitive procedural macros. Earlier entries
-/// could omit those macros and their untracked reads, so none may be reused.
-/// Complete environment keying and acknowledged immutable capture remain required.
-pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 4;
+/// Key epoch of the live dependency class. Epoch 5 limits transcript placement
+/// rewriting to declared rustc artifact events. Earlier entries could rewrite
+/// source-authored diagnostics, so they must not supply replay evidence.
+/// Complete environment keying, dynamic-dependency refusal and acknowledged
+/// immutable capture remain required.
+pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 5;
 /// Projection epoch: exact (unprojected) dependency artifacts.
 pub const LIVE_DEPENDENCY_PROJECTION_EPOCH: u32 = 1;
 /// Canonical spelling of the invocation's out-dir in keys, committed
@@ -186,9 +187,10 @@ pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v3: uns
      exact dependency-directory crate candidates revalidated before serving and after execution";
 
 /// What the executed compiler must produce for a publishable result.
-pub const EXECUTION_SEMANTICS: &str = "live-dependency-v1: rustc exit status 0 by normal \
-     exit, empty stdout, stderr = JSON diagnostics transcript canonicalized by out-dir \
-     substitution; every declared output present";
+pub const EXECUTION_SEMANTICS: &str = "live-dependency-v2: rustc exit status 0 by normal \
+     exit, empty stdout, stderr = byte-preserved JSON diagnostics with placement \
+     substitution only in declared rustc artifact paths; diagnostics containing \
+     output or dependency placement refuse replay; every declared output present";
 
 /// Shell location/process hints are preserved without fragmenting otherwise
 /// identical dependency actions. A compiler's tracked read of any of these
@@ -1417,9 +1419,11 @@ fn validate_build_script_output(
     Ok(())
 }
 
-/// Rewrite every occurrence of the real out-dir to [`CANONICAL_OUT_DIR`]
-/// (committed dep-info and transcripts). Refuses bytes that already
-/// contain the canonical marker: the rewrite would not be invertible.
+/// Low-level byte substitution for an already classified output payload.
+/// Live dep-info and compiler transcripts require their separate bounded
+/// adapters below; arbitrary diagnostic text is not safe to rewrite.
+/// Refuses bytes already containing the canonical marker because substitution
+/// would not be invertible.
 ///
 /// # Errors
 /// A static reason when the rewrite would be ambiguous.
@@ -1443,9 +1447,11 @@ pub fn render_out_dir(canonical: &[u8], out_dir: &str) -> Vec<u8> {
     replace_all(canonical, CANONICAL_OUT_DIR.as_bytes(), out_dir.as_bytes())
 }
 
-/// Canonicalize output placement in replayable dep-info or diagnostics.
-/// Dependency directory strings are refused: an arbitrary diagnostic may
-/// quote a source-authored literal, so replacing those strings is not sound.
+/// Canonicalize output placement in closure-checked dep-info. Only an absolute
+/// path token beneath the output directory is rewritten: a source path with a
+/// matching substring or sibling prefix is not output placement.
+/// Dependency directory strings remain outside this replay profile.
+/// Compiler transcripts must use [`canonicalize_compiler_transcript`] instead.
 ///
 /// # Errors
 /// Canonical markers and observable dependency placement are refused.
@@ -1458,13 +1464,296 @@ pub fn canonicalize_placements(
             return Err("observable dependency directory placement cannot be replayed");
         }
     }
-    canonicalize_out_dir(raw, &plan.out_dir)
+    if contains(raw, b"/__rabs") {
+        return Err("bytes already contain a canonical /__rabs path");
+    }
+    if !plain_path(&plan.out_dir) {
+        return Err("out-dir is not a plain path");
+    }
+    let prefix = format!("{}/", plan.out_dir);
+    let mut canonical = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    while at < raw.len() {
+        if (at == 0 || raw[at - 1].is_ascii_whitespace())
+            && raw[at..].starts_with(prefix.as_bytes())
+        {
+            canonical.extend_from_slice(CANONICAL_OUT_DIR.as_bytes());
+            at += plan.out_dir.len();
+        } else {
+            canonical.push(raw[at]);
+            at += 1;
+        }
+    }
+    Ok(canonical)
 }
 
 /// Render the output placement admitted by [`canonicalize_placements`].
 #[must_use]
 pub fn render_placements(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
     render_out_dir(canonical, &plan.out_dir)
+}
+
+/// Canonicalize only declared artifact paths in a compiler transcript, retaining
+/// every other byte (including whitespace, field order and line terminators).
+/// A diagnostic can quote a source-authored string that happens to equal the
+/// output directory. Rewriting that string for another subscriber changes what
+/// rustc said. Such ambiguous observations refuse publication instead.
+///
+/// The artifact adapter deliberately recognizes only rustc's flat, three-string
+/// event schema. A future schema or escaped path must gain an explicit adapter;
+/// neither a nested `artifact` field nor an arbitrary JSON string grants a path
+/// rewrite. The rest of the pure key crate needs no JSON dependency.
+///
+/// # Errors
+/// Ambiguous placement, undeclared artifact paths, unsupported artifact events,
+/// pre-existing canonical markers or non-UTF-8 compiler output.
+pub fn canonicalize_compiler_transcript(
+    raw: &[u8],
+    plan: &DependencyActionPlan,
+) -> Result<Vec<u8>, &'static str> {
+    if contains(raw, b"/__rabs") {
+        return Err("bytes already contain a canonical /__rabs path");
+    }
+    if !plain_path(&plan.out_dir) {
+        return Err("out-dir is not a plain path");
+    }
+    for root in &plan.dependency_dirs {
+        if root != &plan.out_dir && contains(raw, root.as_bytes()) {
+            return Err("observable dependency directory placement cannot be replayed");
+        }
+    }
+    let mut canonical = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        std::str::from_utf8(line).map_err(|_| "compiler transcript is not UTF-8")?;
+        let (artifact, mentions_output) = transcript_observations(line, plan)?;
+        if !artifact {
+            if mentions_output {
+                return Err("diagnostic contains ambiguous output directory placement");
+            }
+            canonical.extend_from_slice(line);
+            continue;
+        }
+        let (path, emit) =
+            artifact_event_fields(line).ok_or("unsupported compiler artifact notification")?;
+        let relative = line[path.clone()]
+            .strip_prefix(plan.out_dir.as_bytes())
+            .and_then(|path| path.strip_prefix(b"/"))
+            .ok_or("compiler artifact is outside the output directory")?;
+        if !plan.outputs.declarations.iter().any(|output| {
+            use crate::output_declarations::OutputClass;
+            output.virtual_path.as_bytes() == relative
+                && matches!(
+                    (output.class, emit),
+                    (OutputClass::ProvisionalMetadata, b"metadata")
+                        | (OutputClass::DepInfo, b"dep-info")
+                        | (OutputClass::File, b"link")
+                )
+        }) {
+            return Err("compiler artifact does not match a declared output");
+        }
+        canonical.extend_from_slice(&line[..path.start]);
+        canonical.extend_from_slice(CANONICAL_OUT_DIR.as_bytes());
+        canonical.push(b'/');
+        canonical.extend_from_slice(relative);
+        canonical.extend_from_slice(&line[path.end..]);
+    }
+    Ok(canonical)
+}
+
+/// Render a transcript accepted by [`canonicalize_compiler_transcript`]. Only
+/// its validated artifact-path fields can contain the reserved canonical marker.
+#[must_use]
+pub fn render_compiler_transcript(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
+    render_out_dir(canonical, &plan.out_dir)
+}
+
+/// Decode JSON strings for REFUSAL/classification only. Raw substring checks
+/// alone miss `\/` and `\u002f`; an escaped discriminator must not disguise an
+/// artifact as ordinary diagnostic text. The accepted transcript keeps its
+/// original bytes. Actual artifact admission still requires the strict grammar
+/// below, so this observer cannot authorize a new event shape or a path rewrite.
+fn transcript_observations(
+    line: &[u8],
+    plan: &DependencyActionPlan,
+) -> Result<(bool, bool), &'static str> {
+    let mut at = 0;
+    let mut containers = Vec::new();
+    let mut artifact = false;
+    let mut mentions_output = contains(line, plan.out_dir.as_bytes());
+    while at < line.len() {
+        match line[at] {
+            b'"' => {
+                let value = transcript_string(line, &mut at)
+                    .ok_or("invalid JSON string in compiler transcript")?;
+                if contains(&value, b"/__rabs") {
+                    return Err("bytes already contain a canonical /__rabs path");
+                }
+                if plan
+                    .dependency_dirs
+                    .iter()
+                    .any(|root| root != &plan.out_dir && contains(&value, root.as_bytes()))
+                {
+                    return Err("observable dependency directory placement cannot be replayed");
+                }
+                mentions_output |= contains(&value, plan.out_dir.as_bytes());
+                if containers.as_slice() == [b'{'] && value == b"$message_type" {
+                    let mut next = at;
+                    while line.get(next).is_some_and(u8::is_ascii_whitespace) {
+                        next += 1;
+                    }
+                    if line.get(next) == Some(&b':') {
+                        next += 1;
+                        while line.get(next).is_some_and(u8::is_ascii_whitespace) {
+                            next += 1;
+                        }
+                        let kind = transcript_string(line, &mut next)
+                            .ok_or("invalid compiler message discriminator")?;
+                        // Keep any artifact discriminator, including an earlier
+                        // duplicate that a permissive map parser might replace.
+                        artifact |= kind == b"artifact";
+                    }
+                }
+            }
+            opening @ (b'{' | b'[') => {
+                if containers.len() >= 128 {
+                    return Err("compiler transcript nesting exceeds its bound");
+                }
+                containers.push(opening);
+                at += 1;
+            }
+            closing @ (b'}' | b']') => {
+                let expected = if closing == b'}' { b'{' } else { b'[' };
+                if containers.pop() != Some(expected) {
+                    return Err("unbalanced compiler transcript containers");
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    if !containers.is_empty() {
+        return Err("unbalanced compiler transcript containers");
+    }
+    Ok((artifact, mentions_output))
+}
+
+fn transcript_string(bytes: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+    fn hex_quad(bytes: &[u8], at: &mut usize) -> Option<u32> {
+        let mut value = 0;
+        for _ in 0..4 {
+            value = value * 16 + char::from(*bytes.get(*at)?).to_digit(16)?;
+            *at += 1;
+        }
+        Some(value)
+    }
+    if bytes.get(*at) != Some(&b'"') {
+        return None;
+    }
+    *at += 1;
+    let mut decoded = Vec::new();
+    loop {
+        let byte = *bytes.get(*at)?;
+        *at += 1;
+        match byte {
+            b'"' => return Some(decoded),
+            0..=31 => return None,
+            b'\\' => {
+                let escape = *bytes.get(*at)?;
+                *at += 1;
+                match escape {
+                    b'"' | b'\\' | b'/' => decoded.push(escape),
+                    b'b' => decoded.push(8),
+                    b'f' => decoded.push(12),
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b't' => decoded.push(b'\t'),
+                    b'u' => {
+                        let mut value = hex_quad(bytes, at)?;
+                        if (0xd800..=0xdbff).contains(&value) {
+                            if bytes.get(*at..*at + 2)? != b"\\u" {
+                                return None;
+                            }
+                            *at += 2;
+                            let low = hex_quad(bytes, at)?;
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return None;
+                            }
+                            value = 0x10000 + ((value - 0xd800) << 10) + (low - 0xdc00);
+                        }
+                        let character = char::from_u32(value)?;
+                        decoded.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+                    }
+                    _ => return None,
+                }
+            }
+            _ => decoded.push(byte),
+        }
+    }
+}
+
+/// A bounded grammar for the known rustc artifact event. Return the original
+/// path's byte span rather than reserializing JSON and changing rustc's bytes.
+fn artifact_event_fields(line: &[u8]) -> Option<(std::ops::Range<usize>, &[u8])> {
+    fn whitespace(bytes: &[u8], at: &mut usize) {
+        while bytes
+            .get(*at)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            *at += 1;
+        }
+    }
+    fn string(bytes: &[u8], at: &mut usize) -> Option<std::ops::Range<usize>> {
+        whitespace(bytes, at);
+        if bytes.get(*at) != Some(&b'"') {
+            return None;
+        }
+        *at += 1;
+        let start = *at;
+        loop {
+            match *bytes.get(*at)? {
+                b'"' => {
+                    let end = *at;
+                    *at += 1;
+                    return Some(start..end);
+                }
+                b'\\' | 0..=31 => return None,
+                _ => *at += 1,
+            }
+        }
+    }
+    let mut at = 0;
+    whitespace(line, &mut at);
+    if line.get(at) != Some(&b'{') {
+        return None;
+    }
+    at += 1;
+    let mut path = None;
+    let mut emit = None;
+    let mut message_type = false;
+    for field in 0..3 {
+        let name = string(line, &mut at)?;
+        whitespace(line, &mut at);
+        if line.get(at) != Some(&b':') {
+            return None;
+        }
+        at += 1;
+        let value = string(line, &mut at)?;
+        match &line[name] {
+            b"artifact" if path.is_none() => path = Some(value),
+            b"emit" if emit.is_none() => emit = Some(&line[value]),
+            b"$message_type" if !message_type && &line[value] == b"artifact" => {
+                message_type = true;
+            }
+            _ => return None,
+        }
+        whitespace(line, &mut at);
+        if line.get(at) != Some(&if field == 2 { b'}' } else { b',' }) {
+            return None;
+        }
+        at += 1;
+    }
+    whitespace(line, &mut at);
+    (at == line.len() && message_type).then_some((path?, emit?))
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1545,12 +1834,11 @@ pub fn dep_info_closure_violation(
                 {
                     return Some("tracked read of placement-normalized LD_LIBRARY_PATH".into());
                 }
-                // Placement replay currently rewrites complete dep-info and
-                // diagnostic streams. A semantic environment name/value that
-                // contains this output root must not become a placement token:
-                // replay in another out-dir would change the compiler's read.
-                // Match every substring, just as canonicalize_out_dir does.
-                // Execution already preserved the value; only publishing fails.
+                // Preserve the live class's conservative refusal of observed
+                // output placement in environment names/values. The narrower
+                // transcript and dep-info adapters do not prove such a read
+                // cannot also affect native output. Execution preserved the
+                // value; only publication is refused.
                 if read.contains(&plan.out_dir) {
                     return Some(format!(
                         "tracked read of {name} contains compiler output placement"
@@ -2455,7 +2743,7 @@ mod tests {
             assert!(executed.stdout.is_empty());
             assert_eq!(
                 canonicalize_out_dir(&stock.stderr, stock_dir.to_str().unwrap()).unwrap(),
-                canonicalize_placements(&executed.stderr, &plan).unwrap()
+                canonicalize_compiler_transcript(&executed.stderr, &plan).unwrap()
             );
             for name in plan.output_names() {
                 let stock_bytes = std::fs::read(stock_dir.join(&name)).unwrap();
@@ -2811,6 +3099,278 @@ mod tests {
     }
 
     #[test]
+    fn compiler_transcript_rewrites_only_declared_artifact_fields_byte_for_byte() {
+        let a = plan_for(OUT_A, &[], &[]).unwrap();
+        let b = plan_for(OUT_B, &[], &[]).unwrap();
+        let diagnostic = [
+            br#"{ "$message_type" : "diagnostic", "message":"retain \"quotes\" and \u2603", "spans":[] }"#.as_slice(),
+            b"\r\n",
+        ].concat();
+        for output in &a.outputs.declarations {
+            let emit = match output.class {
+                crate::output_declarations::OutputClass::ProvisionalMetadata => "metadata",
+                crate::output_declarations::OutputClass::DepInfo => "dep-info",
+                crate::output_declarations::OutputClass::File => "link",
+                _ => panic!("unexpected fixture output"),
+            };
+            // Nonstandard whitespace and ordering must survive without JSON
+            // reserialization; ordinary diagnostics remain an exact prefix.
+            let event = format!(
+                "  {{ \"emit\" : \"{emit}\", \"artifact\" : \"{OUT_A}/{}\", \"$message_type\" : \"artifact\" }}\r\n",
+                output.virtual_path
+            );
+            let raw = [diagnostic.as_slice(), event.as_bytes()].concat();
+            let canonical = canonicalize_compiler_transcript(&raw, &a).unwrap();
+            assert!(canonical.starts_with(&diagnostic));
+            assert_eq!(render_compiler_transcript(&canonical, &a), raw);
+            let expected = [
+                diagnostic.as_slice(),
+                event.replace(OUT_A, OUT_B).as_bytes(),
+            ]
+            .concat();
+            assert_eq!(render_compiler_transcript(&canonical, &b), expected);
+            let decoded: serde_json::Value =
+                serde_json::from_slice(&canonical[diagnostic.len()..]).unwrap();
+            assert_eq!(
+                decoded["artifact"],
+                format!("{CANONICAL_OUT_DIR}/{}", output.virtual_path)
+            );
+        }
+        assert!(
+            canonicalize_compiler_transcript(&[], &a)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compiler_transcript_refuses_source_authored_placement_and_ambiguous_events() {
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        let path = format!("{OUT_A}/libitoa-c2b2f4e1a6d0b3c9.rmeta");
+        for raw in [
+            format!(
+                "{{\"$message_type\":\"diagnostic\",\"message\":\"deprecated note: {OUT_A}\"}}\n"
+            ),
+            format!("{{\"message\":\"literal {OUT_A}-backup\"}}\n"),
+            format!("{{\"message\":\"nested\",\"span\":{{\"artifact\":\"{path}\"}}}}\n"),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"emit\":\"link\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}-backup/file.rmeta\",\"emit\":\"metadata\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}/undeclared.rmeta\",\"emit\":\"metadata\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"emit\":\"metadata\",\"note\":\"extra field\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"artifact\":\"{path}\",\"emit\":\"metadata\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{}\",\"emit\":\"metadata\"}}\n",
+                path.replace('/', "\\/")
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"emit\":\"metadata\"}} trailing"
+            ),
+            format!(
+                r#"{{"message":"escaped literal {}"}}"#,
+                OUT_A.replace('/', r"\/")
+            ),
+            format!(
+                r#"{{"message":"Unicode literal {}"}}"#,
+                OUT_A.replace('/', r"\u002f")
+            ),
+            format!(
+                r#"{{"\u0024message_type":"ar\u0074ifact","artifact":"{}","emit":"metadata"}}"#,
+                path.replace('/', r"\u002f")
+            ),
+            r#"{"$message_type":"ar\u0074ifact","artifact":"/unrelated/result.rmeta","emit":"metadata"}"#.into(),
+            format!(
+                r#"{{"$message_type":"artifact","$message_type":"diagnostic","artifact":"{}","emit":"metadata"}}"#,
+                path.replace('/', r"\u002f")
+            ),
+            r#"{"message":"literal \u002f__rabs\u002fout"}"#.into(),
+            r#"{"message":"invalid \q escape"}"#.into(),
+            r#"{"message":"invalid \ud800 surrogate"}"#.into(),
+            "{\"message\":\"literal /__rabs/out\"}\n".into(),
+        ] {
+            assert!(
+                canonicalize_compiler_transcript(raw.as_bytes(), &plan).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_string_observer_matches_json_decoding_without_changing_bytes() {
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        for encoded in [
+            r#""plain""#,
+            r#""quoted \"content\" and \\slashes\\""#,
+            r#""line\ncarriage\rtab\tbackspace\bformfeed\f""#,
+            r#""\u0061\u0062\u0063 \u2603 \ud83d\ude80""#,
+            r#""literal \\u002f and \\/""#,
+            "\"literal snowman ☃\"",
+        ] {
+            let mut at = 0;
+            let decoded = transcript_string(encoded.as_bytes(), &mut at).unwrap();
+            assert_eq!(at, encoded.len());
+            let expected: String = serde_json::from_str(encoded).unwrap();
+            assert_eq!(decoded, expected.as_bytes());
+            let line = format!("{{\"$message_type\":\"diagnostic\",\"message\":{encoded}}}\n");
+            assert_eq!(
+                canonicalize_compiler_transcript(line.as_bytes(), &plan).unwrap(),
+                line.as_bytes(),
+                "valid diagnostic escaping must remain byte-identical"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_rustc_diagnostic_literals_survive_replay_to_another_output_directory() {
+        use std::path::Path;
+        use std::process::Command;
+
+        let sysroot = Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        assert!(
+            sysroot.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sysroot.stderr)
+        );
+        let compiler =
+            Path::new(std::str::from_utf8(&sysroot.stdout).unwrap().trim()).join("bin/rustc");
+        let version = Command::new(&compiler).arg("-vV").output().unwrap();
+        assert!(
+            version.status.success(),
+            "{}",
+            String::from_utf8_lossy(&version.stderr)
+        );
+        let version = std::str::from_utf8(&version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let cargo_home = temporary.path().join("cargo-home");
+        let package =
+            cargo_home.join("registry/src/index.example-0123456789abcdef/diagnostic_fixture-1.0.0");
+        let first_out = temporary.path().join("first-out");
+        let second_out = temporary.path().join("second-out");
+        for directory in [&package, &first_out, &second_out] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let source = package.join("lib.rs");
+        std::fs::write(
+            &source,
+            format!(
+                "#[deprecated(note = {:?})]\npub fn old() {{}}\npub fn invoke() {{ old(); }}\n",
+                first_out.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let environment = vec![
+            ("CARGO_HOME".into(), cargo_home.display().to_string()),
+            ("CARGO_MANIFEST_DIR".into(), package.display().to_string()),
+            ("CARGO_PKG_NAME".into(), "diagnostic_fixture".into()),
+            ("CARGO_PKG_VERSION".into(), "1.0.0".into()),
+        ];
+        let compile = |out: &Path| {
+            let argv = vec![
+                compiler.display().to_string(),
+                "--crate-name=diagnostic_fixture".into(),
+                "--edition=2021".into(),
+                source.display().to_string(),
+                "--error-format=json".into(),
+                "--json=artifacts,diagnostic-rendered-ansi".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--force-warn=deprecated".into(),
+                "--out-dir".into(),
+                out.display().to_string(),
+            ];
+            let plan = plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package.to_str().unwrap(),
+                    env: &environment,
+                },
+                host,
+            )
+            .unwrap();
+            let output = Command::new(&compiler)
+                .args(&argv[1..])
+                .current_dir(&package)
+                .env_clear()
+                .envs(plan.execution_env.iter().cloned())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.is_empty());
+            let diagnostics = std::str::from_utf8(&output.stderr).unwrap();
+            assert!(
+                diagnostics.lines().any(|line| {
+                    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    value["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(first_out.to_str().unwrap()))
+                }),
+                "real compiler must emit the source-authored path in its warning"
+            );
+            (plan, output.stderr)
+        };
+        let (first_plan, first_transcript) = compile(&first_out);
+        let (second_plan, second_transcript) = compile(&second_out);
+        // A first-output-root occurrence in diagnostic prose is ambiguous,
+        // even though artifact notifications themselves are safely rewritable.
+        assert!(canonicalize_compiler_transcript(&first_transcript, &first_plan).is_err());
+        // Capturing the same source in another output directory must retain
+        // that literal, then reproduce stock rustc's EXACT bytes at both roots.
+        let canonical = canonicalize_compiler_transcript(&second_transcript, &second_plan).unwrap();
+        assert_eq!(
+            render_compiler_transcript(&canonical, &second_plan),
+            second_transcript
+        );
+        assert_eq!(
+            render_compiler_transcript(&canonical, &first_plan),
+            first_transcript
+        );
+    }
+
+    #[test]
+    fn dep_info_does_not_relocate_source_paths_with_output_prefixes_or_substrings() {
+        let a = plan_for(OUT_A, &[], &[]).unwrap();
+        let b = plan_for(OUT_B, &[], &[]).unwrap();
+        let source_prefix = format!("{OUT_A}-source/src/lib.rs");
+        let source_substring = format!("/unrelated{OUT_A}/src/lib.rs");
+        let raw = format!(
+            "{OUT_A}/libitoa.rmeta: {source_prefix} {source_substring}\n\n{source_prefix}:\n{source_substring}:\n"
+        );
+        let canonical = canonicalize_placements(raw.as_bytes(), &a).unwrap();
+        assert_eq!(render_placements(&canonical, &a), raw.as_bytes());
+        assert_eq!(
+            render_placements(&canonical, &b),
+            raw.replacen(
+                &format!("{OUT_A}/libitoa.rmeta"),
+                &format!("{OUT_B}/libitoa.rmeta"),
+                1
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
     fn sibling_dependency_candidates_are_complete_ordered_and_content_bound() {
         let sibling_plan = |base: &str| {
             let mut args = argv(&format!("{base}/middle/out"), &[]);
@@ -2953,8 +3513,8 @@ mod tests {
             };
             let current =
                 live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &manifest).unwrap();
-            assert_eq!(current.descriptor.key_epoch, 4);
-            for previous_epoch in [1, 2, 3] {
+            assert_eq!(current.descriptor.key_epoch, 5);
+            for previous_epoch in [1, 2, 3, 4] {
                 let mut previous = current.descriptor.clone();
                 previous.key_epoch = previous_epoch;
                 assert_ne!(current.action_key, compute_action_key(&previous).final_key);

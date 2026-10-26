@@ -49,8 +49,8 @@ use rabs_cas::publication::{
 };
 use rabs_key::live_dependency::{
     DependencyActionPlan, LIVE_DEPENDENCY_KEY_EPOCH, LIVE_DEPENDENCY_PROJECTION_EPOCH,
-    LiveDependencyKey, canonicalize_placements, check_dependency_cache_read_closure,
-    dep_info_closure_violation, render_placements,
+    LiveDependencyKey, canonicalize_compiler_transcript, canonicalize_placements,
+    check_dependency_cache_read_closure, dep_info_closure_violation, render_compiler_transcript,
 };
 use rabs_key::output_declarations::OutputClass;
 use rabs_key::typed_digest::compute;
@@ -348,7 +348,7 @@ impl PendingServe {
                     &self.request.dependencies,
                     &self.request.package,
                     plan,
-                    render_placements(&self.canonical_transcript, plan),
+                    render_compiler_transcript(&self.canonical_transcript, plan),
                     installed,
                 )
             }
@@ -1044,7 +1044,7 @@ impl ExecutionAttempt {
         self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
         let input_roots = mappings_for_plan(plan);
-        let transcript = canonicalize_placements(&report.stderr, plan)?;
+        let transcript = canonicalize_compiler_transcript(&report.stderr, plan)?;
         verify_canonical_surface_free_of_staging_roots(
             rabs_sandbox::leak_scanner::Surface::CompilerEvents,
             &transcript,

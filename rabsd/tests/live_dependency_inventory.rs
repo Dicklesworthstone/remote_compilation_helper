@@ -9,7 +9,8 @@
 use rabs_cas::metadata_store::RabsMetadataStore;
 use rabs_key::live_dependency::{
     DependencyActionPlan, ExternFact, LiveRustcRequest, PlannedExtern, ToolchainFacts,
-    canonicalize_placements, live_dependency_key, plan_dependency_action,
+    canonicalize_compiler_transcript, canonicalize_placements, live_dependency_key,
+    plan_dependency_action,
 };
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
@@ -372,7 +373,7 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
             stderr: output.stderr,
         };
         let bytes = output_bytes(&plan);
-        let transcript = canonicalize_placements(&report.stderr, &plan).unwrap();
+        let transcript = canonicalize_compiler_transcript(&report.stderr, &plan).unwrap();
         if let Some(expected) = &expected_outputs {
             assert_eq!(&bytes, expected, "real compiler outputs diverged");
             assert_eq!(expected_transcript.as_ref(), Some(&transcript));
@@ -423,7 +424,7 @@ fn real_compiler_inventory_earns_replay_and_rechecks_exact_archive() {
     );
     assert_eq!(Some(output_bytes(&plan)), expected_outputs);
     assert_eq!(
-        Some(canonicalize_placements(&transcript, &plan).unwrap()),
+        Some(canonicalize_compiler_transcript(&transcript, &plan).unwrap()),
         expected_transcript
     );
     assert_eq!(fixture.published(&key), published_manifest);
