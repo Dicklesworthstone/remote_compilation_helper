@@ -50,7 +50,6 @@ const TARGET: &str = "/__rabs/out/cargo";
 const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
 const MAX_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_CHECK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// All host locations are selected by the operator, not by Cargo or a wrapper
 /// request. State and operation parents must be owned, private directories.
@@ -323,9 +322,11 @@ impl Profile {
 /// identity as the normal daemon. This entry point intentionally has no
 /// implicit advisory-policy overload.
 ///
-/// Cargo stdout/stderr are replayed from complete bounded captures. The exit
-/// code is Cargo's real result; a timeout, cancellation or incomplete drain is
-/// an error even when a signal handler managed to exit zero.
+/// Planning output is captured under a byte bound. The actual check inherits
+/// stdout/stderr, so diagnostics and Cargo JSON reach the caller immediately
+/// with their original bytes and native pipe/terminal behavior. The exit code
+/// is Cargo's real result; a timeout, cancellation or incomplete process-group
+/// cleanup is an error even when a signal handler managed to exit zero.
 pub fn run_profile_with_release(
     path: &Path,
     release_mode: ReleaseAuthorizationMode,
@@ -442,8 +443,10 @@ pub fn run_profile_with_release(
         &spec,
         &support,
         &graph_args,
-        &owner.path().join("unit-graph-drain"),
-        MAX_GRAPH_BYTES,
+        CargoOutput::Capture {
+            directory: owner.path().join("unit-graph-drain"),
+            maximum: MAX_GRAPH_BYTES,
+        },
         timeout,
         &stopped,
     )?;
@@ -539,8 +542,7 @@ pub fn run_profile_with_release(
         &spec,
         &support,
         &check_args,
-        &owner.path().join("check-drain"),
-        MAX_CHECK_BYTES,
+        CargoOutput::Inherit,
         timeout,
         &stopped,
     );
@@ -555,7 +557,6 @@ pub fn run_profile_with_release(
     };
     let shutdown = server.finish();
     let output = result?;
-    replay(&output)?;
     publication_drain.map_err(io::Error::other)?;
     let receipt = shutdown?;
     require(
@@ -598,32 +599,53 @@ fn capture_wrapper(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+enum CargoOutput {
+    Capture { directory: PathBuf, maximum: u64 },
+    Inherit,
+}
+
 fn execute(
     spec: &CanonicalNamespaceSpec,
     support: &HostIsolationSupport,
     args: &[String],
-    drain: &Path,
-    maximum: u64,
+    output: CargoOutput,
     timeout: Duration,
     stopped: &AtomicBool,
 ) -> io::Result<DrainedOutput> {
     let launch = build_canonical_argv(spec, support, CARGO, args)
         .map_err(|error| invalid(error.to_string()))?;
     let mut command = command_for(&launch);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdin(Stdio::null());
+    let (limits, maximum) = match output {
+        CargoOutput::Capture { directory, maximum } => {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            (DrainLimits::new(directory), maximum)
+        }
+        CargoOutput::Inherit => {
+            // No forwarding thread or retained copy stands between Cargo and
+            // its consumer. A slow pipe reader backpressures the child, while
+            // the supervisor can still cancel the entire group. With no piped
+            // child streams the ordinary drain starts no lanes and creates no
+            // spill directory. A zero budget also prevents accidental capture.
+            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            (
+                DrainLimits {
+                    resident_bound: 0,
+                    spill_dir: PathBuf::new(),
+                },
+                0,
+            )
+        }
+    };
     let process = ManagedProcessGroup::spawn_command(command, Attribution::default())?;
     let start = Instant::now();
     let mut cancelled = false;
     let mut timed_out = false;
-    let output =
-        process.wait_with_bounded_drain_budget(&DrainLimits::new(drain), maximum, || {
-            cancelled |= stopped.load(Ordering::Acquire);
-            timed_out |= start.elapsed() >= timeout;
-            cancelled || timed_out
-        })?;
+    let output = process.wait_with_bounded_drain_budget(&limits, maximum, || {
+        cancelled |= stopped.load(Ordering::Acquire);
+        timed_out |= start.elapsed() >= timeout;
+        cancelled || timed_out
+    })?;
     cancelled |= stopped.load(Ordering::Acquire);
     timed_out |= start.elapsed() >= timeout;
     if cancelled || timed_out {

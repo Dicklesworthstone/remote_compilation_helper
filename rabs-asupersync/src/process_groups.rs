@@ -1031,4 +1031,124 @@ mod tests {
         assert_eq!(output.stdout.resident(), b"ordinary-out");
         assert_eq!(output.stderr.resident(), b"ordinary-error");
     }
+
+    #[test]
+    fn inherited_streams_deliver_binary_prefixes_before_exit_without_replay() {
+        use std::io::{Read, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        // These endpoints stand in for the caller's inherited stdout/stderr.
+        // The process supervisor does not own their readers or capture bytes.
+        let (mut stdout, stdout_child) = UnixStream::pair().unwrap();
+        let (mut stderr, stderr_child) = UnixStream::pair().unwrap();
+        let (mut release, stdin_child) = UnixStream::pair().unwrap();
+        for stream in [&stdout, &stderr] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("must-not-be-created");
+        let group = ManagedProcessGroup::spawn_with(
+            &spec(
+                "sh",
+                r"printf 'out\000\377'; printf 'err\376' >&2; read -r release; printf tail; printf end >&2; exit 7",
+            ),
+            |cmd| {
+                cmd.stdin(Stdio::from(OwnedFd::from(stdin_child)))
+                    .stdout(Stdio::from(OwnedFd::from(stdout_child)))
+                    .stderr(Stdio::from(OwnedFd::from(stderr_child)));
+            },
+        )
+        .unwrap();
+        let outcome = std::thread::scope(|scope| {
+            let wait = scope.spawn(|| {
+                let started = Instant::now();
+                group.wait_with_bounded_drain_budget(
+                    &crate::stream_drain::DrainLimits {
+                        resident_bound: 0,
+                        spill_dir: spill.clone(),
+                    },
+                    0,
+                    || started.elapsed() > Duration::from_secs(5),
+                )
+            });
+            let mut out_prefix = [0; 5];
+            let mut err_prefix = [0; 4];
+            stdout.read_exact(&mut out_prefix).unwrap();
+            stderr.read_exact(&mut err_prefix).unwrap();
+            assert_eq!(&out_prefix, b"out\0\xff");
+            assert_eq!(&err_prefix, b"err\xfe");
+            assert!(!wait.is_finished(), "output waited for the process to exit");
+            // Only the consumer can release the child after observing both
+            // prefixes, so this is not a timing assumption about fast writes.
+            release.write_all(b"continue\n").unwrap();
+            let mut out_tail = Vec::new();
+            let mut err_tail = Vec::new();
+            stdout.read_to_end(&mut out_tail).unwrap();
+            stderr.read_to_end(&mut err_tail).unwrap();
+            assert_eq!(out_tail, b"tail");
+            assert_eq!(err_tail, b"end");
+            wait.join().unwrap().unwrap()
+        });
+        assert_eq!(outcome.status.code(), Some(7));
+        assert_eq!(outcome.residual_group_members, 0);
+        assert_eq!(outcome.stdout.total_bytes(), 0);
+        assert_eq!(outcome.stderr.total_bytes(), 0);
+        assert!(!spill.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_stream_backpressure_does_not_block_deadline_or_group_cleanup() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut consumer, output) = UnixStream::pair().unwrap();
+        consumer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec(
+                "sh",
+                "trap '' TERM; sleep 30 & printf ready; while :; do printf '%01000d' 0; done",
+            ),
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::from(OwnedFd::from(output)))
+                    .stderr(Stdio::null());
+            },
+        )
+        .unwrap();
+        let pgid = group.pgid();
+        let mut prefix = [0; 5];
+        consumer.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"ready");
+        // Retain the open reader without consuming the unbounded child output.
+        // There is no forwarding/drain thread that can get stuck writing here.
+        let started = Instant::now();
+        let mut expired = false;
+        let output = group
+            .wait_with_bounded_drain_budget(
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 0,
+                    spill_dir: std::path::PathBuf::new(),
+                },
+                0,
+                || {
+                    expired |= started.elapsed() >= Duration::from_millis(100);
+                    expired
+                },
+            )
+            .unwrap();
+        assert!(expired);
+        assert!(!output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(output.residual_group_members, 0);
+        assert_eq!(output.stdout.total_bytes(), 0);
+        assert_eq!(output.stderr.total_bytes(), 0);
+        assert!(members_from_proc(pgid).is_empty());
+    }
 }

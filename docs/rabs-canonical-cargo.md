@@ -1039,9 +1039,14 @@ dependency's captured source or changing its exact upstream artifact inventory
 changes the key or refuses reuse. Unsupported actions preserve ordinary rustc
 execution rather than borrowing the external dependency class's evidence.
 
-The command replays Cargo's complete bounded stdout and stderr after capture,
-then returns Cargo's actual status. A timeout, cancellation or incomplete drain
-is an error, including a child that exits zero while handling cancellation.
+The actual check inherits stdout and stderr, delivering Cargo JSON and compiler
+diagnostics as they are written with exact bytes and ordinary terminal/pipe
+behavior. There is no delayed replay or retained copy of these streams. A slow
+consumer backpressures Cargo while the process supervisor still enforces the
+execution deadline and cancellation. Graph planning remains a bounded capture.
+The command returns Cargo's actual status; a timeout, cancellation or incomplete
+process-group cleanup is an error, including a child that exits zero while
+handling cancellation.
 Input/toolchain capture and the first graph proof precede the scoped daemon's
 signal listener; they retain the existing bounded preparation behavior and the
 namespace's die-with-parent boundary. Compiler execution after admission uses
