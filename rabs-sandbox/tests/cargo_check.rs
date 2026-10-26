@@ -323,3 +323,222 @@ fn real_cargo_unit_graph_admits_only_selected_pure_check_units() {
     assert!(validate_check_unit_graph(&development).is_err());
     fixture.assert_no_compilation_or_project_execution();
 }
+
+fn host_target(fixture: &Fixture) -> String {
+    let output = Command::new(fixture.tools.join("bin/rustc"))
+        .arg("-vV")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("captured compiler host triple")
+        .to_owned()
+}
+
+fn add_check_profile(fixture: &Fixture) {
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.root().join("Cargo.toml"))
+        .unwrap()
+        .write_all(
+            b"\n[profile.check-fast]\ninherits = 'dev'\nopt-level = 2\ndebug-assertions = false\n",
+        )
+        .unwrap();
+}
+
+#[test]
+fn real_cargo_graph_retains_each_compilation_target_and_named_profile() {
+    let fixture = Fixture::new();
+    let host = host_target(&fixture);
+    add_check_profile(&fixture);
+    let selection = CheckSelection {
+        lib: true,
+        target: vec![host.clone(), "wasm32-unknown-unknown".into()],
+        profile: Some("check-fast".into()),
+        ..CheckSelection::default()
+    };
+    // Graph queries need no cross-target standard library installation: they
+    // describe compiler units without compiling their deliberately invalid Rust.
+    let graph = fixture.graph(selection);
+    let admitted = validate_check_unit_graph(&graph).unwrap();
+    assert_eq!(admitted.roots, 2);
+    assert_eq!(admitted.packages, 2);
+    let mut platforms = std::collections::BTreeSet::new();
+    for root in graph["roots"].as_array().unwrap() {
+        let index = usize::try_from(root.as_u64().unwrap()).unwrap();
+        let unit = &graph["units"][index];
+        platforms.insert(unit["platform"].as_str().unwrap());
+        assert_eq!(unit["profile"]["opt_level"], "2");
+        assert_eq!(unit["profile"]["debug_assertions"], false);
+    }
+    assert_eq!(
+        platforms,
+        std::collections::BTreeSet::from([host.as_str(), "wasm32-unknown-unknown"])
+    );
+    let alias = fixture.graph(CheckSelection {
+        lib: true,
+        target: vec!["host-tuple".into()],
+        profile: Some("check-fast".into()),
+        ..CheckSelection::default()
+    });
+    assert_eq!(validate_check_unit_graph(&alias).unwrap().roots, 1);
+    let root = usize::try_from(alias["roots"][0].as_u64().unwrap()).unwrap();
+    assert_eq!(alias["units"][root]["platform"], host);
+    fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
+fn a_test_profile_does_not_bypass_selected_proc_macro_admission() {
+    let fixture = Fixture::new();
+    let pure = fixture.graph(CheckSelection {
+        lib: true,
+        profile: Some("dev".into()),
+        ..CheckSelection::default()
+    });
+    validate_check_unit_graph(&pure).unwrap();
+    let development = fixture.graph(CheckSelection {
+        lib: true,
+        profile: Some("test".into()),
+        ..CheckSelection::default()
+    });
+    assert!(
+        development["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|unit| unit["target"]["kind"] == serde_json::json!(["proc-macro"]))
+    );
+    assert!(validate_check_unit_graph(&development).is_err());
+    fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
+fn one_unsafe_target_refuses_a_multi_target_check_before_any_project_execution() {
+    let fixture = Fixture::new();
+    let host = host_target(&fixture);
+    // The executable dependency is selected only for WebAssembly. Querying
+    // the native graph and then compiling other targets would miss it entirely.
+    fs::write(
+        fixture.root().join("Cargo.toml"),
+        r#"
+[package]
+name = "selected_graph_app"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+members = ["ordinary"]
+exclude = ["optional-script", "dev-macro"]
+resolver = "2"
+[dependencies]
+ordinary = { path = "ordinary" }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+optional_script = { path = "optional-script" }
+"#,
+    )
+    .unwrap();
+    let lock = fixture.command().args(["generate-lockfile", "--offline"]).output().unwrap();
+    assert!(lock.status.success(), "{}", String::from_utf8_lossy(&lock.stderr));
+    let native = fixture.graph(CheckSelection {
+        lib: true,
+        target: vec![host.clone()],
+        ..CheckSelection::default()
+    });
+    validate_check_unit_graph(&native).unwrap();
+    for targets in [
+        vec!["wasm32-unknown-unknown".to_owned()],
+        vec![host, "wasm32-unknown-unknown".to_owned()],
+    ] {
+        let graph = fixture.graph(CheckSelection {
+            lib: true,
+            target: targets,
+            ..CheckSelection::default()
+        });
+        assert!(
+            graph["units"].as_array().unwrap().iter()
+                .any(|unit| unit["mode"] == "run-custom-build")
+        );
+        assert!(validate_check_unit_graph(&graph).is_err());
+    }
+    fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
+fn a_native_target_check_uses_the_named_profile_and_reports_real_metadata() {
+    let fixture = Fixture::new();
+    let host = host_target(&fixture);
+    add_check_profile(&fixture);
+    // Unlike the graph-only tests, this case intentionally runs rustc for one
+    // pure package. The default profile is a negative control: it must fail.
+    fs::write(
+        fixture.root().join("ordinary/src/lib.rs"),
+        "#![no_std]\n#[cfg(debug_assertions)]\ncompile_error!(\"custom check profile was not applied\");\npub const VALUE: u32 = 17;\n",
+    )
+    .unwrap();
+    let mut selection = CheckSelection {
+        packages: vec!["ordinary".into()],
+        lib: true,
+        target: vec![host.clone()],
+        profile: Some("check-fast".into()),
+        ..CheckSelection::default()
+    };
+    validate_check_unit_graph(&fixture.graph(selection.clone())).unwrap();
+    let check = |selection: &CheckSelection| {
+        fixture.command()
+            .args(selection.cargo_arguments().unwrap())
+            .args(["--offline", "--locked", "--message-format=json"])
+            .output().unwrap()
+    };
+    let compiled = check(&selection);
+    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+    let messages: Vec<Value> = String::from_utf8(compiled.stdout).unwrap()
+        .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert!(messages.iter().any(|message| {
+        message["reason"] == "build-finished" && message["success"] == true
+    }));
+    let artifact = messages.iter().find(|message| {
+        message["reason"] == "compiler-artifact" && message["target"]["name"] == "ordinary"
+    }).expect("Cargo must report the compiled ordinary package");
+    let metadata: Vec<_> = artifact["filenames"].as_array().unwrap().iter()
+        .filter_map(Value::as_str).map(Path::new)
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rmeta"))
+        .collect();
+    assert!(!metadata.is_empty(), "check did not report any metadata output");
+    let expected = fixture.owner.path().join("target").join(host).join("check-fast");
+    for path in metadata {
+        assert!(path.starts_with(&expected), "{}", path.display());
+        assert!(fs::metadata(path).unwrap().len() > 0);
+    }
+    selection.profile = Some("dev".into());
+    let wrong = check(&selection);
+    assert!(!wrong.status.success(), "default-profile negative control passed");
+    assert!(String::from_utf8_lossy(&wrong.stdout)
+        .contains("custom check profile was not applied"));
+}
+
+#[test]
+fn unavailable_target_or_profile_never_falls_back_to_default_units() {
+    let fixture = Fixture::new();
+    for selection in [
+        CheckSelection {
+            lib: true,
+            target: vec!["rabs-nonexistent-compile-target".into()],
+            ..CheckSelection::default()
+        },
+        CheckSelection {
+            lib: true,
+            profile: Some("rabs-nonexistent-profile".into()),
+            ..CheckSelection::default()
+        },
+    ] {
+        let output = fixture.command()
+            .args(selection.cargo_arguments().unwrap())
+            .args(["--offline", "--locked", "--unit-graph", "-Z", "unstable-options"])
+            .output().unwrap();
+        assert!(!output.status.success(), "{selection:?} silently fell back");
+    }
+    fixture.assert_no_compilation_or_project_execution();
+}
