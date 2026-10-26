@@ -391,6 +391,156 @@ fn real_private_incremental_projection_preserves_outputs_and_reuses_edited_compi
 /// fingerprints and captured source bytes. This is not daemon placement, worker
 /// target restoration or a result-cache test: every command below executes.
 #[test]
+fn real_cargo_feature_family_keeps_dependencies_fresh_and_reexecutes_current_program() {
+    let (owner, root, home, tools) = workspace_fixture();
+    fs::write(
+        root.join("app/Cargo.toml"),
+        "[package]\nname='artifact_app'\nversion='0.1.0'\nedition='2024'\n\
+         [dependencies]\nartifact_library={path='../library'}\n\
+         [features]\ndefault=['baseline']\nbaseline=[]\nextra=[]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/build.rs"),
+        r#"fn main() {
+    let baseline = u32::from(std::env::var_os("CARGO_FEATURE_BASELINE").is_some());
+    let extra = u32::from(std::env::var_os("CARGO_FEATURE_EXTRA").is_some());
+    std::fs::write(std::path::Path::new(&std::env::var_os("OUT_DIR").unwrap()).join("features.rs"),
+        (baseline * 100 + extra * 1000).to_string()).unwrap();
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rs"),
+        r#"fn main() {
+    let generated: u32 = include!(concat!(env!("OUT_DIR"), "/features.rs"));
+    let compiled = u32::from(cfg!(feature = "baseline")) * 100
+        + u32::from(cfg!(feature = "extra")) * 1000;
+    assert_eq!(generated, compiled, "build-script and compiler features must agree");
+    println!("feature-value:{}", artifact_library::VALUE + generated);
+}
+"#,
+    )
+    .unwrap();
+    let output_root = owner.path().join("feature-target");
+    fs::create_dir(&output_root).unwrap();
+    fs::set_permissions(&output_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let mode = CargoArtifactMode::RunExecution;
+    let arguments = |selection: &[&str]| {
+        [
+            "run",
+            "--package=artifact_app",
+            "--locked",
+            "--offline",
+            "--message-format=json",
+            "--target-dir=/__rabs/out/cargo",
+        ]
+        .into_iter()
+        .chain(selection.iter().copied())
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    };
+    let family = compatible_arguments("/__rabs/toolchain/bin/cargo", &arguments(&[]), mode)
+        .expect("ordinary Cargo feature-family fixture");
+    for (index, (selection, value, fresh)) in [
+        (vec![], 142, false),
+        (vec!["--no-default-features"], 42, false),
+        (
+            vec!["--no-default-features", "--features", "extra"],
+            1042,
+            false,
+        ),
+        (vec!["--all-features"], 1142, false),
+        (vec!["-F", "baseline"], 142, true),
+        (
+            vec!["--features=extra", "--no-default-features"],
+            1042,
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let args = arguments(&selection);
+        assert_eq!(
+            compatible_arguments("/__rabs/toolchain/bin/cargo", &args, mode),
+            Some(family.clone()),
+            "feature selection must preserve the private target family",
+        );
+        let output = cargo(&tools, &root, &home)
+            .args(args.iter().map(|argument| {
+                if argument == "--target-dir=/__rabs/out/cargo" {
+                    format!("--target-dir={}", output_root.display())
+                } else {
+                    argument.clone()
+                }
+            }))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{selection:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let artifacts = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        for (package, expected) in [("artifact_library", index != 0), ("artifact_app", fresh)] {
+            let selected = artifacts
+                .iter()
+                .filter(|artifact| artifact["target"]["name"] == package)
+                .collect::<Vec<_>>();
+            assert_eq!(selected.len(), 1, "one actual {package} artifact");
+            assert_eq!(selected[0]["fresh"], expected, "{selection:?}: {package}");
+        }
+        let app_manifest = root.join("app/Cargo.toml");
+        let script = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact["manifest_path"] == app_manifest.to_str().unwrap()
+                    && artifact["target"]["kind"] == serde_json::json!(["custom-build"])
+            })
+            .expect("actual feature-dependent app build-script artifact");
+        assert_eq!(script["fresh"], fresh, "{selection:?}: build script");
+        assert!(
+            output
+                .stdout
+                .ends_with(format!("feature-value:{value}\n").as_bytes()),
+            "current feature-selected program output: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            output_root.to_str().unwrap(),
+            mode,
+        )
+        .unwrap();
+        let inventory =
+            TreeInventory::scan_complete(&output_root, 128 * 1024 * 1024, &|| false).unwrap();
+        report
+            .validate_outputs(inventory.names().map(|name| {
+                let executable = fs::metadata(output_root.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111
+                    != 0;
+                (name, executable)
+            }))
+            .unwrap();
+        inventory.verify(&|| false).unwrap();
+    }
+}
+
+/// Exercise source-edit family selection with real Cargo while keeping every
+/// invocation's actual compiler and runtime behavior observable.
+#[test]
 fn real_cargo_source_edit_family_reuses_dependencies_across_commands_and_membership() {
     let (owner, root, home, tools) = workspace_fixture();
     let output_root = owner.path().join("compatible-target");

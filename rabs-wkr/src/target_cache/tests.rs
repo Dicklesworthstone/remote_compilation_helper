@@ -84,7 +84,9 @@ fn fixture_request() -> CanonicalExecRequest {
 }
 
 fn cargo_request(command: &str, options: &[&str]) -> (CanonicalExecRequest, ArtifactPlan) {
-    use rabs_sandbox::cargo_artifacts::{CARGO_ARTIFACTS_VERSION, CARGO_TEST_ARTIFACTS_VERSION};
+    use rabs_sandbox::cargo_artifacts::{
+        CARGO_ARTIFACTS_VERSION, CARGO_RUN_ARTIFACTS_VERSION, CARGO_TEST_ARTIFACTS_VERSION,
+    };
     let mut request = fixture_request();
     if command == "clippy" {
         request.program = "/__rabs/toolchain/bin/cargo-clippy".to_owned();
@@ -115,6 +117,8 @@ fn cargo_request(command: &str, options: &[&str]) -> (CanonicalExecRequest, Arti
         .any(|option| *option == "--no-run");
     let contract = if command == "test" && !no_run {
         CARGO_TEST_ARTIFACTS_VERSION
+    } else if command == "run" {
+        CARGO_RUN_ARTIFACTS_VERSION
     } else {
         CARGO_ARTIFACTS_VERSION
     };
@@ -352,6 +356,11 @@ fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
         ("build", vec!["--all", "--benches"]),
         ("build", vec!["--workspace", "--profile", "test"]),
         ("build", vec!["--workspace", "--profile=dev"]),
+        ("build", vec!["--workspace", "--features=test"]),
+        ("build", vec!["--workspace", "--features", "build"]),
+        ("check", vec!["--workspace", "-F", "test"]),
+        ("build", vec!["--workspace", "--no-default-features"]),
+        ("test", vec!["--workspace", "--all-features"]),
     ] {
         let (request, selected) = cargo_request(command, &options);
         assert_eq!(compatible(&request, &selected), expected, "{options:?}");
@@ -363,8 +372,6 @@ fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
     }
     for options in [
         vec!["--workspace", "--release"],
-        vec!["--workspace", "--features=test"],
-        vec!["--workspace", "--features", "build"],
         vec!["--workspace", "--target", "x86_64-unknown-linux-gnu"],
         vec!["--workspace", "--profile", "custom"],
         vec!["--workspace", "--manifest-path", "member/Cargo.toml"],
@@ -911,6 +918,8 @@ fn selection_normalization_refuses_missing_empty_and_option_shaped_values() {
         "--example",
         "--test",
         "--bench",
+        "--features",
+        "-F",
     ] {
         request.args.push(selector.into());
         assert!(
@@ -930,7 +939,13 @@ fn selection_normalization_refuses_missing_empty_and_option_shaped_values() {
         assert!(compatible_cargo_arguments(&request, &plan).is_none());
         request.args.pop();
     }
-    for selector in ["--workspace=all", "--lib=1", "--all-targets=yes"] {
+    for selector in [
+        "--workspace=all",
+        "--lib=1",
+        "--all-targets=yes",
+        "--all-features=yes",
+        "--no-default-features=1",
+    ] {
         request.args.push(selector.into());
         assert!(
             compatible_cargo_arguments(&request, &plan).is_none(),
@@ -2675,6 +2690,91 @@ fn real_cargo_package_and_target_selections_reuse_dependencies_and_run_current_t
     repeated.assert_output_contains("current selected test actually ran");
     repeated.assert_output_contains("FAILED");
     assert_eq!(cache.state.lock().unwrap().entries.len(), retained + 1);
+}
+
+#[test]
+fn real_cargo_feature_selections_reuse_private_dependencies_and_current_generated_outputs() {
+    let fixture = CargoFixture::with_dependency();
+    fs::write(
+        fixture.workspace.join("Cargo.toml"),
+        "[package]\nname='hot_fixture'\nversion='0.1.0'\nedition='2021'\n\
+         [workspace]\nmembers=['dep']\n\
+         [dependencies]\nhot_dep={path='dep'}\n\
+         [features]\ndefault=['baseline']\nbaseline=[]\nextra=[]\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.workspace.join("build.rs"),
+        r#"fn main() {
+    let baseline = u32::from(std::env::var_os("CARGO_FEATURE_BASELINE").is_some());
+    let extra = u32::from(std::env::var_os("CARGO_FEATURE_EXTRA").is_some());
+    let value = std::fs::read_to_string("input.txt").unwrap().trim().parse::<u32>().unwrap();
+    std::fs::write(std::path::Path::new(&std::env::var_os("OUT_DIR").unwrap()).join("answer.rs"),
+        (value + baseline * 100 + extra * 1000).to_string()).unwrap();
+    println!("cargo:rerun-if-changed=input.txt");
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.workspace.join("src/main.rs"),
+        r#"fn main() {
+    let generated: u32 = include!(concat!(env!("OUT_DIR"), "/answer.rs"));
+    let compiled = 40 + u32::from(cfg!(feature = "baseline")) * 100
+        + u32::from(cfg!(feature = "extra")) * 1000;
+    assert_eq!(generated, compiled, "build-script and compiler features must agree");
+    println!("feature-value:{}:{}", generated, hot_dep::adjustment());
+}
+"#,
+    )
+    .unwrap();
+    let original = fixture.input().manifest.digest();
+    let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+    for (index, (options, value, fresh)) in [
+        (vec![], 140, false),
+        (vec!["--no-default-features"], 40, false),
+        (
+            vec!["--no-default-features", "--features", "extra"],
+            1040,
+            false,
+        ),
+        (vec!["--all-features"], 1140, false),
+        // Different spellings force compatible lookup rather than selecting
+        // the old exact seed; that newest target retains earlier feature units.
+        (vec!["-F", "baseline"], 140, true),
+        (
+            vec!["--features=extra", "--no-default-features"],
+            1040,
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixture.fresh_upload_timestamps();
+        let result = fixture.command(&cache, "run", &options, index != 0);
+        result.assert_fresh("hot_dep", false, index != 0);
+        result.assert_fresh("hot_fixture", false, fresh);
+        let scripts = result
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact["target"]["kind"] == serde_json::json!(["custom-build"]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scripts.len(),
+            1,
+            "one actual feature-dependent build script"
+        );
+        assert_eq!(scripts[0]["fresh"], fresh);
+        assert!(
+            result
+                .stdout
+                .ends_with(format!("feature-value:{value}:0\n").as_bytes()),
+            "the current feature-selected executable must run: {}",
+            String::from_utf8_lossy(&result.stdout),
+        );
+        assert_eq!(fixture.input().manifest.digest(), original);
+    }
 }
 
 #[test]

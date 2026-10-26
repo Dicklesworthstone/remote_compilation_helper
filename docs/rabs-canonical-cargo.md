@@ -560,9 +560,15 @@ Enable [worker-local target retention](rabs-target-state.md) to keep useful stat
 between operations. Every execution still runs its requested Cargo command in a
 private target tree. A compatible seed can contain the complete prior incremental
 state, and rustc decides which work products remain usable after source edits.
-Changing the explicit incremental policy, compiler, profile, features, target or
+Changing the explicit incremental policy, compiler, profile, target or
 other keyed compilation controls selects a different target family. Without
 target retention, the command uses fresh private incremental storage.
+
+Ordinary Cargo feature selections may share a private target when the captured
+dependency closure and other compilation controls remain unchanged. Cargo checks
+the current feature fingerprints and build-script environment; unchanged
+dependencies can remain fresh as features are enabled, disabled or selected
+again. Clippy feature selections remain separate so lint coverage is rechecked.
 
 Incremental compiler state remains on the worker and is excluded from delivered
 artifacts through the explicit contracts described below. It is never a shared

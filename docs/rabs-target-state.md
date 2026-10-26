@@ -168,7 +168,7 @@ worker job grant.
 The pool also separates worker identities, coordinator endpoints, and
 authenticated coordinator certificate keys.
 
-Changing a captured dependency, environment value, feature flag, toolchain,
+Changing a captured dependency, environment value, toolchain,
 output location or required files, or effective job grant starts with a fresh
 target. The restricted local input edit family below is the only exception
 to exact source bytes. An identical invocation can reuse its prior target while Cargo
@@ -181,9 +181,15 @@ command name, execution switch, test/benchmark filter, failure policy, and argum
 after the runtime separator do not fragment this optional target pool.
 Package selectors (`--package`/`-p`, `--workspace`/`--all`, `--exclude`) and target
 selectors (`--lib`, `--bin`, `--example`, `--test`, `--bench`, their plural forms,
-and `--all-targets`) may also change. Cargo still receives every original
-argument and checks the selected units' own fingerprints. Feature, profile,
-target triple, compiler, environment, and other compilation settings stay exact.
+and `--all-targets`) may also change. Feature selection (`--features`/`-F`,
+`--all-features`, and `--no-default-features`) can change within that same private
+target family. Cargo still receives every original argument and checks the
+selected units' own fingerprints, including the feature environment of build
+scripts. It rebuilds changed feature units while keeping unaffected dependencies
+fresh; returning to an earlier feature set can reuse its retained work products.
+The complete captured dependency bytes and configuration stay exact. A feature
+change that changes the captured input closure therefore selects a fresh seed.
+Profile, target triple, compiler, environment, and other compilation settings stay exact.
 Unknown argument forms keep exact-invocation reuse only.
 
 For example, `cargo build` followed by `cargo test --no-run` can reuse compiled
@@ -211,7 +217,7 @@ failure even when all compilation steps are fresh.
 
 Canonical Clippy has its own compatibility family. Repeated Clippy invocations
 and the eligible source/data edits below can reuse a previous Clippy target. The
-captured `cargo-clippy`, Cargo and rustc bindings, all package/target selectors,
+captured `cargo-clippy`, Cargo and rustc bindings, all package/target and feature selectors,
 `--no-deps`, and every argument after Clippy's lint separator remain exact,
 including their order. Clippy can otherwise consider a previously unlinted
 dependency fresh when that package becomes a selected lint target. Keeping its
