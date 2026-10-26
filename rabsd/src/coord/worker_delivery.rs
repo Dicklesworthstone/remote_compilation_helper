@@ -104,11 +104,6 @@ pub(crate) fn negotiated_dependency_context(
         _ => return Err(invalid("unsupported dependency execution mode")),
     };
     require(
-        version != CANONICAL_DEPENDENCY_CONTEXT_VERSION
-            || selected == DependencyExecutionMode::Metadata,
-        "canonical dependency execution requires metadata mode",
-    )?;
-    require(
         hello["dependency_execution_modes"]
             .as_array()
             .is_some_and(|modes| modes.iter().any(|mode| mode == selected.as_str())),
@@ -2110,6 +2105,12 @@ mod tests {
                     CANONICAL_DEPENDENCY_CONTEXT_VERSION
                 ]),
                 "rlib",
+                true,
+            ),
+            (
+                "canonical-dependency-exec-v1",
+                json!(["canonical-dependency-exec-v1"]),
+                "rlib",
                 false,
             ),
         ] {
@@ -2138,16 +2139,47 @@ mod tests {
 
     #[test]
     fn canonical_dependency_recovery_does_not_reauthorize_execution() {
-        let request = json!({"dependency_context":{
-            "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION,"execution_mode":"metadata"
-        }});
         let no_execution = json!({"dependency_contexts":[],"dependency_execution_modes":[]});
+        for execution_mode in ["metadata", "rlib"] {
+            let request = json!({"dependency_context":{
+                "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION,"execution_mode":execution_mode
+            }});
+            assert_eq!(
+                negotiated_dependency_context(&no_execution, &request, DeliveryMode::Resume)
+                    .unwrap(),
+                None
+            );
+            assert!(
+                negotiated_dependency_context(&no_execution, &request, DeliveryMode::Execute)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_archive_requires_both_the_version_and_measured_archive_capability() {
+        let request = json!({"dependency_context":{
+            "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION,"execution_mode":"rlib"
+        }});
+        for hello in [
+            json!({"dependency_contexts":[CANONICAL_DEPENDENCY_CONTEXT_VERSION],
+                "dependency_execution_modes":["metadata"]}),
+            json!({"dependency_contexts":["canonical-dependency-exec-v1"],
+                "dependency_execution_modes":["metadata","rlib"]}),
+        ] {
+            assert!(
+                negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_err()
+            );
+        }
+        let hello = json!({"canonical":false,
+            "dependency_contexts":[CANONICAL_DEPENDENCY_CONTEXT_VERSION],
+            "dependency_execution_modes":["rlib"]});
         assert_eq!(
-            negotiated_dependency_context(&no_execution, &request, DeliveryMode::Resume).unwrap(),
-            None
-        );
-        assert!(
-            negotiated_dependency_context(&no_execution, &request, DeliveryMode::Execute).is_err()
+            negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).unwrap(),
+            Some(NegotiatedDependencyContext {
+                version: CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                mode: DependencyExecutionMode::Rlib,
+            })
         );
     }
 

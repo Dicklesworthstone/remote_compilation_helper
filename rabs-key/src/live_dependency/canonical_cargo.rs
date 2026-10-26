@@ -3,9 +3,10 @@
 //! Source admission remains the existing registry/Git/directory-source class.
 //! The distinct isolation component prevents an ordinary edge execution from
 //! supplying evidence to a canonical Cargo run, even if a caller happens to
-//! use the same path spellings on its host. This is the metadata-only read
-//! closure of the dependency lane, not workspace publication or a claim that
-//! the whole Cargo process has a minimal hermetic input view.
+//! use the same path spellings on its host. Local capture remains metadata-only;
+//! archive codegen requires the separately keyed, enforced worker view. Neither
+//! path grants workspace publication or claims that the whole Cargo process
+//! has a minimal hermetic input view.
 
 use super::{
     DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
@@ -39,7 +40,6 @@ const ISOLATION_PROFILE: &str = "canonical-cargo-external-metadata-v1: \
     namespace; coordinator-only publication with the ordinary evidence gates";
 
 pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
-    check_dependency_cache_read_closure(&plan.invocation)?;
     if plan.generated_root.is_some() || env_value(&plan.execution_env, "OUT_DIR").is_some() {
         return Err(LiveRefusal::Facts(
             "canonical Cargo dependency checks do not admit generated compiler inputs".into(),
@@ -114,6 +114,30 @@ pub fn plan_canonical_cargo_dependency_action(
 ) -> Result<DependencyActionPlan, LiveRefusal> {
     let plan = plan_with_directory_manifest(request, host_triple, directory_source_checksum, true)?;
     canonical_layout(&plan)?;
+    check_dependency_cache_read_closure(&plan.invocation)?;
+    Ok(plan)
+}
+
+/// Plan an external dependency for an enforced canonical worker execution.
+///
+/// Unlike local capture, this admits pure Rust archive emission. The caller
+/// must retain canonical-driver ownership and use the remote key, independently
+/// negotiated output mode and matching closed namespace before lookup or
+/// execution. In particular, an archive may not fall through to local capture:
+/// assembler reads can escape dep-info even when source bytes are immutable.
+///
+/// # Errors
+/// Ordinary source/layout refusals and output classes other than exact metadata
+/// plus dep-info or pure Rust archives with dep-info and optional metadata.
+pub fn plan_canonical_remote_dependency_action(
+    request: LiveRustcRequest<'_>,
+    host_triple: &str,
+    directory_source_checksum: Option<TypedDigest>,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    let plan = plan_with_directory_manifest(request, host_triple, directory_source_checksum, true)?;
+    canonical_layout(&plan)?;
+    super::remote::remote_dependency_output_class(&plan.invocation)
+        .map_err(|error| LiveRefusal::Facts(error.to_string()))?;
     Ok(plan)
 }
 
@@ -143,13 +167,8 @@ pub fn canonical_cargo_dependency_key(
     build_script_output: Option<&[u8]>,
     inputs: &ActionInputManifest,
 ) -> Result<LiveDependencyKey, LiveRefusal> {
-    canonical_layout(plan)?;
-    if build_script_output.is_some() {
-        return Err(LiveRefusal::Facts(
-            "canonical Cargo dependency checks do not admit build-script output".into(),
-        ));
-    }
-    let mut key = dependency_key(
+    check_dependency_cache_read_closure(&plan.invocation)?;
+    let mut key = canonical_dependency_key(
         plan,
         toolchain,
         externs,
@@ -169,6 +188,33 @@ pub fn canonical_cargo_dependency_key(
     key.action_key = compute_action_key(&key.descriptor).final_key;
     key.descriptor_digest = descriptor_digest(&descriptor_canonical_bytes(&key.descriptor));
     Ok(key)
+}
+
+/// Shared canonical input identity before either local metadata or remote
+/// enforced-view policy is attached. This is deliberately not a public serving
+/// key: its caller must select and validate the execution policy.
+pub(super) fn canonical_dependency_key(
+    plan: &DependencyActionPlan,
+    toolchain: &ToolchainFacts,
+    externs: &[ExternFact],
+    directories: &[DependencyDirectoryFact],
+    build_script_output: Option<&[u8]>,
+    inputs: &ActionInputManifest,
+) -> Result<LiveDependencyKey, LiveRefusal> {
+    canonical_layout(plan)?;
+    if build_script_output.is_some() {
+        return Err(LiveRefusal::Facts(
+            "canonical Cargo dependency checks do not admit build-script output".into(),
+        ));
+    }
+    dependency_key(
+        plan,
+        toolchain,
+        externs,
+        directories,
+        build_script_output,
+        inputs,
+    )
 }
 
 #[cfg(test)]

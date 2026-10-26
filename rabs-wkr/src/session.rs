@@ -175,8 +175,9 @@ pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandConte
 /// explicit, including an empty array for a dependency leaf. V7 requires the
 /// execution mode so archive codegen cannot silently inherit metadata's procfs
 /// and device view. A generated tree binds the exact OUT_DIR environment value.
-/// Canonical Cargo metadata has its own version and fixed compiler layout; it
-/// cannot opt into archive codegen or generated-input execution through V7.
+/// Canonical Cargo has its own version and fixed compiler layout. Its explicit
+/// mode selects the measured metadata or closed archive namespace; generated
+/// inputs remain outside this canonical dependency contract.
 pub fn parse_dependency_context(
     request: &serde_json::Value,
 ) -> Result<Option<DependencyExecContext>, String> {
@@ -320,17 +321,17 @@ pub fn parse_dependency_context(
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
     if text("version")? == CANONICAL_DEPENDENCY_CONTEXT_VERSION {
-        if execution_mode != DependencyExecutionMode::Metadata
-            || generated_root.is_some()
+        if generated_root.is_some()
             || text("toolchain_root")? != rabs_sandbox::layout::TOOLCHAIN
             || text("compiler")? != "/__rabs/toolchain/bin/rustc"
         {
             return Err(
-                "canonical dependency context requires pure metadata and its fixed compiler"
+                "canonical dependency context requires retained package inputs and its fixed compiler"
                     .to_owned(),
             );
         }
-        return DependencyExecContext::new_canonical_cargo_metadata(
+        return DependencyExecContext::new_canonical_cargo(
+            execution_mode,
             text("source_root")?,
             text("cwd")?,
             text("out_dir")?,
@@ -364,8 +365,8 @@ pub fn parse_dependency_context(
 /// or process launch. The coordinator's mode is intent, never proof that LLVM
 /// can safely run under that view. The stricter archive path must name only
 /// retained inputs and exactly the complete, derived library output set.
-/// Canonical Cargo metadata uses the same closed-input/output validation, with
-/// its independent metadata-only context rather than the outer Cargo mounts.
+/// Canonical Cargo uses the same closed-input/output validation for both modes,
+/// with an independent per-action context rather than the outer Cargo mounts.
 pub fn validate_dependency_execution(
     request: &CanonicalExecRequest,
     artifacts: Option<&ArtifactPlan>,
@@ -379,9 +380,6 @@ pub fn validate_dependency_execution(
     let Some(context) = &request.dependency_context else {
         return Ok(());
     };
-    if context.canonical_cargo() && context.execution_mode() != DependencyExecutionMode::Metadata {
-        return Err("canonical dependency execution requires metadata mode".into());
-    }
     let argv = std::iter::once(request.program.clone())
         .chain(request.args.iter().cloned())
         .collect::<Vec<_>>();

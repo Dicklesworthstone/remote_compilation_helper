@@ -113,7 +113,10 @@ use crate::typed_digest::compute;
 pub mod remote;
 
 mod canonical_cargo;
-pub use canonical_cargo::{canonical_cargo_dependency_key, plan_canonical_cargo_dependency_action};
+pub use canonical_cargo::{
+    canonical_cargo_dependency_key, plan_canonical_cargo_dependency_action,
+    plan_canonical_remote_dependency_action,
+};
 
 /// Key epoch of the live dependency class. Epoch 5 limits transcript placement
 /// rewriting to declared rustc artifact events. Earlier entries could rewrite

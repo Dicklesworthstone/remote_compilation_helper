@@ -2171,11 +2171,6 @@ fn dependency_context_selection(
                 Some("rlib") => DependencyExecutionMode::Rlib,
                 _ => return Err("unsupported dependency_execution_mode selection".to_owned()),
             };
-            if version == CANONICAL_DEPENDENCY_CONTEXT_VERSION
-                && mode != DependencyExecutionMode::Metadata
-            {
-                return Err("canonical dependency execution requires metadata mode".to_owned());
-            }
             if !supported.contains(&mode) {
                 return Err("dependency execution mode unavailable".to_owned());
             }

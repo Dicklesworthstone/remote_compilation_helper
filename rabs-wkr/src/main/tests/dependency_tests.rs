@@ -111,7 +111,7 @@ fn canonical_dependency_decode_retains_exact_cargo_paths_and_closed_outputs() {
 }
 
 #[test]
-fn canonical_dependency_context_cannot_borrow_original_path_or_archive_authority() {
+fn canonical_dependency_context_requires_its_paths_and_matching_compiler_mode() {
     for (field, value) in [
         ("version", json!(DEPENDENCY_CONTEXT_VERSION)),
         ("execution_mode", json!("rlib")),
@@ -128,6 +128,111 @@ fn canonical_dependency_context_cannot_borrow_original_path_or_archive_authority
     let mut ordinary = dependency_request();
     ordinary["dependency_context"]["version"] = json!(CANONICAL_DEPENDENCY_CONTEXT_VERSION);
     assert!(parse_exec_request(&ordinary).is_err());
+}
+
+fn canonical_archive_request(separate_metadata: bool) -> Value {
+    let mut request = canonical_dependency_request();
+    request["dependency_context"]["execution_mode"] = json!("rlib");
+    request["args"] = json!([
+        "--crate-name",
+        "leaf",
+        "--crate-type",
+        "rlib",
+        if separate_metadata {
+            "--emit=dep-info,metadata,link"
+        } else {
+            "--emit=dep-info,link"
+        },
+        "--out-dir",
+        "/__rabs/out/cargo/debug/deps",
+        "src/lib.rs",
+    ]);
+    request["artifacts"]["files"] = if separate_metadata {
+        json!(["leaf.d", "libleaf.rmeta", "libleaf.rlib"])
+    } else {
+        json!(["leaf.d", "libleaf.rlib"])
+    };
+    request
+}
+
+#[test]
+fn canonical_archive_decode_preserves_mode_paths_and_complete_output_contract() {
+    for separate_metadata in [false, true] {
+        let original = canonical_archive_request(separate_metadata);
+        let parsed = parse_exec_request(&original).unwrap();
+        let context = parsed.dependency_context.as_ref().unwrap();
+        assert!(context.canonical_cargo());
+        assert_eq!(context.version(), CANONICAL_DEPENDENCY_CONTEXT_VERSION);
+        assert_eq!(context.execution_mode(), DependencyExecutionMode::Rlib);
+        assert_eq!(context.compiler(), "/__rabs/toolchain/bin/rustc");
+        assert_eq!(context.out_dir(), "/__rabs/out/cargo/debug/deps");
+        assert_eq!(original, canonical_archive_request(separate_metadata));
+        for outputs in [
+            json!(["leaf.d", "libleaf.rmeta"]),
+            json!(["leaf.d", "libleaf.rlib", "unclaimed.o"]),
+        ] {
+            let mut request = original.clone();
+            request["artifacts"]["files"] = outputs;
+            assert!(parse_exec_request(&request).is_err());
+        }
+        for (field, value) in [
+            ("version", json!("canonical-dependency-exec-v1")),
+            ("version", json!(DEPENDENCY_CONTEXT_VERSION)),
+            ("execution_mode", json!("metadata")),
+            ("generated_root", json!("/__rabs/out/cargo/debug/generated")),
+        ] {
+            let mut request = original.clone();
+            request["dependency_context"][field] = value;
+            assert!(parse_exec_request(&request).is_err(), "{field}");
+        }
+    }
+}
+
+#[test]
+fn canonical_archive_refuses_executable_externs_native_inputs_and_unretained_paths() {
+    for extra in [
+        vec!["--crate-type", "proc-macro"],
+        vec![
+            "--extern",
+            "derive=/__rabs/out/cargo/debug/deps/libderive.so",
+        ],
+        vec!["--extern", "leaf=/outside/libleaf.rlib"],
+        vec!["--extern", "unbound"],
+        vec!["-l", "static=unretained"],
+        vec!["-L", "native=/usr/lib"],
+        vec!["-L", "dependency=/__rabs/out/cargo/unretained"],
+        vec!["--sysroot", "/another/toolchain"],
+        vec!["-C", "linker=/usr/bin/cc"],
+        vec!["-C", "target-cpu=native"],
+        vec!["-C", "incremental=/__rabs/out/cargo/incremental"],
+        vec!["-C", "save-temps=yes"],
+        vec!["-o", "/__rabs/out/cargo/unclaimed"],
+        vec!["--emit=dep-info,metadata,link,llvm-ir"],
+    ] {
+        let mut request = canonical_archive_request(true);
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|arg| json!(arg)));
+        assert!(parse_exec_request(&request).is_err(), "{extra:?}");
+    }
+    for path in [
+        "../outside.rs",
+        "/__rabs/workspace/unretained/lib.rs",
+        "src/../lib.rs",
+    ] {
+        let mut request = canonical_archive_request(true);
+        *request["args"].as_array_mut().unwrap().last_mut().unwrap() = json!(path);
+        assert!(parse_exec_request(&request).is_err(), "{path}");
+    }
+    let mut retained = canonical_archive_request(true);
+    retained["args"].as_array_mut().unwrap().extend([
+        json!("--extern"),
+        json!("input=/__rabs/out/cargo/debug/deps/libinput.rlib"),
+        json!("-L"),
+        json!("dependency=/__rabs/out/cargo/debug/deps"),
+    ]);
+    assert!(parse_exec_request(&retained).is_ok());
 }
 
 #[test]
@@ -647,6 +752,7 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
         json!("dependency-exec-v5"),
         json!("dependency-exec-v6"),
         json!("dependency-exec-v999"),
+        json!("canonical-dependency-exec-v1"),
     ] {
         assert!(
             dependency_context_selection(
@@ -790,13 +896,26 @@ fn canonical_dependency_negotiation_binds_version_as_well_as_mode() {
     }
     let mut archive = grant.clone();
     archive["dependency_execution_mode"] = json!("rlib");
+    let archive_selected = dependency_context_selection(
+        &archive.to_string(),
+        &[DependencyExecutionMode::Rlib],
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        archive_selected.version,
+        CANONICAL_DEPENDENCY_CONTEXT_VERSION
+    );
+    assert_eq!(archive_selected.mode, DependencyExecutionMode::Rlib);
     assert!(
         dependency_context_selection(
             &archive.to_string(),
-            &[
-                DependencyExecutionMode::Metadata,
-                DependencyExecutionMode::Rlib
-            ],
+            &[DependencyExecutionMode::Metadata],
             true,
             true,
             true,
@@ -822,6 +941,21 @@ fn canonical_dependency_negotiation_binds_version_as_well_as_mode() {
         )
         .unwrap_err(),
         "dependency context version does not match negotiation",
+    );
+    let archive = parse_exec_request(&canonical_archive_request(true)).unwrap();
+    assert!(validate_execution_selection(&archive, &report, Some(archive_selected)).is_err());
+    report.dependency_modes = vec![
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+    ];
+    assert!(validate_execution_selection(&archive, &report, Some(archive_selected)).is_ok());
+    assert_eq!(
+        validate_execution_selection(&archive, &report, Some(selected)).unwrap_err(),
+        "dependency execution mode does not match negotiation"
+    );
+    assert_eq!(
+        validate_execution_selection(&canonical, &report, Some(archive_selected)).unwrap_err(),
+        "dependency execution mode does not match negotiation"
     );
 }
 

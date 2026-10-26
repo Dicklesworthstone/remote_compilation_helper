@@ -548,7 +548,8 @@ impl RemoteDependencies {
             })
             .collect();
         let context = if plan.canonical_cargo {
-            DependencyExecContext::new_canonical_cargo_metadata(
+            DependencyExecContext::new_canonical_cargo(
+                execution_mode(plan)?,
                 plan.source_root.clone(),
                 plan.cwd.clone(),
                 plan.out_dir.clone(),
@@ -2050,6 +2051,10 @@ mod execution_resource_tests {
         }
 
         fn canonical() -> Self {
+            Self::canonical_with_outputs("dep-info,metadata")
+        }
+
+        fn canonical_with_outputs(emit: &str) -> Self {
             let package = "/__rabs/cargo-home/registry/src/index/parallel-1.0.0";
             let output = "/__rabs/out/cargo/debug/deps";
             let argv = vec![
@@ -2057,7 +2062,7 @@ mod execution_resource_tests {
                 format!("{package}/src/lib.rs"),
                 "--crate-name=parallel".into(),
                 "--crate-type=lib".into(),
-                "--emit=dep-info,metadata".into(),
+                format!("--emit={emit}"),
                 "--cap-lints=allow".into(),
                 "--error-format=json".into(),
                 "--json=artifacts".into(),
@@ -2075,7 +2080,7 @@ mod execution_resource_tests {
                     format!("{output}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
                 ),
             ];
-            let plan = rabs_key::live_dependency::plan_canonical_cargo_dependency_action(
+            let plan = rabs_key::live_dependency::plan_canonical_remote_dependency_action(
                 LiveRustcRequest {
                     argv: &argv,
                     cwd: package,
@@ -2085,7 +2090,8 @@ mod execution_resource_tests {
                 None,
             )
             .unwrap();
-            let context = DependencyExecContext::new_canonical_cargo_metadata(
+            let context = DependencyExecContext::new_canonical_cargo(
+                execution_mode(&plan).unwrap(),
                 plan.source_root.clone(),
                 plan.cwd.clone(),
                 plan.out_dir.clone(),
@@ -2143,6 +2149,38 @@ mod execution_resource_tests {
             ordinary.request().is_err(),
             "ordinary context authorized a canonical plan"
         );
+    }
+
+    #[test]
+    fn canonical_archive_request_requires_the_closed_archive_mode() {
+        for emit in ["dep-info,link", "dep-info,metadata,link"] {
+            let mut fixture = Fixture::canonical_with_outputs(emit);
+            let request = fixture.request().unwrap();
+            assert_eq!(
+                request["dependency_context"]["version"],
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION
+            );
+            assert_eq!(request["dependency_context"]["execution_mode"], "rlib");
+            assert_eq!(request["args"], json!(fixture.argv[1..]));
+            assert_eq!(
+                request["artifacts"]["files"],
+                json!(fixture.plan.output_names())
+            );
+            assert!(
+                fixture
+                    .plan
+                    .output_names()
+                    .iter()
+                    .any(|name| name.ends_with(".rlib"))
+            );
+            fixture.context = fixture
+                .context
+                .with_execution_mode(DependencyExecutionMode::Metadata);
+            assert!(
+                fixture.request().is_err(),
+                "metadata namespace must not authorize archive codegen"
+            );
+        }
     }
 
     #[test]

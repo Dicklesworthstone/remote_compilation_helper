@@ -733,7 +733,7 @@ pub const INCLUDED: &str = include_str!("message.txt");
 /// receive identical rustc arguments; only private backing paths differ.
 #[test]
 fn real_dependency_rustc_reads_shared_output_metadata_dag() {
-    dependency_metadata_dag(false, false);
+    dependency_metadata_dag(false, false, false);
 }
 
 /// Captured Cargo OUT_DIR files must remain readable beside shared dependency
@@ -741,7 +741,7 @@ fn real_dependency_rustc_reads_shared_output_metadata_dag() {
 /// the same generated paths and environment, and their actual outputs agree.
 #[test]
 fn real_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag() {
-    dependency_metadata_dag(true, false);
+    dependency_metadata_dag(true, false, false);
 }
 
 /// A real archive consumer runs through source transfer, retained toolchain,
@@ -749,10 +749,21 @@ fn real_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag() {
 /// diagnostics must agree with stock rustc despite changed original OUT_DIR.
 #[test]
 fn real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag() {
-    dependency_metadata_dag(true, true);
+    dependency_metadata_dag(true, true, false);
 }
 
-fn dependency_metadata_dag(with_generated: bool, archive: bool) {
+/// Canonical Cargo's logical paths survive real source transfer, compilation
+/// and exact output capture. Codegen also reads a sealed `.incbin` payload that
+/// dep-info does not enumerate, through the retained complete package tree.
+#[test]
+fn real_canonical_dependency_rustc_builds_archive_with_shared_dag_and_assembly_input() {
+    dependency_metadata_dag(false, true, true);
+}
+
+fn dependency_metadata_dag(with_generated: bool, archive: bool, canonical: bool) {
+    use rabs_sandbox::canonical_namespace::{
+        Bind, CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
+    };
     use rabs_sandbox::dependency_context::{
         DependencyArtifactRoot, DependencyExecContext, DependencyExecutionMode,
         DependencyIsolationSupport,
@@ -782,6 +793,16 @@ fn dependency_metadata_dag(with_generated: bool, archive: bool) {
             "SKIP: dependency {} isolation unavailable: {:?}",
             mode.as_str(),
             support.missing()
+        );
+        return;
+    }
+    let canonical_support = canonical.then(HostIsolationSupport::probe);
+    if let Some(support) = &canonical_support
+        && !support.missing_for_canonical().is_empty()
+    {
+        eprintln!(
+            "SKIP: canonical stock compiler namespace unavailable: {:?}",
+            support.missing_for_canonical()
         );
         return;
     }
@@ -823,6 +844,12 @@ pub const SOURCE: &str = file!();
         std::fs::create_dir_all(generated_root.join("nested")).unwrap();
         top_source.extend_from_slice(b"include!(concat!(env!(\"OUT_DIR\"), \"/nested/generated.rs\"));\npub const FROM_GENERATOR: u32 = GENERATED_VALUE;\n");
     }
+    let assembly_input = b"retained assembly input\x00\x01\xff";
+    if canonical && archive {
+        top_source.extend_from_slice(br#"core::arch::global_asm!(".pushsection .rodata.rabs_fixture\n.incbin \"src/payload.bin\"\n.popsection");
+"#);
+        std::fs::write(source.path().join("src/payload.bin"), assembly_input).unwrap();
+    }
     std::fs::write(source.path().join("src/lib.rs"), &top_source).unwrap();
 
     for (name, file) in [("dag_leaf", "leaf.rs"), ("dag_middle", "middle.rs")] {
@@ -855,7 +882,36 @@ pub const SOURCE: &str = file!();
         );
     }
     let loader_parent = out.parent().unwrap();
-    let visible_out = out.to_str().unwrap().to_owned();
+    let visible_out = if canonical {
+        "/__rabs/out/cargo/debug/deps"
+    } else {
+        out.to_str().unwrap()
+    }
+    .to_owned();
+    let visible_loader_parent = if canonical {
+        "/__rabs/out/cargo/debug"
+    } else {
+        loader_parent.to_str().unwrap()
+    }
+    .to_owned();
+    let visible_source = if canonical {
+        "/__rabs/workspace/dependency"
+    } else {
+        source.path().to_str().unwrap()
+    }
+    .to_owned();
+    let visible_compiler = if canonical {
+        "/__rabs/toolchain/bin/rustc"
+    } else {
+        compiler.to_str().unwrap()
+    }
+    .to_owned();
+    let visible_loader = if canonical {
+        "/__rabs/toolchain/lib"
+    } else {
+        loader.to_str().unwrap()
+    }
+    .to_owned();
     let cohort = observe_runtime_cohort(
         &compiler,
         toolchain.path(),
@@ -888,29 +944,23 @@ pub const SOURCE: &str = file!();
             "--extern".to_owned(),
             format!(
                 "dag_middle={}",
-                out.join(format!("libdag_middle.{direct_kind}")).display()
+                Path::new(&visible_out)
+                    .join(format!("libdag_middle.{direct_kind}"))
+                    .display()
             ),
             "--out-dir".to_owned(),
             visible_out.clone(),
             "src/lib.rs".to_owned(),
         ];
         let mut env = vec![
-            (
-                "CARGO_MANIFEST_DIR".to_owned(),
-                source.path().to_str().unwrap().to_owned(),
-            ),
+            ("CARGO_MANIFEST_DIR".to_owned(), visible_source.clone()),
             (
                 "SHARED_DAG_FLAVOR".to_owned(),
                 "retained DAG inputs".to_owned(),
             ),
             (
                 "LD_LIBRARY_PATH".to_owned(),
-                format!(
-                    "{}:{}:{}",
-                    out.display(),
-                    loader_parent.display(),
-                    loader.display()
-                ),
+                format!("{visible_out}:{visible_loader_parent}:{visible_loader}"),
             ),
         ];
         if with_generated {
@@ -924,14 +974,37 @@ pub const SOURCE: &str = file!();
                 "captured Cargo directive".to_owned(),
             ));
         }
-        let stock = Command::new(&compiler)
-            .args(&args)
-            .env_clear()
-            .envs(env.iter().map(|(name, value)| (name, value)))
-            .current_dir(source.path())
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+        let stock = if let Some(support) = &canonical_support {
+            let cargo_home = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            env.extend([
+                ("HOME".to_owned(), "/__rabs/home".to_owned()),
+                ("CARGO_HOME".to_owned(), "/__rabs/cargo-home".to_owned()),
+            ]);
+            let mut spec = CanonicalNamespaceSpec::new();
+            spec.ro_binds = vec![
+                Bind::new(source.path(), &visible_source),
+                Bind::new(toolchain.path(), "/__rabs/toolchain"),
+                Bind::new(cargo_home.path(), "/__rabs/cargo-home"),
+            ];
+            spec.rw_binds = vec![
+                Bind::new(output_owner.path().join("target"), "/__rabs/out/cargo"),
+                Bind::new(home.path(), "/__rabs/home"),
+            ];
+            spec.cwd = Path::new(&visible_source).to_path_buf();
+            spec.env = env.clone();
+            let launch = build_canonical_argv(&spec, support, &visible_compiler, &args).unwrap();
+            command_for(&launch).stdin(Stdio::null()).output().unwrap()
+        } else {
+            Command::new(&compiler)
+                .args(&args)
+                .env_clear()
+                .envs(env.iter().map(|(name, value)| (name, value)))
+                .current_dir(source.path())
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
         assert!(
             stock.status.success(),
             "stock {direct_kind} consumer: {}",
@@ -970,6 +1043,24 @@ pub const SOURCE: &str = file!();
                 std::fs::read(out.join("libdag_middle.rlib")).unwrap(),
             ),
         ]);
+        if canonical && archive {
+            retained.insert(
+                "package/src/payload.bin".to_owned(),
+                assembly_input.to_vec(),
+            );
+            assert!(
+                expected["libdag_top.rlib"]
+                    .windows(assembly_input.len())
+                    .any(|window| window == assembly_input),
+                "real codegen must include the sealed assembly payload in its archive"
+            );
+            assert!(
+                !expected["dag_top.d"]
+                    .windows(b"payload.bin".len())
+                    .any(|window| window == b"payload.bin"),
+                "the fixture must exercise an assembler read absent from dep-info"
+            );
+        }
         if with_generated {
             retained.insert(
                 "generated/nested/generated.rs".to_owned(),
@@ -1011,6 +1102,7 @@ pub const SOURCE: &str = file!();
         let request_id = 426_000
             + if with_generated { 1_000 } else { 0 }
             + if archive { 2_000 } else { 0 }
+            + if canonical { 4_000 } else { 0 }
             + iteration as u64;
         let wire = json!({"kind":"canonical-exec", "request_id":request_id,
             "source_manifest":manifest_json});
@@ -1046,30 +1138,47 @@ pub const SOURCE: &str = file!();
             )
             .unwrap();
         let source_owner = transfer.take_prepared(&wire).unwrap().unwrap();
-        let context = DependencyExecContext::new_with_generated_artifacts(
-            source.path().to_str().unwrap().to_owned(),
-            source.path().to_str().unwrap().to_owned(),
-            toolchain.path().to_str().unwrap().to_owned(),
-            compiler.to_str().unwrap().to_owned(),
-            visible_out.clone(),
-            vec![visible_out.clone()],
-            vec![
+        let artifact_roots = vec![DependencyArtifactRoot {
+            path: visible_out.clone(),
+            prefix: "dependencies/0000".to_owned(),
+        }];
+        let context = if canonical {
+            assert!(
+                !with_generated,
+                "canonical generated inputs require their own contract"
+            );
+            DependencyExecContext::new_canonical_cargo(
+                mode,
+                visible_source.clone(),
+                visible_source.clone(),
                 visible_out.clone(),
-                loader_parent.to_str().unwrap().to_owned(),
-            ],
-            vec![DependencyArtifactRoot {
-                path: visible_out.clone(),
-                prefix: "dependencies/0000".to_owned(),
-            }],
-            with_generated.then(|| generated_root.to_str().unwrap().to_owned()),
-            env,
-            cohort.bytes,
-        )
-        .unwrap()
-        .with_execution_mode(mode);
+                vec![visible_out.clone()],
+                vec![visible_out.clone(), visible_loader_parent.clone()],
+                artifact_roots,
+                env,
+                cohort.bytes,
+            )
+            .unwrap()
+        } else {
+            DependencyExecContext::new_with_generated_artifacts(
+                visible_source.clone(),
+                visible_source.clone(),
+                toolchain.path().to_str().unwrap().to_owned(),
+                visible_compiler.clone(),
+                visible_out.clone(),
+                vec![visible_out.clone()],
+                vec![visible_out.clone(), visible_loader_parent.clone()],
+                artifact_roots,
+                with_generated.then(|| generated_root.to_str().unwrap().to_owned()),
+                env,
+                cohort.bytes,
+            )
+            .unwrap()
+            .with_execution_mode(mode)
+        };
         let request = CanonicalExecRequest {
             request_id,
-            program: compiler.to_str().unwrap().to_owned(),
+            program: visible_compiler.clone(),
             args: args.clone(),
             command_context: CommandContext::default(),
             dependency_context: Some(context),

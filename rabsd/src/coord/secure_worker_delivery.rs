@@ -58,7 +58,8 @@ pub type WorkerAdmissionHook =
 
 /// Negotiation tag for the dependency execution extension. Keeping the
 /// transport selector here lets older workers refuse safely before upload.
-pub(crate) use rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION;
+#[cfg(test)]
+use rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION;
 
 const ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFER_BUDGET: Duration = Duration::from_secs(5 * 60);

@@ -22,10 +22,11 @@ use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
 pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v7";
-/// Separately negotiated canonical Cargo metadata execution. This is not a
+/// Separately negotiated canonical Cargo dependency execution. This is not a
 /// pathname-based extension of the original-path context: both peers must
-/// select this version before canonical aliases can enter a compiler view.
-pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v1";
+/// select this version and its output mode before canonical aliases can enter
+/// a compiler view. Version 2 admits the independently enforced Rlib mode.
+pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v2";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -447,10 +448,13 @@ impl DependencyExecContext {
     /// never mounted. The driver owns path admission; this constructor grants
     /// neither caller-filesystem access nor cache/publication authority.
     ///
-    /// Only metadata execution is admitted. Generated inputs, archives and
-    /// arbitrary canonical mount aliases require a separate execution policy.
+    /// Archive emission selects the existing Rlib namespace, which excludes
+    /// procfs and entropy devices so assembler inputs must come from retained
+    /// keyed bytes. Generated inputs and arbitrary canonical mount aliases
+    /// remain unsupported. Neither mode authorizes local codegen capture.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_canonical_cargo_metadata(
+    pub fn new_canonical_cargo(
+        mode: DependencyExecutionMode,
         source_root: String,
         cwd: String,
         out_dir: String,
@@ -474,6 +478,7 @@ impl DependencyExecContext {
             env,
             runtime_cohort_sha256,
         )
+        .map(|context| context.with_execution_mode(mode))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -911,11 +916,6 @@ pub fn build_dependency_argv(
     program: &str,
     args: &[String],
 ) -> Result<NamespaceLaunch, IsolationError> {
-    if context.canonical_cargo() && context.execution_mode() != DependencyExecutionMode::Metadata {
-        return Err(IsolationError::InvalidSpec {
-            reason: "canonical dependency execution admits metadata only".into(),
-        });
-    }
     support.require_mode(context.execution_mode())?;
     let refuse = || IsolationError::InvalidSpec {
         reason: "dependency namespace differs from its validated context".to_owned(),
@@ -1080,7 +1080,8 @@ mod tests {
     const CANONICAL_OUTPUT: &str = "/__rabs/out/cargo/debug/deps";
 
     fn canonical_context() -> DependencyExecContext {
-        DependencyExecContext::new_canonical_cargo_metadata(
+        DependencyExecContext::new_canonical_cargo(
+            DependencyExecutionMode::Metadata,
             CANONICAL_SOURCE.into(),
             CANONICAL_SOURCE.into(),
             CANONICAL_OUTPUT.into(),
@@ -1165,7 +1166,8 @@ mod tests {
     fn canonical_dependency_layout_cannot_expose_outer_driver_or_host_roots() {
         let original = canonical_context();
         let validate = |context: DependencyExecContext| {
-            DependencyExecContext::new_canonical_cargo_metadata(
+            DependencyExecContext::new_canonical_cargo(
+                context.execution_mode,
                 context.source_root,
                 context.cwd,
                 context.out_dir,
@@ -1232,7 +1234,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn canonical_dependency_namespace_preserves_paths_and_refuses_extra_mounts_and_codegen() {
+    fn canonical_dependency_namespace_preserves_paths_and_refuses_extra_mounts_and_wrong_mode() {
         let mut context = canonical_context();
         let mut spec = context
             .namespace(
@@ -1289,8 +1291,8 @@ mod tests {
         }
         let archive = context.with_execution_mode(DependencyExecutionMode::Rlib);
         assert!(matches!(
-            build_dependency_argv(&archive, &spec, &runtime.runtime, &fixture_support(DependencyExecutionMode::Rlib), archive.compiler(), &args),
-            Err(IsolationError::InvalidSpec { reason }) if reason.contains("metadata only")
+            build_dependency_argv(&archive, &spec, &runtime.runtime, &support, archive.compiler(), &args),
+            Err(IsolationError::InvalidSpec { reason }) if reason.contains("another execution mode")
         ));
     }
 
@@ -1828,7 +1830,33 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn archive_mode_removes_process_and_entropy_files_without_exposing_host_devices() {
-        let mut context = context(Vec::new()).with_execution_mode(DependencyExecutionMode::Rlib);
+        assert_archive_mode_namespace(
+            context(Vec::new()).with_execution_mode(DependencyExecutionMode::Rlib),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_archive_mode_removes_process_and_entropy_files_and_outer_driver_mounts() {
+        let metadata = canonical_context();
+        let archive = DependencyExecContext::new_canonical_cargo(
+            DependencyExecutionMode::Rlib,
+            metadata.source_root,
+            metadata.cwd,
+            metadata.out_dir,
+            metadata.dependency_dirs,
+            metadata.loader_dirs,
+            metadata.artifact_roots,
+            metadata.env,
+            metadata.runtime_cohort_sha256,
+        )
+        .unwrap();
+        assert_eq!(archive.version(), "canonical-dependency-exec-v2");
+        assert_archive_mode_namespace(archive);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_archive_mode_namespace(mut context: DependencyExecContext) {
         let mut spec = context
             .namespace(
                 Path::new("/private/source"),
@@ -1868,6 +1896,32 @@ mod tests {
                 |row| matches!(row[0], "--bind" | "--ro-bind" | "--dev-bind") && row[1] == "/dev"
             )
         );
+        if context.canonical_cargo() {
+            for visible in [
+                layout::WORKSPACE,
+                layout::CARGO_HOME,
+                "/__rabs/home/control",
+            ] {
+                assert!(!argv.windows(3).any(|row| {
+                    matches!(row[0], "--bind" | "--ro-bind" | "--dev-bind") && row[2] == visible
+                }));
+                let mut extra = spec.clone();
+                extra
+                    .ro_binds
+                    .push(Bind::new("/private/outer-driver", visible));
+                assert!(
+                    build_dependency_argv(
+                        &context,
+                        &extra,
+                        &fixture.runtime,
+                        &support,
+                        context.compiler(),
+                        &[],
+                    )
+                    .is_err()
+                );
+            }
+        }
 
         // The separately negotiated metadata mode preserves its established
         // execution semantics; the archive policy must not quietly replace it.
@@ -2149,6 +2203,18 @@ mod tests {
     #[test]
     #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
     fn real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
+        assert_real_archive_view_closes_assembler_inputs(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_canonical_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
+        assert_real_archive_view_closes_assembler_inputs(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_real_archive_view_closes_assembler_inputs(canonical: bool) {
         let toolchain = PathBuf::from(
             std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
                 .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
@@ -2177,18 +2243,38 @@ mod tests {
             || false,
         )
         .unwrap();
-        let context = DependencyExecContext::new(
-            "/source/package".into(),
-            "/source/package".into(),
-            "/toolchains/pinned".into(),
-            "/toolchains/pinned/bin/rustc".into(),
-            "/target/output".into(),
-            Vec::new(),
-            vec![("LD_LIBRARY_PATH".into(), "/toolchains/pinned/lib".into())],
-            runtime.cohort().bytes,
-        )
-        .unwrap()
-        .with_execution_mode(DependencyExecutionMode::Rlib);
+        let context = if canonical {
+            DependencyExecContext::new_canonical_cargo(
+                DependencyExecutionMode::Rlib,
+                CANONICAL_SOURCE.into(),
+                CANONICAL_SOURCE.into(),
+                CANONICAL_OUTPUT.into(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    ("HOME".into(), layout::HOME.into()),
+                    ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+                    ("CARGO_MANIFEST_DIR".into(), CANONICAL_SOURCE.into()),
+                    ("LD_LIBRARY_PATH".into(), "/__rabs/toolchain/lib".into()),
+                ],
+                runtime.cohort().bytes,
+            )
+            .unwrap()
+        } else {
+            DependencyExecContext::new(
+                "/source/package".into(),
+                "/source/package".into(),
+                "/toolchains/pinned".into(),
+                "/toolchains/pinned/bin/rustc".into(),
+                "/target/output".into(),
+                Vec::new(),
+                vec![("LD_LIBRARY_PATH".into(), "/toolchains/pinned/lib".into())],
+                runtime.cohort().bytes,
+            )
+            .unwrap()
+            .with_execution_mode(DependencyExecutionMode::Rlib)
+        };
         context.prepare_empty_backings(&empty).unwrap();
         let spec = context
             .namespace(&source, &toolchain, &output, &empty, &home)
@@ -2209,7 +2295,7 @@ mod tests {
                 "--edition=2024".into(),
                 "--crate-type=rlib".into(),
                 "--emit=dep-info,metadata,link".into(),
-                "--out-dir=/target/output".into(),
+                format!("--out-dir={}", context.out_dir()),
                 "-Cembed-bitcode=no".into(),
             ];
             let launch = build_dependency_argv(
@@ -2225,7 +2311,10 @@ mod tests {
                 .output()
                 .unwrap()
         };
-        let result = compile("/source/package/payload.bin", "closed_archive");
+        let result = compile(
+            &format!("{}/payload.bin", context.source_root()),
+            "closed_archive",
+        );
         assert!(
             result.status.success(),
             "{}",

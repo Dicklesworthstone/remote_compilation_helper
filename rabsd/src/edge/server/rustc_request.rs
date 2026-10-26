@@ -432,9 +432,12 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         env: &parsed.env,
     };
     let planned = match &live.canonical {
-        Some(paths) => {
-            directory_source::plan_canonical_dependency_action(planning_request, &host, paths)
-        }
+        Some(paths) => directory_source::plan_canonical_dependency_action(
+            planning_request,
+            &host,
+            paths,
+            remote_requested,
+        ),
         None => directory_source::plan_dependency_action(planning_request, &host),
     };
     let mut plan = match planned {
@@ -592,22 +595,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             live.reuse_empty_out_dir,
         )
     };
-    let mut key = match key_result {
-        Ok(key) => key,
-        Err(refusal) => {
-            log(
-                "pass-through",
-                &[
-                    ("crate", unit),
-                    ("reason", refusal.code()),
-                    ("detail", &refusal.to_string()),
-                ],
-            );
-            return Decided::Reply(pass_through(refusal.code()));
-        }
-    };
     // Older wrappers keep the existing local protocol. A remote descriptor
     // can only be selected alongside this distinct accepted-execution path.
+    // The local key may deliberately refuse a mode (canonical archive codegen)
+    // that the isolated worker can execute. Keep that refusal until remote
+    // keying completes; never manufacture a local key for worker-only work.
     let mut remote_toolchain_pending = false;
     let remote = if request.get("remote_protocol").and_then(Value::as_u64) == Some(1) {
         live.remote.as_ref().and_then(|remote| {
@@ -643,8 +635,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 live.canonical.as_deref(),
             ) {
                 Ok(Some((remote_key, invocation))) => {
-                    key = remote_key;
-                    Some((Arc::clone(remote), invocation))
+                    Some((remote_key, Arc::clone(remote), invocation))
                 }
                 Ok(None) => {
                     remote_toolchain_pending = true;
@@ -673,6 +664,23 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         // replaced. Retrying reobserves all inputs before remote admission.
         return preparing(unit, PendingFacts::RemoteToolchain);
     }
+    let (key, remote) = match remote {
+        Some((key, remote, invocation)) => (key, Some((remote, invocation))),
+        None => match key_result {
+            Ok(key) => (key, None),
+            Err(refusal) => {
+                log(
+                    "pass-through",
+                    &[
+                        ("crate", unit),
+                        ("reason", refusal.code()),
+                        ("detail", &refusal.to_string()),
+                    ],
+                );
+                return Decided::Reply(pass_through(refusal.code()));
+            }
+        },
+    };
     let key_text = digest_key(&key.action_key);
     let admitted = LiveDependencyRequest {
         key,
