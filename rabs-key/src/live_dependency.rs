@@ -68,6 +68,10 @@
 //!   Dependency-root mentions in diagnostics are refused instead of rewritten.
 //!   Every other path (source, cwd, `--remap-path-prefix`, `--sysroot`)
 //!   is keyed as given — local-host serving only (`SubscriberPathPreserving`).
+//!   The separately prepared canonical Cargo profile already executes at its
+//!   stable visible paths. It keys those exact placements and replays bytes
+//!   unchanged, with its own isolation identity; ordinary wrapper requests
+//!   cannot select that profile through reserved path spelling alone.
 //! - **Dependencies:** the exact bytes of every `--extern` artifact
 //!   (plan §17.7's conservative default), bound to their crate names.
 //!   Every Rust artifact candidate in every dependency search directory is
@@ -107,6 +111,9 @@ use crate::toolchain::ToolchainContract;
 use crate::typed_digest::compute;
 
 pub mod remote;
+
+mod canonical_cargo;
+pub use canonical_cargo::{canonical_cargo_dependency_key, plan_canonical_cargo_dependency_action};
 
 /// Key epoch of the live dependency class. Epoch 5 limits transcript placement
 /// rewriting to declared rustc artifact events. Earlier entries could rewrite
@@ -398,9 +405,15 @@ pub struct DependencyActionPlan {
     pub invocation: NormalizedRustcInvocation,
     /// The real compiler argv\[0\].
     pub compiler: String,
+    /// The prepared canonical Cargo planner admitted these visible paths.
+    /// This selects exact placement keying and byte-preserving replay; it is
+    /// not proof of execution or publication authority. Ordinary wrapper input
+    /// cannot select this profile through an environment variable or wire flag.
+    pub canonical_cargo: bool,
     /// rustc's working directory (= the package root).
     pub cwd: String,
-    /// Absolute out-dir (placement; virtualized in the key).
+    /// Absolute out-dir (virtualized for ordinary host plans; exact for
+    /// prepared canonical Cargo plans).
     pub out_dir: String,
     /// The compiled package root (`CARGO_MANIFEST_DIR`).
     pub package_root: String,
@@ -440,6 +453,11 @@ impl DependencyActionPlan {
     /// disjoint, so replacing one can never hide another.
     #[must_use]
     pub fn placement_mappings(&self) -> Vec<(String, String)> {
+        if self.canonical_cargo {
+            // Cargo already planned under these exact visible paths. They are
+            // semantic key inputs, not subscriber-specific placement aliases.
+            return Vec::new();
+        }
         let mut mappings = vec![(self.out_dir.clone(), CANONICAL_OUT_DIR.to_owned())];
         for (index, root) in self.dependency_dirs.iter().enumerate() {
             if root != &self.out_dir {
@@ -576,6 +594,10 @@ pub struct LiveDependencyKey {
 /// refused rather than escaped: an exact transcript is worth more than
 /// coverage of exotic directory names.
 fn plain_path(path: &str) -> bool {
+    plain_path_in_profile(path, false)
+}
+
+fn plain_path_in_profile(path: &str, canonical_cargo: bool) -> bool {
     path.starts_with('/')
         && path.len() > 1
         && !path.ends_with('/')
@@ -584,7 +606,11 @@ fn plain_path(path: &str) -> bool {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@')
         })
         && !path.split('/').any(|part| part == "." || part == "..")
-        && !path.contains("/__rabs")
+        && if canonical_cargo {
+            within(path, "/__rabs")
+        } else {
+            !path.contains("/__rabs")
+        }
 }
 
 fn safe_component(value: &str) -> bool {
@@ -606,8 +632,9 @@ fn git_metadata(relative: &str) -> bool {
 fn dependency_source(
     cargo_home: &str,
     package_root: &str,
+    canonical_cargo: bool,
 ) -> Result<(DependencySourceKind, String, String), LiveRefusal> {
-    if !plain_path(cargo_home) {
+    if !plain_path_in_profile(cargo_home, canonical_cargo) {
         return Err(LiveRefusal::UnrepresentablePath(cargo_home.to_owned()));
     }
     let registry_src = format!("{cargo_home}/registry/src/");
@@ -648,11 +675,12 @@ fn dependency_source(
 fn directory_source(
     cargo_home: &str,
     package_root: &str,
+    canonical_cargo: bool,
 ) -> Result<(DependencySourceKind, String, String), LiveRefusal> {
     // A witness must not reinterpret an invalid/incomplete Cargo cache path
     // as a standalone package and silently shrink a Git checkout's closure.
-    if !plain_path(cargo_home)
-        || !plain_path(package_root)
+    if !plain_path_in_profile(cargo_home, canonical_cargo)
+        || !plain_path_in_profile(package_root, canonical_cargo)
         || git_metadata(package_root)
         || package_root == cargo_home
         || within(package_root, cargo_home)
@@ -722,7 +750,7 @@ pub fn plan_dependency_action(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    plan_with_directory_manifest(request, host_triple, None)
+    plan_with_directory_manifest(request, host_triple, None, false)
 }
 
 /// Plan a Cargo directory-source dependency after the edge observed a valid
@@ -738,7 +766,7 @@ pub fn plan_directory_dependency_action(
     host_triple: &str,
     checksum_document: TypedDigest,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    plan_with_directory_manifest(request, host_triple, Some(checksum_document))
+    plan_with_directory_manifest(request, host_triple, Some(checksum_document), false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -746,6 +774,7 @@ fn plan_with_directory_manifest(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
     directory_source_manifest: Option<TypedDigest>,
+    canonical_cargo: bool,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
     // Environment first: it is the cheapest way out of the class.
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
@@ -769,13 +798,13 @@ fn plan_with_directory_manifest(
                 .trim_end_matches('/')
         ),
     };
-    if !plain_path(&package_root) {
+    if !plain_path_in_profile(&package_root, canonical_cargo) {
         return Err(LiveRefusal::UnrepresentablePath(package_root));
     }
     let (source_kind, source_root, source_dir_name) = if directory_source_manifest.is_some() {
-        directory_source(&cargo_home, &package_root)?
+        directory_source(&cargo_home, &package_root, canonical_cargo)?
     } else {
-        dependency_source(&cargo_home, &package_root)?
+        dependency_source(&cargo_home, &package_root, canonical_cargo)?
     };
 
     if request.cwd != package_root {
@@ -812,14 +841,14 @@ fn plan_with_directory_manifest(
         Some(SourceInput::Path(path)) => path.clone(),
         _ => return Err(LiveRefusal::SourceOutsidePackage("no source path".into())),
     };
-    if !plain_path(&source) || !within(&source, &package_root) {
+    if !plain_path_in_profile(&source, canonical_cargo) || !within(&source, &package_root) {
         return Err(LiveRefusal::SourceOutsidePackage(source));
     }
     let out_dir = invocation
         .out_dir
         .clone()
         .ok_or_else(|| LiveRefusal::Outputs("missing --out-dir".into()))?;
-    if !plain_path(&out_dir)
+    if !plain_path_in_profile(&out_dir, canonical_cargo)
         || out_dir == source_root
         || within(&out_dir, &source_root)
         || within(&source_root, &out_dir)
@@ -828,7 +857,7 @@ fn plan_with_directory_manifest(
     }
     let generated_root = env_value(request.env, "OUT_DIR").map(str::to_owned);
     if let Some(root) = &generated_root
-        && (!plain_path(root)
+        && (!plain_path_in_profile(root, canonical_cargo)
             // Dep-info replay substitutes the compiler output placement.
             // It must never rewrite a retained exact generated-input path.
             || root.contains(&out_dir)
@@ -840,7 +869,7 @@ fn plan_with_directory_manifest(
     }
     let mut dependency_dirs = Vec::new();
     let mut add_directory = |path: &str| -> Result<(), LiveRefusal> {
-        if !plain_path(path)
+        if !plain_path_in_profile(path, canonical_cargo)
             || path == source_root
             || within(path, &source_root)
             || within(&source_root, path)
@@ -921,6 +950,7 @@ fn plan_with_directory_manifest(
         .unwrap_or_else(|| host_triple.to_owned());
     Ok(DependencyActionPlan {
         compiler: invocation.compiler_argv0.clone(),
+        canonical_cargo,
         invocation,
         cwd: request.cwd.to_owned(),
         out_dir,
@@ -940,12 +970,15 @@ fn plan_with_directory_manifest(
     })
 }
 
-/// The normalized-invocation component: out-dir placement virtualized,
-/// every other path kept, presentation flags bound (an exact transcript
+/// The normalized-invocation component: ordinary host output and dependency
+/// placement virtualized, prepared canonical Cargo placement exact. Every
+/// other path is kept and presentation flags are bound (an exact transcript
 /// is only replayable under the presentation that produced it).
 fn invocation_component(plan: &DependencyActionPlan) -> TypedDigest {
     let mut virtual_invocation = plan.invocation.clone();
-    virtual_invocation.out_dir = Some(CANONICAL_OUT_DIR.to_owned());
+    if !plan.canonical_cargo {
+        virtual_invocation.out_dir = Some(CANONICAL_OUT_DIR.to_owned());
+    }
     for entry in &mut virtual_invocation.lib_search {
         let root = entry
             .strip_prefix("dependency=")
@@ -1088,7 +1121,7 @@ fn environment_component(plan: &DependencyActionPlan) -> Result<TypedDigest, Liv
         .keyed_env
         .iter()
         .map(|(name, value)| {
-            let disposition = if name == "LD_LIBRARY_PATH" {
+            let disposition = if name == "LD_LIBRARY_PATH" && !plan.canonical_cargo {
                 EnvDisposition::SemanticNormalized {
                     normalizer: DYLIB_PATH_NORMALIZER.to_owned(),
                     normalized: value
@@ -1161,6 +1194,29 @@ fn output_platform_component(plan: &DependencyActionPlan) -> TypedDigest {
 /// # Errors
 /// [`LiveRefusal::Facts`] when the facts do not exactly cover the plan.
 pub fn live_dependency_key(
+    plan: &DependencyActionPlan,
+    toolchain: &ToolchainFacts,
+    externs: &[ExternFact],
+    directories: &[DependencyDirectoryFact],
+    build_script_output: Option<&[u8]>,
+    inputs: &ActionInputManifest,
+) -> Result<LiveDependencyKey, LiveRefusal> {
+    if plan.canonical_cargo {
+        return Err(LiveRefusal::Facts(
+            "canonical Cargo plans require their distinct dependency-key policy".into(),
+        ));
+    }
+    dependency_key(
+        plan,
+        toolchain,
+        externs,
+        directories,
+        build_script_output,
+        inputs,
+    )
+}
+
+fn dependency_key(
     plan: &DependencyActionPlan,
     toolchain: &ToolchainFacts,
     externs: &[ExternFact],
@@ -1451,14 +1507,25 @@ pub fn render_out_dir(canonical: &[u8], out_dir: &str) -> Vec<u8> {
 /// path token beneath the output directory is rewritten: a source path with a
 /// matching substring or sibling prefix is not output placement.
 /// Dependency directory strings remain outside this replay profile.
+/// Prepared canonical Cargo plans retain every byte because their actual
+/// visible placement is already exact and included in the key.
 /// Compiler transcripts must use [`canonicalize_compiler_transcript`] instead.
 ///
 /// # Errors
-/// Canonical markers and observable dependency placement are refused.
+/// Canonical markers and observable dependency placement are refused for
+/// ordinary host plans; prepared plans require the fixed canonical layout.
 pub fn canonicalize_placements(
     raw: &[u8],
     plan: &DependencyActionPlan,
 ) -> Result<Vec<u8>, &'static str> {
+    if plan.canonical_cargo {
+        canonical_cargo::canonical_layout(plan)
+            .map_err(|_| "invalid prepared canonical Cargo layout")?;
+        // These are the compiler's actual keyed paths, already identical for
+        // the producer and consumer. Replacing /__rabs/out would corrupt the
+        // nested real target path /__rabs/out/cargo as well as source literals.
+        return Ok(raw.to_vec());
+    }
     for root in &plan.dependency_dirs {
         if root != &plan.out_dir && contains(raw, root.as_bytes()) {
             return Err("observable dependency directory placement cannot be replayed");
@@ -1490,7 +1557,11 @@ pub fn canonicalize_placements(
 /// Render the output placement admitted by [`canonicalize_placements`].
 #[must_use]
 pub fn render_placements(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
-    render_out_dir(canonical, &plan.out_dir)
+    if plan.canonical_cargo {
+        canonical.to_vec()
+    } else {
+        render_out_dir(canonical, &plan.out_dir)
+    }
 }
 
 /// Canonicalize only declared artifact paths in a compiler transcript, retaining
@@ -1498,6 +1569,9 @@ pub fn render_placements(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u
 /// A diagnostic can quote a source-authored string that happens to equal the
 /// output directory. Rewriting that string for another subscriber changes what
 /// rustc said. Such ambiguous observations refuse publication instead.
+/// Prepared canonical Cargo plans key the exact output and dependency paths;
+/// they retain the original transcript, including source-authored path strings.
+/// Artifact events must still match the declared outputs in both profiles.
 ///
 /// The artifact adapter deliberately recognizes only rustc's flat, three-string
 /// event schema. A future schema or escaped path must gain an explicit adapter;
@@ -1506,19 +1580,24 @@ pub fn render_placements(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u
 ///
 /// # Errors
 /// Ambiguous placement, undeclared artifact paths, unsupported artifact events,
-/// pre-existing canonical markers or non-UTF-8 compiler output.
+/// pre-existing canonical markers in ordinary host plans, an invalid prepared
+/// canonical layout, or non-UTF-8 compiler output.
 pub fn canonicalize_compiler_transcript(
     raw: &[u8],
     plan: &DependencyActionPlan,
 ) -> Result<Vec<u8>, &'static str> {
-    if contains(raw, b"/__rabs") {
+    if plan.canonical_cargo {
+        canonical_cargo::canonical_layout(plan)
+            .map_err(|_| "invalid prepared canonical Cargo layout")?;
+    }
+    if !plan.canonical_cargo && contains(raw, b"/__rabs") {
         return Err("bytes already contain a canonical /__rabs path");
     }
-    if !plain_path(&plan.out_dir) {
+    if !plain_path_in_profile(&plan.out_dir, plan.canonical_cargo) {
         return Err("out-dir is not a plain path");
     }
     for root in &plan.dependency_dirs {
-        if root != &plan.out_dir && contains(raw, root.as_bytes()) {
+        if !plan.canonical_cargo && root != &plan.out_dir && contains(raw, root.as_bytes()) {
             return Err("observable dependency directory placement cannot be replayed");
         }
     }
@@ -1527,7 +1606,7 @@ pub fn canonicalize_compiler_transcript(
         std::str::from_utf8(line).map_err(|_| "compiler transcript is not UTF-8")?;
         let (artifact, mentions_output) = transcript_observations(line, plan)?;
         if !artifact {
-            if mentions_output {
+            if mentions_output && !plan.canonical_cargo {
                 return Err("diagnostic contains ambiguous output directory placement");
             }
             canonical.extend_from_slice(line);
@@ -1551,20 +1630,29 @@ pub fn canonicalize_compiler_transcript(
         }) {
             return Err("compiler artifact does not match a declared output");
         }
-        canonical.extend_from_slice(&line[..path.start]);
-        canonical.extend_from_slice(CANONICAL_OUT_DIR.as_bytes());
-        canonical.push(b'/');
-        canonical.extend_from_slice(relative);
-        canonical.extend_from_slice(&line[path.end..]);
+        if plan.canonical_cargo {
+            canonical.extend_from_slice(line);
+        } else {
+            canonical.extend_from_slice(&line[..path.start]);
+            canonical.extend_from_slice(CANONICAL_OUT_DIR.as_bytes());
+            canonical.push(b'/');
+            canonical.extend_from_slice(relative);
+            canonical.extend_from_slice(&line[path.end..]);
+        }
     }
     Ok(canonical)
 }
 
 /// Render a transcript accepted by [`canonicalize_compiler_transcript`]. Only
-/// its validated artifact-path fields can contain the reserved canonical marker.
+/// an ordinary host plan's validated artifact-path fields can contain its
+/// reserved replay marker. Prepared canonical Cargo transcripts remain exact.
 #[must_use]
 pub fn render_compiler_transcript(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
-    render_out_dir(canonical, &plan.out_dir)
+    if plan.canonical_cargo {
+        canonical.to_vec()
+    } else {
+        render_out_dir(canonical, &plan.out_dir)
+    }
 }
 
 /// Decode JSON strings for REFUSAL/classification only. Raw substring checks
@@ -1585,13 +1673,14 @@ fn transcript_observations(
             b'"' => {
                 let value = transcript_string(line, &mut at)
                     .ok_or("invalid JSON string in compiler transcript")?;
-                if contains(&value, b"/__rabs") {
+                if !plan.canonical_cargo && contains(&value, b"/__rabs") {
                     return Err("bytes already contain a canonical /__rabs path");
                 }
-                if plan
-                    .dependency_dirs
-                    .iter()
-                    .any(|root| root != &plan.out_dir && contains(&value, root.as_bytes()))
+                if !plan.canonical_cargo
+                    && plan
+                        .dependency_dirs
+                        .iter()
+                        .any(|root| root != &plan.out_dir && contains(&value, root.as_bytes()))
                 {
                     return Err("observable dependency directory placement cannot be replayed");
                 }
@@ -1827,6 +1916,7 @@ pub fn dep_info_closure_violation(
                     return Some(format!("tracked read of unkeyed variable {name}"));
                 }
                 if name == "LD_LIBRARY_PATH"
+                    && !plan.canonical_cargo
                     && plan.keyed_env.iter().any(|(name, value)| {
                         name == "LD_LIBRARY_PATH"
                             && value.split(':').any(|entry| entry == plan.out_dir)
@@ -1834,12 +1924,13 @@ pub fn dep_info_closure_violation(
                 {
                     return Some("tracked read of placement-normalized LD_LIBRARY_PATH".into());
                 }
-                // Preserve the live class's conservative refusal of observed
+                // Preserve the ordinary host class's refusal of observed
                 // output placement in environment names/values. The narrower
                 // transcript and dep-info adapters do not prove such a read
                 // cannot also affect native output. Execution preserved the
-                // value; only publication is refused.
-                if read.contains(&plan.out_dir) {
+                // value; only publication is refused. Prepared canonical
+                // Cargo plans preserve and key the exact paths and values.
+                if !plan.canonical_cargo && read.contains(&plan.out_dir) {
                     return Some(format!(
                         "tracked read of {name} contains compiler output placement"
                     ));
