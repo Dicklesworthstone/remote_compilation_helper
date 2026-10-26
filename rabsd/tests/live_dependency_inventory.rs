@@ -257,6 +257,7 @@ impl NativeInventory {
                 package,
                 dependencies,
                 toolchain,
+                canonical_paths: None,
                 externs: externs
                     .into_iter()
                     .map(|fact| (fact.path, fact.content_digest))

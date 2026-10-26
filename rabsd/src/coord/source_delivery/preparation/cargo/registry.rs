@@ -1581,7 +1581,7 @@ mod tests {
             &json!({"manifest":"Cargo.toml","cargo_home_source":approved}),
         )
         .unwrap();
-        let (retained, selected) = source.prepare(Arc::clone(&image)).unwrap();
+        let (retained, selected) = source.prepare(Arc::clone(&image), None).unwrap();
         assert!(
             selected
                 .iter()
@@ -1660,7 +1660,7 @@ mod tests {
             .unwrap()
             .path();
         fs::write(namespace.join("fixture-1.0.0.crate"), b"checksum mismatch").unwrap();
-        let error = source.prepare(image).unwrap_err();
+        let error = source.prepare(image, None).unwrap_err();
         assert!(
             error
                 .to_string()

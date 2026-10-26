@@ -32,11 +32,15 @@ is planned. Existing worker output, cancellation, lease and recovery mechanisms
 are reused. The existing scheduler, transport and artifact installer remain in
 control of every operation.
 
-**This profile is execution-only.** It does not publish an action-cache result,
+**This remote profile is execution-only.** It does not publish an action-cache result,
 serve a compiler, program or benchmark-result cache hit, distribute individual rustc units, enable the local dependency
 lane, or share a cache across workers. It does not make an unsandboxed local
 cache key equivalent to a canonical execution. Those remain separate integration
 and qualification tasks. Unlike `--rabs-remote`, this path does not invoke RCH.
+
+A separate [local canonical library-check profile](#local-canonical-library-checks-with-dependency-caching)
+connects captured Cargo execution to the existing external-dependency metadata
+cache. Its explicit command and narrower graph requirements are described below.
 
 ## Profile and prerequisites
 
@@ -891,3 +895,162 @@ and isolated filesystem tests alone do not prove the authenticated build.
 Per-action admission/placement,
 coordinator-only cache publication, cross-worker reuse, real compiler-skip evidence,
 performance gates and the required canary/soak are not completed by this frontend.
+
+## Local canonical library checks with dependency caching
+
+`rabsd --canonical-check-local PROFILE.json` runs the captured native Cargo as
+`cargo check --lib --offline --locked` inside the canonical namespace and connects
+its rustc requests to an operation-owned coordinator. Eligible external registry,
+locked Git and verified directory-source libraries use the existing metadata
+cache, including its cold-result publication, differential verification and
+compiler-skip gates. Cargo plans the units at `/__rabs/workspace` with the captured
+compiler at `/__rabs/toolchain/bin/rustc` and target at `/__rabs/out/cargo`, so moving
+the original checkout does not introduce a different host path into that unit's
+arguments or metadata output.
+
+This first local profile requires a complete resolved graph without **any build
+scripts or procedural macros**. It asks the captured Cargo for the all-features
+dependency graph before exposing a wrapper or cache endpoint. Optional or
+target-specific packages containing those executors also refuse this profile.
+Workspace members, primary packages and unsupported compiler requests compile
+normally inside the namespace. Their results do not enter the dependency cache.
+The supported cache class remains external dependency `metadata` plus `dep-info`;
+workspace publication, generated inputs, archive/codegen caching and per-rustc
+remote dispatch require their own admission and qualification work.
+
+### Create and run the local profile
+
+Install matching native `rabsd` and `rabs-wrap` binaries. The explicit toolchain
+root must contain its real `bin/cargo`, `bin/rustc`, libraries and native sysroot.
+The preparing host must pass the full production bubblewrap namespace probe,
+including private `/proc`, `/dev`, temporary storage and network isolation.
+Unsupported hosts return an error before compilation; there is no weaker local
+execution mode behind this command.
+
+Create two private directories outside the captured source and toolchain. Keep
+the operation parent short enough for a Unix socket pathname; `/tmp/rabs-check-ops`
+is an example. The driver checks existing permissions instead of repairing them:
+
+```sh
+mkdir -m 700 /home/builder/rabs-check-state /tmp/rabs-check-ops
+```
+
+For an already vendored project, save this profile with your actual absolute paths:
+
+```json
+{
+  "version": "canonical-check-local-v1",
+  "source_root": "/data/projects/approved-anchor",
+  "toolchain_root": "/opt/rust/native-linux-toolchain",
+  "state_root": "/home/builder/rabs-check-state",
+  "operation_root": "/tmp/rabs-check-ops",
+  "wrapper": "/usr/local/bin/rabs-wrap",
+  "manifest": "app/Cargo.toml",
+  "vendor": "vendor",
+  "jobs": 1,
+  "timeout_seconds": 1800
+}
+```
+
+```sh
+rabsd --canonical-check-local ./canonical-check.json
+```
+
+`manifest` defaults to `Cargo.toml`, `jobs` to 1 and `timeout_seconds` to 1800.
+The job count accepts 1–4096 and the canonical metadata/check timeout accepts 1–7200
+seconds. A purely local graph omits `vendor`. A registry/Git cache profile uses
+`"cargo_home_source": "/home/builder/.cargo"` instead of `vendor`; the existing
+locked offline planner captures the required package archives and Git objects
+into a private Cargo home. It does not inherit that cache's user configuration,
+credentials or unrelated expanded sources. The source, toolchain, state,
+operation and optional Cargo-cache roots must be disjoint ordinary absolute
+directories. The wrapper must be an ordinary executable outside the captured
+source and mutable state/operation roots. Arbitrary commands, mount declarations
+and environment overrides are not profile fields.
+
+Preparation captures the selected toolchain before its Cargo metadata planning
+and uses those captured Cargo/rustc binaries with a controlled environment.
+The actual graph proof and check then run in the canonical namespace. The source
+workspace and HOME are read-only there. HOME contains the retained wrapper and
+the fresh operation socket; private Cargo state and the target are writable.
+The build sees neither the persistent CAS nor the ordinary daemon endpoint.
+Its scoped endpoint accepts rustc requests only and refuses status, generic
+serving, prepared-job and administrative messages. Logical compiler paths are
+translated to backing files only through the coordinator's retained mount
+capability; a wrapper-supplied path or environment flag cannot construct one.
+
+### Persistent reuse and command results
+
+The driver owns `state_root/canonical-check-v1`, including its CAS and exclusive
+state lock. Concurrent invocations using the same state root return a busy error
+instead of superseding an active coordinator term. This separate namespace also
+keeps the local profile's lifecycle independent of a normal daemon's CAS. Use a
+dedicated state parent and retain it across checks; each command gets a fresh
+private target and source/toolchain capture under `operation_root`.
+
+The ordinary fixed sampling policy requires an initial successful compiler
+result and two matching real compiler comparisons before a subsequent eligible
+request can skip rustc. Repeating the same check four times against the same
+state root exercises that progression. Adaptive sampling or a configured release
+authorization policy can require additional evidence. This command loads the
+same `[rabs]` configuration and environment overrides for build identity and
+release authorization as the normal daemon. `required` remains enforced; the
+profile grants no release verdict or preverified cache entry.
+
+The stderr decision trail records `rabsd-live-dependency` events such as
+`execute`, `hit`, `served`, and the specific reason for a fallback. A `hit` is an
+offer; `served` follows the accepted, verified installation. Workspace crates
+continue through the compiler even on a warm dependency cache. Editing a
+dependency's captured source or changing its exact upstream artifact inventory
+changes the key or refuses reuse. Unsupported actions preserve ordinary rustc
+execution rather than borrowing the external dependency class's evidence.
+
+The command replays Cargo's complete bounded stdout and stderr after capture,
+then returns Cargo's actual status. A timeout, cancellation or incomplete drain
+is an error, including a child that exits zero while handling cancellation.
+Input/toolchain capture and the first graph proof precede the scoped daemon's
+signal listener; they retain the existing bounded preparation behavior and the
+namespace's die-with-parent boundary. Compiler execution after admission uses
+the owned process group and coordinated shutdown path.
+The coordinator drains its sessions and output writers before the private
+operation directory is released. After Cargo's process group exits, admission
+to the scoped endpoint is sealed and the coordinator retains authority while
+acknowledged captures finish publication. This drain has a 60-second deadline;
+expiration is reported as an error rather than silently losing the last unit's
+publication or verification sample. Output paths in Cargo's JSON refer to that
+canonical operation; this check interface returns diagnostics and success/failure,
+while persistent reusable dependency results remain in the profile's CAS.
+
+### Validate the real bridge
+
+The ordinary native tests cover strict profile parsing, pure-graph admission,
+read-only control/source mounts, retained state ownership, and the real scoped
+socket's refusal of generic daemon capabilities while joining an open session:
+
+```sh
+cargo test -p rabsd --lib coord::canonical_local --locked
+cargo test -p rabsd --test canonical_check_local --locked
+```
+
+The full compiler-skip test is explicitly opt-in because it needs the complete
+Linux namespace capability and an installed native wrapper. Build the binaries
+from the same revision, then run:
+
+```sh
+cargo build -p rabsd -p rabs-wrap --locked
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_source \
+    -- --ignored --exact --nocapture
+```
+
+That test runs real Cargo and rustc against two vendored dependency libraries.
+It requires three actual cold/sample compiles with identical action identities,
+then requires verified hits in a different checkout and fresh target after a
+workspace source edit. A subsequent dependency edit must compile, and adding a
+build script must refuse the graph before the cache endpoint is exposed. The test
+does not inject publication rows or verification samples. An ignored test or a
+namespace-support refusal is not end-to-end success evidence; run this test on a
+capable host before enabling the profile operationally. This bounded local bridge
+does not complete the remote worker, workspace-cache or performance qualification
+tasks described above.

@@ -10,6 +10,7 @@
 //! - `--check-config` — parse + validate config, print resolved values
 //! - `--run-for-ms N` — auto-shutdown after N ms (acceptance harness)
 //! - `--worker-prepare` — capture an explicit source projection into a saved bundle
+//! - `--canonical-check-local` — canonical local Cargo check with dependency caching
 //! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - `--worker-exec-tls` — receive one pinned worker execution over mutual TLS/ATP
 //! - `--worker-build-tls` — execute a prepared bundle and install verified outputs
@@ -439,6 +440,14 @@ fn main() {
                 "rabsd {VERSION} — RABS edge+coordinator daemon\n\
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
+                 CANONICAL LOCAL: rabsd --canonical-check-local <profile.json>\n\
+                 Captures source/toolchain, then runs cargo check --lib --offline --locked at canonical paths.\n\
+                 profile version canonical-check-local-v1 requires source_root, toolchain_root, state_root,\n\
+                 operation_root and wrapper absolute paths; state/operation roots must already be private (0700).\n\
+                 Optional manifest (Cargo.toml), vendor or cargo_home_source, jobs (1), timeout_seconds (1800).\n\
+                 Linux namespace support and a graph without build scripts/proc macros are required.\n\
+                 External dependency metadata uses the evidence-gated cache; workspace crates compile normally.\n\
+                 This mode honors the configured build identity and release authorization policy.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
                  instead of source_manifest or workspace_backing. Preparation does not build.\n\
@@ -483,6 +492,44 @@ fn main() {
                  env: RABS_SOCKET_PATH, RABS_LOG_LEVEL, RABS_PREPARED_CONCURRENCY."
             );
             return;
+        }
+        Some("--canonical-check-local") => {
+            if args.len() != 2 {
+                eprintln!("usage: rabsd --canonical-check-local <profile.json>");
+                std::process::exit(2);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let config = match load_config() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!("rabsd: {error}");
+                        std::process::exit(2);
+                    }
+                };
+                let result = rabsd::coord::canonical_local::run_profile_with_release(
+                    std::path::Path::new(&args[1]),
+                    config.release_authorization,
+                    config.build_identity,
+                );
+                let code = match result {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("rabsd canonical check: {error}");
+                        if error.kind() == std::io::ErrorKind::InvalidInput {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                };
+                std::process::exit(code);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("rabsd canonical check requires Linux namespace support");
+                std::process::exit(2);
+            }
         }
         Some("--worker-prepare") => {
             std::process::exit(run_prepare(&args[1..]));

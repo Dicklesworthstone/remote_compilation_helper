@@ -1685,7 +1685,7 @@ fn transcript_observations(
                     return Err("observable dependency directory placement cannot be replayed");
                 }
                 mentions_output |= contains(&value, plan.out_dir.as_bytes());
-                if containers.as_slice() == [b'{'] && value == b"$message_type" {
+                if containers.as_slice() == b"{" && value == b"$message_type" {
                     let mut next = at;
                     while line.get(next).is_some_and(u8::is_ascii_whitespace) {
                         next += 1;

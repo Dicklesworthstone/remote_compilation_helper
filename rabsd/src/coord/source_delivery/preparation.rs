@@ -222,7 +222,7 @@ impl SourcePreparation {
             .and_then(cargo::CargoSource::cargo_home_projection)
     }
 
-    pub(super) fn capture(&self) -> io::Result<SourceUpload> {
+    pub(super) fn capture(&self, planning_toolchain: Option<&Path>) -> io::Result<SourceUpload> {
         // Never capture roots independently and merge them afterward. The scanner
         // compares a complete first closure pass with a complete second pass and
         // retries the ENTIRE closure on mutation. Its byte budget is global.
@@ -231,7 +231,7 @@ impl SourcePreparation {
                 .map_err(|error| invalid(&format!("source closure capture refused: {error:?}")))?,
         );
         if let Some(cargo) = &self.cargo {
-            let (image, files) = cargo.prepare(image)?;
+            let (image, files) = cargo.prepare(image, planning_toolchain)?;
             SourceUpload::from_snapshot(image, "workspace", &files)
         } else if self.closure {
             SourceUpload::from_snapshot_closure(image, &self.selections)

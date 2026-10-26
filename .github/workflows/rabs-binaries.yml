@@ -196,6 +196,19 @@ jobs:
           cargo test --release -p rabs-key --lib live_dependency --locked
           cargo test --release -p rabsd --lib edge::live_facts --locked
           cargo test --release -p rabsd --test live_dependency_inventory --locked
+      - name: Canonical local Cargo ownership and path projection
+        run: |
+          cargo test --release -p rabsd --lib coord::canonical_local --locked
+          cargo test --release -p rabsd --lib coord::live_dependency::canonical --locked
+          cargo test --release -p rabsd --test canonical_check_local --locked
+      - name: Actual canonical Cargo earns and replays dependency results across worktrees
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_source \
+            -- --ignored --exact --nocapture
       - name: Closed archive isolation and authenticated mode selection
         run: |
           cargo test --release -p rabs-sandbox --lib dependency_context --locked

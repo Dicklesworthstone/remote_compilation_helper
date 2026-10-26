@@ -203,7 +203,20 @@ pub fn prepare_source_bundle(
     specification: &Value,
     destination: &Path,
 ) -> io::Result<Value> {
-    prepare_source_bundle_inner(source_root, specification, destination, false)
+    prepare_source_bundle_inner(source_root, specification, destination, false, false)
+        .map(|(report, _source)| report)
+}
+
+/// The canonical local driver keeps the sealed receiver alive when deriving
+/// its private Cargo home. This is the same capture and verification as an
+/// ordinary prepared bundle, without reopening a path as source authority.
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_local_bundle(
+    source_root: &Path,
+    specification: &Value,
+    destination: &Path,
+) -> io::Result<(Value, SourceReceiver)> {
+    prepare_source_bundle_inner(source_root, specification, destination, false, true)
 }
 
 /// Capture immutable inputs for a daemon job whose worker request ID is not yet
@@ -228,7 +241,8 @@ pub fn prepare_source_template(
     // This zero exists only during the ordinary source/request validators. It
     // is never written to request.json, returned as an identity, or dispatched.
     probe["request_id"] = json!(0);
-    prepare_source_bundle_inner(source_root, &probe, destination, true)
+    prepare_source_bundle_inner(source_root, &probe, destination, true, false)
+        .map(|(report, _source)| report)
 }
 
 fn prepare_source_bundle_inner(
@@ -236,7 +250,8 @@ fn prepare_source_bundle_inner(
     specification: &Value,
     destination: &Path,
     allocation_intent: bool,
-) -> io::Result<Value> {
+    selected_planning_toolchain: bool,
+) -> io::Result<(Value, SourceReceiver)> {
     let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
     require(
         destination.is_absolute()
@@ -301,7 +316,34 @@ fn prepare_source_bundle_inner(
             Ok::<_, io::Error>(path)
         })
         .transpose()?;
-    let mut upload = inputs.capture()?;
+    // The local canonical bridge must not run an ambient RUSTC/CARGO during
+    // source planning. Capture the selected dataset first and plan through its
+    // retained executable paths. Existing operator preparation keeps its
+    // ordinary validate-before-destination behavior.
+    let planning_toolchain = if selected_planning_toolchain {
+        let source = toolchain_source
+            .as_ref()
+            .ok_or_else(|| invalid("canonical preparation requires toolchain_source"))?;
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&destination)?;
+        let prepared = capture_toolchain(
+            source,
+            &destination.join("toolchain"),
+            expected_toolchain.as_ref(),
+            &ToolchainLimits::default(),
+            || false,
+        )?;
+        prepared.sync(|| false)?;
+        Some(prepared)
+    } else {
+        None
+    };
+    let mut upload = inputs.capture(planning_toolchain.as_ref().map(PreparedToolchain::root))?;
     if let Some(context) = specification.get("dependency_context") {
         require(
             context["version"] == rabs_sandbox::dependency_context::DEPENDENCY_CONTEXT_VERSION,
@@ -328,21 +370,27 @@ fn prepare_source_bundle_inner(
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(&destination)?; // Exclusive; never merge into an old bundle.
-    let toolchain = toolchain_source
-        .as_ref()
-        .map(|source| {
-            let prepared = capture_toolchain(
-                source,
-                &destination.join("toolchain"),
-                expected_toolchain.as_ref(),
-                &ToolchainLimits::default(),
-                || false,
-            )?;
-            prepared.sync(|| false)?;
-            Ok::<_, io::Error>(prepared)
-        })
-        .transpose()?;
+    if planning_toolchain.is_none() {
+        builder.create(&destination)?; // Exclusive; never merge into an old bundle.
+    }
+    let toolchain = if let Some(prepared) = planning_toolchain {
+        Some(prepared)
+    } else {
+        toolchain_source
+            .as_ref()
+            .map(|source| {
+                let prepared = capture_toolchain(
+                    source,
+                    &destination.join("toolchain"),
+                    expected_toolchain.as_ref(),
+                    &ToolchainLimits::default(),
+                    || false,
+                )?;
+                prepared.sync(|| false)?;
+                Ok::<_, io::Error>(prepared)
+            })
+            .transpose()?
+    };
     let mut request = specification.clone();
     let fields = request
         .as_object_mut()
@@ -434,7 +482,7 @@ fn prepare_source_bundle_inner(
     output.sync_all()?;
     File::open(&destination)?.sync_all()?;
     File::open(&parent)?.sync_all()?;
-    Ok(
+    Ok((
         json!({"kind":if allocation_intent {"prepared-source-template"} else {"prepared-source-bundle"}, "directory":destination,
         "source_root":source, "request_path":request_path, "request_id":request["request_id"],
         "request_sha256":hex(&Sha256::digest(&request_bytes)),
@@ -444,7 +492,8 @@ fn prepare_source_bundle_inner(
         "toolchain_root":toolchain_source.as_ref().map(|_| destination.join("toolchain")),
         "toolchain_transfer":request.get("toolchain_transfer"),
         "executed":false, "publication_authorized":false}),
-    )
+        receiver,
+    ))
 }
 
 #[derive(Debug, Clone)]

@@ -127,6 +127,7 @@ impl CargoSource {
     pub(super) fn prepare(
         &self,
         image: Arc<SealedSourceSnapshot>,
+        selected_toolchain: Option<&Path>,
     ) -> io::Result<(Arc<SealedSourceSnapshot>, Vec<String>)> {
         let vendor = self
             .vendor
@@ -152,19 +153,32 @@ impl CargoSource {
         let root = fs::canonicalize(planning_root.join("image/workspace"))?;
         let tools = planning_root.join("tools");
         fs::create_dir(&tools)?;
-        let cargo = local_tool("cargo", &tools)?;
-        let rustc = match std::env::var_os("RUSTC") {
-            Some(_) => local_tool("rustc", &tools)?,
-            None if cargo
-                .parent()
-                .is_some_and(|parent| parent.join("rustc").is_file()) =>
-            {
-                cargo
-                    .parent()
-                    .ok_or_else(|| invalid("Cargo executable parent"))?
-                    .join("rustc")
+        let (cargo, rustc) = if let Some(toolchain) = selected_toolchain {
+            let cargo = toolchain.join("bin/cargo");
+            let rustc = toolchain.join("bin/rustc");
+            for program in [&cargo, &rustc] {
+                require(
+                    fs::symlink_metadata(program)?.is_file(),
+                    "selected planning toolchain requires ordinary cargo and rustc executables",
+                )?;
             }
-            None => local_tool("rustc", &tools)?,
+            (cargo, rustc)
+        } else {
+            let cargo = local_tool("cargo", &tools)?;
+            let rustc = match std::env::var_os("RUSTC") {
+                Some(_) => local_tool("rustc", &tools)?,
+                None if cargo
+                    .parent()
+                    .is_some_and(|parent| parent.join("rustc").is_file()) =>
+                {
+                    cargo
+                        .parent()
+                        .ok_or_else(|| invalid("Cargo executable parent"))?
+                        .join("rustc")
+                }
+                None => local_tool("rustc", &tools)?,
+            };
+            (cargo, rustc)
         };
         let home = planning_root.join("home");
         fs::create_dir(&home)?;
@@ -174,8 +188,14 @@ impl CargoSource {
             .cargo_home_source
             .as_ref()
             .map(|approved| {
-                let mut locate =
-                    planning_command(&cargo, &rustc, &root, &self.manifest, &planning_root)?;
+                let mut locate = planning_command(
+                    &cargo,
+                    &rustc,
+                    &root,
+                    &self.manifest,
+                    &planning_root,
+                    selected_toolchain,
+                )?;
                 locate
                     .args(["locate-project", "--workspace", "--message-format=json"])
                     .arg("--manifest-path")
@@ -198,7 +218,14 @@ impl CargoSource {
                 RegistryCache::capture(&image, &lock, approved, &cargo_home)
             })
             .transpose()?;
-        let mut command = planning_command(&cargo, &rustc, &root, &self.manifest, &planning_root)?;
+        let mut command = planning_command(
+            &cargo,
+            &rustc,
+            &root,
+            &self.manifest,
+            &planning_root,
+            selected_toolchain,
+        )?;
         command
             .args([
                 "metadata",
@@ -264,6 +291,7 @@ fn planning_command(
     root: &Path,
     manifest: &str,
     planning: &Path,
+    selected_toolchain: Option<&Path>,
 ) -> io::Result<Command> {
     let mut command = Command::new(cargo);
     command
@@ -280,9 +308,14 @@ fn planning_command(
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("CARGO_TARGET_DIR", planning.join("target"));
-    for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
+    if let Some(toolchain) = selected_toolchain {
+        command.env("PATH", format!("{}/bin:/usr/bin:/bin", toolchain.display()));
+        command.env("LD_LIBRARY_PATH", toolchain.join("lib"));
+    } else {
+        for key in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
         }
     }
     Ok(command)

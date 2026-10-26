@@ -35,6 +35,7 @@
 //! Requests outside the live class keep the shadow plane's observation, so
 //! turning the lane on never loses the existing shadow evidence.
 
+use crate::coord::live_dependency::canonical::CanonicalPaths;
 use crate::coord::live_dependency::remote::{PendingRemote, RemoteDependencies};
 use crate::coord::live_dependency::{
     CompletionReport, InstallResult, LiveDecision, LiveDependencyLane, LiveDependencyRequest,
@@ -53,7 +54,7 @@ use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::ObjectId;
 use rabs_sandbox::generated_source::GeneratedSource;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[path = "admission_preflight.rs"]
@@ -78,6 +79,31 @@ pub struct LiveEdge {
     pub(super) facts: Arc<LiveFacts>,
     reuse_empty_out_dir: bool,
     remote: Option<Arc<RemoteDependencies>>,
+    canonical: Option<Arc<CanonicalPaths>>,
+    #[cfg(test)]
+    pub(super) publication_pause: Option<PublicationPause>,
+}
+
+/// Pause one fixture's actual publication after its matching capture ACK.
+/// No result or authority is substituted; releasing the gate continues through
+/// the ordinary captured-result publication and verification checks.
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct PublicationPause {
+    pub(super) reached: std::sync::mpsc::Sender<()>,
+    pub(super) release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl PublicationPause {
+    fn wait(&self) {
+        self.reached.send(()).expect("publication observer present");
+        self.release
+            .lock()
+            .expect("publication gate not poisoned")
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("publication gate released within fixture budget");
+    }
 }
 
 impl LiveEdge {
@@ -89,6 +115,30 @@ impl LiveEdge {
             facts: LiveFacts::new(),
             reuse_empty_out_dir: build_script_reuse::enabled(),
             remote: None,
+            canonical: None,
+            #[cfg(test)]
+            publication_pause: None,
+        }
+    }
+
+    /// Only the prepared canonical driver may bind this capability. The
+    /// ordinary serving socket never derives it from client-supplied fields.
+    pub(crate) fn canonical(lane: LiveDependencyLane, paths: Arc<CanonicalPaths>) -> Self {
+        Self {
+            lane,
+            facts: LiveFacts::new(),
+            reuse_empty_out_dir: false,
+            remote: None,
+            canonical: Some(paths),
+            #[cfg(test)]
+            publication_pause: None,
+        }
+    }
+
+    fn physical_path(&self, path: &str) -> Result<PathBuf, String> {
+        match &self.canonical {
+            Some(paths) => paths.physical(Path::new(path)),
+            None => Ok(PathBuf::from(path)),
         }
     }
 }
@@ -319,10 +369,18 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         return Decided::Shadow(observation(&parsed));
     }
     let constructed = constructed_environment(&parsed.env);
-    let toolchain = match live
-        .facts
-        .toolchain(Path::new(&parsed.argv[0]), &constructed)
-    {
+    let physical_compiler = match live.physical_path(&parsed.argv[0]) {
+        Ok(path) => path,
+        Err(reason) => return refuse(&reason),
+    };
+    let probe_environment = match &live.canonical {
+        Some(paths) => match paths.probe_environment(&constructed) {
+            Ok(environment) => environment,
+            Err(reason) => return refuse(&reason),
+        },
+        None => constructed,
+    };
+    let toolchain = match live.facts.toolchain(&physical_compiler, &probe_environment) {
         Ok(toolchain) => toolchain,
         Err(FactsMiss::Pending) => {
             log(
@@ -353,14 +411,18 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         );
         return Decided::Shadow(observation(&parsed));
     };
-    let mut plan = match directory_source::plan_dependency_action(
-        LiveRustcRequest {
-            argv: &parsed.argv,
-            cwd: &parsed.cwd,
-            env: &parsed.env,
-        },
-        &host,
-    ) {
+    let planning_request = LiveRustcRequest {
+        argv: &parsed.argv,
+        cwd: &parsed.cwd,
+        env: &parsed.env,
+    };
+    let planned = match &live.canonical {
+        Some(paths) => {
+            directory_source::plan_canonical_dependency_action(planning_request, &host, paths)
+        }
+        None => directory_source::plan_dependency_action(planning_request, &host),
+    };
+    let mut plan = match planned {
         Ok(plan) => plan,
         Err(refusal) => {
             // Out of class (workspace members, build scripts, ...): the
@@ -380,47 +442,54 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     // Keep the original observation through the entire request lifecycle.
     // Later cache refreshes must not substitute another toolchain generation
     // after this invocation has been keyed or its compiler has started.
-    let toolchain_guard = match live
-        .facts
-        .toolchain_guard(Path::new(&plan.compiler), &toolchain)
-    {
+    let toolchain_guard = match live.facts.toolchain_guard(&physical_compiler, &toolchain) {
         Ok(guard) => guard,
         Err(FactsMiss::Pending) if may_wait => return preparing(unit, PendingFacts::Toolchain),
         Err(miss) => return refuse(&miss.to_string()),
     };
-    let (package, dependencies) = match input_preparation::observe(&live.facts, &plan, may_wait) {
-        Ok(observed) => observed,
-        Err(input_preparation::InputMiss::PackageAndDependenciesPending) => {
-            log(
-                "preparing",
-                &[
-                    ("crate", unit),
-                    ("reason", PendingFacts::Dependencies.reason()),
-                ],
-            );
-            return preparing(unit, PendingFacts::Package);
-        }
-        Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
-            return preparing(unit, PendingFacts::Package);
-        }
-        Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
-            return preparing(unit, PendingFacts::Dependencies);
-        }
-        Err(input_preparation::InputMiss::Package(miss)) => {
-            log(
-                "pass-through",
-                &[
-                    ("crate", unit),
-                    ("package", &plan.package_root),
-                    ("source", &plan.source_root),
-                    ("reason", &miss.to_string()),
-                ],
-            );
-            return Decided::Reply(pass_through(&miss.to_string()));
-        }
-        Err(input_preparation::InputMiss::Dependencies(miss)) => return refuse(&miss.to_string()),
+    let physical_plan = match &live.canonical {
+        Some(paths) => match paths.project_plan(&plan) {
+            Ok(physical) => physical,
+            Err(reason) => return refuse(&reason),
+        },
+        None => plan.clone(),
     };
-    if let Err(reason) = package.verify_generated_disjoint(&plan) {
+    let (package, dependencies) =
+        match input_preparation::observe(&live.facts, &physical_plan, may_wait) {
+            Ok(observed) => observed,
+            Err(input_preparation::InputMiss::PackageAndDependenciesPending) => {
+                log(
+                    "preparing",
+                    &[
+                        ("crate", unit),
+                        ("reason", PendingFacts::Dependencies.reason()),
+                    ],
+                );
+                return preparing(unit, PendingFacts::Package);
+            }
+            Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
+                return preparing(unit, PendingFacts::Package);
+            }
+            Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
+                return preparing(unit, PendingFacts::Dependencies);
+            }
+            Err(input_preparation::InputMiss::Package(miss)) => {
+                log(
+                    "pass-through",
+                    &[
+                        ("crate", unit),
+                        ("package", &plan.package_root),
+                        ("source", &plan.source_root),
+                        ("reason", &miss.to_string()),
+                    ],
+                );
+                return Decided::Reply(pass_through(&miss.to_string()));
+            }
+            Err(input_preparation::InputMiss::Dependencies(miss)) => {
+                return refuse(&miss.to_string());
+            }
+        };
+    if let Err(reason) = package.verify_generated_disjoint(&physical_plan) {
         return refuse(&reason);
     }
     // This record comes from the generated-tree capture, never a wire field.
@@ -465,7 +534,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     let mut externs = Vec::new();
     for planned in &plan.externs {
         if let PlannedExtern::File { path, .. } = planned {
-            match live.facts.file_digest(Path::new(path)) {
+            let physical_path = match live.physical_path(path) {
+                Ok(path) => path,
+                Err(reason) => return refuse(&reason),
+            };
+            match live.facts.file_digest(&physical_path) {
                 Ok(digest) => externs.push(ExternFact {
                     path: path.clone(),
                     content_digest: digest,
@@ -474,15 +547,31 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }
         }
     }
-    let mut key = match build_script_reuse::key(
-        &mut plan,
-        &toolchain,
-        &externs,
-        &dependencies.directories,
-        &package,
-        &inputs,
-        live.reuse_empty_out_dir,
-    ) {
+    let key_result = if let Some(paths) = &live.canonical {
+        let canonical_directories = match paths.dependency_facts(&dependencies.directories) {
+            Ok(directories) => directories,
+            Err(reason) => return refuse(&reason),
+        };
+        rabs_key::live_dependency::canonical_cargo_dependency_key(
+            &plan,
+            &toolchain,
+            &externs,
+            &canonical_directories,
+            package.build_script_output.as_deref(),
+            &inputs,
+        )
+    } else {
+        build_script_reuse::key(
+            &mut plan,
+            &toolchain,
+            &externs,
+            &dependencies.directories,
+            &package,
+            &inputs,
+            live.reuse_empty_out_dir,
+        )
+    };
+    let mut key = match key_result {
         Ok(key) => key,
         Err(refusal) => {
             log(
@@ -574,6 +663,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             .into_iter()
             .map(|fact| (fact.path, fact.content_digest))
             .collect(),
+        canonical_paths: live.canonical.clone(),
     };
     let decision = match remote {
         Some((remote, invocation)) => live.lane.decide_remote(admitted, remote, invocation),
@@ -834,6 +924,10 @@ pub(super) async fn complete_on_lane(
         if ack.attempt != captured.attempt_hex() || ack.capture != captured.manifest_key() {
             drop(captured);
             return completion_not_published(&finished_key, "capture identity mismatch");
+        }
+        #[cfg(test)]
+        if let Some(pause) = &live.publication_pause {
+            pause.wait();
         }
         let (outcome, known) = captured.publish();
         for output in known {

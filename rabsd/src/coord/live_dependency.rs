@@ -70,6 +70,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod canonical;
 pub mod remote;
 
 mod capture_pins;
@@ -109,10 +110,16 @@ pub struct LiveDependencyRequest {
     pub toolchain: ToolchainGuard,
     /// `(path, digest)` of every extern the key covers.
     pub externs: Vec<(String, TypedDigest)>,
+    /// Driver-owned namespace/backing capability. Ordinary wrapper requests
+    /// cannot construct it, and remote execution never inherits it.
+    pub canonical_paths: Option<Arc<canonical::CanonicalPaths>>,
 }
 
 impl LiveDependencyRequest {
     fn verify_read_closure(&self) -> Result<(), String> {
+        if self.plan.canonical_cargo != self.canonical_paths.is_some() {
+            return Err("canonical compiler plan lacks its retained driver capability".into());
+        }
         check_dependency_cache_read_closure(&self.plan.invocation)
             .map_err(|refusal| refusal.to_string())?;
         self.verify_output_contract()
@@ -125,6 +132,9 @@ impl LiveDependencyRequest {
         &self,
         remote: Option<&remote::RemoteValidation>,
     ) -> Result<(), String> {
+        if remote.is_some() && self.canonical_paths.is_some() {
+            return Err("canonical local execution cannot borrow remote authority".into());
+        }
         match remote {
             Some(remote) => remote.verify_read_closure(self),
             None => self.verify_read_closure(),
@@ -146,8 +156,47 @@ impl LiveDependencyRequest {
     }
 
     fn verify_toolchain(&self) -> Result<(), String> {
+        let physical = self.io_plan()?;
         self.toolchain
-            .verify_unchanged(Path::new(&self.plan.compiler))
+            .verify_unchanged(Path::new(&physical.compiler))
+    }
+
+    fn io_plan(&self) -> Result<std::borrow::Cow<'_, DependencyActionPlan>, String> {
+        match &self.canonical_paths {
+            Some(paths) => paths.project_plan(&self.plan).map(std::borrow::Cow::Owned),
+            None => Ok(std::borrow::Cow::Borrowed(&self.plan)),
+        }
+    }
+
+    fn output_directory(&self) -> Result<PathBuf, String> {
+        match &self.canonical_paths {
+            Some(paths) => paths.physical(Path::new(&self.plan.out_dir)),
+            None => Ok(PathBuf::from(&self.plan.out_dir)),
+        }
+    }
+
+    fn verify_package(&self) -> Result<(), String> {
+        let physical = self.io_plan()?;
+        self.package
+            .verify_unchanged(Path::new(&physical.source_root))?;
+        self.package.verify_generated_disjoint(&physical)
+    }
+
+    fn verify_canonical_surface(
+        &self,
+        surface: rabs_sandbox::leak_scanner::Surface,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        match &self.canonical_paths {
+            Some(paths) => {
+                let roots = paths.backing_roots();
+                let (first, rest) = roots
+                    .split_first()
+                    .ok_or("missing canonical backing roots")?;
+                verify_canonical_surface_free_of_roots(surface, bytes, first, rest)
+            }
+            None => verify_canonical_surface_free_of_staging_roots(surface, bytes, &self.plan),
+        }
     }
 }
 
@@ -291,20 +340,19 @@ impl PendingServe {
         if let Err(reason) = self
             .request
             .verify_toolchain()
-            .and_then(|()| {
-                self.request
-                    .package
-                    .verify_unchanged(Path::new(&plan.source_root))
-            })
-            .and_then(|()| self.request.package.verify_generated_disjoint(plan))
+            .and_then(|()| self.request.verify_package())
             .and_then(|()| self.request.dependencies.verify_unchanged())
         {
             return InstallResult::Declined(reason);
         }
         let expected = expected_outputs(plan);
+        let physical = match self.request.io_plan() {
+            Ok(physical) => physical,
+            Err(reason) => return InstallResult::Declined(reason),
+        };
         match self.coord.serve_for_subscriber(
             &self.request.key.action_key,
-            Path::new(&plan.out_dir),
+            Path::new(&physical.out_dir),
             &expected,
             now_micros(),
             ServeMode::Install,
@@ -347,7 +395,7 @@ impl PendingServe {
                 finish_installation(
                     &self.request.dependencies,
                     &self.request.package,
-                    plan,
+                    &physical,
                     render_compiler_transcript(&self.canonical_transcript, plan),
                     installed,
                 )
@@ -780,9 +828,10 @@ impl LiveDependencyLane {
             return Ok(Err(request));
         };
         let expected = expected_outputs(&request.plan);
+        let physical_outputs = request.output_directory()?;
         match self.coord.serve_for_subscriber(
             &key,
-            Path::new(&request.plan.out_dir),
+            &physical_outputs,
             &expected,
             now_micros(),
             ServeMode::Preview,
@@ -937,8 +986,8 @@ impl LocalAttempt {
     /// Capture caller-owned outputs before acknowledging their custody.
     pub fn capture(self, report: &CompletionReport) -> Result<CapturedLocalAttempt, String> {
         let attempt = self.0;
-        let result =
-            attempt.capture_result(report, Path::new(&attempt.request.plan.out_dir), None)?;
+        let outputs = attempt.request.output_directory()?;
+        let result = attempt.capture_result(report, &outputs, None)?;
         Ok(CapturedLocalAttempt { attempt, result })
     }
 }
@@ -1038,17 +1087,13 @@ impl ExecutionAttempt {
         }
         self.request.verify_toolchain()?;
         let plan = &self.request.plan;
-        self.request
-            .package
-            .verify_unchanged(Path::new(&plan.source_root))?;
-        self.request.package.verify_generated_disjoint(plan)?;
+        self.request.verify_package()?;
         self.request.dependencies.verify_unchanged()?;
         let input_roots = mappings_for_plan(plan);
         let transcript = canonicalize_compiler_transcript(&report.stderr, plan)?;
-        verify_canonical_surface_free_of_staging_roots(
+        self.request.verify_canonical_surface(
             rabs_sandbox::leak_scanner::Surface::CompilerEvents,
             &transcript,
-            plan,
         )?;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let authority = self.authority.clone().ok_or("attempt not admitted")?;
@@ -1081,10 +1126,9 @@ impl ExecutionAttempt {
                     return Err(format!("closure: {violation}"));
                 }
                 let bytes = canonicalize_placements(&raw, plan)?;
-                verify_canonical_surface_free_of_staging_roots(
+                self.request.verify_canonical_surface(
                     rabs_sandbox::leak_scanner::Surface::DepInfo,
                     &bytes,
-                    plan,
                 )?;
                 (sig, put_bytes(cas, &bytes, &mut pins)?)
             } else {
@@ -1116,10 +1160,7 @@ impl ExecutionAttempt {
         }
         // The complete capture must be from one stable input generation, not
         // just start with one. After this barrier publication uses CAS only.
-        self.request
-            .package
-            .verify_unchanged(Path::new(&plan.source_root))?;
-        self.request.package.verify_generated_disjoint(plan)?;
+        self.request.verify_package()?;
         self.request.dependencies.verify_unchanged()?;
         self.request.verify_toolchain()?;
         // Each put takes the store lock for itself only: decisions for other
@@ -1143,12 +1184,16 @@ impl ExecutionAttempt {
                 "input_manifest": digest_key(&self.request.key.descriptor.action_inputs),
             }))
             .map_err(|error| error.to_string())?;
+            let directories = match &self.request.canonical_paths {
+                Some(paths) => paths.dependency_facts(&self.request.dependencies.directories)?,
+                None => self.request.dependencies.directories.clone(),
+            };
             let observed = serde_json::to_vec(&serde_json::json!({
                 "kind": "rabs-live-dependency-observed-inputs-v2",
                 "externs": self.request.externs.iter()
                     .map(|(path, digest)| serde_json::json!([path, digest_key(digest)]))
                     .collect::<Vec<_>>(),
-                "dependency_directories": self.request.dependencies.directories.iter().map(|directory| {
+                "dependency_directories": directories.iter().map(|directory| {
                     serde_json::json!({
                         "path": directory.path,
                         "artifacts": directory.artifacts.iter().map(|artifact| serde_json::json!([artifact.path, digest_key(&artifact.content_digest)])).collect::<Vec<_>>(),

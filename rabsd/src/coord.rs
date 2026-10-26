@@ -19,6 +19,8 @@
 //! immutable blobs and evidence but can never publish (risk R120).
 
 pub mod action_actor;
+#[cfg(target_os = "linux")]
+pub mod canonical_local;
 pub mod target_lease;
 
 pub mod delivery_ack;

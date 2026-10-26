@@ -5,6 +5,7 @@
 //! Every file (listed or not) is still captured and keyed by LiveFacts, and
 //! ordinary post-execution closure, serving and publication checks remain.
 
+use crate::coord::live_dependency::canonical::CanonicalPaths;
 use crate::edge::live_facts::read_stable;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_key::live_dependency::{
@@ -113,6 +114,34 @@ pub(super) fn plan_dependency_action(
         })?
         .atp_content_id;
     plan_directory_dependency_action(request, host, witness)
+}
+
+/// Observe a directory-source witness through a retained canonical mount.
+/// The checksum still identifies the captured document, not trusted content.
+pub(super) fn plan_canonical_dependency_action(
+    request: LiveRustcRequest<'_>,
+    host: &str,
+    paths: &CanonicalPaths,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    use rabs_key::live_dependency::plan_canonical_cargo_dependency_action;
+
+    let package = match plan_canonical_cargo_dependency_action(request, host, None) {
+        Err(LiveRefusal::NotDependencySource(package)) => package,
+        result => return result,
+    };
+    let root = paths
+        .physical(Path::new(&package))
+        .map_err(LiveRefusal::Facts)?;
+    if !std::fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(LiveRefusal::NotDependencySource(package));
+    }
+    let (_, document) = read_stable(&root.join(".cargo-checksum.json"), MAX_CHECKSUM_BYTES)
+        .map_err(|_| LiveRefusal::NotDependencySource(package.clone()))?;
+    validate_checksum(&document)?;
+    let witness = digest_set(&document, DigestRequest::default(), None)
+        .map_err(|_| LiveRefusal::Facts("cannot identify captured directory checksum".into()))?
+        .atp_content_id;
+    plan_canonical_cargo_dependency_action(request, host, Some(witness))
 }
 
 #[cfg(test)]

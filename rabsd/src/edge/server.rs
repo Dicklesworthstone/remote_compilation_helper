@@ -39,6 +39,7 @@ use rabs_protocol::socket_admission::{
 };
 use rabs_protocol::version_negotiation::{Negotiation, VersionHello, VersionRange, negotiate};
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Frame size bound (one JSON line).
@@ -108,6 +109,130 @@ struct EdgeServices {
     prepared_operations:
         Option<std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
     live: Option<std::sync::Arc<rustc_request::LiveEdge>>,
+    /// A prepared canonical Cargo operation can consult only its rustc lane.
+    /// It never receives the normal daemon's status, prepared-job, or generic
+    /// cache-serving capabilities.
+    canonical_only: bool,
+    canonical_activity: Option<Arc<CanonicalActivity>>,
+}
+
+/// Completion barrier for one prepared canonical Cargo operation. Cargo can
+/// exit after its wrapper acknowledges captured outputs but before the edge
+/// publishes them. Keep the coordinator alive until those sessions finish.
+/// Admission is sealed only after Cargo's entire process group has stopped.
+#[derive(Debug)]
+pub(crate) struct CanonicalActivity {
+    state: Mutex<CanonicalActivityState>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+struct CanonicalActivityState {
+    accepting: bool,
+    active: usize,
+}
+
+impl CanonicalActivity {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CanonicalActivityState {
+                accepting: true,
+                active: 0,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn admit(self: &Arc<Self>) -> Option<CanonicalSession> {
+        let mut state = self.state.lock().ok()?;
+        if !state.accepting {
+            return None;
+        }
+        state.active = state.active.checked_add(1)?;
+        Some(CanonicalSession(Arc::clone(self)))
+    }
+
+    /// Seal before testing the counter: an accepted-but-not-yet-counted socket
+    /// must be refused before hello or request handling rather than racing a
+    /// transient zero. A live wrapper that already received a capture receipt
+    /// necessarily owns a counted session, including a queued final ACK.
+    pub(crate) fn seal_and_wait(
+        &self,
+        budget: Duration,
+        stopped: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now()
+            .checked_add(budget)
+            .ok_or("canonical publication drain deadline overflow")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "canonical activity lock poisoned")?;
+        state.accepting = false;
+        loop {
+            if stopped() {
+                return Err("canonical coordinator stopped before publication drain".into());
+            }
+            if state.active == 0 {
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "canonical publication drain timed out with {} active sessions",
+                    state.active
+                ));
+            }
+            let wait = deadline.duration_since(now).min(Duration::from_millis(50));
+            (state, _) = self
+                .changed
+                .wait_timeout(state, wait)
+                .map_err(|_| "canonical activity lock poisoned during drain")?;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_sessions(&self) -> usize {
+        self.state.lock().unwrap().active
+    }
+}
+
+struct CanonicalSession(Arc<CanonicalActivity>);
+impl Drop for CanonicalSession {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+        self.0.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod canonical_activity_tests {
+    use super::*;
+
+    #[test]
+    fn sealing_covers_admitted_sessions_and_refuses_late_registration() {
+        let activity = CanonicalActivity::new();
+        let session = activity.admit().unwrap();
+        assert_eq!(activity.active_sessions(), 1);
+        // A zero budget is a deterministic deadline, not a sleep-based claim
+        // that a captured-but-unpublished session has finished.
+        let error = activity
+            .seal_and_wait(Duration::ZERO, || false)
+            .unwrap_err();
+        assert!(error.contains("1 active sessions"), "{error}");
+        assert!(
+            activity.admit().is_none(),
+            "late accepted sockets must not gain authority"
+        );
+        assert_eq!(activity.active_sessions(), 1);
+        drop(session);
+        assert!(activity.seal_and_wait(Duration::ZERO, || false).is_ok());
+    }
 }
 
 /// The daemon's own hello (transport v1..=1, application v1..=1).
@@ -167,13 +292,28 @@ fn render_log_line(kind: &str, fields: &[(&str, &str)]) -> String {
 ///
 /// [`DaemonRunOptions`]: rabs_asupersync::daemon_runtime::DaemonRunOptions
 pub fn edge_work(config: EdgeServerConfig) -> SubsystemWork {
-    Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config)))
+    Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config, None)))
+}
+
+/// A build-scoped endpoint for a coordinator-owned canonical Cargo driver.
+/// The retained path capability is constructed only after source/toolchain
+/// capture and graph admission; request JSON cannot create or replace it.
+pub(crate) fn canonical_edge_work(
+    config: EdgeServerConfig,
+    paths: std::sync::Arc<crate::coord::live_dependency::canonical::CanonicalPaths>,
+    activity: Arc<CanonicalActivity>,
+) -> SubsystemWork {
+    Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config, Some((paths, activity)))))
 }
 
 async fn serve(
     cx: Cx,
     mut shutdown: ShutdownReceiver,
     config: EdgeServerConfig,
+    canonical: Option<(
+        std::sync::Arc<crate::coord::live_dependency::canonical::CanonicalPaths>,
+        Arc<CanonicalActivity>,
+    )>,
 ) -> Result<(), String> {
     let listener = endpoint::bind(&config.socket_path, FRAME_IO_BUDGET).await?;
     // The endpoint owner just checked the exact bound inode, kernel UID and
@@ -202,6 +342,7 @@ async fn serve(
     // Acceptor and connections remain region-owned. Each admitted blocking
     // operation also owns a join guard; abort cannot leave a detached writer.
     let acceptor_cx = cx.clone();
+    let canonical_only = canonical.is_some();
     let services = EdgeServices {
         shadow,
         coord: config.coord.clone(),
@@ -210,10 +351,15 @@ async fn serve(
             .live_dependency
             .clone()
             .map(|lane| {
-                rustc_request::LiveEdge::configured(lane, &config.state_dir)
-                    .map(std::sync::Arc::new)
+                match &canonical {
+                    Some((paths, _)) => Ok(rustc_request::LiveEdge::canonical(lane, paths.clone())),
+                    None => rustc_request::LiveEdge::configured(lane, &config.state_dir),
+                }
+                .map(std::sync::Arc::new)
             })
             .transpose()?,
+        canonical_only,
+        canonical_activity: canonical.as_ref().map(|(_, activity)| Arc::clone(activity)),
     };
     let limits = EdgeLimits::new(
         services
@@ -258,10 +404,23 @@ async fn accept_loop(
                     return;
                 };
                 connection_id = id;
+                let session = if let Some(activity) = &services.canonical_activity {
+                    let Some(session) = activity.admit() else {
+                        drop(stream);
+                        continue;
+                    };
+                    Some(session)
+                } else {
+                    None
+                };
                 let services = services.clone();
                 let limits = limits.clone();
                 let endpoint_owner = std::sync::Arc::clone(&listener.owner);
                 let spawned = cx.spawn(move |cx| async move {
+                    // This guard is captured BEFORE spawn and outlives the
+                    // complete connection future, including joined publication
+                    // work on cancellation. No zero-counter scheduling gap.
+                    let _canonical_session = session;
                     // Outlives handle_connection, including cancellation that
                     // drops its joined blocking-work owners. A replacement
                     // daemon cannot acquire this endpoint during that cleanup.
@@ -366,6 +525,8 @@ async fn handle_connection(
         coord,
         prepared_operations,
         live,
+        canonical_only,
+        canonical_activity: _,
     } = services;
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
@@ -443,6 +604,16 @@ async fn handle_connection(
             break;
         };
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
+            Ok(value)
+                if canonical_only
+                    && value.get("kind").and_then(|kind| kind.as_str())
+                        != Some("rustc-request") =>
+            {
+                refusal(
+                    "canonical-build-socket",
+                    "this operation grants only canonical rustc requests",
+                )
+            }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
                 let remote = live
                     .as_ref()
