@@ -1004,8 +1004,17 @@ fn exact_target_precedes_a_more_recent_compatible_seed() {
 
 #[test]
 fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_groups() {
-    let cache = Arc::new(TargetCache::new(1024).unwrap());
+    let cache = Arc::new(TargetCache::new(1024 * 1024).unwrap());
     let (source, plan, target, _) = small_fixture();
+    // Exercise the production clone candidate path as well as internal aliases.
+    // Hosts without reflinks must preserve the same guarantees through copying.
+    let bytes = vec![0xa5; 96 * 1024 + 7];
+    fs::write(target.backing().join("artifact"), &bytes).unwrap();
+    fs::set_permissions(
+        target.backing().join("artifact"),
+        fs::Permissions::from_mode(0o750),
+    )
+    .unwrap();
     fs::hard_link(
         target.backing().join("artifact"),
         target.backing().join("artifact-alias"),
@@ -1053,9 +1062,10 @@ fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_gro
     );
     assert_eq!(cloned.nlink(), 2);
     assert_eq!(original.modified().unwrap(), cloned.modified().unwrap());
+    assert_eq!(cloned.permissions().mode() & 0o777, 0o750);
     assert_eq!(
         fs::read(restored.backing().join("artifact")).unwrap(),
-        b"seed"
+        bytes
     );
     assert_eq!(
         fs::metadata(restored.backing().join("empty-out-dir"))
@@ -1066,10 +1076,23 @@ fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_gro
         0o750
     );
     fs::write(restored.backing().join("artifact"), "mine").unwrap();
+    fs::set_permissions(
+        restored.backing().join("artifact"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    File::open(restored.backing().join("artifact"))
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)))
+        .unwrap();
     assert_eq!(
         fs::read(restored.backing().join("artifact-alias")).unwrap(),
         b"mine"
     );
+    let unchanged = fs::metadata(target.backing().join("artifact")).unwrap();
+    assert_eq!(fs::read(target.backing().join("artifact")).unwrap(), bytes);
+    assert_eq!(unchanged.permissions().mode() & 0o777, 0o750);
+    assert_eq!(unchanged.modified().unwrap(), original.modified().unwrap());
     let (_, independent) = cache
         .acquire(
             key,
@@ -1083,11 +1106,17 @@ fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_gro
     let independent = independent.unwrap();
     assert_eq!(
         fs::read(independent.backing().join("artifact")).unwrap(),
-        b"seed"
+        bytes
     );
     assert_eq!(
         fs::read(independent.backing().join("artifact-alias")).unwrap(),
-        b"seed"
+        bytes
+    );
+    let independent_metadata = fs::metadata(independent.backing().join("artifact")).unwrap();
+    assert_eq!(independent_metadata.permissions().mode() & 0o777, 0o750);
+    assert_eq!(
+        independent_metadata.modified().unwrap(),
+        original.modified().unwrap()
     );
     assert_ne!(
         fs::metadata(independent.backing().join("artifact"))
@@ -1095,6 +1124,212 @@ fn clones_preserve_bytes_timestamps_empty_directories_modes_and_private_link_gro
             .ino(),
         cloned.ino()
     );
+}
+
+fn target_copy_files(bytes: &[u8]) -> (tempfile::TempDir, File, File) {
+    let root = private_directory("rabs-target-copy-test-").unwrap();
+    fs::write(root.path().join("source"), bytes).unwrap();
+    let input = File::open(root.path().join("source")).unwrap();
+    let output = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(root.path().join("output"))
+        .unwrap();
+    (root, input, output)
+}
+
+#[test]
+fn small_target_copies_skip_clone_probes_and_reset_empty_or_partial_outputs() {
+    use std::io::{Seek, SeekFrom};
+
+    for length in [0, 1, 64 * 1024] {
+        let bytes = vec![0x6d; length];
+        let (root, mut input, mut output) = target_copy_files(&bytes);
+        input.seek(SeekFrom::End(0)).unwrap();
+        output.write_all(&vec![0x33; length + 17]).unwrap();
+        let digest = clone_or_copy_private_with_cloner(
+            &mut input,
+            &mut output,
+            root.path(),
+            length as u64,
+            &|| false,
+            |_, _, _| panic!("small files must not pay for a clone isolation probe"),
+        )
+        .unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(digest, expected);
+        assert_eq!(fs::read(root.path().join("output")).unwrap(), bytes);
+        assert_eq!(output.metadata().unwrap().len(), length as u64);
+    }
+}
+
+#[test]
+fn failed_target_clone_rewinds_both_handles_and_discards_partial_output() {
+    use std::io::{Seek, SeekFrom};
+
+    let bytes = vec![0x5a; 96 * 1024 + 7];
+    let (root, mut input, mut output) = target_copy_files(&bytes);
+    let digest = clone_or_copy_private_with_cloner(
+        &mut input,
+        &mut output,
+        root.path(),
+        bytes.len() as u64,
+        &|| false,
+        |mut source, mut destination, _| {
+            // A failed backend is allowed to disturb both cursor positions and
+            // leave bytes behind. The fallback must replace the entire file.
+            source.seek(SeekFrom::End(0)).unwrap();
+            destination
+                .write_all(&vec![0xff; bytes.len() + 29])
+                .unwrap();
+            false
+        },
+    )
+    .unwrap();
+    let expected: [u8; 32] = Sha256::digest(&bytes).into();
+    assert_eq!(digest, expected);
+    assert_eq!(fs::read(root.path().join("output")).unwrap(), bytes);
+    assert_eq!(output.metadata().unwrap().len(), bytes.len() as u64);
+}
+
+#[test]
+fn target_clone_hash_and_length_validation_read_the_actual_destination() {
+    let source_bytes = vec![0x17; 96 * 1024 + 7];
+    for delta in [-1_isize, 0, 1] {
+        let cloned_bytes = vec![0x91; source_bytes.len().checked_add_signed(delta).unwrap()];
+        let (root, mut input, mut output) = target_copy_files(&source_bytes);
+        let result = clone_or_copy_private_with_cloner(
+            &mut input,
+            &mut output,
+            root.path(),
+            source_bytes.len() as u64,
+            &|| false,
+            |_, mut destination, _| {
+                // Deterministically exercise validation independently of the
+                // host filesystem. This injection is not proof of real CoW.
+                destination.write_all(&cloned_bytes).unwrap();
+                true
+            },
+        );
+        if delta == 0 {
+            let expected: [u8; 32] = Sha256::digest(&cloned_bytes).into();
+            let source_digest: [u8; 32] = Sha256::digest(&source_bytes).into();
+            assert_eq!(result.unwrap(), expected);
+            assert_ne!(expected, source_digest);
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains(if delta < 0 { "shrank" } else { "grew" })
+            );
+        }
+    }
+}
+
+#[test]
+fn target_clone_cancellation_prevents_return_before_destination_validation() {
+    let bytes = vec![0x6e; 96 * 1024 + 7];
+    let (root, mut input, mut output) = target_copy_files(&bytes);
+    let cancelled = std::cell::Cell::new(false);
+    let error = clone_or_copy_private_with_cloner(
+        &mut input,
+        &mut output,
+        root.path(),
+        bytes.len() as u64,
+        &|| cancelled.get(),
+        |_, mut destination, _| {
+            destination.write_all(&bytes).unwrap();
+            cancelled.set(true);
+            true
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+#[ignore = "requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem"]
+fn real_target_reflink_preserves_private_bytes_metadata_and_independent_writes() {
+    let parent = std::env::var_os("RABS_REFLINK_TEST_ROOT")
+        .expect("set RABS_REFLINK_TEST_ROOT to a reflink-capable filesystem");
+    let root = tempfile::Builder::new()
+        .prefix("rabs-real-target-reflink-")
+        .tempdir_in(parent)
+        .unwrap();
+    let bytes = vec![0x42; 96 * 1024 + 7];
+    let source_path = root.path().join("source");
+    let output_path = root.path().join("output");
+    fs::write(&source_path, &bytes).unwrap();
+    fs::set_permissions(&source_path, fs::Permissions::from_mode(0o750)).unwrap();
+    let mut input = File::open(&source_path).unwrap();
+    input
+        .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(123)))
+        .unwrap();
+    let before = input.metadata().unwrap();
+    let mut output = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .unwrap();
+    let cloned = std::cell::Cell::new(false);
+    let digest = clone_or_copy_private_with_cloner(
+        &mut input,
+        &mut output,
+        root.path(),
+        bytes.len() as u64,
+        &|| false,
+        |source, destination, directory| {
+            let result =
+                rabs_cas::materialization::try_verified_reflink(source, destination, directory);
+            cloned.set(result);
+            result
+        },
+    )
+    .unwrap();
+    assert!(
+        cloned.get(),
+        "a copied fallback cannot satisfy the real-reflink gate"
+    );
+    let expected: [u8; 32] = Sha256::digest(&bytes).into();
+    assert_eq!(digest, expected);
+    assert_eq!(fs::read(&output_path).unwrap(), bytes);
+    let cloned_metadata = output.metadata().unwrap();
+    assert_eq!(before.dev(), cloned_metadata.dev());
+    assert_ne!(before.ino(), cloned_metadata.ino());
+
+    // Apply the same metadata steps as copy_tree, then prove that later target
+    // writes, truncation and metadata changes leave the retained inode intact.
+    output.set_permissions(before.permissions()).unwrap();
+    output
+        .set_times(FileTimes::new().set_modified(before.modified().unwrap()))
+        .unwrap();
+    assert_eq!(
+        output.metadata().unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert_eq!(
+        output.metadata().unwrap().modified().unwrap(),
+        before.modified().unwrap()
+    );
+    fs::write(&output_path, b"private target mutation").unwrap();
+    output.set_len(7).unwrap();
+    output
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    output
+        .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(456)))
+        .unwrap();
+    let unchanged = input.metadata().unwrap();
+    assert_eq!(fs::read(&source_path).unwrap(), bytes);
+    assert_eq!(unchanged.len(), before.len());
+    assert_eq!(unchanged.permissions().mode() & 0o777, 0o750);
+    assert_eq!(unchanged.modified().unwrap(), before.modified().unwrap());
+    fs::write(&source_path, b"source mutation").unwrap();
+    assert_eq!(fs::read(&output_path).unwrap(), b"private");
 }
 
 #[test]

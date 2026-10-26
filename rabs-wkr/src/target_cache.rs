@@ -1225,11 +1225,18 @@ fn copy_tree(
             digest
         } else {
             let mut output = OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(destination.join(name))?;
-            let digest = hash_copy(&mut input, &mut output, metadata.len(), stopped)?;
+            let digest = clone_or_copy_private(
+                &mut input,
+                &mut output,
+                destination,
+                metadata.len(),
+                stopped,
+            )?;
             output.set_permissions(fs::Permissions::from_mode(mode))?;
             output.set_times(FileTimes::new().set_modified(modified))?;
             aliases.insert(inode, name.to_owned());
@@ -1255,6 +1262,57 @@ fn copy_tree(
     }
     tree.verify(stopped)?;
     Ok((files, directories))
+}
+
+/// Retained target state and each restored attempt must own different writable
+/// inodes. Reuse the CAS materializer's verified CoW primitive to avoid writing
+/// the entire target twice per build. Hash the actual clone, not the source, and
+/// keep copy_tree's source inventory and expected seed-digest checks unchanged.
+/// Logical bytes remain fully charged to the pool even when extents are shared.
+#[cfg(target_os = "linux")]
+fn clone_or_copy_private(
+    input: &mut File,
+    output: &mut File,
+    parent: &Path,
+    length: u64,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<[u8; 32]> {
+    clone_or_copy_private_with_cloner(
+        input,
+        output,
+        parent,
+        length,
+        stopped,
+        rabs_cas::materialization::try_verified_reflink,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn clone_or_copy_private_with_cloner(
+    input: &mut File,
+    output: &mut File,
+    parent: &Path,
+    length: u64,
+    stopped: &impl Fn() -> bool,
+    cloner: impl FnOnce(&File, &File, &Path) -> bool,
+) -> io::Result<[u8; 32]> {
+    use std::io::Seek;
+
+    checkpoint(stopped)?;
+    // Fingerprint and dep-info files fit in a single copy buffer. Avoid the
+    // isolation probe's extra file creations and writes for those tiny inputs,
+    // including on filesystems without clone support.
+    if length > 64 * 1024 && cloner(input, output, parent) {
+        output.rewind()?;
+        hash_copy(output, &mut io::sink(), length, stopped)
+    } else {
+        // Unsupported or failed clones may have partially changed the fresh
+        // output. Never retain a suffix, including for an empty source file.
+        output.set_len(0)?;
+        output.rewind()?;
+        input.rewind()?;
+        hash_copy(input, output, length, stopped)
+    }
 }
 
 fn hash_copy(

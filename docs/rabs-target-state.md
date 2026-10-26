@@ -64,6 +64,16 @@ changes and byte-limit reductions use the same bounded store instead of leaving
 an unbounded directory per epoch. Neither durable nor process-only mode shares
 writable target files between workers or executions.
 
+On supported Linux filesystems, retaining and restoring files larger than 64 KiB
+uses verified copy-on-write reflinks. The worker probes filesystem isolation,
+hashes the actual private clone, rechecks the original inventory, and restores
+the exact permissions and timestamps Cargo uses for freshness. Unsupported or
+failed clones use the ordinary verified byte-copy path; small fingerprint and
+dep-info files use that path directly. Each seed and execution still owns
+different writable inodes, and the quota continues to charge the full logical
+target size. This reduces target-copy writes where reflinks are available;
+it does not skip validation or change which Cargo commands execute.
+
 Managed deployments accept the same two environment settings through
 `scripts/rabs_fleet_deploy.sh`. Omitted values retain the active managed settings
 during an upgrade. An explicit zero byte limit disables retention; an explicit
