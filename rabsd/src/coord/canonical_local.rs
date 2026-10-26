@@ -1,6 +1,6 @@
 //! Local canonical Cargo execution connected to the coordinator's rustc cache.
 //!
-//! This explicit profile runs a selected `cargo check --offline --locked` against
+//! This explicit profile runs a selected Cargo check or build offline and locked against
 //! captured inputs and a captured toolchain. Cargo itself runs at canonical
 //! paths, so unit hashes and rustc arguments are stable across checkouts. A
 //! fresh operation-scoped socket admits only rustc requests; the persistent
@@ -8,8 +8,8 @@
 //!
 //! The actual selected Cargo unit graph must contain no build scripts or
 //! procedural macros. Inactive package targets do not grant code execution.
-//! Eligible external dependency metadata uses the existing evidence-gated
-//! lane. Workspace crates and unsupported rustc invocations still compile
+//! Eligible external dependencies use the existing evidence-gated lane;
+//! archive codegen requires an isolated worker. Workspace crates and unsupported rustc invocations still compile
 //! normally in the namespace; this does not promote a workspace cache class.
 
 use super::live::{CoordLive, cluster_id};
@@ -29,7 +29,9 @@ use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{
     CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
 };
-use rabs_sandbox::cargo_check::{CheckSelection, validate_check_unit_graph};
+use rabs_sandbox::cargo_check::{
+    CompilationCommand, CompilationSelection, validate_compilation_unit_graph,
+};
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -43,7 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const PROFILE_VERSION: &str = "canonical-check-local-v1";
+const PROFILE_VERSION: &str = "canonical-compile-local-v1";
 const CARGO: &str = "/__rabs/toolchain/bin/cargo";
 const RUSTC: &str = "/__rabs/toolchain/bin/rustc";
 const TARGET: &str = "/__rabs/out/cargo";
@@ -63,13 +65,15 @@ struct Profile {
     state_root: PathBuf,
     operation_root: PathBuf,
     wrapper: PathBuf,
+    #[serde(default)]
+    command: CompilationCommand,
     #[serde(default = "default_manifest")]
     manifest: String,
     vendor: Option<String>,
     cargo_home_source: Option<PathBuf>,
-    /// An absent field retains the original library-only profile. An explicit
-    /// empty selection uses Cargo's ordinary default members and targets.
-    selection: Option<CheckSelection>,
+    /// An absent check selection retains the library-only default. An explicit
+    /// empty selection and builds use Cargo's ordinary default members/targets.
+    selection: Option<CompilationSelection>,
     #[serde(default = "default_jobs")]
     jobs: u32,
     #[serde(default = "default_timeout")]
@@ -156,7 +160,7 @@ struct StateOwner {
 }
 impl StateOwner {
     fn acquire(parent: &Path) -> io::Result<Self> {
-        let root = parent.join("canonical-check-v1");
+        let root = parent.join("canonical-compile-v1");
         match create_private(&root) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => private_directory(&root)?,
@@ -194,7 +198,7 @@ impl Profile {
     fn validate(&self) -> io::Result<()> {
         require(
             self.version == PROFILE_VERSION,
-            "unsupported canonical check profile version",
+            "unsupported canonical compilation profile version",
         )?;
         require(
             (1..=4096).contains(&self.jobs),
@@ -204,7 +208,7 @@ impl Profile {
             (1..=7200).contains(&self.timeout_seconds),
             "timeout_seconds must be between 1 and 7200",
         )?;
-        self.check_args()?;
+        self.compilation_args()?;
         require(
             relative_member(&self.manifest),
             "manifest must be an ordinary relative path",
@@ -283,10 +287,13 @@ impl Profile {
         cwd
     }
 
-    fn check_args(&self) -> io::Result<Vec<String>> {
+    fn compilation_args(&self) -> io::Result<Vec<String>> {
         let mut args = match &self.selection {
-            Some(selection) => selection.cargo_arguments()?,
-            None => vec!["check".into(), "--lib".into()],
+            Some(selection) => selection.cargo_arguments(self.command)?,
+            None if self.command == CompilationCommand::Check => {
+                vec!["check".into(), "--lib".into()]
+            }
+            None => vec![self.command.as_str().into()],
         };
         args.extend([
             "--offline".into(),
@@ -310,7 +317,7 @@ impl Profile {
         }
         Ok(json!({
             "kind":"canonical-exec", "request_id":1, "program":CARGO,
-            "args":self.check_args()?, "toolchain_source":self.toolchain_root,
+            "args":self.compilation_args()?, "toolchain_source":self.toolchain_root,
             "cargo_source":source,
             "command_context":{"version":"env-cwd-v1", "cwd":self.cwd(),
                 "env":{"CARGO_INCREMENTAL":"0", "CARGO_TARGET_DIR":TARGET, "RUSTC":RUSTC}}
@@ -322,7 +329,7 @@ impl Profile {
 /// identity as the normal daemon. This entry point intentionally has no
 /// implicit advisory-policy overload.
 ///
-/// Planning output is captured under a byte bound. The actual check inherits
+/// Planning output is captured under a byte bound. The actual compilation inherits
 /// stdout/stderr, so diagnostics and Cargo JSON reach the caller immediately
 /// with their original bytes and native pipe/terminal behavior. The exit code
 /// is Cargo's real result; a timeout, cancellation or incomplete process-group
@@ -341,13 +348,13 @@ pub fn run_profile_with_release(
     require(
         support.missing_for_canonical().is_empty(),
         &format!(
-            "canonical local check requires measured namespace support: {:?}",
+            "canonical local compilation requires measured namespace support: {:?}",
             support.missing_for_canonical()
         ),
     )?;
     let owner = Arc::new(
         tempfile::Builder::new()
-            .prefix("rabs-check-")
+            .prefix("rabs-compile-")
             .tempdir_in(&profile.operation_root)?,
     );
     let bundle = owner.path().join("bundle");
@@ -420,20 +427,20 @@ pub fn run_profile_with_release(
             ("/__rabs/workspace".into(), workspace),
             ("/__rabs/cargo-home".into(), cargo_root),
             ("/__rabs/toolchain".into(), toolchain),
-            (TARGET.into(), target_root),
+            (TARGET.into(), target_root.clone()),
             ("/__rabs/home".into(), home_root.clone()),
         ],
     )
     .map_err(io::Error::other)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let timeout = Duration::from_secs(profile.timeout_seconds);
-    let check_args = profile.check_args()?;
-    // Ask the captured Cargo for the exact units this check would compile.
+    let compilation_args = profile.compilation_args()?;
+    // Ask the captured Cargo for the exact units this command would compile.
     // Metadata's package list includes inactive optional/dev targets and cannot
     // establish which build scripts or proc macros a selected check executes.
     // The unit-graph query does not compile/run units, and the cache endpoint
     // does not exist yet. Unsupported Cargo versions fail closed here.
-    let mut graph_args = check_args.clone();
+    let mut graph_args = compilation_args.clone();
     graph_args.extend([
         "--unit-graph".into(),
         "-Z".into(),
@@ -457,7 +464,7 @@ pub fn run_profile_with_release(
         ));
     }
     let graph: Value = serde_json::from_reader(planned.stdout.reader()?)?;
-    let graph = validate_check_unit_graph(&graph)?;
+    let graph = validate_compilation_unit_graph(&graph, profile.command)?;
     for path in graph.source_paths() {
         let path = Path::new(path);
         require(
@@ -501,7 +508,7 @@ pub fn run_profile_with_release(
             prepared_operations: None,
             live_dependency: Some(LiveDependencyLane::new(coord.clone())),
         },
-        paths,
+        Arc::clone(&paths),
         Arc::clone(&activity),
     );
     let options = DaemonRunOptions {
@@ -532,8 +539,9 @@ pub fn run_profile_with_release(
     ]);
     eprintln!(
         "{}",
-        json!({"kind":"canonical-check-started", "version":PROFILE_VERSION,
-        "namespace":"canonical", "cache_scope":"external-dependency-metadata",
+        json!({"kind":"canonical-compilation-started", "version":PROFILE_VERSION,
+        "command":profile.command.as_str(), "namespace":"canonical",
+        "cache_scope":"external-dependency-metadata-and-worker-rlib",
         "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
         "selected_units":graph.units, "selected_packages":graph.packages,
         "selected_roots":graph.roots})
@@ -541,7 +549,7 @@ pub fn run_profile_with_release(
     let result = execute(
         &spec,
         &support,
-        &check_args,
+        &compilation_args,
         CargoOutput::Inherit,
         timeout,
         &stopped,
@@ -564,11 +572,54 @@ pub fn run_profile_with_release(
         "canonical coordinator did not drain cleanly",
     )?;
     eprintln!("{}", receipt.to_json_line());
+    if output.status.success() && profile.command == CompilationCommand::Build {
+        // No Cargo process, wrapper session or materializer remains. Verify
+        // the retained target mapping once more before moving its completed
+        // tree to a fresh private output owner. Captured source, toolchain,
+        // credentials and control sockets stay with the temporary operation.
+        require(
+            paths
+                .physical(Path::new(TARGET))
+                .map_err(io::Error::other)?
+                == target_root,
+            "completed target differs from its retained canonical mount",
+        )?;
+        let delivered = retain_build_target(&profile.operation_root, &target_root)?;
+        eprintln!(
+            "{}",
+            json!({"kind":"canonical-build-completed", "version":PROFILE_VERSION,
+                "canonical_target":TARGET, "target_directory":delivered})
+        );
+    }
     use std::os::unix::process::ExitStatusExt;
     Ok(output
         .status
         .code()
         .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(1)))
+}
+
+/// Move, rather than recopy, a fully drained target to a newly allocated private
+/// owner on the same filesystem. There is no caller-selected overwrite target
+/// and no retained copy of source or toolchain inputs. Only successful builds
+/// call this; check/error/cancellation paths keep temporary target ownership.
+fn retain_build_target(parent: &Path, target: &Path) -> io::Result<PathBuf> {
+    private_directory(parent)?;
+    require(
+        fs::symlink_metadata(target)?.is_dir(),
+        "completed Cargo target must be an ordinary directory",
+    )?;
+    let destination = tempfile::Builder::new()
+        .prefix("rabs-build-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    let delivered = destination.path().join("target");
+    fs::rename(target, &delivered)?;
+    // Ownership transfers immediately after the move: a later reporting/fsync
+    // error must not recursively discard a successful build's artifacts.
+    let retained = destination.keep();
+    File::open(&retained)?.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(delivered)
 }
 
 fn make_read_only(spec: &mut CanonicalNamespaceSpec, visible: &str) -> io::Result<()> {
@@ -859,17 +910,20 @@ mod tests {
     }
 
     #[test]
-    fn selected_checks_keep_driver_owned_control_arguments_and_legacy_library_default() {
+    fn selected_compilations_keep_driver_owned_control_arguments_and_check_library_default() {
         let mut profile: Profile = serde_json::from_value(json!({
             "version":PROFILE_VERSION, "source_root":"/source", "toolchain_root":"/toolchain",
             "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
         }))
         .unwrap();
-        assert_eq!(&profile.check_args().unwrap()[..2], ["check", "--lib"]);
-        profile.selection = Some(CheckSelection::default());
+        assert_eq!(
+            &profile.compilation_args().unwrap()[..2],
+            ["check", "--lib"]
+        );
+        profile.selection = Some(CompilationSelection::default());
         assert!(
             !profile
-                .check_args()
+                .compilation_args()
                 .unwrap()
                 .iter()
                 .any(|arg| arg == "--lib")
@@ -919,10 +973,110 @@ mod tests {
     }
 
     #[test]
+    fn build_command_uses_cargo_defaults_and_preserves_the_exact_graph_selection() {
+        let mut profile: Profile = serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "command":"build",
+            "source_root":"/source", "toolchain_root":"/toolchain",
+            "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
+        }))
+        .unwrap();
+        assert_eq!(profile.command, CompilationCommand::Build);
+        assert_eq!(
+            &profile.compilation_args().unwrap()[..2],
+            ["build", "--offline"]
+        );
+        profile.selection = Some(
+            serde_json::from_value(json!({
+                "packages":["app"], "bin":["server"], "profile":"release"
+            }))
+            .unwrap(),
+        );
+        let request = profile.source_specification().unwrap();
+        assert_eq!(
+            request["args"],
+            json!([
+                "build",
+                "--package",
+                "app",
+                "--bin",
+                "server",
+                "--profile",
+                "release",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+                "/__rabs/workspace/Cargo.toml",
+                "--message-format=json",
+                "--jobs",
+                "1"
+            ])
+        );
+        for command in ["test", "run", "bench", "rustc", "clippy"] {
+            assert!(serde_json::from_value::<Profile>(json!({
+                "version":PROFILE_VERSION, "command":command,
+                "source_root":"/source", "toolchain_root":"/toolchain",
+                "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
+            })).is_err());
+        }
+    }
+
+    #[test]
+    fn completed_build_retains_only_outputs_without_copying_or_overwriting() {
+        let owner = crate::test_util::private_tempdir();
+        let operation = tempfile::tempdir_in(owner.path()).unwrap();
+        let target = operation.path().join("target");
+        create_private(&target).unwrap();
+        create_private(&target.join("debug")).unwrap();
+        fs::write(target.join("debug/libapp.rlib"), b"complete archive").unwrap();
+        fs::write(target.join("debug/app"), b"completed executable").unwrap();
+        fs::set_permissions(target.join("debug/app"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            operation.path().join("captured-input"),
+            b"not a deliverable",
+        )
+        .unwrap();
+        let before = fs::metadata(target.join("debug/libapp.rlib")).unwrap();
+        let delivered = retain_build_target(owner.path(), &target).unwrap();
+        let after = fs::metadata(delivered.join("debug/libapp.rlib")).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert!(!target.exists());
+        assert!(operation.path().join("captured-input").is_file());
+        drop(operation);
+        assert_eq!(
+            fs::read(delivered.join("debug/libapp.rlib")).unwrap(),
+            b"complete archive"
+        );
+        assert_eq!(
+            fs::metadata(delivered.join("debug/app")).unwrap().mode() & 0o111,
+            0o111
+        );
+        assert_eq!(
+            fs::read_dir(delivered.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            fs::metadata(delivered.parent().unwrap()).unwrap().mode() & 0o077,
+            0
+        );
+
+        let next_operation = tempfile::tempdir_in(owner.path()).unwrap();
+        let next_target = next_operation.path().join("target");
+        create_private(&next_target).unwrap();
+        fs::write(next_target.join("different"), b"next build").unwrap();
+        let next = retain_build_target(owner.path(), &next_target).unwrap();
+        assert_ne!(next, delivered);
+        assert_eq!(
+            fs::read(delivered.join("debug/libapp.rlib")).unwrap(),
+            b"complete archive"
+        );
+        assert_eq!(fs::read(next.join("different")).unwrap(), b"next build");
+    }
+
+    #[test]
     fn live_profile_state_cannot_be_taken_over_and_does_not_alias_daemon_cas() {
         let owner = tempfile::tempdir().unwrap();
         let first = StateOwner::acquire(owner.path()).unwrap();
-        assert_eq!(first.root, owner.path().join("canonical-check-v1"));
+        assert_eq!(first.root, owner.path().join("canonical-compile-v1"));
         assert!(!owner.path().join("cas").exists());
         let refusal = match StateOwner::acquire(owner.path()) {
             Ok(_) => panic!("a live profile state owner was superseded"),

@@ -63,21 +63,24 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
   --rabs-canonical FILE  Build, check, lint, test, run or bench on a canonical worker.
-  --rabs-canonical-local FILE  Check selected Cargo units in the local canonical namespace.
+  --rabs-canonical-local FILE  Build or check selected Cargo units in the local canonical namespace.
   --rabs-recover DIR     Recover a retained canonical operation; never execute it again.
   --help                Show this help without starting a daemon or Cargo.
 
 Local canonical mode: cargo rabs --rabs-canonical-local PROFILE.json -- check --workspace
 It runs the captured nightly Cargo and rustc through rabsd's operation-owned
-canonical check driver. The profile version is canonical-check-local-v1; see
+canonical compilation driver. The profile version is canonical-compile-local-v1; see
 docs/rabs-canonical-cargo.md for its explicit source, toolchain, state, operation
 and wrapper paths. With no Cargo arguments this mode selects ordinary `check`.
 Package, workspace, feature, target-kind/named-target, built-in compilation target
-and compilation profile selection are accepted. These command arguments replace
-the profile's selection, including an empty selection for ordinary `check`; the
-selected manifest and jobs come from the profile. Cargo's actual unit graph determines admission before the cache
-endpoint is exposed. Only supported external metadata dependencies may earn a
-compiler skip; workspace units still compile. Build scripts and procedural
+and compilation profile selection are accepted with `check` or `build`. These
+command arguments replace the profile's command and selection, including an
+empty selection for ordinary `check`; the manifest and jobs come from the profile.
+Cargo's actual unit graph determines admission before the cache endpoint is exposed.
+Supported external metadata and isolated archive dependencies may earn a compiler
+skip; workspace units still compile. Successful builds retain their target tree
+at the private output path reported by the native driver. `build --tests` compiles
+harnesses without running them. Build scripts and procedural
 macros required by the selected units currently refuse this mode.
 The launcher retains the exact native profile in a new private operation
 directory and execs rabsd once. It starts no ordinary daemon, Cargo or RCH itself,
@@ -1669,13 +1672,13 @@ def run_canonical(args, env):
         return 127
 
 
-LOCAL_CHECK_FLAGS = {
+LOCAL_COMPILATION_FLAGS = {
     "--workspace": "workspace", "--all-features": "all_features",
     "--no-default-features": "no_default_features", "--lib": "lib",
     "--bins": "bins", "--tests": "tests", "--examples": "examples",
     "--benches": "benches", "--all-targets": "all_targets", "--release": "release",
 }
-LOCAL_CHECK_VALUES = {
+LOCAL_COMPILATION_VALUES = {
     "--package": "packages", "--exclude": "exclude", "--features": "features",
     "--bin": "bin", "--test": "test", "--example": "example", "--bench": "bench",
     "--target": "target",
@@ -1683,23 +1686,23 @@ LOCAL_CHECK_VALUES = {
 
 
 def canonical_local_selection(args):
-    """Translate only check selectors; the native driver owns command authority.
+    """Translate compilation selectors; the native driver owns command authority.
 
-    Selection bounds match rabs_sandbox::cargo_check::CheckSelection. Values
+    Selection bounds match rabs_sandbox::cargo_check::CompilationSelection. Values
     remain literal argv data. Cargo, not Python, interprets feature/package
     syntax; no flag can select a compiler, manifest, config or output root.
     """
     args = list(args) if args else ["check"]
-    if args[0] != "check":
-        raise SetupError("local canonical mode supports cargo check only")
+    if args[0] not in ("check", "build"):
+        raise SetupError("local canonical mode supports cargo check or build only")
     selection = {}
     at = 1
     while at < len(args):
         option, separator, value = args[at].partition("=")
         if option == "-r" and not separator:
             option = "--release"
-        if option in LOCAL_CHECK_FLAGS and not separator:
-            selection[LOCAL_CHECK_FLAGS[option]] = True
+        if option in LOCAL_COMPILATION_FLAGS and not separator:
+            selection[LOCAL_COMPILATION_FLAGS[option]] = True
             at += 1
             continue
         if option in ("-p", "-F"):
@@ -1707,7 +1710,7 @@ def canonical_local_selection(args):
         elif args[at].startswith(("-p", "-F")) and not args[at].startswith("--"):
             option = "--package" if args[at].startswith("-p") else "--features"
             separator, value = "=", args[at][2:]
-        if option not in LOCAL_CHECK_VALUES and option != "--profile":
+        if option not in LOCAL_COMPILATION_VALUES and option != "--profile":
             raise SetupError("unsupported local canonical Cargo argument: " + args[at])
         if not separator:
             at += 1
@@ -1730,8 +1733,8 @@ def canonical_local_selection(args):
                 raise SetupError("local canonical --profile may be specified only once")
             selection["profile"] = value
         else:
-            selection.setdefault(LOCAL_CHECK_VALUES[option], []).append(value)
-        count = sum(len(selection.get(field, [])) for field in LOCAL_CHECK_VALUES.values())
+            selection.setdefault(LOCAL_COMPILATION_VALUES[option], []).append(value)
+        count = sum(len(selection.get(field, [])) for field in LOCAL_COMPILATION_VALUES.values())
         if count + int("profile" in selection) > 128:
             raise SetupError("local canonical selection has too many values")
         at += 1
@@ -1739,11 +1742,11 @@ def canonical_local_selection(args):
         raise SetupError("local canonical --exclude requires --workspace")
     if selection.get("release") and "profile" in selection:
         raise SetupError("local canonical --release conflicts with --profile")
-    # This is the native deterministic check prefix, including option bytes.
-    size = len("check")
-    size += sum(len(option) for option, field in LOCAL_CHECK_FLAGS.items() if selection.get(field))
+    # This is the native deterministic compilation prefix, including option bytes.
+    size = len(args[0])
+    size += sum(len(option) for option, field in LOCAL_COMPILATION_FLAGS.items() if selection.get(field))
     size += sum(len(option) + len(value.encode("utf-8"))
-                for option, field in LOCAL_CHECK_VALUES.items()
+                for option, field in LOCAL_COMPILATION_VALUES.items()
                 for value in selection.get(field, []))
     if "profile" in selection:
         size += len("--profile") + len(selection["profile"].encode("utf-8"))
@@ -1756,10 +1759,12 @@ def canonical_local_profile(path):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
     required = {"version", "source_root", "toolchain_root", "state_root", "operation_root", "wrapper"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "selection"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection"}
     if (not required <= profile.keys() or profile.keys() - required - optional
-            or profile["version"] != "canonical-check-local-v1"):
-        raise SetupError("invalid canonical-check-local-v1 profile fields")
+            or profile["version"] != "canonical-compile-local-v1"):
+        raise SetupError("invalid canonical-compile-local-v1 profile fields")
+    if profile.get("command", "check") not in ("check", "build"):
+        raise SetupError("local canonical command must be check or build")
     for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
         if name in profile and (type(profile[name]) is not int or not 1 <= profile[name] <= maximum):
             raise SetupError("local canonical " + name + " must be an integer from 1 to " + str(maximum))
@@ -1798,16 +1803,16 @@ def canonical_local_profile(path):
         raise SetupError("local canonical wrapper must be outside source, state and operation roots")
     if profile.get("selection") is not None:
         selection = profile["selection"]
-        allowed = set(LOCAL_CHECK_FLAGS.values()) | set(LOCAL_CHECK_VALUES.values()) | {"profile"}
+        allowed = set(LOCAL_COMPILATION_FLAGS.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile"}
         if type(selection) is not dict or selection.keys() - allowed:
             raise SetupError("invalid local canonical profile selection fields")
-        original_args = ["check"]
-        for option, field in LOCAL_CHECK_FLAGS.items():
+        original_args = [profile.get("command", "check")]
+        for option, field in LOCAL_COMPILATION_FLAGS.items():
             if field in selection and type(selection[field]) is not bool:
                 raise SetupError("local canonical selection " + field + " must be a boolean")
             if selection.get(field):
                 original_args.append(option)
-        for option, field in LOCAL_CHECK_VALUES.items():
+        for option, field in LOCAL_COMPILATION_VALUES.items():
             if field in selection:
                 if type(selection[field]) is not list or any(type(value) is not str for value in selection[field]):
                     raise SetupError("local canonical selection " + field + " must be a string array")
@@ -1824,7 +1829,7 @@ def canonical_local_profile(path):
 def canonical_local_invocation(profile_path, args, env):
     """Retain exact selected native intent, then transfer process ownership once."""
     if sys.platform != "linux":
-        raise SetupError("local canonical Cargo checks require Linux")
+        raise SetupError("local canonical Cargo compilation requires Linux")
     if any(env.get(name) == "1" for name in (
         "CARGO_RABS_CANONICAL_ACTIVE", "CARGO_RABS_REMOTE_ACTIVE", "RCH_RABS_WORKER_ACTIVE",
     )):
@@ -1834,14 +1839,15 @@ def canonical_local_invocation(profile_path, args, env):
     daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
     if os.path.samefile(daemon, __file__):
         raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
-    # Explicit command arguments replace saved selection. Even empty selection
-    # is written, so `check` uses Cargo's defaults, not the native legacy --lib.
+    # Explicit command arguments replace saved command and selection. Even an
+    # empty selection is written, preserving Cargo's ordinary default targets.
+    profile["command"] = args[0] if args else "check"
     profile["selection"] = selection
     encoded = json.dumps(profile, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_FRAME:
         raise SetupError("local canonical profile exceeds its native size bound")
     import secrets
-    operation = Path(profile["operation_root"]) / ("check-" + secrets.token_hex(16))
+    operation = Path(profile["operation_root"]) / (profile["command"] + "-" + secrets.token_hex(16))
     operation.mkdir(mode=0o700)
     retained = operation / "profile.json"
     descriptor = os.open(retained, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -1858,7 +1864,7 @@ def canonical_local_invocation(profile_path, args, env):
     child_env = dict(env)
     child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
     print("cargo-rabs: local canonical profile retained at " + str(retained), file=sys.stderr, flush=True)
-    return daemon, [daemon, "--canonical-check-local", str(retained)], child_env
+    return daemon, [daemon, "--canonical-compile-local", str(retained)], child_env
 
 
 def run_canonical_local(args, env):

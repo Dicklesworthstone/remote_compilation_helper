@@ -1,9 +1,9 @@
-//! One bounded Cargo check selection shared by planning and execution.
+//! One bounded Cargo compilation selection shared by planning and execution.
 //!
 //! These are target/feature selectors, not arbitrary Cargo arguments. The
 //! driver supplies the retained manifest, offline/locked mode, compiler,
 //! output directory and job budget itself. Both the nonexecuting unit-graph
-//! query and the subsequent check use this exact argument vector.
+//! query and the subsequent compilation use this exact argument vector.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -12,14 +12,37 @@ const MAX_VALUES: usize = 128;
 const MAX_VALUE_BYTES: usize = 1024;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 
-/// Cargo's ordinary package, feature and target selection for a check.
+/// The captured Cargo command, separate from package and target selectors.
+///
+/// Neither command runs project executables. `Build` may compile test and
+/// benchmark harnesses, but only Cargo's `test`, `bench` and `run` commands
+/// execute them; those commands are deliberately absent from this profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompilationCommand {
+    #[default]
+    Check,
+    Build,
+}
+
+impl CompilationCommand {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::Build => "build",
+        }
+    }
+}
+
+/// Cargo's ordinary package, feature and target selection for a compilation.
 ///
 /// An empty selection means Cargo's default targets and default members. The
-/// legacy local profile explicitly supplies `lib: true` when its optional
-/// selection field is absent. Unknown fields cannot become command options.
+/// driver may explicitly supply `lib: true` for a library-only check. Unknown
+/// fields cannot become command options or select project execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CheckSelection {
+pub struct CompilationSelection {
     pub workspace: bool,
     pub packages: Vec<String>,
     pub exclude: Vec<String>,
@@ -43,7 +66,7 @@ pub struct CheckSelection {
     pub target: Vec<String>,
     /// Cargo's profile name, not profile settings. Cargo validates existence
     /// and inheritance in the captured workspace. The unit graph and actual
-    /// check use the same value, including `test` and its development units.
+    /// compilation use the same value, including `test` and its development units.
     pub profile: Option<String>,
 }
 
@@ -65,27 +88,27 @@ fn ordinary_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-impl CheckSelection {
-    /// Construct the complete selected check prefix without host authority.
+impl CompilationSelection {
+    /// Construct the complete selected compilation prefix without host authority.
     ///
     /// Cargo remains the authority for package-spec, feature and target-name
     /// syntax. Values are passed as distinct argv entries, never shell text.
     /// Leading options, control bytes and oversized requests are refused here
     /// before any source capture or command planning can start.
-    pub fn cargo_arguments(&self) -> io::Result<Vec<String>> {
+    pub fn cargo_arguments(&self, command: CompilationCommand) -> io::Result<Vec<String>> {
         if !self.exclude.is_empty() && !self.workspace {
             return Err(invalid(
-                "Cargo check exclusions require workspace selection",
+                "Cargo compilation exclusions require workspace selection",
             ));
         }
         if self.release && self.profile.is_some() {
             return Err(invalid(
-                "choose release or an explicit Cargo check profile, not both",
+                "choose release or an explicit Cargo compilation profile, not both",
             ));
         }
         if self.target.iter().any(|target| !ordinary_name(target)) {
             return Err(invalid(
-                "Cargo check targets must be built-in names, not target-specification paths",
+                "Cargo compilation targets must be built-in names, not target-specification paths",
             ));
         }
         if self
@@ -93,7 +116,7 @@ impl CheckSelection {
             .as_ref()
             .is_some_and(|profile| !ordinary_name(profile))
         {
-            return Err(invalid("invalid Cargo check profile name"));
+            return Err(invalid("invalid Cargo compilation profile name"));
         }
         let values = [
             ("--package", &self.packages),
@@ -108,9 +131,9 @@ impl CheckSelection {
         let count = values.iter().map(|(_, values)| values.len()).sum::<usize>()
             + usize::from(self.profile.is_some());
         if count > MAX_VALUES {
-            return Err(invalid("Cargo check selection has too many values"));
+            return Err(invalid("Cargo compilation selection has too many values"));
         }
-        let mut args = vec!["check".to_owned()];
+        let mut args = vec![command.as_str().to_owned()];
         for (enabled, option) in [
             (self.workspace, "--workspace"),
             (self.all_features, "--all-features"),
@@ -134,7 +157,7 @@ impl CheckSelection {
                     || value.starts_with('-')
                     || value.chars().any(char::is_control)
                 {
-                    return Err(invalid("invalid Cargo check selection value"));
+                    return Err(invalid("invalid Cargo compilation selection value"));
                 }
                 args.push(option.to_owned());
                 args.push(value.clone());
@@ -146,7 +169,7 @@ impl CheckSelection {
         }
         if args.iter().map(String::len).sum::<usize>() > MAX_ARGUMENT_BYTES {
             return Err(invalid(
-                "Cargo check selection exceeds its argument byte budget",
+                "Cargo compilation selection exceeds its argument byte budget",
             ));
         }
         Ok(args)
@@ -161,23 +184,31 @@ mod tests {
     #[test]
     fn empty_selection_preserves_cargos_default_member_and_target_selection() {
         assert_eq!(
-            CheckSelection::default().cargo_arguments().unwrap(),
+            CompilationSelection::default()
+                .cargo_arguments(CompilationCommand::Check)
+                .unwrap(),
             ["check"]
         );
         assert_eq!(
-            CheckSelection {
+            CompilationSelection {
                 lib: true,
-                ..CheckSelection::default()
+                ..CompilationSelection::default()
             }
-            .cargo_arguments()
+            .cargo_arguments(CompilationCommand::Check)
             .unwrap(),
             ["check", "--lib"]
+        );
+        assert_eq!(
+            CompilationSelection::default()
+                .cargo_arguments(CompilationCommand::Build)
+                .unwrap(),
+            ["build"]
         );
     }
 
     #[test]
     fn package_features_and_named_targets_are_literal_cargo_arguments() {
-        let selection: CheckSelection = serde_json::from_value(json!({
+        let selection: CompilationSelection = serde_json::from_value(json!({
             "workspace":true, "exclude":["integration-*"],
             "packages":["core@1.0.0", "app"],
             "features":["app/fast,core/serde", "core/std"],
@@ -187,7 +218,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            selection.cargo_arguments().unwrap(),
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .unwrap(),
             [
                 "check",
                 "--workspace",
@@ -231,7 +264,7 @@ mod tests {
             let mut selection = json!({});
             selection[field] = value;
             assert!(
-                serde_json::from_value::<CheckSelection>(selection).is_err(),
+                serde_json::from_value::<CompilationSelection>(selection).is_err(),
                 "{field}"
             );
         }
@@ -242,53 +275,85 @@ mod tests {
             "feature\0",
             "name\n",
         ] {
-            let selection = CheckSelection {
+            let selection = CompilationSelection {
                 features: vec![value.into()],
-                ..CheckSelection::default()
+                ..CompilationSelection::default()
             };
-            assert!(selection.cargo_arguments().is_err(), "{value:?}");
+            for command in [CompilationCommand::Check, CompilationCommand::Build] {
+                assert!(
+                    selection.cargo_arguments(command).is_err(),
+                    "{command:?}: {value:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn argument_limits_apply_to_the_whole_selection_and_exclusions_require_workspace() {
-        let mut selection = CheckSelection {
+        let mut selection = CompilationSelection {
             features: vec!["feature".into(); MAX_VALUES],
-            ..CheckSelection::default()
+            ..CompilationSelection::default()
         };
-        assert!(selection.cargo_arguments().is_ok());
+        assert!(selection.cargo_arguments(CompilationCommand::Check).is_ok());
         selection.packages.push("package".into());
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.packages.clear();
         selection.features = vec!["a".repeat(MAX_VALUE_BYTES); MAX_VALUES];
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.features = vec!["a".repeat(MAX_VALUE_BYTES + 1)];
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.features.clear();
         selection.exclude.push("excluded".into());
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.workspace = true;
-        assert!(selection.cargo_arguments().is_ok());
+        assert!(selection.cargo_arguments(CompilationCommand::Check).is_ok());
     }
 
     #[test]
     fn compilation_targets_and_profile_survive_profile_roundtrip_in_order() {
-        let selection: CheckSelection = serde_json::from_value(json!({
+        let selection: CompilationSelection = serde_json::from_value(json!({
             "workspace":true, "lib":true,
             "target":["wasm32-unknown-unknown", "aarch64-unknown-linux-gnu", "host-tuple"],
             "profile":"check-fast", "features":["core/serde"]
         }))
         .unwrap();
-        let roundtrip: CheckSelection =
+        let roundtrip: CompilationSelection =
             serde_json::from_value(serde_json::to_value(&selection).unwrap()).unwrap();
         assert_eq!(roundtrip, selection);
         assert_eq!(
-            roundtrip.cargo_arguments().unwrap(),
+            roundtrip
+                .cargo_arguments(CompilationCommand::Check)
+                .unwrap(),
             [
-                "check", "--workspace", "--lib", "--features", "core/serde",
-                "--target", "wasm32-unknown-unknown",
-                "--target", "aarch64-unknown-linux-gnu",
-                "--target", "host-tuple", "--profile", "check-fast"
+                "check",
+                "--workspace",
+                "--lib",
+                "--features",
+                "core/serde",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--target",
+                "host-tuple",
+                "--profile",
+                "check-fast"
             ]
         );
     }
@@ -296,21 +361,41 @@ mod tests {
     #[test]
     fn target_and_profile_selectors_never_grant_external_file_authority() {
         for name in [
-            "", "--config=bad", "-Zunstable-options", "/tmp/target.json",
-            "./target.json", "../target", "target.json", "spec/target",
-            "C:\\spec\\target.json", "target\0", "target\n", "host tuple",
-            "target=wasm32", "targét", ".", "..",
+            "",
+            "--config=bad",
+            "-Zunstable-options",
+            "/tmp/target.json",
+            "./target.json",
+            "../target",
+            "target.json",
+            "spec/target",
+            "C:\\spec\\target.json",
+            "target\0",
+            "target\n",
+            "host tuple",
+            "target=wasm32",
+            "targét",
+            ".",
+            "..",
         ] {
-            let target = CheckSelection {
+            let target = CompilationSelection {
                 target: vec![name.into()],
-                ..CheckSelection::default()
+                ..CompilationSelection::default()
             };
-            let profile = CheckSelection {
+            let profile = CompilationSelection {
                 profile: Some(name.into()),
-                ..CheckSelection::default()
+                ..CompilationSelection::default()
             };
-            assert!(target.cargo_arguments().is_err(), "target {name:?}");
-            assert!(profile.cargo_arguments().is_err(), "profile {name:?}");
+            for command in [CompilationCommand::Check, CompilationCommand::Build] {
+                assert!(
+                    target.cargo_arguments(command).is_err(),
+                    "{command:?} target {name:?}"
+                );
+                assert!(
+                    profile.cargo_arguments(command).is_err(),
+                    "{command:?} profile {name:?}"
+                );
+            }
         }
         for value in [
             json!({"target":"wasm32-unknown-unknown"}),
@@ -319,58 +404,147 @@ mod tests {
             json!({"profile":["release"]}),
             json!({"profile":{"inherits":"release"}}),
         ] {
-            assert!(serde_json::from_value::<CheckSelection>(value).is_err());
+            assert!(serde_json::from_value::<CompilationSelection>(value).is_err());
         }
     }
 
     #[test]
     fn explicit_profiles_do_not_silently_override_release_or_the_default() {
         for name in ["dev", "release", "test", "bench", "check_fast"] {
-            let mut selection = CheckSelection {
+            let mut selection = CompilationSelection {
                 profile: Some(name.into()),
-                ..CheckSelection::default()
+                ..CompilationSelection::default()
             };
-            assert_eq!(selection.cargo_arguments().unwrap(), ["check", "--profile", name]);
+            assert_eq!(
+                selection
+                    .cargo_arguments(CompilationCommand::Check)
+                    .unwrap(),
+                ["check", "--profile", name]
+            );
             selection.release = true;
-            assert!(selection.cargo_arguments().is_err());
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Check)
+                    .is_err()
+            );
         }
-        let default: CheckSelection = serde_json::from_value(json!({"profile":null})).unwrap();
-        assert_eq!(default.cargo_arguments().unwrap(), ["check"]);
+        let default: CompilationSelection =
+            serde_json::from_value(json!({"profile":null})).unwrap();
         assert_eq!(
-            CheckSelection { release: true, ..CheckSelection::default() }
-                .cargo_arguments().unwrap(),
+            default.cargo_arguments(CompilationCommand::Check).unwrap(),
+            ["check"]
+        );
+        assert_eq!(
+            CompilationSelection {
+                release: true,
+                ..CompilationSelection::default()
+            }
+            .cargo_arguments(CompilationCommand::Check)
+            .unwrap(),
             ["check", "--release"]
         );
     }
 
     #[test]
     fn target_and_profile_values_share_existing_global_budgets() {
-        let mut selection = CheckSelection {
+        let mut selection = CompilationSelection {
             target: vec!["host-tuple".into(); MAX_VALUES],
-            ..CheckSelection::default()
+            ..CompilationSelection::default()
         };
-        assert!(selection.cargo_arguments().is_ok());
+        assert!(selection.cargo_arguments(CompilationCommand::Check).is_ok());
         selection.profile = Some("dev".into());
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.target.pop();
-        assert!(selection.cargo_arguments().is_ok());
+        assert!(selection.cargo_arguments(CompilationCommand::Check).is_ok());
         selection.features.push("feature".into());
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.features.clear();
         selection.profile = None;
         selection.target = vec!["a".repeat(MAX_VALUE_BYTES); MAX_VALUES];
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.target = vec!["a".repeat(MAX_VALUE_BYTES + 1)];
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         selection.target.clear();
         selection.profile = Some("a".repeat(MAX_VALUE_BYTES + 1));
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
         // Neither new field can evade the aggregate byte budget by being
         // individually bounded. These 16 values fit until a profile is added.
         selection.profile = None;
         selection.features = vec!["a".repeat(1000); 16];
-        assert!(selection.cargo_arguments().is_ok());
+        assert!(selection.cargo_arguments(CompilationCommand::Check).is_ok());
         selection.profile = Some("a".repeat(1000));
-        assert!(selection.cargo_arguments().is_err());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Check)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn build_selectors_compile_targets_without_granting_runtime_commands() {
+        let selection = CompilationSelection {
+            workspace: true,
+            tests: true,
+            examples: true,
+            target: vec!["host-tuple".into()],
+            profile: Some("release".into()),
+            ..CompilationSelection::default()
+        };
+        assert_eq!(
+            selection
+                .cargo_arguments(CompilationCommand::Build)
+                .unwrap(),
+            [
+                "build",
+                "--workspace",
+                "--tests",
+                "--examples",
+                "--target",
+                "host-tuple",
+                "--profile",
+                "release",
+            ]
+        );
+        for (text, expected) in [
+            ("check", CompilationCommand::Check),
+            ("build", CompilationCommand::Build),
+        ] {
+            let command: CompilationCommand = serde_json::from_value(json!(text)).unwrap();
+            assert_eq!(command, expected);
+            assert_eq!(serde_json::to_value(command).unwrap(), json!(text));
+        }
+        for value in [
+            json!("run"),
+            json!("test"),
+            json!("bench"),
+            json!("doc"),
+            json!("check --config=bad"),
+            json!("Build"),
+            json!(null),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(serde_json::from_value::<CompilationCommand>(value).is_err());
+        }
     }
 }

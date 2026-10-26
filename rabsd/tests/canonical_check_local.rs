@@ -65,6 +65,11 @@ fn source(root: &Path, value: u32) {
     );
     write(
         root,
+        "src/main.rs",
+        "fn main() { println!(\"{}\", canonical_app::answer()); }\n",
+    );
+    write(
+        root,
         ".cargo/config.toml",
         "[source.crates-io]\nreplace-with='vendored-sources'\n[source.vendored-sources]\ndirectory='vendor'\n",
     );
@@ -139,7 +144,7 @@ fn run_with_environment(
         .env("RABS_CONFIG", root.join("config.toml"))
         .env("RABS_SPRT_SAMPLING", "0")
         .envs(environment.iter().map(|(name, value)| (name, value)))
-        .args(["--canonical-check-local"])
+        .args(["--canonical-compile-local"])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -157,7 +162,7 @@ fn run_with_environment(
         .unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(600),
-        "canonical check timed out"
+        "canonical compilation timed out"
     );
     assert_eq!(output.residual_group_members, 0);
     let mut stderr = String::new();
@@ -189,13 +194,13 @@ fn run_with_environment(
 fn cli_rejects_profile_environment_instead_of_granting_an_ambient_mount_capability() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("config.toml"), "[rabs]\n").unwrap();
-    let profile = json!({"version":"canonical-check-local-v1", "source_root":"/source",
+    let profile = json!({"version":"canonical-compile-local-v1", "source_root":"/source",
         "toolchain_root":"/toolchain", "state_root":"/state", "operation_root":"/operations",
         "wrapper":"/rabs-wrap", "env":{"RABS_SOCKET_PATH":"/ordinary-daemon.sock"}});
     let (code, _, output) = run(root.path(), 0, &profile);
     assert_eq!(code, 2, "{output}");
     assert!(output.contains("unknown field `env`"), "{output}");
-    assert!(!output.contains("canonical-check-started"));
+    assert!(!output.contains("canonical-compilation-started"));
 }
 
 fn decisions(events: &[Value], decision: &str) -> BTreeMap<String, String> {
@@ -249,7 +254,7 @@ fn native_fixture() -> (tempfile::TempDir, Value) {
     let second = owner.path().join("source-b");
     source(&first, 40);
     source(&second, 40);
-    let profile = json!({"version":"canonical-check-local-v1", "source_root":first,
+    let profile = json!({"version":"canonical-compile-local-v1", "source_root":first,
         "toolchain_root":toolchain, "state_root":owner.path().join("state"),
         "operation_root":owner.path().join("ops"), "wrapper":wrapper, "vendor":"vendor",
         "jobs":1, "timeout_seconds":300});
@@ -355,7 +360,7 @@ fn canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_
         assert!(
             !events
                 .iter()
-                .any(|event| event["kind"] == "canonical-check-started"),
+                .any(|event| event["kind"] == "canonical-compilation-started"),
             "selected executor reached cache admission: {output}"
         );
     }
@@ -665,10 +670,158 @@ fn assert_answer(root: &Path, answer: u32, workspace_edit: bool) {
     );
 }
 
+/// Validate the delivered user output, including a real executable consuming
+/// the remotely produced or replayed archives. The driver may retain only the
+/// target tree after its coordinator, wrapper sessions and compiler have drained.
+fn delivered_build(
+    root: &Path,
+    number: u32,
+    events: &[Value],
+    answer: u32,
+) -> (PathBuf, BTreeMap<String, Vec<u8>>) {
+    let completed = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-build-completed")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed.len(),
+        1,
+        "each successful build must report exactly one delivered target"
+    );
+    let event = completed[0];
+    assert_eq!(event["version"], "canonical-compile-local-v1");
+    assert_eq!(event["canonical_target"], "/__rabs/out/cargo");
+    let target = PathBuf::from(event["target_directory"].as_str().unwrap());
+    assert_eq!(target.file_name().unwrap(), "target");
+    assert_eq!(
+        fs::canonicalize(&target).unwrap(),
+        target,
+        "delivered target must be an ordinary physical directory"
+    );
+    let owner = target.parent().unwrap().to_path_buf();
+    assert_eq!(owner.parent().unwrap(), root.join("ops"));
+    assert!(
+        owner
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("rabs-build-")
+    );
+    assert_eq!(
+        fs::metadata(&owner).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let retained = fs::read_dir(&owner)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained,
+        [std::ffi::OsString::from("target")],
+        "source, Cargo home, toolchain and control socket must not survive output delivery"
+    );
+
+    let mut archives = BTreeMap::new();
+    for name in ["canonical_leaf", "canonical_dep"] {
+        let prefix = format!("lib{name}-");
+        let candidates = fs::read_dir(target.join("debug/deps"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|file| file.to_str())
+                    .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".rlib"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "missing or ambiguous delivered {name} archive"
+        );
+        assert!(fs::symlink_metadata(&candidates[0]).unwrap().is_file());
+        let bytes = read_bounded(&candidates[0]);
+        assert!(
+            bytes.len() > 8 && bytes.starts_with(b"!<arch>\n"),
+            "delivered {name} must be a real nonempty Rust archive"
+        );
+        archives.insert(name.to_owned(), bytes);
+    }
+
+    let binary = target.join("debug/canonical_app");
+    let metadata = fs::symlink_metadata(&binary).unwrap();
+    assert!(
+        metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o111 != 0,
+        "Cargo build must deliver its linked executable"
+    );
+    let mut command = Command::new(&binary);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let output = ManagedProcessGroup::spawn_command(command, Attribution::default())
+        .unwrap()
+        .wait_with_bounded_drain_budget(
+            &DrainLimits::new(root.join(format!("delivered-binary-{number}"))),
+            16 * 1024,
+            || started.elapsed() > Duration::from_secs(10),
+        )
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "delivered binary timed out"
+    );
+    assert!(
+        output.status.success(),
+        "delivered binary failed: {:?}",
+        output.status
+    );
+    assert_eq!(output.residual_group_members, 0);
+    let mut stdout = Vec::new();
+    output
+        .stdout
+        .reader()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    assert_eq!(
+        stdout,
+        format!("{answer}\n").as_bytes(),
+        "linked binary used stale or incorrect dependency code"
+    );
+    let mut stderr = Vec::new();
+    output
+        .stderr
+        .reader()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert!(stderr.is_empty(), "{:?}", String::from_utf8_lossy(&stderr));
+    (owner, archives)
+}
+
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo/TLS worker/cache execution"]
 fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktrees() {
+    remote_dependency_replay("check");
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo build/TLS worker/archive cache and linked binary execution"]
+fn canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary() {
+    remote_dependency_replay("build");
+}
+
+/// Exercise the production native CLI, wrapper, remote executor, CAS sampling,
+/// exact delivery and invalidation using the same dependency graph in each mode.
+fn remote_dependency_replay(command: &str) {
     let (owner, mut profile) = native_fixture();
+    profile["command"] = json!(command);
+    let build = command == "build";
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
     assert_answer(&first, 42, false);
@@ -676,10 +829,33 @@ fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktree
     let (mut worker, environment) = NativeWorker::start(owner.path());
     let mut first_keys = None;
     let mut receipt: Option<Value> = None;
+    let mut first_archives = None;
+    let mut retained_targets = BTreeSet::new();
     for number in 1..=3 {
         let (code, events, output) =
             run_with_environment(owner.path(), number, &profile, &environment);
         assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        if build {
+            let (target, archives) = delivered_build(owner.path(), number, &events, 42);
+            assert!(
+                retained_targets.insert(target),
+                "a successful build reused mutable output"
+            );
+            if let Some(expected) = &first_archives {
+                assert_eq!(
+                    &archives, expected,
+                    "cold archive samples differ byte-for-byte"
+                );
+            } else {
+                first_archives = Some(archives);
+            }
+        } else {
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["kind"] == "canonical-build-completed")
+            );
+        }
         let offered = decisions(&events, "remote-offer");
         assert_eq!(
             offered.len(),
@@ -744,6 +920,15 @@ fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktree
     profile["source_root"] = json!(second);
     let (code, events, output) = run_with_environment(owner.path(), 4, &profile, &environment);
     assert_eq!(code, 0, "{output}");
+    if build {
+        let (target, archives) = delivered_build(owner.path(), 4, &events, 43);
+        assert!(retained_targets.insert(target));
+        assert_eq!(
+            Some(&archives),
+            first_archives.as_ref(),
+            "warm replay must deliver the exact remotely compiled dependency archives"
+        );
+    }
     assert_eq!(
         decisions(&events, "hit"),
         first_keys.clone().unwrap(),
@@ -782,6 +967,17 @@ fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktree
         code, 0,
         "changed dependency metadata must satisfy the new const result: {output}"
     );
+    if build {
+        let (target, archives) = delivered_build(owner.path(), 5, &events, 43);
+        assert!(retained_targets.insert(target));
+        for name in ["canonical_leaf", "canonical_dep"] {
+            assert_ne!(
+                archives[name],
+                first_archives.as_ref().unwrap()[name],
+                "changed source reused stale {name} archive bytes"
+            );
+        }
+    }
     let changed = decisions(&events, "remote-offer");
     assert_eq!(
         changed.len(),
@@ -826,7 +1022,8 @@ fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktree
     assert!(
         !events
             .iter()
-            .any(|event| event["kind"] == "canonical-check-started"
+            .any(|event| event["kind"] == "canonical-compilation-started"
+                || event["kind"] == "canonical-build-completed"
                 || event["kind"] == "rabsd-live-dependency"
                 || event["kind"] == "rabsd-remote-dependency-executed"),
         "{output}"
@@ -844,11 +1041,13 @@ fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktree
             .count(),
         before_refusal_executions
     );
-    assert!(
-        fs::read_dir(owner.path().join("ops"))
-            .unwrap()
-            .next()
-            .is_none()
+    let retained = fs::read_dir(owner.path().join("ops"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        retained, retained_targets,
+        "only successful build targets may survive; checks and rejected graphs retain no operation"
     );
     worker.finish();
 }

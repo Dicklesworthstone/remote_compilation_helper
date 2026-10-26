@@ -27,10 +27,11 @@ loader.exec_module(launcher)
 
 DRIVER = r'''
 import json, os, pathlib, signal, stat, sys
-assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-check-local", sys.argv
+assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-compile-local", sys.argv
 path = pathlib.Path(sys.argv[2])
 profile = json.loads(path.read_bytes())
-assert profile["version"] == "canonical-check-local-v1"
+assert profile["version"] == "canonical-compile-local-v1"
+assert profile["command"] in ("check", "build")
 assert "selection" in profile
 record = {"pid":os.getpid(), "argv":sys.argv, "profile":profile,
           "retained":str(path), "file_mode":stat.S_IMODE(path.stat().st_mode),
@@ -76,7 +77,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.record = self.root / "driver.ndjson"
         self.profile_path = self.root / "profile.json"
         self.profile = {
-            "version": "canonical-check-local-v1", "source_root": str(self.source),
+            "version": "canonical-compile-local-v1", "source_root": str(self.source),
             "toolchain_root": str(self.tools), "state_root": str(self.state),
             "operation_root": str(self.operations), "wrapper": str(self.wrapper),
             "manifest": "member/Cargo.toml", "jobs": 3, "timeout_seconds": 600,
@@ -135,9 +136,9 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(record["input"], "00ff737464696e")
         self.assertEqual(record["cwd"], str(self.root))
         self.assertEqual(record["environment"], dict(env, CARGO_RABS_CANONICAL_ACTIVE="1"))
-        expected = dict(self.profile, selection={"workspace": True})
+        expected = dict(self.profile, command="check", selection={"workspace": True})
         self.assertEqual(record["profile"], expected)
-        self.assertEqual(record["argv"], [str(self.driver), "--canonical-check-local", record["retained"]])
+        self.assertEqual(record["argv"], [str(self.driver), "--canonical-compile-local", record["retained"]])
         retained = Path(record["retained"])
         self.assertEqual(retained.parent.parent, self.operations)
         self.assertEqual(record["file_mode"], 0o600)
@@ -148,14 +149,40 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertNotIn("AMBIENT_INPUT", retained.read_text())
 
     def test_default_check_replaces_saved_selection_with_cargo_defaults(self):
+        self.profile["command"] = "build"
         self.profile["selection"] = {"lib": True, "features": ["from-profile"]}
         self.save()
         for args in ([], ["check"]):
             status, _, stderr, _ = self.invoke(args)
             self.assertEqual(status, 0, stderr.decode(errors="replace"))
+            self.assertEqual(self.records()[-1]["profile"]["command"], "check")
             self.assertEqual(self.records()[-1]["profile"]["selection"], {})
         self.assertEqual(len(list(self.operations.iterdir())), 2)
         self.assertNotEqual(self.records()[0]["retained"], self.records()[1]["retained"])
+
+    def test_build_selectors_and_compile_only_harnesses_reach_the_native_driver_once(self):
+        self.profile["command"] = "check"
+        self.profile["selection"] = {"lib": True, "features": ["from-profile"]}
+        self.save()
+        original = self.profile_path.read_bytes()
+        for args, expected in (
+            (["build"], {}),
+            (["build", "--workspace", "--tests", "--examples", "--target=host-tuple", "--profile=release"],
+             {"workspace": True, "tests": True, "examples": True, "target": ["host-tuple"], "profile": "release"}),
+            (["build", "--package=app", "--bin=server", "--features=app/fast", "--release"],
+             {"packages": ["app"], "bin": ["server"], "features": ["app/fast"], "release": True}),
+        ):
+            with self.subTest(args=args):
+                status, _, stderr, pid = self.invoke(args)
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                record = self.records()[-1]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(record["profile"], dict(self.profile, command="build", selection=expected))
+                self.assertEqual(record["argv"], [str(self.driver), "--canonical-compile-local", record["retained"]])
+                self.assertTrue(Path(record["retained"]).parent.name.startswith("build-"))
+                self.assertEqual(self.profile_path.read_bytes(), original)
+        self.assertEqual(len(self.records()), 3)
+        self.assertEqual(len(list(self.operations.iterdir())), 3)
 
     def test_named_packages_features_and_targets_reach_the_retained_native_profile(self):
         args = ["check", "--workspace", "--exclude=integration-*", "-p", "core@1.0.0",
@@ -238,7 +265,7 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def test_commands_authority_options_and_missing_values_refuse_before_handoff(self):
         rejected = [
-            ["build"], ["test"], ["clippy"], ["+nightly", "check"],
+            ["test"], ["run"], ["bench"], ["doc"], ["clippy"], ["+nightly", "check"],
             ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
             ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
             ["check", "--message-format=json"], ["check", "-Zunstable-options"],
@@ -251,6 +278,18 @@ class CanonicalLocalCargo(unittest.TestCase):
             ["check", "--rabs-no-start"], ["check", "--rabs-remote"],
         ]
         for args in rejected:
+            with self.subTest(args=args):
+                self.assert_refused(args)
+
+    def test_build_cannot_override_native_authority_or_request_program_execution(self):
+        for args in (
+            ["build", "--config=other"], ["build", "--target-dir=/other"],
+            ["build", "--manifest-path", "other/Cargo.toml"], ["build", "--message-format=json"],
+            ["build", "--out-dir=/other"], ["build", "--artifact-dir=/other"],
+            ["build", "--tests", "--", "--nocapture"], ["build", "test"],
+            ["build", "--no-run"], ["build", "--run"], ["build", "-Zunstable-options"],
+            ["build", "--profile=dev", "--release"], ["build", "--target=/tmp/custom.json"],
+        ):
             with self.subTest(args=args):
                 self.assert_refused(args)
 
@@ -299,7 +338,11 @@ class CanonicalLocalCargo(unittest.TestCase):
     def test_strict_profile_refusals_never_create_retained_intent(self):
         original = dict(self.profile)
         for change in (
-            {"version": "canonical-cargo-v1"}, {"env": {"RABS_SOCKET_PATH": "/other"}},
+            {"version": "canonical-cargo-v1"}, {"version": "canonical-check-local-v1"},
+            {"env": {"RABS_SOCKET_PATH": "/other"}},
+            {"command": "test"}, {"command": "run"}, {"command": "build --config=other"},
+            {"command": None}, {"command": True}, {"command": ["build"]},
+            {"command": {"build": True}}, {"command": "Build"},
             {"jobs": True}, {"timeout_seconds": 7201}, {"manifest": "../Cargo.toml"},
             {"manifest": "Cargo.lock"}, {"selection": {"args": ["build"]}},
             {"selection": {"lib": "true"}}, {"selection": {"features": "feature"}},
@@ -320,7 +363,7 @@ class CanonicalLocalCargo(unittest.TestCase):
                 self.assert_refused(["check"])
         self.profile = original
         self.save()
-        self.profile_path.write_text(self.profile_path.read_text()[:-1] + ',"version":"canonical-check-local-v1"}')
+        self.profile_path.write_text(self.profile_path.read_text()[:-1] + ',"version":"canonical-compile-local-v1"}')
         self.assert_refused(["check"])
 
     def test_unsafe_storage_overlap_and_symlink_profiles_refuse_before_writes(self):
@@ -348,10 +391,12 @@ class CanonicalLocalCargo(unittest.TestCase):
                 launcher.canonical_local_invocation(str(self.profile_path), ["check"], self.env)
 
     def test_native_failure_is_returned_once_without_fallback(self):
-        status, _, stderr, _ = self.invoke(["check"], dict(self.env, TEST_EXIT="101"))
-        self.assertEqual(status, 101, stderr.decode(errors="replace"))
-        self.assertEqual(len(self.records()), 1)
-        self.assertEqual(len(list(self.operations.iterdir())), 1)
+        for command in ("check", "build"):
+            status, _, stderr, _ = self.invoke([command], dict(self.env, TEST_EXIT="101"))
+            self.assertEqual(status, 101, stderr.decode(errors="replace"))
+        self.assertEqual(len(self.records()), 2)
+        self.assertEqual(len(list(self.operations.iterdir())), 2)
+        self.assertEqual([record["profile"]["command"] for record in self.records()], ["check", "build"])
 
     def test_missing_driver_and_recursive_driver_refuse_before_creating_intent(self):
         self.assert_refused(["check"], dict(self.env, CARGO_RABS_DAEMON=str(self.root / "missing")))
@@ -372,7 +417,8 @@ class CanonicalLocalCargo(unittest.TestCase):
         status, stdout, _, _ = self.invoke(prefix=["rabs", "--help"])
         self.assertEqual(status, 0)
         self.assertIn(b"--rabs-canonical-local", stdout)
-        self.assertIn(b"canonical-check-local-v1", stdout)
+        self.assertIn(b"canonical-compile-local-v1", stdout)
+        self.assertIn(b"build --tests", stdout)
         self.assertFalse(self.record.exists())
         self.assertEqual(list(self.operations.iterdir()), [])
 

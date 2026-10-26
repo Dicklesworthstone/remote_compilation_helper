@@ -73,7 +73,7 @@ jobs:
           python3 tests/test_rabs_worker_cache_diagnostics.py -v
       - name: Canonical Cargo frontend (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_canonical.py -v
-      - name: Selected local canonical checks (native driver is an explicit fixture)
+      - name: Selected local canonical builds and checks (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_local.py -v
       - name: Explicit canonical build inputs (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_environment.py -v
@@ -120,7 +120,7 @@ jobs:
         run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
       - name: Run wrapper unit and real socket delivery regressions
         run: cargo test -p rabs-wrap --bin rabs-wrap --test live_protocol --locked
-      - name: Selected Cargo check planning with the actual captured-toolchain interface
+      - name: Selected Cargo check and build planning with real compiler outputs
         run: |
           cargo test -p rabs-sandbox --lib cargo_check --locked
           cargo test -p rabs-sandbox --test cargo_check --locked -- --nocapture
@@ -227,6 +227,15 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktrees \
             -- --ignored --exact --nocapture
+      - name: Canonical Cargo offloads archives, replays them and delivers a working binary
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary \
+            -- --ignored --exact --nocapture
       - name: Closed archive isolation and authenticated mode selection
         run: |
           cargo test --release -p rabs-sandbox --lib dependency_context --locked
@@ -234,12 +243,19 @@ jobs:
             cargo test --release -p rabs-sandbox --lib \
               real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
               --locked -- --ignored --nocapture
+          RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+            cargo test --release -p rabs-sandbox --lib \
+              dependency_context::tests::real_canonical_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
+              --locked -- --ignored --exact --nocapture
           cargo test --release -p rabs-wkr --bin rabs-wkr dependency --locked
           cargo test --release -p rabs-wkr --bin rabs-wkr archive --locked
           cargo test --release -p rabsd --lib coord::secure_worker_delivery::tests --locked
           cargo test --release -p rabs-wkr --test process_tree_linux \
             real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
             --locked -- --nocapture
+          cargo test --release -p rabs-wkr --test process_tree_linux \
+            real_canonical_dependency_rustc_builds_archive_with_shared_dag_and_assembly_input \
+            --locked -- --exact --nocapture
       - name: Actual offline Cargo builds, links and replays remote archives
         timeout-minutes: 30
         env:

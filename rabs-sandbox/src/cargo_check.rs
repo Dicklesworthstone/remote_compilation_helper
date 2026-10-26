@@ -1,7 +1,7 @@
-//! Admission of the units Cargo actually selected for a library/workspace check.
+//! Admission of the units Cargo actually selected for a check or build.
 //!
 //! `cargo metadata` describes packages, including optional and development
-//! dependencies that a particular check will never execute. Cargo's nightly
+//! dependencies that a particular command will never execute. Cargo's nightly
 //! `--unit-graph -Z unstable-options` output instead describes that command's
 //! compiler/build-script units without building them. The canonical driver
 //! obtains this graph from its captured Cargo before exposing a cache endpoint.
@@ -10,7 +10,7 @@
 //! It does not infer feature resolution, grant cache authority, or establish
 //! provenance from JSON alone. The caller must run the trusted captured Cargo
 //! with the same command selection, semantic environment, configuration and
-//! mount view as the subsequent check, and bind every returned source path to
+//! mount view as the subsequent compilation, and bind every returned source path to
 //! its captured input roots. The driver may add its trusted wrapper and socket
 //! control variables only after admission; these controls cannot select Cargo
 //! packages, features or targets. Build scripts, proc macros and unknown unit modes
@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::io;
 
 mod selection;
-pub use selection::CheckSelection;
+pub use selection::{CompilationCommand, CompilationSelection};
 
 const MAX_UNITS: usize = 16_384;
 const MAX_DEPENDENCIES: usize = 262_144;
@@ -29,9 +29,9 @@ const MAX_FEATURES: usize = 4_096;
 const MAX_TEXT: usize = 8_192;
 const LIBRARY_TYPES: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib"];
 
-/// A validated selected check graph. Counts are explanatory, not authority.
+/// A validated selected compilation graph. Counts are explanatory, not authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckUnitGraph {
+pub struct CompilationUnitGraph {
     /// Number of selected compiler units, including distinct feature/profile units.
     pub units: usize,
     /// Number of distinct opaque Cargo package identities in those units.
@@ -41,7 +41,7 @@ pub struct CheckUnitGraph {
     source_paths: Vec<String>,
 }
 
-impl CheckUnitGraph {
+impl CompilationUnitGraph {
     /// Sorted, deduplicated compiler source paths for captured-root validation.
     /// These retain Cargo's exact spelling; no host or namespace rewriting occurs.
     #[must_use]
@@ -107,7 +107,7 @@ fn target_source(unit: &Value) -> io::Result<&str> {
             let kind = text(kind, "target kind")?;
             require(
                 !matches!(kind, "custom-build" | "proc-macro"),
-                "selected Cargo check contains build scripts or procedural macros",
+                "selected Cargo compilation contains build scripts or procedural macros",
             )?;
             let allowed = LIBRARY_TYPES.contains(&kind)
                 || kind == "bin"
@@ -130,12 +130,16 @@ fn index(value: &Value, units: usize) -> io::Result<usize> {
         .ok_or_else(|| invalid("Cargo unit graph index is absent or outside its units"))
 }
 
-/// Validate a version-1, nonexecuting Cargo unit graph for a selected check.
+/// Validate a version-1, nonexecuting Cargo unit graph for a selected command.
 ///
 /// All nodes are validated, including any node not reachable from a selected
 /// root. Unreachable nodes, cycles, invalid dependency references and unknown
 /// execution modes refuse the whole graph. Merely omitting a dangerous node
-/// from `roots` therefore cannot make it an admitted check graph.
+/// from `roots` therefore cannot make it an admitted compilation graph.
+/// `Build` may contain `test` units: `cargo build --tests` compiles those harnesses
+/// without running them. The same mode is refused for `Check`. The caller must
+/// bind this command to both its trusted Cargo graph query and final invocation;
+/// a graph from `cargo test` never establishes compile-only execution authority.
 ///
 /// The parser deliberately does not reconstruct Cargo's feature resolver or
 /// package selection from `cargo metadata`. Multiple units for the same package
@@ -147,7 +151,10 @@ fn index(value: &Value, units: usize) -> io::Result<usize> {
 /// for any selected build-script/proc-macro/execution mode outside ordinary
 /// Rust compilation. This is an execution eligibility check only, never a
 /// result-publication or compiler-skip authorization.
-pub fn validate_check_unit_graph(graph: &Value) -> io::Result<CheckUnitGraph> {
+pub fn validate_compilation_unit_graph(
+    graph: &Value,
+    command: CompilationCommand,
+) -> io::Result<CompilationUnitGraph> {
     require(
         graph["version"].as_u64() == Some(1),
         "unsupported Cargo unit graph version",
@@ -178,11 +185,15 @@ pub fn validate_check_unit_graph(graph: &Value) -> io::Result<CheckUnitGraph> {
         let mode = text(&unit["mode"], "unit mode")?;
         require(
             mode != "run-custom-build",
-            "selected Cargo check contains build scripts or procedural macros",
+            "selected Cargo compilation contains build scripts or procedural macros",
         )?;
+        let compile_only = match command {
+            CompilationCommand::Check => matches!(mode, "check" | "build"),
+            CompilationCommand::Build => matches!(mode, "build" | "test"),
+        };
         require(
-            matches!(mode, "check" | "build"),
-            "selected Cargo check contains an unsupported execution mode",
+            compile_only,
+            "selected Cargo compilation contains an unsupported execution mode for its command",
         )?;
         source_paths.insert(target_source(unit)?.to_owned());
         require(unit["profile"].is_object(), "Cargo unit profile is missing")?;
@@ -196,7 +207,7 @@ pub fn validate_check_unit_graph(graph: &Value) -> io::Result<CheckUnitGraph> {
         optional_bool(unit, "is_std")?;
         require(
             unit.get("is_std").and_then(Value::as_bool) != Some(true),
-            "building the standard library is outside the captured check profile",
+            "building the standard library is outside the captured compilation profile",
         )?;
         let features = unit["features"]
             .as_array()
@@ -235,7 +246,7 @@ pub fn validate_check_unit_graph(graph: &Value) -> io::Result<CheckUnitGraph> {
         dependencies.push(next);
     }
     validate_reachability(&dependencies, &selected)?;
-    Ok(CheckUnitGraph {
+    Ok(CompilationUnitGraph {
         units: units.len(),
         packages: packages.len(),
         roots: selected.len(),
@@ -305,7 +316,7 @@ mod tests {
 
     #[test]
     fn selected_compiler_graph_retains_unique_source_paths_and_counts() {
-        let report = validate_check_unit_graph(&graph()).unwrap();
+        let report = validate_compilation_unit_graph(&graph(), CompilationCommand::Check).unwrap();
         assert_eq!((report.units, report.packages, report.roots), (2, 2, 1));
         assert_eq!(
             report.source_paths(),
@@ -324,7 +335,7 @@ mod tests {
         graph["units"][1]["dependencies"] = json!([]);
         graph["units"][1]["features"] = json!(["extra"]);
         graph["units"][1]["platform"] = json!("x86_64-unknown-linux-gnu");
-        let report = validate_check_unit_graph(&graph).unwrap();
+        let report = validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
         assert_eq!((report.units, report.packages, report.roots), (2, 1, 1));
         assert_eq!(report.source_paths().len(), 1);
     }
@@ -343,7 +354,7 @@ mod tests {
             let mut graph = graph();
             graph["units"][0]["target"]["kind"] = json!([kind]);
             graph["units"][0]["target"]["crate_types"] = json!([crate_type]);
-            validate_check_unit_graph(&graph).unwrap();
+            validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
         }
     }
 
@@ -354,7 +365,7 @@ mod tests {
                 let mut graph = graph();
                 graph["units"][1]["target"][field] = json!([kind]);
                 assert!(
-                    validate_check_unit_graph(&graph).is_err(),
+                    validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err(),
                     "{field}: {kind}"
                 );
             }
@@ -369,11 +380,14 @@ mod tests {
         ] {
             let mut graph = graph();
             graph["units"][1]["mode"] = json!(mode);
-            assert!(validate_check_unit_graph(&graph).is_err(), "{mode}");
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err(),
+                "{mode}"
+            );
         }
         let mut graph = graph();
         graph["units"][0]["is_std"] = json!(true);
-        assert!(validate_check_unit_graph(&graph).is_err());
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
     }
 
     #[test]
@@ -381,7 +395,7 @@ mod tests {
         for version in [json!(0), json!(2), json!("1"), Value::Null] {
             let mut graph = graph();
             graph["version"] = version;
-            assert!(validate_check_unit_graph(&graph).is_err());
+            assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
         }
         for roots in [
             json!([]),
@@ -392,7 +406,7 @@ mod tests {
         ] {
             let mut graph = graph();
             graph["roots"] = roots;
-            assert!(validate_check_unit_graph(&graph).is_err());
+            assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
         }
         for index in [
             json!(0),
@@ -404,12 +418,12 @@ mod tests {
         ] {
             let mut graph = graph();
             graph["units"][0]["dependencies"][0]["index"] = index;
-            assert!(validate_check_unit_graph(&graph).is_err());
+            assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
         }
         let mut graph = graph();
         let edge = graph["units"][0]["dependencies"][0].clone();
         graph["units"][0]["dependencies"] = json!([edge.clone(), edge]);
-        assert!(validate_check_unit_graph(&graph).is_err());
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
     }
 
     #[test]
@@ -417,7 +431,7 @@ mod tests {
         let mut cyclic = graph();
         cyclic["units"][1] = unit("dependency", &[0]);
         assert!(
-            validate_check_unit_graph(&cyclic)
+            validate_compilation_unit_graph(&cyclic, CompilationCommand::Check)
                 .unwrap_err()
                 .to_string()
                 .contains("cycle")
@@ -425,16 +439,21 @@ mod tests {
         let mut dangling = graph();
         dangling["units"][0]["dependencies"] = json!([]);
         assert!(
-            validate_check_unit_graph(&dangling)
+            validate_compilation_unit_graph(&dangling, CompilationCommand::Check)
                 .unwrap_err()
                 .to_string()
                 .contains("unreachable")
         );
         dangling["units"][1]["target"]["kind"] = json!(["proc-macro"]);
-        assert!(validate_check_unit_graph(&dangling).is_err());
+        assert!(validate_compilation_unit_graph(&dangling, CompilationCommand::Check).is_err());
         dangling["units"][1] = unit("dependency", &[]);
         dangling["roots"] = json!([0, 1]);
-        assert_eq!(validate_check_unit_graph(&dangling).unwrap().roots, 2);
+        assert_eq!(
+            validate_compilation_unit_graph(&dangling, CompilationCommand::Check)
+                .unwrap()
+                .roots,
+            2
+        );
     }
 
     #[test]
@@ -449,7 +468,10 @@ mod tests {
         ] {
             let mut graph = graph();
             graph["units"][0].as_object_mut().unwrap().remove(field);
-            assert!(validate_check_unit_graph(&graph).is_err(), "{field}");
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err(),
+                "{field}"
+            );
         }
         for source in [
             "src/lib.rs",
@@ -463,14 +485,17 @@ mod tests {
         ] {
             let mut graph = graph();
             graph["units"][0]["target"]["src_path"] = json!(source);
-            assert!(validate_check_unit_graph(&graph).is_err(), "{source:?}");
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err(),
+                "{source:?}"
+            );
         }
         let mut graph = graph();
         graph["units"][0]["features"] = json!(["duplicate", "duplicate"]);
-        assert!(validate_check_unit_graph(&graph).is_err());
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
         graph["units"][0]["features"] = json!([]);
         graph["units"][0]["target"]["test"] = json!("true");
-        assert!(validate_check_unit_graph(&graph).is_err());
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
     }
 
     #[test]
@@ -485,11 +510,55 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut graph = json!({"version":1, "units":units, "roots":[0]});
-        assert_eq!(validate_check_unit_graph(&graph).unwrap().units, MAX_UNITS);
+        assert_eq!(
+            validate_compilation_unit_graph(&graph, CompilationCommand::Check)
+                .unwrap()
+                .units,
+            MAX_UNITS
+        );
         graph["units"]
             .as_array_mut()
             .unwrap()
             .push(unit("excessive", &[]));
-        assert!(validate_check_unit_graph(&graph).is_err());
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
+    }
+
+    #[test]
+    fn build_graphs_admit_compiled_test_harnesses_only_under_build_authority() {
+        let mut graph = graph();
+        graph["units"][0]["mode"] = json!("test");
+        graph["units"][0]["target"]["kind"] = json!(["test"]);
+        graph["units"][0]["target"]["crate_types"] = json!(["bin"]);
+        graph["units"][1]["mode"] = json!("build");
+        let report = validate_compilation_unit_graph(&graph, CompilationCommand::Build).unwrap();
+        assert_eq!((report.units, report.packages, report.roots), (2, 2, 1));
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
+        graph["units"][0]["mode"] = json!("build");
+        validate_compilation_unit_graph(&graph, CompilationCommand::Build).unwrap();
+        for mode in [
+            "check",
+            "run",
+            "doc",
+            "doctest",
+            "run-custom-build",
+            "future-mode",
+        ] {
+            graph["units"][0]["mode"] = json!(mode);
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Build).is_err(),
+                "{mode}"
+            );
+        }
+        graph["units"][0]["mode"] = json!("build");
+        for kind in ["proc-macro", "custom-build"] {
+            for field in ["kind", "crate_types"] {
+                let mut rejected = graph.clone();
+                rejected["units"][1]["target"][field] = json!([kind]);
+                assert!(
+                    validate_compilation_unit_graph(&rejected, CompilationCommand::Build).is_err(),
+                    "{kind}: {field}"
+                );
+            }
+        }
     }
 }
