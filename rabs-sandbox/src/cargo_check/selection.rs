@@ -37,10 +37,32 @@ pub struct CheckSelection {
     pub example: Vec<String>,
     pub bench: Vec<String>,
     pub release: bool,
+    /// Built-in compilation targets in argument order. Empty retains Cargo's
+    /// default; `host-tuple` is resolved by the captured Cargo. JSON target
+    /// specifications are additional inputs and are not admitted as names.
+    pub target: Vec<String>,
+    /// Cargo's profile name, not profile settings. Cargo validates existence
+    /// and inheritance in the captured workspace. The unit graph and actual
+    /// check use the same value, including `test` and its development units.
+    pub profile: Option<String>,
 }
 
 fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, reason)
+}
+
+/// Names can select captured compiler/workspace semantics, never an additional
+/// JSON target specification or a host file. Deliberately stricter than Cargo's
+/// general --target syntax until target-specification capture is modeled.
+fn ordinary_name(value: &str) -> bool {
+    value.len() <= MAX_VALUE_BYTES
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 impl CheckSelection {
@@ -56,6 +78,23 @@ impl CheckSelection {
                 "Cargo check exclusions require workspace selection",
             ));
         }
+        if self.release && self.profile.is_some() {
+            return Err(invalid(
+                "choose release or an explicit Cargo check profile, not both",
+            ));
+        }
+        if self.target.iter().any(|target| !ordinary_name(target)) {
+            return Err(invalid(
+                "Cargo check targets must be built-in names, not target-specification paths",
+            ));
+        }
+        if self
+            .profile
+            .as_ref()
+            .is_some_and(|profile| !ordinary_name(profile))
+        {
+            return Err(invalid("invalid Cargo check profile name"));
+        }
         let values = [
             ("--package", &self.packages),
             ("--exclude", &self.exclude),
@@ -64,8 +103,10 @@ impl CheckSelection {
             ("--test", &self.test),
             ("--example", &self.example),
             ("--bench", &self.bench),
+            ("--target", &self.target),
         ];
-        let count = values.iter().map(|(_, values)| values.len()).sum::<usize>();
+        let count = values.iter().map(|(_, values)| values.len()).sum::<usize>()
+            + usize::from(self.profile.is_some());
         if count > MAX_VALUES {
             return Err(invalid("Cargo check selection has too many values"));
         }
@@ -98,6 +139,10 @@ impl CheckSelection {
                 args.push(option.to_owned());
                 args.push(value.clone());
             }
+        }
+        if let Some(profile) = &self.profile {
+            args.push("--profile".into());
+            args.push(profile.clone());
         }
         if args.iter().map(String::len).sum::<usize>() > MAX_ARGUMENT_BYTES {
             return Err(invalid(
@@ -224,5 +269,108 @@ mod tests {
         assert!(selection.cargo_arguments().is_err());
         selection.workspace = true;
         assert!(selection.cargo_arguments().is_ok());
+    }
+
+    #[test]
+    fn compilation_targets_and_profile_survive_profile_roundtrip_in_order() {
+        let selection: CheckSelection = serde_json::from_value(json!({
+            "workspace":true, "lib":true,
+            "target":["wasm32-unknown-unknown", "aarch64-unknown-linux-gnu", "host-tuple"],
+            "profile":"check-fast", "features":["core/serde"]
+        }))
+        .unwrap();
+        let roundtrip: CheckSelection =
+            serde_json::from_value(serde_json::to_value(&selection).unwrap()).unwrap();
+        assert_eq!(roundtrip, selection);
+        assert_eq!(
+            roundtrip.cargo_arguments().unwrap(),
+            [
+                "check", "--workspace", "--lib", "--features", "core/serde",
+                "--target", "wasm32-unknown-unknown",
+                "--target", "aarch64-unknown-linux-gnu",
+                "--target", "host-tuple", "--profile", "check-fast"
+            ]
+        );
+    }
+
+    #[test]
+    fn target_and_profile_selectors_never_grant_external_file_authority() {
+        for name in [
+            "", "--config=bad", "-Zunstable-options", "/tmp/target.json",
+            "./target.json", "../target", "target.json", "spec/target",
+            "C:\\spec\\target.json", "target\0", "target\n", "host tuple",
+            "target=wasm32", "targét", ".", "..",
+        ] {
+            let target = CheckSelection {
+                target: vec![name.into()],
+                ..CheckSelection::default()
+            };
+            let profile = CheckSelection {
+                profile: Some(name.into()),
+                ..CheckSelection::default()
+            };
+            assert!(target.cargo_arguments().is_err(), "target {name:?}");
+            assert!(profile.cargo_arguments().is_err(), "profile {name:?}");
+        }
+        for value in [
+            json!({"target":"wasm32-unknown-unknown"}),
+            json!({"target":[true]}),
+            json!({"target":null}),
+            json!({"profile":["release"]}),
+            json!({"profile":{"inherits":"release"}}),
+        ] {
+            assert!(serde_json::from_value::<CheckSelection>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_profiles_do_not_silently_override_release_or_the_default() {
+        for name in ["dev", "release", "test", "bench", "check_fast"] {
+            let mut selection = CheckSelection {
+                profile: Some(name.into()),
+                ..CheckSelection::default()
+            };
+            assert_eq!(selection.cargo_arguments().unwrap(), ["check", "--profile", name]);
+            selection.release = true;
+            assert!(selection.cargo_arguments().is_err());
+        }
+        let default: CheckSelection = serde_json::from_value(json!({"profile":null})).unwrap();
+        assert_eq!(default.cargo_arguments().unwrap(), ["check"]);
+        assert_eq!(
+            CheckSelection { release: true, ..CheckSelection::default() }
+                .cargo_arguments().unwrap(),
+            ["check", "--release"]
+        );
+    }
+
+    #[test]
+    fn target_and_profile_values_share_existing_global_budgets() {
+        let mut selection = CheckSelection {
+            target: vec!["host-tuple".into(); MAX_VALUES],
+            ..CheckSelection::default()
+        };
+        assert!(selection.cargo_arguments().is_ok());
+        selection.profile = Some("dev".into());
+        assert!(selection.cargo_arguments().is_err());
+        selection.target.pop();
+        assert!(selection.cargo_arguments().is_ok());
+        selection.features.push("feature".into());
+        assert!(selection.cargo_arguments().is_err());
+        selection.features.clear();
+        selection.profile = None;
+        selection.target = vec!["a".repeat(MAX_VALUE_BYTES); MAX_VALUES];
+        assert!(selection.cargo_arguments().is_err());
+        selection.target = vec!["a".repeat(MAX_VALUE_BYTES + 1)];
+        assert!(selection.cargo_arguments().is_err());
+        selection.target.clear();
+        selection.profile = Some("a".repeat(MAX_VALUE_BYTES + 1));
+        assert!(selection.cargo_arguments().is_err());
+        // Neither new field can evade the aggregate byte budget by being
+        // individually bounded. These 16 values fit until a profile is added.
+        selection.profile = None;
+        selection.features = vec!["a".repeat(1000); 16];
+        assert!(selection.cargo_arguments().is_ok());
+        selection.profile = Some("a".repeat(1000));
+        assert!(selection.cargo_arguments().is_err());
     }
 }
