@@ -38,7 +38,7 @@ lane, or share a cache across workers. It does not make an unsandboxed local
 cache key equivalent to a canonical execution. Those remain separate integration
 and qualification tasks. Unlike `--rabs-remote`, this path does not invoke RCH.
 
-A separate [local canonical library-check profile](#local-canonical-library-checks-with-dependency-caching)
+A separate [local canonical check profile](#local-canonical-checks-with-dependency-caching)
 connects captured Cargo execution to the existing external-dependency metadata
 cache. Its explicit command and narrower graph requirements are described below.
 
@@ -896,10 +896,11 @@ Per-action admission/placement,
 coordinator-only cache publication, cross-worker reuse, real compiler-skip evidence,
 performance gates and the required canary/soak are not completed by this frontend.
 
-## Local canonical library checks with dependency caching
+## Local canonical checks with dependency caching
 
 `rabsd --canonical-check-local PROFILE.json` runs the captured native Cargo as
-`cargo check --lib --offline --locked` inside the canonical namespace and connects
+`cargo check --offline --locked` with the selected packages, features and targets
+inside the canonical namespace and connects
 its rustc requests to an operation-owned coordinator. Eligible external registry,
 locked Git and verified directory-source libraries use the existing metadata
 cache, including its cold-result publication, differential verification and
@@ -908,10 +909,22 @@ compiler at `/__rabs/toolchain/bin/rustc` and target at `/__rabs/out/cargo`, so 
 the original checkout does not introduce a different host path into that unit's
 arguments or metadata output.
 
-This first local profile requires a complete resolved graph without **any build
-scripts or procedural macros**. It asks the captured Cargo for the all-features
-dependency graph before exposing a wrapper or cache endpoint. Optional or
-target-specific packages containing those executors also refuse this profile.
+The local profile asks the captured Cargo to plan the **actual selected build
+units** with `check --unit-graph -Z unstable-options`, using the same command
+arguments, captured configuration and canonical paths as execution. Planning
+does not compile or run project units, and finishes before a wrapper or cache
+endpoint is exposed. A selected build script or procedural macro refuses the
+operation. Inactive optional dependencies, development targets and other
+workspace members containing those executors no longer prevent a safe library
+or package check. Unknown graph versions, modes, target kinds, malformed edges,
+cycles, unreachable units and sources outside the retained inputs also refuse.
+This requires a nightly Cargo supporting the unit-graph interface; an unsupported
+toolchain does not fall back to a guessed package graph.
+
+The earlier source preparation still captures the complete approved anchor and
+uses locked all-features metadata to validate its dependency closure. Selecting
+fewer check units does not reduce the authorized upload/capture scope or make
+missing locked dependencies available offline.
 Workspace members, primary packages and unsupported compiler requests compile
 normally inside the namespace. Their results do not enter the dependency cache.
 The supported cache class remains external dependency `metadata` plus `dep-info`;
@@ -920,7 +933,7 @@ remote dispatch require their own admission and qualification work.
 
 ### Create and run the local profile
 
-Install matching native `rabsd` and `rabs-wrap` binaries. The explicit toolchain
+Install matching native `rabsd` and `rabs-wrap` binaries. The explicit nightly toolchain
 root must contain its real `bin/cargo`, `bin/rustc`, libraries and native sysroot.
 The preparing host must pass the full production bubblewrap namespace probe,
 including private `/proc`, `/dev`, temporary storage and network isolation.
@@ -957,7 +970,28 @@ rabsd --canonical-check-local ./canonical-check.json
 ```
 
 `manifest` defaults to `Cargo.toml`, `jobs` to 1 and `timeout_seconds` to 1800.
-The job count accepts 1–4096 and the canonical metadata/check timeout accepts 1–7200
+Omitting `selection` retains the original `check --lib` behavior. Setting
+`"selection": {}` uses Cargo's ordinary default members and targets. A selection
+can specify `workspace`, `packages`, `exclude`, `features`, `all_features`,
+`no_default_features`, `lib`, `bins`, `tests`, `examples`, `benches`, `all_targets`,
+the named-target arrays `bin`, `test`, `example`, `bench`, and `release`.
+Exclusions require workspace selection. For example:
+
+```json
+"selection": {
+  "packages": ["core", "app"],
+  "features": ["app/fast"],
+  "no_default_features": true,
+  "lib": true
+}
+```
+
+Cargo resolves package/feature names and target availability itself. These fields
+cannot supply another command, compiler, environment, configuration file,
+manifest, output directory or arbitrary unstable option. A test target selection
+type-checks tests; it does not execute their harnesses.
+
+The job count accepts 1–4096 and the canonical graph/check timeout accepts 1–7200
 seconds. A purely local graph omits `vendor`. A registry/Git cache profile uses
 `"cargo_home_source": "/home/builder/.cargo"` instead of `vendor`; the existing
 locked offline planner captures the required package archives and Git objects
@@ -1023,7 +1057,7 @@ while persistent reusable dependency results remain in the profile's CAS.
 
 ### Validate the real bridge
 
-The ordinary native tests cover strict profile parsing, pure-graph admission,
+The ordinary native tests cover strict profile parsing, selected unit-graph admission,
 read-only control/source mounts, retained state ownership, and the real scoped
 socket's refusal of generic daemon capabilities while joining an open session:
 
@@ -1047,10 +1081,74 @@ RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
 That test runs real Cargo and rustc against two vendored dependency libraries.
 It requires three actual cold/sample compiles with identical action identities,
 then requires verified hits in a different checkout and fresh target after a
-workspace source edit. A subsequent dependency edit must compile, and adding a
-build script must refuse the graph before the cache endpoint is exposed. The test
+workspace source edit. Unused optional build-script and development proc-macro
+dependencies are present throughout those checks. A subsequent dependency edit
+must compile, while explicitly selecting either executor must refuse the graph
+before the cache endpoint is exposed. The test
 does not inject publication rows or verification samples. An ignored test or a
 namespace-support refusal is not end-to-end success evidence; run this test on a
 capable host before enabling the profile operationally. This bounded local bridge
 does not complete the remote worker, workspace-cache or performance qualification
 tasks described above.
+
+### Select local Cargo units from the Cargo command line
+
+The installed `cargo-rabs` launcher accepts the same local profile and turns
+ordinary check selectors into the native driver's typed selection:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-check.json -- check
+cargo rabs --rabs-canonical-local ./canonical-check.json -- check --workspace --all-targets
+cargo rabs --rabs-canonical-local ./canonical-check.json -- check -p app --bin server \
+  --no-default-features --features app/http --release
+```
+
+Omitting the Cargo arguments selects `check`. Explicit command-line selection
+replaces the profile's entire `selection` object; it never merges with saved
+features or targets. An empty selection uses Cargo's ordinary default members
+and targets. Directly invoking `rabsd` with a profile that omits `selection`
+retains the older `--lib` behavior. The profile still selects the manifest,
+source and toolchain roots, job budget, timeout, state directory and wrapper.
+
+| Selection | Accepted options |
+|---|---|
+| Packages | `-p` / `--package`, `--workspace`, `--exclude` with `--workspace` |
+| Features | `-F` / `--features`, `--all-features`, `--no-default-features` |
+| Target kinds | `--lib`, `--bins`, `--tests`, `--examples`, `--benches`, `--all-targets` |
+| Named targets | `--bin`, `--test`, `--example`, `--bench` |
+| Compilation profile | `--release` / `-r` |
+
+Value options accept separate arguments and `--option=value`; `-pPACKAGE` and
+`-FFEATURES` are also accepted. Repeated value options retain every literal value.
+Cargo interprets package specifications and comma/space-separated feature lists.
+The native driver constructs both its nonexecuting unit-graph query and the
+subsequent check from the same selection. It requires a captured nightly Cargo
+with unit-graph support and refuses required build-script/procedural-macro units
+before exposing the cache endpoint. Selecting a different target or feature set
+can therefore admit a check whose unused targets need those executors. Source
+preparation still captures the locked graph; these selectors do not narrow the
+approved source boundary or authorize generated-input caching.
+
+This command accepts `check` only. The native driver supplies locked/offline
+mode, canonical compiler and output locations, and JSON diagnostics. Arguments
+that would override them, including `--config`, `--manifest-path`, `--target-dir`,
+`--message-format`, `-Z`, `--target`, `--profile`, or arguments after a second
+`--`, are refused. Set `jobs` and `manifest` in the profile. Launcher modes and
+local root-admission settings cannot be combined with this mode.
+
+Before the single native handoff, the launcher saves the resolved profile as
+`operation_root/check-<random>/profile.json` with mode 0600 in a mode 0700
+directory. It prints that retained pathname on stderr, preserves the source
+profile, then replaces its own process with
+`rabsd --canonical-check-local <retained-profile>`. Native exit status, signals,
+stdin and stdout/stderr pass through that handoff. `CARGO_RABS_DAEMON` may select
+the matching installed `rabsd`; the selected compiler and wrapper still come
+from the profile. Release-policy configuration remains native and mandatory.
+No ordinary daemon is started, and a setup/native failure does not retry through
+Cargo, RCH or a weaker namespace.
+
+`scripts/tests/test_cargo_rabs_local.py` exercises this launcher handoff with an
+explicit executable driver fixture, including literal selections, retained
+permissions, process identity, raw streams, exit signals and refusal paths.
+Those tests establish the frontend contract. The real Cargo/compiler/cache
+qualification still requires the native integration tests above.

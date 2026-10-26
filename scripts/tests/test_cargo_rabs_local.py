@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Real local launcher/exec/filesystem tests with an explicit native-driver double.
+
+The fixture records the exact retained profile and process handoff. It does not
+implement Cargo, the namespace, unit-graph admission, the coordinator or a cache;
+passing these tests is not native compiler-skip evidence.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+LAUNCHER = Path(__file__).resolve().parents[1] / "cargo-rabs"
+loader = importlib.machinery.SourceFileLoader("cargo_rabs_local_test", str(LAUNCHER))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+launcher = importlib.util.module_from_spec(spec)
+loader.exec_module(launcher)
+
+DRIVER = r'''
+import json, os, pathlib, signal, stat, sys
+assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-check-local", sys.argv
+path = pathlib.Path(sys.argv[2])
+profile = json.loads(path.read_bytes())
+assert profile["version"] == "canonical-check-local-v1"
+assert "selection" in profile
+record = {"pid":os.getpid(), "argv":sys.argv, "profile":profile,
+          "retained":str(path), "file_mode":stat.S_IMODE(path.stat().st_mode),
+          "directory_mode":stat.S_IMODE(path.parent.stat().st_mode),
+          "cwd":os.getcwd(), "environment":dict(os.environ),
+          "input":sys.stdin.buffer.read().hex()}
+if os.environ.get("TEST_INHERITED_FD"):
+    record["inherited"] = os.read(int(os.environ["TEST_INHERITED_FD"]), 1024).hex()
+with open(os.environ["TEST_DRIVER_RECORD"], "a") as output:
+    output.write(json.dumps(record) + "\n")
+sys.stdout.buffer.write(b"fixture check stdout\x00\xff\n")
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(b"fixture check stderr\x00\xfe\n")
+sys.stderr.buffer.flush()
+if os.environ.get("TEST_SIGNAL"):
+    os.kill(os.getpid(), signal.SIGTERM)
+sys.exit(int(os.environ.get("TEST_EXIT", "0")))
+'''
+
+
+class CanonicalLocalCargo(unittest.TestCase):
+    def setUp(self):
+        self.owner = tempfile.TemporaryDirectory(prefix="rabs-local-launcher-")
+        self.addCleanup(self.owner.cleanup)
+        self.root = Path(self.owner.name)
+        self.source = self.root / "source 雪"
+        self.tools = self.root / "tools"
+        self.state = self.root / "state"
+        self.operations = self.root / "operations"
+        for directory in (self.source, self.tools / "bin", self.state, self.operations):
+            directory.mkdir(parents=True, mode=0o700)
+        self.forbidden = self.root / "unexpected-build"
+        for name in ("cargo", "rustc", "rch"):
+            tool = self.tools / "bin" / name
+            tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
+            tool.chmod(0o700)
+        self.wrapper = self.root / "rabs-wrap"
+        self.wrapper.write_text("#!/bin/sh\nexit 97\n")
+        self.wrapper.chmod(0o700)
+        self.driver = self.root / "rabsd"
+        self.driver.write_text("#!" + sys.executable + " -S\n" + DRIVER)
+        self.driver.chmod(0o700)
+        self.record = self.root / "driver.ndjson"
+        self.profile_path = self.root / "profile.json"
+        self.profile = {
+            "version": "canonical-check-local-v1", "source_root": str(self.source),
+            "toolchain_root": str(self.tools), "state_root": str(self.state),
+            "operation_root": str(self.operations), "wrapper": str(self.wrapper),
+            "manifest": "member/Cargo.toml", "jobs": 3, "timeout_seconds": 600,
+        }
+        self.env = {
+            "PATH": os.defpath, "HOME": str(self.root), "LC_ALL": "C.UTF-8",
+            "CARGO_RABS_DAEMON": str(self.driver),
+            "CARGO": str(self.tools / "bin/cargo"), "CARGO_RABS_RCH": str(self.tools / "bin/rch"),
+            "TEST_DRIVER_RECORD": str(self.record), "RABS_CONFIG": str(self.root / "policy.toml"),
+            "AMBIENT_INPUT": "not copied into the native profile",
+        }
+        self.save()
+
+    def save(self):
+        self.profile_path.write_text(json.dumps(self.profile))
+
+    def invoke(self, args=None, env=None, prefix=None, input=b"", pass_fds=()):
+        if prefix is None:
+            prefix = ["rabs", "--rabs-canonical-local", str(self.profile_path), "--"]
+        command = [sys.executable, "-I", "-S", str(LAUNCHER)] + prefix + (args or [])
+        child = subprocess.Popen(
+            command, cwd=self.root, env=self.env if env is None else env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=pass_fds,
+        )
+        try:
+            stdout, stderr = child.communicate(input, timeout=8)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=3)
+        self.assertFalse(self.forbidden.exists(), "launcher ran stock Cargo/rustc/RCH")
+        return child.returncode, stdout, stderr, child.pid
+
+    def records(self):
+        return [json.loads(line) for line in self.record.read_text().splitlines()]
+
+    def assert_refused(self, args=None, env=None, prefix=None):
+        operations = list(self.operations.iterdir())
+        count = len(self.records()) if self.record.exists() else 0
+        status, stdout, stderr, _ = self.invoke(args, env, prefix)
+        self.assertEqual(status, 2, stderr.decode(errors="replace"))
+        self.assertEqual(stdout, b"")
+        self.assertEqual(list(self.operations.iterdir()), operations)
+        self.assertEqual(len(self.records()) if self.record.exists() else 0, count)
+
+    def test_exec_handoff_preserves_pid_status_raw_streams_stdin_and_native_policy_environment(self):
+        original = self.profile_path.read_bytes()
+        env = dict(self.env, TEST_EXIT="37", RABS_RELEASE_AUTHORIZATION="required")
+        status, stdout, stderr, pid = self.invoke(["check", "--workspace"], env, input=b"\x00\xffstdin")
+        self.assertEqual(status, 37)
+        self.assertEqual(stdout, b"fixture check stdout\x00\xff\n")
+        self.assertIn(b"fixture check stderr\x00\xfe\n", stderr)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["input"], "00ff737464696e")
+        self.assertEqual(record["cwd"], str(self.root))
+        self.assertEqual(record["environment"], dict(env, CARGO_RABS_CANONICAL_ACTIVE="1"))
+        expected = dict(self.profile, selection={"workspace": True})
+        self.assertEqual(record["profile"], expected)
+        self.assertEqual(record["argv"], [str(self.driver), "--canonical-check-local", record["retained"]])
+        retained = Path(record["retained"])
+        self.assertEqual(retained.parent.parent, self.operations)
+        self.assertEqual(record["file_mode"], 0o600)
+        self.assertEqual(record["directory_mode"], 0o700)
+        self.assertEqual(json.loads(retained.read_bytes()), expected)
+        self.assertEqual(self.profile_path.read_bytes(), original)
+        self.assertNotIn("env", record["profile"])
+        self.assertNotIn("AMBIENT_INPUT", retained.read_text())
+
+    def test_default_check_replaces_saved_selection_with_cargo_defaults(self):
+        self.profile["selection"] = {"lib": True, "features": ["from-profile"]}
+        self.save()
+        for args in ([], ["check"]):
+            status, _, stderr, _ = self.invoke(args)
+            self.assertEqual(status, 0, stderr.decode(errors="replace"))
+            self.assertEqual(self.records()[-1]["profile"]["selection"], {})
+        self.assertEqual(len(list(self.operations.iterdir())), 2)
+        self.assertNotEqual(self.records()[0]["retained"], self.records()[1]["retained"])
+
+    def test_named_packages_features_and_targets_reach_the_retained_native_profile(self):
+        args = ["check", "--workspace", "--exclude=integration-*", "-p", "core@1.0.0",
+                "-papp", "--package=third", "--features", "app/fast,core/serde",
+                "-Fcore/std", "-F=extra", "--features=雪", "--no-default-features",
+                "--all-features", "--lib", "--bins", "--tests", "--examples", "--benches",
+                "--all-targets", "--bin", "server", "--bin=cli", "--test", "roundtrip",
+                "--example=client", "--bench", "throughput", "--release"]
+        status, _, stderr, _ = self.invoke(args)
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        selected = self.records()[0]["profile"]["selection"]
+        self.assertEqual(selected, {
+            "workspace": True, "exclude": ["integration-*"],
+            "packages": ["core@1.0.0", "app", "third"],
+            "features": ["app/fast,core/serde", "core/std", "extra", "雪"],
+            "no_default_features": True, "all_features": True,
+            "lib": True, "bins": True, "tests": True, "examples": True, "benches": True,
+            "all_targets": True, "bin": ["server", "cli"], "test": ["roundtrip"],
+            "example": ["client"], "bench": ["throughput"], "release": True,
+        })
+        self.assertEqual(self.records()[0]["profile"]["manifest"], "member/Cargo.toml")
+        self.assertEqual(self.records()[0]["profile"]["jobs"], 3)
+
+    def test_signal_exit_and_inherited_file_descriptors_survive_exec(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"inherited\x00\xff")
+            os.close(write_fd)
+            write_fd = None
+            env = dict(self.env, TEST_SIGNAL="1", TEST_INHERITED_FD=str(read_fd))
+            status, _, _, pid = self.invoke(["check", "-r"], env, pass_fds=(read_fd,))
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
+        self.assertEqual(status, -signal.SIGTERM)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["inherited"], "696e6865726974656400ff")
+        self.assertEqual(record["profile"]["selection"], {"release": True})
+
+    def test_commands_authority_options_and_missing_values_refuse_before_handoff(self):
+        rejected = [
+            ["build"], ["test"], ["clippy"], ["+nightly", "check"],
+            ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
+            ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
+            ["check", "--message-format=json"], ["check", "-Zunstable-options"],
+            ["check", "--target=x86_64-unknown-linux-gnu"], ["check", "--profile=custom"],
+            ["check", "--jobs=2"], ["check", "--", "--help"],
+            ["check", "--exclude", "unselected"], ["check", "--package"],
+            ["check", "--features="], ["check", "--bin", "--lib"],
+            ["check", "--tests=true"], ["check", "--features", "invalid\nvalue"],
+            ["check", "--features", "invalid\u0085value"],
+            ["check", "--rabs-no-start"], ["check", "--rabs-remote"],
+        ]
+        for args in rejected:
+            with self.subTest(args=args):
+                self.assert_refused(args)
+
+    def test_selection_limits_include_all_fields_utf8_bytes_and_option_bytes(self):
+        exact = ["check"] + [item for _ in range(128) for item in ("-F", "a")]
+        self.assertEqual(len(launcher.canonical_local_selection(exact)["features"]), 128)
+        self.assert_refused(exact + ["--bin", "one-more"])
+        self.assert_refused(["check", "--features", "雪" * 342])
+        self.assert_refused(["check"] + [item for _ in range(16) for item in ("-F", "a" * 1024)])
+
+    def test_strict_profile_refusals_never_create_retained_intent(self):
+        original = dict(self.profile)
+        for change in (
+            {"version": "canonical-cargo-v1"}, {"env": {"RABS_SOCKET_PATH": "/other"}},
+            {"jobs": True}, {"timeout_seconds": 7201}, {"manifest": "../Cargo.toml"},
+            {"manifest": "Cargo.lock"}, {"selection": {"args": ["build"]}},
+            {"selection": {"lib": "true"}}, {"selection": {"features": "feature"}},
+            {"selection": {"features": ["--config=other"]}},
+            {"selection": {"exclude": ["package"]}},
+            {"vendor": "vendor", "cargo_home_source": str(self.root)},
+        ):
+            with self.subTest(change=change):
+                self.profile = dict(original, **change)
+                self.save()
+                self.assert_refused(["check"])
+        self.profile = original
+        self.save()
+        self.profile_path.write_text(self.profile_path.read_text()[:-1] + ',"version":"canonical-check-local-v1"}')
+        self.assert_refused(["check"])
+
+    def test_unsafe_storage_overlap_and_symlink_profiles_refuse_before_writes(self):
+        self.operations.chmod(0o755)
+        self.assert_refused(["check"])
+        self.operations.chmod(0o700)
+        self.profile["operation_root"] = str(self.source)
+        self.save()
+        self.assert_refused(["check"])
+        self.assertEqual(list(self.source.iterdir()), [])
+        self.profile["operation_root"] = str(self.operations)
+        self.save()
+        alias = self.root / "profile-alias.json"
+        alias.symlink_to(self.profile_path)
+        self.assert_refused(["check"], prefix=["--rabs-canonical-local", str(alias), "--"])
+
+    def test_mode_mixing_nested_execution_and_root_admission_refuse(self):
+        for leading in ("--rabs-remote", "--rabs-no-start", "--rabs-require-daemon"):
+            self.assert_refused(prefix=["rabs", leading, "--rabs-canonical-local", str(self.profile_path)])
+        for flag in ("CARGO_RABS_CANONICAL_ACTIVE", "CARGO_RABS_REMOTE_ACTIVE", "RCH_RABS_WORKER_ACTIVE"):
+            self.assert_refused(["check"], dict(self.env, **{flag: "1"}))
+        self.assert_refused(["check"], dict(self.env, CARGO_RABS_ROOT_CAPACITY="4"))
+        with patch.object(launcher.sys, "platform", "darwin"):
+            with self.assertRaises(launcher.SetupError):
+                launcher.canonical_local_invocation(str(self.profile_path), ["check"], self.env)
+
+    def test_native_failure_is_returned_once_without_fallback(self):
+        status, _, stderr, _ = self.invoke(["check"], dict(self.env, TEST_EXIT="101"))
+        self.assertEqual(status, 101, stderr.decode(errors="replace"))
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(len(list(self.operations.iterdir())), 1)
+
+    def test_missing_driver_and_recursive_driver_refuse_before_creating_intent(self):
+        self.assert_refused(["check"], dict(self.env, CARGO_RABS_DAEMON=str(self.root / "missing")))
+        self.assert_refused(["check"], dict(self.env, CARGO_RABS_DAEMON=str(LAUNCHER)))
+
+    def test_exec_failure_retains_selected_intent_without_running_another_executor(self):
+        self.driver.write_text("#!/nonexistent-rabs-fixture-interpreter\n")
+        status, stdout, stderr, _ = self.invoke(["check", "--bin", "selected"])
+        self.assertEqual(status, 127, stderr.decode(errors="replace"))
+        self.assertEqual(stdout, b"")
+        self.assertFalse(self.record.exists())
+        operation, = self.operations.iterdir()
+        retained = json.loads((operation / "profile.json").read_bytes())
+        self.assertEqual(retained["selection"], {"bin": ["selected"]})
+        self.assertIn(b"cannot execute local canonical driver", stderr)
+
+    def test_help_describes_local_mode_without_starting_anything(self):
+        status, stdout, _, _ = self.invoke(prefix=["rabs", "--help"])
+        self.assertEqual(status, 0)
+        self.assertIn(b"--rabs-canonical-local", stdout)
+        self.assertIn(b"canonical-check-local-v1", stdout)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(list(self.operations.iterdir()), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
