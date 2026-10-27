@@ -10,9 +10,9 @@
 //! Linux/macOS have the required acquisition and change witnesses. Other hosts
 //! retain the existing publisher API, not a weaker approximation of this proof.
 
-use super::{BlobStoreLayout, PutError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::RAW_PROFILE_V1;
+use super::{BlobStoreLayout, PutError};
 use rabs_protocol::result_identity::TypedDigest;
 use std::path::{Path, PathBuf};
 
@@ -80,10 +80,20 @@ impl RawTargetObservation {
     /// All other failures retain their ordinary error/collision semantics.
     #[must_use]
     pub fn changed(error: &PutError) -> bool {
-        matches!(error, PutError::Io { step: "raw-target-observation-changed", .. })
+        matches!(
+            error,
+            PutError::Io {
+                step: "raw-target-observation-changed",
+                ..
+            }
+        )
     }
 
-    pub(super) fn check_binding(&self, target: &Path, expected: &TypedDigest) -> Result<(), PutError> {
+    pub(super) fn check_binding(
+        &self,
+        target: &Path,
+        expected: &TypedDigest,
+    ) -> Result<(), PutError> {
         if self.target != target || self.expected != *expected {
             return Err(PutError::Io {
                 step: "raw-target-observation-binding",
@@ -97,7 +107,10 @@ impl RawTargetObservation {
         self.check_binding(target, expected)?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            self.file.as_ref().ok_or_else(|| changed(target))?.validate(target)
+            self.file
+                .as_ref()
+                .ok_or_else(|| changed(target))?
+                .validate(target)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -105,11 +118,18 @@ impl RawTargetObservation {
         }
     }
 
-    pub(super) fn digest(&self, target: &Path, expected: &TypedDigest) -> Result<TypedDigest, PutError> {
+    pub(super) fn digest(
+        &self,
+        target: &Path,
+        expected: &TypedDigest,
+    ) -> Result<TypedDigest, PutError> {
         self.validate(target, expected)?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            self.file.as_ref().map(|file| file.digest.clone()).ok_or_else(|| changed(target))
+            self.file
+                .as_ref()
+                .map(|file| file.digest.clone())
+                .ok_or_else(|| changed(target))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -121,7 +141,11 @@ impl RawTargetObservation {
         self.validate(target, expected)?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            self.file.as_ref().ok_or_else(|| changed(target))?.file.sync_all()
+            self.file
+                .as_ref()
+                .ok_or_else(|| changed(target))?
+                .file
+                .sync_all()
                 .map_err(super::io_err("fsync-existing"))?;
             self.validate(target, expected)
         }
@@ -160,8 +184,12 @@ mod native {
     impl Version {
         fn of(metadata: &Metadata) -> Self {
             Self {
-                dev: metadata.dev(), ino: metadata.ino(), size: metadata.size(),
-                mode: metadata.mode(), uid: metadata.uid(), gid: metadata.gid(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                size: metadata.size(),
+                mode: metadata.mode(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
                 links: metadata.nlink(),
                 mtime: (metadata.mtime(), metadata.mtime_nsec()),
                 ctime: (metadata.ctime(), metadata.ctime_nsec()),
@@ -210,9 +238,14 @@ mod native {
             // the lstat. Validate the actual open object before consuming bytes.
             let descriptor = rustix::fs::open(
                 path,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+                OFlags::RDONLY
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::NOCTTY,
                 Mode::empty(),
-            ).map_err(|error| super::super::io_err("open-existing-observation")(error.into()))?;
+            )
+            .map_err(|error| super::super::io_err("open-existing-observation")(error.into()))?;
             let mut file = File::from(descriptor);
             validate_file(&file, path, &version)?;
             let mut hasher = Sha256::new();
@@ -221,23 +254,37 @@ mod native {
             let mut buffer = vec![0_u8; BUFFER_BYTES];
             let mut remaining = version.size;
             while remaining != 0 {
-                let bound = usize::try_from(remaining.min(BUFFER_BYTES as u64))
-                    .map_err(|error| PutError::Io { step: "observe-existing-size", error: error.to_string() })?;
+                let bound =
+                    usize::try_from(remaining.min(BUFFER_BYTES as u64)).map_err(|error| {
+                        PutError::Io {
+                            step: "observe-existing-size",
+                            error: error.to_string(),
+                        }
+                    })?;
                 let count = read_retry(&mut file, &mut buffer[..bound])
                     .map_err(super::super::io_err("read-existing-observation"))?;
-                if count == 0 { return Err(changed(path)); }
+                if count == 0 {
+                    return Err(changed(path));
+                }
                 hasher.update(&buffer[..count]);
                 remaining -= count as u64;
             }
             // Separate EOF probe avoids size + 1 overflow, even at u64::MAX.
             if read_retry(&mut file, &mut buffer[..1])
-                .map_err(super::super::io_err("read-existing-observation"))? != 0 {
+                .map_err(super::super::io_err("read-existing-observation"))?
+                != 0
+            {
                 return Err(changed(path));
             }
             validate_file(&file, path, &version)?;
             Ok(Some(Self {
-                file, version,
-                digest: TypedDigest { algorithm: DigestAlgorithm::Sha256V1, domain, bytes: hasher.finalize().into() },
+                file,
+                version,
+                digest: TypedDigest {
+                    algorithm: DigestAlgorithm::Sha256V1,
+                    domain,
+                    bytes: hasher.finalize().into(),
+                },
             }))
         }
 
@@ -249,8 +296,11 @@ mod native {
     fn validate_file(file: &File, path: &Path, version: &Version) -> Result<(), PutError> {
         let held = file.metadata().map_err(|_| changed(path))?;
         let named = std::fs::symlink_metadata(path).map_err(|_| changed(path))?;
-        if !held.is_file() || !named.is_file()
-            || Version::of(&held) != *version || Version::of(&named) != *version {
+        if !held.is_file()
+            || !named.is_file()
+            || Version::of(&held) != *version
+            || Version::of(&named) != *version
+        {
             return Err(changed(path));
         }
         Ok(())

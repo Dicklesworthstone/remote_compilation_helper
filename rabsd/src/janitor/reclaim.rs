@@ -137,10 +137,19 @@ impl Reclaimer {
             return Ok(ReclaimReport::deferred("no-authority"));
         }
         for (sql, reason) in [
-            ("SELECT 1 FROM action_generations WHERE tombstoned != 1 LIMIT 1", "active-generation"),
+            (
+                "SELECT 1 FROM action_generations WHERE tombstoned != 1 LIMIT 1",
+                "active-generation",
+            ),
             ("SELECT 1 FROM quarantines LIMIT 1", "quarantine-present"),
-            ("SELECT 1 FROM divergence_incidents LIMIT 1", "divergence-evidence"),
-            ("SELECT 1 FROM object_locations WHERE quarantined != 0 LIMIT 1", "quarantined-location"),
+            (
+                "SELECT 1 FROM divergence_incidents LIMIT 1",
+                "divergence-evidence",
+            ),
+            (
+                "SELECT 1 FROM object_locations WHERE quarantined != 0 LIMIT 1",
+                "quarantined-location",
+            ),
         ] {
             if !store.query(sql, &[]).map_err(db_error)?.is_empty() {
                 return Ok(ReclaimReport::deferred(reason));
@@ -184,16 +193,24 @@ impl Reclaimer {
         // Reuse the existing protection judgment. Nothing executes this full
         // metadata-only plan: filter its eligible locations to the supported
         // physical representation, then bound the actual mark/unlink work.
-        let world = GcWorld { reclaim_budget: usize::MAX, ..GcWorld::default() };
+        let world = GcWorld {
+            reclaim_budget: usize::MAX,
+            ..GcWorld::default()
+        };
         let mut plan = plan_gc(store, &world, GcMode::Normal, seq).map_err(db_error)?;
         // Give already-observed candidates priority over newly arriving blobs.
         plan.reclaim.sort_by(|a, b| {
             (!self.observed.contains_key(a), a).cmp(&(!self.observed.contains_key(b), b))
         });
-        let due: BTreeSet<_> = store.due_gc_tombstones(seq).map_err(db_error)?
-            .into_iter().map(|row| LocationRef {
-                object_key: row.object_key, store_path: row.store_path,
-            }).collect();
+        let due: BTreeSet<_> = store
+            .due_gc_tombstones(seq)
+            .map_err(db_error)?
+            .into_iter()
+            .map(|row| LocationRef {
+                object_key: row.object_key,
+                store_path: row.store_path,
+            })
+            .collect();
         let mut selected = Vec::new();
         let mut stamps = BTreeMap::new();
         for location in &plan.reclaim {
@@ -204,16 +221,23 @@ impl Reclaimer {
                 report.retained += 1;
                 continue;
             };
-            let parameters = [SqlValue::Text(location.object_key.clone()), SqlValue::Text(location.store_path.clone())];
+            let parameters = [
+                SqlValue::Text(location.object_key.clone()),
+                SqlValue::Text(location.store_path.clone()),
+            ];
             let rows = store.query(LOCATION_SQL, &parameters).map_err(db_error)?;
             if !matches!(rows.as_slice(), [row] if matches!(row.as_slice(),
-                [SqlValue::Text(encoding), SqlValue::Int(0)] if encoding == RAW_PROFILE_V1)) {
+                [SqlValue::Text(encoding), SqlValue::Int(0)] if encoding == RAW_PROFILE_V1))
+            {
                 report.retained += 1;
                 continue;
             }
             let stamp = match inspect(layout, &path, uid) {
                 Ok(stamp) => stamp,
-                Err(_) => { report.retained += 1; continue; }
+                Err(_) => {
+                    report.retained += 1;
+                    continue;
+                }
             };
             if stamp.is_none() && !has_intent(store, location)? {
                 // Missing without our durable intent belongs to reconciliation,
@@ -227,8 +251,14 @@ impl Reclaimer {
         let keep: BTreeSet<_> = selected.iter().cloned().collect();
         // Newly protected/unsupported objects lose their grace, not their pins.
         // Limit rescue writes to our own bounded observation set.
-        for location in self.observed.keys().filter(|location| !keep.contains(*location)) {
-            store.remove_gc_tombstone(&location.object_key, &location.store_path).map_err(db_error)?;
+        for location in self
+            .observed
+            .keys()
+            .filter(|location| !keep.contains(*location))
+        {
+            store
+                .remove_gc_tombstone(&location.object_key, &location.store_path)
+                .map_err(db_error)?;
         }
         self.observed.retain(|location, _| keep.contains(location));
         plan.truncated |= plan.reclaim.len() > selected.len();
@@ -257,13 +287,33 @@ impl Reclaimer {
                 old.stamp == *stamp && clock().saturating_duration_since(old.since) >= grace
             }) && due.contains(location);
             if !ready {
-                if self.observed.get(location).is_none_or(|old| old.stamp != *stamp) {
-                    self.observed.insert(location.clone(), Observation { stamp: stamp.clone(), since: clock() });
+                if self
+                    .observed
+                    .get(location)
+                    .is_none_or(|old| old.stamp != *stamp)
+                {
+                    self.observed.insert(
+                        location.clone(),
+                        Observation {
+                            stamp: stamp.clone(),
+                            since: clock(),
+                        },
+                    );
                 }
                 continue;
             }
-            let total = report.unlinked_bytes.checked_add(stamp.len).ok_or("byte count overflow")?;
-            store.record_decision_receipt(INTENT, &intent_subject(location), 0, "unlink", "canonical-raw-v1")
+            let total = report
+                .unlinked_bytes
+                .checked_add(stamp.len)
+                .ok_or("byte count overflow")?;
+            store
+                .record_decision_receipt(
+                    INTENT,
+                    &intent_subject(location),
+                    0,
+                    "unlink",
+                    "canonical-raw-v1",
+                )
                 .map_err(db_error)?;
             // Recheck both component types and inode/version immediately before
             // unlink; a replacement or an extra hard link restarts/refuses it.
@@ -278,19 +328,23 @@ impl Reclaimer {
             retire_location(store, location)?;
             self.observed.remove(location);
         }
-        store.record_gc_receipt(&GcReceiptRow {
-            seq,
-            mode: "physical-raw-v1".into(),
-            planned: report.observed as u64,
-            reclaimed: report.unlinked_files,
-            skipped: (report.observed as u64).saturating_sub(report.unlinked_files),
-            truncated: plan.truncated,
-        }).map_err(db_error)?;
+        store
+            .record_gc_receipt(&GcReceiptRow {
+                seq,
+                mode: "physical-raw-v1".into(),
+                planned: report.observed as u64,
+                reclaimed: report.unlinked_files,
+                skipped: (report.observed as u64).saturating_sub(report.unlinked_files),
+                truncated: plan.truncated,
+            })
+            .map_err(db_error)?;
         Ok(())
     }
 }
 
-fn db_error(error: impl std::fmt::Debug) -> String { format!("{error:?}") }
+fn db_error(error: impl std::fmt::Debug) -> String {
+    format!("{error:?}")
+}
 
 fn next_sequence(store: &mut dyn RabsMetadataStore) -> Result<u64, String> {
     let rows = store.query(SEQUENCE_SQL, &[]).map_err(db_error)?;
@@ -302,8 +356,11 @@ fn next_sequence(store: &mut dyn RabsMetadataStore) -> Result<u64, String> {
         },
         _ => return Err("ambiguous GC sequence".into()),
     };
-    value.checked_add(1).filter(|value| *value < i64::MAX)
-        .map(|value| value as u64).ok_or_else(|| "GC sequence exhausted".into())
+    value
+        .checked_add(1)
+        .filter(|value| *value < i64::MAX)
+        .map(|value| value as u64)
+        .ok_or_else(|| "GC sequence exhausted".into())
 }
 
 fn intent_subject(location: &LocationRef) -> String {
@@ -311,45 +368,78 @@ fn intent_subject(location: &LocationRef) -> String {
 }
 
 fn has_intent(store: &mut dyn RabsMetadataStore, location: &LocationRef) -> Result<bool, String> {
-    let rows = store.query(INTENT_SQL, &[SqlValue::Text(INTENT.into()), SqlValue::Text(intent_subject(location))])
+    let rows = store
+        .query(
+            INTENT_SQL,
+            &[
+                SqlValue::Text(INTENT.into()),
+                SqlValue::Text(intent_subject(location)),
+            ],
+        )
         .map_err(db_error)?;
     match rows.as_slice() {
         [] => Ok(false),
-        [row] if matches!(row.as_slice(), [SqlValue::Text(decision)] if decision == "unlink") => Ok(true),
+        [row] if matches!(row.as_slice(), [SqlValue::Text(decision)] if decision == "unlink") => {
+            Ok(true)
+        }
         _ => Err("invalid physical GC intent".into()),
     }
 }
 
-fn retire_location(store: &mut dyn RabsMetadataStore, location: &LocationRef) -> Result<(), String> {
-    store.remove_location_by_key(&location.object_key, &location.store_path).map_err(db_error)?;
-    store.remove_gc_tombstone(&location.object_key, &location.store_path).map_err(db_error)?;
+fn retire_location(
+    store: &mut dyn RabsMetadataStore,
+    location: &LocationRef,
+) -> Result<(), String> {
+    store
+        .remove_location_by_key(&location.object_key, &location.store_path)
+        .map_err(db_error)?;
+    store
+        .remove_gc_tombstone(&location.object_key, &location.store_path)
+        .map_err(db_error)?;
     Ok(())
 }
 
 fn canonical_raw_path(layout: &BlobStoreLayout, location: &LocationRef) -> Option<PathBuf> {
-    let hex = location.object_key.strip_prefix(ATP_OBJECT_CONTENT_DOMAIN)?.strip_prefix(':')?;
-    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    let hex = location
+        .object_key
+        .strip_prefix(ATP_OBJECT_CONTENT_DOMAIN)?
+        .strip_prefix(':')?;
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return None;
     }
     let mut bytes = [0; 32];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
     }
-    let object = TypedDigest { algorithm: DigestAlgorithm::Sha256V1, domain: ATP_OBJECT_CONTENT_DOMAIN, bytes };
+    let object = TypedDigest {
+        algorithm: DigestAlgorithm::Sha256V1,
+        domain: ATP_OBJECT_CONTENT_DOMAIN,
+        bytes,
+    };
     let expected = layout.published_path(&object, RAW_PROFILE_V1, &object);
     (expected.as_os_str() == Path::new(&location.store_path).as_os_str()).then_some(expected)
 }
 
 fn inspect(layout: &BlobStoreLayout, path: &Path, uid: u32) -> Result<Option<Stamp>, String> {
     let parent = path.parent().ok_or("missing raw shard directory")?;
-    for directory in [layout.root().to_path_buf(), layout.root().join("objects"), parent.to_path_buf()] {
+    for directory in [
+        layout.root().to_path_buf(),
+        layout.root().join("objects"),
+        parent.to_path_buf(),
+    ] {
         let meta = fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
         if !meta.file_type().is_dir() || meta.uid() != uid {
             return Err("raw CAS parent is not an owned real directory".into());
         }
     }
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() && meta.nlink() == 1 && meta.uid() == uid => Ok(Some(Stamp::of(&meta))),
+        Ok(meta) if meta.file_type().is_file() && meta.nlink() == 1 && meta.uid() == uid => {
+            Ok(Some(Stamp::of(&meta)))
+        }
         Ok(_) => Err("raw CAS candidate is linked, non-regular, or foreign-owned".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
@@ -358,7 +448,8 @@ fn inspect(layout: &BlobStoreLayout, path: &Path, uid: u32) -> Result<Option<Sta
 
 fn sync_parent(path: &Path) -> Result<(), String> {
     let parent = path.parent().ok_or("missing raw shard directory")?;
-    fs::File::open(parent).and_then(|directory| directory.sync_all())
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
         .map_err(|e| format!("sync raw shard {}: {e}", parent.display()))
 }
 

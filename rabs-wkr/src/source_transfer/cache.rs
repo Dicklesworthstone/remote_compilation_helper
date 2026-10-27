@@ -572,7 +572,12 @@ mod tests {
         let input = private();
         let source = staged(
             input.path(),
-            &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc"), ("d", b"dddd")],
+            &[
+                ("a", b"aaaa"),
+                ("b", b"bbbb"),
+                ("c", b"cccc"),
+                ("d", b"dddd"),
+            ],
         );
         // Exercise the byte and object ceilings independently, then together.
         for (bytes, files) in [(8, 4), (16, 2), (8, 2)] {
@@ -634,7 +639,10 @@ mod tests {
     fn lru_eviction_still_reclaims_objects_outside_the_current_projection() {
         let parent = private();
         let seed = private();
-        let cached = staged(seed.path(), &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")]);
+        let cached = staged(
+            seed.path(),
+            &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")],
+        );
         let cache = bounded_cache(parent.path(), 12, 3);
         assert_eq!(cache.remember(&cached).unwrap(), 3);
         // Deliberate timestamps, not sleeps or filesystem timestamp resolution.
@@ -654,7 +662,10 @@ mod tests {
         let entries = cache.inventory().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries.iter().map(|entry| entry.bytes).sum::<u64>(), 12);
-        assert_eq!(fs::read(cached.sealed_root().unwrap().join("b")).unwrap(), b"bbbb");
+        assert_eq!(
+            fs::read(cached.sealed_root().unwrap().join("b")).unwrap(),
+            b"bbbb"
+        );
     }
 
     #[test]
@@ -663,7 +674,12 @@ mod tests {
         let input = private();
         let source = staged(
             input.path(),
-            &[("a", b"same"), ("b", b"diff"), ("c", b"same"), ("d", b"tail")],
+            &[
+                ("a", b"same"),
+                ("b", b"diff"),
+                ("c", b"same"),
+                ("d", b"tail"),
+            ],
         );
         let cache = bounded_cache(parent.path(), 8, 2);
         assert_eq!(cache.remember(&source).unwrap(), 2);
@@ -696,7 +712,15 @@ mod tests {
                 fs::read(source.sealed_root().unwrap().join(&file.path)).unwrap()
             );
         }
-        assert_eq!(cache.inventory().unwrap().iter().map(|entry| entry.bytes).sum::<u64>(), 8);
+        assert_eq!(
+            cache
+                .inventory()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<u64>(),
+            8
+        );
         assert_eq!(cache.remember(&source).unwrap(), 0);
     }
 
@@ -712,7 +736,10 @@ mod tests {
         let path = source.sealed_root().unwrap().join("a-cold");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&path, b"evil").unwrap();
-        assert!(matches!(cache.remember(&source), Err(RememberError::Source(_))));
+        assert!(matches!(
+            cache.remember(&source),
+            Err(RememberError::Source(_))
+        ));
         assert_eq!(cache.load(&entry("hot", b"warm")).unwrap(), b"warm");
         assert!(cache.load(&entry("a-cold", b"cold")).is_none());
         assert!(!cache.root.join(INCOMING).exists());

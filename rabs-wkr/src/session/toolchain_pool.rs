@@ -178,7 +178,11 @@ impl ToolchainLease {
         self.validate_namespace_at(spec, Path::new(context.toolchain_root()))
     }
 
-    fn validate_namespace_at(&self, spec: &CanonicalNamespaceSpec, visible: &Path) -> io::Result<()> {
+    fn validate_namespace_at(
+        &self,
+        spec: &CanonicalNamespaceSpec,
+        visible: &Path,
+    ) -> io::Result<()> {
         let root = std::fs::canonicalize(self.root())?;
         let pool = std::fs::canonicalize(self.dataset.pool.0.path())?;
         let durable = self

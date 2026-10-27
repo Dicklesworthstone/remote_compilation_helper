@@ -313,22 +313,24 @@ mod wait_budget_tests {
         let (gate, entered, release) = gate();
         thread::scope(|scope| {
             let owner = scope.spawn(|| {
-                read_with(&flights, &owner_memo, &path, signature, &|path, signature| {
-                    reads.fetch_add(1, Ordering::SeqCst);
-                    gate.hold()?;
-                    digest(path, signature)
-                })
+                read_with(
+                    &flights,
+                    &owner_memo,
+                    &path,
+                    signature,
+                    &|path, signature| {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        gate.hold()?;
+                        digest(path, signature)
+                    },
+                )
             });
             entered.recv_timeout(TEST_DEADLINE).unwrap();
             let original = Arc::clone(flights.active.lock().unwrap().get(&signature).unwrap());
             for _ in 0..4 {
-                let error = read_with(
-                    &flights,
-                    &follower_memo,
-                    &path,
-                    signature,
-                    &|_, _| panic!("timeout must not dispatch a duplicate file read"),
-                )
+                let error = read_with(&flights, &follower_memo, &path, signature, &|_, _| {
+                    panic!("timeout must not dispatch a duplicate file read")
+                })
                 .unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::TimedOut);
                 assert!(follower_memo.get(&signature).is_none());
@@ -420,10 +422,19 @@ mod wait_budget_tests {
         ))));
         flight.changed.notify_all();
         reader.join().unwrap();
-        let error = outcome.expect("notifications extended the shared deadline").unwrap_err();
+        let error = outcome
+            .expect("notifications extended the shared deadline")
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains("shared toolchain digest wait deadline"));
-        assert!(still_unpublished, "a follower must not publish its timeout to other readers");
+        assert!(
+            error
+                .to_string()
+                .contains("shared toolchain digest wait deadline")
+        );
+        assert!(
+            still_unpublished,
+            "a follower must not publish its timeout to other readers"
+        );
     }
 
     #[test]
@@ -509,9 +520,12 @@ mod wait_budget_tests {
             release.send(()).unwrap();
             assert_eq!(owner.join().unwrap().unwrap(), expected);
             assert_eq!(memo.get(&signature), Some(expected.clone()));
-            assert!(read_with(&flights, &memo, &alias, signature, &|_, _| {
-                panic!("a replaced alias must be refused before hashing")
-            }).is_err());
+            assert!(
+                read_with(&flights, &memo, &alias, signature, &|_, _| {
+                    panic!("a replaced alias must be refused before hashing")
+                })
+                .is_err()
+            );
         });
     }
 
@@ -521,7 +535,8 @@ mod wait_budget_tests {
         let flights = expired_flights();
         assert_eq!(
             flights
-                .run(signature, || flights.run(signature, || Ok(expected.clone())))
+                .run(signature, || flights
+                    .run(signature, || Ok(expected.clone())))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock

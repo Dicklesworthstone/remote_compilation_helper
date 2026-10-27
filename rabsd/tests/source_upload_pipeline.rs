@@ -308,9 +308,9 @@ impl WorkerPeer for ReceiverPeer {
                         reply["next_offset"] = json!(reply["next_offset"].as_u64().unwrap() + 1);
                     }
                     Fault::DuplicateAck => {
-                        reply = self.previous_ack.clone().unwrap_or_else(|| {
-                            json!({"kind":"source-ready", "request_id":17, "sealed":false})
-                        });
+                        reply = self.previous_ack.clone().unwrap_or_else(
+                            || json!({"kind":"source-ready", "request_id":17, "sealed":false}),
+                        );
                     }
                     Fault::LostAck => {
                         return Err(io::Error::new(
@@ -346,10 +346,7 @@ fn source_pipeline_batches_small_files_across_file_boundaries() {
         [4, 4, 4, 4, 4, 4, 4, 4, 3, 2, 1],
         "neither serial transfer nor drain-all batches may pass this gate"
     );
-    assert_eq!(
-        peer.pending_before_send,
-        [0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3]
-    );
+    assert_eq!(peer.pending_before_send, [0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3]);
     assert_eq!(peer.maximum_pending, 4);
     assert_eq!(fixture.request, original);
 }
@@ -552,11 +549,13 @@ fn every_source_ack_failure_stops_refill_and_the_final_drain_without_retry() {
             let mut peer = ReceiverPeer::new(&fixture);
             peer.fault = fault;
             peer.fault_at = at;
-            let mut source =
-                SourcePeer::new(&mut peer, &fixture.upload, &fixture.request).unwrap();
+            let mut source = SourcePeer::new(&mut peer, &fixture.upload, &fixture.request).unwrap();
             let hello = json!({"source_transfers":["source-files-v1"]});
             let grant = json!({"kind":"session-ok"});
-            assert!(source.negotiate(&hello, &grant).is_err(), "{fault:?} at {at}");
+            assert!(
+                source.negotiate(&hello, &grant).is_err(),
+                "{fault:?} at {at}"
+            );
             assert!(
                 source.negotiate(&hello, &grant).is_err(),
                 "failed transfer retried"
@@ -640,6 +639,10 @@ fn a_lost_or_invalid_final_seal_is_not_success_or_a_new_source_negotiation() {
         assert!(peer.receiver.as_ref().unwrap().sealed_root().is_some());
         assert_eq!(peer.sent.len(), 12);
         assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
-        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+        assert!(
+            peer.sent
+                .iter()
+                .all(|frame| frame["kind"] != "canonical-exec")
+        );
     }
 }
