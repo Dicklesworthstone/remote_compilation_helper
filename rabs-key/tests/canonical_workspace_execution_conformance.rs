@@ -72,8 +72,11 @@ fn main() {
     {
         panic!("compiler exec: {}", compiler.exec());
     }
-    let root = std::path::PathBuf::from(std::env::var_os("RABS_WORKSPACE_RECORD").unwrap())
+    let mut root = std::path::PathBuf::from(std::env::var_os("RABS_WORKSPACE_RECORD").unwrap())
         .join(package);
+    if std::env::var_os("RABS_WORKSPACE_RECORD_ALL").is_some() {
+        root = root.join(format!("unit-{}", std::process::id()));
+    }
     std::fs::create_dir_all(&root).unwrap();
     fields(&root.join("argv"), argv);
     fields(&root.join("env"), std::env::vars().flat_map(|(name, value)| [name, value]));
@@ -488,12 +491,17 @@ fn cargo(layout: &Layout, wrapper: &Path, record: &Path) -> Command {
     for name in [
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
+        // `cargo test` adds the outer test target directory to this loader
+        // path. It is not part of the nested fixture's toolchain or inputs;
+        // let the nested Cargo invocation construct its own compiler path.
+        "LD_LIBRARY_PATH",
         "RUSTC_WORKSPACE_WRAPPER",
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_TARGET",
         "CARGO_PRIMARY_PACKAGE",
         "OUT_DIR",
         "WORKSPACE_FIXTURE_BUILD_TOKEN",
+        "RABS_WORKSPACE_RECORD_ALL",
     ] {
         cargo.env_remove(name);
     }
@@ -548,6 +556,394 @@ fn assert_selected_unit(
     assert_eq!(unit["features"], serde_json::json!(expected_features));
 }
 
+fn actual_all_target_metadata_units(
+    root: &Path,
+    workspace: &Path,
+    wrapper: &Path,
+    toolchain: &Path,
+    facts: &ToolchainFacts,
+    runtime: &TypedDigest,
+) {
+    use std::collections::BTreeMap;
+
+    let record = root.join("records-all-targets");
+    let layout = Layout {
+        workspace: workspace.to_owned(),
+        target: root.join("target-all-targets"),
+        cargo_home: root.join("cargo-home"),
+        home: root.join("home"),
+        toolchain: toolchain.to_owned(),
+    };
+    let selected_command = || {
+        let mut command = cargo(&layout, wrapper, &record);
+        command
+            .args([
+                "check",
+                "--offline",
+                "--locked",
+                "--jobs=1",
+                "--package",
+                MEMBER,
+                "--all-targets",
+                "--target-dir",
+            ])
+            .arg(&layout.target)
+            .env("RABS_WORKSPACE_RECORD_ALL", "1");
+        command
+    };
+    let graph: serde_json::Value = serde_json::from_slice(
+        &checked(selected_command().args(["--unit-graph", "-Z", "unstable-options"])).stdout,
+    )
+    .unwrap();
+    checked(&mut selected_command());
+    let host = facts.host_triple().unwrap();
+    let mut recordings = BTreeMap::new();
+    for entry in fs::read_dir(record.join(MEMBER)).unwrap() {
+        let actual = Recorded::load(&entry.unwrap().path());
+        let canonical = actual.canonical(&layout);
+        let plan =
+            plan_canonical_workspace_execution(canonical.request(), host).unwrap_or_else(|error| {
+                panic!(
+                    "real Cargo all-target metadata request refused: {error}; {:#?}",
+                    canonical.argv
+                )
+            });
+        let Some(SourceInput::Path(source)) = &plan.invocation.source else {
+            panic!("real Cargo target must have a source path");
+        };
+        let harness = actual.argv.iter().any(|argument| argument == "--test");
+        assert!(
+            recordings
+                .insert((source.clone(), harness), (actual, canonical, plan))
+                .is_none()
+        );
+    }
+    let expected = [
+        ("src/lib.rs", "lib", false, None, false),
+        ("src/lib.rs", "lib", true, None, false),
+        (
+            "src/main.rs",
+            "bin",
+            false,
+            Some("workspace-member-bin"),
+            false,
+        ),
+        (
+            "src/main.rs",
+            "bin",
+            true,
+            Some("workspace-member-bin"),
+            false,
+        ),
+        (
+            "examples/example.rs",
+            "example",
+            false,
+            Some("workspace-member-example"),
+            false,
+        ),
+        ("tests/integration.rs", "test", true, None, false),
+        ("tests/custom.rs", "test", false, None, true),
+        ("benches/bench.rs", "bench", true, None, false),
+        ("benches/custom.rs", "bench", false, None, true),
+    ];
+    assert_eq!(
+        recordings.len(),
+        expected.len(),
+        "every selected target must really compile"
+    );
+    let mut keys = BTreeMap::new();
+    for (index, (relative, target_kind, harness, binary_name, custom)) in
+        expected.into_iter().enumerate()
+    {
+        let source = format!("crates/member/{relative}");
+        let (actual, canonical, plan) = recordings.remove(&(source.clone(), harness)).unwrap();
+        assert_eq!(Path::new(&actual.cwd), workspace);
+        assert_eq!(
+            actual.env("CARGO_MANIFEST_DIR"),
+            workspace.join("crates/member").to_str()
+        );
+        assert_ne!(actual.env("CARGO_MANIFEST_DIR"), Some(actual.cwd.as_str()));
+        assert_eq!(actual.env("CARGO_PRIMARY_PACKAGE"), Some("1"));
+        assert_eq!(actual.env("CARGO_BIN_NAME"), binary_name);
+        assert_eq!(
+            actual.env("WORKSPACE_FIXTURE_BUILD_TOKEN"),
+            Some("real-cargo-build-script")
+        );
+        assert!(actual.argv.contains(&source));
+        assert_eq!(
+            plan.source_kind,
+            DependencySourceKind::WorkspaceExecutionOnly
+        );
+        assert_eq!(plan.cwd, "/__rabs/workspace");
+        assert_eq!(plan.package_root, "/__rabs/workspace/crates/member");
+        assert_eq!(
+            plan.invocation
+                .passthrough
+                .iter()
+                .any(|argument| argument == "--test"),
+            harness
+        );
+        assert_eq!(plan.invocation.cfgs.iter().any(|cfg| cfg == "test"), custom);
+        if harness || custom {
+            assert!(
+                plan.invocation.crate_types.is_empty(),
+                "Cargo relies on the actual implicit binary/harness shape"
+            );
+        } else {
+            assert_eq!(
+                plan.invocation.crate_types,
+                [if target_kind == "lib" { "lib" } else { "bin" }]
+            );
+        }
+        let mut emits = plan.invocation.emit.clone();
+        emits.sort();
+        assert_eq!(emits, ["dep-info", "metadata"]);
+        let mut expected_environment = canonical.env.clone();
+        expected_environment.sort();
+        assert_eq!(plan.execution_env, expected_environment);
+        assert!(
+            plan.invocation
+                .lints
+                .iter()
+                .any(|lint| lint.name == "unused_variables" && lint.level == "deny")
+        );
+        assert!(plan_dependency_action(actual.request(), host).is_err());
+
+        let resolved_source = workspace_source_path(&plan).unwrap();
+        let units = graph["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|unit| {
+                unit["mode"] == "check"
+                    && unit["target"]["src_path"]
+                        .as_str()
+                        .is_some_and(|path| layout.canonical(path) == resolved_source)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !units.is_empty(),
+            "the actual Cargo graph must retain this source family"
+        );
+        for unit in &units {
+            assert_eq!(unit["target"]["kind"], serde_json::json!([target_kind]));
+            assert_eq!(
+                unit["target"]["crate_types"],
+                serde_json::json!([if target_kind == "lib" { "lib" } else { "bin" }])
+            );
+            assert_eq!(
+                unit["target"]["name"].as_str().unwrap().replace('-', "_"),
+                plan.invocation.crate_name.as_deref().unwrap()
+            );
+            assert!(unit["platform"].is_null());
+            let mut features = plan.invocation.features.clone();
+            features.sort();
+            assert_eq!(unit["features"], serde_json::json!(features));
+            let package = unit["pkg_id"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("path+file://")
+                .unwrap()
+                .split_once('#')
+                .unwrap()
+                .0;
+            assert_eq!(layout.canonical(package), plan.package_root);
+            assert!(unit["profile"].get("test").is_none());
+            assert!(unit["target"].get("harness").is_none());
+        }
+        if matches!(relative, "src/lib.rs" | "src/main.rs") {
+            assert_eq!(units.len(), 2);
+            assert_eq!(
+                units[0], units[1],
+                "pinned Cargo does not serialize the normal versus --test discriminator; selected-family membership must not invent it"
+            );
+        } else {
+            assert_eq!(units.len(), 1);
+        }
+
+        let inputs = observed_inputs(&layout, &plan);
+        let directories = observed_directories(&layout, &plan);
+        let externs = plan
+            .externs
+            .iter()
+            .filter_map(|external| match external {
+                PlannedExtern::File { path, .. } => Some(ExternFact {
+                    path: path.clone(),
+                    content_digest: object_file(&layout.physical(path)),
+                }),
+                PlannedExtern::Toolchain { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let generated = plan.generated_root.as_deref().unwrap();
+        let script = fs::read(
+            layout
+                .physical(generated)
+                .parent()
+                .unwrap()
+                .join("run/stdout"),
+        )
+        .unwrap();
+        let key = remote_workspace_execution_key(
+            &plan,
+            facts,
+            &directories,
+            &inputs,
+            Some(&script),
+            "/__rabs/toolchain",
+            &facts.sysroot_root_digest.bytes,
+            runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            key.descriptor.action_class,
+            ActionClass::RustcWorkspaceCompile
+        );
+        assert!(
+            live_dependency_key(&plan, facts, &externs, &directories, Some(&script), &inputs)
+                .is_err()
+        );
+        assert!(
+            canonical_cargo_dependency_key(
+                &plan,
+                facts,
+                &externs,
+                &directories,
+                Some(&script),
+                &inputs
+            )
+            .is_err()
+        );
+        assert!(
+            remote_dependency_key(
+                &plan,
+                facts,
+                &directories,
+                &inputs,
+                Some(&script),
+                "/__rabs/toolchain",
+                &facts.sysroot_root_digest.bytes,
+                runtime
+            )
+            .is_err()
+        );
+        keys.insert((source.clone(), harness), key.action_key);
+
+        let output_names = plan.output_names();
+        assert_eq!(output_names.len(), 2);
+        let metadata = output_names
+            .iter()
+            .find(|name| name.ends_with(".rmeta"))
+            .unwrap();
+        let dep_info = output_names
+            .iter()
+            .find(|name| name.ends_with(".d"))
+            .unwrap();
+        let output_root = layout.physical(&plan.out_dir);
+        let metadata_size = fs::metadata(output_root.join(metadata)).unwrap().len();
+        if target_kind == "lib" && !harness {
+            assert!(metadata_size > 0);
+        } else {
+            assert_eq!(
+                metadata_size, 0,
+                "successful binary/harness checking emits an empty metadata file"
+            );
+        }
+        assert!(fs::metadata(output_root.join(dep_info)).unwrap().len() > 0);
+        let mut actual_names = fs::read_dir(&output_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        actual_names.sort();
+        assert_eq!(
+            actual_names, output_names,
+            "metadata checking produces no executable or archive"
+        );
+        let mut metadata_announced = false;
+        for line in actual
+            .stderr
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let message: serde_json::Value = serde_json::from_slice(line).unwrap();
+            if let Some(path) = message["artifact"].as_str() {
+                let name = Path::new(path)
+                    .strip_prefix(&output_root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                assert!(output_names.iter().any(|expected| expected == name));
+                if message["emit"] == "metadata" {
+                    assert_eq!(name, metadata);
+                    metadata_announced = true;
+                }
+            }
+        }
+        assert!(
+            metadata_announced,
+            "rustc announces even the empty metadata artifact"
+        );
+        let replay = actual.replay(root, &format!("all-targets-{index}-complete"));
+        assert!(
+            replay.status.success(),
+            "{}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert_eq!(
+            replay.stderr, actual.stderr,
+            "metadata and harness diagnostics remain byte-preserving"
+        );
+
+        if target_kind != "lib" || harness {
+            let mut linked_argv = canonical.argv.clone();
+            let emit = linked_argv
+                .iter_mut()
+                .find(|argument| argument.starts_with("--emit="))
+                .unwrap();
+            *emit = "--emit=dep-info,link".into();
+            assert!(
+                plan_canonical_workspace_execution(
+                    LiveRustcRequest {
+                        argv: &linked_argv,
+                        cwd: &canonical.cwd,
+                        env: &canonical.env
+                    },
+                    host
+                )
+                .is_err(),
+                "execution-only metadata admission must not authorize linking or test execution"
+            );
+        }
+        let original = fs::read(workspace.join(&source)).unwrap();
+        let mut denied = original.clone();
+        denied.extend_from_slice(
+            b"\npub fn all_target_lint_guard() { let unused_metadata_guard = 1; }\n",
+        );
+        fs::write(workspace.join(&source), denied).unwrap();
+        let refused = actual.replay(root, &format!("all-targets-{index}-lint-policy"));
+        fs::write(workspace.join(&source), original).unwrap();
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("unused_metadata_guard"));
+        // A rejected compiler may retire its previous output. Restore the real
+        // successful artifact before replaying a later target that depends on
+        // this unit; no hand-written metadata substitutes for that execution.
+        let restored = actual.replay(root, &format!("all-targets-{index}-restored"));
+        assert!(
+            restored.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restored.stderr)
+        );
+        assert_eq!(restored.stderr, actual.stderr);
+    }
+    for source in ["crates/member/src/lib.rs", "crates/member/src/main.rs"] {
+        assert_ne!(
+            keys[&(source.to_owned(), false)],
+            keys[&(source.to_owned(), true)],
+            "normal and --test invocations retain distinct exact execution identities"
+        );
+    }
+}
+
 #[test]
 fn actual_cargo_workspace_units_preserve_execution_and_refuse_dependency_cache_authority() {
     let scratch = tempfile::tempdir().unwrap();
@@ -591,6 +987,32 @@ fixture_feature = []
 workspace_leaf_fixture = { path = "../leaf" }
 [lints]
 workspace = true
+
+[[bin]]
+name = "workspace-member-bin"
+path = "src/main.rs"
+
+[[example]]
+name = "workspace-member-example"
+path = "examples/example.rs"
+
+[[test]]
+name = "workspace-member-integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "workspace-member-custom-test"
+path = "tests/custom.rs"
+harness = false
+
+[[bench]]
+name = "workspace-member-bench"
+path = "benches/bench.rs"
+
+[[bench]]
+name = "workspace-member-custom-bench"
+path = "benches/custom.rs"
+harness = false
 "#,
     )
     .unwrap();
@@ -612,6 +1034,31 @@ workspace = true
     )
     .unwrap();
     fs::write(&source, MEMBER_SOURCE).unwrap();
+    for (path, custom, named_binary) in [
+        ("src/main.rs", false, true),
+        ("examples/example.rs", false, true),
+        ("tests/integration.rs", false, false),
+        ("tests/custom.rs", true, false),
+        ("benches/bench.rs", false, false),
+        ("benches/custom.rs", true, false),
+    ] {
+        let path = member.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = MEMBER_SOURCE.to_owned();
+        if named_binary {
+            bytes.push_str("\nconst _: &str = env!(\"CARGO_BIN_NAME\");\n");
+        }
+        if custom {
+            bytes.push_str(
+                "\n#[cfg(not(test))]\ncompile_error!(\"custom harness check lost cfg(test)\");\n",
+            );
+        }
+        if named_binary || custom {
+            bytes.push_str("\nfn main() { panic!(\"metadata compilation must never execute this target\"); }\n");
+        }
+        bytes.push_str("\n#[test]\nfn metadata_only_test() { panic!(\"cargo check must never execute a test\"); }\n");
+        fs::write(path, bytes).unwrap();
+    }
     fs::write(workspace.join("shared/value.txt"), "real sibling source").unwrap();
     fs::write(
         member.join("build.rs"),
@@ -941,4 +1388,5 @@ fn main() {
             fs::write(&source, MEMBER_SOURCE).unwrap();
         }
     }
+    actual_all_target_metadata_units(root, &workspace, &wrapper, &toolchain, &facts, &runtime);
 }

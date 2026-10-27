@@ -1706,7 +1706,7 @@ fn metadata_check_targets(root: &Path, leaf: u32) {
     write(
         root,
         "Cargo.toml",
-        "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[dependencies]\ncanonical_dep='=1.0.0'\n[lib]\ntest=true\nbench=false\n[[bin]]\nname='canonical_cli'\npath='src/main.rs'\ntest=true\nbench=false\n[[example]]\nname='metadata_example'\npath='examples/metadata.rs'\ntest=false\nbench=false\n[[test]]\nname='metadata_integration'\npath='tests/metadata.rs'\n[[bench]]\nname='metadata_bench'\npath='benches/metadata.rs'\nharness=false\n",
+        "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[dependencies]\ncanonical_dep='=1.0.0'\n[lib]\ntest=true\nbench=false\n[[bin]]\nname='canonical_cli'\npath='src/main.rs'\ntest=true\nbench=false\n[[example]]\nname='metadata_example'\npath='examples/metadata.rs'\ntest=false\nbench=false\n[[test]]\nname='metadata_integration'\npath='tests/metadata.rs'\n[[test]]\nname='metadata_custom_integration'\npath='tests/custom_metadata.rs'\nharness=false\n[[bench]]\nname='metadata_bench'\npath='benches/metadata.rs'\nharness=false\n[[bench]]\nname='metadata_standard_bench'\npath='benches/standard_metadata.rs'\nharness=true\n",
     );
     let checksum = |name: &str| {
         let value: Value = serde_json::from_slice(&read_bounded(
@@ -1739,7 +1739,9 @@ fn metadata_check_targets(root: &Path, leaf: u32) {
         "src/main.rs",
         "examples/metadata.rs",
         "tests/metadata.rs",
+        "tests/custom_metadata.rs",
         "benches/metadata.rs",
+        "benches/standard_metadata.rs",
     ] {
         write(root, path, &consumer);
     }
@@ -1761,7 +1763,9 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
         ("canonical_cli".to_owned(), 2),
         ("metadata_example".to_owned(), 1),
         ("metadata_integration".to_owned(), 1),
+        ("metadata_custom_integration".to_owned(), 1),
         ("metadata_bench".to_owned(), 1),
+        ("metadata_standard_bench".to_owned(), 1),
     ]);
     let mut attempts = BTreeMap::new();
     let mut previous_keys = BTreeSet::new();
@@ -1816,8 +1820,8 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
             offered.len(),
-            9,
-            "two external dependencies and all seven workspace units must execute: {output}"
+            11,
+            "two external dependencies and all nine workspace units must execute: {output}"
         );
         let completed = events
             .iter()
@@ -1860,7 +1864,7 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|event| event["reason"] == "compiler-artifact")
             .collect::<Vec<_>>();
-        assert_eq!(artifacts.len(), 9, "{output}");
+        assert_eq!(artifacts.len(), 11, "{output}");
         assert!(
             artifacts
                 .iter()
@@ -1871,7 +1875,7 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
         if let Some(previous) = &previous_receipt {
             assert!(
                 receipt["request_id"].as_u64().unwrap()
-                    >= previous["request_id"].as_u64().unwrap() + 9,
+                    >= previous["request_id"].as_u64().unwrap() + 11,
                 "unchanged/changed checks must acquire fresh worker attempts"
             );
         }
@@ -1882,7 +1886,7 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
                 .iter()
                 .filter(|event| event["kind"] == "worker-toolchain-acquired")
                 .count(),
-            9 * number as usize
+            11 * number as usize
         );
     }
     let target = sole_retained_target(owner.path());
