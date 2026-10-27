@@ -21,6 +21,7 @@ fn context() -> Value {
         "out_dir":"/work/target/debug/deps",
         "dependency_dirs":["/work/target/debug/deps"],
         "artifact_roots":[],
+        "generated_directories":[],
         "env":[["DEPENDENCY_FLAVOR","spaces \"quotes\" $HOME\n雪"],["EXPLICIT_EMPTY",""]],
         "runtime_cohort_sha256":"ab".repeat(32),
     })
@@ -72,6 +73,7 @@ fn canonical_dependency_request() -> Value {
         "out_dir":"/__rabs/out/cargo/debug/deps",
         "dependency_dirs":["/__rabs/out/cargo/debug/deps"],
         "artifact_roots":[],
+        "generated_directories":[],
         "env":[
             ["HOME","/__rabs/home"],
             ["CARGO_HOME","/__rabs/cargo-home"],
@@ -176,6 +178,7 @@ fn canonical_generated_request(archive: bool, populated: bool) -> Value {
             ]),
         ]);
     if populated {
+        request["dependency_context"]["generated_directories"] = json!(["nested"]);
         let manifest = SourceManifest::new(vec![
             SourceFile {
                 path: "package/src/lib.rs".into(),
@@ -212,7 +215,7 @@ fn canonical_generated_context_decodes_empty_and_populated_trees_in_both_modes()
             let original = wire.clone();
             let parsed = parse_exec_request(&wire).unwrap();
             let context = parsed.dependency_context.unwrap();
-            assert_eq!(context.version(), "canonical-dependency-exec-v3");
+            assert_eq!(context.version(), "canonical-dependency-exec-v4");
             assert!(context.canonical_cargo());
             assert_eq!(
                 context.execution_mode(),
@@ -273,7 +276,7 @@ fn canonical_archive_decode_preserves_mode_paths_and_complete_output_contract() 
 }
 
 #[test]
-fn canonical_generated_dependency_decode_requires_v3_and_exact_owned_out_dir() {
+fn canonical_generated_dependency_decode_requires_v4_and_exact_owned_out_dir() {
     let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
     for mut request in [
         canonical_dependency_request(),
@@ -287,7 +290,7 @@ fn canonical_generated_dependency_decode_requires_v3_and_exact_owned_out_dir() {
         let original = request.clone();
         let parsed = parse_exec_request(&request).unwrap();
         let context = parsed.dependency_context.unwrap();
-        assert_eq!(context.version(), "canonical-dependency-exec-v3");
+        assert_eq!(context.version(), "canonical-dependency-exec-v4");
         assert_eq!(context.generated_root(), Some(generated));
         assert!(
             context
@@ -299,6 +302,7 @@ fn canonical_generated_dependency_decode_requires_v3_and_exact_owned_out_dir() {
         for version in [
             "canonical-dependency-exec-v1",
             "canonical-dependency-exec-v2",
+            "canonical-dependency-exec-v3",
             DEPENDENCY_CONTEXT_VERSION,
         ] {
             let mut obsolete = request.clone();
@@ -728,6 +732,60 @@ fn generated_out_dir_requires_an_exact_optional_root_and_environment() {
     );
 }
 
+#[test]
+fn generated_directory_context_requires_exact_bounded_topology_and_current_version() {
+    for mut request in [
+        dependency_request(),
+        canonical_generated_request(false, false),
+    ] {
+        if request["dependency_context"]["generated_root"].is_null() {
+            let generated = "/work/target/debug/build/generated-unit/out";
+            request["dependency_context"]["generated_root"] = json!(generated);
+            request["dependency_context"]["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["OUT_DIR", generated]));
+        }
+        request["dependency_context"]["generated_directories"] = json!(["empty", "empty/child"]);
+        let original = request.clone();
+        let context = parse_exec_request(&request)
+            .unwrap()
+            .dependency_context
+            .unwrap();
+        assert_eq!(context.generated_directories(), ["empty", "empty/child"]);
+        assert_eq!(original, request);
+        for directories in [
+            Value::Null,
+            json!([17]),
+            json!([""]),
+            json!(["../outside"]),
+            json!(["/absolute"]),
+            json!(["missing/parent"]),
+            json!(["empty", "empty"]),
+            json!(["empty/child", "empty"]),
+            json!(["empty", "empty\\child"]),
+        ] {
+            let mut invalid = request.clone();
+            invalid["dependency_context"]["generated_directories"] = directories;
+            assert!(parse_exec_request(&invalid).is_err());
+        }
+        let mut omitted = request.clone();
+        omitted["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generated_directories");
+        assert!(parse_exec_request(&omitted).is_err());
+        for old in ["dependency-exec-v7", "canonical-dependency-exec-v3"] {
+            let mut obsolete = request.clone();
+            obsolete["dependency_context"]["version"] = json!(old);
+            assert!(parse_exec_request(&obsolete).is_err());
+        }
+    }
+    let mut without_root = dependency_request();
+    without_root["dependency_context"]["generated_directories"] = json!(["empty"]);
+    assert!(parse_exec_request(&without_root).is_err());
+}
+
 fn dependency_dag_request() -> Value {
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
     let mut request = dependency_request();
@@ -1044,6 +1102,7 @@ fn canonical_dependency_negotiation_binds_version_as_well_as_mode() {
     for previous in [
         "canonical-dependency-exec-v1",
         "canonical-dependency-exec-v2",
+        "canonical-dependency-exec-v3",
     ] {
         let mut old = grant.clone();
         old["dependency_context"] = json!(previous);
@@ -1407,6 +1466,12 @@ fn retained_v4_dependency_result_remains_recoverable_after_context_upgrade() {
 }
 
 #[cfg(unix)]
+#[test]
+fn retained_v7_dependency_result_remains_recoverable_after_directory_contract_upgrade() {
+    assert_retained_dependency_resume("dependency-exec-v7");
+}
+
+#[cfg(unix)]
 fn assert_retained_dependency_resume(version: &str) {
     let root = private_root();
     let mut original = dependency_request();
@@ -1419,6 +1484,10 @@ fn assert_retained_dependency_resume(version: &str) {
     // exact saved fingerprint still authorizes retrieval-only recovery.
     original["dependency_context"]["version"] = json!(version);
     if version != DEPENDENCY_CONTEXT_VERSION {
+        original["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generated_directories");
         if matches!(version, "dependency-exec-v1" | "dependency-exec-v2") {
             original["dependency_context"]
                 .as_object_mut()
@@ -1459,6 +1528,9 @@ fn assert_retained_dependency_resume(version: &str) {
     let mut changed = original.clone();
     changed["dependency_context"]["cwd"] = json!("/home/user/registry/package/src");
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":changed}));
+    let mut changed_tree = original.clone();
+    changed_tree["dependency_context"]["generated_directories"] = json!(["empty"]);
+    peer.frame(json!({"kind":"result-resume","request_id":id,"request":changed_tree}));
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":original}));
     let mut report = report();
     // Retained bytes remain recoverable even if the host can no longer create
@@ -1477,18 +1549,19 @@ fn assert_retained_dependency_resume(version: &str) {
         |_, _, _| panic!("retained dependency recovery invoked execution"),
         pressure,
     ));
-    pump(driver.as_mut(), &peer, 2);
+    pump(driver.as_mut(), &peer, 3);
     assert_eq!(peer.replies()[0]["kind"], "error");
-    let resumed = peer.replies()[1].clone();
+    assert_eq!(peer.replies()[1]["kind"], "error");
+    let resumed = peer.replies()[2].clone();
     assert_eq!(resumed["kind"], "exec-result");
     assert_eq!(resumed["resumed"], true);
     peer.frame(output_read(id, "stdout", 1, 3));
     peer.frame(
         json!({"kind":"artifact-read","request_id":id,"name":"lib.rlib","offset":0,"max_bytes":64}),
     );
-    pump(driver.as_mut(), &peer, 4);
-    assert_eq!(peer.replies()[2]["data_hex"], "00ff42");
-    assert_eq!(peer.replies()[3]["data_hex"], "6172636869766500ff");
+    pump(driver.as_mut(), &peer, 5);
+    assert_eq!(peer.replies()[3]["data_hex"], "00ff42");
+    assert_eq!(peer.replies()[4]["data_hex"], "6172636869766500ff");
     peer.frame(output_ack(id));
     peer.frame(json!({"kind":"artifact-ack","request_id":id,
         "manifest_sha256":resumed["artifact_manifest"]["manifest_sha256"],

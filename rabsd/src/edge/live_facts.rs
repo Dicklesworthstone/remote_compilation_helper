@@ -26,6 +26,8 @@ use rabs_key::live_dependency::{
     DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact, ToolchainFacts,
 };
 use rabs_key::typed_digest::compute;
+use rabs_protocol::input_evidence::DirectoryEnumeration;
+use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::TypedDigest;
 use rabs_sandbox::snapshot_capture::{
     MemberDisposition, MemberKind, SealedSourceSnapshot, capture_sealed_source, member_disposition,
@@ -401,6 +403,62 @@ struct GeneratedObservation {
 }
 
 impl PackageFacts {
+    /// Exact directory topology from the same sealed image as the generated
+    /// file bytes. Root and empty directory listings are semantic inputs too:
+    /// `empty/../value.rs` cannot be opened unless `empty` actually exists.
+    pub fn generated_directory_enumerations(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<Vec<DirectoryEnumeration>, String> {
+        let captured = match (
+            self.snapshot.manifest(GENERATED_ROOT),
+            plan.generated_root.as_ref(),
+        ) {
+            (None, None) => return Ok(Vec::new()),
+            (Some(captured), Some(_)) => captured,
+            _ => return Err("generated directory capture differs from the action plan".into()),
+        };
+        let mut directories = BTreeMap::<String, Vec<RawBytes>>::new();
+        directories.insert(String::new(), Vec::new());
+        for (path, member) in &captured.members {
+            match member {
+                MemberKind::Directory => {
+                    directories.insert(path.clone(), Vec::new());
+                }
+                MemberKind::Regular { .. } => {}
+                MemberKind::Symlink { .. } => {
+                    return Err("generated directory capture contains a symlink".into());
+                }
+            }
+        }
+        rabs_sandbox::generated_source::validate_generated_directories(
+            &directories
+                .keys()
+                .filter(|path| !path.is_empty())
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| format!("generated directory capture: {error}"))?;
+        for path in captured.members.keys() {
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            directories
+                .get_mut(parent)
+                .ok_or("generated directory capture is missing a parent")?
+                .push(RawBytes::new(name.as_bytes().to_vec()));
+        }
+        Ok(directories
+            .into_iter()
+            .map(|(relative, entries)| DirectoryEnumeration {
+                virtual_path: RawBytes::new(if relative.is_empty() {
+                    plan.generated_virtual_root().into_bytes()
+                } else {
+                    plan.generated_input_virtual_path(&relative).into_bytes()
+                }),
+                entries,
+            })
+            .collect())
+    }
+
     /// Re-walk `root` and require exactly the captured members with the
     /// captured identities. Used after the compiler ran against the live
     /// tree: a result is only publishable if its inputs never moved.
@@ -988,24 +1046,21 @@ fn captured_files(
     let manifest = snapshot
         .manifest(logical_root)
         .ok_or("capture lost its root")?;
-    let captured_count = manifest
-        .members
-        .values()
-        .filter(|member| matches!(member, MemberKind::Regular { .. }))
-        .count();
-    let observed_count = observed
-        .iter()
-        .filter(|(_, sig)| matches!(sig, MemberSig::File(_)))
-        .count();
-    if captured_count != observed_count
-        || manifest
-            .members
-            .values()
-            .any(|member| matches!(member, MemberKind::Symlink { .. }))
+    if manifest.members.len() != observed.len()
+        || manifest.members.iter().zip(observed).any(
+            |((captured_path, captured), (observed_path, observed))| {
+                captured_path != observed_path
+                    || !matches!(
+                        (captured, observed),
+                        (MemberKind::Directory, MemberSig::Directory)
+                            | (MemberKind::Regular { .. }, MemberSig::File(_))
+                    )
+            },
+        )
     {
         return Err("capture does not cover the complete input tree".into());
     }
-    let mut files = Vec::with_capacity(captured_count);
+    let mut files = Vec::new();
     for (relative, member) in &manifest.members {
         if let MemberKind::Regular { mode, .. } = member {
             let bytes = snapshot
@@ -2022,6 +2077,70 @@ mod tests {
         )
         .unwrap();
         (dir, plan)
+    }
+
+    #[test]
+    fn generated_directory_listings_are_sealed_with_files_and_include_empty_subtrees() {
+        let (_dir, plan) = generated_fixture();
+        let source = Path::new(&plan.source_root);
+        let generated = Path::new(plan.generated_root.as_ref().unwrap());
+        std::fs::create_dir_all(generated.join("empty/child")).unwrap();
+        std::fs::create_dir(generated.join("nested")).unwrap();
+        std::fs::write(generated.join("nested/value.rs"), b"captured").unwrap();
+        let facts = LiveFacts::new();
+        let captured = facts
+            .package(source, plan.source_kind, Some(generated))
+            .unwrap();
+        let listings = captured.generated_directory_enumerations(&plan).unwrap();
+        let readable = listings
+            .iter()
+            .map(|listing| {
+                (
+                    String::from_utf8(listing.virtual_path.as_bytes().to_vec()).unwrap(),
+                    listing
+                        .entries
+                        .iter()
+                        .map(|name| String::from_utf8(name.as_bytes().to_vec()).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            readable,
+            vec![
+                (
+                    plan.generated_virtual_root(),
+                    vec!["empty".into(), "nested".into(), "value.rs".into()]
+                ),
+                (
+                    plan.generated_input_virtual_path("empty"),
+                    vec!["child".into()]
+                ),
+                (plan.generated_input_virtual_path("empty/child"), vec![]),
+                (
+                    plan.generated_input_virtual_path("nested"),
+                    vec!["value.rs".into()]
+                ),
+            ]
+        );
+        std::fs::rename(
+            generated.join("empty/child"),
+            generated.join("empty/renamed"),
+        )
+        .unwrap();
+        assert!(captured.verify_unchanged(source).is_err());
+        assert_eq!(
+            captured.generated_directory_enumerations(&plan).unwrap(),
+            listings,
+            "retained listings must not reopen a mutable OUT_DIR"
+        );
+        let next = facts
+            .package(source, plan.source_kind, Some(generated))
+            .unwrap();
+        assert_ne!(
+            next.generated_directory_enumerations(&plan).unwrap(),
+            listings
+        );
     }
 
     #[test]

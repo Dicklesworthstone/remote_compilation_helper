@@ -211,7 +211,8 @@ build-script output record, the original `OUT_DIR` path and every generated
 file, including an explicitly captured empty tree. A tree containing empty
 subdirectories stays on the local protocol because the current file transfer
 cannot reproduce those directories; a truly empty root is supported.
-Generated file contents or membership changes select a different key. The
+Generated file contents, directory membership and empty-directory topology
+select a different key. The
 captured `rustc-env` directives must agree with the compiler environment. Every
 source or generated path reported by dep-info must belong to the captured
 input closure. This does not cache or replay
@@ -219,14 +220,19 @@ the build script's execution.
 
 The worker keeps the original source, generated-input, output and toolchain
 path spellings and full compiler environment inside private mounts. The
-`dependency-exec-v7` context binds an explicit list of populated dependency
+`dependency-exec-v8` context binds an explicit list of populated dependency
 roots to their first-use directory indices. A single sealed source transfer contains
 `package/<source-path>`, optional `generated/<generated-path>` and
 `dependencies/NNNN/<artifact-basename>`; only the declared package, generated
 and retained candidate files may appear. The worker verifies that inventory
 and mounts the generated tree and each disjoint populated dependency root
-read-only. A captured empty generated tree receives an exclusive empty
-backing. The generated root must match the original `OUT_DIR` environment
+read-only. The context carries every generated subdirectory, including empty
+ones, separately from the file-byte manifest. The worker reconstructs the exact
+tree in an exclusive backing without modifying the sealed transfer bundle or
+sharing file inodes with it. This preserves compiler path traversal such as
+`empty/../value.rs`; removing or replacing an empty directory also invalidates
+the retained input guard. A truly empty generated root has the same explicit
+ownership. The generated root must match the original `OUT_DIR` environment
 value and cannot overlap source, output, dependency or toolchain roots.
 Generated input files never become returned compiler artifacts.
 For a shared input/output root, it rechecks the sealed input bytes and creates
@@ -269,7 +275,7 @@ Metadata and whole-Cargo execution retain their full canonical isolation checks.
 Sealed-result recovery requires the original request fingerprint and retained
 bytes, without requiring the restarted host to support new execution.
 
-The launcher requires a daemon advertising `dependency-exec-v7`; old execution
+The launcher requires a daemon advertising `dependency-exec-v8`; old execution
 contexts cannot admit new work. Already sealed results from older contexts can
 still resume against their exact saved request fingerprint.
 
@@ -361,7 +367,7 @@ CARGO_RABS_WRAP="$PWD/target/debug/rabs-wrap" \
 This starts a live daemon if needed. Subsequent invocations retain the exported
 pool selection so the launcher checks the attached daemon's exact normalized
 configuration, including worker order, remote protocol 1 and
-`dependency-exec-v7`. The advertised `remote_dependency` object contains these
+`dependency-exec-v8`. The advertised `remote_dependency` object contains these
 protocol fields and a `workers` array in configured order. A singleton daemon
 does not satisfy a pool request, even when the pool contains that one worker.
 An existing daemon is never reconfigured or restarted to fit a new request;
@@ -507,7 +513,7 @@ receipt. Terminal events are associated with the crate that admitted their
 action key; one crate's successful execution cannot stand in for another's.
 Toolchain warmup may let different nodes start qualification on different runs.
 
-With `dependency-exec-v7`, this DAG oracle can use shared or disjoint dependency
+With `dependency-exec-v8`, this DAG oracle can use shared or disjoint dependency
 and output directories. It performs no compiler-argument rewriting and never
 treats local fallback as evidence of remote admission. It selects the installed
 Cargo and its matching compiler explicitly; ordinary rustup-based Cargo use

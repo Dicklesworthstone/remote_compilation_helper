@@ -178,6 +178,7 @@ fn path_preserving_dependency_matches_stock_over_real_tls_worker() {
             "dependency_dirs":[out, empty_search],
             "loader_dirs":[out, loader_parent],
             "artifact_roots":[],
+            "generated_directories":[],
             "env":environment,
             "runtime_cohort_sha256":cohort_hex,
         },
