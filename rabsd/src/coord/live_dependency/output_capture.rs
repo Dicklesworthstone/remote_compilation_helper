@@ -306,9 +306,7 @@ mod tests {
         assert_eq!(std::fs::read(&captured.stage).unwrap(), b"original");
         assert_ne!(
             std::fs::metadata(&source).unwrap().ino(),
-            std::fs::metadata(&captured.stage)
-                .unwrap()
-                .ino()
+            std::fs::metadata(&captured.stage).unwrap().ino()
         );
         assert!(
             std::fs::metadata(&captured.stage)

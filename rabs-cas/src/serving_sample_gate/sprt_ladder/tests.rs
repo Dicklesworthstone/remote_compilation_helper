@@ -2,22 +2,30 @@
 //! These do not claim real compiler executions or a measured divergence rate.
 
 use super::*;
-use crate::serving_sample_gate::{ActionClassRisk, SampleGateDecision, SamplingPolicy, decide};
-use crate::serving_sample_gate::tests::{action, fresh_path, published, samples};
 use crate::metadata_store::{FsqliteEngine, RusqliteEngine, SqlMetadataStore};
+use crate::serving_sample_gate::tests::{action, fresh_path, published, samples};
+use crate::serving_sample_gate::{ActionClassRisk, SampleGateDecision, SamplingPolicy, decide};
 
 fn bound(store: &mut dyn RabsMetadataStore, tag: u8, generation: u128) -> String {
     let key = published(store, tag, generation);
-    store.record_decision_receipt(CLASS_KIND, &key, 0, CLASS, "synthetic descriptor binding").unwrap();
+    store
+        .record_decision_receipt(CLASS_KIND, &key, 0, CLASS, "synthetic descriptor binding")
+        .unwrap();
     key
 }
 
 fn proof(store: &mut dyn RabsMetadataStore, tag: u8, generation: u128, attempt: u128, seq: u64) {
     let key = crate::metadata_store::digest_key(&action(tag));
-    store.record_attempt(attempt, generation, "fixture-verifier", seq).unwrap();
-    store.record_verification_sample(&action(tag), attempt, true, seq).unwrap();
+    store
+        .record_attempt(attempt, generation, "fixture-verifier", seq)
+        .unwrap();
+    store
+        .record_verification_sample(&action(tag), attempt, true, seq)
+        .unwrap();
     let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
-    store.record_decision_receipt(VERIFIED, &key, seq, &format!("{attempt:032x}"), &manifest).unwrap();
+    store
+        .record_decision_receipt(VERIFIED, &key, seq, &format!("{attempt:032x}"), &manifest)
+        .unwrap();
 }
 
 fn drain(store: &mut dyn RabsMetadataStore) -> Checkpoint {
@@ -39,28 +47,62 @@ fn attribution_scenarios(store: &mut dyn RabsMetadataStore) -> Vec<String> {
     let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
 
     // A second sample and receipt for the same admitted attempt is NOT a trial.
-    store.record_verification_sample(&action(1), 10_001, true, 2).unwrap();
-    store.record_decision_receipt(VERIFIED, &key, 2, &format!("{:032x}", 10_001), &manifest).unwrap();
+    store
+        .record_verification_sample(&action(1), 10_001, true, 2)
+        .unwrap();
+    store
+        .record_decision_receipt(VERIFIED, &key, 2, &format!("{:032x}", 10_001), &manifest)
+        .unwrap();
     // A raw sample has no publication-engine acknowledgment.
-    store.record_attempt(10_002, 10, "fixture-verifier", 3).unwrap();
-    store.record_verification_sample(&action(1), 10_002, true, 3).unwrap();
+    store
+        .record_attempt(10_002, 10, "fixture-verifier", 3)
+        .unwrap();
+    store
+        .record_verification_sample(&action(1), 10_002, true, 3)
+        .unwrap();
     // A winner re-offer, even with a forged positive receipt, is not independent.
-    store.record_verification_sample(&action(1), 101, true, 4).unwrap();
-    store.record_decision_receipt(VERIFIED, &key, 4, &format!("{:032x}", 101), &manifest).unwrap();
+    store
+        .record_verification_sample(&action(1), 101, true, 4)
+        .unwrap();
+    store
+        .record_decision_receipt(VERIFIED, &key, 4, &format!("{:032x}", 101), &manifest)
+        .unwrap();
     // Unknown attempt and wrong manifest cannot manufacture positive credit.
-    store.record_verification_sample(&action(1), 999_999, true, 5).unwrap();
-    store.record_decision_receipt(VERIFIED, &key, 5, &format!("{:032x}", 999_999), &manifest).unwrap();
-    store.record_attempt(10_003, 10, "fixture-verifier", 6).unwrap();
-    store.record_verification_sample(&action(1), 10_003, true, 6).unwrap();
-    store.record_decision_receipt(VERIFIED, &key, 6, &format!("{:032x}", 10_003), "wrong-manifest").unwrap();
+    store
+        .record_verification_sample(&action(1), 999_999, true, 5)
+        .unwrap();
+    store
+        .record_decision_receipt(VERIFIED, &key, 5, &format!("{:032x}", 999_999), &manifest)
+        .unwrap();
+    store
+        .record_attempt(10_003, 10, "fixture-verifier", 6)
+        .unwrap();
+    store
+        .record_verification_sample(&action(1), 10_003, true, 6)
+        .unwrap();
+    store
+        .record_decision_receipt(
+            VERIFIED,
+            &key,
+            6,
+            &format!("{:032x}", 10_003),
+            "wrong-manifest",
+        )
+        .unwrap();
     assert_eq!(drain(store).passes, 1);
 
     let private = published(store, 2, 11);
-    store.record_decision_receipt(CLASS_KIND, &private, 0, "private-only", CLASS).unwrap();
+    store
+        .record_decision_receipt(CLASS_KIND, &private, 0, "private-only", CLASS)
+        .unwrap();
     proof(store, 2, 11, 11_001, 1);
     // Attribute a private action's attempt to the requested action: refused.
-    store.record_verification_sample(&action(1), 11_001, true, 7).unwrap();
-    store.record_decision_receipt(VERIFIED, &key, 7, &format!("{:032x}", 11_001), &manifest).unwrap();
+    store
+        .record_verification_sample(&action(1), 11_001, true, 7)
+        .unwrap();
+    store
+        .record_decision_receipt(VERIFIED, &key, 7, &format!("{:032x}", 11_001), &manifest)
+        .unwrap();
     assert_eq!(drain(store).passes, 1);
 
     proof(store, 1, 10, 10_004, 8);
@@ -72,15 +114,27 @@ fn attribution_scenarios(store: &mut dyn RabsMetadataStore) -> Vec<String> {
 fn exact_sprt_crossings_spend_three_disjoint_windows_and_never_reach_zero_floor() {
     let expected = [10_000, 2_500, 500, 100];
     for passes in 0..=FINAL_PASSES {
-        let checkpoint = Checkpoint { cursor: passes as i64, passes };
+        let checkpoint = Checkpoint {
+            cursor: passes as i64,
+            passes,
+        };
         let stage = (passes / PASSES_PER_STEP) as usize;
         assert_eq!(checkpoint.verification_bps(), expected[stage]);
-        assert_eq!(checkpoint.replay_limit() + 1, 10_000 / u64::from(expected[stage]));
+        assert_eq!(
+            checkpoint.replay_limit() + 1,
+            10_000 / u64::from(expected[stage])
+        );
     }
     // The previous integer is strictly before every boundary, not promoted.
     for step in 1..=3_u64 {
-        let before = Checkpoint { cursor: 0, passes: step * PASSES_PER_STEP - 1 };
-        let at = Checkpoint { cursor: 0, passes: step * PASSES_PER_STEP };
+        let before = Checkpoint {
+            cursor: 0,
+            passes: step * PASSES_PER_STEP - 1,
+        };
+        let at = Checkpoint {
+            cursor: 0,
+            passes: step * PASSES_PER_STEP,
+        };
         assert_eq!(before.step() + 1, at.step());
     }
 }
@@ -93,9 +147,14 @@ fn only_attributed_independent_publication_comparisons_earn_credit() {
 
 #[test]
 fn reference_and_frankensqlite_fold_the_same_evidence() {
-    let mut reference = SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("sprt-ref")).unwrap()).unwrap();
-    let mut candidate = SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("sprt-fsq")).unwrap()).unwrap();
-    assert_eq!(attribution_scenarios(&mut reference), attribution_scenarios(&mut candidate));
+    let mut reference =
+        SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("sprt-ref")).unwrap()).unwrap();
+    let mut candidate =
+        SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("sprt-fsq")).unwrap()).unwrap();
+    assert_eq!(
+        attribution_scenarios(&mut reference),
+        attribution_scenarios(&mut candidate)
+    );
 }
 
 #[test]
@@ -103,7 +162,15 @@ fn marker_before_checkpoint_crash_loses_credit_instead_of_double_counting() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
     let key = bound(&mut store, 1, 10);
     proof(&mut store, 1, 10, 10_001, 1);
-    store.record_decision_receipt(COUNTED, &format!("{key}:{:032x}", 10_001), 0, "consumed", CLASS).unwrap();
+    store
+        .record_decision_receipt(
+            COUNTED,
+            &format!("{key}:{:032x}", 10_001),
+            0,
+            "consumed",
+            CLASS,
+        )
+        .unwrap();
     assert_eq!(drain(&mut store).passes, 0);
     proof(&mut store, 1, 10, 10_002, 2);
     assert_eq!(drain(&mut store).passes, 1);
@@ -129,7 +196,9 @@ fn checkpoint_and_attempt_identity_survive_real_database_reopening() {
     let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
     // Reinsert the same receipt: the append-only API acknowledges an exact
     // retry without rewriting it. The stable attempt marker must still win.
-    store.record_decision_receipt(VERIFIED, &key, 1, &format!("{:032x}", 10_001), &manifest).unwrap();
+    store
+        .record_decision_receipt(VERIFIED, &key, 1, &format!("{:032x}", 10_001), &manifest)
+        .unwrap();
     assert_eq!(drain(&mut store).passes, 1);
     proof(&mut store, 1, 10, 10_002, 2);
     assert_eq!(drain(&mut store).passes, 2);
@@ -150,15 +219,39 @@ fn opt_in_gate_requires_verification_without_mutating_existing_publication() {
     samples(&mut store, 1, 10, 3, 0);
     let policy = SamplingPolicy::sample_all(2, 10_000);
     let before = store.differential_snapshot().unwrap();
-    assert_eq!(decide(&mut store, &action(1), ActionClassRisk::LowRiskRegistry, &policy, false).unwrap(), SampleGateDecision::ServeFromCache);
+    assert_eq!(
+        decide(
+            &mut store,
+            &action(1),
+            ActionClassRisk::LowRiskRegistry,
+            &policy,
+            false
+        )
+        .unwrap(),
+        SampleGateDecision::ServeFromCache
+    );
     assert_eq!(store.differential_snapshot().unwrap(), before);
     let manifest = store.published_manifest_key_str(&key).unwrap();
-    assert_eq!(decide(&mut store, &action(1), ActionClassRisk::LowRiskRegistry, &policy, true).unwrap(),
+    assert_eq!(
+        decide(
+            &mut store,
+            &action(1),
+            ActionClassRisk::LowRiskRegistry,
+            &policy,
+            true
+        )
+        .unwrap(),
         SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ClassVerificationRequired {
-            class: CLASS.into(), credited_comparisons: 0, verification_basis_points: 10_000,
-        }));
+            class: CLASS.into(),
+            credited_comparisons: 0,
+            verification_basis_points: 10_000,
+        })
+    );
     assert_eq!(store.published_manifest_key_str(&key).unwrap(), manifest);
-    assert_eq!(store.serving_disposition_key(&key).unwrap().as_deref(), Some("servable"));
+    assert_eq!(
+        store.serving_disposition_key(&key).unwrap().as_deref(),
+        Some("servable")
+    );
 }
 
 #[test]
@@ -168,27 +261,54 @@ fn negative_evidence_vetoes_before_any_sprt_credit_or_checkpoint_write() {
     samples(&mut store, 1, 10, 3, 0);
     let culprit = bound(&mut store, 2, 11);
     proof(&mut store, 1, 10, 10_099, 99);
-    store.record_verification_sample(&action(2), 999_999, false, 1).unwrap();
+    store
+        .record_verification_sample(&action(2), 999_999, false, 1)
+        .unwrap();
     let before = store.differential_snapshot().unwrap();
-    let result = decide(&mut store, &action(1), ActionClassRisk::LowRiskRegistry, &SamplingPolicy::sample_all(2, 10_000), true).unwrap();
-    assert!(matches!(result, SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ClassSafetyHold { culprit_action_key, .. }) if culprit_action_key == culprit));
+    let result = decide(
+        &mut store,
+        &action(1),
+        ActionClassRisk::LowRiskRegistry,
+        &SamplingPolicy::sample_all(2, 10_000),
+        true,
+    )
+    .unwrap();
+    assert!(
+        matches!(result, SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ClassSafetyHold { culprit_action_key, .. }) if culprit_action_key == culprit)
+    );
     assert_eq!(store.differential_snapshot().unwrap(), before);
 }
 
 #[test]
 fn invalid_checkpoints_and_conflicting_attempt_markers_refuse() {
-    for (passes, cursor) in [("01", "10"), ("1", "0"), ("209287", "300000"), ("1", "-1"), ("1", "9223372036854775808")] {
+    for (passes, cursor) in [
+        ("01", "10"),
+        ("1", "0"),
+        ("209287", "300000"),
+        ("1", "-1"),
+        ("1", "9223372036854775808"),
+    ] {
         // Each corrupt receipt is immutable; test it independently instead
         // of assuming that the same primary key can be overwritten.
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        store.record_decision_receipt(STATE, CLASS, 0, passes, cursor).unwrap();
+        store
+            .record_decision_receipt(STATE, CLASS, 0, passes, cursor)
+            .unwrap();
         assert!(Checkpoint::load(&mut store).is_err());
     }
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
     let key = bound(&mut store, 1, 10);
     Checkpoint::default().persist(&mut store).unwrap();
     proof(&mut store, 1, 10, 10_001, 1);
-    store.record_decision_receipt(COUNTED, &format!("{key}:{:032x}", 10_001), 0, "consumed", "another-class").unwrap();
+    store
+        .record_decision_receipt(
+            COUNTED,
+            &format!("{key}:{:032x}", 10_001),
+            0,
+            "consumed",
+            "another-class",
+        )
+        .unwrap();
     assert!(advance(&mut store).is_err());
 }
 
@@ -197,10 +317,15 @@ fn promotion_receipts_bind_each_boundary_and_do_not_advance_evidence() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
     // Boundary injection exercises receipt encoding/idempotency ONLY. It is
     // not a substitute for earning comparisons through the journal reducer.
-    let at = Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES };
+    let at = Checkpoint {
+        cursor: FINAL_PASSES as i64,
+        passes: FINAL_PASSES,
+    };
     record_crossings(&mut store, at).unwrap();
     for (step, bps) in [(1, 2500), (2, 500), (3, 100)] {
-        let (decision, reason) = receipt(&mut store, PROMOTION, CLASS, step).unwrap().unwrap();
+        let (decision, reason) = receipt(&mut store, PROMOTION, CLASS, step)
+            .unwrap()
+            .unwrap();
         assert_eq!(decision, format!("verification-bps={bps}"));
         assert!(reason.contains(&format!("cumulative-passes={}", step * PASSES_PER_STEP)));
         assert!(reason.contains("llr=-6.906786798374720935"));
@@ -219,7 +344,9 @@ fn comparison_cadence_uses_existing_durable_install_receipts() {
     proof(&mut store, 1, 10, 10_001, 1);
     for used in 0..=3 {
         assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(used));
-        store.record_decision_receipt(INSTALL, &format!("{key}:1"), used, "install", "fixture").unwrap();
+        store
+            .record_decision_receipt(INSTALL, &format!("{key}:1"), used, "install", "fixture")
+            .unwrap();
     }
     proof(&mut store, 1, 10, 10_002, 2);
     assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(0));
@@ -243,8 +370,14 @@ fn progressive_checkpoint_scenario(store: &mut dyn RabsMetadataStore) -> Vec<Str
         let history = checkpoint_history(store);
         assert_eq!(history.len(), comparison as usize);
         assert_eq!(&history[..prior.len()], prior.as_slice());
-        assert_eq!(history.last().unwrap()[0], SqlValue::Int(comparison as i64 - 1));
-        assert_eq!(history.last().unwrap()[1], SqlValue::Text(comparison.to_string()));
+        assert_eq!(
+            history.last().unwrap()[0],
+            SqlValue::Int(comparison as i64 - 1)
+        );
+        assert_eq!(
+            history.last().unwrap()[1],
+            SqlValue::Text(comparison.to_string())
+        );
         prior = history;
 
         // An exact retry after an ambiguous successful append must not even
@@ -265,14 +398,12 @@ fn successive_checkpoint_generations_preserve_history_and_retry_idempotently() {
 
 #[test]
 fn reference_and_frankensqlite_append_identical_checkpoint_histories() {
-    let mut reference = SqlMetadataStore::open(
-        RusqliteEngine::open(&fresh_path("sprt-generations-ref")).unwrap(),
-    )
-    .unwrap();
-    let mut candidate = SqlMetadataStore::open(
-        FsqliteEngine::open(&fresh_path("sprt-generations-fsq")).unwrap(),
-    )
-    .unwrap();
+    let mut reference =
+        SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("sprt-generations-ref")).unwrap())
+            .unwrap();
+    let mut candidate =
+        SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("sprt-generations-fsq")).unwrap())
+            .unwrap();
     assert_eq!(
         progressive_checkpoint_scenario(&mut reference),
         progressive_checkpoint_scenario(&mut candidate)
@@ -283,10 +414,18 @@ fn reference_and_frankensqlite_append_identical_checkpoint_histories() {
 fn legacy_seq_zero_is_retained_while_new_evidence_advances() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
     bound(&mut store, 1, 10);
-    store.record_decision_receipt(STATE, CLASS, 0, "0", "0").unwrap();
+    store
+        .record_decision_receipt(STATE, CLASS, 0, "0", "0")
+        .unwrap();
     let legacy = checkpoint_history(&mut store);
     for comparison in 1..=3_u64 {
-        proof(&mut store, 1, 10, 30_000 + u128::from(comparison), comparison);
+        proof(
+            &mut store,
+            1,
+            10,
+            30_000 + u128::from(comparison),
+            comparison,
+        );
         assert_eq!(drain(&mut store).passes, comparison);
     }
     let history = checkpoint_history(&mut store);
@@ -306,22 +445,62 @@ fn latest_generation_not_rowid_cursor_or_pass_count_selects_the_checkpoint() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
     // Synthetic restore order: an older, more optimistic checkpoint gets a
     // later rowid. A higher cursor/pass count does not make it authoritative.
-    store.record_decision_receipt(STATE, CLASS, 5, "1", "7").unwrap();
-    store.record_decision_receipt(STATE, CLASS, 4, "100", "100").unwrap();
+    store
+        .record_decision_receipt(STATE, CLASS, 5, "1", "7")
+        .unwrap();
+    store
+        .record_decision_receipt(STATE, CLASS, 4, "100", "100")
+        .unwrap();
     // Other receipt kinds and other class subjects cannot select a generation.
-    store.record_decision_receipt(STATE, "other-class", i64::MAX as u64, "1", "1").unwrap();
-    store.record_decision_receipt("other-state", CLASS, i64::MAX as u64, "1", "1").unwrap();
-    assert_eq!(Checkpoint::load(&mut store).unwrap(), Checkpoint { cursor: 7, passes: 1 });
-    Checkpoint { cursor: 10, passes: 2 }.persist(&mut store).unwrap();
-    assert_eq!(Checkpoint::latest(&mut store).unwrap(), Some((6, Checkpoint { cursor: 10, passes: 2 })));
+    store
+        .record_decision_receipt(STATE, "other-class", i64::MAX as u64, "1", "1")
+        .unwrap();
+    store
+        .record_decision_receipt("other-state", CLASS, i64::MAX as u64, "1", "1")
+        .unwrap();
+    assert_eq!(
+        Checkpoint::load(&mut store).unwrap(),
+        Checkpoint {
+            cursor: 7,
+            passes: 1
+        }
+    );
+    Checkpoint {
+        cursor: 10,
+        passes: 2,
+    }
+    .persist(&mut store)
+    .unwrap();
+    assert_eq!(
+        Checkpoint::latest(&mut store).unwrap(),
+        Some((
+            6,
+            Checkpoint {
+                cursor: 10,
+                passes: 2
+            }
+        ))
+    );
 }
 
 #[test]
 fn malformed_latest_generation_never_falls_back_to_a_valid_older_checkpoint() {
-    for (passes, cursor) in [("01", "10"), ("1", "0"), ("1", "-1"), ("1", "9223372036854775808")] {
+    for (passes, cursor) in [
+        ("01", "10"),
+        ("1", "0"),
+        ("1", "-1"),
+        ("1", "9223372036854775808"),
+    ] {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        Checkpoint { cursor: 10, passes: 1 }.persist(&mut store).unwrap();
-        store.record_decision_receipt(STATE, CLASS, 1, passes, cursor).unwrap();
+        Checkpoint {
+            cursor: 10,
+            passes: 1,
+        }
+        .persist(&mut store)
+        .unwrap();
+        store
+            .record_decision_receipt(STATE, CLASS, 1, passes, cursor)
+            .unwrap();
         let before = store.differential_snapshot().unwrap();
         assert!(Checkpoint::load(&mut store).is_err());
         assert!(Checkpoint::default().persist(&mut store).is_err());
@@ -333,10 +512,17 @@ fn malformed_latest_generation_never_falls_back_to_a_valid_older_checkpoint() {
 #[test]
 fn generation_overflow_refuses_without_rewriting_or_resetting_evidence() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-    store.record_decision_receipt(STATE, CLASS, i64::MAX as u64, "1", "10").unwrap();
+    store
+        .record_decision_receipt(STATE, CLASS, i64::MAX as u64, "1", "10")
+        .unwrap();
     let before = store.differential_snapshot().unwrap();
     // An exact retry needs no new generation even at the integer boundary.
-    Checkpoint { cursor: 10, passes: 1 }.persist(&mut store).unwrap();
+    Checkpoint {
+        cursor: 10,
+        passes: 1,
+    }
+    .persist(&mut store)
+    .unwrap();
     assert!(matches!(
         Checkpoint { cursor: 11, passes: 2 }.persist(&mut store),
         Err(StoreError::Corruption(reason)) if reason.contains("generation overflow")
@@ -347,12 +533,26 @@ fn generation_overflow_refuses_without_rewriting_or_resetting_evidence() {
 #[test]
 fn invalid_new_checkpoint_cannot_append_over_a_healthy_journal() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-    Checkpoint { cursor: 10, passes: 1 }.persist(&mut store).unwrap();
+    Checkpoint {
+        cursor: 10,
+        passes: 1,
+    }
+    .persist(&mut store)
+    .unwrap();
     let before = store.differential_snapshot().unwrap();
     for checkpoint in [
-        Checkpoint { cursor: -1, passes: 0 },
-        Checkpoint { cursor: 1, passes: 2 },
-        Checkpoint { cursor: i64::MAX, passes: FINAL_PASSES + 1 },
+        Checkpoint {
+            cursor: -1,
+            passes: 0,
+        },
+        Checkpoint {
+            cursor: 1,
+            passes: 2,
+        },
+        Checkpoint {
+            cursor: i64::MAX,
+            passes: FINAL_PASSES + 1,
+        },
     ] {
         assert!(checkpoint.persist(&mut store).is_err());
     }
@@ -366,7 +566,15 @@ fn full_pages_of_internal_history_advance_but_idle_scans_do_not_append_forever()
     proof(&mut store, 1, 10, 40_001, 1);
     assert_eq!(drain(&mut store).passes, 1);
     for index in 0..2 * PAGE {
-        store.record_decision_receipt(COUNTED, &format!("synthetic-history-{index}"), 0, "consumed", CLASS).unwrap();
+        store
+            .record_decision_receipt(
+                COUNTED,
+                &format!("synthetic-history-{index}"),
+                0,
+                "consumed",
+                CLASS,
+            )
+            .unwrap();
     }
     proof(&mut store, 1, 10, 40_002, 2);
     assert_eq!(drain(&mut store).passes, 2);

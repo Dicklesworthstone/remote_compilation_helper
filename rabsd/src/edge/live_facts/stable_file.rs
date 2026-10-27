@@ -44,7 +44,9 @@ pub(super) fn read_at(
     let mut file = open(path, before)?;
     let capacity = usize::try_from(before.size()).map_err(io::Error::other)?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(capacity).map_err(io::Error::other)?;
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(io::Error::other)?;
     // Do not read up to max_bytes + 1: it can overflow, and a growing file
     // must not make us consume more than its already observed length.
     (&mut file).take(before.size()).read_to_end(&mut bytes)?;
@@ -208,7 +210,11 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let socket = dir.path().join("socket");
         let _listener = UnixListener::bind(&socket).unwrap();
-        for path in [directory.as_path(), socket.as_path(), Path::new("/dev/null")] {
+        for path in [
+            directory.as_path(),
+            socket.as_path(),
+            Path::new("/dev/null"),
+        ] {
             assert!(open(path, before).is_err(), "{path:?}");
             assert!(read_stable(path, 8).is_err(), "{path:?}");
         }

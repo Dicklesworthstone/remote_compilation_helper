@@ -735,7 +735,10 @@ mod tests {
                 let general = derive_output_declarations(&inv, host).unwrap();
                 assert!(!general.declarations.is_empty());
                 assert!(
-                    general.declarations.iter().all(|d| d.class != OutputClass::DepInfo)
+                    general
+                        .declarations
+                        .iter()
+                        .all(|d| d.class != OutputClass::DepInfo)
                 );
                 assert_eq!(
                     derive_dependency_output_declarations(&inv, host),
@@ -952,14 +955,16 @@ mod tests {
                         let mut threaded = dependency(&args);
                         threaded.emit = baseline.emit.clone();
                         let original = threaded.clone();
-                        let expected = derive_dependency_output_declarations(&baseline, host)
-                            .unwrap();
-                        let actual = derive_dependency_output_declarations(&threaded, host)
-                            .unwrap();
+                        let expected =
+                            derive_dependency_output_declarations(&baseline, host).unwrap();
+                        let actual =
+                            derive_dependency_output_declarations(&threaded, host).unwrap();
                         assert_eq!(actual, expected, "{host}: {args:?} {emit}");
                         assert_eq!(threaded, original, "admission must not rewrite rustc argv");
                         assert_ne!(threaded.canonical_bytes(), baseline.canonical_bytes());
-                        threaded.unstable.push(("embed-metadata".into(), Some("no".into())));
+                        threaded
+                            .unstable
+                            .push(("embed-metadata".into(), Some("no".into())));
                         assert_eq!(
                             derive_dependency_output_declarations(&threaded, host).unwrap(),
                             expected,
@@ -988,7 +993,8 @@ mod tests {
             Some("4294967296"),
         ] {
             let mut inv = dependency(&[]);
-            inv.unstable.push(("threads".into(), value.map(str::to_owned)));
+            inv.unstable
+                .push(("threads".into(), value.map(str::to_owned)));
             assert!(
                 matches!(
                     derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu"),
@@ -1026,8 +1032,8 @@ mod tests {
     #[test]
     fn frontend_thread_count_is_bound_to_the_full_live_key_and_toolchain_profile() {
         use crate::live_dependency::{
-            LiveRustcRequest, ToolchainFacts, dep_info_closure_violation,
-            live_dependency_key, plan_dependency_action,
+            LiveRustcRequest, ToolchainFacts, dep_info_closure_violation, live_dependency_key,
+            plan_dependency_action,
         };
         use crate::typed_digest::compute;
         use rabs_protocol::input_evidence::{

@@ -11,8 +11,9 @@
 
 use super::{
     DependencySourceKind, FactsMiss, FileSig, GeneratedObservation, LiveFacts, MAX_PACKAGE_BYTES,
-    MAX_PACKAGE_FILES, MAX_RETAINED_PACKAGE_BYTES, MAX_WARMING, MemberSig, PROBE_RETRY, PackageFacts,
-    PackageKey, SYNCHRONOUS_PACKAGE_BYTES, WarmPermit, capture_package, observe_generated, walk_package,
+    MAX_PACKAGE_FILES, MAX_RETAINED_PACKAGE_BYTES, MAX_WARMING, MemberSig, PROBE_RETRY,
+    PackageFacts, PackageKey, SYNCHRONOUS_PACKAGE_BYTES, WarmPermit, capture_package,
+    observe_generated, walk_package,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -323,7 +324,13 @@ pub(super) fn observe(
     source_kind: DependencySourceKind,
     generated_root: Option<&Path>,
 ) -> Result<Arc<PackageFacts>, FactsMiss> {
-    observe_with(facts, root, source_kind, generated_root, Observation::capture)
+    observe_with(
+        facts,
+        root,
+        source_kind,
+        generated_root,
+        Observation::capture,
+    )
 }
 
 fn observe_with(
@@ -333,9 +340,8 @@ fn observe_with(
     generated_root: Option<&Path>,
     capture: impl FnOnce(&Observation) -> Result<PackageFacts, String> + Send + 'static,
 ) -> Result<Arc<PackageFacts>, FactsMiss> {
-    let observation = Arc::new(
-        Observation::read(root, source_kind, generated_root).map_err(FactsMiss::Refused)?,
-    );
+    let observation =
+        Arc::new(Observation::read(root, source_kind, generated_root).map_err(FactsMiss::Refused)?);
     let (reservation, warm) = {
         let mut memos = facts
             .packages

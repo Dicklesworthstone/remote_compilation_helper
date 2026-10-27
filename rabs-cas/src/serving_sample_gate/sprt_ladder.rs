@@ -163,9 +163,11 @@ impl Checkpoint {
         match rows.as_slice() {
             [] => Ok(None),
             [row] => match row.as_slice() {
-                [SqlValue::Int(generation), SqlValue::Text(passes), SqlValue::Text(cursor)]
-                    if *generation >= 0 =>
-                {
+                [
+                    SqlValue::Int(generation),
+                    SqlValue::Text(passes),
+                    SqlValue::Text(cursor),
+                ] if *generation >= 0 => {
                     let checkpoint = Self {
                         cursor: i64::try_from(number(cursor)?)
                             .map_err(|_| corrupt("cursor overflow"))?,
@@ -290,7 +292,8 @@ fn advance(store: &mut dyn RabsMetadataStore) -> Result<Checkpoint, StoreError> 
             SqlValue::Int(seq),
             SqlValue::Text(attempt),
             SqlValue::Text(manifest),
-        ] = fields else {
+        ] = fields
+        else {
             return Err(corrupt("verification receipt shape"));
         };
         if !admitted(store, action, *seq, attempt, manifest)? {
@@ -342,7 +345,9 @@ fn record_crossings(
             Some((old_decision, old_reason))
                 if old_decision == decision && old_reason == reason => {}
             Some(_) => return Err(corrupt("conflicting promotion receipt")),
-            None => store.record_decision_receipt(PROMOTION, CLASS, step as u64, decision, &reason)?,
+            None => {
+                store.record_decision_receipt(PROMOTION, CLASS, step as u64, decision, &reason)?
+            }
         }
     }
     Ok(())
@@ -367,7 +372,10 @@ fn used_since_comparison(
     }
     let rows = store.query(
         "SELECT COUNT(*) FROM decision_receipts WHERE kind = ?1 AND subject = ?2",
-        &[SqlValue::Text(INSTALL.into()), SqlValue::Text(format!("{action}:{seq}"))],
+        &[
+            SqlValue::Text(INSTALL.into()),
+            SqlValue::Text(format!("{action}:{seq}")),
+        ],
     )?;
     match rows.as_slice() {
         [row] => match row.as_slice() {
@@ -399,9 +407,7 @@ pub(super) fn refusal(
     let checkpoint = advance(store)?;
     record_crossings(store, checkpoint)?;
     let used = used_since_comparison(store, action)?;
-    if checkpoint.replay_limit() == 0
-        || used.is_none_or(|used| used >= checkpoint.replay_limit())
-    {
+    if checkpoint.replay_limit() == 0 || used.is_none_or(|used| used >= checkpoint.replay_limit()) {
         return Ok(Some(PrivateExecutionReason::ClassVerificationRequired {
             class: CLASS.into(),
             credited_comparisons: checkpoint.passes,
@@ -457,7 +463,13 @@ fn replay_limit_with_mode(
     // Reuse the actual policy gate, never a second interpretation of its
     // evidence. In particular a checkpoint cannot overrule sibling divergence
     // or reset the spent receipts of the latest independent comparison.
-    match super::decide(store, action, super::ActionClassRisk::LowRiskRegistry, policy, true)? {
+    match super::decide(
+        store,
+        action,
+        super::ActionClassRisk::LowRiskRegistry,
+        policy,
+        true,
+    )? {
         super::SampleGateDecision::ExecutePrivately(_) => Ok(Some(0)),
         super::SampleGateDecision::ServeFromCache => {
             Ok(Some(Checkpoint::load(store)?.replay_limit()))
@@ -492,8 +504,16 @@ mod replay_budget_tests {
         key
     }
 
-    fn ceiling(store: &mut dyn RabsMetadataStore, selected: Mode) -> Result<Option<u64>, StoreError> {
-        replay_limit_with_mode(store, &action(1), &SamplingPolicy::sample_all(2, 10_000), selected)
+    fn ceiling(
+        store: &mut dyn RabsMetadataStore,
+        selected: Mode,
+    ) -> Result<Option<u64>, StoreError> {
+        replay_limit_with_mode(
+            store,
+            &action(1),
+            &SamplingPolicy::sample_all(2, 10_000),
+            selected,
+        )
     }
 
     #[test]
@@ -517,14 +537,18 @@ mod replay_budget_tests {
     #[test]
     fn every_sprt_stage_controls_the_actual_replay_ceiling_without_spending_receipts() {
         for (stage, limit) in [(0, 0), (1, 3), (2, 19), (3, 99)] {
-            let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
             let key = fixture(&mut store);
             // Deliberately inject the checkpoint to isolate the consumer of a
             // qualified boundary. This is NOT evidence that trials were earned;
             // the reducer/attribution tests above exercise those independently.
-            Checkpoint { cursor: FINAL_PASSES as i64, passes: stage * PASSES_PER_STEP }
-                .persist(&mut store)
-                .unwrap();
+            Checkpoint {
+                cursor: FINAL_PASSES as i64,
+                passes: stage * PASSES_PER_STEP,
+            }
+            .persist(&mut store)
+            .unwrap();
             let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
             for used in 0..limit {
                 assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(limit));
@@ -533,12 +557,24 @@ mod replay_budget_tests {
                 assert_eq!(ceiling(&mut store, Mode::Fixed).unwrap(), None);
                 assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(used));
                 store
-                    .record_decision_receipt(INSTALL, &format!("{key}:100"), used, "install", &manifest)
+                    .record_decision_receipt(
+                        INSTALL,
+                        &format!("{key}:100"),
+                        used,
+                        "install",
+                        &manifest,
+                    )
                     .unwrap();
             }
             assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
-            assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(limit));
-            assert_eq!(store.published_manifest_key_str(&key).unwrap().as_deref(), Some(manifest.as_str()));
+            assert_eq!(
+                used_since_comparison(&mut store, &key).unwrap(),
+                Some(limit)
+            );
+            assert_eq!(
+                store.published_manifest_key_str(&key).unwrap().as_deref(),
+                Some(manifest.as_str())
+            );
         }
     }
 
@@ -546,18 +582,29 @@ mod replay_budget_tests {
     fn advanced_checkpoint_cannot_override_class_safety_or_current_policy() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         fixture(&mut store);
-        Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }
-            .persist(&mut store)
-            .unwrap();
+        Checkpoint {
+            cursor: FINAL_PASSES as i64,
+            passes: FINAL_PASSES,
+        }
+        .persist(&mut store)
+        .unwrap();
         assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(99));
-        for policy in [SamplingPolicy::sample_all(100, 10_000), SamplingPolicy::sample_all(2, 10_001)] {
-            assert_eq!(replay_limit_with_mode(&mut store, &action(1), &policy, Mode::Sprt).unwrap(), Some(0));
+        for policy in [
+            SamplingPolicy::sample_all(100, 10_000),
+            SamplingPolicy::sample_all(2, 10_001),
+        ] {
+            assert_eq!(
+                replay_limit_with_mode(&mut store, &action(1), &policy, Mode::Sprt).unwrap(),
+                Some(0)
+            );
         }
         let sibling = published(&mut store, 2, 11);
         store
             .record_decision_receipt(CLASS_KIND, &sibling, 0, CLASS, "synthetic sibling")
             .unwrap();
-        store.record_verification_sample(&action(2), 999_999, false, 1).unwrap();
+        store
+            .record_verification_sample(&action(2), 999_999, false, 1)
+            .unwrap();
         let before = store.differential_snapshot().unwrap();
         assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
         assert_eq!(store.differential_snapshot().unwrap(), before);
@@ -570,8 +617,15 @@ mod replay_budget_tests {
         // Class bindings are immutable too: create a private action rather
         // than attempting to overwrite fixture()'s live dependency binding.
         let key = published(&mut store, 1, 10);
-        store.record_decision_receipt(CLASS_KIND, &key, 0, "private-only", "not a dependency").unwrap();
-        Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }.persist(&mut store).unwrap();
+        store
+            .record_decision_receipt(CLASS_KIND, &key, 0, "private-only", "not a dependency")
+            .unwrap();
+        Checkpoint {
+            cursor: FINAL_PASSES as i64,
+            passes: FINAL_PASSES,
+        }
+        .persist(&mut store)
+        .unwrap();
         let before = store.differential_snapshot().unwrap();
         assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
         assert_eq!(store.differential_snapshot().unwrap(), before);
@@ -581,15 +635,24 @@ mod replay_budget_tests {
     fn malformed_checkpoint_or_conflicting_promotion_never_falls_back_to_fixed() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         fixture(&mut store);
-        store.record_decision_receipt(STATE, CLASS, 0, "not-a-counter", "100").unwrap();
+        store
+            .record_decision_receipt(STATE, CLASS, 0, "not-a-counter", "100")
+            .unwrap();
         assert!(ceiling(&mut store, Mode::Sprt).is_err());
         // Corruption is not repaired by superseding its receipt. Exercise the
         // independent promotion-conflict case against a fresh, valid store.
         assert!(Checkpoint::default().persist(&mut store).is_err());
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         fixture(&mut store);
-        Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }.persist(&mut store).unwrap();
-        store.record_decision_receipt(PROMOTION, CLASS, 1, "verification-bps=0", "forged").unwrap();
+        Checkpoint {
+            cursor: FINAL_PASSES as i64,
+            passes: FINAL_PASSES,
+        }
+        .persist(&mut store)
+        .unwrap();
+        store
+            .record_decision_receipt(PROMOTION, CLASS, 1, "verification-bps=0", "forged")
+            .unwrap();
         assert!(ceiling(&mut store, Mode::Sprt).is_err());
     }
 
@@ -598,10 +661,32 @@ mod replay_budget_tests {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         let key = fixture(&mut store);
         store.record_attempt(20_002, 10, "", 101).unwrap();
-        store.record_verification_sample(&action(1), 20_002, true, 101).unwrap();
+        store
+            .record_verification_sample(&action(1), 20_002, true, 101)
+            .unwrap();
         let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
-        store.record_decision_receipt(VERIFIED, &key, 101, &format!("{:032x}", 20_002), &manifest).unwrap();
-        assert!(!admitted(&mut store, &key, 101, &format!("{:032x}", 20_002), &manifest).unwrap());
-        assert!(admitted(&mut store, &key, 100, &format!("{:032x}", 20_001), &manifest).unwrap());
+        store
+            .record_decision_receipt(VERIFIED, &key, 101, &format!("{:032x}", 20_002), &manifest)
+            .unwrap();
+        assert!(
+            !admitted(
+                &mut store,
+                &key,
+                101,
+                &format!("{:032x}", 20_002),
+                &manifest
+            )
+            .unwrap()
+        );
+        assert!(
+            admitted(
+                &mut store,
+                &key,
+                100,
+                &format!("{:032x}", 20_001),
+                &manifest
+            )
+            .unwrap()
+        );
     }
 }
