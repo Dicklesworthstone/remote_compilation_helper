@@ -35,6 +35,7 @@ fn cargo(toolchain: &Path, root: &Path, home: &Path) -> Command {
 }
 
 fn cargo_tool(toolchain: &Path, root: &Path, home: &Path, program: &str) -> Command {
+    // ubs:ignore[rust.security.command-executable] — private test callers pass only literal cargo/cargo-clippy names under the runner-selected installed sysroot.
     let mut command = Command::new(toolchain.join("bin").join(program));
     command
         .env_clear()
@@ -1104,7 +1105,7 @@ pub const VALUE:u32=42;
                 .collect::<Vec<_>>();
             assert_eq!(files.len(), 1, "one actual library archive");
             assert!(files[0].starts_with(&target));
-            let bytes = fs::read(&files[0]).unwrap();
+            let bytes = fs::read(files[0]).unwrap();
             assert!(bytes.windows(wanted.len()).any(|window| window == wanted));
             assert!(
                 !bytes
