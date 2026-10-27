@@ -79,6 +79,26 @@ fn verify_temporary(
     length: u64,
     mode: u32,
 ) -> Result<()> {
+    verify_temporary_with_uid(
+        directory,
+        temporary,
+        file,
+        original,
+        length,
+        mode,
+        rustix::process::geteuid().as_raw(),
+    )
+}
+
+fn verify_temporary_with_uid(
+    directory: &File,
+    temporary: &Path,
+    file: &File,
+    original: &Metadata,
+    length: u64,
+    mode: u32,
+    expected_uid: u32,
+) -> Result<()> {
     let parent = temporary
         .parent()
         .context("output temporary has no parent")?;
@@ -106,7 +126,7 @@ fn verify_temporary(
         metadata.is_file()
             && metadata.dev() == original.dev()
             && metadata.ino() == original.ino()
-            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && metadata.uid() == expected_uid
             && metadata.nlink() == 1
             && metadata.len() == length
             && metadata.mode() & 0o7777 == mode
@@ -116,6 +136,100 @@ fn verify_temporary(
         "publication copy identity, length, permissions or links changed; evidence retained"
     );
     Ok(())
+}
+
+/// Short-lived pre-execution suitability probe in the nearest existing ancestor
+/// of a local output root. Reuses the exact exclusive creation and identity/UID
+/// predicates that final publication enforces, and unlinks the probe ONLY when
+/// those predicates prove our held descriptor still owns `temporary`.
+/// Wrong-UID, modified-mode, multi-link, or replaced entries remain retained
+/// as diagnostic evidence.
+pub(super) fn probe_output_directory(
+    parent: &Path,
+    identity: &str,
+    expected_uid: u32,
+    mut observe: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    super::publication_runtime::checkpoint()?;
+    let directory = File::open(parent)?;
+    let held_directory = directory.metadata()?;
+    let named_directory = std::fs::metadata(parent)?;
+    anyhow::ensure!(
+        held_directory.is_dir()
+            && named_directory.is_dir()
+            && held_directory.dev() == named_directory.dev()
+            && held_directory.ino() == named_directory.ino(),
+        "publication copy directory changed; evidence retained"
+    );
+    let probe_name = format!(
+        ".rch-pub-probe-{identity}-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let temporary = parent.join(&probe_name);
+    let file = File::from(rustix::fs::openat(
+        directory.as_fd(),
+        &probe_name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    let original = file.metadata()?;
+    struct ProbeGuard<'a> {
+        directory: &'a File,
+        temporary: &'a Path,
+        probe_name: &'a str,
+        file: &'a File,
+        original: &'a Metadata,
+        expected_uid: u32,
+        cleaned: bool,
+    }
+    impl ProbeGuard<'_> {
+        fn verify(&self) -> Result<()> {
+            verify_temporary_with_uid(
+                self.directory,
+                self.temporary,
+                self.file,
+                self.original,
+                0,
+                COPY_MODE,
+                self.expected_uid,
+            )
+        }
+        fn cleanup(mut self) -> Result<()> {
+            self.verify()?;
+            rustix::fs::unlinkat(
+                self.directory.as_fd(),
+                self.probe_name,
+                rustix::fs::AtFlags::empty(),
+            )?;
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+    impl Drop for ProbeGuard<'_> {
+        fn drop(&mut self) {
+            if !self.cleaned && self.verify().is_ok() {
+                let _ = rustix::fs::unlinkat(
+                    self.directory.as_fd(),
+                    self.probe_name,
+                    rustix::fs::AtFlags::empty(),
+                );
+            }
+        }
+    }
+    let guard = ProbeGuard {
+        directory: &directory,
+        temporary: &temporary,
+        probe_name: &probe_name,
+        file: &file,
+        original: &original,
+        expected_uid,
+        cleaned: false,
+    };
+    file.set_permissions(Permissions::from_mode(COPY_MODE))?;
+    guard.verify()?;
+    observe(&temporary)?;
+    super::publication_runtime::checkpoint()?;
+    guard.cleanup()
 }
 
 fn required_copy_bytes(remaining: u64, block_bytes: u64) -> Result<u64> {

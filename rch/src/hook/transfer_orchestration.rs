@@ -2251,6 +2251,7 @@ async fn execute_remote_compilation_inner(
     let defer_cargo_stdout = reporter.cargo_json_stdout;
 
     if let Some(session) = recovery_session.as_mut() {
+        session.verify_publication_suitability().await?;
         session.starting_execution()?;
     }
     // Heap-pinned: the streaming execution future is large (bd-uz82c).

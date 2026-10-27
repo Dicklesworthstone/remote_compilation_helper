@@ -742,6 +742,10 @@ const OUTPUT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600
 /// missing suffixes keep the same identity after another job creates them.
 /// Resolve a symlink before applying a following `..`, as the filesystem does.
 fn output_lock_root_identity(root: &Path) -> anyhow::Result<PathBuf> {
+    Ok(output_root_identity_and_existing_prefix(root)?.0)
+}
+
+fn output_root_identity_and_existing_prefix(root: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     use std::path::Component;
 
     let absolute = if root.is_absolute() {
@@ -750,16 +754,34 @@ fn output_lock_root_identity(root: &Path) -> anyhow::Result<PathBuf> {
         std::env::current_dir()?.join(root)
     };
     let mut resolved = PathBuf::new();
+    let mut existing = PathBuf::new();
+    let mut missing_suffix = false;
     for component in absolute.components() {
         match component {
             Component::Prefix(_) => anyhow::bail!(
                 "output publication requires a Unix directory path: {}",
                 root.display()
             ),
-            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::RootDir => {
+                resolved.push(component.as_os_str());
+                existing.push(component.as_os_str());
+            }
             Component::CurDir => {}
             Component::ParentDir => {
                 resolved.pop();
+                if missing_suffix && resolved.exists() {
+                    let canonical = std::fs::canonicalize(&resolved)?;
+                    anyhow::ensure!(
+                        std::fs::metadata(&canonical)?.is_dir(),
+                        "output publication root has a non-directory component: {}",
+                        resolved.display()
+                    );
+                    resolved = canonical;
+                    existing = resolved.clone();
+                    missing_suffix = false;
+                } else if !missing_suffix {
+                    existing = resolved.clone();
+                }
             }
             Component::Normal(name) => {
                 resolved.push(name);
@@ -771,6 +793,8 @@ fn output_lock_root_identity(root: &Path) -> anyhow::Result<PathBuf> {
                             resolved.display()
                         );
                         resolved = canonical;
+                        existing = resolved.clone();
+                        missing_suffix = false;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         // A missing directory is allowed, but a dangling
@@ -778,7 +802,9 @@ fn output_lock_root_identity(root: &Path) -> anyhow::Result<PathBuf> {
                         // it as one would assign a different lock from its
                         // eventual target when that target appears.
                         match std::fs::symlink_metadata(&resolved) {
-                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                                missing_suffix = true;
+                            }
                             Ok(_) => {
                                 return Err(error).with_context(|| {
                                     format!(
@@ -795,7 +821,12 @@ fn output_lock_root_identity(root: &Path) -> anyhow::Result<PathBuf> {
             }
         }
     }
-    Ok(resolved)
+    anyhow::ensure!(
+        !existing.as_os_str().is_empty(),
+        "output publication root has no existing ancestor directory: {}",
+        root.display()
+    );
+    Ok((resolved, existing))
 }
 
 /// Exclusive ownership of one local output root for the duration of a single
@@ -1796,6 +1827,86 @@ impl RecoverySession {
         next_recipe.exit_code = Some(exit);
         self.persist_next_recipe(next_recipe)
     }
+    /// Short-lived pre-execution suitability check of every local publication
+    /// destination root. Reuses the output-root lock, canonical prefix/dangling
+    /// symlink resolver, and exclusive `0600` ownership/UID probe before
+    /// crossing the durable `starting_execution` boundary. Final publication
+    /// revalidation remains unchanged.
+    pub(crate) async fn verify_publication_suitability(&mut self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        let expected_uid = rustix::process::geteuid().as_raw();
+        #[cfg(not(unix))]
+        let expected_uid = 0;
+        self.verify_publication_suitability_with(expected_uid, |_| Ok(()))
+            .await
+    }
+
+    pub(super) async fn verify_publication_suitability_with<F>(
+        &mut self,
+        expected_uid: u32,
+        mut observe: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(&Path) -> anyhow::Result<()> + Send + 'static,
+    {
+        anyhow::ensure!(
+            self.recipe.prepared
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && !self.recipe.sources_released
+                && !self.recipe.pair_released
+                && !self.recipe.tree_retired
+                && !self.recipe.retired
+                && self.recipe.exit_code.is_none()
+                && self.recipe.returned.is_none()
+                && self.recipe.phases.iter().all(|phase| {
+                    !phase.complete
+                        && phase.published.is_empty()
+                        && phase.pending.is_none()
+                        && phase.missing_result.is_none()
+                }),
+            "pre-execution publication suitability requires an unconsumed prepared session"
+        );
+        let mut roots = Vec::new();
+        for phase in &self.recipe.phases {
+            if !roots.contains(&phase.local) {
+                roots.push(phase.local.clone());
+            }
+        }
+        let observe = std::sync::Arc::new(std::sync::Mutex::new(observe));
+        for root in roots {
+            let publication = lock_output_root(&root).await?;
+            let observe = std::sync::Arc::clone(&observe);
+            publication_runtime::run(self, publication, move |session| {
+                publication_runtime::checkpoint()?;
+                let (identity, existing) = output_root_identity_and_existing_prefix(&root)?;
+                #[cfg(unix)]
+                publication_copy::probe_output_directory(
+                    &existing,
+                    &session.recipe.identity,
+                    expected_uid,
+                    |temporary| {
+                        observe.lock().map_err(|_| {
+                            anyhow::anyhow!("publication suitability observer poisoned")
+                        })?(temporary)
+                    },
+                )?;
+                #[cfg(not(unix))]
+                let _ = (&existing, expected_uid, &observe);
+                let (after_identity, after_existing) =
+                    output_root_identity_and_existing_prefix(&root)?;
+                anyhow::ensure!(
+                    after_identity == identity && after_existing == existing,
+                    "output publication root changed during suitability probe: {}",
+                    root.display()
+                );
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn starting_execution(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.recipe.prepared
