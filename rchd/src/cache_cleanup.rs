@@ -304,9 +304,16 @@ fn build_cleanup_command_with_source_guard(
          candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
          if [ \"$low_disk\" -eq 1 ]; then \
            {{ \
-             find \"$base\" -mindepth 2 -maxdepth 2 -type d ! -path \"$base/offroot/*\" -printf '%T@ %p\\n' 2>/dev/null; \
-             if [ -d \"$base/offroot\" ]; then \
-               find \"$base/offroot\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null; \
+             if find \"$base\" -maxdepth 0 -printf '' >/dev/null 2>&1; then \
+               find \"$base\" -mindepth 2 -maxdepth 2 -type d ! -path \"$base/offroot/*\" -printf '%T@ %p\\n' 2>/dev/null; \
+               if [ -d \"$base/offroot\" ]; then \
+                 find \"$base/offroot\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null; \
+               fi; \
+             else \
+               find \"$base\" -mindepth 2 -maxdepth 2 -type d ! -path \"$base/offroot/*\" -exec stat -f '%m %N' {{}} + 2>/dev/null; \
+               if [ -d \"$base/offroot\" ]; then \
+                 find \"$base/offroot\" -mindepth 2 -maxdepth 2 -type d -exec stat -f '%m %N' {{}} + 2>/dev/null; \
+               fi; \
              fi; \
            }} | sort -n | sed 's/^[^ ]* //' > \"$candidates\"; \
          else \

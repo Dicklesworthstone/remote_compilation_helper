@@ -1273,6 +1273,54 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
 /// millions of inodes; apparent size instead of block usage is an acceptable
 /// trade for an observability surface. `escaped_base` MUST already be
 /// validated with [`is_safe_reap_base`].
+/// Portable, checked candidate metadata helper for [`enumerate_targets_command`].
+///
+/// Uses GNU `find -printf '%T@ %s\n'` when available (or `gfind` on macOS with
+/// findutils), falling back to BSD `find -exec stat -f '%m %z' {} +` on macOS/BSD.
+/// Emits a trailing `RCH_META_STATUS <exit_code>` sentinel into the `awk` stream
+/// so partial traversal failures, unsupported `find` flags, empty trees, or
+/// malformed rows fail closed instead of defaulting `newest` to `0` (epoch) and
+/// misclassifying a young target directory as expired (bd-ql5bu).
+const ENUMERATE_METADATA_FRAGMENT: &str = r#"__gc_enumerate_metadata() {
+  [ -d "$1" ] || return 1;
+  {
+    if find "$1" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+      find "$1" -printf '%T@ %s\n' 2>/dev/null;
+    elif command -v gfind >/dev/null 2>&1 && gfind "$1" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+      gfind "$1" -printf '%T@ %s\n' 2>/dev/null;
+    elif stat -f '%m %z' "$1" >/dev/null 2>&1; then
+      find "$1" -exec stat -f '%m %z' {} + 2>/dev/null;
+    else
+      (exit 1);
+    fi;
+    printf 'RCH_META_STATUS %d\n' "$?";
+  } | awk '
+    /^RCH_META_STATUS / {
+      if (NF != 2 || $2 != "0") bad = 1;
+      saw_status = 1;
+      next;
+    }
+    NF != 2 || $1 !~ /^[0-9]+(\.[0-9]+)?$/ || $2 !~ /^[0-9]+$/ {
+      bad = 1;
+      next;
+    }
+    {
+      split($1, parts, ".");
+      t = parts[1] + 0;
+      sz = $2 + 0;
+      if (t <= 0 || sz < 0) { bad = 1; next; }
+      rows++;
+      if (t > newest) newest = t;
+      bytes += sz;
+    }
+    END {
+      if (bad || !saw_status || rows < 1 || newest <= 0) exit 1;
+      kb = (bytes - (bytes % 1024)) / 1024;
+      printf "%.0f %.0f\n", newest, kb;
+    }
+  ';
+}; "#;
+
 #[must_use]
 pub fn enumerate_targets_command(escaped_base: &str) -> String {
     let preamble = candidate_discovery_preamble(
@@ -1292,15 +1340,29 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
     // on, tmp base included.
     format!(
         "{preamble}\
+         {meta_helper}\
          __gc_select \"$__tmpf\" \".rch-target-*-pool-*\" \"{DEFAULT_TARGET_NAME}\" \"{cache_glob}\"; \
          while IFS= read -r d; do \
            [ -d \"$d\" ] || continue; \
-           set -- $(find \"$d\" -printf '%T@ %s\\n' 2>/dev/null | awk '{{ t=int($1); if (t>n) n=t; s+=$2 }} END {{ printf \"%d %d\", n, int(s/1024) }}'); \
-           newest=${{1:-0}}; kb=${{2:-0}}; \
+           if ! __meta=$(__gc_enumerate_metadata \"$d\"); then \
+             printf 'RCH_TARGET_METADATA_ERR %s\\n' \"$d\" >&2; continue; \
+           fi; \
+           set -- $__meta; \
+           if [ \"$#\" -ne 2 ]; then \
+             printf 'RCH_TARGET_METADATA_ERR %s\\n' \"$d\" >&2; continue; \
+           fi; \
+           newest=$1; kb=$2; \
+           case \"$newest:$kb\" in \
+             ''|*[!0-9:]*) printf 'RCH_TARGET_METADATA_ERR %s\\n' \"$d\" >&2; continue ;; \
+           esac; \
+           if [ \"$newest\" -le 0 ]; then \
+             printf 'RCH_TARGET_METADATA_ERR %s\\n' \"$d\" >&2; continue; \
+           fi; \
            printf 'RCH_TARGET_ENTRY %s %s %s %s %s\\n' \"$newest\" \"$kb\" \"$(__gc_handles \"$d\")\" \"$(__gc_procs \"$d\")\" \"$d\"; \
          done < \"$__tmpf\"; \
          rm -f \"$__tmpf\" \"$__all\"; \
          {gate_cleanup}exit 0",
+        meta_helper = ENUMERATE_METADATA_FRAGMENT,
         cache_glob = CARGO_CACHE_GLOB,
         gate_cleanup = gate_snapshot_cleanup()
     )
@@ -1610,6 +1672,9 @@ pub fn evaluate_gc_candidate(
     let Some(required_secs) = policy.window_secs(class) else {
         return GcVerdict::Keep(GcKeepReason::ClassDisabled);
     };
+    if entry.newest_mtime_unix == 0 {
+        return GcVerdict::Keep(GcKeepReason::GateUnavailable("mtime"));
+    }
     let age_secs = entry.age_secs(now_unix);
     if age_secs < required_secs {
         return GcVerdict::Keep(GcKeepReason::TooYoung {
@@ -1682,7 +1747,7 @@ pub fn select_cap_evictions(
             if class == GcClass::Unrecognized || policy.window_secs(class).is_none() {
                 return false;
             }
-            if entry.age_secs(now_unix) < policy.idle_secs {
+            if entry.newest_mtime_unix == 0 || entry.age_secs(now_unix) < policy.idle_secs {
                 return false;
             }
             let strict = class.requires_known_gates();
@@ -2225,6 +2290,9 @@ pub fn parse_target_entries(stdout: &str) -> Vec<RemoteTargetEntry> {
             let rest = line.trim().strip_prefix("RCH_TARGET_ENTRY ")?;
             let mut parts = rest.splitn(5, ' ');
             let newest_mtime_unix = parts.next()?.parse::<u64>().ok()?;
+            if newest_mtime_unix == 0 {
+                return None;
+            }
             let kb = parts.next()?.parse::<u64>().ok()?;
             let third = parts.next()?;
             let (open_handles, live_process, path) = match GateEvidence::from_token(third) {
@@ -4788,5 +4856,218 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         // Both directories must still exist intact after the census.
         assert!(unclaimed.exists());
         assert!(claimed.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_metadata_distinguishes_recent_and_expired_pools_and_bsd_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let tmpbase = tmp.path().join("scratch");
+        std::fs::create_dir_all(&tmpbase).unwrap();
+
+        let recent_pool = base
+            .join("frankensonos")
+            .join(".rch-target-mminiold-pool-recent");
+        let expired_pool = base
+            .join("frankensonos")
+            .join(".rch-target-mminiold-pool-expired");
+        std::fs::create_dir_all(recent_pool.join("nested")).unwrap();
+        std::fs::create_dir_all(expired_pool.join("nested")).unwrap();
+
+        let recent_file = recent_pool.join("nested/artifact.rlib");
+        let expired_file = expired_pool.join("nested/artifact.rlib");
+        std::fs::write(&recent_file, vec![b'r'; 6 * 1024]).unwrap();
+        std::fs::write(&expired_file, vec![b'e'; 10 * 1024]).unwrap();
+
+        let now = SystemTime::now();
+        let now_unix = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // 5.04 days old (435,872 seconds), strictly below the 168h (604,800s) pooled window.
+        let recent_mtime = now - Duration::from_secs(435_872);
+        let older_mtime = now - Duration::from_secs(8 * DAY);
+        for (root, nested, file, mtime) in [
+            (
+                &recent_pool,
+                recent_pool.join("nested"),
+                &recent_file,
+                recent_mtime,
+            ),
+            (
+                &expired_pool,
+                expired_pool.join("nested"),
+                &expired_file,
+                older_mtime,
+            ),
+        ] {
+            std::fs::File::open(file)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            std::fs::File::open(nested)
+                .unwrap()
+                .set_modified(older_mtime)
+                .unwrap();
+            std::fs::File::open(root)
+                .unwrap()
+                .set_modified(older_mtime)
+                .unwrap();
+        }
+
+        // 1. Native enumeration pass:
+        let cmd = enumerate_targets_command(base.to_str().unwrap());
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("TMPDIR", &tmpbase)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let entries = parse_target_entries(&String::from_utf8_lossy(&out.stdout));
+        let recent_entry = entries
+            .iter()
+            .find(|e| e.path.ends_with(".rch-target-mminiold-pool-recent"))
+            .expect("recent pool enumerated");
+        let expired_entry = entries
+            .iter()
+            .find(|e| e.path.ends_with(".rch-target-mminiold-pool-expired"))
+            .expect("expired pool enumerated");
+        assert!(recent_entry.kb >= 6);
+        assert!(expired_entry.kb >= 10);
+
+        let mut recent_eval = recent_entry.clone();
+        recent_eval.open_handles = GateEvidence::Free;
+        recent_eval.live_process = GateEvidence::Free;
+        let mut expired_eval = expired_entry.clone();
+        expired_eval.open_handles = GateEvidence::Free;
+        expired_eval.live_process = GateEvidence::Free;
+
+        assert!(
+            matches!(
+                evaluate_gc_candidate(&recent_eval, now_unix, &policy()),
+                GcVerdict::Keep(GcKeepReason::TooYoung { .. })
+            ),
+            "5.04-day-old pooled target must be kept under 168h retention: {recent_eval:?}"
+        );
+        assert_eq!(
+            evaluate_gc_candidate(&expired_eval, now_unix, &policy()),
+            GcVerdict::Collect,
+            "8-day-old pooled target must be collectible under 168h retention: {expired_eval:?}"
+        );
+
+        // 2. BSD fallback (`find` lacks `-printf`, `stat -f '%m %z'` used) and >32-bit KiB:
+        let shim_bin = tmp.path().join("bsd-shims");
+        std::fs::create_dir_all(&shim_bin).unwrap();
+        let find_shim = shim_bin.join("find");
+        std::fs::write(
+            &find_shim,
+            "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = \"-printf\" ] && exit 1; done\nfor real in /usr/bin/find /bin/find; do [ -x \"$real\" ] && exec \"$real\" \"$@\"; done\nexit 127\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&find_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gfind_shim = shim_bin.join("gfind");
+        std::fs::write(&gfind_shim, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&gfind_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stat_shim = shim_bin.join("stat");
+        std::fs::write(
+            &stat_shim,
+            "#!/bin/sh\nif [ \"$1\" = \"-f\" ] && [ \"$2\" = \"%m %z\" ]; then\n  shift 2\n  for real in /usr/bin/stat /bin/stat; do\n    if [ -x \"$real\" ]; then\n      if \"$real\" -c '%Y %s' \"$1\" >/dev/null 2>&1; then exec \"$real\" -c '%Y %s' \"$@\"; else exec \"$real\" -f '%m %z' \"$@\"; fi\n    fi\n  done\nfi\nfor real in /usr/bin/stat /bin/stat; do [ -x \"$real\" ] && exec \"$real\" \"$@\"; done\nexit 127\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stat_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bsd_script = format!("{ENUMERATE_METADATA_FRAGMENT}\n__gc_enumerate_metadata \"$1\"");
+        let bsd_recent = Command::new("sh")
+            .args(["-c", &bsd_script, "bsd-meta"])
+            .arg(&recent_pool)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    shim_bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(bsd_recent.status.success(), "{bsd_recent:?}");
+        let bsd_tokens: Vec<u64> = String::from_utf8_lossy(&bsd_recent.stdout)
+            .split_whitespace()
+            .map(|tok| tok.parse::<u64>().unwrap())
+            .collect();
+        assert_eq!(bsd_tokens.len(), 2);
+        assert_eq!(bsd_tokens[0], recent_entry.newest_mtime_unix);
+        assert!(bsd_tokens[1] >= 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_metadata_refuses_partial_empty_and_malformed_observations() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        // Rust parser and evaluator refuse zero/epoch timestamps:
+        assert!(
+            parse_target_entries("RCH_TARGET_ENTRY 0 4096 free free /data/p/.rch-target\n")
+                .is_empty()
+        );
+        let zero_entry = RemoteTargetEntry {
+            newest_mtime_unix: 0,
+            kb: 4096,
+            path: POOL.to_string(),
+            open_handles: GateEvidence::Free,
+            live_process: GateEvidence::Free,
+        };
+        assert_eq!(
+            evaluate_gc_candidate(&zero_entry, NOW, &policy()),
+            GcVerdict::Keep(GcKeepReason::GateUnavailable("mtime"))
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = tmp.path().join(".rch-target-w1-pool-abc");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(pool.join("artifact.o"), b"xxxx").unwrap();
+
+        let script = format!("{ENUMERATE_METADATA_FRAGMENT}\n__gc_enumerate_metadata \"$1\"");
+
+        // Missing directory fails closed:
+        let missing = Command::new("sh")
+            .args(["-c", &script, "meta-missing"])
+            .arg(tmp.path().join("does-not-exist"))
+            .output()
+            .unwrap();
+        assert!(!missing.status.success());
+
+        // Partial `find` failure (prints one valid row then exits 1) fails closed:
+        let shim_bin = tmp.path().join("fail-shims");
+        std::fs::create_dir_all(&shim_bin).unwrap();
+        let find_shim = shim_bin.join("find");
+        std::fs::write(
+            &find_shim,
+            "#!/bin/sh\nif [ \"$2\" = \"-maxdepth\" ]; then exit 0; fi\nprintf '1800000000 4096\\n'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&find_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let partial = Command::new("sh")
+            .args(["-c", &script, "meta-partial"])
+            .arg(&pool)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    shim_bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            !partial.status.success(),
+            "partial find failure must not emit metadata: {partial:?}"
+        );
+        assert!(partial.stdout.is_empty());
     }
 }
