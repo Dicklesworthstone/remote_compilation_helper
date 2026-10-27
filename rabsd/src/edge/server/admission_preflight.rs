@@ -176,7 +176,10 @@ fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<L
     dependency_inputs_rejection(
         &invocation,
         env_value("OUT_DIR"),
-        mode == PreflightMode::CanonicalRemoteDependency,
+        matches!(
+            mode,
+            PreflightMode::CanonicalRemoteDependency | PreflightMode::WorkspaceExecutionOnly
+        ),
     )
     .or_else(|| sysroot_preflight::rejection(&invocation))
     // Use the SAME option model as final derivation, not a second flag
@@ -197,10 +200,10 @@ fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<L
 fn dependency_inputs_rejection(
     invocation: &NormalizedRustcInvocation,
     generated_root: Option<&str>,
-    canonical_remote: bool,
+    canonical_archive_execution: bool,
 ) -> Option<LiveRefusal> {
     if let Err(refusal) =
-        validate_generated_native_inputs(invocation, generated_root, canonical_remote)
+        validate_generated_native_inputs(invocation, generated_root, canonical_archive_execution)
     {
         return Some(refusal);
     }

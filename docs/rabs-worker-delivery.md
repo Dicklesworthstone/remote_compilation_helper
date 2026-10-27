@@ -246,9 +246,12 @@ local native-result capture. Metadata-only checks, system or dynamic library
 searches, library modifiers/renaming, and native search paths belonging to a
 different package's `OUT_DIR` continue locally. In particular, a native search
 path propagated through a larger dependency graph is not implicitly included
-in the current package's captured generated tree. Fresh workspace execution is
-also outside this extension: a selected workspace compilation consuming such a
-propagated path compiles locally without action-cache publication or replay.
+in the current package's captured generated tree. Fresh workspace library
+execution can bundle archives from its own captured `OUT_DIR` under the
+separately negotiated `canonical-workspace-exec-v3` contract. It validates the
+same complete generated-file and directory evidence, retains exact arguments,
+and grants no action-cache publication or replay authority. A workspace unit
+consuming a native path from another package's generated tree remains local.
 
 The worker keeps the original source, generated-input, output and toolchain
 path spellings and full compiler environment inside private mounts. The

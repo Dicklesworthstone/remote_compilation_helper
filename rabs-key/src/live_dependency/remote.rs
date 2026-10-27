@@ -171,9 +171,9 @@ pub fn remote_dependency_output_class(
 
 /// Check the bounded generated-native extension before capture or execution.
 ///
-/// Only a retained external-dependency canonical Cargo context may pass
-/// `canonical_cargo = true`; workspace execution-only contexts must pass false.
-/// Path spelling is not authority. This helper permits static archive bundling
+/// Only a retained canonical remote dependency or selected fresh workspace
+/// execution context may pass `canonical_archive_execution = true`. Path
+/// spelling is not authority. This helper permits static archive bundling
 /// in the closed Rlib view, never final native linking or local capture. All
 /// non-dependency search arguments are checked, including searches used by
 /// source `#[link]` attributes without a command-line `-l`.
@@ -190,7 +190,7 @@ pub fn remote_dependency_output_class(
 pub fn validate_generated_native_inputs(
     invocation: &NormalizedRustcInvocation,
     generated_root: Option<&str>,
-    canonical_cargo: bool,
+    canonical_archive_execution: bool,
 ) -> Result<Vec<String>, LiveRefusal> {
     let mut native_dirs = Vec::new();
     for search in &invocation.lib_search {
@@ -200,7 +200,7 @@ pub fn validate_generated_native_inputs(
         let path = search
             .strip_prefix("native=")
             .ok_or_else(|| LiveRefusal::SearchPath(search.clone()))?;
-        if !canonical_cargo || !plain_path_in_profile(path, true) {
+        if !canonical_archive_execution || !plain_path_in_profile(path, true) {
             return Err(LiveRefusal::SearchPath(search.clone()));
         }
         if !native_dirs.iter().any(|directory| directory == path) {
@@ -215,7 +215,7 @@ pub fn validate_generated_native_inputs(
     if native_dirs.is_empty() && invocation.native_libs.is_empty() {
         return Ok(native_dirs);
     }
-    if !canonical_cargo
+    if !canonical_archive_execution
         || remote_dependency_output_class(invocation) != Ok(RemoteDependencyOutputClass::Rlib)
     {
         return Err(LiveRefusal::Facts(
@@ -532,7 +532,7 @@ pub(super) fn remote_execution_shape(
     validate_generated_native_inputs(
         &plan.invocation,
         plan.generated_root.as_deref(),
-        plan.canonical_cargo && plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly,
+        plan.canonical_cargo,
     )
     .map_err(|_| RemoteDependencyRefusal::NativeInputs)?;
     if plan
@@ -562,7 +562,7 @@ pub(super) fn remote_execution_shape(
 /// The common key validator has already checked every generated file and
 /// directory listing. Bind native lookup to that complete tree instead of
 /// observing a host search directory or assuming it exists on the worker.
-fn validate_generated_native_manifest(
+pub(super) fn validate_generated_native_manifest(
     plan: &DependencyActionPlan,
     inputs: &ActionInputManifest,
 ) -> Result<(), LiveRefusal> {

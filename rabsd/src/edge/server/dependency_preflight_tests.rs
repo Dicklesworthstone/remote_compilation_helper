@@ -243,6 +243,97 @@ fn generated_static_archives_reach_only_retained_canonical_remote_planning() {
     ));
 }
 
+#[test]
+fn workspace_native_archives_reach_only_fresh_planning_with_the_exact_out_dir() {
+    use super::{canonical_remote_rejection, remote_rejection, workspace_rejection};
+    use rabs_key::live_dependency::plan_canonical_workspace_execution;
+
+    let generated = "/__rabs/out/cargo/debug/build/member-hash/out";
+    let argv = vec![
+        "/__rabs/toolchain/bin/rustc".into(),
+        "--crate-name=member".into(),
+        "--crate-type=lib".into(),
+        "--emit=dep-info,metadata,link".into(),
+        "--error-format=json".into(),
+        "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+        "-Ldependency=/__rabs/out/cargo/debug/deps".into(),
+        format!("-Lnative={generated}/native"),
+        "-lstatic=answer".into(),
+        "member/src/lib.rs".into(),
+    ];
+    let env = vec![
+        ("HOME".into(), "/__rabs/home".into()),
+        ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+        (
+            "CARGO_MANIFEST_DIR".into(),
+            "/__rabs/workspace/member".into(),
+        ),
+        ("CARGO_PKG_NAME".into(), "member".into()),
+        ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+        ("OUT_DIR".into(), generated.into()),
+    ];
+    let request = LiveRustcRequest {
+        argv: &argv,
+        env: &env,
+        cwd: "/__rabs/workspace",
+    };
+    assert_eq!(workspace_rejection(request), None);
+    assert!(rejection(request).is_some());
+    assert!(remote_rejection(request).is_some());
+    assert!(canonical_remote_rejection(request).is_some());
+    for host in HOSTS {
+        let plan = plan_canonical_workspace_execution(request, host).unwrap();
+        assert_eq!(
+            plan.invocation,
+            rabs_key::invocation::parse(&argv, None).unwrap()
+        );
+        assert_eq!(plan.generated_root.as_deref(), Some(generated));
+    }
+    for extra in [
+        "-Lnative=/usr/lib",
+        "-Lnative=/__rabs/out/cargo/debug/build/other/out/native",
+        "-Lnative=/__rabs/out/cargo/debug/build/member-hash/outside",
+        "-ldylib=answer",
+        "-lstatic:-bundle=answer",
+        "-lstatic=../answer",
+        "-Ctarget-cpu=native",
+    ] {
+        let mut changed = argv.clone();
+        changed.push(extra.into());
+        let request = LiveRustcRequest {
+            argv: &changed,
+            env: &env,
+            cwd: "/__rabs/workspace",
+        };
+        assert!(workspace_rejection(request).is_some(), "{extra}");
+        assert!(
+            plan_canonical_workspace_execution(request, HOSTS[0]).is_err(),
+            "{extra}"
+        );
+    }
+    let mut metadata = argv.clone();
+    *metadata
+        .iter_mut()
+        .find(|arg| arg.starts_with("--emit="))
+        .unwrap() = "--emit=dep-info,metadata".into();
+    let metadata = LiveRustcRequest {
+        argv: &metadata,
+        env: &env,
+        cwd: "/__rabs/workspace",
+    };
+    assert!(workspace_rejection(metadata).is_some());
+    assert!(plan_canonical_workspace_execution(metadata, HOSTS[0]).is_err());
+    let mut missing_out_dir = env.clone();
+    missing_out_dir.retain(|(name, _)| name != "OUT_DIR");
+    let missing_out_dir = LiveRustcRequest {
+        argv: &argv,
+        env: &missing_out_dir,
+        cwd: "/__rabs/workspace",
+    };
+    assert!(workspace_rejection(missing_out_dir).is_some());
+    assert!(plan_canonical_workspace_execution(missing_out_dir, HOSTS[0]).is_err());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn actual_edge_passes_unservable_consumers_through_without_preparing() {

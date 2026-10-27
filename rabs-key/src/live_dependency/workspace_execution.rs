@@ -28,8 +28,8 @@ const COMPILER: &str = "/__rabs/toolchain/bin/rustc";
 const TOOLCHAIN: &str = "/__rabs/toolchain";
 const TARGET: &str = "/__rabs/out/cargo";
 const POLICY_DOMAIN: &str = "rabs.canonical-workspace-execution.isolation.v1";
-pub(super) const WORKSPACE_EXECUTION_PROFILE: &str = "canonical-workspace-execution-only-v2: \
-    canonical-workspace-exec-v2 explicitly negotiated; one fresh independently \
+pub(super) const WORKSPACE_EXECUTION_PROFILE: &str = "canonical-workspace-execution-only-v3: \
+    canonical-workspace-exec-v3 explicitly negotiated; one fresh independently \
     supervised worker rustc for a coordinator-retained Cargo-selected compilation; \
     exact canonical argv, working directory, manifest directory, complete \
     presented environment including primary-package and lint behavior; complete \
@@ -37,12 +37,18 @@ pub(super) const WORKSPACE_EXECUTION_PROFILE: &str = "canonical-workspace-execut
     identities and every immediate directory listing including empty directories; \
     independently retained toolchain and measured ELF runtime; exact read-only \
     Rust metadata/archive candidate inventories; fresh private output, HOME and \
-    temporary storage; library metadata or closed pure-Rust archive mode, binary \
+    temporary storage; library metadata or closed Rust archive mode, binary \
     and standard or custom test/bench harness metadata with exact dep-info and \
     required possibly empty rmeta; exact --test, cfg and crate-type presence \
     retained and matched against the driver's selected target families and roots; \
-    no binary/test linking or test execution; no native link \
-    inputs, executable externs, incremental state or coordinator control socket; \
+    native static archives may be bundled only in Rlib mode from the exact \
+    current package OUT_DIR and its complete retained directory/file tree; \
+    original native search/library order and Cargo stdout remain bound; every \
+    native search directory and named default-bundle static archive must be \
+    present in that retained tree; no propagated foreign generated roots, \
+    dynamic/framework/system searches, link modifiers or external linker; \
+    no binary/test linking or test execution, executable externs, incremental \
+    state or coordinator control socket; \
     authenticated request-owned receipt and drained process group required; \
     installation only into this live request's exact declared output paths; no \
     dependency or workspace action-cache lookup, publication, shared result \
@@ -90,13 +96,22 @@ pub fn workspace_source_path(plan: &DependencyActionPlan) -> Result<String, Live
 }
 
 pub(super) fn workspace_layout(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
-    // Canonical workspace execution shares mechanical worker checks with
-    // external dependencies, but it has no generated-native execution authority.
+    // Native inputs use only this request's complete own OUT_DIR in the closed
+    // Rlib view. Propagated foreign roots need separate ownership and transport
+    // evidence and cannot borrow the single retained generated tree.
     remote::validate_generated_native_inputs(
         &plan.invocation,
         plan.generated_root.as_deref(),
-        false,
+        plan.canonical_cargo,
     )?;
+    if plan
+        .invocation
+        .codegen
+        .iter()
+        .any(|(name, value)| name == "target-cpu" && value.as_deref() == Some("native"))
+    {
+        return Err(LiveRefusal::NativeCpu);
+    }
     let outputs = derive_workspace_output_declarations(&plan.invocation, &plan.host_triple)
         .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
     if outputs != plan.outputs {
@@ -253,6 +268,10 @@ pub fn remote_workspace_execution_key(
         build_script_output,
         inputs,
     )?;
+    // A complete generated tree alone does not prove that requested native
+    // directories and archives occur within it. Enforce the same evidence
+    // relation used for canonical dependencies before issuing a fresh identity.
+    remote::validate_generated_native_manifest(plan, inputs)?;
     remote::bind_remote_execution_inputs(
         &mut key,
         plan,
@@ -260,7 +279,7 @@ pub fn remote_workspace_execution_key(
         retained_toolchain_sha256,
         runtime,
     )?;
-    key.descriptor.key_epoch = 2;
+    key.descriptor.key_epoch = 3;
     key.descriptor.projection_epoch = 1;
     key.descriptor.action_class = ActionClass::RustcWorkspaceCompile;
     // Every presented value participates here, including wrapper/jobserver
@@ -428,12 +447,24 @@ mod tests {
         plan: &DependencyActionPlan,
         inputs: &ActionInputManifest,
     ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        key_with_record(
+            plan,
+            inputs,
+            plan.generated_root.as_ref().map(|_| b"".as_slice()),
+        )
+    }
+
+    fn key_with_record(
+        plan: &DependencyActionPlan,
+        inputs: &ActionInputManifest,
+        record: Option<&[u8]>,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
         remote_workspace_execution_key(
             plan,
             &toolchain(),
             &directories(plan),
             inputs,
-            plan.generated_root.as_ref().map(|_| b"".as_slice()),
+            record,
             TOOLCHAIN,
             &[39; 32],
             &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
@@ -500,7 +531,7 @@ mod tests {
             let inputs = inputs(&plan);
             let directories = directories(&plan);
             let key = key(&plan, &inputs).unwrap();
-            assert_eq!(key.descriptor.key_epoch, 2);
+            assert_eq!(key.descriptor.key_epoch, 3);
             assert_eq!(key.descriptor.projection_epoch, 1);
             assert_eq!(
                 key.descriptor.action_class,
@@ -898,35 +929,273 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_native_archives_cannot_inherit_workspace_execution_authority() {
+    fn native_request() -> (Vec<String>, Vec<(String, String)>) {
         let (mut argv, mut env) = request();
         argv[8] = "--emit=dep-info,metadata,link".into();
+        argv.extend([
+            format!("-Lnative={GENERATED}/nested"),
+            format!("-Lnative={GENERATED}"),
+            "-lstatic=answer".into(),
+        ]);
         env.push(("OUT_DIR".into(), GENERATED.into()));
-        let archive = from_request(&argv, &env, WORKSPACE);
-        let mut manifest = inputs(&archive);
-        manifest
-            .directory_enumerations
-            .push(listing(archive.generated_virtual_root(), &["libanswer.a"]));
-        manifest.inputs.push(PositiveInput {
-            virtual_path: RawBytes::new(
-                archive
-                    .generated_input_virtual_path("libanswer.a")
-                    .into_bytes(),
+        (argv, env)
+    }
+
+    fn native_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let mut manifest = inputs(plan);
+        manifest.directory_enumerations.extend([
+            listing(
+                plan.generated_virtual_root(),
+                &["empty", "libanswer.a", "nested"],
             ),
-            object: ObjectId(compute("rabs.test.workspace-input.v1", b"native archive")),
-            file_type: InputFileType::Regular,
-            executable: false,
-            symlink_resolution: Vec::new(),
+            listing(plan.generated_input_virtual_path("empty"), &[]),
+            listing(
+                plan.generated_input_virtual_path("nested"),
+                &["libanswer.a"],
+            ),
+        ]);
+        for relative in ["libanswer.a", "nested/libanswer.a"] {
+            manifest.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(
+                    plan.generated_input_virtual_path(relative).into_bytes(),
+                ),
+                object: ObjectId(compute("rabs.test.workspace-input.v1", relative.as_bytes())),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+        }
+        manifest
+    }
+
+    #[test]
+    fn own_native_archives_bind_complete_inputs_and_order_without_cache_authority() {
+        let (argv, env) = native_request();
+        let plan = from_request(&argv, &env, WORKSPACE);
+        let manifest = native_inputs(&plan);
+        let original = key(&plan, &manifest).unwrap();
+        assert_eq!(
+            plan.invocation,
+            crate::invocation::parse(&argv, None).unwrap()
+        );
+        assert_eq!(plan.dependency_dirs, [OUTPUT]);
+        assert_eq!(plan.keyed_env, plan.execution_env);
+        assert_eq!(
+            env_value(&plan.execution_env, "CARGO_PRIMARY_PACKAGE"),
+            Some("1")
+        );
+        assert_eq!(
+            generated_input_directories(&plan, &manifest).unwrap(),
+            ["empty", "nested"]
+        );
+        assert_eq!(original.descriptor.key_epoch, 3);
+        assert_eq!(
+            original.descriptor.action_class,
+            ActionClass::RustcWorkspaceCompile
+        );
+        assert!(remote_workspace_execution_shape(&plan, &directories(&plan), TOOLCHAIN).is_ok());
+
+        // Every candidate is retained, including a currently shadowed archive.
+        let mut changed = manifest.clone();
+        changed
+            .inputs
+            .iter_mut()
+            .find(|input| {
+                input.virtual_path.as_bytes()
+                    == plan.generated_input_virtual_path("libanswer.a").as_bytes()
+            })
+            .unwrap()
+            .object = ObjectId(compute(
+            "rabs.test.workspace-input.v1",
+            b"changed native bytes",
+        ));
+        let changed_key = key(&plan, &changed).unwrap();
+        assert_ne!(original.action_key, changed_key.action_key);
+        assert_ne!(
+            original.descriptor.action_inputs,
+            changed_key.descriptor.action_inputs
+        );
+        let mut reordered = plan.clone();
+        reordered.invocation.lib_search.swap(1, 2);
+        assert_ne!(
+            original.action_key,
+            key(&reordered, &manifest).unwrap().action_key
+        );
+        let mut source_attribute = plan.clone();
+        source_attribute.invocation.native_libs.clear();
+        assert_ne!(
+            original.action_key,
+            key(&source_attribute, &manifest).unwrap().action_key
+        );
+        assert_ne!(
+            key_with_record(
+                &plan,
+                &manifest,
+                Some(b"cargo::rustc-link-lib=static=answer\n")
+            )
+            .unwrap()
+            .action_key,
+            key_with_record(
+                &plan,
+                &manifest,
+                Some(b"cargo::rustc-link-search=native=retained\n")
+            )
+            .unwrap()
+            .action_key,
+            "the exact Cargo record is independently retained"
+        );
+        assert!(key_with_record(&plan, &manifest, None).is_err());
+
+        let directories = directories(&plan);
+        assert!(
+            live_dependency_key(&plan, &toolchain(), &[], &directories, Some(b""), &manifest)
+                .is_err()
+        );
+        assert!(
+            canonical_cargo_dependency_key(
+                &plan,
+                &toolchain(),
+                &[],
+                &directories,
+                Some(b""),
+                &manifest
+            )
+            .is_err()
+        );
+        assert!(remote::remote_dependency_shape(&plan, &directories, TOOLCHAIN).is_err());
+        assert!(remote::remote_dependency_isolation_policy(&plan).is_err());
+        assert!(
+            remote::remote_dependency_key(
+                &plan,
+                &toolchain(),
+                &directories,
+                &manifest,
+                Some(b""),
+                TOOLCHAIN,
+                &[39; 32],
+                &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+            )
+            .is_err()
+        );
+        let mut forged_local = plan;
+        forged_local.canonical_cargo = false;
+        assert!(
+            live_dependency_key(
+                &forged_local,
+                &toolchain(),
+                &[],
+                &directories,
+                Some(b""),
+                &manifest
+            )
+            .is_err()
+        );
+        assert!(key(&forged_local, &manifest).is_err());
+    }
+
+    #[test]
+    fn native_workspace_identity_requires_the_named_archive_and_search_directory_evidence() {
+        let (argv, env) = native_request();
+        let plan = from_request(&argv, &env, WORKSPACE);
+        let retained = native_inputs(&plan);
+        key(&plan, &retained).unwrap();
+
+        let mut empty = inputs(&plan);
+        empty.directory_enumerations.extend([
+            listing(plan.generated_virtual_root(), &["empty", "nested"]),
+            listing(plan.generated_input_virtual_path("empty"), &[]),
+            listing(plan.generated_input_virtual_path("nested"), &[]),
+        ]);
+        // A coherent directory tree still cannot stand in for requested bytes.
+        generated_input_directories(&plan, &empty).unwrap();
+        assert!(
+            key(&plan, &empty)
+                .unwrap_err()
+                .to_string()
+                .contains("static native archive is absent")
+        );
+        let mut missing_directory = plan.clone();
+        missing_directory
+            .invocation
+            .lib_search
+            .push(format!("native={GENERATED}/missing"));
+        assert!(
+            remote_workspace_execution_shape(&missing_directory, &directories(&plan), TOOLCHAIN)
+                .is_ok()
+        );
+        assert!(
+            key(&missing_directory, &retained)
+                .unwrap_err()
+                .to_string()
+                .contains("native search directory is absent")
+        );
+
+        let mut misplaced = retained.clone();
+        misplaced.inputs.retain(|input| {
+            input.virtual_path.as_bytes()
+                != plan
+                    .generated_input_virtual_path("nested/libanswer.a")
+                    .as_bytes()
         });
-        key(&archive, &manifest).unwrap();
+        misplaced
+            .directory_enumerations
+            .last_mut()
+            .unwrap()
+            .entries
+            .clear();
+        generated_input_directories(&plan, &misplaced).unwrap();
+        let mut nested_only = plan.clone();
+        nested_only
+            .invocation
+            .lib_search
+            .retain(|search| search != &format!("native={GENERATED}"));
+        assert!(
+            key(&nested_only, &misplaced).is_err(),
+            "an archive outside the searched directory cannot supply the request"
+        );
+        let mut symlink = retained;
+        symlink.inputs.last_mut().unwrap().file_type = InputFileType::Symlink;
+        symlink
+            .inputs
+            .last_mut()
+            .unwrap()
+            .symlink_resolution
+            .push(RawBytes::from("/usr/lib/libanswer.a"));
+        assert!(key(&plan, &symlink).is_err());
+    }
+
+    #[test]
+    fn native_workspace_scope_refuses_foreign_searches_modifiers_metadata_and_mutated_plans() {
+        let (argv, env) = native_request();
+        let plan = from_request(&argv, &env, WORKSPACE);
+        let manifest = native_inputs(&plan);
+        let refuse = |changed: &DependencyActionPlan| {
+            assert!(remote_workspace_execution_isolation_policy(changed).is_err());
+            assert!(
+                remote_workspace_execution_shape(changed, &directories(changed), TOOLCHAIN)
+                    .is_err()
+            );
+            assert!(key(changed, &manifest).is_err());
+        };
         for extra in [
-            vec![format!("-Lnative={GENERATED}")],
-            vec!["-lstatic=answer".into()],
-            vec![format!("-Lnative={GENERATED}"), "-lstatic=answer".into()],
+            "-Lnative=/__rabs/out/cargo/debug/build/other/out",
+            "-Lnative=/__rabs/workspace/native",
+            "-Lnative=/__rabs/toolchain/lib",
+            "-Lnative=/usr/lib",
+            "-Lall=/__rabs/out/cargo/debug/build/member-123/out",
+            "-Lnative=/__rabs/out/cargo/debug/build/member-123/out/../other",
+            "-ldylib=answer",
+            "-lframework=answer",
+            "-lanswer",
+            "-lstatic:+bundle=answer",
+            "-lstatic:-bundle=answer",
+            "-lstatic:+whole-archive=answer",
+            "-lstatic=answer:renamed",
+            "-Ctarget-cpu=native",
+            "--emit=dep-info,metadata",
         ] {
             let mut changed = argv.clone();
-            changed.extend(extra);
+            changed.push(extra.into());
             assert!(
                 plan_canonical_workspace_execution(
                     LiveRustcRequest {
@@ -937,21 +1206,31 @@ mod tests {
                     HOST,
                 )
                 .is_err(),
-                "generated native inputs remain outside the workspace execution class"
+                "{extra}"
             );
-            let mut forged = archive.clone();
+            let mut forged = plan.clone();
             forged.invocation = crate::invocation::parse(&changed, None).unwrap();
-            assert!(remote_workspace_execution_isolation_policy(&forged).is_err());
-            assert!(
-                remote_workspace_execution_shape(&forged, &directories(&forged), TOOLCHAIN)
-                    .is_err()
-            );
-            assert!(
-                remote::remote_execution_shape(&forged, &directories(&forged), TOOLCHAIN).is_err(),
-                "shared mechanics must not treat canonical workspace context as native authority"
-            );
-            assert!(key(&forged, &manifest).is_err());
+            refuse(&forged);
         }
+        let mut no_search = plan.clone();
+        no_search
+            .invocation
+            .lib_search
+            .retain(|search| search.starts_with("dependency="));
+        refuse(&no_search);
+        let mut no_generated = plan.clone();
+        no_generated.generated_root = None;
+        no_generated
+            .execution_env
+            .retain(|(name, _)| name != "OUT_DIR");
+        refuse(&no_generated);
+        let mut metadata = plan;
+        metadata.invocation.emit = vec!["dep-info".into(), "metadata".into()];
+        metadata.outputs =
+            derive_workspace_output_declarations(&metadata.invocation, HOST).unwrap();
+        refuse(&metadata);
+        metadata.invocation.native_libs.clear();
+        refuse(&metadata);
     }
 
     #[test]

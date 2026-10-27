@@ -1203,7 +1203,7 @@ actual compiler arguments are independently bound into each execution identity.
 Ordinary wrapper requests cannot enable this path by supplying canonical-looking
 names.
 
-This uses the separately negotiated `canonical-workspace-exec-v2` context.
+This uses the separately negotiated `canonical-workspace-exec-v3` context.
 Workers must advertise that version and the requested `metadata` or `rlib`
 mode; update both coordinator and worker binaries together. Matching binaries
 and the worker setup above are sufficient; there is no new cache-enablement
@@ -1214,6 +1214,22 @@ installed; no executable is linked, and no test or benchmark body runs during
 these checks. Final binary/test linking, native linking, procedural-macro
 consumers and incremental compiler state remain outside this per-unit worker
 profile; build scripts execute through the existing canonical Cargo driver.
+
+Workspace library builds can also bundle static native archives produced in
+their own build-script `OUT_DIR`. The coordinator captures that complete tree,
+including empty subdirectories and the Cargo output record, and requires each
+declared native search directory and `libNAME.a` to occur in the retained
+evidence. The worker accepts only ordinary rlib output and unmodified
+`-l static=NAME` arguments whose `-L native=...` paths stay within that exact
+`OUT_DIR`. Rustc bundles the captured archive inside the closed archive view;
+this step invokes no external linker. Archive bytes participate in the fresh
+execution identity even though rustc's dep-info does not list them.
+
+This scope excludes native metadata checks, dynamic/system libraries, native
+library modifiers, and paths propagated from another package's generated tree.
+Those inputs cannot be acquired by spelling an unretained path in rustc argv.
+Workspace native results remain request-owned and are never published or
+replayed through the dependency action cache.
 
 Each accepted workspace request executes afresh. Its identity binds the entire
 retained workspace, including sibling files and empty directories, generated

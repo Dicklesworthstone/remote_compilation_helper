@@ -184,7 +184,7 @@ fn workspace_metadata_decoder_accepts_bins_and_harnesses_with_exact_output_names
         assert_eq!(parsed.args, args);
         let context = parsed.dependency_context.unwrap();
         assert!(context.workspace_execution_only());
-        assert_eq!(context.version(), "canonical-workspace-exec-v2");
+        assert_eq!(context.version(), "canonical-workspace-exec-v3");
 
         let mut missing_metadata = wire.clone();
         missing_metadata["artifacts"]["files"] = json!(["leaf.d"]);
@@ -219,6 +219,7 @@ fn workspace_decoder_requires_its_exact_profile_and_complete_directory_shape() {
     for (field, value) in [
         ("version", json!(CANONICAL_DEPENDENCY_CONTEXT_VERSION)),
         ("version", json!("canonical-workspace-exec-v1")),
+        ("version", json!("canonical-workspace-exec-v2")),
         ("source_root", json!("/__rabs/workspace/member")),
         ("source_directories", Value::Null),
         ("source_directories", json!(["member/src"])),
@@ -447,16 +448,72 @@ fn canonical_native_archive_request_requires_closed_generated_inputs() {
 }
 
 #[test]
-fn workspace_execution_cannot_inherit_generated_native_dependency_authority() {
+fn workspace_native_archives_require_the_bound_generated_tree_and_archive_mode() {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+
+    let mut wire = canonical_native_request();
+    wire["dependency_context"] = canonical_workspace_request(true)["dependency_context"].clone();
+    wire["args"][7] = json!("member/src/lib.rs");
+    let manifest = SourceManifest::new(vec![
+        SourceFile {
+            path: "package/member/src/lib.rs".into(),
+            len: 1,
+            sha256: [1; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "generated/nested/input.rs".into(),
+            len: 1,
+            sha256: [2; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "generated/nested/libnative.a".into(),
+            len: 8,
+            sha256: [3; 32],
+            executable: false,
+        },
+    ])
+    .unwrap();
+    wire["source_manifest"]["files"][0]["path"] = json!("package/member/src/lib.rs");
+    wire["source_manifest"]["manifest_sha256"] =
+        json!(rabs_wkr::source_transfer::hex(&manifest.digest()));
+    let original = wire.clone();
+    let parsed = parse_exec_request(&wire).unwrap();
+    let context = parsed.dependency_context.as_ref().unwrap();
+    assert!(context.workspace_execution_only());
+    assert_eq!(context.version(), "canonical-workspace-exec-v3");
+    assert_eq!(context.execution_mode(), DependencyExecutionMode::Rlib);
+    assert_eq!(context.generated_directories(), ["nested"]);
+    assert!(
+        context
+            .env()
+            .contains(&("CARGO_PRIMARY_PACKAGE".into(), "1".into()))
+    );
+    assert_eq!(
+        wire, original,
+        "native arguments and source ownership stay exact"
+    );
+
+    let mut missing_directory = wire.clone();
+    missing_directory["dependency_context"]["generated_directories"] = json!([]);
+    assert!(parse_exec_request(&missing_directory).is_err());
+    for version in ["canonical-workspace-exec-v1", "canonical-workspace-exec-v2"] {
+        let mut old_worker = wire.clone();
+        old_worker["dependency_context"]["version"] = json!(version);
+        assert!(parse_exec_request(&old_worker).is_err());
+    }
     for archive in [false, true] {
         let baseline = canonical_workspace_request(archive);
         assert!(parse_exec_request(&baseline).is_ok());
         for extra in [
-            vec!["-Lnative=/__rabs/out/cargo/debug/build/leaf-hash/out/nested"],
+            vec!["-Lnative=/__rabs/out/cargo/debug/build/other/out/nested"],
             vec![
                 "-Lnative=/__rabs/out/cargo/debug/build/leaf-hash/out/nested",
-                "-lstatic=native",
+                "-ldylib=native",
             ],
+            vec!["-Lnative=/usr/lib", "-lstatic=native"],
+            vec!["-Lnative=/__rabs/out/cargo/debug/build/leaf-hash/outside"],
             vec!["-lstatic=native"],
         ] {
             let mut request = baseline.clone();
@@ -471,6 +528,15 @@ fn workspace_execution_cannot_inherit_generated_native_dependency_authority() {
             );
         }
     }
+    let mut metadata = canonical_workspace_request(false);
+    metadata["args"].as_array_mut().unwrap().extend([
+        json!("-Lnative=/__rabs/out/cargo/debug/build/leaf-hash/out/nested"),
+        json!("-lstatic=native"),
+    ]);
+    assert!(
+        parse_exec_request(&metadata).is_err(),
+        "native metadata remains outside this profile"
+    );
 }
 
 #[test]
@@ -1538,6 +1604,7 @@ fn workspace_execution_requires_its_own_negotiated_version_in_both_modes() {
             DEPENDENCY_CONTEXT_VERSION,
             CANONICAL_DEPENDENCY_CONTEXT_VERSION,
             "canonical-workspace-exec-v1",
+            "canonical-workspace-exec-v2",
         ] {
             assert!(
                 validate_execution_selection(

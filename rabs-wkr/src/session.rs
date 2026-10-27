@@ -444,14 +444,15 @@ pub fn validate_dependency_execution(
     let invocation = rabs_key::invocation::parse(&argv, None)
         .map_err(|error| format!("dependency invocation: {error:?}"))?;
     let class = remote_dependency_output_class(&invocation).map_err(|error| error.to_string())?;
-    // Native archives are an extension of the closed canonical rlib view,
-    // never of ordinary metadata, workspace execution or host-native lookup.
+    // Native archives are an extension of the closed canonical rlib view for
+    // dependencies and freshly executed workspace units. Metadata execution
+    // and host-native lookup cannot borrow this authority.
     // The source transfer retains the complete generated tree; the compiler
     // can resolve only these declared directories and its other sealed inputs.
     let native_directories = validate_generated_native_inputs(
         &invocation,
         context.generated_root(),
-        context.canonical_cargo() && !context.workspace_execution_only(),
+        context.canonical_cargo(),
     )
     .map_err(|error| format!("dependency generated native inputs: {error}"))?;
     for directory in &native_directories {

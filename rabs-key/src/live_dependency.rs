@@ -819,6 +819,10 @@ fn plan_in_profile(
 ) -> Result<DependencyActionPlan, LiveRefusal> {
     let canonical_cargo = mode != DependencyPlanningMode::Ordinary;
     let workspace_execution_only = mode == DependencyPlanningMode::WorkspaceExecutionOnly;
+    let canonical_archive_execution = matches!(
+        mode,
+        DependencyPlanningMode::CanonicalRemote | DependencyPlanningMode::WorkspaceExecutionOnly
+    );
     // Environment first: it is the cheapest way out of the class.
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
@@ -902,9 +906,7 @@ fn plan_in_profile(
     {
         return Err(LiveRefusal::NativeCpu);
     }
-    if mode != DependencyPlanningMode::CanonicalRemote
-        && let Some(library) = invocation.native_libs.first()
-    {
+    if !canonical_archive_execution && let Some(library) = invocation.native_libs.first() {
         return Err(LiveRefusal::NativeLibrary(library.clone()));
     }
     let source = match &invocation.source {
@@ -946,7 +948,7 @@ fn plan_in_profile(
     remote::validate_generated_native_inputs(
         &invocation,
         generated_root.as_deref(),
-        mode == DependencyPlanningMode::CanonicalRemote,
+        canonical_archive_execution,
     )?;
     let mut dependency_dirs = Vec::new();
     let mut add_directory = |path: &str| -> Result<(), LiveRefusal> {
@@ -978,7 +980,7 @@ fn plan_in_profile(
         // These inputs belong to the complete generated tree, not to Rust's
         // crate-candidate inventory. The bounded remote validator above has
         // already proved every native directory is within the exact OUT_DIR.
-        if mode == DependencyPlanningMode::CanonicalRemote && entry.starts_with("native=") {
+        if canonical_archive_execution && entry.starts_with("native=") {
             continue;
         }
         let path = entry
