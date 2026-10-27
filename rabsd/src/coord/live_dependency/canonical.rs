@@ -204,8 +204,32 @@ impl CanonicalPaths {
         &self,
         logical: &DependencyActionPlan,
     ) -> Result<DependencyActionPlan, String> {
-        if logical.generated_root.is_some() {
-            return Err("canonical dependency bridge does not admit generated inputs".into());
+        if let Some(generated) = &logical.generated_root {
+            let generated = Path::new(generated);
+            let target = Path::new("/__rabs/out/cargo");
+            let mut presented = logical
+                .execution_env
+                .iter()
+                .filter(|(name, _)| name == "OUT_DIR")
+                .map(|(_, value)| value.as_str());
+            if !logical.canonical_cargo
+                || generated == target
+                || !generated.starts_with(target)
+                || generated.file_name().and_then(|name| name.to_str()) != Some("out")
+                || presented.next() != generated.to_str()
+                || presented.next().is_some()
+                || std::iter::once(&logical.out_dir)
+                    .chain(&logical.dependency_dirs)
+                    .any(|other| {
+                        let other = Path::new(other);
+                        generated.starts_with(other) || other.starts_with(generated)
+                    })
+            {
+                return Err(
+                    "canonical generated inputs must bind a distinct Cargo OUT_DIR under the retained target mount"
+                        .into(),
+                );
+            }
         }
         let translate = |value: &str| path_text(self.physical(Path::new(value))?);
         let mut physical = logical.clone();
@@ -214,6 +238,14 @@ impl CanonicalPaths {
         physical.out_dir = translate(&logical.out_dir)?;
         physical.package_root = translate(&logical.package_root)?;
         physical.source_root = translate(&logical.source_root)?;
+        // Cargo's root-output record and the compiler environment retain the
+        // visible OUT_DIR spelling. Only this I/O field selects the hidden
+        // backing; package observation validates the two names together.
+        physical.generated_root = logical
+            .generated_root
+            .as_deref()
+            .map(translate)
+            .transpose()?;
         physical.dependency_dirs = logical
             .dependency_dirs
             .iter()
@@ -536,6 +568,175 @@ mod tests {
                 .physical(Path::new("/__rabs/workspace/lib.rs"))
                 .is_err()
         );
+    }
+
+    fn generated_plan() -> DependencyActionPlan {
+        use rabs_key::live_dependency::{
+            LiveRustcRequest, plan_canonical_remote_dependency_action,
+        };
+
+        let package = "/__rabs/cargo-home/registry/src/fixture-index/generated-1.0.0";
+        let generated = "/__rabs/out/cargo/debug/build/generated-123/out";
+        let argv = vec![
+            "/__rabs/toolchain/bin/rustc".into(),
+            "--crate-name=generated".into(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata".into(),
+            "--cap-lints=allow".into(),
+            "--error-format=json".into(),
+            "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+            "-Ldependency=/__rabs/out/cargo/debug/deps".into(),
+            format!("{package}/lib.rs"),
+        ];
+        let env = vec![
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_MANIFEST_DIR".into(), package.into()),
+            ("CARGO_PKG_NAME".into(), "generated".into()),
+            ("OUT_DIR".into(), generated.into()),
+        ];
+        plan_canonical_remote_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package,
+                env: &env,
+            },
+            "x86_64-unknown-linux-gnu",
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generated_capture_binds_visible_cargo_records_to_retained_physical_inputs() {
+        use crate::edge::live_facts::{GENERATED_ROOT, LiveFacts};
+
+        let (_owner, paths) = fixture();
+        let paths = paths.require_closed_dependency_execution().unwrap();
+        let logical = generated_plan();
+        let physical = paths.project_plan(&logical).unwrap();
+        let source = Path::new(&physical.source_root);
+        let generated = Path::new(physical.generated_root.as_deref().unwrap());
+        let run = generated.parent().unwrap().join("run");
+        for directory in [
+            source,
+            generated,
+            run.as_path(),
+            Path::new(&physical.out_dir),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            source.join("lib.rs"),
+            b"include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
+        )
+        .unwrap();
+        std::fs::write(generated.join("value.rs"), b"pub const VALUE:u32=17;\n").unwrap();
+        let record = b"cargo::rustc-env=GENERATED_VALUE=exact value\n";
+        std::fs::write(run.join("stdout"), record).unwrap();
+        let visible = logical.generated_root.as_deref().unwrap();
+        std::fs::write(run.join("root-output"), visible).unwrap();
+
+        // Projection changes only I/O locations. Cargo's exact argv, complete
+        // environment and recorded OUT_DIR are never rewritten to host paths.
+        assert_ne!(physical.generated_root, logical.generated_root);
+        assert_eq!(physical.execution_env, logical.execution_env);
+        assert_eq!(physical.invocation, logical.invocation);
+        let facts = LiveFacts::new();
+        assert!(
+            facts
+                .package(source, logical.source_kind, Some(generated))
+                .is_err()
+        );
+        let first = facts.package_for_plan(&physical).unwrap();
+        assert_eq!(
+            first.build_script_output.as_deref(),
+            Some(record.as_slice())
+        );
+        assert_eq!(
+            first.snapshot.file_bytes(GENERATED_ROOT, "value.rs"),
+            Some(b"pub const VALUE:u32=17;\n".as_slice())
+        );
+        assert_eq!(
+            std::fs::read(run.join("root-output")).unwrap(),
+            visible.as_bytes()
+        );
+        assert!(Arc::ptr_eq(
+            &first,
+            &facts.package_for_plan(&physical).unwrap()
+        ));
+        first.verify_unchanged(source).unwrap();
+        first.verify_generated_disjoint(&physical).unwrap();
+        assert!(paths.require_local_capture().is_err());
+
+        std::fs::write(generated.join("value.rs"), b"pub const VALUE:u32=23;\n").unwrap();
+        assert!(first.verify_unchanged(source).is_err());
+        let changed = facts.package_for_plan(&physical).unwrap();
+        assert_ne!(first.generated_files, changed.generated_files);
+        std::fs::write(
+            run.join("stdout"),
+            b"cargo::rustc-env=GENERATED_VALUE=changed\n",
+        )
+        .unwrap();
+        assert!(changed.verify_unchanged(source).is_err());
+        let changed_record = facts.package_for_plan(&physical).unwrap();
+        assert_ne!(
+            first.build_script_output,
+            changed_record.build_script_output
+        );
+        std::fs::write(
+            run.join("root-output"),
+            b"/__rabs/out/cargo/debug/build/other/out",
+        )
+        .unwrap();
+        assert!(changed_record.verify_unchanged(source).is_err());
+        assert!(facts.package_for_plan(&physical).is_err());
+    }
+
+    #[test]
+    fn generated_projection_refuses_ambient_aliasing_and_mismatched_out_dir_names() {
+        let (owner, paths) = fixture();
+        let plan = generated_plan();
+        for invalid in [
+            "/tmp/ambient/out",
+            "/__rabs/workspace/vendor/generated/out",
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug",
+            "/__rabs/out/cargo/debug/deps/out",
+            "/__rabs/out/cargo/debug/build/generated/out/../other/out",
+        ] {
+            let mut invalid_plan = plan.clone();
+            invalid_plan.generated_root = Some(invalid.into());
+            for (name, value) in &mut invalid_plan.execution_env {
+                if name == "OUT_DIR" {
+                    *value = invalid.into();
+                }
+            }
+            assert!(paths.project_plan(&invalid_plan).is_err(), "{invalid}");
+        }
+        let mut mismatched = plan.clone();
+        mismatched.generated_root = Some("/__rabs/out/cargo/debug/build/other/out".into());
+        assert!(paths.project_plan(&mismatched).is_err());
+        let mut alias_spelling = plan.clone();
+        alias_spelling
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "OUT_DIR")
+            .unwrap()
+            .1
+            .push('/');
+        assert!(paths.project_plan(&alias_spelling).is_err());
+        let mut duplicate = plan.clone();
+        duplicate
+            .execution_env
+            .push(("OUT_DIR".into(), plan.generated_root.clone().unwrap()));
+        assert!(paths.project_plan(&duplicate).is_err());
+
+        let physical = paths.project_plan(&plan).unwrap();
+        let generated = Path::new(physical.generated_root.as_deref().unwrap());
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(owner.path().join("0"), generated).unwrap();
+        assert!(paths.project_plan(&plan).is_err());
     }
 
     #[test]

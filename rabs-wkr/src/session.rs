@@ -176,8 +176,8 @@ pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandConte
 /// execution mode so archive codegen cannot silently inherit metadata's procfs
 /// and device view. A generated tree binds the exact OUT_DIR environment value.
 /// Canonical Cargo has its own version and fixed compiler layout. Its explicit
-/// mode selects the measured metadata or closed archive namespace; generated
-/// inputs remain outside this canonical dependency contract.
+/// mode selects the measured metadata or closed archive namespace. Version 3
+/// also binds a complete sealed generated tree at its exact canonical OUT_DIR.
 pub fn parse_dependency_context(
     request: &serde_json::Value,
 ) -> Result<Option<DependencyExecContext>, String> {
@@ -321,8 +321,7 @@ pub fn parse_dependency_context(
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
     if text("version")? == CANONICAL_DEPENDENCY_CONTEXT_VERSION {
-        if generated_root.is_some()
-            || text("toolchain_root")? != rabs_sandbox::layout::TOOLCHAIN
+        if text("toolchain_root")? != rabs_sandbox::layout::TOOLCHAIN
             || text("compiler")? != "/__rabs/toolchain/bin/rustc"
         {
             return Err(
@@ -330,7 +329,7 @@ pub fn parse_dependency_context(
                     .to_owned(),
             );
         }
-        return DependencyExecContext::new_canonical_cargo(
+        return DependencyExecContext::new_canonical_cargo_with_generated(
             execution_mode,
             text("source_root")?,
             text("cwd")?,
@@ -338,6 +337,7 @@ pub fn parse_dependency_context(
             dirs,
             loader_dirs,
             artifact_roots,
+            generated_root,
             env,
             runtime_cohort,
         )

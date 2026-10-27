@@ -947,10 +947,13 @@ therefore blocks local lookup, capture and publication even when a worker is
 missing, busy or refuses the action. Without a suitable worker the current
 compilation proceeds through Cargo with no local action-cache authority.
 
-Build-script producers, proc-macro producers/consumers, units with generated
-`OUT_DIR` inputs, workspace/primary packages and native-link inputs retain their
-per-action cache restrictions and compile normally. Eligible independent pure
-dependencies may use the isolated worker cache. Dynamic-library candidates in a
+Build-script producers, proc-macro producers/consumers, workspace/primary packages
+and native-link inputs retain their per-action cache restrictions and compile
+normally. Eligible external libraries that consume a completed build script's
+`OUT_DIR` can use the isolated worker metadata or archive cache with the complete
+generated tree captured as an input. The build script itself still runs under
+Cargo. Eligible independent pure dependencies may also use the isolated worker
+cache. Dynamic-library candidates in a
 dependency search directory still conservatively prevent that directory's
 admission; this change does not claim complete per-unit acceleration for every
 macro-heavy graph. Build-script failure and generated-source errors preserve
@@ -1081,20 +1084,36 @@ mixed or invalid explicit settings refuse startup. Credentials and transport
 state remain outside the Cargo namespace; no normal daemon needs to be started
 for this operation-owned coordinator.
 
-The worker must explicitly advertise `canonical-dependency-exec-v2` and support
+The worker must explicitly advertise `canonical-dependency-exec-v3` and support
 the selected `metadata` or `rlib` execution mode. Both peers retain that exact version and mode through
 authenticated admission. An older worker cannot silently reinterpret the request
 as ordinary-path dependency execution, and metadata support does not authorize an
 archive action. The worker receives only the retained
-package, exact dependency candidates and captured toolchain. It retains its own
+package, any complete generated input tree, exact dependency candidates and
+captured toolchain. It retains its own
 runtime and verifies it against the keyed runtime cohort, then creates private
 output and HOME trees. The outer Cargo workspace, Cargo home,
 control socket and persistent CAS are not exposed to that compiler.
 
+For a library with `OUT_DIR`, the coordinator requires Cargo's completed
+`root-output` record to name that exact canonical path and captures its byte-exact
+persisted stdout alongside every file in the generated tree. Empty generated
+trees have an explicit private owner. The path must be below
+`/__rabs/out/cargo`, disjoint from compiler outputs and dependency search roots;
+the worker mounts it read-only at the original logical name. The action key
+binds the complete generated contents, the persisted Cargo directives and the
+presented environment. Source and record generations are checked again before
+publication and installation. A changed generated file therefore cannot reuse
+the earlier consumer result even when its package source and build script are
+unchanged. These inputs authorize only an independently supervised compiler
+execution; they do not authorize local result capture or cache the script's
+execution, filesystem observations or side effects.
+
 Archive execution also excludes process information and entropy devices from
 the compiler's filesystem view. Its only null device is an independently checked
 real `/dev/null` character device. The action key covers the complete retained
-package, exact dependency artifacts, compiler, runtime and presented environment.
+package and generated inputs, exact dependency artifacts, compiler, runtime and
+presented environment.
 Assembler `.incbin` reads can therefore consume keyed package bytes even when
 rustc omits those files from dep-info; host-only paths, `/proc` content and
 `/dev/urandom` cannot become invisible archive inputs. This is a closed per-action
@@ -1347,6 +1366,36 @@ in the archive but not rustc's dep-info, then verifies that unkeyed host/process
 entropy inputs are inaccessible. These are runnable acceptance tests, not a
 claim that an incapable host has passed them. Full native execution, build
 qualification and performance evidence must be established on a capable host.
+
+The generated-input variants run the same Cargo, wrapper, TLS worker and cache
+path for both output modes:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output \
+    -- --ignored --exact --nocapture
+```
+
+Their vendored dependency's build script reads a captured workspace file outside
+its package and writes generated Rust. After three real remote samples, a
+relocated build must replay both dependency results. Changing only that workspace
+input then leaves the dependency package bytes unchanged: the independent leaf
+must still replay, while the generated-input consumer needs a different key and
+an actual remote compile. A compile-time assertion checks the new metadata;
+the build variant also compares the archives and executes the delivered binary.
+The worker boundary tests separately compare native rustc outputs with sealed
+generated input transfer, including a modified original tree, and ownership
+tests cover empty trees and writable-alias refusal. The workflow runs the exact
+native selectors above; adding them does not establish that an unsupported host
+has passed the full path.
 
 ### Select local Cargo units from the Cargo command line
 

@@ -125,6 +125,36 @@ fn source(root: &Path, value: u32) {
     );
 }
 
+fn generated_dependency(root: &Path) {
+    write(root, "generated-value.txt", "2\n");
+    vendor(
+        root,
+        "canonical_dep",
+        BTreeMap::from([
+            (
+                "Cargo.toml",
+                "[package]\nname='canonical_dep'\nversion='1.0.0'\nedition='2021'\n[dependencies]\ncanonical_leaf='=1.0.0'\n",
+            ),
+            (
+                "build.rs",
+                r#"fn main() {
+    let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let input = package.parent().unwrap().parent().unwrap().join("generated-value.txt");
+    let value: u32 = std::fs::read_to_string(&input).unwrap().trim().parse().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("generated.rs"), format!("const GENERATED_OFFSET: u32 = {value};\n")).unwrap();
+    println!("cargo:rerun-if-changed={}", input.display());
+}
+"#,
+            ),
+            (
+                "src/lib.rs",
+                "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub const fn answer()->u32 { canonical_leaf::answer()+GENERATED_OFFSET }\n",
+            ),
+        ]),
+    );
+}
+
 fn run(root: &Path, number: u32, profile: &Value) -> (i32, Vec<Value>, String) {
     run_with_environment(root, number, profile, &[])
 }
@@ -1042,23 +1072,39 @@ fn delivered_build(
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo/TLS worker/cache execution"]
 fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktrees() {
-    remote_dependency_replay("check");
+    remote_dependency_replay("check", false);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo build/TLS worker/archive cache and linked binary execution"]
 fn canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary() {
-    remote_dependency_replay("build");
+    remote_dependency_replay("build", false);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/cache execution"]
+fn canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir() {
+    remote_dependency_replay("check", true);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/archive execution"]
+fn canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output() {
+    remote_dependency_replay("build", true);
 }
 
 /// Exercise the production native CLI, wrapper, remote executor, CAS sampling,
 /// exact delivery and invalidation using the same dependency graph in each mode.
-fn remote_dependency_replay(command: &str) {
+fn remote_dependency_replay(command: &str, with_generated: bool) {
     let (owner, mut profile) = native_fixture();
     profile["command"] = json!(command);
     let build = command == "build";
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
+    if with_generated {
+        generated_dependency(&first);
+        generated_dependency(&second);
+    }
     assert_answer(&first, 42, false);
     assert_answer(&second, 42, true);
     let (mut worker, environment) = NativeWorker::start(owner.path());
@@ -1195,7 +1241,14 @@ fn remote_dependency_replay(command: &str) {
         before_replay
     );
 
-    source(&second, 41);
+    if with_generated {
+        // The dependency package and its build script remain byte-identical.
+        // Only this captured workspace input changes the generated Rust bytes,
+        // so a distinct consumer key must come from the retained OUT_DIR tree.
+        write(&second, "generated-value.txt", "3\n");
+    } else {
+        source(&second, 41);
+    }
     assert_answer(&second, 43, false);
     let (code, events, output) = run_with_environment(owner.path(), 5, &profile, &environment);
     assert_eq!(
@@ -1205,38 +1258,62 @@ fn remote_dependency_replay(command: &str) {
     if build {
         let (target, archives) = delivered_build(owner.path(), 5, &events, 43);
         assert!(retained_targets.insert(target));
-        for name in ["canonical_leaf", "canonical_dep"] {
+        let previous = first_archives.as_ref().unwrap();
+        if with_generated {
+            assert_eq!(
+                archives["canonical_leaf"], previous["canonical_leaf"],
+                "editing a generator input changed the independent leaf archive"
+            );
+        } else {
             assert_ne!(
-                archives[name],
-                first_archives.as_ref().unwrap()[name],
-                "changed source reused stale {name} archive bytes"
+                archives["canonical_leaf"], previous["canonical_leaf"],
+                "changed source reused stale canonical_leaf archive bytes"
             );
         }
+        assert_ne!(
+            archives["canonical_dep"], previous["canonical_dep"],
+            "changed dependency inputs reused stale consumer archive bytes"
+        );
     }
     let changed = decisions(&events, "remote-offer");
+    let changed_names: &[&str] = if with_generated {
+        &["canonical_dep"]
+    } else {
+        &["canonical_leaf", "canonical_dep"]
+    };
     assert_eq!(
         changed.len(),
-        2,
-        "both the changed leaf and its metadata consumer must execute remotely: {output}"
+        changed_names.len(),
+        "changed dependency inputs must execute remotely: {output}"
     );
     let first_keys = first_keys.unwrap();
-    for name in ["canonical_leaf", "canonical_dep"] {
+    for name in changed_names {
         assert_ne!(
-            changed[name], first_keys[name],
+            changed[*name], first_keys[*name],
             "stale {name} action identity"
         );
         assert!(
             events
                 .iter()
                 .any(|event| event["kind"] == "rabsd-remote-dependency-executed"
-                    && event["key"] == changed[name]),
+                    && event["key"] == changed[*name]),
             "{name} did not complete remotely: {output}"
         );
     }
-    assert!(
-        decisions(&events, "hit").is_empty() && decisions(&events, "execute").is_empty(),
-        "{output}"
-    );
+    let hits = decisions(&events, "hit");
+    if with_generated {
+        assert_eq!(
+            hits,
+            BTreeMap::from([(
+                "canonical_leaf".to_owned(),
+                first_keys["canonical_leaf"].clone()
+            )]),
+            "the unchanged leaf must replay while its generated-input consumer rebuilds: {output}"
+        );
+    } else {
+        assert!(hits.is_empty(), "{output}");
+    }
+    assert!(decisions(&events, "execute").is_empty(), "{output}");
     // This fixture's selected script deliberately panics. Cargo must actually
     // run it and preserve that failure, while every dependency cache attempt
     // remains under worker authority rather than local wrapper claims.

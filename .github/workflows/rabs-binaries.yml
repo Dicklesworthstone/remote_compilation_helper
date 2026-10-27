@@ -244,6 +244,24 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary \
             -- --ignored --exact --nocapture
+      - name: Canonical Cargo captures generated metadata inputs and invalidates changed OUT_DIR
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir \
+            -- --ignored --exact --nocapture
+      - name: Canonical Cargo replays generated archives and delivers the changed linked result
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+          RABS_TEST_WORKER_BIN: ${{ github.workspace }}/target/release/rabs-wkr
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output \
+            -- --ignored --exact --nocapture
       - name: Closed archive isolation and authenticated mode selection
         run: |
           cargo test --release -p rabs-sandbox --lib dependency_context --locked
@@ -257,12 +275,19 @@ jobs:
               --locked -- --ignored --exact --nocapture
           cargo test --release -p rabs-wkr --bin rabs-wkr dependency --locked
           cargo test --release -p rabs-wkr --bin rabs-wkr archive --locked
+          cargo test --release -p rabs-wkr --lib canonical_generated_inputs --locked
           cargo test --release -p rabsd --lib coord::secure_worker_delivery::tests --locked
           cargo test --release -p rabs-wkr --test process_tree_linux \
             real_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
             --locked -- --nocapture
           cargo test --release -p rabs-wkr --test process_tree_linux \
             real_canonical_dependency_rustc_builds_archive_with_shared_dag_and_assembly_input \
+            --locked -- --exact --nocapture
+          cargo test --release -p rabs-wkr --test process_tree_linux \
+            real_canonical_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag \
+            --locked -- --exact --nocapture
+          cargo test --release -p rabs-wkr --test process_tree_linux \
+            real_canonical_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag \
             --locked -- --exact --nocapture
       - name: Actual offline Cargo builds, links and replays remote archives
         timeout-minutes: 30

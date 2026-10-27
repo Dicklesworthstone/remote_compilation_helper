@@ -1492,22 +1492,57 @@ mod tests {
         rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
         tempfile::TempDir,
     ) {
-        use rabs_sandbox::dependency_context::DependencyExecContext;
+        generated_dependency_profile_fixture(files, false)
+    }
+
+    fn generated_dependency_profile_fixture(
+        files: &[(&str, &[u8], bool)],
+        canonical: bool,
+    ) -> (
+        SourceOwner,
+        rabs_sandbox::dependency_context::DependencyExecContext,
+        rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        tempfile::TempDir,
+    ) {
+        use rabs_sandbox::dependency_context::{DependencyExecContext, DependencyExecutionMode};
         let owner = uploaded_dependency_bundle(files);
-        let generated = "/target/build/unit/out";
-        let context = DependencyExecContext::new_with_generated_artifacts(
-            "/source/package".to_owned(),
-            "/source/package".to_owned(),
-            "/toolchains/pinned".to_owned(),
-            "/toolchains/pinned/bin/rustc".to_owned(),
-            "/target/deps".to_owned(),
-            vec!["/target/deps".to_owned()],
-            vec!["/target".to_owned()],
-            Vec::new(),
-            Some(generated.to_owned()),
-            vec![("OUT_DIR".to_owned(), generated.to_owned())],
-            [7; 32],
-        )
+        let context = if canonical {
+            let source = "/__rabs/workspace/vendor/package";
+            let output = "/__rabs/out/cargo/debug/deps";
+            let generated = "/__rabs/out/cargo/debug/build/package-123/out";
+            DependencyExecContext::new_canonical_cargo_with_generated(
+                DependencyExecutionMode::Metadata,
+                source.into(),
+                source.into(),
+                output.into(),
+                vec![output.into()],
+                vec!["/__rabs/out/cargo/debug".into()],
+                Vec::new(),
+                Some(generated.into()),
+                vec![
+                    ("HOME".into(), "/__rabs/home".into()),
+                    ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                    ("CARGO_MANIFEST_DIR".into(), source.into()),
+                    ("OUT_DIR".into(), generated.into()),
+                ],
+                [7; 32],
+            )
+        } else {
+            let generated = "/target/build/unit/out";
+            DependencyExecContext::new_with_generated_artifacts(
+                "/source/package".to_owned(),
+                "/source/package".to_owned(),
+                "/toolchains/pinned".to_owned(),
+                "/toolchains/pinned/bin/rustc".to_owned(),
+                "/target/deps".to_owned(),
+                vec!["/target/deps".to_owned()],
+                vec!["/target".to_owned()],
+                Vec::new(),
+                Some(generated.to_owned()),
+                vec![("OUT_DIR".to_owned(), generated.to_owned())],
+                [7; 32],
+            )
+        }
         .unwrap();
         let runtime = tempfile::tempdir().unwrap();
         for name in ["toolchain", "output", "empty", "home"] {
@@ -1527,6 +1562,65 @@ mod tests {
             )
             .unwrap();
         (owner, context, spec, runtime)
+    }
+
+    #[test]
+    fn canonical_generated_inputs_use_exact_sealed_or_empty_read_only_owners() {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use rabs_sandbox::dependency_context::DependencyExecutionMode;
+        let package = ("package/src/lib.rs", b"source".as_slice(), false);
+        let generated = (
+            "generated/nested/input.rs",
+            b"pub const VALUE:u32=73;".as_slice(),
+            false,
+        );
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            for files in [vec![package], vec![package, generated]] {
+                let (owner, context, mut spec, _runtime) =
+                    generated_dependency_profile_fixture(&files, true);
+                let context = context.with_execution_mode(mode);
+                let guard = owner
+                    .prepare_dependency_generated(91, &context, &mut spec)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(context.version(), "canonical-dependency-exec-v3");
+                assert_eq!(guard.files.len(), files.len() - 1);
+                owner.protect_dependency(91, &context, &spec).unwrap();
+                guard.verify().unwrap();
+                let visible = std::path::Path::new(context.generated_root().unwrap());
+                assert_eq!(
+                    spec.ro_binds
+                        .iter()
+                        .filter(|bind| bind.visible == visible)
+                        .count(),
+                    1
+                );
+                assert!(
+                    spec.rw_binds
+                        .iter()
+                        .all(|bind| !bind.visible.starts_with(visible))
+                );
+                if files.len() == 1 {
+                    assert_eq!(std::fs::read_dir(&guard.backing).unwrap().count(), 0);
+                } else {
+                    assert_eq!(
+                        std::fs::read(guard.backing.join("nested/input.rs")).unwrap(),
+                        generated.1
+                    );
+                }
+                let mut writable = spec.clone();
+                writable
+                    .rw_binds
+                    .push(Bind::new(&guard.backing, "/__rabs/home/mutable-generated"));
+                assert!(owner.protect_dependency(91, &context, &writable).is_err());
+                let mut missing = spec;
+                missing.ro_binds.retain(|bind| bind.visible != visible);
+                assert!(owner.protect_dependency(91, &context, &missing).is_err());
+            }
+        }
     }
 
     #[test]

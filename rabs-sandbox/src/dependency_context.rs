@@ -25,8 +25,9 @@ pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v7";
 /// Separately negotiated canonical Cargo dependency execution. This is not a
 /// pathname-based extension of the original-path context: both peers must
 /// select this version and its output mode before canonical aliases can enter
-/// a compiler view. Version 2 admits the independently enforced Rlib mode.
-pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v2";
+/// a compiler view. Version 3 additionally admits a complete sealed generated
+/// input tree at its canonical Cargo OUT_DIR in either execution mode.
+pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v3";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -450,8 +451,8 @@ impl DependencyExecContext {
     ///
     /// Archive emission selects the existing Rlib namespace, which excludes
     /// procfs and entropy devices so assembler inputs must come from retained
-    /// keyed bytes. Generated inputs and arbitrary canonical mount aliases
-    /// remain unsupported. Neither mode authorizes local codegen capture.
+    /// keyed bytes. Arbitrary canonical mount aliases remain unsupported.
+    /// Neither mode authorizes local codegen capture.
     #[allow(clippy::too_many_arguments)]
     pub fn new_canonical_cargo(
         mode: DependencyExecutionMode,
@@ -461,6 +462,37 @@ impl DependencyExecContext {
         dependency_dirs: Vec<String>,
         loader_dirs: Vec<String>,
         artifact_roots: Vec<DependencyArtifactRoot>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_canonical_cargo_with_generated(
+            mode,
+            source_root,
+            cwd,
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            None,
+            env,
+            runtime_cohort_sha256,
+        )
+    }
+
+    /// Add one complete retained build-script input tree at the exact OUT_DIR
+    /// beneath the canonical Cargo target. The tree is disjoint from writable
+    /// compiler outputs and may be empty; its bytes are supplied by the sealed
+    /// source owner. The worker neither executes nor caches the build script.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_canonical_cargo_with_generated(
+        mode: DependencyExecutionMode,
+        source_root: String,
+        cwd: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        generated_root: Option<String>,
         env: Vec<(String, String)>,
         runtime_cohort_sha256: [u8; 32],
     ) -> Result<Self, DependencyContextError> {
@@ -474,7 +506,7 @@ impl DependencyExecContext {
             dependency_dirs,
             loader_dirs,
             artifact_roots,
-            None,
+            generated_root,
             env,
             runtime_cohort_sha256,
         )
@@ -506,7 +538,9 @@ impl DependencyExecContext {
                 .iter()
                 .any(|root| canonical_descendant(&source_root, root))
                 || toolchain_root != layout::TOOLCHAIN
-                || generated_root.is_some()
+                || generated_root
+                    .as_ref()
+                    .is_some_and(|root| !canonical_descendant(root, "/__rabs/out/cargo"))
                 || !canonical_descendant(&out_dir, "/__rabs/out/cargo")
                 || dependency_dirs
                     .iter()
@@ -1160,6 +1194,176 @@ mod tests {
                 .unwrap(),
             [PathBuf::from("/private/toolchain/lib")]
         );
+    }
+
+    fn canonical_generated_context(
+        root: &str,
+        mode: DependencyExecutionMode,
+    ) -> Result<DependencyExecContext, DependencyContextError> {
+        let base = canonical_context();
+        let mut env = base.env;
+        env.push(("OUT_DIR".into(), root.into()));
+        DependencyExecContext::new_canonical_cargo_with_generated(
+            mode,
+            base.source_root,
+            base.cwd,
+            base.out_dir,
+            base.dependency_dirs,
+            base.loader_dirs,
+            base.artifact_roots,
+            Some(root.into()),
+            env,
+            base.runtime_cohort_sha256,
+        )
+    }
+
+    #[test]
+    fn canonical_generated_inputs_require_a_disjoint_cargo_target_and_exact_environment() {
+        let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            let context = canonical_generated_context(generated, mode).unwrap();
+            assert_eq!(context.version(), "canonical-dependency-exec-v3");
+            assert_eq!(context.generated_root(), Some(generated));
+            assert_eq!(context.execution_mode(), mode);
+            assert!(
+                context
+                    .env()
+                    .contains(&("OUT_DIR".into(), generated.into()))
+            );
+            let mut env = context.env.clone();
+            env.retain(|(name, _)| name != "OUT_DIR");
+            assert!(
+                DependencyExecContext::new_canonical_cargo_with_generated(
+                    mode,
+                    context.source_root,
+                    context.cwd,
+                    context.out_dir,
+                    context.dependency_dirs,
+                    context.loader_dirs,
+                    context.artifact_roots,
+                    Some(generated.into()),
+                    env,
+                    context.runtime_cohort_sha256,
+                )
+                .is_err()
+            );
+        }
+        for root in [
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug",
+            CANONICAL_OUTPUT,
+            "/__rabs/out/cargo/debug/deps/generated",
+            "/__rabs/out/cargo/debug/build/../out",
+            "/__rabs/out/cargo-other/build/leaf/out",
+            "/__rabs/workspace/generated",
+            "/__rabs/cargo-home/generated",
+            "/__rabs/toolchain/generated",
+            "/__rabs/home/control",
+            "/tmp/generated",
+        ] {
+            assert!(
+                canonical_generated_context(root, DependencyExecutionMode::Metadata).is_err(),
+                "generated root escaped its closed canonical input contract: {root}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_generated_namespace_keeps_inputs_read_only_under_the_loader_parent() {
+        let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            let mut context = canonical_generated_context(generated, mode).unwrap();
+            let empty = tempfile::tempdir().unwrap();
+            context.prepare_empty_backings(empty.path()).unwrap();
+            let mut spec = context
+                .namespace(
+                    Path::new("/private/bundle/package"),
+                    Path::new("/private/toolchain"),
+                    Path::new("/private/output"),
+                    empty.path(),
+                    Path::new("/private/home"),
+                )
+                .unwrap();
+            let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
+            let parent = spec
+                .ro_binds
+                .iter()
+                .find(|bind| bind.visible == Path::new("/__rabs/out/cargo/debug"))
+                .unwrap();
+            assert!(parent.backing.join("build/leaf-123/out").is_dir());
+            let support = fixture_support(mode);
+            let launch = build_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+            )
+            .unwrap();
+            let argv = launch
+                .argv
+                .iter()
+                .map(|arg| arg.to_str().unwrap())
+                .collect::<Vec<_>>();
+            let parent_at = argv
+                .windows(3)
+                .position(|row| {
+                    row == [
+                        "--ro-bind",
+                        parent.backing.to_str().unwrap(),
+                        "/__rabs/out/cargo/debug",
+                    ]
+                })
+                .unwrap();
+            let generated_at = argv
+                .windows(3)
+                .position(|row| row == ["--ro-bind", "/private/bundle/generated", generated])
+                .unwrap();
+            assert!(parent_at < generated_at);
+            assert!(
+                spec.rw_binds
+                    .iter()
+                    .all(|bind| !overlaps(&bind.visible, Path::new(generated)))
+            );
+            let mut missing = spec.clone();
+            missing
+                .ro_binds
+                .retain(|bind| bind.visible != Path::new(generated));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &missing,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &[],
+                )
+                .is_err()
+            );
+            let mut writable = spec;
+            writable
+                .rw_binds
+                .push(Bind::new("/private/bundle/generated", generated));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &writable,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &[],
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1851,7 +2055,7 @@ mod tests {
             metadata.runtime_cohort_sha256,
         )
         .unwrap();
-        assert_eq!(archive.version(), "canonical-dependency-exec-v2");
+        assert_eq!(archive.version(), "canonical-dependency-exec-v3");
         assert_archive_mode_namespace(archive);
     }
 

@@ -388,12 +388,39 @@ enum MemberSig {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GeneratedObservation {
     root: PathBuf,
+    // Cargo writes its namespace-visible OUT_DIR, which can differ from the
+    // coordinator's retained physical backing. Both names are memo identity.
+    recorded_root: PathBuf,
     members: Vec<(String, MemberSig)>,
     // Unlike compiler output directories this is a read-only input tree.
     // Retain every directory generation to detect transient added inputs.
     directories: Vec<(PathBuf, FileSig)>,
     script_output: (PathBuf, FileSig),
     root_output: (PathBuf, FileSig),
+}
+
+#[derive(Clone, Copy)]
+struct GeneratedRoot<'a> {
+    physical: &'a Path,
+    recorded: &'a Path,
+}
+
+impl<'a> GeneratedRoot<'a> {
+    fn ordinary(root: &'a Path) -> Self {
+        Self {
+            physical: root,
+            recorded: root,
+        }
+    }
+}
+
+impl GeneratedObservation {
+    fn input(&self) -> GeneratedRoot<'_> {
+        GeneratedRoot {
+            physical: &self.root,
+            recorded: &self.recorded_root,
+        }
+    }
 }
 
 impl PackageFacts {
@@ -406,7 +433,7 @@ impl PackageFacts {
     pub fn verify_unchanged(&self, root: &Path) -> Result<(), String> {
         let (members, _) = walk_package(root, self.source_kind)?;
         if let Some(generated) = &self.generated
-            && observe_generated(&generated.root)?.0 != *generated
+            && observe_generated(generated.input())?.0 != *generated
         {
             return Err("generated inputs changed during execution".into());
         }
@@ -880,7 +907,8 @@ fn walk_package(
     Ok((members, total))
 }
 
-fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String> {
+fn observe_generated(input: GeneratedRoot<'_>) -> Result<(GeneratedObservation, u64), String> {
+    let root = input.physical;
     // A lexical root reached through an ancestor symlink may overlap the
     // compiler's writable tree despite the planner's disjoint-path check.
     for ancestor in root.ancestors() {
@@ -942,7 +970,13 @@ fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String>
     let root_output = run.join("root-output");
     let (root_sig, root_bytes) = read_stable(&root_output, 64 * 1024)
         .map_err(|error| format!("build-script root-output: {error}"))?;
-    if root_bytes != root.to_str().ok_or("non-UTF-8 generated root")?.as_bytes() {
+    if root_bytes
+        != input
+            .recorded
+            .to_str()
+            .ok_or("non-UTF-8 generated root")?
+            .as_bytes()
+    {
         return Err("Cargo build-script record names a different OUT_DIR".into());
     }
     let script_output = run.join(script_record);
@@ -954,6 +988,7 @@ fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String>
     Ok((
         GeneratedObservation {
             root: root.to_path_buf(),
+            recorded_root: input.recorded.to_path_buf(),
             members,
             directories,
             script_output: (script_output, script_sig),
@@ -1008,7 +1043,7 @@ fn captured_files(
 fn capture_package(
     root: &Path,
     source_kind: DependencySourceKind,
-    generated_root: Option<&Path>,
+    generated_root: Option<GeneratedRoot<'_>>,
 ) -> Result<PackageFacts, String> {
     let (before, bytes) = walk_package(root, source_kind)?;
     let (generated, generated_bytes) = match generated_root {
@@ -1036,7 +1071,7 @@ fn capture_package(
     }
     let mut roots = vec![(PACKAGE_ROOT.to_owned(), root.to_path_buf())];
     if let Some(root) = generated_root {
-        roots.push((GENERATED_ROOT.to_owned(), root.to_path_buf()));
+        roots.push((GENERATED_ROOT.to_owned(), root.physical.to_path_buf()));
     }
     let snapshot = capture_sealed_source(&roots, false, 3, MAX_PACKAGE_BYTES)
         .map_err(|error| format!("capture: {error:?}"))?;
@@ -1051,7 +1086,7 @@ fn capture_package(
             if sig != tree.script_output.1 {
                 return Err("build-script output record changed during capture".into());
             }
-            if observe_generated(&tree.root)?.0 != *tree {
+            if observe_generated(tree.input())?.0 != *tree {
                 return Err("generated inputs changed during capture".into());
             }
             (
@@ -1517,7 +1552,50 @@ impl LiveFacts {
         source_kind: DependencySourceKind,
         generated_root: Option<&Path>,
     ) -> Result<Arc<PackageFacts>, FactsMiss> {
-        package_capture::observe(self, root, source_kind, generated_root)
+        package_capture::observe(
+            self,
+            root,
+            source_kind,
+            generated_root.map(GeneratedRoot::ordinary),
+        )
+    }
+
+    /// Observe an I/O-projected compiler plan. Only the retained canonical
+    /// driver projection may pair a physical generated root with a different
+    /// OUT_DIR spelling; its environment still has Cargo's exact visible name.
+    /// This establishes input facts, never local result-capture authority.
+    pub(crate) fn package_for_plan(
+        self: &Arc<Self>,
+        plan: &DependencyActionPlan,
+    ) -> Result<Arc<PackageFacts>, FactsMiss> {
+        let mut presented = plan
+            .execution_env
+            .iter()
+            .filter(|(name, _)| name == "OUT_DIR")
+            .map(|(_, value)| Path::new(value));
+        let generated = match (
+            plan.generated_root.as_deref().map(Path::new),
+            presented.next(),
+        ) {
+            (None, None) => None,
+            (Some(physical), Some(recorded))
+                if presented.next().is_none()
+                    && (plan.canonical_cargo || physical.as_os_str() == recorded.as_os_str()) =>
+            {
+                Some(GeneratedRoot { physical, recorded })
+            }
+            _ => {
+                return Err(FactsMiss::Refused(
+                    "generated input backing and presented OUT_DIR disagree".into(),
+                ));
+            }
+        };
+        package_capture::observe(
+            self,
+            Path::new(&plan.source_root),
+            plan.source_kind,
+            generated,
+        )
     }
 }
 
@@ -2024,6 +2102,74 @@ mod tests {
     }
 
     #[test]
+    fn warmed_generated_capture_retains_canonical_recorded_root_and_rejects_rebinding() {
+        let (_dir, mut plan) = generated_fixture();
+        let source = Path::new(&plan.source_root);
+        let generated = Path::new(plan.generated_root.as_deref().unwrap());
+        let visible = "/__rabs/out/cargo/debug/build/generated-123/out";
+        plan.canonical_cargo = true;
+        plan.execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "OUT_DIR")
+            .unwrap()
+            .1 = visible.into();
+        let record = generated.parent().unwrap().join("run/root-output");
+        std::fs::write(&record, visible).unwrap();
+        // Force the actual background capture path: the borrowed logical name
+        // must survive in its owned observation, not fall back to the backing.
+        std::fs::File::create(source.join("large-input.bin"))
+            .unwrap()
+            .set_len(SYNCHRONOUS_PACKAGE_BYTES + 1)
+            .unwrap();
+        let facts = LiveFacts::new();
+        assert!(matches!(
+            facts.package_for_plan(&plan),
+            Err(FactsMiss::Pending)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let captured = loop {
+            match facts.package_for_plan(&plan) {
+                Ok(captured) => break captured,
+                Err(FactsMiss::Pending) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "generated capture did not finish"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("canonical generated capture refused: {error}"),
+            }
+        };
+        assert_eq!(
+            captured.generated.as_ref().unwrap().recorded_root,
+            Path::new(visible)
+        );
+        assert!(Arc::ptr_eq(
+            &captured,
+            &facts.package_for_plan(&plan).unwrap()
+        ));
+        captured.verify_unchanged(source).unwrap();
+        captured.verify_generated_disjoint(&plan).unwrap();
+        let mut rebound = plan.clone();
+        rebound
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "OUT_DIR")
+            .unwrap()
+            .1 = "/__rabs/out/cargo/debug/build/different/out".into();
+        assert!(matches!(
+            facts.package_for_plan(&rebound),
+            Err(FactsMiss::Refused(_))
+        ));
+        std::fs::write(&record, generated.to_str().unwrap()).unwrap();
+        assert!(captured.verify_unchanged(source).is_err());
+        assert!(matches!(
+            facts.package_for_plan(&plan),
+            Err(FactsMiss::Refused(_))
+        ));
+    }
+
+    #[test]
     fn generated_inputs_refuse_symlinks_and_compiler_output_aliases() {
         let (dir, plan) = generated_fixture();
         let source = Path::new(&plan.source_root);
@@ -2084,28 +2230,42 @@ mod tests {
         std::fs::write(unit.join("root-output"), out.to_str().unwrap()).unwrap();
         std::fs::write(unit.join("stderr"), b"").unwrap();
         std::fs::write(unit.join("invoked.timestamp"), b"This file has an mtime").unwrap();
-        let (observed, _) = observe_generated(&out).unwrap();
+        let (observed, _) = observe_generated(GeneratedRoot::ordinary(&out)).unwrap();
         assert_eq!(observed.script_output.0, unit.join("output"));
         assert_eq!(observed.root_output.0, unit.join("root-output"));
-        assert_eq!(observe_generated(&out).unwrap().0, observed);
+        assert_eq!(
+            observe_generated(GeneratedRoot::ordinary(&out)).unwrap().0,
+            observed
+        );
         // A rerun of the build script rewrites the record: never the same.
         std::fs::write(unit.join("output"), b"cargo:rustc-cfg=other\n").unwrap();
-        assert_ne!(observe_generated(&out).unwrap().0, observed);
+        assert_ne!(
+            observe_generated(GeneratedRoot::ordinary(&out)).unwrap().0,
+            observed
+        );
         // The record must name THIS OUT_DIR.
         std::fs::write(unit.join("root-output"), b"/elsewhere/out").unwrap();
         assert!(
-            observe_generated(&out)
+            observe_generated(GeneratedRoot::ordinary(&out))
                 .unwrap_err()
                 .contains("different OUT_DIR")
         );
         // A `run` entry that is not a directory is neither layout: refuse.
         std::fs::write(unit.join("root-output"), out.to_str().unwrap()).unwrap();
         std::fs::write(unit.join("run"), b"not a directory").unwrap();
-        assert!(observe_generated(&out).unwrap_err().contains("not real"));
+        assert!(
+            observe_generated(GeneratedRoot::ordinary(&out))
+                .unwrap_err()
+                .contains("not real")
+        );
         // Without any record there is nothing to bind: refuse.
         std::fs::remove_file(unit.join("run")).unwrap();
         std::fs::remove_file(unit.join("output")).unwrap();
-        assert!(observe_generated(&out).unwrap_err().contains("stdout"));
+        assert!(
+            observe_generated(GeneratedRoot::ordinary(&out))
+                .unwrap_err()
+                .contains("stdout")
+        );
     }
 
     #[test]

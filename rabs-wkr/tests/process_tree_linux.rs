@@ -760,6 +760,16 @@ fn real_canonical_dependency_rustc_builds_archive_with_shared_dag_and_assembly_i
     dependency_metadata_dag(false, true, true);
 }
 
+#[test]
+fn real_canonical_dependency_rustc_reads_generated_out_dir_with_shared_metadata_dag() {
+    dependency_metadata_dag(true, false, true);
+}
+
+#[test]
+fn real_canonical_dependency_rustc_builds_archive_with_generated_inputs_and_shared_dag() {
+    dependency_metadata_dag(true, true, true);
+}
+
 fn dependency_metadata_dag(with_generated: bool, archive: bool, canonical: bool) {
     use rabs_sandbox::canonical_namespace::{
         Bind, CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
@@ -900,6 +910,12 @@ pub const SOURCE: &str = file!();
         source.path().to_str().unwrap()
     }
     .to_owned();
+    let visible_generated = if canonical {
+        "/__rabs/out/cargo/debug/build/dag_top/out"
+    } else {
+        generated_root.to_str().unwrap()
+    }
+    .to_owned();
     let visible_compiler = if canonical {
         "/__rabs/toolchain/bin/rustc"
     } else {
@@ -965,10 +981,7 @@ pub const SOURCE: &str = file!();
         ];
         if with_generated {
             std::fs::write(generated_root.join("nested/generated.rs"), generated_source).unwrap();
-            env.push((
-                "OUT_DIR".to_owned(),
-                generated_root.to_str().unwrap().to_owned(),
-            ));
+            env.push(("OUT_DIR".to_owned(), visible_generated.clone()));
             env.push((
                 "BUILD_SCRIPT_FLAVOR".to_owned(),
                 "captured Cargo directive".to_owned(),
@@ -1075,7 +1088,12 @@ pub const SOURCE: &str = file!();
             .unwrap();
             let dep_info = std::str::from_utf8(&expected["dag_top.d"]).unwrap();
             assert!(
-                dep_info.contains(generated_root.join("nested/generated.rs").to_str().unwrap())
+                dep_info.contains(
+                    Path::new(&visible_generated)
+                        .join("nested/generated.rs")
+                        .to_str()
+                        .unwrap()
+                )
             );
             assert!(dep_info.contains("# env-dep:OUT_DIR="));
             assert!(dep_info.contains("# env-dep:BUILD_SCRIPT_FLAVOR=captured Cargo directive"));
@@ -1143,11 +1161,7 @@ pub const SOURCE: &str = file!();
             prefix: "dependencies/0000".to_owned(),
         }];
         let context = if canonical {
-            assert!(
-                !with_generated,
-                "canonical generated inputs require their own contract"
-            );
-            DependencyExecContext::new_canonical_cargo(
+            DependencyExecContext::new_canonical_cargo_with_generated(
                 mode,
                 visible_source.clone(),
                 visible_source.clone(),
@@ -1155,6 +1169,7 @@ pub const SOURCE: &str = file!();
                 vec![visible_out.clone()],
                 vec![visible_out.clone(), visible_loader_parent.clone()],
                 artifact_roots,
+                with_generated.then(|| visible_generated.clone()),
                 env,
                 cohort.bytes,
             )

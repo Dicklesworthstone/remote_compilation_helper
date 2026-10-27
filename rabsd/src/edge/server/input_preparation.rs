@@ -8,7 +8,6 @@
 
 use crate::edge::live_facts::{DependencyFacts, FactsMiss, LiveFacts, PackageFacts};
 use rabs_key::live_dependency::DependencyActionPlan;
-use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -24,11 +23,7 @@ pub(super) fn observe(
     may_wait: bool,
 ) -> Result<(Arc<PackageFacts>, Arc<DependencyFacts>), InputMiss> {
     join_observations(
-        facts.package(
-            Path::new(&plan.source_root),
-            plan.source_kind,
-            plan.generated_root.as_deref().map(Path::new),
-        ),
+        facts.package_for_plan(plan),
         || facts.dependencies(plan),
         may_wait,
     )

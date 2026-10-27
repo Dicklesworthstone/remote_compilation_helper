@@ -189,6 +189,69 @@ fn canonical_archive_decode_preserves_mode_paths_and_complete_output_contract() 
 }
 
 #[test]
+fn canonical_generated_dependency_decode_requires_v3_and_exact_owned_out_dir() {
+    let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+    for mut request in [
+        canonical_dependency_request(),
+        canonical_archive_request(true),
+    ] {
+        request["dependency_context"]["generated_root"] = json!(generated);
+        request["dependency_context"]["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(["OUT_DIR", generated]));
+        let original = request.clone();
+        let parsed = parse_exec_request(&request).unwrap();
+        let context = parsed.dependency_context.unwrap();
+        assert_eq!(context.version(), "canonical-dependency-exec-v3");
+        assert_eq!(context.generated_root(), Some(generated));
+        assert!(
+            context
+                .env()
+                .contains(&("OUT_DIR".into(), generated.into()))
+        );
+        assert_eq!(request, original, "decoding changed exact request identity");
+
+        for version in [
+            "canonical-dependency-exec-v1",
+            "canonical-dependency-exec-v2",
+            DEPENDENCY_CONTEXT_VERSION,
+        ] {
+            let mut obsolete = request.clone();
+            obsolete["dependency_context"]["version"] = json!(version);
+            assert!(parse_exec_request(&obsolete).is_err(), "{version}");
+        }
+        for root in [
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug/deps",
+            "/__rabs/out/cargo/debug/deps/generated",
+            "/__rabs/out/cargo/debug/build/../out",
+            "/__rabs/workspace/generated",
+            "/__rabs/cargo-home/generated",
+            "/__rabs/home/control",
+            "/usr/generated",
+        ] {
+            let mut invalid = request.clone();
+            invalid["dependency_context"]["generated_root"] = json!(root);
+            *invalid["dependency_context"]["env"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap() = json!(["OUT_DIR", root]);
+            assert!(parse_exec_request(&invalid).is_err(), "{root}");
+        }
+        let mut missing_environment = request.clone();
+        missing_environment["dependency_context"]["env"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(parse_exec_request(&missing_environment).is_err());
+        request["dependency_context"]["generated_root"] = Value::Null;
+        assert!(parse_exec_request(&request).is_err());
+    }
+}
+
+#[test]
 fn canonical_archive_refuses_executable_externs_native_inputs_and_unretained_paths() {
     for extra in [
         vec!["--crate-type", "proc-macro"],
@@ -874,6 +937,25 @@ fn canonical_dependency_negotiation_binds_version_as_well_as_mode() {
     .unwrap();
     assert_eq!(selected.version, CANONICAL_DEPENDENCY_CONTEXT_VERSION);
     assert_eq!(selected.mode, DependencyExecutionMode::Metadata);
+    for previous in [
+        "canonical-dependency-exec-v1",
+        "canonical-dependency-exec-v2",
+    ] {
+        let mut old = grant.clone();
+        old["dependency_context"] = json!(previous);
+        assert!(
+            dependency_context_selection(
+                &old.to_string(),
+                &[DependencyExecutionMode::Metadata],
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+            .is_err()
+        );
+    }
     for flags in [
         [false, true, true, true, true],
         [true, false, true, true, true],

@@ -550,7 +550,7 @@ impl RemoteDependencies {
             })
             .collect();
         let context = if plan.canonical_cargo {
-            DependencyExecContext::new_canonical_cargo(
+            DependencyExecContext::new_canonical_cargo_with_generated(
                 execution_mode(plan)?,
                 plan.source_root.clone(),
                 plan.cwd.clone(),
@@ -558,6 +558,7 @@ impl RemoteDependencies {
                 plan.dependency_dirs.clone(),
                 empty_loader,
                 artifact_roots,
+                plan.generated_root.clone(),
                 plan.execution_env.clone(),
                 runtime_bytes,
             )

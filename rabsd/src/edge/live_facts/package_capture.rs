@@ -10,9 +10,10 @@
 //! a saturated warmer cannot consume useful cache state without doing work.
 
 use super::{
-    DependencySourceKind, FactsMiss, FileSig, GeneratedObservation, LiveFacts, MAX_PACKAGE_BYTES,
-    MAX_PACKAGE_FILES, MAX_RETAINED_PACKAGE_BYTES, MAX_WARMING, MemberSig, PROBE_RETRY, PackageFacts,
-    PackageKey, SYNCHRONOUS_PACKAGE_BYTES, WarmPermit, capture_package, observe_generated, walk_package,
+    DependencySourceKind, FactsMiss, FileSig, GeneratedObservation, GeneratedRoot, LiveFacts,
+    MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES, MAX_RETAINED_PACKAGE_BYTES, MAX_WARMING, MemberSig,
+    PROBE_RETRY, PackageFacts, PackageKey, SYNCHRONOUS_PACKAGE_BYTES, WarmPermit, capture_package,
+    observe_generated, walk_package,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,7 +45,7 @@ impl Observation {
     fn read(
         root: &Path,
         source_kind: DependencySourceKind,
-        generated_root: Option<&Path>,
+        generated_root: Option<GeneratedRoot<'_>>,
     ) -> Result<Self, String> {
         let identity = root_identity(root)?;
         let (members, source_bytes) = walk_package(root, source_kind)?;
@@ -71,7 +72,7 @@ impl Observation {
             key: (
                 root.to_path_buf(),
                 source_kind,
-                generated_root.map(Path::to_path_buf),
+                generated_root.map(|root| root.physical.to_path_buf()),
             ),
             root_identity: identity,
             members,
@@ -81,7 +82,11 @@ impl Observation {
     }
 
     fn capture(&self) -> Result<PackageFacts, String> {
-        capture_package(&self.key.0, self.key.1, self.key.2.as_deref())
+        capture_package(
+            &self.key.0,
+            self.key.1,
+            self.generated.as_ref().map(GeneratedObservation::input),
+        )
     }
 
     fn matches_capture(&self, captured: &PackageFacts) -> Result<(), String> {
@@ -321,21 +326,26 @@ pub(super) fn observe(
     facts: &Arc<LiveFacts>,
     root: &Path,
     source_kind: DependencySourceKind,
-    generated_root: Option<&Path>,
+    generated_root: Option<GeneratedRoot<'_>>,
 ) -> Result<Arc<PackageFacts>, FactsMiss> {
-    observe_with(facts, root, source_kind, generated_root, Observation::capture)
+    observe_with(
+        facts,
+        root,
+        source_kind,
+        generated_root,
+        Observation::capture,
+    )
 }
 
 fn observe_with(
     facts: &Arc<LiveFacts>,
     root: &Path,
     source_kind: DependencySourceKind,
-    generated_root: Option<&Path>,
+    generated_root: Option<GeneratedRoot<'_>>,
     capture: impl FnOnce(&Observation) -> Result<PackageFacts, String> + Send + 'static,
 ) -> Result<Arc<PackageFacts>, FactsMiss> {
-    let observation = Arc::new(
-        Observation::read(root, source_kind, generated_root).map_err(FactsMiss::Refused)?,
-    );
+    let observation =
+        Arc::new(Observation::read(root, source_kind, generated_root).map_err(FactsMiss::Refused)?);
     let (reservation, warm) = {
         let mut memos = facts
             .packages
