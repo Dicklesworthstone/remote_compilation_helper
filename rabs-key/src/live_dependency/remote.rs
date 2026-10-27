@@ -19,8 +19,9 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::TypedDigest;
 
 use super::{
-    DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveDependencyKey, LiveRefusal,
-    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path, within,
+    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
+    LiveDependencyKey, LiveRefusal, PlannedExtern, ToolchainFacts, live_dependency_key,
+    plain_path_in_profile, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
@@ -35,15 +36,20 @@ use crate::typed_digest::compute;
 pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v2";
 /// Isolation policy domain for the remote metadata dependency class.
 pub const REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str = "rabs.remote-leaf.isolation.v1";
+/// Canonical Cargo planning and closed worker execution form a distinct lane.
+/// Neither ordinary worker receipts nor local canonical checks supply its
+/// evidence, even when source bytes and compiler options happen to match.
+pub const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str =
+    "rabs.canonical-cargo-remote-dependency.isolation.v1";
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
-pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v6: \
+pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v7: \
     Linux worker namespace; subscriber paths preserved; complete regular-file \
     dependency source, exact toolchain and complete crate-candidate inventories \
     mounted read-only; explicit rmeta and complete rlib extern bytes retained; \
     complete generated OUT_DIR tree retained read-only at its original path, \
-    including an empty tree, with exact captured Cargo stdout and rustc-env \
+    including every empty directory and exact keyed directory listing, with captured Cargo stdout and rustc-env \
     directives bound; build-script execution is not cached; no bare extern, \
     proc-macro or native inputs; metadata and dep-info \
     only; shared input/output roots use exact read-only file mounts above private \
@@ -52,7 +58,7 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
     receive private empty backings; outputs private until complete authenticated \
     delivery; network denied; compiler environment preserved by dependency-env-v2 \
     except process-local jobserver descriptors; all loader paths within the exact \
-    toolchain or independently observed dependency-exec-v6 directories without \
+    toolchain or independently observed dependency-exec-v8 directories without \
     dynamic libraries, including Cargo output parents; selected host ELF runtime \
     bytes, exact loader symlink topology and loader cache captured and mounted \
     read-only in a sparse /usr view without other host /usr or /etc/alternatives \
@@ -67,11 +73,12 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
 /// integrated assembler may read `.incbin` files without listing them in
 /// dep-info; it must not see procfs, randomness devices, or the host filesystem.
 /// This policy is never evidence for an unsandboxed local archive compilation.
-pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
-    dependency-exec-v7 rlib execution mode; original subscriber paths preserved; \
+pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v2: \
+    dependency-exec-v8 rlib execution mode; original subscriber paths preserved; \
     complete regular-file package, generated OUT_DIR, exact toolchain, Rust \
     dependency candidate inventories and observed selected ELF runtime retained \
-    read-only; exact compiler environment except process-local jobserver descriptors; \
+    read-only; generated trees include every empty directory and exact keyed directory listing; \
+    exact compiler environment except process-local jobserver descriptors; \
     network denied; no procfs or general device filesystem, only deterministic \
     /dev/null; fresh private empty home, temporary and output storage; LLVM \
     integrated archive codegen only with no proc macros, native link inputs, \
@@ -80,6 +87,38 @@ pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
     required dep-info and optional detached metadata accompany the complete rlib; \
     exact private output capture, runtime/input revalidation, authenticated delivery \
     and coordinator-only publication; full-result readiness";
+
+const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-remote-metadata-v4: canonical-dependency-exec-v4 negotiated \
+    separately from dependency-exec-v8; coordinator-owned canonical Cargo \
+    planning and retained logical-to-physical mappings; exact canonical rustc \
+    argv, cwd, environment and replay bytes; external registry, Git or checked \
+    directory-source metadata and dep-info only; closed worker package, complete \
+    toolchain and candidate inventories with independently matched retained ELF \
+    runtime; no outer Cargo workspace, complete Cargo home or coordinator control \
+    socket mounted; existing authenticated delivery, input revalidation, closure, \
+    sampling and release authorization remain required; complete generated OUT_DIR \
+    retained read-only at its exact canonical spelling, including every empty directory \
+    and exact keyed directory listing, \
+    with exact persisted Cargo stdout and matching rustc-env directives keyed; \
+    no workspace, archive, build-script execution or proc-macro authority";
+
+const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rlib-v3: \
+    canonical-dependency-exec-v4 rlib mode negotiated independently from metadata \
+    and ordinary dependency-exec-v8; coordinator-owned canonical Cargo planning \
+    and retained logical-to-physical mappings; exact canonical rustc argv, cwd, \
+    environment and replay bytes; complete immutable external registry, Git or \
+    checked directory-source package, toolchain, exact Rust candidate inventories \
+    and independently matched retained ELF runtime; existing closed archive \
+    namespace with no procfs, entropy devices, outer Cargo workspace/home or \
+    coordinator control socket; fresh private output, HOME and temporary storage; \
+    all assembler include/incbin inputs must resolve within retained keyed bytes \
+    or fail; existing exact output validation, authenticated delivery, input \
+    revalidation, sampling and release authorization required; no local codegen \
+    capture or workspace publication; complete generated OUT_DIR retained read-only \
+    at its exact canonical spelling, including every empty directory and exact keyed \
+    directory listing, with exact persisted \
+    Cargo stdout and matching rustc-env directives keyed; no build-script execution, \
+    proc macros or native linking";
 
 /// Output and isolation class selected from a bounded compiler invocation.
 /// This is not execution or serving authority: the caller must enforce the
@@ -120,6 +159,30 @@ pub fn remote_dependency_output_class(
 pub fn remote_dependency_isolation_policy(
     plan: &DependencyActionPlan,
 ) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    reject_workspace_cache_authority(plan)?;
+    if plan.canonical_cargo {
+        super::canonical_cargo::canonical_layout(plan)?;
+        let (canonical_profile, execution_profile) =
+            match remote_dependency_output_class(&plan.invocation)? {
+                RemoteDependencyOutputClass::Metadata => (
+                    CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE,
+                    REMOTE_DEPENDENCY_ISOLATION_PROFILE,
+                ),
+                RemoteDependencyOutputClass::Rlib => (
+                    CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE,
+                    REMOTE_RLIB_ISOLATION_PROFILE,
+                ),
+            };
+        let mut policy = CanonicalEncoder::new();
+        policy
+            .str(canonical_profile)
+            .str(execution_profile)
+            .str(plan.source_kind.as_str());
+        return Ok(compute(
+            CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN,
+            &policy.finish(),
+        ));
+    }
     let profile = match remote_dependency_output_class(&plan.invocation)? {
         RemoteDependencyOutputClass::Metadata => REMOTE_DEPENDENCY_ISOLATION_PROFILE,
         RemoteDependencyOutputClass::Rlib => REMOTE_RLIB_ISOLATION_PROFILE,
@@ -224,7 +287,8 @@ fn loader_paths(
     plan: &DependencyActionPlan,
     toolchain_root: &str,
 ) -> Result<(Vec<String>, Vec<String>), RemoteDependencyRefusal> {
-    if !plain_path(toolchain_root)
+    if !plain_path_in_profile(toolchain_root, plan.canonical_cargo)
+        || (plan.canonical_cargo && toolchain_root != "/__rabs/toolchain")
         || plan.compiler != format!("{toolchain_root}/bin/rustc")
         || plan.invocation.compiler_argv0 != plan.compiler
     {
@@ -259,7 +323,7 @@ fn loader_paths(
             continue;
         }
         for entry in value.split(':') {
-            if !plain_path(entry) {
+            if !plain_path_in_profile(entry, plan.canonical_cargo) {
                 return Err(RemoteDependencyRefusal::LoaderEnvironment(
                     "LD_LIBRARY_PATH contains an empty, relative or unrepresentable entry".into(),
                 ));
@@ -269,14 +333,19 @@ fn loader_paths(
             } else if within(entry, toolchain_root) {
                 search_paths.push(entry[toolchain_root.len() + 1..].to_owned());
             } else {
-                if overlaps(entry, toolchain_root)
-                    || overlaps(entry, &plan.source_root)
-                    || [
+                let reserved = if plan.canonical_cargo {
+                    entry != "/__rabs/out/cargo" && !within(entry, "/__rabs/out/cargo")
+                } else {
+                    [
                         "/__rabs", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc",
                         "/dev", "/sys", "/run",
                     ]
                     .iter()
                     .any(|reserved| overlaps(entry, reserved))
+                };
+                if overlaps(entry, toolchain_root)
+                    || overlaps(entry, &plan.source_root)
+                    || reserved
                     || within(entry, &plan.out_dir)
                     || plan.dependency_dirs.iter().any(|root| within(entry, root))
                     || plan
@@ -308,6 +377,32 @@ fn loader_paths(
 /// dependency-inventory restrictions that remote_dependency_key enforces again.
 /// A success admits preparation only; it is not dispatch or cache authority.
 pub fn remote_dependency_shape(
+    plan: &DependencyActionPlan,
+    directories: &[DependencyDirectoryFact],
+    toolchain_root: &str,
+) -> Result<(), RemoteDependencyRefusal> {
+    reject_workspace_cache_authority(plan)?;
+    if plan.canonical_cargo {
+        super::canonical_cargo::canonical_layout(plan)?;
+    }
+    remote_execution_shape(plan, directories, toolchain_root)
+}
+
+fn reject_workspace_cache_authority(
+    plan: &DependencyActionPlan,
+) -> Result<(), RemoteDependencyRefusal> {
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "workspace execution-only plans have no remote dependency-cache authority".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Shared mechanical execution constraints. The public class-specific entry
+/// points validate their source/profile authority before reaching this helper.
+pub(super) fn remote_execution_shape(
     plan: &DependencyActionPlan,
     directories: &[DependencyDirectoryFact],
     toolchain_root: &str,
@@ -367,8 +462,9 @@ fn validate_generated_root(
         return Ok(());
     };
     let overlaps = |other: &str| root == other || within(root, other) || within(other, root);
-    if !plain_path(root)
+    if !plain_path_in_profile(root, plan.canonical_cargo)
         || root.contains(&plan.out_dir)
+        || (!plan.canonical_cargo && overlaps("/__rabs"))
         || [
             plan.source_root.as_str(),
             plan.out_dir.as_str(),
@@ -377,8 +473,7 @@ fn validate_generated_root(
         .into_iter()
         .chain(plan.dependency_dirs.iter().map(String::as_str))
         .chain([
-            "/__rabs", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys",
-            "/run",
+            "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys", "/run",
         ])
         .any(overlaps)
     {
@@ -390,7 +485,7 @@ fn validate_generated_root(
 /// Resolve every explicit extern to its exact keyed candidate. The ordinary
 /// local planner labels a bare extern as toolchain-provided but does not prove
 /// that resolution cannot execute a proc macro, so this remote class refuses it.
-fn remote_extern_facts(
+pub(super) fn remote_extern_facts(
     plan: &DependencyActionPlan,
     directories: &[DependencyDirectoryFact],
 ) -> Result<Vec<ExternFact>, RemoteDependencyRefusal> {
@@ -473,14 +568,49 @@ pub fn remote_dependency_key(
     }
     remote_dependency_shape(plan, directories, toolchain_root)?;
     let externs = remote_extern_facts(plan, directories)?;
-    let mut key = live_dependency_key(
+    let mut key = if plan.canonical_cargo {
+        super::canonical_cargo::canonical_dependency_key(
+            plan,
+            toolchain,
+            &externs,
+            directories,
+            build_script_output,
+            inputs,
+        )?
+    } else {
+        live_dependency_key(
+            plan,
+            toolchain,
+            &externs,
+            directories,
+            build_script_output,
+            inputs,
+        )?
+    };
+    key.descriptor.sandbox_semantic_policy = remote_dependency_isolation_policy(plan)?;
+    bind_remote_execution_inputs(
+        &mut key,
         plan,
-        toolchain,
-        &externs,
-        directories,
-        build_script_output,
-        inputs,
+        toolchain_root,
+        retained_toolchain_sha256,
+        runtime,
     )?;
+    Ok(key)
+}
+
+/// Bind the retained toolchain, exact archive placements and measured runtime
+/// without assigning source-class authority. Workspace callers replace the
+/// complete environment and execution policy with their separate contract.
+pub(super) fn bind_remote_execution_inputs(
+    key: &mut LiveDependencyKey,
+    plan: &DependencyActionPlan,
+    toolchain_root: &str,
+    retained_toolchain_sha256: &[u8; 32],
+    runtime: &TypedDigest,
+) -> Result<(), RemoteDependencyRefusal> {
+    if runtime.domain != RUNTIME_COHORT_DOMAIN {
+        return Err(RemoteDependencyRefusal::RuntimeIdentity);
+    }
     let output_class = remote_dependency_output_class(&plan.invocation)?;
     if output_class == RemoteDependencyOutputClass::Rlib {
         // An assembler `.incbin` can mention the original dependency/output
@@ -530,7 +660,6 @@ pub fn remote_dependency_key(
         .str("toolchain-dataset-v1")
         .bytes(retained_toolchain_sha256);
     key.descriptor.toolchain = compute(REMOTE_TOOLCHAIN_DOMAIN, &retained_toolchain.finish());
-    key.descriptor.sandbox_semantic_policy = remote_dependency_isolation_policy(plan)?;
     let codegen = |name: &str| {
         plan.invocation
             .codegen
@@ -568,15 +697,16 @@ pub fn remote_dependency_key(
     .contract_digest();
     key.action_key = compute_action_key(&key.descriptor).final_key;
     key.descriptor_digest = descriptor_digest(&descriptor_canonical_bytes(&key.descriptor));
-    Ok(key)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::canonical_cargo_dependency_key;
     use super::*;
     use crate::live_dependency::{LiveRustcRequest, plan_dependency_action};
     use rabs_protocol::input_evidence::{
-        INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
     };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
@@ -653,6 +783,15 @@ mod tests {
                     symlink_resolution: Vec::new(),
                 })
                 .collect(),
+            directory_enumerations: plan
+                .generated_root
+                .as_ref()
+                .map(|_| DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
             ..ActionInputManifest::default()
         }
     }
@@ -680,6 +819,283 @@ mod tests {
         plan.outputs =
             derive_dependency_output_declarations(&plan.invocation, &plan.host_triple).unwrap();
         plan
+    }
+
+    fn canonical_plan(out_dir: &str) -> DependencyActionPlan {
+        canonical_plan_with_emit(out_dir, "dep-info,metadata")
+    }
+
+    fn canonical_plan_with_emit(out_dir: &str, emit: &str) -> DependencyActionPlan {
+        canonical_plan_with_generated(out_dir, emit, None)
+    }
+
+    fn canonical_plan_with_generated(
+        out_dir: &str,
+        emit: &str,
+        generated: Option<&str>,
+    ) -> DependencyActionPlan {
+        let package = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
+        let argv = [
+            "/__rabs/toolchain/bin/rustc".to_owned(),
+            "--crate-name=leaf".into(),
+            "--crate-type=lib".into(),
+            "--edition=2021".into(),
+            format!("{package}/src/lib.rs"),
+            "--error-format=json".into(),
+            "--json=artifacts".into(),
+            format!("--emit={emit}"),
+            "--cap-lints=allow".into(),
+            format!("--out-dir={out_dir}"),
+            "-L".into(),
+            format!("dependency={out_dir}"),
+        ];
+        let mut env = vec![
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            ("CARGO_MANIFEST_DIR".into(), package.into()),
+            ("CARGO_PKG_NAME".into(), "leaf".into()),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!("{out_dir}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
+            ),
+        ];
+        if let Some(root) = generated {
+            env.push(("OUT_DIR".into(), root.into()));
+            env.push(("BUILD_LABEL".into(), "pinned".into()));
+        }
+        let request = LiveRustcRequest {
+            argv: &argv,
+            cwd: package,
+            env: &env,
+        };
+        if generated.is_some() {
+            assert!(
+                super::super::plan_canonical_cargo_dependency_action(
+                    request,
+                    "x86_64-unknown-linux-gnu",
+                    None,
+                )
+                .is_err(),
+                "generated inputs cannot select local metadata capture"
+            );
+        } else if emit.contains("link") {
+            assert!(matches!(
+                super::super::plan_canonical_cargo_dependency_action(
+                    request,
+                    "x86_64-unknown-linux-gnu",
+                    None,
+                ),
+                Err(LiveRefusal::UnclosedCodegenInputs)
+            ));
+        }
+        super::super::plan_canonical_remote_dependency_action(
+            request,
+            "x86_64-unknown-linux-gnu",
+            None,
+        )
+        .unwrap()
+    }
+
+    fn canonical_key(
+        plan: &DependencyActionPlan,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_dependency_key(
+            plan,
+            &toolchain(),
+            &directories(plan),
+            &inputs(plan),
+            None,
+            "/__rabs/toolchain",
+            &[41; 32],
+            &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+    }
+
+    #[test]
+    fn canonical_remote_metadata_has_separate_authority_and_exact_replay_identity() {
+        let plan = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let remote = canonical_key(&plan).unwrap();
+        let local = canonical_cargo_dependency_key(
+            &plan,
+            &toolchain(),
+            &[],
+            &directories(&plan),
+            None,
+            &inputs(&plan),
+        )
+        .unwrap();
+        let ordinary = key(&super::tests::plan(OUTPUT), b"runtime");
+        assert_eq!(
+            remote.descriptor.sandbox_semantic_policy.domain,
+            CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN
+        );
+        assert_ne!(remote.action_key, local.action_key);
+        assert_ne!(remote.action_key, ordinary.action_key);
+        assert_ne!(
+            remote.descriptor.sandbox_semantic_policy,
+            ordinary.descriptor.sandbox_semantic_policy
+        );
+        assert_eq!(
+            remote.action_key,
+            compute_action_key(&remote.descriptor).final_key
+        );
+        assert_eq!(
+            remote.descriptor_digest,
+            descriptor_digest(&descriptor_canonical_bytes(&remote.descriptor))
+        );
+        let moved = canonical_plan("/__rabs/out/cargo/debug/other-deps");
+        assert_ne!(remote.action_key, canonical_key(&moved).unwrap().action_key);
+        assert_eq!(
+            remote_loader_search_paths(&plan, "/__rabs/toolchain").unwrap(),
+            ["lib"]
+        );
+        assert_eq!(
+            remote_empty_loader_directories(&plan, "/__rabs/toolchain").unwrap(),
+            ["/__rabs/out/cargo/debug", "/__rabs/out/cargo/debug/deps"]
+        );
+    }
+
+    #[test]
+    fn canonical_remote_context_cannot_borrow_unobserved_generated_or_host_path_authority() {
+        let original = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let mut generated = original.clone();
+        generated.generated_root = Some("/__rabs/out/cargo/debug/build/leaf/out".into());
+        generated
+            .execution_env
+            .push(("OUT_DIR".into(), generated.generated_root.clone().unwrap()));
+        assert!(canonical_key(&generated).is_err());
+        let mut ordinary = original.clone();
+        ordinary.canonical_cargo = false;
+        assert!(canonical_key(&ordinary).is_err());
+        assert!(remote_dependency_shape(&original, &directories(&original), TOOLCHAIN).is_err());
+        for directory in [
+            "/__rabs/home/control",
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/out",
+            "/__rabs/out/cargo-other/debug",
+            "/usr/lib",
+            "/work/target/debug",
+        ] {
+            let mut plan = original.clone();
+            plan.execution_env
+                .iter_mut()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1 = directory.to_owned();
+            assert!(canonical_key(&plan).is_err(), "loader alias {directory}");
+        }
+    }
+
+    #[test]
+    fn canonical_archives_require_remote_authority_and_key_assembler_payload_bytes() {
+        for emit in ["dep-info,link", "dep-info,metadata,link"] {
+            let plan = canonical_plan_with_emit("/__rabs/out/cargo/debug/deps", emit);
+            let archive = canonical_key(&plan).unwrap();
+            assert_eq!(
+                remote_dependency_output_class(&plan.invocation),
+                Ok(RemoteDependencyOutputClass::Rlib)
+            );
+            assert!(plan.output_names().contains(&"libleaf.rlib".to_owned()));
+            assert!(matches!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    None,
+                    &inputs(&plan),
+                ),
+                Err(LiveRefusal::UnclosedCodegenInputs)
+            ));
+            assert!(
+                live_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    None,
+                    &inputs(&plan),
+                )
+                .is_err()
+            );
+            let metadata = canonical_key(&canonical_plan(&plan.out_dir)).unwrap();
+            let ordinary = key(&archive_plan(OUTPUT, emit.contains("metadata")), b"runtime");
+            for other in [metadata, ordinary] {
+                assert_ne!(archive.action_key, other.action_key);
+                assert_ne!(
+                    archive.descriptor.sandbox_semantic_policy,
+                    other.descriptor.sandbox_semantic_policy
+                );
+            }
+            assert_eq!(
+                archive.descriptor.normalized_invocation.domain,
+                "rabs.remote-rlib.exact-invocation.v1"
+            );
+            let moved = canonical_plan_with_emit("/__rabs/out/cargo/release/deps", emit);
+            assert_ne!(
+                archive.action_key,
+                canonical_key(&moved).unwrap().action_key
+            );
+
+            // .incbin is absent from rustc dep-info. The complete retained
+            // package inventory, rather than a discovered Rust read set, must
+            // therefore invalidate an archive when those bytes change.
+            let mut retained = inputs(&plan);
+            retained.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(plan.input_virtual_path("payload.bin").into_bytes()),
+                object: ObjectId(compute("test.source.v1", b"assembler payload one")),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+            let with_inputs = |inputs: &ActionInputManifest| {
+                remote_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &directories(&plan),
+                    inputs,
+                    None,
+                    "/__rabs/toolchain",
+                    &[41; 32],
+                    &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .unwrap()
+            };
+            let first = with_inputs(&retained);
+            retained.inputs.last_mut().unwrap().object =
+                ObjectId(compute("test.source.v1", b"assembler payload two"));
+            assert_ne!(first.action_key, with_inputs(&retained).action_key);
+            assert_eq!(
+                archive.action_key,
+                compute_action_key(&archive.descriptor).final_key
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_remote_archive_policy_does_not_admit_other_codegen_or_native_linking() {
+        let original = canonical_plan_with_emit("/__rabs/out/cargo/debug/deps", "dep-info,link");
+        for emit in [
+            vec!["link"],
+            vec!["dep-info", "metadata", "link", "asm"],
+            vec!["dep-info", "obj"],
+            vec!["dep-info", "llvm-ir"],
+        ] {
+            let mut plan = original.clone();
+            plan.invocation.emit = emit.into_iter().map(str::to_owned).collect();
+            assert!(canonical_key(&plan).is_err());
+            assert!(remote_dependency_isolation_policy(&plan).is_err());
+        }
+        for crate_type in ["bin", "dylib", "cdylib", "staticlib", "proc-macro"] {
+            let mut plan = original.clone();
+            plan.invocation.crate_types = vec![crate_type.into()];
+            assert!(canonical_key(&plan).is_err());
+            assert!(remote_dependency_isolation_policy(&plan).is_err());
+        }
+        let mut generated = original.clone();
+        generated.generated_root = Some("/__rabs/out/cargo/debug/build/leaf/out".into());
+        assert!(canonical_key(&generated).is_err());
     }
 
     #[test]
@@ -1297,6 +1713,11 @@ mod tests {
 
     fn generated_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
         let mut inputs = inputs(plan);
+        inputs.directory_enumerations[0].entries = vec![RawBytes::from("nested")];
+        inputs.directory_enumerations.push(DirectoryEnumeration {
+            virtual_path: RawBytes::new(plan.generated_input_virtual_path("nested").into_bytes()),
+            entries: vec![RawBytes::from("generated.rs")],
+        });
         inputs.inputs.push(PositiveInput {
             virtual_path: RawBytes::new(
                 plan.generated_input_virtual_path("nested/generated.rs")
@@ -1321,10 +1742,329 @@ mod tests {
             &directories(plan),
             inputs,
             record,
-            TOOLCHAIN,
+            if plan.canonical_cargo {
+                "/__rabs/toolchain"
+            } else {
+                TOOLCHAIN
+            },
             &[41; 32],
             &compute(RUNTIME_COHORT_DOMAIN, b"same-runtime"),
         )
+    }
+
+    #[test]
+    fn canonical_generated_compiles_bind_complete_tree_and_cargo_record_in_both_output_modes() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        let mut keys = Vec::new();
+        for emit in [
+            "dep-info,metadata",
+            "dep-info,link",
+            "dep-info,metadata,link",
+        ] {
+            let plan =
+                canonical_plan_with_generated("/__rabs/out/cargo/debug/deps", emit, Some(root));
+            let retained = generated_inputs(&plan);
+            let original = generated_key(&plan, &retained, Some(record)).unwrap();
+            assert!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    Some(record),
+                    &retained,
+                )
+                .is_err(),
+                "a canonical local completion cannot acquire generated-input authority"
+            );
+            let mut changed = retained.clone();
+            changed.inputs.last_mut().unwrap().object =
+                ObjectId(compute("rabs.test.v1", b"pub const VALUE: u32 = 99;"));
+            assert_ne!(
+                generated_key(&plan, &changed, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "generated bytes, including assembler inputs, are semantic"
+            );
+            let mut added = retained.clone();
+            let mut file = added.inputs.last().unwrap().clone();
+            file.virtual_path =
+                RawBytes::new(plan.generated_input_virtual_path("extra.bin").into_bytes());
+            added.inputs.push(file);
+            added.directory_enumerations[0]
+                .entries
+                .insert(0, RawBytes::from("extra.bin"));
+            assert_ne!(
+                generated_key(&plan, &added, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "complete generated membership is semantic"
+            );
+            let mut empty_directories = retained.clone();
+            empty_directories.directory_enumerations[0]
+                .entries
+                .insert(0, RawBytes::from("empty"));
+            empty_directories.directory_enumerations.extend([
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("empty").into_bytes(),
+                    ),
+                    entries: vec![RawBytes::from("child")],
+                },
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("empty/child")
+                            .into_bytes(),
+                    ),
+                    entries: Vec::new(),
+                },
+            ]);
+            assert_ne!(
+                generated_key(&plan, &empty_directories, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "empty generated directories remain semantic in every remote output mode"
+            );
+            assert_ne!(
+                generated_key(
+                    &plan,
+                    &retained,
+                    Some(
+                        b"cargo::rustc-env=BUILD_LABEL=pinned\ncargo::rerun-if-changed=input.dat\n"
+                    )
+                )
+                .unwrap()
+                .action_key,
+                original.action_key,
+                "the exact Cargo record is semantic"
+            );
+            assert!(generated_key(&plan, &retained, None).is_err());
+            assert!(
+                generated_key(
+                    &plan,
+                    &retained,
+                    Some(b"cargo::rustc-env=BUILD_LABEL=stale\n")
+                )
+                .is_err()
+            );
+            let moved = canonical_plan_with_generated(
+                "/__rabs/out/cargo/debug/deps",
+                emit,
+                Some("/__rabs/out/cargo/debug/build/other-unit/out"),
+            );
+            assert_ne!(
+                generated_key(&moved, &retained, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "original canonical OUT_DIR spelling is retained"
+            );
+            assert_eq!(
+                original.action_key,
+                compute_action_key(&original.descriptor).final_key
+            );
+            keys.push(original.action_key);
+        }
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
+    }
+
+    #[test]
+    fn canonical_empty_generated_tree_is_keyed_without_inventing_a_generated_file() {
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some("/__rabs/out/cargo/debug/build/leaf-unit/out"),
+        );
+        let source_only = inputs(&plan);
+        let empty = generated_key(&plan, &source_only, Some(b"")).unwrap();
+        let no_generated = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let absent = generated_key(&no_generated, &inputs(&no_generated), None).unwrap();
+        assert_ne!(empty.action_key, absent.action_key);
+        assert_ne!(
+            empty.descriptor.negative_dependencies,
+            absent.descriptor.negative_dependencies
+        );
+        assert!(generated_key(&plan, &source_only, None).is_err());
+        assert!(generated_key(&no_generated, &inputs(&no_generated), Some(b"")).is_err());
+        assert_ne!(
+            empty.action_key,
+            generated_key(&plan, &generated_inputs(&plan), Some(b""))
+                .unwrap()
+                .action_key
+        );
+    }
+
+    #[test]
+    fn canonical_generated_stdout_requires_matching_keyed_rustc_env() {
+        let mut plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some("/__rabs/out/cargo/debug/build/leaf-generated/out"),
+        );
+        let stdout = b"cargo::rustc-env=GENERATED_LABEL=one\n";
+        assert!(generated_key(&plan, &inputs(&plan), Some(stdout)).is_err());
+        plan.execution_env
+            .push(("GENERATED_LABEL".into(), "one".into()));
+        plan.keyed_env
+            .push(("GENERATED_LABEL".into(), "one".into()));
+        plan.execution_env.sort();
+        plan.keyed_env.sort();
+        let original = generated_key(&plan, &inputs(&plan), Some(stdout)).unwrap();
+        let changed_stdout = b"cargo::rustc-env=GENERATED_LABEL=two\n";
+        assert!(generated_key(&plan, &inputs(&plan), Some(changed_stdout)).is_err());
+        for environment in [&mut plan.execution_env, &mut plan.keyed_env] {
+            environment
+                .iter_mut()
+                .find(|(name, _)| name == "GENERATED_LABEL")
+                .unwrap()
+                .1 = "two".into();
+        }
+        assert_ne!(
+            original.action_key,
+            generated_key(&plan, &inputs(&plan), Some(changed_stdout))
+                .unwrap()
+                .action_key
+        );
+        assert!(generated_key(&plan, &inputs(&plan), Some(stdout)).is_err());
+        assert!(generated_key(&plan, &inputs(&plan), Some(b"cargo::rustc-env=broken\n")).is_err());
+    }
+
+    #[test]
+    fn canonical_generated_paths_and_dep_info_cannot_escape_the_retained_tree() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some(root),
+        );
+        let retained = generated_inputs(&plan);
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        generated_key(&plan, &retained, Some(record)).unwrap();
+        let raw = format!(
+            "{}/leaf.d: {}/src/lib.rs {root}/nested/generated.rs\n# env-dep:OUT_DIR={root}\n",
+            plan.out_dir, plan.source_root
+        );
+        let captured = |path: &str| {
+            retained
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        assert!(
+            super::super::dep_info_closure_violation(&plan, raw.as_bytes(), captured).is_none()
+        );
+        assert_eq!(
+            super::super::canonicalize_placements(raw.as_bytes(), &plan).unwrap(),
+            raw.as_bytes()
+        );
+        let diagnostic = format!(
+            "{{\"$message_type\":\"diagnostic\",\"message\":\"generated input {root}/nested/generated.rs\"}}\n"
+        );
+        assert_eq!(
+            super::super::canonicalize_compiler_transcript(diagnostic.as_bytes(), &plan).unwrap(),
+            diagnostic.as_bytes(),
+        );
+        let uncaptured = raw.replace("nested/generated.rs", "nested/missing.rs");
+        assert!(
+            super::super::dep_info_closure_violation(&plan, uncaptured.as_bytes(), captured)
+                .is_some()
+        );
+        let escaped = raw.replace(
+            &format!("{root}/nested/generated.rs"),
+            "/__rabs/home/control/rustc.sock",
+        );
+        assert!(
+            super::super::dep_info_closure_violation(&plan, escaped.as_bytes(), |_| true).is_some(),
+            "a claimed capture cannot authorize a read outside the package and generated tree"
+        );
+
+        for bad in [
+            "/__rabs/home/control",
+            "/__rabs/cargo-home/registry/generated",
+            "/__rabs/workspace/generated",
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug/deps",
+            "/__rabs/out/cargo/debug/deps/nested",
+            "/__rabs/out/cargo/debug",
+            "/__rabs/out/cargo/../escape",
+            "/__rabs/out/cargo-other/debug/build/leaf/out",
+            "/__rabs/toolchain/generated",
+            "/tmp/host-generated",
+            "/usr/generated",
+        ] {
+            let mut bad_plan = plan.clone();
+            bad_plan.generated_root = Some(bad.into());
+            for env in [&mut bad_plan.execution_env, &mut bad_plan.keyed_env] {
+                env.iter_mut()
+                    .find(|(name, _)| name == "OUT_DIR")
+                    .unwrap()
+                    .1 = bad.into();
+            }
+            assert!(
+                generated_key(&bad_plan, &retained, Some(record)).is_err(),
+                "{bad}"
+            );
+        }
+        let mut missing = plan.clone();
+        missing.generated_root = None;
+        assert!(generated_key(&missing, &retained, Some(record)).is_err());
+        let mut duplicate = plan.clone();
+        duplicate
+            .execution_env
+            .push(("OUT_DIR".into(), root.into()));
+        assert!(generated_key(&duplicate, &retained, Some(record)).is_err());
+        let mut missing_environment = plan.clone();
+        missing_environment
+            .execution_env
+            .retain(|(name, _)| name != "OUT_DIR");
+        assert!(generated_key(&missing_environment, &retained, Some(record)).is_err());
+        let mut mismatched_environment = plan.clone();
+        mismatched_environment
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "OUT_DIR")
+            .unwrap()
+            .1 = "/__rabs/out/cargo/debug/build/other-unit/out".into();
+        assert!(generated_key(&mismatched_environment, &retained, Some(record)).is_err());
+        let mut candidate_alias = plan.clone();
+        candidate_alias.dependency_dirs.push(root.into());
+        assert!(generated_key(&candidate_alias, &retained, Some(record)).is_err());
+    }
+
+    #[test]
+    fn canonical_generated_loader_parent_stays_empty_and_cannot_load_generated_libraries() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some(root),
+        );
+        // Cargo puts this ancestor on its loader path. It remains an empty
+        // skeleton above the separately bound read-only generated input tree.
+        assert!(
+            remote_empty_loader_directories(&plan, "/__rabs/toolchain")
+                .unwrap()
+                .contains(&"/__rabs/out/cargo/debug".to_owned())
+        );
+        remote_dependency_shape(&plan, &directories(&plan), "/__rabs/toolchain").unwrap();
+        for loader in [root.to_owned(), format!("{root}/lib")] {
+            let mut changed = plan.clone();
+            changed
+                .execution_env
+                .iter_mut()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1 = loader;
+            assert!(matches!(
+                remote_dependency_shape(&changed, &directories(&changed), "/__rabs/toolchain"),
+                Err(RemoteDependencyRefusal::LoaderEnvironment(_))
+            ));
+        }
     }
 
     #[test]
@@ -1372,6 +2112,9 @@ mod tests {
         member.virtual_path =
             RawBytes::new(plan.generated_input_virtual_path("new.rs").into_bytes());
         added.inputs.push(member);
+        added.directory_enumerations[0]
+            .entries
+            .push(RawBytes::from("new.rs"));
         assert_ne!(
             remote.action_key,
             generated_key(&plan, &added, Some(record))

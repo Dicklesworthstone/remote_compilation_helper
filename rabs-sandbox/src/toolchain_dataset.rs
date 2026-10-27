@@ -15,7 +15,6 @@
 //! Callers must reject outputs if verification fails. Failed new directories are
 //! retained for inspection, never overwritten or silently reused.
 
-#[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -238,13 +237,37 @@ pub fn capture_toolchain(
     limits: &ToolchainLimits,
     stopped: impl Fn() -> bool,
 ) -> io::Result<PreparedToolchain> {
+    capture_toolchain_with_cloner(source, destination, expected, limits, stopped, |_, _, _| {
+        false
+    })
+}
+
+/// Capture using an optional verified private copy-on-write primitive supplied
+/// by the effects-owning caller. The callback must never alias source inodes or
+/// mutate source bytes. It is tried only for files larger than one copy buffer.
+/// A false result falls back to a complete byte copy, resetting both cursors and
+/// truncating any partial destination left by the attempt.
+///
+/// Cloning replaces only writes: source bytes still determine the identity,
+/// source mutation barriers remain in force, and the complete actual destination
+/// is independently rehashed before ownership returns. A successful callback is
+/// never content evidence. Keeping the primitive here as a callback preserves
+/// the sandbox's dependency direction and its prohibition on unsafe code.
+pub fn capture_toolchain_with_cloner(
+    source: &Path,
+    destination: &Path,
+    expected: Option<&ToolchainIdentity>,
+    limits: &ToolchainLimits,
+    stopped: impl Fn() -> bool,
+    cloner: impl Fn(&File, &File, &Path) -> bool,
+) -> io::Result<PreparedToolchain> {
     #[cfg(target_os = "linux")]
     {
-        linux::capture(source, destination, expected, limits, &stopped)
+        linux::capture(source, destination, expected, limits, &stopped, &cloner)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (source, destination, expected, limits, stopped);
+        let _ = (source, destination, expected, limits, stopped, cloner);
         Err(unsupported())
     }
 }
@@ -712,6 +735,15 @@ mod linux {
             destination: Option<&Path>,
             stopped: &impl Fn() -> bool,
         ) -> io::Result<ToolchainIdentity> {
+            self.stream_with_cloner(destination, stopped, &|_, _, _| false)
+        }
+
+        fn stream_with_cloner(
+            &self,
+            destination: Option<&Path>,
+            stopped: &impl Fn() -> bool,
+            cloner: &impl Fn(&File, &File, &Path) -> bool,
+        ) -> io::Result<ToolchainIdentity> {
             let mut digest = Sha256::new();
             digest.update(TOOLCHAIN_DATASET_VERSION.as_bytes());
             let mut buffer = [0_u8; 64 * 1024];
@@ -753,6 +785,36 @@ mod linux {
                                     .open(root.join(path))
                             })
                             .transpose()?;
+                        let cloned =
+                            if let (Some(parent), Some(output)) = (destination, &mut output) {
+                                // The caller supplies the already-audited primitive;
+                                // small files avoid its filesystem isolation probe.
+                                let attempted = entry.stamp.size > buffer.len() as u64;
+                                let cloned = attempted && cloner(&source, output, parent);
+                                checkpoint(stopped)?;
+                                if cloned {
+                                    let metadata = output.metadata()?;
+                                    require(
+                                        metadata.is_file()
+                                            && metadata.len() == entry.stamp.size
+                                            && (metadata.dev(), metadata.ino())
+                                                != (entry.stamp.device, entry.stamp.inode),
+                                        "toolchain clone is not an independent complete file",
+                                    )?;
+                                } else if attempted {
+                                    // Failed primitives may leave both a partial
+                                    // suffix and moved file offsets. Neither may
+                                    // leak into the verified fallback copy.
+                                    output.set_len(0)?;
+                                    output.rewind()?;
+                                }
+                                if attempted {
+                                    source.rewind()?;
+                                }
+                                cloned
+                            } else {
+                                false
+                            };
                         let mut file_digest = Sha256::new();
                         let mut copied = 0_u64;
                         loop {
@@ -766,7 +828,7 @@ mod linux {
                                 .filter(|bytes| *bytes <= entry.stamp.size)
                                 .ok_or_else(|| invalid("toolchain file grew during capture"))?;
                             file_digest.update(&buffer[..read]);
-                            if let Some(output) = &mut output {
+                            if !cloned && let Some(output) = &mut output {
                                 output.write_all(&buffer[..read])?;
                             }
                         }
@@ -820,6 +882,7 @@ mod linux {
         expected: Option<&ToolchainIdentity>,
         limits: &ToolchainLimits,
         stopped: &impl Fn() -> bool,
+        cloner: &impl Fn(&File, &File, &Path) -> bool,
     ) -> io::Result<PreparedToolchain> {
         absolute(destination)?;
         let parent = fs::canonicalize(
@@ -845,7 +908,7 @@ mod linux {
         let inventory = Inventory::scan(source, limits, stopped)?;
         checkpoint(stopped)?;
         fs::DirBuilder::new().mode(0o700).create(&destination)?;
-        let identity = inventory.stream(Some(&destination), stopped)?;
+        let identity = inventory.stream_with_cloner(Some(&destination), stopped, cloner)?;
         inventory.verify(stopped)?;
         require(
             expected.is_none_or(|expected| *expected == identity),

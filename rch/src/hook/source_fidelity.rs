@@ -860,9 +860,10 @@ pub(super) fn validate_owned_source_content_closure(
                             "captured Cargo metadata changed: {}",
                             local.display()
                         );
-                        Some(String::from_utf8(bytes).with_context(|| {
-                            format!("captured Cargo metadata is not UTF-8: {}", local.display())
-                        })?)
+                        // Preserve opaque fixture bytes in the captured file
+                        // commitment. Only reachable manifests require text;
+                        // selected configs remain universally checked.
+                        String::from_utf8(bytes).ok()
                     } else {
                         None
                     };
@@ -879,11 +880,8 @@ pub(super) fn validate_owned_source_content_closure(
     let primary_directory = primary_directory.ok_or_else(|| {
         anyhow::anyhow!("owned source closure has no primary invocation directory")
     })?;
-    let selected_local_manifest = normalize(
-        &selected_manifest_root
-            .unwrap_or(local_build_dir)
-            .join("Cargo.toml"),
-    )?;
+    let selected_local_manifest =
+        normalize(selected_manifest_root.unwrap_or(local_build_dir))?.join("Cargo.toml");
     let selected_manifest = local_files.get(&selected_local_manifest).ok_or_else(|| {
         anyhow::anyhow!("Cargo entrypoint is not present in the captured source closure")
     })?;
@@ -2120,6 +2118,12 @@ mod tests {
             OwnedSyncClosureLayout,
             Vec<PreparedSourceContentRoot>,
         ) {
+            // These tiny source/config trees must not inherit the checkout's
+            // unselected .cargo config through a managed TMPDIR. The guard
+            // still walks every physical ancestor and refuses any ambient one.
+            // Prefix names the owned-closure fixture; the directory itself is
+            // created under /tmp so a managed TMPDIR inside a Cargo workspace
+            // cannot become a physical ancestor.
             let temp = tempfile::Builder::new()
                 .prefix("rch-owned-closure-")
                 .tempdir_in("/tmp")
@@ -2142,6 +2146,10 @@ mod tests {
                     "pub fn value() -> u32 { member::value() }\n",
                 ),
                 (
+                    "workspace/apps/app/tests/negative/Cargo.toml",
+                    "[package]\nname = \"negative\"\nversion = \"0.1.0\"\nbuild = \"missing.rs\"\n",
+                ),
+                (
                     "foreign/Cargo.toml",
                     "[workspace]\nmembers = [\"crates/member\"]\n",
                 ),
@@ -2159,6 +2167,9 @@ mod tests {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, contents).unwrap();
             }
+            let opaque = local.join("workspace/apps/app/tests/opaque/Cargo.toml");
+            fs::create_dir_all(opaque.parent().unwrap()).unwrap();
+            fs::write(opaque, [0xff, 0xfe]).unwrap();
             let policy = PathTopologyPolicy::new(local.clone(), local.clone());
             let primary = local.join("workspace/apps/app");
             let plan = build_sync_closure_plan(
@@ -2270,6 +2281,52 @@ mod tests {
                 &policy,
             )
             .unwrap();
+        }
+
+        #[tokio::test]
+        async fn captured_fixture_commitments_survive_until_identical_manifest_activation() {
+            let (_temp, policy, layout, prepared) = fixture().await;
+            let cwd = policy.canonical_root().join("workspace/apps/app");
+            for (relative, expected_error) in [
+                ("tests/negative/Cargo.toml", "missing.rs"),
+                ("tests/opaque/Cargo.toml", "primary manifest text"),
+            ] {
+                let local = cwd.join(relative);
+                let original = fs::read(&local).unwrap();
+                let committed = prepared
+                    .iter()
+                    .flat_map(|root| {
+                        root.manifest.files.iter().map(|file| {
+                            (Path::new(&root.manifest.local_root).join(&file.path), file)
+                        })
+                    })
+                    .find(|(path, _)| path == &local)
+                    .unwrap()
+                    .1;
+                assert_eq!(committed.byte_count, original.len() as u64);
+                assert_eq!(committed.sha256, sha256_hex(&original));
+                validate_owned_source_content_closure(
+                    &prepared,
+                    &layout.source_root,
+                    &cwd,
+                    None,
+                    "cargo check --all-targets --locked",
+                    &policy,
+                )
+                .unwrap();
+                let selected = local.parent().unwrap();
+                let error = validate_owned_source_content_closure(
+                    &prepared,
+                    &layout.source_root,
+                    &cwd,
+                    Some(selected),
+                    &format!("cargo check --manifest-path {relative}"),
+                    &policy,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(expected_error), "{error:#}");
+                assert_eq!(fs::read(local).unwrap(), original);
+            }
         }
 
         #[tokio::test]
@@ -2409,7 +2466,7 @@ mod tests {
             fs::create_dir(&home).unwrap();
             let cwd = layout.plan.iter().find(|entry| entry.is_primary).unwrap();
             let run_guard = |guard: &str, home: &Path| {
-                std::process::Command::new("/bin/sh")
+                std::process::Command::new("/bin/sh") // ubs:ignore — runs the generated config guard around the fixed fixture Cargo stub in this private test tree.
                     .args(["-c", guard])
                     .current_dir(&cwd.remote_root)
                     .env("CARGO_HOME", home)

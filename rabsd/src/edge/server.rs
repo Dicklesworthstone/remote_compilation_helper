@@ -352,7 +352,11 @@ async fn serve(
             .clone()
             .map(|lane| {
                 match &canonical {
-                    Some((paths, _)) => Ok(rustc_request::LiveEdge::canonical(lane, paths.clone())),
+                    Some((paths, _)) => rustc_request::LiveEdge::canonical_configured(
+                        lane,
+                        paths.clone(),
+                        &config.state_dir,
+                    ),
                     None => rustc_request::LiveEdge::configured(lane, &config.state_dir),
                 }
                 .map(std::sync::Arc::new)

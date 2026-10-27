@@ -3,6 +3,13 @@
 use super::*;
 use serde_json::{Value, json};
 
+fn original_selection(mode: DependencyExecutionMode) -> DependencySelection {
+    DependencySelection {
+        version: DEPENDENCY_CONTEXT_VERSION,
+        mode,
+    }
+}
+
 fn context() -> Value {
     json!({
         "version":DEPENDENCY_CONTEXT_VERSION,
@@ -14,6 +21,7 @@ fn context() -> Value {
         "out_dir":"/work/target/debug/deps",
         "dependency_dirs":["/work/target/debug/deps"],
         "artifact_roots":[],
+        "generated_directories":[],
         "env":[["DEPENDENCY_FLAVOR","spaces \"quotes\" $HOME\n雪"],["EXPLICIT_EMPTY",""]],
         "runtime_cohort_sha256":"ab".repeat(32),
     })
@@ -40,6 +48,396 @@ fn dependency_request() -> Value {
         "artifacts":{"unit":"leaf","files":["leaf.d","libleaf.rmeta"]},
         "dependency_context":context(),
     })
+}
+
+fn canonical_dependency_request() -> Value {
+    let mut request = dependency_request();
+    request["program"] = json!("/__rabs/toolchain/bin/rustc");
+    request["args"] = json!([
+        "--crate-name",
+        "leaf",
+        "--crate-type",
+        "lib",
+        "--emit=dep-info,metadata",
+        "--out-dir",
+        "/__rabs/out/cargo/debug/deps",
+        "src/lib.rs",
+    ]);
+    request["dependency_context"] = json!({
+        "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+        "execution_mode":"metadata",
+        "source_root":"/__rabs/cargo-home/registry/src/pinned/leaf-1.0.0",
+        "cwd":"/__rabs/cargo-home/registry/src/pinned/leaf-1.0.0",
+        "toolchain_root":"/__rabs/toolchain",
+        "compiler":"/__rabs/toolchain/bin/rustc",
+        "out_dir":"/__rabs/out/cargo/debug/deps",
+        "dependency_dirs":["/__rabs/out/cargo/debug/deps"],
+        "artifact_roots":[],
+        "generated_directories":[],
+        "env":[
+            ["HOME","/__rabs/home"],
+            ["CARGO_HOME","/__rabs/cargo-home"],
+            ["CARGO_MANIFEST_DIR","/__rabs/cargo-home/registry/src/pinned/leaf-1.0.0"],
+        ],
+        "runtime_cohort_sha256":"ab".repeat(32),
+    });
+    request
+}
+
+#[test]
+fn canonical_dependency_decode_retains_exact_cargo_paths_and_closed_outputs() {
+    let wire = canonical_dependency_request();
+    let parsed = parse_exec_request(&wire).unwrap();
+    let context = parsed.dependency_context.as_ref().unwrap();
+    assert_eq!(context.version(), CANONICAL_DEPENDENCY_CONTEXT_VERSION);
+    assert!(context.canonical_cargo());
+    assert_eq!(context.execution_mode(), DependencyExecutionMode::Metadata);
+    assert_eq!(context.compiler(), "/__rabs/toolchain/bin/rustc");
+    assert_eq!(context.toolchain_root(), "/__rabs/toolchain");
+    assert_eq!(
+        context.cwd(),
+        "/__rabs/cargo-home/registry/src/pinned/leaf-1.0.0"
+    );
+    assert_eq!(context.out_dir(), "/__rabs/out/cargo/debug/deps");
+    assert_eq!(context.generated_root(), None);
+    assert!(parsed.toolchain_backing.is_empty() && parsed.workspace_backing.is_empty());
+    assert_eq!(
+        wire,
+        canonical_dependency_request(),
+        "decoding must not rewrite request identity"
+    );
+    let ordinary = parse_exec_request(&dependency_request()).unwrap();
+    let ordinary = ordinary.dependency_context.unwrap();
+    assert_eq!(ordinary.version(), DEPENDENCY_CONTEXT_VERSION);
+    assert!(!ordinary.canonical_cargo());
+}
+
+#[test]
+fn canonical_dependency_context_requires_its_paths_and_matching_compiler_mode() {
+    for (field, value) in [
+        ("version", json!(DEPENDENCY_CONTEXT_VERSION)),
+        ("execution_mode", json!("rlib")),
+        ("generated_root", json!("/__rabs/out/cargo/debug/generated")),
+        ("toolchain_root", json!("/home/user/toolchains/pinned")),
+        ("compiler", json!("/home/user/toolchains/pinned/bin/rustc")),
+        ("source_root", json!("/__rabs/cargo-home")),
+        ("out_dir", json!("/__rabs/home/control")),
+    ] {
+        let mut request = canonical_dependency_request();
+        request["dependency_context"][field] = value;
+        assert!(parse_exec_request(&request).is_err(), "{field}");
+    }
+    let mut ordinary = dependency_request();
+    ordinary["dependency_context"]["version"] = json!(CANONICAL_DEPENDENCY_CONTEXT_VERSION);
+    assert!(parse_exec_request(&ordinary).is_err());
+}
+
+fn canonical_archive_request(separate_metadata: bool) -> Value {
+    let mut request = canonical_dependency_request();
+    request["dependency_context"]["execution_mode"] = json!("rlib");
+    request["args"] = json!([
+        "--crate-name",
+        "leaf",
+        "--crate-type",
+        "rlib",
+        if separate_metadata {
+            "--emit=dep-info,metadata,link"
+        } else {
+            "--emit=dep-info,link"
+        },
+        "--out-dir",
+        "/__rabs/out/cargo/debug/deps",
+        "src/lib.rs",
+    ]);
+    request["artifacts"]["files"] = if separate_metadata {
+        json!(["leaf.d", "libleaf.rmeta", "libleaf.rlib"])
+    } else {
+        json!(["leaf.d", "libleaf.rlib"])
+    };
+    request
+}
+
+fn canonical_generated_request(archive: bool, populated: bool) -> Value {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    let mut request = if archive {
+        canonical_archive_request(true)
+    } else {
+        canonical_dependency_request()
+    };
+    let generated = "/__rabs/out/cargo/debug/build/leaf-hash/out";
+    request["dependency_context"]["generated_root"] = json!(generated);
+    request["dependency_context"]["loader_dirs"] = json!(["/__rabs/out/cargo/debug"]);
+    request["dependency_context"]["env"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!(["OUT_DIR", generated]),
+            json!([
+                "LD_LIBRARY_PATH",
+                "/__rabs/out/cargo/debug:/__rabs/toolchain/lib"
+            ]),
+        ]);
+    if populated {
+        request["dependency_context"]["generated_directories"] = json!(["nested"]);
+        let manifest = SourceManifest::new(vec![
+            SourceFile {
+                path: "package/src/lib.rs".into(),
+                len: 1,
+                sha256: [1; 32],
+                executable: false,
+            },
+            SourceFile {
+                path: "generated/nested/input.rs".into(),
+                len: 1,
+                sha256: [2; 32],
+                executable: false,
+            },
+        ])
+        .unwrap();
+        request["source_manifest"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "path":"generated/nested/input.rs", "bytes":1,
+                "sha256":"02".repeat(32), "executable":false,
+            }));
+        request["source_manifest"]["manifest_sha256"] =
+            json!(rabs_wkr::source_transfer::hex(&manifest.digest()));
+    }
+    request
+}
+
+#[test]
+fn canonical_generated_context_decodes_empty_and_populated_trees_in_both_modes() {
+    for archive in [false, true] {
+        for populated in [false, true] {
+            let wire = canonical_generated_request(archive, populated);
+            let original = wire.clone();
+            let parsed = parse_exec_request(&wire).unwrap();
+            let context = parsed.dependency_context.unwrap();
+            assert_eq!(context.version(), "canonical-dependency-exec-v4");
+            assert!(context.canonical_cargo());
+            assert_eq!(
+                context.execution_mode(),
+                if archive {
+                    DependencyExecutionMode::Rlib
+                } else {
+                    DependencyExecutionMode::Metadata
+                }
+            );
+            assert_eq!(
+                context.generated_root(),
+                Some("/__rabs/out/cargo/debug/build/leaf-hash/out")
+            );
+            assert!(context.env().contains(&(
+                "OUT_DIR".into(),
+                "/__rabs/out/cargo/debug/build/leaf-hash/out".into()
+            )));
+            assert_eq!(
+                wire, original,
+                "decoder changed the retained input contract"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_archive_decode_preserves_mode_paths_and_complete_output_contract() {
+    for separate_metadata in [false, true] {
+        let original = canonical_archive_request(separate_metadata);
+        let parsed = parse_exec_request(&original).unwrap();
+        let context = parsed.dependency_context.as_ref().unwrap();
+        assert!(context.canonical_cargo());
+        assert_eq!(context.version(), CANONICAL_DEPENDENCY_CONTEXT_VERSION);
+        assert_eq!(context.execution_mode(), DependencyExecutionMode::Rlib);
+        assert_eq!(context.compiler(), "/__rabs/toolchain/bin/rustc");
+        assert_eq!(context.out_dir(), "/__rabs/out/cargo/debug/deps");
+        assert_eq!(original, canonical_archive_request(separate_metadata));
+        for outputs in [
+            json!(["leaf.d", "libleaf.rmeta"]),
+            json!(["leaf.d", "libleaf.rlib", "unclaimed.o"]),
+        ] {
+            let mut request = original.clone();
+            request["artifacts"]["files"] = outputs;
+            assert!(parse_exec_request(&request).is_err());
+        }
+        for (field, value) in [
+            ("version", json!("canonical-dependency-exec-v1")),
+            ("version", json!("canonical-dependency-exec-v2")),
+            ("version", json!(DEPENDENCY_CONTEXT_VERSION)),
+            ("execution_mode", json!("metadata")),
+            ("generated_root", json!("/__rabs/out/cargo/debug/generated")),
+        ] {
+            let mut request = original.clone();
+            request["dependency_context"][field] = value;
+            assert!(parse_exec_request(&request).is_err(), "{field}");
+        }
+    }
+}
+
+#[test]
+fn canonical_generated_dependency_decode_requires_v4_and_exact_owned_out_dir() {
+    let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+    for mut request in [
+        canonical_dependency_request(),
+        canonical_archive_request(true),
+    ] {
+        request["dependency_context"]["generated_root"] = json!(generated);
+        request["dependency_context"]["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(["OUT_DIR", generated]));
+        let original = request.clone();
+        let parsed = parse_exec_request(&request).unwrap();
+        let context = parsed.dependency_context.unwrap();
+        assert_eq!(context.version(), "canonical-dependency-exec-v4");
+        assert_eq!(context.generated_root(), Some(generated));
+        assert!(
+            context
+                .env()
+                .contains(&("OUT_DIR".into(), generated.into()))
+        );
+        assert_eq!(request, original, "decoding changed exact request identity");
+
+        for version in [
+            "canonical-dependency-exec-v1",
+            "canonical-dependency-exec-v2",
+            "canonical-dependency-exec-v3",
+            DEPENDENCY_CONTEXT_VERSION,
+        ] {
+            let mut obsolete = request.clone();
+            obsolete["dependency_context"]["version"] = json!(version);
+            assert!(parse_exec_request(&obsolete).is_err(), "{version}");
+        }
+        for root in [
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug",
+            "/__rabs/out/cargo/debug/deps",
+            "/__rabs/out/cargo/debug/deps/generated",
+            "/__rabs/out/cargo/debug/build/../out",
+            "/__rabs/out/cargo-other/generated",
+            "/__rabs/workspace/generated",
+            "/__rabs/cargo-home/generated",
+            "/__rabs/cargo-home/registry/src/pinned/leaf-1.0.0/generated",
+            "/__rabs/toolchain/generated",
+            "/__rabs/home/control",
+            "/usr/generated",
+        ] {
+            let mut invalid = request.clone();
+            invalid["dependency_context"]["generated_root"] = json!(root);
+            *invalid["dependency_context"]["env"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap() = json!(["OUT_DIR", root]);
+            assert!(parse_exec_request(&invalid).is_err(), "{root}");
+        }
+        for value in ["", "/__rabs/out/cargo/another-out"] {
+            let mut mismatched = request.clone();
+            *mismatched["dependency_context"]["env"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap() = json!(["OUT_DIR", value]);
+            assert!(parse_exec_request(&mismatched).is_err());
+        }
+        let mut missing_root = request.clone();
+        missing_root["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generated_root");
+        assert!(parse_exec_request(&missing_root).is_err());
+        let mut missing_environment = request.clone();
+        missing_environment["dependency_context"]["env"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(parse_exec_request(&missing_environment).is_err());
+        request["dependency_context"]["generated_root"] = Value::Null;
+        assert!(parse_exec_request(&request).is_err());
+    }
+}
+
+#[test]
+fn canonical_archive_refuses_executable_externs_native_inputs_and_unretained_paths() {
+    for extra in [
+        vec!["--crate-type", "proc-macro"],
+        vec![
+            "--extern",
+            "derive=/__rabs/out/cargo/debug/deps/libderive.so",
+        ],
+        vec!["--extern", "leaf=/outside/libleaf.rlib"],
+        vec!["--extern", "unbound"],
+        vec!["-l", "static=unretained"],
+        vec!["-L", "native=/usr/lib"],
+        vec!["-L", "dependency=/__rabs/out/cargo/unretained"],
+        vec!["--sysroot", "/another/toolchain"],
+        vec!["-C", "linker=/usr/bin/cc"],
+        vec!["-C", "target-cpu=native"],
+        vec!["-C", "incremental=/__rabs/out/cargo/incremental"],
+        vec!["-C", "save-temps=yes"],
+        vec!["-o", "/__rabs/out/cargo/unclaimed"],
+        vec!["--emit=dep-info,metadata,link,llvm-ir"],
+    ] {
+        let mut request = canonical_archive_request(true);
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|arg| json!(arg)));
+        assert!(parse_exec_request(&request).is_err(), "{extra:?}");
+    }
+    for path in [
+        "../outside.rs",
+        "/__rabs/workspace/unretained/lib.rs",
+        "src/../lib.rs",
+    ] {
+        let mut request = canonical_archive_request(true);
+        *request["args"].as_array_mut().unwrap().last_mut().unwrap() = json!(path);
+        assert!(parse_exec_request(&request).is_err(), "{path}");
+    }
+    let mut retained = canonical_archive_request(true);
+    retained["args"].as_array_mut().unwrap().extend([
+        json!("--extern"),
+        json!("input=/__rabs/out/cargo/debug/deps/libinput.rlib"),
+        json!("-L"),
+        json!("dependency=/__rabs/out/cargo/debug/deps"),
+    ]);
+    assert!(parse_exec_request(&retained).is_ok());
+}
+
+#[test]
+fn canonical_dependency_compiler_must_match_retained_inputs_and_complete_metadata_outputs() {
+    for extra in [
+        vec!["--crate-type", "proc-macro"],
+        vec![
+            "--extern",
+            "derive=/__rabs/out/cargo/debug/deps/libderive.so",
+        ],
+        vec!["--extern", "leaf=/outside/libleaf.rmeta"],
+        vec!["-L", "native=/usr/lib"],
+        vec!["--sysroot", "/another/toolchain"],
+        vec!["--out-dir", "/__rabs/out/cargo/other"],
+        vec!["--emit=dep-info,metadata,link"],
+    ] {
+        let mut request = canonical_dependency_request();
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|arg| json!(arg)));
+        assert!(parse_exec_request(&request).is_err(), "{extra:?}");
+    }
+    let mut source = canonical_dependency_request();
+    *source["args"].as_array_mut().unwrap().last_mut().unwrap() =
+        json!("/__rabs/home/control/source.rs");
+    assert!(parse_exec_request(&source).is_err());
+    for outputs in [
+        json!(["libleaf.rmeta"]),
+        json!(["leaf.d", "libleaf.rmeta", "other.rmeta"]),
+    ] {
+        let mut request = canonical_dependency_request();
+        request["artifacts"]["files"] = outputs;
+        assert!(parse_exec_request(&request).is_err());
+    }
 }
 
 #[test]
@@ -334,6 +732,60 @@ fn generated_out_dir_requires_an_exact_optional_root_and_environment() {
     );
 }
 
+#[test]
+fn generated_directory_context_requires_exact_bounded_topology_and_current_version() {
+    for mut request in [
+        dependency_request(),
+        canonical_generated_request(false, false),
+    ] {
+        if request["dependency_context"]["generated_root"].is_null() {
+            let generated = "/work/target/debug/build/generated-unit/out";
+            request["dependency_context"]["generated_root"] = json!(generated);
+            request["dependency_context"]["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["OUT_DIR", generated]));
+        }
+        request["dependency_context"]["generated_directories"] = json!(["empty", "empty/child"]);
+        let original = request.clone();
+        let context = parse_exec_request(&request)
+            .unwrap()
+            .dependency_context
+            .unwrap();
+        assert_eq!(context.generated_directories(), ["empty", "empty/child"]);
+        assert_eq!(original, request);
+        for directories in [
+            Value::Null,
+            json!([17]),
+            json!([""]),
+            json!(["../outside"]),
+            json!(["/absolute"]),
+            json!(["missing/parent"]),
+            json!(["empty", "empty"]),
+            json!(["empty/child", "empty"]),
+            json!(["empty", "empty\\child"]),
+        ] {
+            let mut invalid = request.clone();
+            invalid["dependency_context"]["generated_directories"] = directories;
+            assert!(parse_exec_request(&invalid).is_err());
+        }
+        let mut omitted = request.clone();
+        omitted["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generated_directories");
+        assert!(parse_exec_request(&omitted).is_err());
+        for old in ["dependency-exec-v7", "canonical-dependency-exec-v3"] {
+            let mut obsolete = request.clone();
+            obsolete["dependency_context"]["version"] = json!(old);
+            assert!(parse_exec_request(&obsolete).is_err());
+        }
+    }
+    let mut without_root = dependency_request();
+    without_root["dependency_context"]["generated_directories"] = json!(["empty"]);
+    assert!(parse_exec_request(&without_root).is_err());
+}
+
 fn dependency_dag_request() -> Value {
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
     let mut request = dependency_request();
@@ -498,7 +950,7 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
     );
     assert_eq!(
         dependency_context_selection(&grant, &supported, true, true, true, true, true).unwrap(),
-        Some(DependencyExecutionMode::Metadata),
+        Some(original_selection(DependencyExecutionMode::Metadata)),
     );
     for flags in [
         [false, true, true, true, true],
@@ -524,6 +976,8 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
         json!("dependency-exec-v5"),
         json!("dependency-exec-v6"),
         json!("dependency-exec-v999"),
+        json!("canonical-dependency-exec-v1"),
+        json!("canonical-dependency-exec-v2"),
     ] {
         assert!(
             dependency_context_selection(
@@ -554,7 +1008,7 @@ fn dependency_mode_selection_never_infers_support_or_downgrades() {
             dependency_context_selection(
                 &grant.to_string(), &[mode], true, true, true, true, true,
             ).unwrap(),
-            Some(mode),
+            Some(original_selection(mode)),
         );
         for unsupported in [
             vec![],
@@ -627,6 +1081,168 @@ fn dependency_mode_selection_never_infers_support_or_downgrades() {
 }
 
 #[test]
+fn canonical_dependency_negotiation_binds_version_as_well_as_mode() {
+    let grant = json!({
+        "dependency_context":CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+        "dependency_execution_mode":"metadata",
+    });
+    let selected = dependency_context_selection(
+        &grant.to_string(),
+        &[DependencyExecutionMode::Metadata],
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.version, CANONICAL_DEPENDENCY_CONTEXT_VERSION);
+    assert_eq!(selected.mode, DependencyExecutionMode::Metadata);
+    for previous in [
+        "canonical-dependency-exec-v1",
+        "canonical-dependency-exec-v2",
+        "canonical-dependency-exec-v3",
+    ] {
+        let mut old = grant.clone();
+        old["dependency_context"] = json!(previous);
+        assert!(
+            dependency_context_selection(
+                &old.to_string(),
+                &[DependencyExecutionMode::Metadata],
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+            .is_err()
+        );
+    }
+    for flags in [
+        [false, true, true, true, true],
+        [true, false, true, true, true],
+        [true, true, false, true, true],
+        [true, true, true, false, true],
+        [true, true, true, true, false],
+    ] {
+        assert!(
+            dependency_context_selection(
+                &grant.to_string(),
+                &[DependencyExecutionMode::Metadata],
+                flags[0],
+                flags[1],
+                flags[2],
+                flags[3],
+                flags[4],
+            )
+            .is_err()
+        );
+    }
+    let mut archive = grant.clone();
+    archive["dependency_execution_mode"] = json!("rlib");
+    let archive_selected = dependency_context_selection(
+        &archive.to_string(),
+        &[DependencyExecutionMode::Rlib],
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        archive_selected.version,
+        CANONICAL_DEPENDENCY_CONTEXT_VERSION
+    );
+    assert_eq!(archive_selected.mode, DependencyExecutionMode::Rlib);
+    assert!(
+        dependency_context_selection(
+            &archive.to_string(),
+            &[DependencyExecutionMode::Metadata],
+            true,
+            true,
+            true,
+            true,
+            true,
+        )
+        .is_err()
+    );
+    let mut report = report();
+    report.dependency_modes = vec![DependencyExecutionMode::Metadata];
+    let canonical = parse_exec_request(&canonical_dependency_request()).unwrap();
+    let ordinary = parse_exec_request(&dependency_request()).unwrap();
+    assert!(validate_execution_selection(&canonical, &report, Some(selected)).is_ok());
+    assert_eq!(
+        validate_execution_selection(&ordinary, &report, Some(selected)).unwrap_err(),
+        "dependency context version does not match negotiation",
+    );
+    assert_eq!(
+        validate_execution_selection(
+            &canonical,
+            &report,
+            Some(original_selection(DependencyExecutionMode::Metadata))
+        )
+        .unwrap_err(),
+        "dependency context version does not match negotiation",
+    );
+    let archive = parse_exec_request(&canonical_archive_request(true)).unwrap();
+    assert!(validate_execution_selection(&archive, &report, Some(archive_selected)).is_err());
+    report.dependency_modes = vec![
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+    ];
+    assert!(validate_execution_selection(&archive, &report, Some(archive_selected)).is_ok());
+    assert_eq!(
+        validate_execution_selection(&archive, &report, Some(selected)).unwrap_err(),
+        "dependency execution mode does not match negotiation"
+    );
+    assert_eq!(
+        validate_execution_selection(&canonical, &report, Some(archive_selected)).unwrap_err(),
+        "dependency execution mode does not match negotiation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_dependency_version_swap_refuses_before_input_or_durable_admission() {
+    let root = private_root();
+    let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let mut report = report();
+    report.dependency_modes = vec![DependencyExecutionMode::Metadata];
+    let mut wire = Wire::default();
+    let peer = wire.clone();
+    peer.frame(canonical_dependency_request());
+    peer.frame(json!({"kind":"request-status","request_id":712}));
+    peer.close();
+    wait(drive_session_with_inputs(
+        &mut wire,
+        &report,
+        false,
+        Some(&mut journal),
+        true,
+        true,
+        true,
+        false,
+        &ExecutionLeaseSelection::default(),
+        false,
+        Some(original_selection(DependencyExecutionMode::Metadata)),
+        |_, _, _, _, _, _| panic!("wrong dependency path policy reached executor"),
+        pressure,
+    ))
+    .unwrap();
+    let replies = peer.replies();
+    assert_eq!(replies[0]["kind"], "error");
+    assert_eq!(
+        replies[0]["reason"],
+        "dependency context version does not match negotiation"
+    );
+    assert_eq!(replies[1]["status"], "unknown");
+    assert_eq!(journal.high_water(), None);
+}
+
+#[test]
 fn archive_only_capability_never_authorizes_metadata_or_canonical_commands() {
     let mut archive_only = report();
     archive_only.canonical_namespace = false;
@@ -635,15 +1251,19 @@ fn archive_only_capability_never_authorizes_metadata_or_canonical_commands() {
     let metadata = parse_exec_request(&dependency_request()).unwrap();
     let canonical = parse_exec_request(&request(19)).unwrap();
     assert!(
-        validate_execution_selection(&archive, &archive_only, Some(DependencyExecutionMode::Rlib),)
-            .is_ok()
+        validate_execution_selection(
+            &archive,
+            &archive_only,
+            Some(original_selection(DependencyExecutionMode::Rlib)),
+        )
+        .is_ok()
     );
     assert!(validate_execution_selection(&archive, &archive_only, None).is_err());
     assert!(
         validate_execution_selection(
             &archive,
             &archive_only,
-            Some(DependencyExecutionMode::Metadata),
+            Some(original_selection(DependencyExecutionMode::Metadata)),
         )
         .is_err()
     );
@@ -651,7 +1271,7 @@ fn archive_only_capability_never_authorizes_metadata_or_canonical_commands() {
         validate_execution_selection(
             &metadata,
             &archive_only,
-            Some(DependencyExecutionMode::Rlib),
+            Some(original_selection(DependencyExecutionMode::Rlib)),
         )
         .is_err()
     );
@@ -659,7 +1279,7 @@ fn archive_only_capability_never_authorizes_metadata_or_canonical_commands() {
         validate_execution_selection(
             &metadata,
             &archive_only,
-            Some(DependencyExecutionMode::Metadata),
+            Some(original_selection(DependencyExecutionMode::Metadata)),
         )
         .is_err()
     );
@@ -668,7 +1288,7 @@ fn archive_only_capability_never_authorizes_metadata_or_canonical_commands() {
         validate_execution_selection(
             &canonical,
             &archive_only,
-            Some(DependencyExecutionMode::Rlib),
+            Some(original_selection(DependencyExecutionMode::Rlib)),
         )
         .is_err()
     );
@@ -678,7 +1298,7 @@ fn archive_only_capability_never_authorizes_metadata_or_canonical_commands() {
         validate_execution_selection(
             &canonical,
             &archive_only,
-            Some(DependencyExecutionMode::Rlib),
+            Some(original_selection(DependencyExecutionMode::Rlib)),
         )
         .is_err()
     );
@@ -761,7 +1381,10 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
     let hello: Value = serde_json::from_str(&worker_hello(&report(), &journal)).unwrap();
     assert_eq!(
         hello["dependency_contexts"],
-        json!([DEPENDENCY_CONTEXT_VERSION])
+        json!([
+            DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION
+        ])
     );
     assert_eq!(hello["dependency_execution_modes"], json!([]));
 }
@@ -794,7 +1417,7 @@ fn archive_mode_mismatch_refuses_before_input_or_durable_admission() {
         false,
         &ExecutionLeaseSelection::default(),
         false,
-        Some(DependencyExecutionMode::Rlib),
+        Some(original_selection(DependencyExecutionMode::Rlib)),
         |_, _, _, _, _, _| panic!("mismatched namespace reached executor"),
         pressure,
     ))
@@ -843,6 +1466,12 @@ fn retained_v4_dependency_result_remains_recoverable_after_context_upgrade() {
 }
 
 #[cfg(unix)]
+#[test]
+fn retained_v7_dependency_result_remains_recoverable_after_directory_contract_upgrade() {
+    assert_retained_dependency_resume("dependency-exec-v7");
+}
+
+#[cfg(unix)]
 fn assert_retained_dependency_resume(version: &str) {
     let root = private_root();
     let mut original = dependency_request();
@@ -855,6 +1484,10 @@ fn assert_retained_dependency_resume(version: &str) {
     // exact saved fingerprint still authorizes retrieval-only recovery.
     original["dependency_context"]["version"] = json!(version);
     if version != DEPENDENCY_CONTEXT_VERSION {
+        original["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generated_directories");
         if matches!(version, "dependency-exec-v1" | "dependency-exec-v2") {
             original["dependency_context"]
                 .as_object_mut()
@@ -895,6 +1528,9 @@ fn assert_retained_dependency_resume(version: &str) {
     let mut changed = original.clone();
     changed["dependency_context"]["cwd"] = json!("/home/user/registry/package/src");
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":changed}));
+    let mut changed_tree = original.clone();
+    changed_tree["dependency_context"]["generated_directories"] = json!(["empty"]);
+    peer.frame(json!({"kind":"result-resume","request_id":id,"request":changed_tree}));
     peer.frame(json!({"kind":"result-resume","request_id":id,"request":original}));
     let mut report = report();
     // Retained bytes remain recoverable even if the host can no longer create
@@ -913,18 +1549,19 @@ fn assert_retained_dependency_resume(version: &str) {
         |_, _, _| panic!("retained dependency recovery invoked execution"),
         pressure,
     ));
-    pump(driver.as_mut(), &peer, 2);
+    pump(driver.as_mut(), &peer, 3);
     assert_eq!(peer.replies()[0]["kind"], "error");
-    let resumed = peer.replies()[1].clone();
+    assert_eq!(peer.replies()[1]["kind"], "error");
+    let resumed = peer.replies()[2].clone();
     assert_eq!(resumed["kind"], "exec-result");
     assert_eq!(resumed["resumed"], true);
     peer.frame(output_read(id, "stdout", 1, 3));
     peer.frame(
         json!({"kind":"artifact-read","request_id":id,"name":"lib.rlib","offset":0,"max_bytes":64}),
     );
-    pump(driver.as_mut(), &peer, 4);
-    assert_eq!(peer.replies()[2]["data_hex"], "00ff42");
-    assert_eq!(peer.replies()[3]["data_hex"], "6172636869766500ff");
+    pump(driver.as_mut(), &peer, 5);
+    assert_eq!(peer.replies()[3]["data_hex"], "00ff42");
+    assert_eq!(peer.replies()[4]["data_hex"], "6172636869766500ff");
     peer.frame(output_ack(id));
     peer.frame(json!({"kind":"artifact-ack","request_id":id,
         "manifest_sha256":resumed["artifact_manifest"]["manifest_sha256"],

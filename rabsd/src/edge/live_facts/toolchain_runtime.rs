@@ -208,9 +208,9 @@ pub(super) fn observe(directory: &Path) -> Result<Observation, String> {
     };
     if !directory_current()
         || !aliases.still_current()
-        || !files.iter().all(|(path, signature)| {
-            lstat_regular(path).is_ok_and(|current| current == *signature)
-        })
+        || !files
+            .iter()
+            .all(|(path, signature)| lstat_regular(path).is_ok_and(|current| current == *signature))
         || !directory_current()
     {
         return Err("runtime library inputs changed during observation".into());

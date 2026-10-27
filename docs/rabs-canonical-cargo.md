@@ -38,9 +38,10 @@ lane, or share a cache across workers. It does not make an unsandboxed local
 cache key equivalent to a canonical execution. Those remain separate integration
 and qualification tasks. Unlike `--rabs-remote`, this path does not invoke RCH.
 
-A separate [local canonical library-check profile](#local-canonical-library-checks-with-dependency-caching)
-connects captured Cargo execution to the existing external-dependency metadata
-cache. Its explicit command and narrower graph requirements are described below.
+A separate [local canonical compilation profile](#local-canonical-builds-and-checks-with-dependency-caching)
+connects captured Cargo checks and builds to the external-dependency cache, with
+isolated worker execution for eligible Rust archives. Its commands and narrower
+graph requirements are described below.
 
 ## Profile and prerequisites
 
@@ -310,13 +311,20 @@ allowing Cargo to skip compilation it considers fresh. An exact invocation is
 preferred; compatible `build`, `check`, `test`, `run` and `bench` commands can
 share a target when their other compilation settings match. Cargo still executes
 each current request, including its selected programs and runtime arguments.
-Ordinary local source and data edits can retain compiled dependencies: changed
-inputs and their surviving ancestor directories receive timestamps newer than
-the retained target, and Cargo applies its own freshness checks. Embedded text
-or binary assets and declared build-script inputs follow the same path. Cargo
-manifests, lockfiles, configuration, executable inputs, immutable dependency
-sources, environment, toolchain, feature, or effective job-grant changes still
-start with a fresh target.
+Ordinary local source and data edits can retain compiler metadata from an
+eligible check. The complete retained target must contain only metadata,
+dep-info and recognized Cargo bookkeeping. Changed inputs and their surviving
+ancestor directories receive timestamps newer than the retained target, and
+Cargo applies its own freshness checks. A target containing archives, object
+files, executables, generated outputs or incremental state requires the complete
+source capture to remain identical. Procedural macros, build scripts and the
+integrated assembler can read files that Cargo does not track; retiming those
+files cannot make a previously compiled consumer stale. Compiler injection,
+captured Cargo configuration and ambiguous manifest controls also disable
+source-edit reuse. Manifests, lockfiles, immutable dependency sources,
+environment, toolchain and effective job-grant changes select a different
+target family. An older eligible metadata seed can still be selected when a
+newer codegen seed cannot be reused after an edit.
 
 A completed ordinary compiler, test, run or benchmark failure can also retain its private
 target after verified process cleanup. The next request executes Cargo again
@@ -562,8 +570,10 @@ options; the launcher does not change optimization settings to enable reuse.
 
 Enable [worker-local target retention](rabs-target-state.md) to keep useful state
 between operations. Every execution still runs its requested Cargo command in a
-private target tree. A compatible seed can contain the complete prior incremental
-state, and rustc decides which work products remain usable after source edits.
+private target tree. With identical captured source, a compatible seed can
+contain the complete prior incremental state. A source edit starts a fresh
+target when the retained inventory contains codegen or incremental products;
+those products do not inherit the metadata-only source-edit policy.
 Changing the explicit incremental policy, compiler, profile, target or
 other keyed compilation controls selects a different target family. Without
 target retention, the command uses fresh private incremental storage.
@@ -896,54 +906,105 @@ Per-action admission/placement,
 coordinator-only cache publication, cross-worker reuse, real compiler-skip evidence,
 performance gates and the required canary/soak are not completed by this frontend.
 
-## Local canonical library checks with dependency caching
+## Local canonical builds and checks with dependency caching
 
-`rabsd --canonical-check-local PROFILE.json` runs the captured native Cargo as
-`cargo check --lib --offline --locked` inside the canonical namespace and connects
+`rabsd --canonical-compile-local PROFILE.json` runs the captured native Cargo as
+`cargo check`, `cargo build` or `cargo test`, always offline and locked, with the selected packages, features and targets
+inside the canonical namespace and connects
 its rustc requests to an operation-owned coordinator. Eligible external registry,
 locked Git and verified directory-source libraries use the existing metadata
-cache, including its cold-result publication, differential verification and
-compiler-skip gates. Cargo plans the units at `/__rabs/workspace` with the captured
+cache or the isolated worker archive lane, including cold-result publication,
+differential verification and compiler-skip gates. Successful builds retain their
+completed target tree and report its usable host path. `test --no-run` delivers
+its compiled harnesses the same way; ordinary tests and doctests execute on every
+invocation and return their current result. Cargo plans the units at `/__rabs/workspace` with the captured
 compiler at `/__rabs/toolchain/bin/rustc` and target at `/__rabs/out/cargo`, so moving
 the original checkout does not introduce a different host path into that unit's
 arguments or metadata output.
 
-This first local profile requires a complete resolved graph without **any build
-scripts or procedural macros**. It asks the captured Cargo for the all-features
-dependency graph before exposing a wrapper or cache endpoint. Optional or
-target-specific packages containing those executors also refuse this profile.
+The local profile asks the captured Cargo to plan the **actual selected build
+units** with `--unit-graph -Z unstable-options` on the selected `check`, `build` or `test`, using the same Cargo
+selection, captured configuration and canonical paths as execution. Harness
+arguments after `--` are supplied only to the actual test invocation. Planning
+does not compile or run project units, and finishes before a wrapper or cache
+endpoint is exposed. Selected build scripts and procedural macros execute under
+Cargo. A build-script run must name its matching compiled producer, and the
+complete graph retains a coordinator-owned requirement that dependency caching
+use isolated workers. Inactive optional dependencies, development targets and
+other workspace members do not enable that requirement unless Cargo selects
+their executors. `build --tests`, `build --benches` and `build --all-targets`
+may compile harnesses; they never run tests or benchmarks. `test` admits the
+selected test and library-doctest units and always requires isolated-worker
+authority for dependency caching, including when `--no-run` is selected. Cargo
+can emit the same unit graph with or without `--no-run`; the retained command
+selection determines whether the harnesses execute. Unknown graph versions, modes, target kinds, malformed edges,
+cycles, unreachable units and sources outside the retained inputs also refuse.
+This requires a nightly Cargo supporting the unit-graph interface; an unsupported
+toolchain does not fall back to a guessed package graph.
+
+The earlier source preparation still captures the complete approved anchor and
+uses locked all-features metadata to validate its dependency closure. Selecting
+fewer compilation units does not reduce the authorized upload/capture scope or make
+missing locked dependencies available offline.
 Workspace members, primary packages and unsupported compiler requests compile
 normally inside the namespace. Their results do not enter the dependency cache.
-The supported cache class remains external dependency `metadata` plus `dep-info`;
-workspace publication, generated inputs, archive/codegen caching and per-rustc
-remote dispatch require their own admission and qualification work.
+External dependency `metadata` plus `dep-info` may execute locally or on an
+explicitly configured authenticated dependency worker. Pure Rust `lib`/`rlib`
+archive actions with `dep-info` and `link`, optionally also `metadata`, require
+the worker's separately admitted closed archive namespace before they can publish
+or replay a cache result. With no suitable worker, Cargo still builds those
+archives in its own namespace, without granting those local archive results cache
+authority. Test commands and graphs containing active build scripts or procedural macros also
+require that isolated worker lane for metadata cache publication and replay.
+Project executors can access the operation's wrapper socket; they cannot turn a
+claimed local completion into trusted cache evidence. The retained graph policy
+therefore blocks local lookup, capture and publication even when a worker is
+missing, busy or refuses the action. Without a suitable worker the current
+compilation proceeds through Cargo with no local action-cache authority.
+
+Build-script producers, proc-macro producers/consumers, workspace/primary packages
+and native-link inputs retain their per-action cache restrictions and compile
+normally. Eligible external libraries that consume a completed build script's
+`OUT_DIR` can use the isolated worker metadata or archive cache with the complete
+generated tree captured as an input. The build script itself still runs under
+Cargo. Eligible independent pure dependencies may also use the isolated worker
+cache. Dynamic-library candidates in a
+dependency search directory still conservatively prevent that directory's
+admission; this change does not claim complete per-unit acceleration for every
+macro-heavy graph. Build-script failure and generated-source errors preserve
+Cargo's failure status. No script, macro, test or program result cache is added.
 
 ### Create and run the local profile
 
-Install matching native `rabsd` and `rabs-wrap` binaries. The explicit toolchain
+Install matching native `rabsd` and `rabs-wrap` binaries. The explicit nightly toolchain
 root must contain its real `bin/cargo`, `bin/rustc`, libraries and native sysroot.
+Selected doctests additionally require an ordinary executable `bin/rustdoc` in
+that captured toolchain. Test invocations bind `RUSTDOC` to
+`/__rabs/toolchain/bin/rustdoc`; ambient PATH or configuration cannot select a
+different documentation-test compiler.
 The preparing host must pass the full production bubblewrap namespace probe,
 including private `/proc`, `/dev`, temporary storage and network isolation.
 Unsupported hosts return an error before compilation; there is no weaker local
 execution mode behind this command.
 
 Create two private directories outside the captured source and toolchain. Keep
-the operation parent short enough for a Unix socket pathname; `/tmp/rabs-check-ops`
+the operation parent short enough for a Unix socket pathname; `/tmp/rabs-compile-ops`
 is an example. The driver checks existing permissions instead of repairing them:
 
 ```sh
-mkdir -m 700 /home/builder/rabs-check-state /tmp/rabs-check-ops
+mkdir -m 700 /home/builder/rabs-compile-state /tmp/rabs-compile-ops
 ```
 
 For an already vendored project, save this profile with your actual absolute paths:
 
 ```json
 {
-  "version": "canonical-check-local-v1",
+  "version": "canonical-compile-local-v1",
+  "command": "check",
   "source_root": "/data/projects/approved-anchor",
   "toolchain_root": "/opt/rust/native-linux-toolchain",
-  "state_root": "/home/builder/rabs-check-state",
-  "operation_root": "/tmp/rabs-check-ops",
+  "state_root": "/home/builder/rabs-compile-state",
+  "operation_root": "/tmp/rabs-compile-ops",
   "wrapper": "/usr/local/bin/rabs-wrap",
   "manifest": "app/Cargo.toml",
   "vendor": "vendor",
@@ -953,11 +1014,47 @@ For an already vendored project, save this profile with your actual absolute pat
 ```
 
 ```sh
-rabsd --canonical-check-local ./canonical-check.json
+rabsd --canonical-compile-local ./canonical-compile.json
 ```
 
-`manifest` defaults to `Cargo.toml`, `jobs` to 1 and `timeout_seconds` to 1800.
-The job count accepts 1–4096 and the canonical metadata/check timeout accepts 1–7200
+`command` is `check` by default, `build`, or `test`. The profile and native entry point
+replace `canonical-check-local-v1` and `--canonical-check-local`; install matching
+tools and update saved local profiles. `manifest` defaults to `Cargo.toml`, `jobs`
+to 1 and `timeout_seconds` to 1800.
+Omitting `selection` for `check` retains the library-only `check --lib` behavior;
+omitting it for `build` or `test` uses Cargo's ordinary default members and targets. Setting
+`"selection": {}` uses Cargo's ordinary default members and targets. A selection
+can specify `workspace`, `packages`, `exclude`, `features`, `all_features`,
+`no_default_features`, `lib`, `bins`, `tests`, `examples`, `benches`, `all_targets`,
+the named-target arrays `bin`, `test`, `example`, `bench`, the compilation-target
+array `target`, and either `release` or the optional profile-name string `profile`.
+For `test`, it also accepts `doc`, `no_run`, `no_fail_fast`, an optional
+`test_filter` string and the literal `test_args` array. These test-only fields
+cannot change a `check` or `build` command.
+An empty `target` and absent or null `profile` retain Cargo's defaults. Exclusions
+require workspace selection. For example:
+
+```json
+"selection": {
+  "packages": ["core", "app"],
+  "features": ["app/fast"],
+  "no_default_features": true,
+  "lib": true
+}
+```
+
+Cargo resolves package/feature names and target availability itself. These fields
+cannot supply another command, compiler, environment, configuration file,
+manifest, output directory or arbitrary unstable option. A test target selection
+type-checks tests under `check` and compiles their executable harnesses under
+`build`; neither command executes them. Compilation targets and
+profile names contain only ASCII letters, digits, hyphens and underscores, start
+with a letter or digit, and are at most 1,024 bytes. JSON target specifications
+and paths are not admitted. `host-tuple` selects the captured Cargo's host target;
+required target libraries must already exist in the captured toolchain. Cargo
+validates profile existence and inheritance in the captured workspace.
+
+The job count accepts 1–4096 and each canonical graph/compilation timeout accepts 1–7200
 seconds. A purely local graph omits `vendor`. A registry/Git cache profile uses
 `"cargo_home_source": "/home/builder/.cargo"` instead of `vendor`; the existing
 locked offline planner captures the required package archives and Git objects
@@ -965,32 +1062,219 @@ into a private Cargo home. It does not inherit that cache's user configuration,
 credentials or unrelated expanded sources. The source, toolchain, state,
 operation and optional Cargo-cache roots must be disjoint ordinary absolute
 directories. The wrapper must be an ordinary executable outside the captured
-source and mutable state/operation roots. Arbitrary commands, mount declarations
+source and mutable state/operation roots. Commands other than `check`, `build` and `test`, mount declarations
 and environment overrides are not profile fields.
 
 Preparation captures the selected toolchain before its Cargo metadata planning
 and uses those captured Cargo/rustc binaries with a controlled environment.
-The actual graph proof and check then run in the canonical namespace. The source
+The actual graph proof and compilation then run in the canonical namespace. The source
 workspace and HOME are read-only there. HOME contains the retained wrapper and
 the fresh operation socket; private Cargo state and the target are writable.
+Tests use the same view. Write temporary files through `TMPDIR` (`/__rabs/tmp`)
+or the private target selected by `CARGO_TARGET_DIR`; tests that write into the
+source checkout or HOME will fail. Networking is isolated, so tests cannot rely
+on external services. These runtime constraints apply to doctests too, and
+failures retain Cargo's status rather than retrying outside the namespace.
 The build sees neither the persistent CAS nor the ordinary daemon endpoint.
 Its scoped endpoint accepts rustc requests only and refuses status, generic
 serving, prepared-job and administrative messages. Logical compiler paths are
 translated to backing files only through the coordinator's retained mount
 capability; a wrapper-supplied path or environment flag cannot construct one.
 
+### Send canonical dependency compilations to workers
+
+The local Cargo driver also accepts the existing pinned dependency-worker
+configuration from its operator environment. With no worker configuration it
+keeps the local metadata lane only for compiler-only check/build graphs without
+project executors. Test commands and graphs with build scripts or procedural
+macros compile without local action-cache authority.
+To use workers, install matching `rabsd`, `rabs-wrap` and
+`rabs-wkr` binaries and provision the mutual-TLS credentials described in
+[live dependency worker setup](rabs-worker-delivery.md#run-the-live-cargo-dependency-worker).
+Run the worker's normal outward reconnect loop against the configured listener,
+then launch the same canonical profile:
+
+```sh
+RABS_COORD_TLS_CA=/credentials/ca.pem \
+RABS_COORD_TLS_CERT=/credentials/coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/coordinator.key \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_SPKI_SHA256 \
+  cargo rabs --rabs-canonical-local ./canonical-compile.json -- build --lib
+```
+
+Replace the address, paths and pin with the deployment's actual values. The
+listener belongs to the coordinator; the worker connects to it. A configured
+pool uses `RABS_DEPENDENCY_WORKERS_JSON` instead of the three singleton fields,
+with the same existing 1–32 worker bound and per-worker certificate pins. Partial,
+mixed or invalid explicit settings refuse startup. Credentials and transport
+state remain outside the Cargo namespace; no normal daemon needs to be started
+for this operation-owned coordinator.
+
+The worker must explicitly advertise `canonical-dependency-exec-v4` and support
+the selected `metadata` or `rlib` execution mode. Both peers retain that exact version and mode through
+authenticated admission. An older worker cannot silently reinterpret the request
+as ordinary-path dependency execution, and metadata support does not authorize an
+archive action. The worker receives only the retained
+package, any complete generated input tree, exact dependency candidates and
+captured toolchain. It retains its own
+runtime and verifies it against the keyed runtime cohort, then creates private
+output and HOME trees. The outer Cargo workspace, Cargo home,
+control socket and persistent CAS are not exposed to that compiler.
+
+For a library with `OUT_DIR`, the coordinator requires Cargo's completed
+`root-output` record to name that exact canonical path and captures its byte-exact
+persisted stdout alongside every file and directory in the generated tree.
+Directory-only trees and empty subdirectories are retained, keyed and rebuilt
+under an explicit private owner. The path must be below
+`/__rabs/out/cargo`, disjoint from compiler outputs and dependency search roots;
+the worker mounts it read-only at the original logical name. The action key
+binds the complete generated contents and directory listings, the persisted Cargo directives and the
+presented environment. Source and record generations are checked again before
+publication and installation. A changed generated file or directory therefore cannot reuse
+the earlier consumer result even when its package source and build script are
+unchanged. These inputs authorize only an independently supervised compiler
+execution; they do not authorize local result capture or cache the script's
+execution, filesystem observations or side effects.
+
+The capture binding comes from the driver's retained mount capability, not from
+a canonical-path flag in a compiler plan. It binds both the physical tree and
+Cargo's recorded logical name through background capture and memo reuse. A
+request whose worker context names another generated root is refused before
+dispatch, and generated-input requests cannot recover local publication authority
+by bypassing the edge's ordinary admission path.
+
+Archive execution also excludes process information and entropy devices from
+the compiler's filesystem view. Its only null device is an independently checked
+real `/dev/null` character device. The action key covers the complete retained
+package and generated inputs, exact dependency artifacts, compiler, runtime and
+presented environment.
+Assembler `.incbin` reads can therefore consume keyed package bytes even when
+rustc omits those files from dep-info; host-only paths, `/proc` content and
+`/dev/urandom` cannot become invisible archive inputs. This is a closed per-action
+view, separate from the larger namespace where Cargo plans and builds workspace
+targets. Canonical local metadata evidence cannot promote an archive, and canonical
+remote metadata and archive policies have distinct action identities.
+
+Cargo's `/__rabs/...` names remain unchanged in compiler arguments, environment,
+dep-info, output declarations and action keys. Only coordinator file observation
+and final output installation use retained physical backing paths. Runtime and
+complete-toolchain checks are repeated through publication and installation, and
+the ordinary worker runtime-compatibility requirements still apply. This
+canonical remote class has a separate key policy from both ordinary remote work
+and local canonical execution; existing local samples do not promote remote hits.
+
+Cold results use the existing private execution and verified delivery path, then
+require the wrapper's manifest-specific acceptance before installation. Repeated
+eligible requests earn cache replay through the existing differential-sampling
+and release-authorization gates. `remote-offer`, `rabsd-remote-dependency-admitted`
+and the worker's durable receipts distinguish real dispatch from local fallback.
+An incompatible worker or a refused action does not gain publication authority;
+fallback after dispatch still requires verified completion of remote execution.
+Workspace/primary crates continue under Cargo's normal compilation and freshness
+rules. Selected project executors never authorize local dependency cache capture
+or replay, even after a worker refusal.
+
 ### Persistent reuse and command results
 
-The driver owns `state_root/canonical-check-v1`, including its CAS and exclusive
+The driver owns `state_root/canonical-compile-v1`, including its CAS and exclusive
 state lock. Concurrent invocations using the same state root return a busy error
 instead of superseding an active coordinator term. This separate namespace also
 keeps the local profile's lifecycle independent of a normal daemon's CAS. Use a
-dedicated state parent and retain it across checks; each command gets a fresh
+dedicated state parent and retain it across commands; each command gets a fresh
 private target and source/toolchain capture under `operation_root`.
+
+To retain Cargo's own private target state between local canonical commands,
+add this optional object to the same profile:
+
+```json
+"target_cache": {
+  "runtime_epoch": "builder-image-2026.10",
+  "max_bytes": 1073741824,
+  "max_families": 8
+}
+```
+
+`runtime_epoch` is an operator-selected identifier for this host's tools and
+libraries. Change it whenever host compiler/linker/runtime files visible through
+the namespace's read-only `/usr` view change. Captured Rust toolchain bytes,
+wrapper bytes, driver build identity, canonical environment and namespace,
+Cargo target/profile and immutable source controls are bound automatically.
+An epoch is required because a captured Rust toolchain alone does not identify
+the host linker and system libraries. It accepts 1–256 ASCII letters, digits,
+dots, underscores and hyphens. Omit `target_cache` to retain the original cold
+target behavior, including when exercising dependency-cache sampling.
+
+The default `max_bytes` is 1 GiB; the maximum is 8 GiB of retained snapshot
+bytes across all target families. `max_families` defaults to 8 and accepts 1–32. Each family
+retains one committed generation, so switching between compilation profiles,
+toolchains, runtime epochs or source-control configurations can return to a
+previous compatible target instead of always starting cold. A verified restore
+or successful capture refreshes that family's recency. When either budget is
+exceeded, the least recently used families are removed while preserving the
+newly committed family. Setting `max_families` to 1 selects single-family
+retention.
+
+A replacement is fully captured before other healthy families are evicted to
+make room for it. Startup also enforces newly lowered retention limits, giving
+the selected family preference when its snapshot fits the new byte budget.
+Atomic publication may temporarily retain the old aggregate plus one replacement
+of at most `max_bytes`, with bounded metadata. Recovery handles each family's
+pending/previous/committed transaction separately; pending data never becomes a
+usable seed. The earlier single-family store is validated and moved into the
+new family layout without copying its target files. Unknown entries or unsafe
+filesystem aliases refuse optional cache use instead of becoming cleanup targets.
+
+Every invocation still starts Cargo and admits its actual selected unit graph.
+A usable seed is verified and copied or reflinked into a new private target;
+its stored files are never mounted writable. Unchanged captured source files
+receive their previous timestamps in a separate runtime workspace. Eligible
+local source/data edits are stamped after every retained fingerprint; removed
+or renamed inputs also dirty their surviving parent directories and manifests.
+Cargo then decides which units rebuild. Compiler-only checks can retain this
+source-edit family. Identical captured inputs can also reuse compatible build,
+package and feature selections; toolchain, target/profile,
+runtime epoch, lockfile, manifest, configuration and captured dependency changes
+separate the seed family. Immutable registry/Git/vendor inputs remain exact.
+This allows workspace crates to stay fresh without granting them action-cache
+publication or skipping Cargo's current command.
+
+Code-generating builds, all test commands, and selected graphs with build scripts
+or procedural macros use the **complete captured source identity** for private target reuse. An unchanged capture can
+reuse its verified target, but any captured file edit starts that graph with a
+cold target. Procedural macros may read data through ordinary filesystem calls
+that do not appear in rustc's dependency information; changing only such a file
+must invalidate the prior expansion even when Cargo would otherwise report the
+consumer as fresh. Pure Rust codegen has a similar gap: LLVM assembler
+`.incbin` reads can embed data without reporting it in rustc's dep-info.
+Changing only that data must not return an old archive or executable. The more
+selective source-edit reuse above remains available to compiler-only checks.
+With multiple families retained, returning to an earlier exact source snapshot
+can recover its own target state even after an intervening source edit or
+build selected a different family.
+
+The `canonical-compilation-started` stderr record reports
+`private_target_state` as `disabled`, `cold` or `restored`. A failed optional
+restore keeps its partial copy unmounted and runs the current command cold;
+a failed save preserves Cargo's actual result. Both report a
+`canonical-target-state-unavailable` diagnostic. A new seed is saved only after
+complete compiler/session/coordinator drain and either successful Cargo execution
+or a normally exited `test` command. A failing test may therefore retain its
+compiled artifacts for the next invocation; the tests still execute again, and
+the previous success or failure is never served as a test result.
+That same successful cold command can replace a seed after a failed restore.
+An ineligible source edit or a failed private destination preserves a healthy
+committed seed until that replacement succeeds.
+Failed check/build commands, cancelled commands and incomplete process-group
+cleanup cannot replace a successful seed. Checks can also
+retain reusable state too. Successful build delivery still owns separate files,
+so editing or running a previously delivered binary cannot alter the seed or
+another invocation's outputs.
 
 The ordinary fixed sampling policy requires an initial successful compiler
 result and two matching real compiler comparisons before a subsequent eligible
-request can skip rustc. Repeating the same check four times against the same
+request can skip rustc. Repeating the same eligible command four times against the same
 state root exercises that progression. Adaptive sampling or a configured release
 authorization policy can require additional evidence. This command loads the
 same `[rabs]` configuration and environment overrides for build identity and
@@ -1000,14 +1284,20 @@ profile grants no release verdict or preverified cache entry.
 The stderr decision trail records `rabsd-live-dependency` events such as
 `execute`, `hit`, `served`, and the specific reason for a fallback. A `hit` is an
 offer; `served` follows the accepted, verified installation. Workspace crates
-continue through the compiler even on a warm dependency cache. Editing a
+continue through the compiler even on a warm dependency action cache unless
+Cargo itself finds them fresh in an explicitly enabled private target. Editing a
 dependency's captured source or changing its exact upstream artifact inventory
 changes the key or refuses reuse. Unsupported actions preserve ordinary rustc
 execution rather than borrowing the external dependency class's evidence.
 
-The command replays Cargo's complete bounded stdout and stderr after capture,
-then returns Cargo's actual status. A timeout, cancellation or incomplete drain
-is an error, including a child that exits zero while handling cancellation.
+The actual compilation inherits stdout and stderr, delivering Cargo JSON and compiler
+diagnostics as they are written with exact bytes and ordinary terminal/pipe
+behavior. There is no delayed replay or retained copy of these streams. A slow
+consumer backpressures Cargo while the process supervisor still enforces the
+execution deadline and cancellation. Graph planning remains a bounded capture.
+The command returns Cargo's actual status; a timeout, cancellation or incomplete
+process-group cleanup is an error, including a child that exits zero while
+handling cancellation.
 Input/toolchain capture and the first graph proof precede the scoped daemon's
 signal listener; they retain the existing bounded preparation behavior and the
 namespace's die-with-parent boundary. Compiler execution after admission uses
@@ -1017,20 +1307,74 @@ operation directory is released. After Cargo's process group exits, admission
 to the scoped endpoint is sealed and the coordinator retains authority while
 acknowledged captures finish publication. This drain has a 60-second deadline;
 expiration is reported as an error rather than silently losing the last unit's
-publication or verification sample. Output paths in Cargo's JSON refer to that
-canonical operation; this check interface returns diagnostics and success/failure,
-while persistent reusable dependency results remain in the profile's CAS.
+publication or verification sample. A check returns diagnostics and success/failure;
+its temporary target is released after optional private state capture. Persistent reusable dependency results remain
+in the profile's CAS.
+
+A successful `build` or `test --no-run` moves its complete target tree, after that clean drain, to
+a fresh private `operation_root/rabs-build-<random>/target` directory. The move
+preserves the actual artifacts, executable permissions and inodes without a second
+copy. Captured source, toolchain, Cargo home and control sockets stay in the
+temporary operation and are released separately. Existing delivery directories
+are never overwritten, and failed, cancelled or incompletely drained operations
+do not expose a successful build delivery.
+
+The native driver prints a `canonical-build-completed` JSON record on stderr
+with the selected `command`, `tests_executed: false`,
+`canonical_target: "/__rabs/out/cargo"` and the real `target_directory`.
+Cargo's stdout and artifact paths retain their original canonical spelling; use
+the reported target directory for the same relative output path. For example,
+`/__rabs/out/cargo/release/server` is available as
+`<target_directory>/release/server`; an explicit target triple adds its usual
+subdirectory. A retained binary may be run directly when its normal target and
+runtime requirements are met. RABS does not run it as part of `build` or
+`test --no-run`. Test harnesses retain Cargo's ordinary names under `debug/deps`
+or the selected target/profile directory. Each delivered command
+has its own retained outputs; this is artifact delivery, not a shared writable
+target cache or a request to skip Cargo's current command.
 
 ### Validate the real bridge
 
-The ordinary native tests cover strict profile parsing, pure-graph admission,
-read-only control/source mounts, retained state ownership, and the real scoped
+The ordinary native tests cover strict profile parsing, command-specific unit-graph admission,
+read-only control/source mounts, retained state and output ownership, and the real scoped
 socket's refusal of generic daemon capabilities while joining an open session:
 
 ```sh
 cargo test -p rabsd --lib coord::canonical_local --locked
 cargo test -p rabsd --test canonical_check_local --locked
+cargo test -p rabs-sandbox --lib cargo_check --locked
+cargo test -p rabs-sandbox --test cargo_check --locked -- --nocapture
 ```
+
+The sandbox Cargo tests invoke the actual installed nightly Cargo and rustc.
+They check selected feature/target/profile graphs, real check metadata, build
+archives, generated Rust from a build script, a functioning procedural macro,
+a linked binary and compiled test harnesses. Build and no-run cases require
+execution markers to remain absent. Test cases then verify filtering, repeated
+execution when Cargo reports a fresh harness, doctest execution and the current
+failure exit status. A wrong-profile negative control must fail compilation. These
+cases validate command selection and its real Cargo outputs; they do not substitute
+for the isolated worker/cache fixtures below.
+
+The local canonical test fixtures require the full namespace and matching native
+driver/wrapper binaries:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_tests_deliver_no_run_artifacts_and_execute_each_current_run \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_doctests_execute_with_captured_rustdoc_and_preserve_failures \
+    -- --ignored --exact --nocapture
+```
+
+These cases check delivered no-run harnesses, execution of each current test
+request, the captured rustdoc, failure propagation and refusal of local cache
+authority from test code. They must actually execute on a supported host; an
+ignored fixture or a namespace-capability refusal is not passing evidence.
 
 The full compiler-skip test is explicitly opt-in because it needs the complete
 Linux namespace capability and an installed native wrapper. Build the binaries
@@ -1047,10 +1391,206 @@ RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
 That test runs real Cargo and rustc against two vendored dependency libraries.
 It requires three actual cold/sample compiles with identical action identities,
 then requires verified hits in a different checkout and fresh target after a
-workspace source edit. A subsequent dependency edit must compile, and adding a
-build script must refuse the graph before the cache endpoint is exposed. The test
+workspace source edit. Unused optional build-script and development proc-macro
+dependencies are present throughout those checks. A subsequent dependency edit
+must compile. Explicitly selecting either executor must execute its real code
+and validate the generated result without borrowing the earlier local cache
+authority. The script also connects to the wrapper socket and attempts to claim
+local capture; the retained operation policy must refuse that claim. The test
 does not inject publication rows or verification samples. An ignored test or a
 namespace-support refusal is not end-to-end success evidence; run this test on a
-capable host before enabling the profile operationally. This bounded local bridge
-does not complete the remote worker, workspace-cache or performance qualification
-tasks described above.
+capable host before enabling the profile operationally.
+
+The remote bridge has a separate opt-in fixture using the actual native worker,
+mutual TLS, captured Cargo/rustc and durable worker request receipts:
+
+```sh
+cargo build -p rabsd -p rabs-wrap -p rabs-wkr --locked
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktrees \
+    -- --ignored --exact --nocapture
+```
+
+This requires OpenSSL and full canonical namespace support. It requires three
+completed remote compilations of each of two dependencies, then verifies that a
+relocated check serves both from cache without advancing the worker's execution
+receipts. A changed dependency must produce the changed metadata consumed by a
+compile-time check in the root package. Selecting the fixture's deliberately
+failing build script must execute it and retain Cargo's failure, without falling
+back to local cache capture. It does not inject
+cache rows, samples or delivery receipts. Merely adding or ignoring this fixture
+is not native execution evidence; run it on a capable host to qualify the new
+canonical remote metadata path. Neither metadata bridge test establishes workspace
+caching, archive execution or a performance improvement.
+
+The canonical build fixture exercises the separate archive path and final artifact
+delivery using the same complete Linux namespace and matching binaries:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary \
+    -- --ignored --exact --nocapture
+
+RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+  cargo test -p rabs-sandbox --lib \
+    dependency_context::tests::real_canonical_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info \
+    --locked -- --ignored --exact --nocapture
+```
+
+The build fixture requires three real remote archive executions for each of two
+dependencies, then verifies a relocated warm build without additional worker
+executions. It compares delivered `.rlib` bytes and executes the final linked
+binary, edits a dependency and requires new keys and changed outputs, and checks
+that the failing build script cannot create a completed build delivery. The
+sandbox fixture separately compiles an actual `.incbin` payload whose bytes appear
+in the archive but not rustc's dep-info, then verifies that unkeyed host/process/
+entropy inputs are inaccessible. These are runnable acceptance tests, not a
+claim that an incapable host has passed them. Full native execution, build
+qualification and performance evidence must be established on a capable host.
+
+The generated-input variants run the same Cargo, wrapper, TLS worker and cache
+path for both output modes:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output \
+    -- --ignored --exact --nocapture
+```
+
+Their vendored dependency's build script reads a captured workspace file outside
+its package and writes generated Rust. After three real remote samples, a
+relocated build must replay both dependency results. Changing only that workspace
+input then leaves the dependency package bytes unchanged: the independent leaf
+must still replay, while the generated-input consumer needs a different key and
+an actual remote compile. A compile-time assertion checks the new metadata;
+the build variant also compares the archives and executes the delivered binary.
+The worker boundary tests separately compare native rustc outputs with sealed
+generated input transfer, including a modified original tree, and ownership
+tests cover empty trees and writable-alias refusal. The workflow runs the exact
+native selectors above; adding them does not establish that an unsupported host
+has passed the full path.
+
+Two complementary cases place the generator in the leaf dependency itself:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_offloads_generated_dependency_metadata_and_invalidates_generated_bytes \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_build_offloads_generated_archives_and_delivers_current_generated_code \
+    -- --ignored --exact --nocapture
+```
+
+Only the script's workspace input changes; package source, exact stdout and
+`rustc-env` remain fixed. Both the generated leaf and its dependent must acquire
+new keys and execute remotely. This checks propagation through the dependency
+graph alongside the unchanged-leaf replay case above. The build case requires
+the delivered executable to use the new generated value.
+
+### Select local Cargo units from the Cargo command line
+
+The installed `cargo-rabs` launcher accepts the same local profile and turns
+ordinary build/check/test selectors into the native driver's typed command and selection:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace --all-targets
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check -p app --bin server \
+  --no-default-features --features app/http --release
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- check -p core --lib \
+  --target wasm32-unknown-unknown --target host-tuple --profile dev
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- build -p app --bin server --release
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- build --workspace --all-targets
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- build -p core --tests --profile test
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- test --workspace
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --no-run
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --doc
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core roundtrip \
+  --no-fail-fast -- --exact --nocapture --test-threads=1
+```
+
+Omitting the Cargo arguments selects `check`. Explicit command-line selection
+replaces the profile's `command` and entire `selection` object; it never merges with saved
+features or targets. An empty selection uses Cargo's ordinary default members
+and targets. Directly invoking `rabsd` with a check profile that omits `selection`
+retains the library-only `--lib` behavior; build and test profiles use Cargo's defaults.
+The profile still selects the manifest,
+source and toolchain roots, job budget, timeout, state directory and wrapper.
+
+| Selection | Accepted options |
+|---|---|
+| Packages | `-p` / `--package`, `--workspace`, `--exclude` with `--workspace` |
+| Features | `-F` / `--features`, `--all-features`, `--no-default-features` |
+| Target kinds | `--lib`, `--bins`, `--tests`, `--examples`, `--benches`, `--all-targets` |
+| Named targets | `--bin`, `--test`, `--example`, `--bench` |
+| Compilation targets | Repeated `--target` with built-in target names or `host-tuple` |
+| Compilation profile | `--release` / `-r`, or one `--profile NAME` |
+| Test execution | `test` only: `--no-run`, `--doc`, `--no-fail-fast`, one optional test-name filter |
+| Test harness | `test` only: literal arguments after `--`, such as `--exact`, `--nocapture`, `--ignored` or `--test-threads=1` |
+
+Value options accept separate arguments and `--option=value`; `-pPACKAGE` and
+`-FFEATURES` are also accepted. Repeated array-valued options retain every literal
+value in order. `--profile` occurs at most once and cannot be combined with
+`--release` or `-r`. Target and profile names use the same restricted name syntax
+as the native profile above; neither can select a JSON target specification or
+another file. All array entries, the optional profile, the test filter and
+harness arguments together share the
+128-value limit and the selected command arguments' 16 KiB byte budget, including
+option names. Each individual value is limited to 1,024 UTF-8 bytes.
+Cargo interprets package specifications and comma/space-separated feature lists.
+The native driver constructs both its nonexecuting unit-graph query and the
+subsequent compilation from the same command and selection. It requires a captured nightly Cargo
+with unit-graph support and derives the worker-only cache policy from the test
+command or required build-script/procedural-macro units before exposing the cache endpoint. Selecting
+a different target or feature set can therefore retain local metadata caching
+when those executors are inactive. Source
+preparation still captures the locked graph; these selectors do not narrow the
+approved source boundary or replace the isolated generated-input admission checks.
+
+This mode accepts `check`, `build` and `test`. `run`, `bench`, Clippy and arbitrary
+subcommands are not admitted. `build --tests` and `build --benches` compile only;
+`test --no-run` also compiles without executing its harnesses. Ordinary `test`
+and `test --doc` run on every request, even when their compiled inputs are fresh.
+The filter and harness arguments are retained as separate typed fields; the
+driver appends the harness tail after its own Cargo options. No argument after
+that separator can become a Cargo configuration or planning option.
+The native driver supplies locked/offline
+mode, canonical compiler and output locations, and JSON diagnostics. Arguments
+that would override them, including `--config`, `--manifest-path`, `--target-dir`,
+`--message-format` and `-Z`, are refused as Cargo options. Harness arguments after
+`--` are accepted only for `test`. Set `jobs` and `manifest` in the profile. Launcher modes and
+local root-admission settings cannot be combined with this mode.
+
+Before the single native handoff, the launcher saves the resolved profile as
+`operation_root/<check-or-build-or-test>-<random>/profile.json` with mode 0600 in a mode 0700
+directory. It prints that retained pathname on stderr, preserves the source
+profile, then replaces its own process with
+`rabsd --canonical-compile-local <retained-profile>`. Native exit status, signals,
+stdin and stdout/stderr pass through that handoff. `CARGO_RABS_DAEMON` may select
+the matching installed `rabsd`; the selected compiler and wrapper still come
+from the profile. Release-policy configuration remains native and mandatory.
+No ordinary daemon is started, and a setup/native failure does not retry through
+Cargo, RCH or a weaker namespace.
+
+`scripts/tests/test_cargo_rabs_local.py` exercises this launcher handoff with an
+explicit executable driver fixture, including literal selections, retained
+permissions, process identity, raw streams, exit signals and refusal paths.
+Those tests establish the frontend contract. The real Cargo/compiler/cache
+qualification still requires the native integration tests above.

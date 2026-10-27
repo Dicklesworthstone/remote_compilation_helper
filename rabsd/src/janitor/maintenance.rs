@@ -63,10 +63,13 @@ impl Config {
 }
 
 fn number(value: Option<&str>, default: u64, maximum: u64, key: &str) -> Result<u64, String> {
-    let Some(value) = value else { return Ok(default); };
+    let Some(value) = value else {
+        return Ok(default);
+    };
     let value = value.trim();
     let parsed = (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| value.parse::<u64>().ok()).flatten()
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
         .filter(|value| (1..=maximum).contains(value));
     parsed.ok_or_else(|| format!("{key} must be an integer in 1..={maximum}"))
 }
@@ -129,7 +132,11 @@ impl Worker {
                 }
             }
         }).map_err(|error| format!("start CAS maintenance: {error}"))?;
-        Ok(Self { cancelled, wake, thread: Some(thread) })
+        Ok(Self {
+            cancelled,
+            wake,
+            thread: Some(thread),
+        })
     }
 }
 
@@ -137,8 +144,13 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
         let _ = self.wake.send(());
-        if let Some(thread) = self.thread.take() && thread.join().is_err() {
-            event_error("janitor-maintenance-panicked", "joined worker panicked; no worker remains");
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            event_error(
+                "janitor-maintenance-panicked",
+                "joined worker panicked; no worker remains",
+            );
         }
     }
 }
@@ -156,20 +168,30 @@ fn measure_usage(root: &Path, cancelled: &AtomicBool) -> Result<u64, String> {
     let mut entries = 0_usize;
     let mut bytes = 0_u64;
     while let Some(directory) = pending.pop() {
-        if cancelled.load(Ordering::Acquire) { return Err("usage scan cancelled".into()); }
+        if cancelled.load(Ordering::Acquire) {
+            return Err("usage scan cancelled".into());
+        }
         let metadata = fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
-        if !metadata.file_type().is_dir() { return Err("usage directory changed type".into()); }
+        if !metadata.file_type().is_dir() {
+            return Err("usage directory changed type".into());
+        }
         for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
-            if cancelled.load(Ordering::Acquire) { return Err("usage scan cancelled".into()); }
+            if cancelled.load(Ordering::Acquire) {
+                return Err("usage scan cancelled".into());
+            }
             entries = entries.checked_add(1).ok_or("usage entry count overflow")?;
-            if entries > MAX_USAGE_ENTRIES { return Err("usage inventory limit exceeded".into()); }
+            if entries > MAX_USAGE_ENTRIES {
+                return Err("usage inventory limit exceeded".into());
+            }
             let path = entry.map_err(|e| e.to_string())?.path();
             let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
             if metadata.file_type().is_dir() {
                 pending.push(path);
             } else if metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                 if files.insert((metadata.dev(), metadata.ino())) {
-                    bytes = bytes.checked_add(metadata.len()).ok_or("usage byte count overflow")?;
+                    bytes = bytes
+                        .checked_add(metadata.len())
+                        .ok_or("usage byte count overflow")?;
                 }
             } else {
                 return Err("unsupported node in usage inventory".into());
@@ -180,24 +202,33 @@ fn measure_usage(root: &Path, cancelled: &AtomicBool) -> Result<u64, String> {
 }
 
 pub(super) fn work(mounted: Result<Arc<LiveCas>, String>, quota: Option<u64>) -> SubsystemWork {
-    Box::new(move |cx, mut shutdown| Box::pin(async move {
-        let cas = mounted?;
-        let config = Config::from_environment().inspect_err(|reason| event_error("janitor-gc-config-refused", reason))?;
-        println!("{}", serde_json::json!({
-            "v":1, "kind":"janitor-cas-mounted", "root":cas.cas_root().display().to_string(),
-            "serving_refused":cas.serving_refused, "repaired":cas.repaired, "reported":cas.reported,
-        }));
-        println!("{}", serde_json::json!({
-            "v":1,"kind":"janitor-maintenance-config", "physical_reclaim":config.reclaim,
-            "interval_seconds":config.interval.as_secs(), "grace_seconds":config.grace.as_secs(),
-            "max_locations":config.limit, "quota_advisory":true,
-        }));
-        let owner = Worker::start(cas, quota, config)?;
-        cx.trace("janitor region up: recurring joined maintenance outside control reactor");
-        shutdown.wait().await;
-        drop(owner);
-        Ok(())
-    }))
+    Box::new(move |cx, mut shutdown| {
+        Box::pin(async move {
+            let cas = mounted?;
+            let config = Config::from_environment()
+                .inspect_err(|reason| event_error("janitor-gc-config-refused", reason))?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "v":1, "kind":"janitor-cas-mounted", "root":cas.cas_root().display().to_string(),
+                    "serving_refused":cas.serving_refused, "repaired":cas.repaired, "reported":cas.reported,
+                })
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                    "v":1,"kind":"janitor-maintenance-config", "physical_reclaim":config.reclaim,
+                    "interval_seconds":config.interval.as_secs(), "grace_seconds":config.grace.as_secs(),
+                    "max_locations":config.limit, "quota_advisory":true,
+                })
+            );
+            let owner = Worker::start(cas, quota, config)?;
+            cx.trace("janitor region up: recurring joined maintenance outside control reactor");
+            shutdown.wait().await;
+            drop(owner);
+            Ok(())
+        })
+    })
 }
 
 #[cfg(test)]
@@ -215,7 +246,11 @@ mod tests {
         assert_eq!(default.grace, Duration::from_secs(300));
         assert_eq!(default.limit, 64);
         for value in ["1", "true", "on"] {
-            assert!(Config::from_values(Some(value), Some("1"), Some("1"), Some("1024")).unwrap().reclaim);
+            assert!(
+                Config::from_values(Some(value), Some("1"), Some("1"), Some("1024"))
+                    .unwrap()
+                    .reclaim
+            );
         }
         for value in ["", "yes", "garbage"] {
             assert!(Config::from_values(Some(value), None, None, None).is_err());
@@ -236,9 +271,16 @@ mod tests {
         fs::write(outside.path().join("large"), vec![0_u8; 1024 * 1024]).unwrap();
         symlink(outside.path(), root.path().join("outside")).unwrap();
         symlink(root.path(), root.path().join("cycle")).unwrap();
-        let links = fs::symlink_metadata(root.path().join("outside")).unwrap().len()
-            + fs::symlink_metadata(root.path().join("cycle")).unwrap().len();
-        assert_eq!(measure_usage(root.path(), &AtomicBool::new(false)).unwrap(), 3 + links);
+        let links = fs::symlink_metadata(root.path().join("outside"))
+            .unwrap()
+            .len()
+            + fs::symlink_metadata(root.path().join("cycle"))
+                .unwrap()
+                .len();
+        assert_eq!(
+            measure_usage(root.path(), &AtomicBool::new(false)).unwrap(),
+            3 + links
+        );
     }
 
     #[test]
@@ -255,7 +297,12 @@ mod tests {
         let root = private_tempdir();
         let cas = Arc::new(mount_and_reconcile(root.path()).unwrap());
         let weak = Arc::downgrade(&cas);
-        let owner = Worker::start(Arc::clone(&cas), None, Config::from_values(None, None, None, None).unwrap()).unwrap();
+        let owner = Worker::start(
+            Arc::clone(&cas),
+            None,
+            Config::from_values(None, None, None, None).unwrap(),
+        )
+        .unwrap();
         drop(cas);
         assert!(weak.upgrade().is_some());
         assert!(mount_and_reconcile(root.path()).is_err());

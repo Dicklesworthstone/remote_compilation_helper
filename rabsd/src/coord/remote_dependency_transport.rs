@@ -10,8 +10,8 @@
 //! they never retry an execution or resolve its durable uncertainty.
 
 use super::secure_worker_delivery::{
-    DEPENDENCY_CONTEXT_VERSION, OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook,
-    parse_worker_pin, receive_authenticated_with_admission,
+    OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook, parse_worker_pin,
+    receive_authenticated_with_admission,
 };
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
@@ -21,6 +21,9 @@ use super::worker_delivery::{
 use asupersync::runtime::RuntimeBuilder;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_peer};
 use rabs_protocol::worker_fence::WorkerSessionOffer;
+use rabs_sandbox::dependency_context::{
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION,
+};
 use serde_json::Value;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -390,7 +393,7 @@ impl RemoteDependencyReservation {
     /// Persist only this selected worker's exact recovery context. A pool can
     /// change membership or order while an uncertain result remains retained;
     /// its aggregate status cannot identify the owner of this request.
-    pub fn worker_configuration(&self) -> Value {
+    pub fn worker_configuration(&self, context_version: &str) -> Value {
         let pin: String = self
             .transport
             .pin
@@ -398,7 +401,7 @@ impl RemoteDependencyReservation {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         serde_json::json!({
-            "remote_protocol":1, "dependency_context":DEPENDENCY_CONTEXT_VERSION,
+            "remote_protocol":1, "dependency_context":context_version,
             "listen":self.transport.address.to_string(), "worker_id":self.transport.worker,
             "worker_spki_sha256":pin,
         })
@@ -506,8 +509,10 @@ fn preflight(request: &Value, upload: &SourceUpload, destination: &Path) -> io::
             "remote dependency destination must be absolute without traversal",
         ));
     }
-    if request["dependency_context"]["version"] != DEPENDENCY_CONTEXT_VERSION
-        || request.get("command_context").is_some()
+    if !matches!(
+        request["dependency_context"]["version"].as_str(),
+        Some(DEPENDENCY_CONTEXT_VERSION | CANONICAL_DEPENDENCY_CONTEXT_VERSION)
+    ) || request.get("command_context").is_some()
         || request.get("artifacts").is_none()
         || !toolchain_transfer(request)?
         || request["program"].as_str().is_none()
@@ -860,23 +865,29 @@ mod tests {
         let transport = transport();
         let now = Instant::now();
         transport.observe_delivery(&disconnected(false), false, now);
-        let owner = transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).unwrap();
+        let owner = transport
+            .try_reserve_at(now + FIRST_CONNECTION_COOLDOWN)
+            .unwrap();
         let complete = delivered(true, false);
         transport.observe_delivery(&complete, false, now + FIRST_CONNECTION_COOLDOWN);
         assert!(transport.cooldown.lock().unwrap().failed_at.is_none());
-        assert!(transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).is_err());
+        assert!(
+            transport
+                .try_reserve_at(now + FIRST_CONNECTION_COOLDOWN)
+                .is_err()
+        );
         drop(owner);
-        assert!(transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).is_ok());
+        assert!(
+            transport
+                .try_reserve_at(now + FIRST_CONNECTION_COOLDOWN)
+                .is_ok()
+        );
         assert_eq!(complete.as_ref().unwrap().receipt["exit_code"], 1);
         assert_eq!(
             complete.as_ref().unwrap().receipt["publication_authorized"],
             false,
         );
-        transport.observe_delivery(
-            &disconnected(false),
-            false,
-            now + FIRST_CONNECTION_COOLDOWN,
-        );
+        transport.observe_delivery(&disconnected(false), false, now + FIRST_CONNECTION_COOLDOWN);
         assert_eq!(
             transport.cooldown.lock().unwrap().delay,
             FIRST_CONNECTION_COOLDOWN,
@@ -907,7 +918,11 @@ mod tests {
         let outcome = disconnected(true);
         transport.observe_delivery(&outcome, false, now);
         assert!(transport.try_reserve_at(now).is_err());
-        drop(transport.try_reserve_at(now + MAX_CONNECTION_COOLDOWN).unwrap());
+        drop(
+            transport
+                .try_reserve_at(now + MAX_CONNECTION_COOLDOWN)
+                .unwrap(),
+        );
         // Availability is not drain proof, actor reconciliation or permission
         // to retry this same request. The original result is unchanged.
         let failure = outcome.unwrap_err();

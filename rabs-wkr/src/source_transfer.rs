@@ -9,6 +9,8 @@
 
 mod cache;
 
+pub use cache::{DEFAULT_SOURCE_CACHE_BYTES, MAX_SOURCE_CACHE_BYTES, SourceCache};
+
 #[cfg(test)]
 use rabs_sandbox::cargo_home::CARGO_HOME_SOURCE_VERSION;
 use rabs_sandbox::cargo_home::{CargoHomeProjection, PreparedCargoHome};
@@ -239,9 +241,14 @@ fn dependency_same_directory(left: &std::fs::Metadata, right: &std::fs::Metadata
 }
 
 impl DependencyGeneratedInputs {
-    fn capture(backing: std::path::PathBuf, files: &[&SourceFile]) -> io::Result<Self> {
+    fn capture(
+        backing: std::path::PathBuf,
+        files: &[&SourceFile],
+        directories: &[String],
+    ) -> io::Result<Self> {
         use std::io::Read;
 
+        rabs_sandbox::generated_source::validate_generated_directories(directories)?;
         let refuse = || io::Error::other("generated input differs from its sealed manifest");
         let directory_metadata = std::fs::symlink_metadata(&backing)?;
         if !directory_metadata.is_dir() || std::fs::canonicalize(&backing)? != backing {
@@ -258,6 +265,14 @@ impl DependencyGeneratedInputs {
             directories: std::collections::BTreeMap::new(),
             files: std::collections::BTreeMap::new(),
         };
+        for name in directories {
+            let path = guard.backing.join(name);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_dir() || std::fs::canonicalize(&path)? != path {
+                return Err(refuse());
+            }
+            guard.directories.insert(name.clone(), metadata);
+        }
         for expected in files {
             let name = expected
                 .path
@@ -265,15 +280,12 @@ impl DependencyGeneratedInputs {
                 .ok_or_else(refuse)?;
             for (offset, _) in name.match_indices('/') {
                 let parent = &name[..offset];
-                let path = guard.backing.join(parent);
-                let metadata = std::fs::symlink_metadata(&path)?;
-                if !metadata.is_dir() || std::fs::canonicalize(&path)? != path {
+                if !guard.directories.contains_key(parent) {
                     return Err(refuse());
                 }
-                guard
-                    .directories
-                    .entry(parent.to_owned())
-                    .or_insert(metadata);
+            }
+            if guard.directories.contains_key(name) {
+                return Err(refuse());
             }
             let path = guard.backing.join(name);
             if std::fs::canonicalize(&path)? != path {
@@ -511,6 +523,20 @@ impl SourceOwner {
                 if relative.is_empty() || context.generated_root().is_none() {
                     return Err(refuse("dependency generated member is not declared"));
                 }
+                let directories = context.generated_directories();
+                if directories
+                    .binary_search_by(|path| path.as_str().cmp(relative))
+                    .is_ok()
+                    || relative.match_indices('/').any(|(offset, _)| {
+                        directories
+                            .binary_search_by(|path| path.as_str().cmp(&relative[..offset]))
+                            .is_err()
+                    })
+                {
+                    return Err(refuse(
+                        "generated file conflicts with its complete directory inventory",
+                    ));
+                }
                 generated_present = true;
                 continue;
             }
@@ -571,15 +597,18 @@ impl SourceOwner {
     }
 
     /// Prepare the complete generated tree and retain its identity through
-    /// execution. A zero-file manifest receives a newly created private empty
-    /// directory beside the sealed bundle; no undeclared directory is inserted
-    /// into SourceReceiver's already verified source inventory.
+    /// execution. Every tree receives a private backing beside the sealed
+    /// bundle so explicit empty directories never change SourceReceiver's
+    /// file-only inventory. Files are bounded copies, never writable aliases
+    /// of a transfer or cache inode.
     pub(crate) fn prepare_dependency_generated(
         &self,
         request_id: u64,
         context: &rabs_sandbox::dependency_context::DependencyExecContext,
         spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
     ) -> io::Result<Option<DependencyGeneratedInputs>> {
+        use std::io::Read;
+
         let package = self.dependency_root(request_id, context)?;
         let Some(visible) = context.generated_root() else {
             return Ok(None);
@@ -606,20 +635,66 @@ impl SourceOwner {
             .iter()
             .filter(|file| file.path.starts_with("generated/"))
             .collect();
-        let backing = if files.is_empty() {
-            let root = self._directory.path().join("generated-empty");
-            let mut builder = std::fs::DirBuilder::new();
+        // SourceReceiver creates only file parents. Hold that exact original
+        // tree while copying; additional generated directories belong solely
+        // to the request-bound execution context and its private backing.
+        let source_guard = if files.is_empty() {
+            None
+        } else {
+            let mut parents = std::collections::BTreeSet::new();
+            for file in &files {
+                let relative = file.path.strip_prefix("generated/").unwrap();
+                for (offset, _) in relative.match_indices('/') {
+                    parents.insert(relative[..offset].to_owned());
+                }
+            }
+            Some(DependencyGeneratedInputs::capture(
+                bundle.join("generated"),
+                &files,
+                &parents.into_iter().collect::<Vec<_>>(),
+            )?)
+        };
+        let backing = self._directory.path().join("generated-inputs");
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&backing)?;
+        for directory in context.generated_directories() {
+            builder.create(backing.join(directory))?;
+        }
+        for expected in &files {
+            let relative = expected.path.strip_prefix("generated/").unwrap();
+            let source = rabs_sandbox::regular_input::open(&bundle.join(&expected.path))?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
             #[cfg(unix)]
             {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-            builder.create(&root)?;
-            root
-        } else {
-            bundle.join("generated")
-        };
-        let guard = DependencyGeneratedInputs::capture(backing, &files)?;
+            let mut destination = options.open(backing.join(relative))?;
+            if std::io::copy(&mut source.take(expected.len + 1), &mut destination)? != expected.len
+            {
+                return Err(io::Error::other(
+                    "generated input changed length during preparation",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                destination.set_permissions(std::fs::Permissions::from_mode(
+                    if expected.executable { 0o555 } else { 0o444 },
+                ))?;
+            }
+        }
+        if let Some(source_guard) = source_guard {
+            source_guard.verify()?;
+        }
+        let guard =
+            DependencyGeneratedInputs::capture(backing, &files, context.generated_directories())?;
         binding.backing = guard.backing.clone();
         Ok(Some(guard))
     }
@@ -800,17 +875,7 @@ impl SourceOwner {
             .ok_or_else(|| refuse("dependency bundle parent is missing"))?;
         let generated_backing = if let Some(generated) = context.generated_root() {
             let visible = Path::new(generated);
-            let backing = if self
-                .receiver
-                .manifest()
-                .files()
-                .iter()
-                .any(|file| file.path.starts_with("generated/"))
-            {
-                bundle.join("generated")
-            } else {
-                self._directory.path().join("generated-empty")
-            };
+            let backing = self._directory.path().join("generated-inputs");
             let mut owned = 0;
             for bind in &spec.ro_binds {
                 if bind.visible == visible && bind.backing == backing {
@@ -1086,11 +1151,15 @@ impl SourceOwner {
 pub struct SourceTransferState {
     pending: Option<SourceOwner>,
     input_budget: Option<Duration>,
-    #[cfg(test)]
-    cache_override: Option<cache::SourceCache>,
+    cache: Option<SourceCache>,
 }
 
 impl SourceTransferState {
+    pub(crate) fn with_cache(mut self, cache: Option<SourceCache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
     /// A selected full-toolchain upload follows the source upload before
     /// execution admission. Both inputs retain one fixed combined budget from
     /// source-begin; progress never renews it. Ordinary source-only sessions
@@ -1138,14 +1207,7 @@ impl SourceTransferState {
             }
             let deadline = Instant::now() + self.input_budget.unwrap_or(UPLOAD_BUDGET);
             let cache = if allow_cached_files {
-                #[cfg(test)]
-                let configured = self
-                    .cache_override
-                    .clone()
-                    .map_or_else(cache::SourceCache::configured, |cache| Ok(Some(cache)));
-                #[cfg(not(test))]
-                let configured = cache::SourceCache::configured();
-                configured.map_err(|error| format!("source cache configuration: {error}"))?
+                self.cache.clone().map(|cache| cache.before(deadline))
             } else {
                 None
             };
@@ -1169,19 +1231,13 @@ impl SourceTransferState {
                 if file.len == 0 {
                     continue;
                 }
-                if let Some(bytes) = cache.as_ref().and_then(|cache| cache.load(&file)) {
-                    // Read and verify the COMPLETE cached object first. A miss
-                    // must leave staging untouched, not poison it mid-copy.
-                    for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
-                        receiver
-                            .write_chunk(
-                                &file.path,
-                                index as u64 * MAX_SOURCE_CHUNK as u64,
-                                chunk,
-                                Sha256::digest(chunk).into(),
-                            )
-                            .map_err(|error| error.to_string())?;
-                    }
+                if let Some(snapshot) = cache.as_ref().and_then(|cache| cache.load(&file)) {
+                    // Lookup verifies a complete anonymous snapshot before any
+                    // receiver write. Large archives use a fixed-size buffer,
+                    // and later cache corruption cannot change this snapshot.
+                    snapshot
+                        .install(&mut receiver)
+                        .map_err(|error| error.to_string())?;
                     reused_bytes += file.len;
                 } else {
                     missing_files.push(file.path);
@@ -1430,7 +1486,7 @@ mod tests {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         SourceTransferState {
-            cache_override: Some(cache::SourceCache::open(parent).unwrap()),
+            cache: Some(SourceCache::open(parent, DEFAULT_SOURCE_CACHE_BYTES).unwrap()),
             ..SourceTransferState::default()
         }
     }
@@ -1492,22 +1548,67 @@ mod tests {
         rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
         tempfile::TempDir,
     ) {
-        use rabs_sandbox::dependency_context::DependencyExecContext;
+        generated_dependency_profile_fixture(files, false)
+    }
+
+    fn generated_dependency_profile_fixture(
+        files: &[(&str, &[u8], bool)],
+        canonical: bool,
+    ) -> (
+        SourceOwner,
+        rabs_sandbox::dependency_context::DependencyExecContext,
+        rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+        tempfile::TempDir,
+    ) {
+        use rabs_sandbox::dependency_context::{DependencyExecContext, DependencyExecutionMode};
         let owner = uploaded_dependency_bundle(files);
-        let generated = "/target/build/unit/out";
-        let context = DependencyExecContext::new_with_generated_artifacts(
-            "/source/package".to_owned(),
-            "/source/package".to_owned(),
-            "/toolchains/pinned".to_owned(),
-            "/toolchains/pinned/bin/rustc".to_owned(),
-            "/target/deps".to_owned(),
-            vec!["/target/deps".to_owned()],
-            vec!["/target".to_owned()],
-            Vec::new(),
-            Some(generated.to_owned()),
-            vec![("OUT_DIR".to_owned(), generated.to_owned())],
-            [7; 32],
-        )
+        let mut directories = std::collections::BTreeSet::new();
+        for (path, _, _) in files {
+            if let Some(relative) = path.strip_prefix("generated/") {
+                for (offset, _) in relative.match_indices('/') {
+                    directories.insert(relative[..offset].to_owned());
+                }
+            }
+        }
+        let context = if canonical {
+            let source = "/__rabs/workspace/vendor/package";
+            let output = "/__rabs/out/cargo/debug/deps";
+            let generated = "/__rabs/out/cargo/debug/build/package-123/out";
+            DependencyExecContext::new_canonical_cargo_with_generated(
+                DependencyExecutionMode::Metadata,
+                source.into(),
+                source.into(),
+                output.into(),
+                vec![output.into()],
+                vec!["/__rabs/out/cargo/debug".into()],
+                Vec::new(),
+                Some(generated.into()),
+                vec![
+                    ("HOME".into(), "/__rabs/home".into()),
+                    ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                    ("CARGO_MANIFEST_DIR".into(), source.into()),
+                    ("OUT_DIR".into(), generated.into()),
+                ],
+                [7; 32],
+            )
+        } else {
+            let generated = "/target/build/unit/out";
+            DependencyExecContext::new_with_generated_artifacts(
+                "/source/package".to_owned(),
+                "/source/package".to_owned(),
+                "/toolchains/pinned".to_owned(),
+                "/toolchains/pinned/bin/rustc".to_owned(),
+                "/target/deps".to_owned(),
+                vec!["/target/deps".to_owned()],
+                vec!["/target".to_owned()],
+                Vec::new(),
+                Some(generated.to_owned()),
+                vec![("OUT_DIR".to_owned(), generated.to_owned())],
+                [7; 32],
+            )
+        }
+        .unwrap()
+        .with_generated_directories(directories.into_iter().collect())
         .unwrap();
         let runtime = tempfile::tempdir().unwrap();
         for name in ["toolchain", "output", "empty", "home"] {
@@ -1527,6 +1628,113 @@ mod tests {
             )
             .unwrap();
         (owner, context, spec, runtime)
+    }
+
+    #[test]
+    fn canonical_generated_inputs_use_exact_sealed_or_empty_read_only_owners() {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use rabs_sandbox::dependency_context::DependencyExecutionMode;
+        let package = ("package/src/lib.rs", b"source".as_slice(), false);
+        let generated = (
+            "generated/nested/input.rs",
+            b"pub const VALUE:u32=73;".as_slice(),
+            false,
+        );
+        let binary = (
+            "generated/nested/data.bin",
+            b"captured binary bytes\n\0\xff".as_slice(),
+            false,
+        );
+        let executable = ("generated/helper", b"helper bytes".as_slice(), true);
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            for files in [
+                vec![package],
+                vec![package, generated],
+                vec![package, generated, binary, executable],
+            ] {
+                let (owner, context, mut spec, _runtime) =
+                    generated_dependency_profile_fixture(&files, true);
+                let context = context.with_execution_mode(mode);
+                let original = spec.clone();
+                let guard = owner
+                    .prepare_dependency_generated(91, &context, &mut spec)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(context.version(), "canonical-dependency-exec-v4");
+                assert_eq!(guard.files.len(), files.len() - 1);
+                owner.protect_dependency(91, &context, &spec).unwrap();
+                guard.verify().unwrap();
+                let visible = std::path::Path::new(context.generated_root().unwrap());
+                assert_eq!(
+                    spec.ro_binds
+                        .iter()
+                        .filter(|bind| bind.visible == visible)
+                        .count(),
+                    1
+                );
+                assert!(
+                    spec.rw_binds
+                        .iter()
+                        .all(|bind| !bind.visible.starts_with(visible))
+                );
+                if files.len() == 1 {
+                    assert_eq!(std::fs::read_dir(&guard.backing).unwrap().count(), 0);
+                    assert!(
+                        owner
+                            .receiver
+                            .sealed_root()
+                            .unwrap()
+                            .join("generated")
+                            .symlink_metadata()
+                            .is_err()
+                    );
+                    assert!(
+                        owner
+                            .prepare_dependency_generated(91, &context, &mut original.clone())
+                            .is_err(),
+                        "an empty generated owner cannot be silently reused"
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read(guard.backing.join("nested/input.rs")).unwrap(),
+                        generated.1
+                    );
+                }
+                if files.len() == 4 {
+                    assert_eq!(
+                        std::fs::read(guard.backing.join("nested/data.bin")).unwrap(),
+                        binary.1
+                    );
+                    assert_eq!(
+                        std::fs::read(guard.backing.join("helper")).unwrap(),
+                        executable.1
+                    );
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_ne!(
+                            std::fs::metadata(guard.backing.join("helper"))
+                                .unwrap()
+                                .permissions()
+                                .mode()
+                                & 0o111,
+                            0
+                        );
+                    }
+                }
+                let mut writable = spec.clone();
+                writable
+                    .rw_binds
+                    .push(Bind::new(&guard.backing, "/__rabs/home/mutable-generated"));
+                assert!(owner.protect_dependency(91, &context, &writable).is_err());
+                let mut missing = spec;
+                missing.ro_binds.retain(|bind| bind.visible != visible);
+                assert!(owner.protect_dependency(91, &context, &missing).is_err());
+            }
+        }
     }
 
     #[test]
@@ -1585,6 +1793,157 @@ mod tests {
                     executable.1
                 );
             }
+        }
+    }
+
+    #[test]
+    fn generated_directory_only_and_mixed_trees_preserve_exact_private_topology() {
+        use rabs_sandbox::dependency_context::DependencyExecutionMode;
+        use std::os::unix::fs::MetadataExt;
+        let package = ("package/src/lib.rs", b"source".as_slice(), false);
+        let generated = ("generated/value.rs", b"generated bytes".as_slice(), false);
+        for canonical in [false, true] {
+            for mode in [
+                DependencyExecutionMode::Metadata,
+                DependencyExecutionMode::Rlib,
+            ] {
+                for files in [vec![package], vec![package, generated]] {
+                    let (owner, context, mut spec, runtime) =
+                        generated_dependency_profile_fixture(&files, canonical);
+                    let context = context
+                        .with_execution_mode(mode)
+                        .with_generated_directories(vec!["empty".into(), "empty/child".into()])
+                        .unwrap();
+                    let guard = owner
+                        .prepare_dependency_generated(91, &context, &mut spec)
+                        .unwrap()
+                        .unwrap();
+                    owner.protect_dependency(91, &context, &spec).unwrap();
+                    guard.verify().unwrap();
+                    assert_eq!(
+                        guard
+                            .directories
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        ["empty", "empty/child"]
+                    );
+                    assert!(guard.backing.join("empty/child").is_dir());
+                    assert_eq!(
+                        std::fs::read_dir(guard.backing.join("empty/child"))
+                            .unwrap()
+                            .count(),
+                        0
+                    );
+                    let sealed = owner.receiver.sealed_root().unwrap();
+                    assert!(
+                        !sealed.join("generated/empty").exists(),
+                        "execution topology must not alter the sealed transfer"
+                    );
+                    if files.len() == 2 {
+                        let original =
+                            std::fs::metadata(sealed.join("generated/value.rs")).unwrap();
+                        let copied = std::fs::metadata(guard.backing.join("value.rs")).unwrap();
+                        assert_ne!(
+                            (original.dev(), original.ino()),
+                            (copied.dev(), copied.ino())
+                        );
+                        assert_eq!(
+                            std::fs::read(guard.backing.join("value.rs")).unwrap(),
+                            generated.1
+                        );
+                    }
+                    std::fs::rename(
+                        guard.backing.join("empty/child"),
+                        runtime.path().join("retained-child"),
+                    )
+                    .unwrap();
+                    std::fs::create_dir(guard.backing.join("empty/child")).unwrap();
+                    assert!(
+                        guard.verify().is_err(),
+                        "same-name empty directory replacement must invalidate the guard"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_directory_topology_allows_real_rustc_include_traversal() {
+        let files = [
+            ("package/src/lib.rs", b"pub const VALUE: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/empty/../value.rs\"));\n".as_slice(), false),
+            ("generated/value.rs", b"retained generated value".as_slice(), false),
+        ];
+        let (owner, context, mut spec, runtime) = generated_dependency_fixture(&files);
+        let context = context
+            .with_generated_directories(vec!["empty".into()])
+            .unwrap();
+        let guard = owner
+            .prepare_dependency_generated(91, &context, &mut spec)
+            .unwrap()
+            .unwrap();
+        owner.protect_dependency(91, &context, &spec).unwrap();
+        let source = owner
+            .dependency_root(91, &context)
+            .unwrap()
+            .join("src/lib.rs");
+        let compile = || {
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .args([
+                    "--crate-name=generated_tree",
+                    "--crate-type=lib",
+                    "--emit=metadata",
+                    "--out-dir",
+                ])
+                .arg(runtime.path().join("output"))
+                .arg(&source)
+                .env("OUT_DIR", &guard.backing)
+                .output()
+                .expect("run the actual Rust compiler")
+        };
+        let result = compile();
+        assert!(
+            result.status.success(),
+            "rustc could not read the preserved generated tree: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            runtime
+                .path()
+                .join("output/libgenerated_tree.rmeta")
+                .is_file()
+        );
+        guard.verify().unwrap();
+        std::fs::rename(
+            guard.backing.join("empty"),
+            runtime.path().join("retained-empty"),
+        )
+        .unwrap();
+        assert!(
+            !compile().status.success(),
+            "negative control must fail when required empty directory is omitted"
+        );
+        assert!(guard.verify().is_err());
+    }
+
+    #[test]
+    fn generated_file_manifest_requires_declared_parents_and_disjoint_directory_names() {
+        let files = [
+            ("package/src/lib.rs", b"source".as_slice(), false),
+            ("generated/nested/value.rs", b"generated".as_slice(), false),
+        ];
+        let (owner, context, spec, _runtime) = generated_dependency_fixture(&files);
+        for directories in [vec![], vec!["nested".into(), "nested/value.rs".into()]] {
+            let invalid = context
+                .clone()
+                .with_generated_directories(directories)
+                .unwrap();
+            assert!(owner.dependency_root(91, &invalid).is_err());
+            assert!(
+                owner
+                    .prepare_dependency_generated(91, &invalid, &mut spec.clone())
+                    .is_err()
+            );
         }
     }
 
@@ -1686,6 +2045,15 @@ mod tests {
 
     #[test]
     fn generated_mounts_refuse_shadowing_redirection_and_writable_aliases() {
+        assert_generated_mount_protection(false);
+    }
+
+    #[test]
+    fn canonical_generated_mounts_refuse_shadowing_redirection_and_writable_aliases() {
+        assert_generated_mount_protection(true);
+    }
+
+    fn assert_generated_mount_protection(canonical: bool) {
         use rabs_sandbox::canonical_namespace::Bind;
         use std::path::Path;
         for populated in [false, true] {
@@ -1693,7 +2061,8 @@ mod tests {
             if populated {
                 files.push(("generated/input.rs", b"generated".as_slice(), false));
             }
-            let (owner, context, mut spec, runtime) = generated_dependency_fixture(&files);
+            let (owner, context, mut spec, runtime) =
+                generated_dependency_profile_fixture(&files, canonical);
             let guard = owner
                 .prepare_dependency_generated(91, &context, &mut spec)
                 .unwrap()
@@ -1713,7 +2082,7 @@ mod tests {
             assert!(owner.protect_dependency(91, &context, &redirected).is_err());
             for shadow in [
                 visible.join("input.rs"),
-                Path::new("/target/build").to_path_buf(),
+                visible.parent().unwrap().parent().unwrap().to_path_buf(),
             ] {
                 let mut changed = spec.clone();
                 changed
@@ -1725,7 +2094,10 @@ mod tests {
                 Bind::new(&guard.backing, "/scratch"),
                 Bind::new(runtime.path().join("output"), visible),
                 Bind::new(runtime.path().join("output"), visible.join("child")),
-                Bind::new(runtime.path().join("output"), "/target/build"),
+                Bind::new(
+                    runtime.path().join("output"),
+                    visible.parent().unwrap().parent().unwrap(),
+                ),
             ] {
                 let mut changed = spec.clone();
                 changed.rw_binds.push(bind);
@@ -2352,17 +2724,18 @@ mod tests {
     }
 
     #[test]
-    fn cold_upload_then_reopened_cache_reuses_private_bytes_but_still_requires_seal() {
+    fn large_archive_upload_then_reopened_cache_reuses_private_bytes_but_still_requires_seal() {
         use std::os::unix::fs::MetadataExt;
         let cache = tempfile::tempdir().unwrap();
-        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK + 7).map(|i| (i % 251) as u8).collect();
-        let manifest = projection(&[("src/lib.rs", &bytes, false), ("empty", b"", false)]);
+        let bytes: Vec<_> = (0..5 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        let archive = "dependencies/0000/liblarge.rlib";
+        let manifest = projection(&[(archive, &bytes, false), ("empty", b"", false)]);
         let mut cold = cached_state(cache.path());
         let reply = cold.handle(&begin(&manifest, 7), true, false).unwrap();
-        assert_eq!(reply["missing_files"], json!(["src/lib.rs"]));
+        assert_eq!(reply["missing_files"], json!([archive]));
         assert_eq!(reply["source_reused_bytes"], 0);
         assert!(cold.handle(&seal(&manifest, 7), true, false).is_err());
-        upload(&mut cold, &manifest, 7, "src/lib.rs", &bytes);
+        upload(&mut cold, &manifest, 7, archive, &bytes);
         assert_eq!(
             cold.handle(&seal(&manifest, 7), true, false).unwrap()["sealed"],
             true
@@ -2384,7 +2757,7 @@ mod tests {
         assert_eq!(warm.pending.as_ref().unwrap().deadline, until);
         warm.handle(&seal(&manifest, 8), true, false).unwrap();
         let root = std::path::PathBuf::from(warm.prepared_path(&request, true).unwrap().unwrap());
-        assert_eq!(std::fs::read(root.join("src/lib.rs")).unwrap(), bytes);
+        assert_eq!(std::fs::read(root.join(archive)).unwrap(), bytes);
         assert_eq!(std::fs::read(root.join("empty")).unwrap(), b"");
         let cached = cache
             .path()
@@ -2392,12 +2765,61 @@ mod tests {
             .join(format!("{}.src", hex(&Sha256::digest(&bytes))));
         assert_ne!(
             std::fs::metadata(cached).unwrap().ino(),
-            std::fs::metadata(root.join("src/lib.rs")).unwrap().ino()
+            std::fs::metadata(root.join(archive)).unwrap().ino()
         );
         let owner = warm.take_prepared(&request).unwrap().unwrap();
         assert!(warm.prepared_path(&request, true).is_err());
         assert!(root.exists());
         drop(owner);
+    }
+
+    #[test]
+    fn corrupt_large_archive_is_a_clean_miss_before_any_receiver_write() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let cache = tempfile::tempdir().unwrap();
+        let bytes = vec![b'A'; 5 * 1024 * 1024 + 19];
+        let archive = "dependencies/0000/liblarge.rlib";
+        let manifest = projection(&[(archive, &bytes, false)]);
+        let mut cold = cached_state(cache.path());
+        cold.handle(&begin(&manifest, 31), true, false).unwrap();
+        upload(&mut cold, &manifest, 31, archive, &bytes);
+        cold.handle(&seal(&manifest, 31), true, false).unwrap();
+        drop(cold);
+        let path = cache
+            .path()
+            .join("source-files-v1")
+            .join(format!("{}.src", hex(&Sha256::digest(&bytes))));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut corrupt = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        corrupt.seek(SeekFrom::End(-1)).unwrap();
+        corrupt.write_all(b"B").unwrap();
+        drop(corrupt);
+
+        let mut next = cached_state(cache.path());
+        let reply = next.handle(&begin(&manifest, 32), true, false).unwrap();
+        assert_eq!(reply["missing_files"], json!([archive]));
+        assert_eq!(reply["source_reused_bytes"], 0);
+        let owner = next.pending.as_ref().unwrap();
+        assert_eq!(
+            std::fs::metadata(owner._directory.path().join("workspace").join(archive))
+                .unwrap()
+                .len(),
+            0
+        );
+        // A late bad byte cannot poison the receiver: the entire correct upload
+        // remains usable and replaces the corrupt cache object after sealing.
+        upload(&mut next, &manifest, 32, archive, &bytes);
+        assert_eq!(
+            next.handle(&seal(&manifest, 32), true, false).unwrap()["sealed"],
+            true
+        );
+        assert_eq!(
+            cached_state(cache.path())
+                .handle(&begin(&manifest, 33), true, false)
+                .unwrap()["source_reused_bytes"],
+            bytes.len()
+        );
     }
 
     #[test]

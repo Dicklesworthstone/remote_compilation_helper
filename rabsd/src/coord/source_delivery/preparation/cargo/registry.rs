@@ -1432,6 +1432,40 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
 
+        const ISOLATED: &str = "RABS_TEST_REGISTRY_REPLAY_ISOLATED";
+        const TEST_NAME: &str = "coord::source_delivery::preparation::cargo::registry::tests::two_same_host_sparse_registries_replay_offline_from_archives_without_user_home_state";
+        if std::env::var_os(ISOLATED).is_none() {
+            // prepare() creates its own planning directories through TMPDIR.
+            // Scope a clean physical parent to this subprocess, rather than
+            // mutating the test process environment or weakening ancestor checks.
+            let scratch = tempfile::Builder::new()
+                .prefix("rabs-registry-replay-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            fs::set_permissions(scratch.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let clean_tmp = fs::canonicalize(scratch.path()).unwrap();
+            let mut isolated = std::process::Command::new(std::env::current_exe().unwrap());
+            isolated
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .env("TMPDIR", &clean_tmp);
+            let output = super::super::bounded_command(
+                isolated,
+                scratch.path(),
+                Duration::from_secs(180),
+                OUTPUT_LIMIT,
+            )
+            .unwrap();
+            let output = String::from_utf8_lossy(&output);
+            assert!(
+                output.contains(&format!("test {TEST_NAME} ... ok"))
+                    && output.contains("1 passed; 0 failed; 0 ignored"),
+                "isolated registry replay must execute its named test: {output}"
+            );
+            return;
+        }
+        assert_eq!(std::env::var_os(ISOLATED), Some("1".into()));
+
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1539,7 +1573,7 @@ mod tests {
             }
         });
         let mut fetch =
-            super::super::planning_command(&cargo, &rustc, &workspace, "Cargo.toml", &seed)
+            super::super::planning_command(&cargo, &rustc, &workspace, "Cargo.toml", &seed, None)
                 .unwrap();
         fetch.args(["fetch", "--manifest-path"]).arg(workspace.join("Cargo.toml"))
             .env("CARGO_HTTP_USER_AGENT", "remote_compilation_helper-agent (+https://github.com/Dicklesworthstone/remote_compilation_helper)");
@@ -1642,7 +1676,8 @@ mod tests {
         assert!(!prepared.root().join("credentials.toml").exists());
         assert!(!prepared.root().join("config.toml").exists());
         let mut replay =
-            super::super::planning_command(&cargo, &rustc, worker, "Cargo.toml", &seed).unwrap();
+            super::super::planning_command(&cargo, &rustc, worker, "Cargo.toml", &seed, None)
+                .unwrap();
         replay
             .args(["test", "--locked", "--offline", "--lib"])
             .env("CARGO_HOME", prepared.root())

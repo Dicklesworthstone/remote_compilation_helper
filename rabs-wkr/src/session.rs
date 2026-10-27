@@ -12,10 +12,11 @@ use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
-    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
-    DependencyExecutionMode, DependencyIsolationSupport, MAX_DEPENDENCY_DIRS,
-    MAX_DEPENDENCY_ENV_ENTRIES,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot,
+    DependencyExecContext, DependencyExecutionMode, DependencyIsolationSupport,
+    MAX_DEPENDENCY_DIRS, MAX_DEPENDENCY_ENV_ENTRIES,
 };
+use rabs_sandbox::generated_source::MAX_GENERATED_DIRECTORIES;
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -65,8 +66,9 @@ pub struct CanonicalExecRequest {
     /// Explicit, validated environment additions and canonical working directory.
     /// Absence on the wire uses the canonical workspace and pinned base only.
     pub command_context: CommandContext,
-    /// Separately negotiated original-path leaf rustc execution. This never
-    /// changes the semantics of an ordinary canonical command context.
+    /// Separately negotiated leaf rustc execution with an explicit original or
+    /// canonical Cargo path policy. This never changes the semantics of an
+    /// ordinary canonical command context.
     pub dependency_context: Option<DependencyExecContext>,
     /// Worker-local source of the toolchain dataset. Execution captures private
     /// bytes or leases an exactly pinned captured dataset, never this live path.
@@ -174,6 +176,9 @@ pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandConte
 /// explicit, including an empty array for a dependency leaf. V7 requires the
 /// execution mode so archive codegen cannot silently inherit metadata's procfs
 /// and device view. A generated tree binds the exact OUT_DIR environment value.
+/// Canonical Cargo has its own version and fixed compiler layout. Its explicit
+/// mode selects the measured metadata or closed archive namespace. Version 3
+/// also binds a complete sealed generated tree at its exact canonical OUT_DIR.
 pub fn parse_dependency_context(
     request: &serde_json::Value,
 ) -> Result<Option<DependencyExecContext>, String> {
@@ -195,6 +200,7 @@ pub fn parse_dependency_context(
         "compiler",
         "out_dir",
         "artifact_roots",
+        "generated_directories",
         "env",
         "runtime_cohort_sha256",
     ];
@@ -205,8 +211,10 @@ pub fn parse_dependency_context(
                 && field != "loader_dirs"
                 && field != "generated_root"
         })
-        || object.get("version").and_then(serde_json::Value::as_str)
-            != Some(DEPENDENCY_CONTEXT_VERSION)
+        || !matches!(
+            object.get("version").and_then(serde_json::Value::as_str),
+            Some(DEPENDENCY_CONTEXT_VERSION | CANONICAL_DEPENDENCY_CONTEXT_VERSION)
+        )
     {
         return Err("dependency_context requires supported exact fields".to_owned());
     }
@@ -263,6 +271,18 @@ pub fn parse_dependency_context(
     };
     let dirs = directories("dependency_dirs")?;
     let loader_dirs = directories("loader_dirs")?;
+    let generated_directories = object
+        .get("generated_directories")
+        .and_then(serde_json::Value::as_array)
+        .filter(|paths| paths.len() <= MAX_GENERATED_DIRECTORIES)
+        .ok_or("generated_directories must be a bounded array")?
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .map(str::to_owned)
+                .ok_or("generated_directories entries must be strings".to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let generated_root = match object.get("generated_root") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
@@ -314,6 +334,31 @@ pub fn parse_dependency_context(
         *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
+    if text("version")? == CANONICAL_DEPENDENCY_CONTEXT_VERSION {
+        if text("toolchain_root")? != rabs_sandbox::layout::TOOLCHAIN
+            || text("compiler")? != "/__rabs/toolchain/bin/rustc"
+        {
+            return Err(
+                "canonical dependency context requires retained package inputs and its fixed compiler"
+                    .to_owned(),
+            );
+        }
+        return DependencyExecContext::new_canonical_cargo_with_generated(
+            execution_mode,
+            text("source_root")?,
+            text("cwd")?,
+            text("out_dir")?,
+            dirs,
+            loader_dirs,
+            artifact_roots,
+            generated_root,
+            env,
+            runtime_cohort,
+        )
+        .and_then(|context| context.with_generated_directories(generated_directories))
+        .map(Some)
+        .map_err(|error| error.to_string());
+    }
     DependencyExecContext::new_with_generated_artifacts(
         text("source_root")?,
         text("cwd")?,
@@ -327,6 +372,7 @@ pub fn parse_dependency_context(
         env,
         runtime_cohort,
     )
+    .and_then(|context| context.with_generated_directories(generated_directories))
     .map(|context| Some(context.with_execution_mode(execution_mode)))
     .map_err(|error| error.to_string())
 }
@@ -335,6 +381,8 @@ pub fn parse_dependency_context(
 /// or process launch. The coordinator's mode is intent, never proof that LLVM
 /// can safely run under that view. The stricter archive path must name only
 /// retained inputs and exactly the complete, derived library output set.
+/// Canonical Cargo uses the same closed-input/output validation for both modes,
+/// with an independent per-action context rather than the outer Cargo mounts.
 pub fn validate_dependency_execution(
     request: &CanonicalExecRequest,
     artifacts: Option<&ArtifactPlan>,
@@ -355,7 +403,11 @@ pub fn validate_dependency_execution(
         .map_err(|error| format!("dependency invocation: {error:?}"))?;
     let class = remote_dependency_output_class(&invocation).map_err(|error| error.to_string())?;
     match (context.execution_mode(), class) {
-        (DependencyExecutionMode::Metadata, RemoteDependencyOutputClass::Metadata) => return Ok(()),
+        (DependencyExecutionMode::Metadata, RemoteDependencyOutputClass::Metadata) => {
+            if !context.canonical_cargo() {
+                return Ok(());
+            }
+        }
         (DependencyExecutionMode::Rlib, RemoteDependencyOutputClass::Rlib) => {}
         _ => return Err("dependency execution mode differs from compiler outputs".into()),
     }

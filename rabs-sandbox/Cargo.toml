@@ -21,6 +21,7 @@ doctest = false
 [dependencies]
 memchr = { workspace = true }
 rabs-protocol = { path = "../rabs-protocol" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 

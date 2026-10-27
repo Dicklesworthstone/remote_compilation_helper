@@ -144,6 +144,200 @@ fn init_clean_overlay_test_repo() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn clean_overlay_fixture_bytes_are_data_until_the_same_manifest_is_selected() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    let bad_build = b"[package]\nname='bad-build'\nversion='0.1.0'\nbuild='build.rs'\n";
+    let bad_path = b"[package]\nname='bad-path'\nversion='0.1.0'\n[dependencies]\nforeign={path='/absolute/unpublished'}\n";
+    for (name, bytes) in [
+        ("build", bad_build.as_slice()),
+        ("path", bad_path.as_slice()),
+        ("opaque", &[0xff, 0xfe]),
+    ] {
+        let directory = root.join("fixtures").join(name);
+        std::fs::create_dir_all(directory.join("src")).unwrap();
+        std::fs::write(directory.join("Cargo.toml"), bytes).unwrap();
+        std::fs::write(directory.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+    git_output(&root, &["add", "fixtures"]).await.unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "retain negative fixture bytes",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    validate_clean_overlay_cargo_sources(&root, &spec, "cargo check --all-targets")
+        .await
+        .unwrap();
+    let selected = selected_clean_overlay_cargo_tree(&root, &spec)
+        .await
+        .unwrap();
+    for (name, bytes, diagnostic) in [
+        ("build", bad_build.as_slice(), "build.rs"),
+        ("path", bad_path.as_slice(), "/absolute/unpublished"),
+        ("opaque", &[0xff, 0xfe], "Cargo metadata"),
+    ] {
+        let relative = format!("fixtures/{name}/Cargo.toml");
+        assert!(selected.contains_key(Path::new(&relative)));
+        let error = validate_clean_overlay_cargo_sources(
+            &root,
+            &spec,
+            &format!("cargo check --manifest-path {relative}"),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+        assert_eq!(std::fs::read(root.join(&relative)).unwrap(), bytes);
+        assert_eq!(
+            git_output_bytes(&root, &["cat-file", "blob", &format!("HEAD:{relative}")])
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+    validate_clean_overlay_cargo_sources(&root, &spec, "cargo check --all-targets")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn clean_overlay_actual_manifest_selector_precedes_workspace_semantics() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='bad-root'\nversion='0.1.0'\nbuild='missing.rs'",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("nested/src")).unwrap();
+    std::fs::write(
+        root.join("nested/Cargo.toml"),
+        "[package]\nname='standalone'\nversion='0.1.0'\n[workspace]",
+    )
+    .unwrap();
+    std::fs::write(root.join("nested/src/lib.rs"), "pub fn standalone() {}\n").unwrap();
+    git_output(&root, &["add", "Cargo.toml", "nested"])
+        .await
+        .unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "independent nested workspace",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        validate_clean_overlay_cargo_sources(&root, &spec, "cargo check")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("missing.rs")
+    );
+    for command in [
+        "cargo check --manifest-path nested/Cargo.toml",
+        "cargo check --manifest-path=nested/Cargo.toml --config 'build.jobs=1'",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap();
+    }
+    assert!(
+        validate_clean_overlay_cargo_sources(
+            &root,
+            &spec,
+            "cargo check --manifest-path nested/Cargo.toml --manifest-path Cargo.toml"
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_manifest_file_alias_does_not_replace_the_selected_source_base() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir_all(root.join("fixtures/literal/src")).unwrap();
+    std::fs::create_dir_all(root.join("fixtures/alias/src")).unwrap();
+    std::fs::write(
+        root.join("fixtures/literal/Cargo.toml"),
+        "[package]\nname='literal'\nversion='0.1.0'\nbuild='build.rs'",
+    )
+    .unwrap();
+    std::fs::write(root.join("fixtures/literal/build.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        root.join("fixtures/literal/src/lib.rs"),
+        "pub fn literal() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fixtures/alias/src/lib.rs"),
+        "pub fn alias() {}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../literal/Cargo.toml",
+        root.join("fixtures/alias/Cargo.toml"),
+    )
+    .unwrap();
+    git_output(&root, &["add", "fixtures"]).await.unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "retain manifest alias fixture",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    for command in [
+        "cargo check",
+        "cargo check --manifest-path fixtures/literal/Cargo.toml",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap();
+    }
+    let error = validate_clean_overlay_cargo_sources(
+        &root,
+        &spec,
+        "cargo check --manifest-path fixtures/alias/Cargo.toml",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("manifest file symlinks"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn clean_overlay_cargo_preflight_reads_selected_base_not_ambient_manifest() {
     let _guard = test_guard!();
     let root = init_clean_overlay_test_repo().keep();
@@ -1008,7 +1202,7 @@ fn join_exec_command_keeps_leading_assignments_as_assignments() {
         "printf '%s|%s' \"$RCH_T_A\" \"$RCH_T_B\"".to_string(),
     ];
     let joined = join_exec_command(&parts);
-    let output = std::process::Command::new("sh")
+    let output = std::process::Command::new("sh") // ubs:ignore — executes only the fixed assignment/printf argv above to check real shell quoting.
         .arg("-c")
         .arg(&joined)
         .output()
@@ -5095,7 +5289,7 @@ fn cargo_profile_forwarding_binds_settings_and_preserves_shell_precedence() {
         ),
     ] {
         let bound = bind_cargo_profile_command(command, &environment, &layer0, settings.clone());
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new("sh") // ubs:ignore — fixed printf cases and fixture-only profile settings exercise real shell environment precedence.
             .args(["-c", &bound])
             .env_clear()
             .output()
@@ -5504,6 +5698,122 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         .live_checkout_refused
     );
     assert!(!remote_release_faults(&checked("Permission denied"), &worker).live_checkout_refused);
+}
+
+#[test]
+fn clean_overlay_disk_budget_diagnostic_survives_saturated_ui_and_unconfirmed_completion() {
+    use super::transfer_orchestration::{
+        CompileUiState, capture_disk_budget_diagnostic,
+        ensure_remote_process_setup_after_completion,
+    };
+
+    let budget = rch_common::BuildDiskBudget {
+        max_growth_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+        min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+    };
+    let pipeline = TransferPipeline::new(
+        PathBuf::from("/tmp/disk-diagnostic-capture"),
+        "disk-diagnostic-capture".into(),
+        "abc123".into(),
+        TransferConfig::default(),
+    )
+    .with_disk_budget(Some(budget));
+    let setup_marker = pipeline.remote_process_setup_marker();
+    let deadline = setup_marker.strip_suffix("_IDENTITY_UNAVAILABLE").unwrap();
+    let failure = serde_json::json!({
+        "reason": "monitor_unavailable", "free_bytes": 0, "growth_bytes": 0,
+        "max_growth_bytes": budget.max_growth_bytes, "min_free_bytes": budget.min_free_bytes,
+        "started": true, "detail": "output scan deadline", "peak_output_bytes": 423_714_816,
+    });
+    let line = format!("{deadline}_DISK_BUDGET:{failure}\n");
+    let usage = serde_json::json!({
+        "max_growth_bytes": budget.max_growth_bytes, "min_free_bytes": budget.min_free_bytes,
+        "peak_output_bytes": 423_714_816, "peak_growth_bytes": 280_694_784,
+        "complete": false, "exit_code": null,
+    });
+    let usage_line = format!("{deadline}_DISK_USAGE:{usage}\n");
+
+    let mut state = CompileUiState::new(Some(CompilationProgress::new(
+        rch_common::ui::OutputContext::Machine,
+        "worker-diagnostic",
+        true,
+    )));
+    state.output = "x".repeat(256 * 1024);
+    let mut captured = String::new();
+    let mut emitted = String::new();
+    // Exercise the production cap first: ordinary output is retained for
+    // analysis but cannot grow the already full progress preview.
+    state.capture_stderr("ordinary overflow\n", &mut captured, false, |line| {
+        emitted.push_str(line);
+    });
+    assert!(state.output_truncated);
+    assert_eq!(state.output.len(), 256 * 1024);
+    assert!(emitted.is_empty());
+
+    let observed =
+        capture_disk_budget_diagnostic(&pipeline, &line, &mut state, &mut captured, |line| {
+            emitted.push_str(line)
+        })
+        .expect("the exact attempt-bound failure must reach the uncapped diagnostic sink");
+    assert!(observed.started);
+    assert_eq!(observed.reason, "monitor_unavailable");
+    assert_eq!(observed.detail, "output scan deadline");
+    assert_eq!(observed.peak_output_bytes, Some(423_714_816));
+    assert_eq!(emitted, line);
+    assert_eq!(captured, format!("ordinary overflow\n{line}"));
+    assert_eq!(state.output.len(), 256 * 1024);
+    assert!(state.output_truncated);
+
+    assert!(pipeline.parse_disk_usage_marker(&usage_line).is_none());
+    assert!(pipeline.parse_disk_usage_exit_code(&usage_line).is_none());
+    for ordinary in [&usage_line[..], "RCH_SCOPED_COMPLETION_UNCONFIRMED\n"] {
+        state.capture_stderr(ordinary, &mut captured, false, |line| {
+            emitted.push_str(line);
+        });
+    }
+    let result = rch_common::CommandResult {
+        exit_code: 255,
+        stdout: String::new(),
+        stderr: captured.clone(),
+        duration_ms: 0,
+    };
+    let error = ensure_remote_process_setup_after_completion(&pipeline, &result, None).unwrap_err();
+    assert!(is_remote_execution_unconfirmed(&error));
+    assert!(format!("{error:#}").contains("SSH execution exit 255"));
+    assert!(
+        error
+            .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            .is_none(),
+        "diagnostic retention must not turn unknown containment into a confirmed disk result"
+    );
+    assert_eq!(remote_failure_exit_code(&error), EXIT_BUILD_ERROR);
+    assert_eq!(
+        classify_remote_pipeline_failure(&error),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    assert!(
+        remote_pipeline_failure_summary(&WorkerId::new("worker-diagnostic"), &error)
+            .contains("ownership retained for recovery")
+    );
+    assert!(captured.contains(&line));
+    assert_eq!(emitted, line);
+
+    let other = TransferPipeline::new(
+        PathBuf::from("/tmp/disk-diagnostic-capture"),
+        "disk-diagnostic-capture".into(),
+        "abc123".into(),
+        TransferConfig::default(),
+    )
+    .with_disk_budget(Some(budget));
+    let retained_before = captured.clone();
+    assert!(
+        capture_disk_budget_diagnostic(&other, &line, &mut state, &mut captured, |line| emitted
+            .push_str(line),)
+        .is_none(),
+        "another attempt's nonce cannot become trusted disk-failure evidence"
+    );
+    assert_eq!(captured, retained_before);
+    assert_eq!(emitted, line);
 }
 
 #[test]

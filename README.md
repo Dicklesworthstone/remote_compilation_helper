@@ -1286,8 +1286,20 @@ Git tree hash, and remote path. All roots share the same execution lease and
 are retired together. Cross-repository symlinks and non-sibling layouts are
 currently refused.
 
-This check conservatively covers all selected manifests, including inactive
-fixtures. File-based `--config`, configuration includes, and changes to Cargo's
+Manifest semantics follow the selected entrypoint's workspace members and local
+dependency closure, including dev, build, target-specific, optional, inherited,
+patched and replaced path dependencies. Unreferenced Cargo manifests remain
+transferred fixture bytes; naming the same fixture as a member, dependency or
+entrypoint activates the same containment and source checks. Workspace excludes
+are literal directory prefixes; explicit members override them, while excluded
+default members stay excluded. Exclusions never hide actual path dependencies.
+Legacy Cargo dependency-table and package-table aliases retain these checks.
+Workspace pointers in selected ancestor packages activate their captured root
+too; absolute, absent, aliased or non-workspace targets refuse before Cargo.
+Selected manifest-file symlinks are refused because resolving their bytes must
+not change Cargo's relative source base; unreferenced aliases remain data.
+All inventory paths/symlinks and selected Cargo configuration retain their
+containment checks. File-based `--config`, configuration includes, and changes to Cargo's
 working directory are refused. On the worker, any Cargo-home or ancestor
 configuration is refused before Cargo starts, even if that configuration would
 be harmless. Cargo clean-overlay jobs currently require a Unix worker for this

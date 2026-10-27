@@ -769,7 +769,10 @@ mod tests {
         let mut w = world();
         w.reconciliation_complete = true;
         let plan = plan_gc(store, &w, mode, 100).unwrap();
-        assert_eq!(plan.reclaim.len(), if mode == GcMode::Normal { 6 } else { 8 });
+        assert_eq!(
+            plan.reclaim.len(),
+            if mode == GcMode::Normal { 6 } else { 8 }
+        );
 
         // All changes happen AFTER the plan. Even an expired-looking lease
         // remains a root until the authority-scoped retirement releases it.
@@ -834,7 +837,10 @@ mod tests {
             [SqlValue::Int(planned), SqlValue::Int(reclaimed), SqlValue::Int(5)]
                 if *planned == expected_planned && *reclaimed == expected_reclaimed)));
         for tag in [1, 2, 3, 4, 5, 6, 7, 9] {
-            assert!(store.object_located(&digest(tag)).unwrap(), "lost object {tag}");
+            assert!(
+                store.object_located(&digest(tag)).unwrap(),
+                "lost object {tag}"
+            );
         }
         assert_eq!(store.object_locations(&digest(6)).unwrap().len(), 2);
 
@@ -893,7 +899,10 @@ mod tests {
             let mut candidate =
                 SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("late-fsq")).unwrap())
                     .unwrap();
-            assert_eq!(scenario(&mut reference, mode), scenario(&mut candidate, mode));
+            assert_eq!(
+                scenario(&mut reference, mode),
+                scenario(&mut candidate, mode)
+            );
         }
     }
 
@@ -1056,9 +1065,11 @@ mod tests {
                 vec![budget_location(first), budget_location(first + 1)]
             );
             mark_plan(store, &plan, 10).unwrap();
-            w.protections
-                .transfers
-                .extend(plan.reclaim.iter().map(|location| location.object_key.clone()));
+            w.protections.transfers.extend(
+                plan.reclaim
+                    .iter()
+                    .map(|location| location.object_key.clone()),
+            );
         }
         // Transfer owners have finished. One reader has since acquired the
         // last object, and another copy disappeared independently of GC.
@@ -1177,7 +1188,16 @@ mod tests {
                 SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
             install_unlink_backlog(&mut store, mode);
             store
-                .create_pin(45, &digest(1), "reader", "transfer", None, None, false, "hold")
+                .create_pin(
+                    45,
+                    &digest(1),
+                    "reader",
+                    "transfer",
+                    None,
+                    None,
+                    false,
+                    "hold",
+                )
                 .unwrap();
             let w = GcWorld {
                 reclaim_budget: 1,
@@ -1229,7 +1249,10 @@ mod tests {
             let mut candidate =
                 SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("budget-fsq")).unwrap())
                     .unwrap();
-            assert_eq!(scenario(&mut reference, mode), scenario(&mut candidate, mode));
+            assert_eq!(
+                scenario(&mut reference, mode),
+                scenario(&mut candidate, mode)
+            );
         }
     }
 

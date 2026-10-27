@@ -122,10 +122,21 @@ pub(super) fn plan_canonical_dependency_action(
     request: LiveRustcRequest<'_>,
     host: &str,
     paths: &CanonicalPaths,
+    remote_execution: bool,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    use rabs_key::live_dependency::plan_canonical_cargo_dependency_action;
+    use rabs_key::live_dependency::{
+        plan_canonical_cargo_dependency_action, plan_canonical_remote_dependency_action,
+    };
 
-    let package = match plan_canonical_cargo_dependency_action(request, host, None) {
+    // Archive codegen requires the closed per-action worker view. A retained
+    // canonical Cargo namespace alone is not that authority: its wider source
+    // and proc/device mounts must never produce a shared archive cache entry.
+    let planner = if remote_execution {
+        plan_canonical_remote_dependency_action
+    } else {
+        plan_canonical_cargo_dependency_action
+    };
+    let package = match planner(request, host, None) {
         Err(LiveRefusal::NotDependencySource(package)) => package,
         result => return result,
     };
@@ -141,7 +152,7 @@ pub(super) fn plan_canonical_dependency_action(
     let witness = digest_set(&document, DigestRequest::default(), None)
         .map_err(|_| LiveRefusal::Facts("cannot identify captured directory checksum".into()))?
         .atp_content_id;
-    plan_canonical_cargo_dependency_action(request, host, Some(witness))
+    planner(request, host, Some(witness))
 }
 
 #[cfg(test)]

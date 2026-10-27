@@ -10,7 +10,7 @@
 //! - `--check-config` — parse + validate config, print resolved values
 //! - `--run-for-ms N` — auto-shutdown after N ms (acceptance harness)
 //! - `--worker-prepare` — capture an explicit source projection into a saved bundle
-//! - `--canonical-check-local` — canonical local Cargo check with dependency caching
+//! - `--canonical-compile-local` — canonical local Cargo check/build with dependency caching
 //! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - `--worker-exec-tls` — receive one pinned worker execution over mutual TLS/ATP
 //! - `--worker-build-tls` — execute a prepared bundle and install verified outputs
@@ -440,13 +440,19 @@ fn main() {
                 "rabsd {VERSION} — RABS edge+coordinator daemon\n\
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
-                 CANONICAL LOCAL: rabsd --canonical-check-local <profile.json>\n\
-                 Captures source/toolchain, then runs cargo check --lib --offline --locked at canonical paths.\n\
-                 profile version canonical-check-local-v1 requires source_root, toolchain_root, state_root,\n\
+                 CANONICAL LOCAL: rabsd --canonical-compile-local <profile.json>\n\
+                 Captures source/toolchain, then runs selected cargo check/build/test --offline --locked at canonical paths.\n\
+                 profile version canonical-compile-local-v1 requires source_root, toolchain_root, state_root,\n\
                  operation_root and wrapper absolute paths; state/operation roots must already be private (0700).\n\
                  Optional manifest (Cargo.toml), vendor or cargo_home_source, jobs (1), timeout_seconds (1800).\n\
-                 Linux namespace support and a graph without build scripts/proc macros are required.\n\
-                 External dependency metadata uses the evidence-gated cache; workspace crates compile normally.\n\
+                 command is check (default), build or test; selection chooses packages, features, targets and profiles.\n\
+                 A check without selection means --lib; build and test --no-run retain their completed target directory.\n\
+                 Test selection accepts doc, no_run, no_fail_fast, test_filter and literal test_args after --.\n\
+                 Tests/doctests execute on every request; doctests use captured rustdoc and failures retain Cargo's status.\n\
+                 Linux namespaces and nightly Cargo unit-graph planning are required.\n\
+                 Tests and selected build-script/proc-macro graphs require isolated workers for dependency cache authority.\n\
+                 Without a worker those units compile normally; source/HOME are read-only and networking is isolated.\n\
+                 External metadata and isolated worker archives use the evidence-gated cache; workspace crates compile normally.\n\
                  This mode honors the configured build identity and release authorization policy.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
@@ -493,9 +499,9 @@ fn main() {
             );
             return;
         }
-        Some("--canonical-check-local") => {
+        Some("--canonical-compile-local") => {
             if args.len() != 2 {
-                eprintln!("usage: rabsd --canonical-check-local <profile.json>");
+                eprintln!("usage: rabsd --canonical-compile-local <profile.json>");
                 std::process::exit(2);
             }
             #[cfg(target_os = "linux")]
@@ -515,7 +521,7 @@ fn main() {
                 let code = match result {
                     Ok(code) => code,
                     Err(error) => {
-                        eprintln!("rabsd canonical check: {error}");
+                        eprintln!("rabsd canonical compilation: {error}");
                         if error.kind() == std::io::ErrorKind::InvalidInput {
                             2
                         } else {

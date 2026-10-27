@@ -71,7 +71,10 @@ impl<K, V> Drop for Cache<K, V> {
 
 impl<K: Eq, V: Send + Sync + 'static> Cache<K, V> {
     pub(super) fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "toolchain retention requires positive capacity");
+        assert!(
+            capacity > 0,
+            "toolchain retention requires positive capacity"
+        );
         Self {
             entries: VecDeque::new(),
             pending: None,
@@ -80,9 +83,11 @@ impl<K: Eq, V: Send + Sync + 'static> Cache<K, V> {
     }
 
     fn harvest(&mut self) {
-        if !self.pending.as_ref().is_some_and(|pending| {
-            pending.handle.as_ref().is_some_and(JoinHandle::is_finished)
-        }) {
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.handle.as_ref().is_some_and(JoinHandle::is_finished))
+        {
             return;
         }
         let mut pending = self.pending.take().expect("finished capture owner");
@@ -170,7 +175,10 @@ impl<K: Eq, V: Send + Sync + 'static> Cache<K, V> {
     pub(super) fn invalidate(&mut self, key: &K, value: &Arc<V>) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| {
             &entry.key == key
-                && entry.value.as_ref().is_ok_and(|current| Arc::ptr_eq(current, value))
+                && entry
+                    .value
+                    .as_ref()
+                    .is_ok_and(|current| Arc::ptr_eq(current, value))
         }) {
             entry.invalidated = true;
         }
@@ -186,10 +194,7 @@ mod tests {
 
     // These exercise the actual ownership/thread cache, with small values in
     // place of compiler images. They do not assert a compiler or TLS execution.
-    fn finish<K: Eq + Clone, V: Send + Sync + 'static>(
-        cache: &mut Cache<K, V>,
-        key: K,
-    ) -> Arc<V> {
+    fn finish<K: Eq + Clone, V: Send + Sync + 'static>(cache: &mut Cache<K, V>, key: K) -> Arc<V> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(value) = cache
@@ -203,7 +208,11 @@ mod tests {
         }
     }
 
-    fn ready(cache: &mut Cache<&'static str, usize>, key: &'static str, value: usize) -> Arc<usize> {
+    fn ready(
+        cache: &mut Cache<&'static str, usize>,
+        key: &'static str,
+        value: usize,
+    ) -> Arc<usize> {
         assert!(cache.poll(key, move |_| Ok(value)).unwrap().is_none());
         finish(cache, key)
     }
@@ -226,14 +235,30 @@ mod tests {
         let mut cache = Cache::new(3);
         let existing = ready(&mut cache, "a", 1);
         let (release, wait) = mpsc::channel();
-        assert!(cache.poll("b", move |_| {
-            wait.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
-            Ok(2)
-        }).unwrap().is_none());
+        assert!(
+            cache
+                .poll("b", move |_| {
+                    wait.recv_timeout(Duration::from_secs(5))
+                        .map_err(|e| e.to_string())?;
+                    Ok(2)
+                })
+                .unwrap()
+                .is_none()
+        );
         assert!(Arc::ptr_eq(&existing, &finish(&mut cache, "a")));
         // One capture globally, even for independent misses.
-        assert!(cache.poll("c", |_| panic!("second capture started")).unwrap().is_none());
-        assert!(cache.poll("b", |_| panic!("duplicate capture started")).unwrap().is_none());
+        assert!(
+            cache
+                .poll("c", |_| panic!("second capture started"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .poll("b", |_| panic!("duplicate capture started"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(cache.entries.len(), 1);
         release.send(()).unwrap();
         assert_eq!(*finish(&mut cache, "b"), 2);
@@ -245,9 +270,19 @@ mod tests {
         let first = ready(&mut cache, "a", 1);
         let second = ready(&mut cache, "b", 2);
         let weak = Arc::downgrade(&first);
-        assert!(cache.poll("c", |_| panic!("capacity exceeded")).unwrap().is_none());
+        assert!(
+            cache
+                .poll("c", |_| panic!("capacity exceeded"))
+                .unwrap()
+                .is_none()
+        );
         drop(first);
-        assert!(cache.poll("c", |_| panic!("late upgrade could escape the bound")).unwrap().is_none());
+        assert!(
+            cache
+                .poll("c", |_| panic!("late upgrade could escape the bound"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(*weak.upgrade().unwrap(), 1);
         drop(weak);
         assert!(cache.poll("c", |_| Ok(3)).unwrap().is_none());
@@ -277,9 +312,19 @@ mod tests {
         let first = ready(&mut cache, "a", 1);
         let lease = Arc::clone(&first);
         cache.invalidate(&"a", &first);
-        assert!(cache.poll("a", |_| panic!("old generation is still leased")).unwrap().is_none());
+        assert!(
+            cache
+                .poll("a", |_| panic!("old generation is still leased"))
+                .unwrap()
+                .is_none()
+        );
         drop(first);
-        assert!(cache.poll("a", |_| panic!("one lease remains")).unwrap().is_none());
+        assert!(
+            cache
+                .poll("a", |_| panic!("one lease remains"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(*lease, 1);
         drop(lease);
         let replaced = ready(&mut cache, "a", 2);
@@ -317,7 +362,12 @@ mod tests {
     fn failed_capture_is_reported_only_to_its_own_key_and_can_retry() {
         let mut cache = Cache::new(2);
         let good = ready(&mut cache, "good", 1);
-        assert!(cache.poll("bad", |_| Err("capture rejected changed bytes".into())).unwrap().is_none());
+        assert!(
+            cache
+                .poll("bad", |_| Err("capture rejected changed bytes".into()))
+                .unwrap()
+                .is_none()
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while cache.pending.is_some() {
             assert!(Arc::ptr_eq(&good, &finish(&mut cache, "good")));
@@ -325,7 +375,9 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(
-            cache.poll("bad", |_| panic!("error has not been consumed")).unwrap_err(),
+            cache
+                .poll("bad", |_| panic!("error has not been consumed"))
+                .unwrap_err(),
             "capture rejected changed bytes",
         );
         assert_eq!(*ready(&mut cache, "bad", 2), 2);
@@ -345,16 +397,23 @@ mod tests {
                 let all_polled = Arc::clone(&all_polled);
                 let release = Arc::clone(&release);
                 scope.spawn(move || {
-                    assert!(cache.lock().unwrap().poll("same", move |stopped| {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        while !release.load(Ordering::Acquire) {
-                            if stopped.load(Ordering::Acquire) {
-                                return Err("cancelled".into());
-                            }
-                            std::thread::yield_now();
-                        }
-                        Ok(42)
-                    }).unwrap().is_none());
+                    assert!(
+                        cache
+                            .lock()
+                            .unwrap()
+                            .poll("same", move |stopped| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                while !release.load(Ordering::Acquire) {
+                                    if stopped.load(Ordering::Acquire) {
+                                        return Err("cancelled".into());
+                                    }
+                                    std::thread::yield_now();
+                                }
+                                Ok(42)
+                            })
+                            .unwrap()
+                            .is_none()
+                    );
                     all_polled.wait();
                 });
             }
@@ -369,13 +428,18 @@ mod tests {
         let completed = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&completed);
         let mut cache = Cache::<&str, usize>::new(1);
-        assert!(cache.poll("pending", move |cancelled| {
-            while !cancelled.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            stopped.store(true, Ordering::Release);
-            Err("cancelled".into())
-        }).unwrap().is_none());
+        assert!(
+            cache
+                .poll("pending", move |cancelled| {
+                    while !cancelled.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    stopped.store(true, Ordering::Release);
+                    Err("cancelled".into())
+                })
+                .unwrap()
+                .is_none()
+        );
         drop(cache);
         assert!(completed.load(Ordering::Acquire));
     }
@@ -384,7 +448,12 @@ mod tests {
     #[test]
     fn panicked_capture_is_joined_and_does_not_strand_capacity() {
         let mut cache = Cache::<&str, usize>::new(1);
-        assert!(cache.poll("panic", |_| panic!("capture fixture panic")).unwrap().is_none());
+        assert!(
+            cache
+                .poll("panic", |_| panic!("capture fixture panic"))
+                .unwrap()
+                .is_none()
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let result = cache.poll("panic", |_| panic!("unexpected second capture"));
@@ -412,15 +481,27 @@ mod tests {
         let mut cache = Cache::new(1);
         let (dropped, observe) = mpsc::channel();
         let original = dropped.clone();
-        assert!(cache.poll("old", move |_| Ok(Owner { dropped: original })).unwrap().is_none());
+        assert!(
+            cache
+                .poll("old", move |_| Ok(Owner { dropped: original }))
+                .unwrap()
+                .is_none()
+        );
         drop(finish(&mut cache, "old"));
         let caller = std::thread::current().id();
-        assert!(cache.poll("new", move |_| {
-            let evictor = observe.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
-            assert_ne!(evictor, caller);
-            assert_eq!(evictor, std::thread::current().id());
-            Ok(Owner { dropped })
-        }).unwrap().is_none());
+        assert!(
+            cache
+                .poll("new", move |_| {
+                    let evictor = observe
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|e| e.to_string())?;
+                    assert_ne!(evictor, caller);
+                    assert_eq!(evictor, std::thread::current().id());
+                    Ok(Owner { dropped })
+                })
+                .unwrap()
+                .is_none()
+        );
         drop(finish(&mut cache, "new"));
     }
 
@@ -436,7 +517,10 @@ mod tests {
         assert_eq!(cache.entries.len(), 2, "both generations remain charged");
         assert!(cache.entries.iter().any(|entry| {
             entry.invalidated
-                && entry.value.as_ref().is_ok_and(|value| Arc::ptr_eq(value, &original))
+                && entry
+                    .value
+                    .as_ref()
+                    .is_ok_and(|value| Arc::ptr_eq(value, &original))
         }));
         // A late validator names a generation, not whichever image now occupies
         // the same compiler path. It cannot invalidate or shadow the new owner.
@@ -459,19 +543,37 @@ mod tests {
             assert!(cache.pending.is_none());
         }
         for _ in 0..16 {
-            assert!(cache.poll("compiler", |_| panic!("all generations are leased")).unwrap().is_none());
-            assert!(cache.poll("another", |_| panic!("same bound applies across keys")).unwrap().is_none());
+            assert!(
+                cache
+                    .poll("compiler", |_| panic!("all generations are leased"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .poll("another", |_| panic!("same bound applies across keys"))
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(cache.entries.len(), CAPACITY);
             assert!(cache.pending.is_none());
         }
         let oldest = readers.pop_front().unwrap();
         let weak = Arc::downgrade(&oldest);
         drop(oldest);
-        assert!(cache.poll("compiler", |_| panic!("weak owner can still upgrade")).unwrap().is_none());
+        assert!(
+            cache
+                .poll("compiler", |_| panic!("weak owner can still upgrade"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(*weak.upgrade().unwrap(), 0);
         drop(weak);
         assert!(cache.poll("compiler", |_| Ok(CAPACITY)).unwrap().is_none());
-        assert_eq!(cache.entries.len() + usize::from(cache.pending.is_some()), CAPACITY);
+        assert_eq!(
+            cache.entries.len() + usize::from(cache.pending.is_some()),
+            CAPACITY
+        );
         let latest = finish(&mut cache, "compiler");
         assert_eq!(*latest, CAPACITY);
         for (index, reader) in readers.iter().enumerate() {
@@ -502,16 +604,28 @@ mod tests {
         let old = ready(&mut cache, "compiler", 1);
         let independent = ready(&mut cache, "independent", 9);
         cache.invalidate(&"compiler", &old);
-        assert!(cache.poll("compiler", |_| Err("new source capture refused".into())).unwrap().is_none());
+        assert!(
+            cache
+                .poll("compiler", |_| Err("new source capture refused".into()))
+                .unwrap()
+                .is_none()
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while cache.pending.is_some() {
-            assert!(Arc::ptr_eq(&independent, &finish(&mut cache, "independent")));
+            assert!(Arc::ptr_eq(
+                &independent,
+                &finish(&mut cache, "independent")
+            ));
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
         assert_eq!(cache.entries.len(), 3);
         assert_eq!(
-            cache.poll("compiler", |_| panic!("error must be returned before retry")).unwrap_err(),
+            cache
+                .poll("compiler", |_| panic!(
+                    "error must be returned before retry"
+                ))
+                .unwrap_err(),
             "new source capture refused",
         );
         assert_eq!(*old, 1);
@@ -533,18 +647,40 @@ mod tests {
         let (release, wait) = mpsc::channel();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&calls);
-        assert!(cache.poll("compiler", move |_| {
-            count.fetch_add(1, Ordering::SeqCst);
-            entered.send(()).map_err(|error| error.to_string())?;
-            wait.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?;
-            Ok(2)
-        }).unwrap().is_none());
+        assert!(
+            cache
+                .poll("compiler", move |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).map_err(|error| error.to_string())?;
+                    wait.recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| error.to_string())?;
+                    Ok(2)
+                })
+                .unwrap()
+                .is_none()
+        );
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         for _ in 0..128 {
-            assert!(cache.poll("compiler", |_| panic!("duplicate replacement")).unwrap().is_none());
-            assert!(cache.poll("another", |_| panic!("second capture lane")).unwrap().is_none());
-            assert!(Arc::ptr_eq(&independent, &finish(&mut cache, "independent")));
-            assert_eq!(cache.entries.len() + usize::from(cache.pending.is_some()), 3);
+            assert!(
+                cache
+                    .poll("compiler", |_| panic!("duplicate replacement"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .poll("another", |_| panic!("second capture lane"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(Arc::ptr_eq(
+                &independent,
+                &finish(&mut cache, "independent")
+            ));
+            assert_eq!(
+                cache.entries.len() + usize::from(cache.pending.is_some()),
+                3
+            );
             assert_eq!(*old, 1);
         }
         release.send(()).unwrap();
@@ -560,18 +696,26 @@ mod tests {
         let mut cache = Cache::new(2);
         let old = ready(&mut cache, "compiler", 1);
         cache.invalidate(&"compiler", &old);
-        assert!(cache.poll("compiler", move |cancelled| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !cancelled.load(Ordering::Acquire) {
-                assert!(Instant::now() < deadline, "replacement was not cancelled");
-                std::thread::yield_now();
-            }
-            joined.store(true, Ordering::Release);
-            Err("replacement cancelled".into())
-        }).unwrap().is_none());
+        assert!(
+            cache
+                .poll("compiler", move |cancelled| {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !cancelled.load(Ordering::Acquire) {
+                        assert!(Instant::now() < deadline, "replacement was not cancelled");
+                        std::thread::yield_now();
+                    }
+                    joined.store(true, Ordering::Release);
+                    Err("replacement cancelled".into())
+                })
+                .unwrap()
+                .is_none()
+        );
         drop(cache);
         assert!(completed.load(Ordering::Acquire));
-        assert_eq!(*old, 1, "the old request still owns its image after shutdown");
+        assert_eq!(
+            *old, 1,
+            "the old request still owns its image after shutdown"
+        );
     }
 
     #[test]
@@ -583,30 +727,61 @@ mod tests {
         }
         impl Drop for Image {
             fn drop(&mut self) {
-                let _ = self.dropped.send((self.generation, std::thread::current().id()));
+                let _ = self
+                    .dropped
+                    .send((self.generation, std::thread::current().id()));
             }
         }
         let mut cache = Cache::new(2);
         let (dropped, observe) = mpsc::channel();
         let first = dropped.clone();
-        assert!(cache.poll("compiler", move |_| Ok(Image { generation: 1, dropped: first })).unwrap().is_none());
+        assert!(
+            cache
+                .poll("compiler", move |_| Ok(Image {
+                    generation: 1,
+                    dropped: first
+                }))
+                .unwrap()
+                .is_none()
+        );
         let old = finish(&mut cache, "compiler");
         cache.invalidate(&"compiler", &old);
         let second = dropped.clone();
-        assert!(cache.poll("compiler", move |_| Ok(Image { generation: 2, dropped: second })).unwrap().is_none());
+        assert!(
+            cache
+                .poll("compiler", move |_| Ok(Image {
+                    generation: 2,
+                    dropped: second
+                }))
+                .unwrap()
+                .is_none()
+        );
         let current = finish(&mut cache, "compiler");
         assert_eq!(current.generation, 2);
         assert!(matches!(observe.try_recv(), Err(mpsc::TryRecvError::Empty)));
         drop(old);
-        assert!(matches!(observe.try_recv(), Err(mpsc::TryRecvError::Empty)), "the cache still owns and charges retired backing");
+        assert!(
+            matches!(observe.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the cache still owns and charges retired backing"
+        );
         let caller = std::thread::current().id();
-        assert!(cache.poll("another", move |_| {
-            let (generation, thread) = observe.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?;
-            assert_eq!(generation, 1);
-            assert_ne!(thread, caller);
-            assert_eq!(thread, std::thread::current().id());
-            Ok(Image { generation: 3, dropped })
-        }).unwrap().is_none());
+        assert!(
+            cache
+                .poll("another", move |_| {
+                    let (generation, thread) = observe
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| error.to_string())?;
+                    assert_eq!(generation, 1);
+                    assert_ne!(thread, caller);
+                    assert_eq!(thread, std::thread::current().id());
+                    Ok(Image {
+                        generation: 3,
+                        dropped,
+                    })
+                })
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(finish(&mut cache, "another").generation, 3);
         assert!(Arc::ptr_eq(&current, &finish(&mut cache, "compiler")));
         assert_eq!(cache.entries.len(), 2);

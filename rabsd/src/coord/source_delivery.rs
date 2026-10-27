@@ -22,7 +22,9 @@ use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::{
     MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
 };
-use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits, capture_toolchain};
+use rabs_sandbox::toolchain_dataset::{
+    PreparedToolchain, ToolchainLimits, capture_toolchain_with_cloner,
+};
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -331,12 +333,13 @@ fn prepare_source_bundle_inner(
             builder.mode(0o700);
         }
         builder.create(&destination)?;
-        let prepared = capture_toolchain(
+        let prepared = capture_toolchain_with_cloner(
             source,
             &destination.join("toolchain"),
             expected_toolchain.as_ref(),
             &ToolchainLimits::default(),
             || false,
+            rabs_cas::materialization::try_verified_reflink,
         )?;
         prepared.sync(|| false)?;
         Some(prepared)
@@ -379,12 +382,13 @@ fn prepare_source_bundle_inner(
         toolchain_source
             .as_ref()
             .map(|source| {
-                let prepared = capture_toolchain(
+                let prepared = capture_toolchain_with_cloner(
                     source,
                     &destination.join("toolchain"),
                     expected_toolchain.as_ref(),
                     &ToolchainLimits::default(),
                     || false,
+                    rabs_cas::materialization::try_verified_reflink,
                 )?;
                 prepared.sync(|| false)?;
                 Ok::<_, io::Error>(prepared)
@@ -947,6 +951,20 @@ impl SourceUpload {
                 generated.is_some() == request["dependency_context"]["generated_root"].is_string(),
                 "generated source selection differs from the execution context",
             )?;
+            if let Some(generated) = generated {
+                require(
+                    request["dependency_context"]["generated_directories"]
+                        == json!(generated.directories()),
+                    "generated directory topology differs from the captured execution inputs",
+                )?;
+            } else {
+                require(
+                    request["dependency_context"]
+                        .get("generated_directories")
+                        .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)),
+                    "generated directories require a captured generated root",
+                )?;
+            }
         }
         let begin = self.begin_frame(request);
         require(
@@ -1158,6 +1176,61 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem"]
+    fn toolchain_capture_requires_real_reflink_and_retains_independent_bytes() {
+        use std::cell::Cell;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = std::env::var_os("RABS_REFLINK_TEST_ROOT")
+            .expect("set RABS_REFLINK_TEST_ROOT to a reflink-capable filesystem");
+        let owner = tempfile::Builder::new()
+            .prefix("rabs-toolchain-reflink-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(root)
+            .unwrap();
+        let source = owner.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let compiler = source.join("compiler");
+        let bytes = b"toolchain reflink isolation\0\xff".repeat(4096);
+        fs::write(&compiler, &bytes).unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        let cloned = Cell::new(0);
+        let prepared = capture_toolchain_with_cloner(
+            &source,
+            &owner.path().join("retained"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+            |input, output, parent| {
+                let success =
+                    rabs_cas::materialization::try_verified_reflink(input, output, parent);
+                if success {
+                    cloned.set(cloned.get() + 1);
+                }
+                success
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cloned.get(),
+            1,
+            "copy fallback cannot satisfy the reflink gate"
+        );
+        let retained = prepared.root().join("compiler");
+        assert_ne!(
+            fs::metadata(&compiler).unwrap().ino(),
+            fs::metadata(&retained).unwrap().ino()
+        );
+        assert_eq!(fs::metadata(&compiler).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(fs::metadata(&retained).unwrap().mode() & 0o777, 0o555);
+        fs::write(&compiler, b"source changed after capture").unwrap();
+        assert_eq!(fs::read(&retained).unwrap(), bytes);
+        prepared.verify(|| false).unwrap();
+        assert!(prepared.verify_source_unchanged(&source, || false).is_err());
+    }
+
     #[test]
     fn unresolved_cargo_plans_are_refused_before_execution_or_resume() {
         let request = json!({"cargo_source":{"manifest":"Cargo.toml"}});
@@ -1317,6 +1390,7 @@ mod tests {
         .unwrap();
         if populated {
             fs::create_dir(root.join("out/nested")).unwrap();
+            fs::create_dir_all(root.join("out/empty/inner")).unwrap();
             fs::write(
                 root.join("out/nested/generated.rs"),
                 b"pub const GENERATED: u64 = 42;\n",
@@ -1370,12 +1444,24 @@ mod tests {
         assert_eq!(upload.wire_manifest(), reverse_order.wire_manifest());
         let request = json!({"kind":"canonical-exec", "request_id":7,
             "program":"fixture", "toolchain_backing":"/tc",
-            "dependency_context":{"generated_root":"/cargo/build/pkg/out"},
+            "dependency_context":{"generated_root":"/cargo/build/pkg/out",
+                "generated_directories":["empty", "empty/inner", "nested"]},
             "source_manifest":upload.wire_manifest()});
         upload.validate_request(&request).unwrap();
         let mut missing_context = request.clone();
         missing_context["dependency_context"]["generated_root"] = Value::Null;
         assert!(upload.validate_request(&missing_context).is_err());
+        for directories in [
+            json!([]),
+            json!(["nested"]),
+            json!(["empty", "empty/inner", "nested", "unobserved"]),
+            json!(["nested", "empty", "empty/inner"]),
+            Value::Null,
+        ] {
+            let mut different_tree = request.clone();
+            different_tree["dependency_context"]["generated_directories"] = directories;
+            assert!(upload.validate_request(&different_tree).is_err());
+        }
 
         fs::write(root.path().join("package/src/lib.rs"), b"changed package").unwrap();
         fs::write(root.path().join("out/data.bin"), b"changed generated bytes").unwrap();
@@ -1510,7 +1596,8 @@ mod tests {
             "source_manifest":generated.wire_manifest()});
         plain.validate_request(&request).unwrap();
         assert!(generated.validate_request(&request).is_err());
-        request["dependency_context"] = json!({"generated_root":"/cargo/build/pkg/out"});
+        request["dependency_context"] = json!({"generated_root":"/cargo/build/pkg/out",
+            "generated_directories":[]});
         generated.validate_request(&request).unwrap();
         assert!(plain.validate_request(&request).is_err());
         let mut peer = ReceiverPeer::new();
