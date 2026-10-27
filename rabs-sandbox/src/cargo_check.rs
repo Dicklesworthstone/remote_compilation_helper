@@ -1,4 +1,4 @@
-//! Admission of the units Cargo actually selected for a check, build or test.
+//! Admission of the units Cargo actually selected for a check, build, Clippy or test.
 //!
 //! `cargo metadata` describes packages, including optional and development
 //! dependencies that a particular command will never execute. Cargo's nightly
@@ -108,7 +108,7 @@ impl CompilationUnitGraph {
         &self.library_units
     }
 
-    /// Project code can run while Cargo compiles this graph. A cache endpoint
+    /// Project code or a lint driver can run while Cargo compiles this graph. A cache endpoint
     /// visible to that code must not accept local wrapper-completion claims;
     /// only independently supervised closed worker executions may supply hits.
     #[must_use]
@@ -287,7 +287,12 @@ pub fn validate_compilation_unit_graph(
     let mut packages = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
     let mut library_units = BTreeSet::new();
-    let mut project_executors = command == CompilationCommand::Test;
+    // A lint driver is not rustc: it can inspect captured configuration beyond
+    // compiler dep-info and must never acquire local rustc-result authority.
+    let mut project_executors = matches!(
+        command,
+        CompilationCommand::Test | CompilationCommand::Clippy
+    );
     let mut doctests = false;
     let mut dependencies = Vec::with_capacity(units.len());
     let mut dependency_count = 0_usize;
@@ -301,7 +306,9 @@ pub fn validate_compilation_unit_graph(
             // mode on an ordinary binary cannot authorize program execution.
             TargetClass::BuildScript => matches!(mode, "build" | "run-custom-build"),
             TargetClass::Ordinary | TargetClass::ProcMacro => match command {
-                CompilationCommand::Check => matches!(mode, "check" | "build"),
+                CompilationCommand::Check | CompilationCommand::Clippy => {
+                    matches!(mode, "check" | "build")
+                }
                 CompilationCommand::Build => matches!(mode, "build" | "test"),
                 CompilationCommand::Test => matches!(mode, "build" | "test" | "doctest"),
             },
@@ -622,7 +629,11 @@ mod tests {
 
     fn script_graph(command: CompilationCommand) -> Value {
         let mut app = unit("app", &[1]);
-        app["mode"] = json!(command.as_str());
+        app["mode"] = json!(if command == CompilationCommand::Clippy {
+            "check"
+        } else {
+            command.as_str()
+        });
         let mut compiled = unit("generator", &[]);
         compiled["mode"] = json!("build");
         compiled["target"]["kind"] = json!(["custom-build"]);
@@ -641,6 +652,7 @@ mod tests {
             CompilationCommand::Check,
             CompilationCommand::Build,
             CompilationCommand::Test,
+            CompilationCommand::Clippy,
         ] {
             let graph = script_graph(command);
             let report = validate_compilation_unit_graph(&graph, command).unwrap();
@@ -665,6 +677,7 @@ mod tests {
             CompilationCommand::Check,
             CompilationCommand::Build,
             CompilationCommand::Test,
+            CompilationCommand::Clippy,
         ] {
             for mutation in [
                 "no-producer",
@@ -870,6 +883,36 @@ mod tests {
                     "{kind}: {field}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn clippy_graphs_never_grant_local_rustc_cache_authority_or_program_execution() {
+        let mut graph = graph();
+        for mode in ["check", "build"] {
+            graph["units"][0]["mode"] = json!(mode);
+            let report =
+                validate_compilation_unit_graph(&graph, CompilationCommand::Clippy).unwrap();
+            assert!(report.requires_closed_dependency_execution());
+            assert!(!report.contains_doctests());
+            let checked =
+                validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
+            assert_eq!(report.library_units(), checked.library_units());
+        }
+        for mode in [
+            "clippy",
+            "test",
+            "doctest",
+            "run",
+            "doc",
+            "run-custom-build",
+            "future-mode",
+        ] {
+            graph["units"][0]["mode"] = json!(mode);
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Clippy).is_err(),
+                "{mode}"
+            );
         }
     }
 

@@ -4,7 +4,8 @@
 //! driver supplies the retained manifest, offline/locked mode, compiler,
 //! output directory and job budget itself. Both the nonexecuting unit-graph
 //! query and the subsequent compilation use the same Cargo selection. Test
-//! harness arguments form a separate tail, after the driver's Cargo options.
+//! harness and Clippy lint arguments form separate tails after the driver's
+//! Cargo options.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -17,8 +18,10 @@ const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 ///
 /// `Check` and `Build` compile without running the requested targets. `Test`
 /// also runs Cargo's selected tests and doctests unless `no_run` is selected;
-/// test outcomes are never action-cache results. Cargo can run build scripts
-/// and load procedural macros in all three commands. The validated unit graph
+/// test outcomes are never action-cache results. `Clippy` checks the selected
+/// targets with the captured lint driver, whose results are never rustc cache
+/// results. Cargo can run build scripts and load procedural macros in every
+/// command. The validated unit graph
 /// selects the required closed-worker boundary for compiler cache authority.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +30,7 @@ pub enum CompilationCommand {
     Check,
     Build,
     Test,
+    Clippy,
 }
 
 impl CompilationCommand {
@@ -36,6 +40,7 @@ impl CompilationCommand {
             Self::Check => "check",
             Self::Build => "build",
             Self::Test => "test",
+            Self::Clippy => "clippy",
         }
     }
 }
@@ -84,6 +89,12 @@ pub struct CompilationSelection {
     /// Literal test-harness arguments. These are appended after `--`, never
     /// interpreted as Cargo configuration, source, toolchain or output options.
     pub test_args: Vec<String>,
+    /// Lint only the selected packages, leaving dependency rustc compilation to
+    /// Cargo. This flag belongs to Clippy rather than to ordinary Cargo check.
+    pub no_deps: bool,
+    /// Bounded lint-level controls after `--`, only for Clippy. Arbitrary rustc
+    /// flags, response files and output/configuration paths are not admitted.
+    pub lint_args: Vec<String>,
 }
 
 fn invalid(reason: &str) -> io::Error {
@@ -104,6 +115,61 @@ fn ordinary_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn validate_lint_arguments(args: &[String]) -> io::Result<()> {
+    let mut at = 0;
+    while at < args.len() {
+        let argument = &args[at];
+        let (option, value) = if let Some((option, value)) = argument.split_once('=') {
+            (option, value)
+        } else if ["-A", "-W", "-D", "-F"]
+            .iter()
+            .any(|option| argument.starts_with(*option) && argument.len() > option.len())
+        {
+            (&argument[..2], &argument[2..])
+        } else {
+            at += 1;
+            let value = args
+                .get(at)
+                .ok_or_else(|| invalid("Clippy lint option requires a value"))?;
+            (argument.as_str(), value.as_str())
+        };
+        if option == "--cap-lints" {
+            if !matches!(value, "allow" | "warn" | "deny" | "forbid") {
+                return Err(invalid("unsupported Clippy lint cap"));
+            }
+        } else {
+            if !matches!(
+                option,
+                "-A" | "-W"
+                    | "-D"
+                    | "-F"
+                    | "--allow"
+                    | "--warn"
+                    | "--force-warn"
+                    | "--deny"
+                    | "--forbid"
+            ) || (argument.contains('=') && !option.starts_with("--"))
+            {
+                return Err(invalid("unsupported Clippy lint option"));
+            }
+            if value.len() > 256
+                || !value.split("::").all(|part| {
+                    part.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                        && part.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-')
+                        })
+                })
+            {
+                return Err(invalid("invalid Clippy lint name"));
+            }
+        }
+        at += 1;
+    }
+    Ok(())
+}
+
 impl CompilationSelection {
     /// Construct the complete selected compilation prefix without host authority.
     ///
@@ -121,6 +187,12 @@ impl CompilationSelection {
         {
             return Err(invalid("test selection requires the Cargo test command"));
         }
+        if command != CompilationCommand::Clippy && (self.no_deps || !self.lint_args.is_empty()) {
+            return Err(invalid(
+                "Clippy selection requires the Cargo clippy command",
+            ));
+        }
+        validate_lint_arguments(&self.lint_args)?;
         if !self.exclude.is_empty() && !self.workspace {
             return Err(invalid(
                 "Cargo compilation exclusions require workspace selection",
@@ -156,7 +228,8 @@ impl CompilationSelection {
         let count = values.iter().map(|(_, values)| values.len()).sum::<usize>()
             + usize::from(self.profile.is_some())
             + usize::from(self.test_filter.is_some())
-            + self.test_args.len();
+            + self.test_args.len()
+            + self.lint_args.len();
         if count > MAX_VALUES {
             return Err(invalid("Cargo compilation selection has too many values"));
         }
@@ -175,6 +248,7 @@ impl CompilationSelection {
             (self.doc, "--doc"),
             (self.no_run, "--no-run"),
             (self.no_fail_fast, "--no-fail-fast"),
+            (self.no_deps, "--no-deps"),
         ] {
             if enabled {
                 args.push(option.to_owned());
@@ -213,8 +287,13 @@ impl CompilationSelection {
         {
             return Err(invalid("invalid test-harness argument"));
         }
-        let runtime_bytes = self.test_args.iter().map(String::len).sum::<usize>()
-            + if self.test_args.is_empty() { 0 } else { 2 };
+        let tail = if command == CompilationCommand::Clippy {
+            &self.lint_args
+        } else {
+            &self.test_args
+        };
+        let runtime_bytes =
+            tail.iter().map(String::len).sum::<usize>() + if tail.is_empty() { 0 } else { 2 };
         if args.iter().map(String::len).sum::<usize>() + runtime_bytes > MAX_ARGUMENT_BYTES {
             return Err(invalid(
                 "Cargo compilation selection exceeds its argument byte budget",
@@ -223,17 +302,22 @@ impl CompilationSelection {
         Ok(args)
     }
 
-    /// Construct the literal test-harness tail after validating the entire
+    /// Construct the test-harness or Clippy lint tail after validating the entire
     /// selection, including its shared count and byte limits. Append this only
-    /// after all driver-owned Cargo options. Unit-graph queries omit the tail:
-    /// their selected compilation units do not depend on test-harness options.
+    /// after all driver-owned Cargo options. Unit-graph queries omit test-harness
+    /// arguments, but retain Clippy lint arguments for the same driver invocation.
     pub fn runtime_arguments(&self, command: CompilationCommand) -> io::Result<Vec<String>> {
         self.cargo_arguments(command)?;
-        if self.test_args.is_empty() {
+        let tail = if command == CompilationCommand::Clippy {
+            &self.lint_args
+        } else {
+            &self.test_args
+        };
+        if tail.is_empty() {
             return Ok(Vec::new());
         }
         Ok(std::iter::once("--".to_owned())
-            .chain(self.test_args.iter().cloned())
+            .chain(tail.iter().cloned())
             .collect())
     }
 }
@@ -597,6 +681,7 @@ mod tests {
             ("check", CompilationCommand::Check),
             ("build", CompilationCommand::Build),
             ("test", CompilationCommand::Test),
+            ("clippy", CompilationCommand::Clippy),
         ] {
             let command: CompilationCommand = serde_json::from_value(json!(text)).unwrap();
             assert_eq!(command, expected);
@@ -696,6 +781,107 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn clippy_selection_preserves_lint_order_without_admitting_compiler_options() {
+        let selection: CompilationSelection = serde_json::from_value(json!({
+            "workspace":true, "all_targets":true, "no_deps":true,
+            "lint_args":["-D", "warnings", "-Aclippy::needless_return", "--force-warn=dead_code",
+                "--cap-lints", "forbid"]
+        }))
+        .unwrap();
+        assert_eq!(
+            selection
+                .cargo_arguments(CompilationCommand::Clippy)
+                .unwrap(),
+            ["clippy", "--workspace", "--all-targets", "--no-deps"]
+        );
+        assert_eq!(
+            selection
+                .runtime_arguments(CompilationCommand::Clippy)
+                .unwrap(),
+            [
+                "--",
+                "-D",
+                "warnings",
+                "-Aclippy::needless_return",
+                "--force-warn=dead_code",
+                "--cap-lints",
+                "forbid"
+            ]
+        );
+        let decoded: CompilationSelection =
+            serde_json::from_value(serde_json::to_value(&selection).unwrap()).unwrap();
+        assert_eq!(decoded, selection);
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+        ] {
+            assert!(selection.cargo_arguments(command).is_err());
+        }
+        for args in [
+            vec!["--emit=link"],
+            vec!["--cfg", "custom"],
+            vec!["@response"],
+            vec!["--sysroot", "/other"],
+            vec!["-D"],
+            vec!["-D", ""],
+            vec!["-Dwarnings=allow"],
+            vec!["-D", "warnings\n"],
+            vec!["--allow", "clippy::"],
+            vec!["--allow", "clippy::BAD"],
+            vec!["--allow", "clippy::lint:__CLIPPY_HACKERY__"],
+            vec!["--cap-lints", "force-warn"],
+            vec!["--config", "/other"],
+        ] {
+            let selection = CompilationSelection {
+                lint_args: args.into_iter().map(str::to_owned).collect(),
+                ..CompilationSelection::default()
+            };
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Clippy)
+                    .is_err(),
+                "{selection:?}"
+            );
+        }
+        let mut selection = CompilationSelection {
+            lint_args: vec!["-Awarnings".into(); MAX_VALUES],
+            ..CompilationSelection::default()
+        };
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Clippy)
+                .is_ok()
+        );
+        selection.packages.push("app".into());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Clippy)
+                .is_err()
+        );
+        selection.packages.clear();
+        selection.lint_args = vec![format!("-A{}", "a".repeat(256)); MAX_VALUES];
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Clippy)
+                .is_err()
+        );
+        selection.lint_args = vec![format!("-A{}", "a".repeat(257))];
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Clippy)
+                .is_err()
+        );
+        selection.lint_args.clear();
+        selection.test_args.push("--nocapture".into());
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Clippy)
+                .is_err()
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@ assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-compile-local", sys.ar
 path = pathlib.Path(sys.argv[2])
 profile = json.loads(path.read_bytes())
 assert profile["version"] == "canonical-compile-local-v1"
-assert profile["command"] in ("check", "build", "test")
+assert profile["command"] in ("check", "build", "test", "clippy")
 assert "selection" in profile
 record = {"pid":os.getpid(), "argv":sys.argv, "profile":profile,
           "retained":str(path), "file_mode":stat.S_IMODE(path.stat().st_mode),
@@ -64,7 +64,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         for directory in (self.source, self.tools / "bin", self.state, self.operations):
             directory.mkdir(parents=True, mode=0o700)
         self.forbidden = self.root / "unexpected-build"
-        for name in ("cargo", "rustc", "rch"):
+        for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver", "rch"):
             tool = self.tools / "bin" / name
             tool.write_text("#!/bin/sh\nprintf unexpected >> '" + str(self.forbidden) + "'\nexit 98\n")
             tool.chmod(0o700)
@@ -222,6 +222,87 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(len(self.records()), 3)
         self.assertEqual(len(list(self.operations.iterdir())), 3)
 
+    def test_clippy_selection_and_exact_lint_order_reach_native_driver_once(self):
+        original = self.profile_path.read_bytes()
+        for args, expected in (
+            (["clippy"], {}),
+            (["clippy", "--workspace", "--all-targets", "--no-deps", "--", "-D", "warnings",
+              "-Aclippy::needless_return", "--force-warn=dead_code", "--cap-lints", "warn"],
+             {"workspace": True, "all_targets": True, "no_deps": True,
+              "lint_args": ["-D", "warnings", "-Aclippy::needless_return",
+                            "--force-warn=dead_code", "--cap-lints", "warn"]}),
+            (["clippy", "-papp", "--lib", "--target=host-tuple", "--profile=dev"],
+             {"packages": ["app"], "lib": True, "target": ["host-tuple"], "profile": "dev"}),
+        ):
+            with self.subTest(args=args):
+                status, _, stderr, pid = self.invoke(args)
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                record = self.records()[-1]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(record["profile"], dict(self.profile, command="clippy", selection=expected))
+                self.assertTrue(Path(record["retained"]).parent.name.startswith("clippy-"))
+                self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_clippy_requires_captured_components_before_retaining_operation(self):
+        for name in ("cargo", "rustc", "cargo-clippy", "clippy-driver"):
+            with self.subTest(name=name):
+                tool = self.tools / "bin" / name
+                tool.chmod(0o600)
+                self.assert_refused(["clippy"])
+                tool.chmod(0o700)
+        incomplete = self.root / "incomplete-toolchain"
+        (incomplete / "bin").mkdir(parents=True)
+        self.profile["toolchain_root"] = str(incomplete)
+        self.save()
+        self.assert_refused(["clippy"])
+
+    def test_clippy_rejects_compiler_authority_test_execution_and_invalid_lint_tails(self):
+        for args in (
+            ["clippy", "--no-run"], ["clippy", "--doc"], ["clippy", "--no-fail-fast"],
+            ["clippy", "test-filter"], ["clippy", "--config=other"],
+            ["clippy", "--", "--emit=link"], ["clippy", "--", "--sysroot", "/other"],
+            ["clippy", "--", "@response"], ["clippy", "--", "--cfg", "custom"],
+            ["clippy", "--", "-D"], ["clippy", "--", "-D", ""],
+            ["clippy", "--", "-D=warnings"], ["clippy", "--", "-D", "Warnings"],
+            ["clippy", "--", "--allow", "clippy::"],
+            ["clippy", "--", "--allow", "clippy::lint__CLIPPY_HACKERY__--sysroot"],
+            ["clippy", "--", "--cap-lints", "force-warn"],
+            ["check", "--no-deps"], ["build", "--no-deps"], ["test", "--no-deps"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+        exact = ["clippy", "--"] + ["-Awarnings"] * 128
+        self.assertEqual(len(launcher.canonical_local_selection(exact)["lint_args"]), 128)
+        for args in (exact + ["-Awarnings"], ["clippy", "-papp"] + exact[1:],
+                     ["clippy", "--"] + ["-A" + "a" * 256] * 128,
+                     ["clippy", "--", "-A" + "a" * 257]):
+            with self.subTest(args=args):
+                with self.assertRaises(launcher.SetupError):
+                    launcher.canonical_local_selection(args)
+
+    def test_saved_clippy_intent_is_validated_and_replaced_without_merging_lints(self):
+        self.profile["command"] = "clippy"
+        self.profile["selection"] = {"no_deps": True, "lint_args": ["-D", "warnings"]}
+        self.save()
+        for args, expected in ((["check"], {}), (["clippy", "--", "-Awarnings"],
+                                               {"lint_args": ["-Awarnings"]})):
+            status, _, stderr, _ = self.invoke(args)
+            self.assertEqual(status, 0, stderr.decode(errors="replace"))
+            self.assertEqual(self.records()[-1]["profile"]["selection"], expected)
+        for selection in ({"no_deps": "true"}, {"lint_args": "-Dwarnings"},
+                          {"lint_args": [True]}, {"lint_args": None},
+                          {"lint_args": ["--cfg", "other"]},
+                          {"test_args": ["-Awarnings"]}, {"test_filter": "filter"}):
+            with self.subTest(selection=selection):
+                self.profile["selection"] = selection
+                self.save()
+                self.assert_refused(["clippy"])
+        self.profile["selection"] = {"lint_args": ["-Awarnings"]}
+        for command in ("check", "build", "test"):
+            self.profile["command"] = command
+            self.save()
+            self.assert_refused(["clippy"])
+
     def test_test_selectors_filters_and_literal_harness_tail_reach_native_driver_once(self):
         self.profile["command"] = "build"
         self.profile["selection"] = {"lib": True, "features": ["from-profile"]}
@@ -361,7 +442,7 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def test_commands_authority_options_and_missing_values_refuse_before_handoff(self):
         rejected = [
-            ["run"], ["bench"], ["doc"], ["clippy"], ["+nightly", "check"],
+            ["run"], ["bench"], ["doc"], ["rustc"], ["+nightly", "check"],
             ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
             ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
             ["check", "--message-format=json"], ["check", "-Zunstable-options"],
@@ -402,7 +483,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         ):
             with self.subTest(args=args):
                 self.assert_refused(args)
-        for command in ("check", "build"):
+        for command in ("check", "build", "clippy"):
             for option in ("--doc", "--no-run", "--no-fail-fast"):
                 with self.subTest(command=command, option=option):
                     self.assert_refused([command, option])

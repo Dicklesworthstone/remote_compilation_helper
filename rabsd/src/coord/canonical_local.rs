@@ -1,14 +1,14 @@
 //! Local canonical Cargo execution connected to the coordinator's rustc cache.
 //!
-//! This explicit profile runs a selected Cargo check, build or test offline and locked against
+//! This explicit profile runs a selected Cargo check, build, test or Clippy offline and locked against
 //! captured inputs and a captured toolchain. Cargo itself runs at canonical
 //! paths, so unit hashes and rustc arguments are stable across checkouts. A
 //! fresh operation-scoped socket admits only rustc requests; the persistent
 //! CAS and the ordinary daemon socket are never visible to the build.
 //!
 //! The selected Cargo unit graph identifies active build scripts and procedural
-//! macros. Their presence, or a test command, disables local compiler-result authority for the whole
-//! operation; eligible dependency caching requires isolated workers. Pure graphs
+//! macros. Their presence, or a test/Clippy command, disables local compiler-result authority for the whole
+//! operation; eligible dependency caching requires isolated workers. Pure check/build graphs
 //! retain the existing evidence-gated metadata lane; archive codegen requires an
 //! isolated worker. Selected workspace libraries can execute freshly on workers;
 //! unsupported rustc invocations compile normally in the namespace. Workspace
@@ -55,6 +55,8 @@ use target_state::{TargetCacheConfig, TargetState};
 
 const PROFILE_VERSION: &str = "canonical-compile-local-v1";
 const CARGO: &str = "/__rabs/toolchain/bin/cargo";
+const CARGO_CLIPPY: &str = "/__rabs/toolchain/bin/cargo-clippy";
+const CLIPPY_DRIVER: &str = "/__rabs/toolchain/bin/clippy-driver";
 const RUSTC: &str = "/__rabs/toolchain/bin/rustc";
 const RUSTDOC: &str = "/__rabs/toolchain/bin/rustdoc";
 const TARGET: &str = "/__rabs/out/cargo";
@@ -302,6 +304,14 @@ impl Profile {
         cwd
     }
 
+    fn program(&self) -> &'static str {
+        if self.command == CompilationCommand::Clippy {
+            CARGO_CLIPPY
+        } else {
+            CARGO
+        }
+    }
+
     fn compilation_prefix(&self) -> io::Result<Vec<String>> {
         let mut args = match &self.selection {
             Some(selection) => selection.cargo_arguments(self.command)?,
@@ -339,6 +349,11 @@ impl Profile {
             "-Z".into(),
             "unstable-options".into(),
         ]);
+        if self.command == CompilationCommand::Clippy
+            && let Some(selection) = &self.selection
+        {
+            args.extend(selection.runtime_arguments(self.command)?);
+        }
         Ok(args)
     }
 
@@ -363,8 +378,11 @@ impl Profile {
         if self.command == CompilationCommand::Test {
             environment["RUSTDOC"] = json!(RUSTDOC);
         }
+        if self.command == CompilationCommand::Clippy {
+            environment["CARGO"] = json!(CARGO);
+        }
         Ok(json!({
-            "kind":"canonical-exec", "request_id":1, "program":CARGO,
+            "kind":"canonical-exec", "request_id":1, "program":self.program(),
             "args":self.compilation_args()?, "toolchain_source":self.toolchain_root,
             "cargo_source":source,
             "command_context":{"version":"env-cwd-v1", "cwd":self.cwd(),
@@ -501,6 +519,9 @@ pub fn run_profile_with_release(
     if profile.command == CompilationCommand::Test {
         plan.extra_env.push(("RUSTDOC".into(), RUSTDOC.into()));
     }
+    if profile.command == CompilationCommand::Clippy {
+        plan.extra_env.push(("CARGO".into(), CARGO.into()));
+    }
     let mut spec = plan.to_spec().map_err(|error| invalid(error.to_string()))?;
     spec.cwd = profile.cwd();
     // Source and HOME are immutable inside the build. In particular, mounting
@@ -519,6 +540,18 @@ pub fn run_profile_with_release(
         ],
     )
     .map_err(io::Error::other)?;
+    if profile.command == CompilationCommand::Clippy {
+        for program in [CARGO_CLIPPY, CLIPPY_DRIVER] {
+            let physical = paths
+                .physical(Path::new(program))
+                .map_err(io::Error::other)?;
+            let metadata = fs::symlink_metadata(physical)?;
+            require(
+                metadata.is_file() && metadata.mode() & 0o111 != 0,
+                "Clippy requires captured ordinary executable bin/cargo-clippy and bin/clippy-driver",
+            )?;
+        }
+    }
     let stopped = Arc::new(AtomicBool::new(false));
     let timeout = Duration::from_secs(profile.timeout_seconds);
     let compilation_args = profile.compilation_args()?;
@@ -531,6 +564,7 @@ pub fn run_profile_with_release(
     let planned = execute(
         &spec,
         &support,
+        profile.program(),
         &graph_args,
         CargoOutput::Capture {
             directory: owner.path().join("unit-graph-drain"),
@@ -601,6 +635,7 @@ pub fn run_profile_with_release(
                 projection: cargo_projection.as_ref(),
                 spec: &spec,
                 support: &support,
+                program: profile.program(),
                 args: &compilation_args,
                 build_identity: &build_identity,
                 wrapper: Sha256::digest(&wrapper).into(),
@@ -717,6 +752,8 @@ pub fn run_profile_with_release(
         "private_target_state":private_target_state,
         "test_execution":profile.command == CompilationCommand::Test && !profile.no_run(),
         "test_result_cache":false,
+        "lint_execution":profile.command == CompilationCommand::Clippy,
+        "lint_result_cache":false,
         "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
         "selected_units":graph.units, "selected_packages":graph.packages,
         "selected_roots":graph.roots})
@@ -724,6 +761,7 @@ pub fn run_profile_with_release(
     let result = execute(
         &spec,
         &support,
+        profile.program(),
         &compilation_args,
         CargoOutput::Inherit,
         timeout,
@@ -796,6 +834,7 @@ struct TargetReuseContext<'a> {
     projection: Option<&'a CargoHomeProjection>,
     spec: &'a CanonicalNamespaceSpec,
     support: &'a HostIsolationSupport,
+    program: &'a str,
     args: &'a [String],
     build_identity: &'a str,
     wrapper: [u8; 32],
@@ -824,14 +863,15 @@ impl TargetReuseContext<'_> {
         } else {
             CargoArtifactMode::Compilation
         };
-        let args =
-            compatible_arguments(CARGO, self.args, mode).unwrap_or_else(|| self.args.to_vec());
+        let args = compatible_arguments(self.program, self.args, mode)
+            .unwrap_or_else(|| self.args.to_vec());
         // Build scripts, procedural macros and LLVM's assembler can read
         // captured data without reporting it to Cargo or rustc dep-info.
         // Retiming a file cannot dirty a unit that never declared that file:
         // even a pure Rust build can embed an untracked global_asm! .incbin.
         // Source-edit families therefore require a compiler-only check. All
-        // codegen and project-executor graphs keep their complete source key.
+        // codegen, Clippy and project-executor graphs keep their complete source
+        // key. Clippy can read manifests/configuration outside rustc dep-info.
         let metadata_only = self.args.first().is_some_and(|command| command == "check");
         let source = if metadata_only && !self.closed_dependency_execution {
             source_edit_identity(self.workspace, self.full_source, self.projection)
@@ -861,7 +901,7 @@ impl TargetReuseContext<'_> {
             "projection":self.projection.map(|home| (home.version(), home.prefix())),
             "toolchain":{"sha256":toolchain.sha256,
                 "files":toolchain.files,"bytes":toolchain.bytes},
-            "program":CARGO, "args":args, "cwd":self.spec.cwd,
+            "program":self.program, "args":args, "cwd":self.spec.cwd,
             "env":self.spec.env, "hostname":self.spec.hostname,
             "ro":ro, "rw":rw, "output":TARGET,
             "bubblewrap":self.support.bubblewrap,
@@ -944,12 +984,13 @@ enum CargoOutput {
 fn execute(
     spec: &CanonicalNamespaceSpec,
     support: &HostIsolationSupport,
+    program: &str,
     args: &[String],
     output: CargoOutput,
     timeout: Duration,
     stopped: &AtomicBool,
 ) -> io::Result<DrainedOutput> {
-    let launch = build_canonical_argv(spec, support, CARGO, args)
+    let launch = build_canonical_argv(spec, support, program, args)
         .map_err(|error| invalid(error.to_string()))?;
     let mut command = command_for(&launch);
     command.stdin(Stdio::null());
@@ -1297,13 +1338,49 @@ mod tests {
                 "1"
             ])
         );
-        for command in ["run", "bench", "rustc", "clippy"] {
+        for command in ["run", "bench", "rustc", "doc"] {
             assert!(serde_json::from_value::<Profile>(json!({
                 "version":PROFILE_VERSION, "command":command,
                 "source_root":"/source", "toolchain_root":"/toolchain",
                 "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
             })).is_err());
         }
+    }
+
+    #[test]
+    fn clippy_uses_captured_driver_and_identical_lints_after_the_planning_controls() {
+        let profile: Profile = serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "command":"clippy",
+            "source_root":"/source", "toolchain_root":"/toolchain",
+            "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap",
+            "jobs":3, "selection":{"workspace":true, "all_targets":true, "no_deps":true,
+                "lint_args":["-D", "warnings", "-Aclippy::needless_return"]}
+        }))
+        .unwrap();
+        let args = profile.compilation_args().unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            &args[..4],
+            ["clippy", "--workspace", "--all-targets", "--no-deps"]
+        );
+        assert_eq!(
+            &args[separator + 1..],
+            ["-D", "warnings", "-Aclippy::needless_return"]
+        );
+        let graph = profile.graph_args().unwrap();
+        assert_eq!(&graph[..separator], &args[..separator]);
+        assert_eq!(
+            &graph[separator..separator + 3],
+            ["--unit-graph", "-Z", "unstable-options"]
+        );
+        assert_eq!(&graph[separator + 3..], &args[separator..]);
+        let request = profile.source_specification().unwrap();
+        assert_eq!(request["program"], CARGO_CLIPPY);
+        assert_eq!(request["args"], json!(args));
+        assert_eq!(request["command_context"]["env"]["CARGO"], CARGO);
+        assert_eq!(request["command_context"]["env"]["RUSTC"], RUSTC);
+        assert!(request["command_context"]["env"].get("RUSTDOC").is_none());
+        assert!(!profile.no_run());
     }
 
     #[test]
@@ -1600,6 +1677,7 @@ mod tests {
         projection: Option<CargoHomeProjection>,
         spec: CanonicalNamespaceSpec,
         support: HostIsolationSupport,
+        program: &'static str,
         args: Vec<String>,
         config: TargetCacheConfig,
         wrapper: [u8; 32],
@@ -1636,6 +1714,7 @@ mod tests {
                     cgroup_v2: false,
                     landlock: false,
                 },
+                program: CARGO,
                 args: [
                     "check",
                     "--offline",
@@ -1671,6 +1750,7 @@ mod tests {
                 projection: self.projection.as_ref(),
                 spec: &self.spec,
                 support: &self.support,
+                program: self.program,
                 args: &self.args,
                 build_identity: &self.driver,
                 wrapper: self.wrapper,
@@ -1811,6 +1891,61 @@ mod tests {
             tests.key(),
             compiled,
             "doc selection retains its separate target family"
+        );
+    }
+
+    #[test]
+    fn private_clippy_targets_bind_driver_full_source_selections_and_ordered_lints() {
+        let clippy = || {
+            let mut fixture = ReuseKeyFixture::new();
+            fixture.program = CARGO_CLIPPY;
+            fixture.args[0] = "clippy".into();
+            fixture.closed_dependency_execution = true;
+            fixture.spec.env.push(("CARGO".into(), CARGO.into()));
+            fixture
+        };
+        let original = clippy().key();
+        assert_ne!(
+            original,
+            ReuseKeyFixture::new().key(),
+            "a check cannot make lint execution fresh"
+        );
+        let mut changed = clippy();
+        changed.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None);
+        assert_ne!(
+            changed.key(),
+            original,
+            "Clippy may read source not listed in compiler dep-info"
+        );
+        for option in ["--no-deps", "--all-targets", "--workspace"] {
+            let mut changed = clippy();
+            changed.args.push(option.into());
+            assert_ne!(
+                changed.key(),
+                original,
+                "Clippy selection must retain lint coverage: {option}"
+            );
+        }
+        let mut changed = clippy();
+        changed.program = CARGO;
+        assert_ne!(
+            changed.key(),
+            original,
+            "the actual captured driver is part of the family"
+        );
+        let mut changed = clippy();
+        changed
+            .args
+            .extend(["--", "-D", "warnings", "-A", "dead_code"].map(str::to_owned));
+        let deny_then_allow = changed.key();
+        assert_ne!(deny_then_allow, original);
+        let tail = changed.args.len() - 4;
+        changed.args[tail..]
+            .clone_from_slice(&["-A", "dead_code", "-D", "warnings"].map(str::to_owned));
+        assert_ne!(
+            changed.key(),
+            deny_then_allow,
+            "later lint levels can override earlier ones"
         );
     }
 

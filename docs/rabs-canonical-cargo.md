@@ -909,7 +909,7 @@ performance gates and the required canary/soak are not completed by this fronten
 ## Local canonical builds and checks with dependency caching
 
 `rabsd --canonical-compile-local PROFILE.json` runs the captured native Cargo as
-`cargo check`, `cargo build` or `cargo test`, always offline and locked, with the selected packages, features and targets
+`cargo check`, `cargo build`, `cargo clippy` or `cargo test`, always offline and locked, with the selected packages, features and targets
 inside the canonical namespace and connects
 its rustc requests to an operation-owned coordinator. Eligible external registry,
 locked Git and verified directory-source libraries use the existing metadata
@@ -923,9 +923,11 @@ the original checkout does not introduce a different host path into that unit's
 arguments or metadata output.
 
 The local profile asks the captured Cargo to plan the **actual selected build
-units** with `--unit-graph -Z unstable-options` on the selected `check`, `build` or `test`, using the same Cargo
+units** with `--unit-graph -Z unstable-options` on the selected `check`, `build`, `clippy` or `test`, using the same Cargo
 selection, captured configuration and canonical paths as execution. Harness
-arguments after `--` are supplied only to the actual test invocation. Planning
+arguments after `--` are supplied only to the actual test invocation. Clippy's
+validated lint arguments are retained for both planning and execution, after
+the driver's Cargo options. Planning
 does not compile or run project units, and finishes before a wrapper or cache
 endpoint is exposed. Selected build scripts and procedural macros execute under
 Cargo. A build-script run must name its matching compiled producer, and the
@@ -1017,12 +1019,12 @@ For an already vendored project, save this profile with your actual absolute pat
 rabsd --canonical-compile-local ./canonical-compile.json
 ```
 
-`command` is `check` by default, `build`, or `test`. The profile and native entry point
+`command` is `check` by default, `build`, `clippy`, or `test`. The profile and native entry point
 replace `canonical-check-local-v1` and `--canonical-check-local`; install matching
 tools and update saved local profiles. `manifest` defaults to `Cargo.toml`, `jobs`
 to 1 and `timeout_seconds` to 1800.
 Omitting `selection` for `check` retains the library-only `check --lib` behavior;
-omitting it for `build` or `test` uses Cargo's ordinary default members and targets. Setting
+omitting it for `build`, `clippy` or `test` uses Cargo's ordinary default members and targets. Setting
 `"selection": {}` uses Cargo's ordinary default members and targets. A selection
 can specify `workspace`, `packages`, `exclude`, `features`, `all_features`,
 `no_default_features`, `lib`, `bins`, `tests`, `examples`, `benches`, `all_targets`,
@@ -1030,7 +1032,9 @@ the named-target arrays `bin`, `test`, `example`, `bench`, the compilation-targe
 array `target`, and either `release` or the optional profile-name string `profile`.
 For `test`, it also accepts `doc`, `no_run`, `no_fail_fast`, an optional
 `test_filter` string and the literal `test_args` array. These test-only fields
-cannot change a `check` or `build` command.
+cannot change a `check`, `build` or `clippy` command. For `clippy`, the selection
+also accepts `no_deps` and a `lint_args` array containing bounded lint controls;
+these fields cannot change another command.
 An empty `target` and absent or null `profile` retain Cargo's defaults. Exclusions
 require workspace selection. For example:
 
@@ -1062,7 +1066,7 @@ into a private Cargo home. It does not inherit that cache's user configuration,
 credentials or unrelated expanded sources. The source, toolchain, state,
 operation and optional Cargo-cache roots must be disjoint ordinary absolute
 directories. The wrapper must be an ordinary executable outside the captured
-source and mutable state/operation roots. Commands other than `check`, `build` and `test`, mount declarations
+source and mutable state/operation roots. Commands other than `check`, `build`, `clippy` and `test`, mount declarations
 and environment overrides are not profile fields.
 
 Preparation captures the selected toolchain before its Cargo metadata planning
@@ -1086,7 +1090,7 @@ capability; a wrapper-supplied path or environment flag cannot construct one.
 The local Cargo driver also accepts the existing pinned dependency-worker
 configuration from its operator environment. With no worker configuration it
 keeps the local metadata lane only for compiler-only check/build graphs without
-project executors. Test commands and graphs with build scripts or procedural
+project executors. Test/Clippy commands and graphs with build scripts or procedural
 macros compile without local action-cache authority.
 To use workers, install matching `rabsd`, `rabs-wrap` and
 `rabs-wkr` binaries and provision the mutual-TLS credentials described in
@@ -1219,6 +1223,48 @@ for eligible workspace libraries without granting workspace action-cache reuse.
 Cargo still owns command execution and freshness; the optional private target
 reuse described below has its existing independent rules and limits.
 
+### Local Clippy with reusable dependency compilation
+
+The same local profile can lint its selected Cargo units:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- clippy --workspace --all-targets --no-deps -- -D warnings
+```
+
+The captured toolchain must contain ordinary executable `bin/cargo-clippy` and
+`bin/clippy-driver`, alongside Cargo and rustc. Both the graph query and the
+actual command invoke that captured `cargo-clippy`, with `CARGO` and `RUSTC`
+bound to the captured canonical binaries. Toolchain capture identifies their
+bytes; an ambient rustup proxy or another PATH entry cannot select the driver.
+
+`--no-deps` limits lint coverage as it does in ordinary Clippy. The tail after
+`--` accepts `-A`, `-W`, `-D`, `-F`, `--allow`, `--warn`, `--force-warn`, `--deny`,
+`--forbid` and `--cap-lints`. Short flags accept separate or attached lint names;
+long flags accept separate values or `=value`. Lint names are bounded lowercase
+identifiers, including names such as `clippy::needless_return`. Lint caps are
+`allow`, `warn`, `deny` or `forbid`. Their order is preserved, because later
+lint levels can change the result. Compiler flags, response files, paths and
+arbitrary Clippy arguments are refused. A direct native profile expresses the
+same selection as `"command":"clippy"` with
+`"selection":{"no_deps":true,"lint_args":["-D","warnings"]}`.
+
+Clippy driver invocations pass through the wrapper and never acquire a rustc
+cache key, publication capability or compiler-skip reply. The entire operation
+disables local dependency-result authority. Ordinary rustc dependency requests
+may use the existing isolated-worker lane when its admission and replay gates
+are satisfied; without an admitted worker they compile normally. Cargo still
+owns lint freshness and the current command's diagnostics and exit status.
+Clippy-driver wrapper chains also remain outside fresh workspace offload; a
+selected library record cannot substitute ordinary rustc for its lint execution.
+
+Optional private target reuse keeps Clippy in its own families, binding its
+exact selection, ordered lint controls, captured driver and complete source
+snapshot. A warm `check` cannot supply Clippy lint coverage. Changing lint
+levels or captured configuration starts a different family, including changes
+that rustc dep-info would not observe. An identical Clippy request can restore
+verified private Cargo state; it still starts the selected Cargo/Clippy command.
+Lint outcomes are never shared action-cache results or delivered build artifacts.
+
 ### Persistent reuse and command results
 
 The driver owns `state_root/canonical-compile-v1`, including its CAS and exclusive
@@ -1283,7 +1329,7 @@ separate the seed family. Immutable registry/Git/vendor inputs remain exact.
 This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
 
-Code-generating builds, all test commands, and selected graphs with build scripts
+Code-generating builds, all test/Clippy commands, and selected graphs with build scripts
 or procedural macros use the **complete captured source identity** for private target reuse. An unchanged capture can
 reuse its verified target, but any captured file edit starts that graph with a
 cold target. Procedural macros may read data through ordinary filesystem calls
@@ -1389,13 +1435,15 @@ cargo test -p rabs-sandbox --lib cargo_check --locked
 cargo test -p rabs-sandbox --test cargo_check --locked -- --nocapture
 ```
 
-The sandbox Cargo tests invoke the actual installed nightly Cargo and rustc.
+The sandbox Cargo tests invoke the actual installed nightly Cargo, rustc and Clippy.
 They check selected feature/target/profile graphs, real check metadata, build
 archives, generated Rust from a build script, a functioning procedural macro,
 a linked binary and compiled test harnesses. Build and no-run cases require
 execution markers to remain absent. Test cases then verify filtering, repeated
 execution when Cargo reports a fresh harness, doctest execution and the current
-failure exit status. A wrong-profile negative control must fail compilation. These
+failure exit status. Clippy cases plan without compiling, then prove that lint
+failures remain visible after a successful check and changes to lint levels.
+A wrong-profile negative control must fail compilation. These
 cases validate command selection and its real Cargo outputs; they do not substitute
 for the isolated worker/cache fixtures below.
 
@@ -1412,11 +1460,19 @@ RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
   cargo test -p rabsd --test canonical_check_local --locked \
     canonical_cargo_doctests_execute_with_captured_rustdoc_and_preserve_failures \
     -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_clippy_preserves_current_lints_and_separates_private_target_families \
+    -- --ignored --exact --nocapture
 ```
 
 These cases check delivered no-run harnesses, execution of each current test
 request, the captured rustdoc, failure propagation and refusal of local cache
-authority from test code. They must actually execute on a supported host; an
+authority from test code. The Clippy fixture checks cold/warm target reuse,
+current lint failures after a warm check, lint-level and configuration changes,
+and refusal of local rustc cache authority. It also requires the captured Clippy
+components. These tests must actually execute on a supported host; an
 ignored fixture or a namespace-capability refusal is not passing evidence.
 
 The full compiler-skip test is explicitly opt-in because it needs the complete
@@ -1550,7 +1606,7 @@ the delivered executable to use the new generated value.
 ### Select local Cargo units from the Cargo command line
 
 The installed `cargo-rabs` launcher accepts the same local profile and turns
-ordinary build/check/test selectors into the native driver's typed command and selection:
+ordinary build/check/clippy/test selectors into the native driver's typed command and selection:
 
 ```sh
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- check
@@ -1562,6 +1618,8 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- check -p core --li
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- build -p app --bin server --release
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- build --workspace --all-targets
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- build -p core --tests --profile test
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- clippy --workspace --all-targets --no-deps -- -D warnings
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- clippy -p core --lib -- -Aclippy::needless_return
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test --workspace
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --no-run
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --doc
@@ -1573,7 +1631,7 @@ Omitting the Cargo arguments selects `check`. Explicit command-line selection
 replaces the profile's `command` and entire `selection` object; it never merges with saved
 features or targets. An empty selection uses Cargo's ordinary default members
 and targets. Directly invoking `rabsd` with a check profile that omits `selection`
-retains the library-only `--lib` behavior; build and test profiles use Cargo's defaults.
+retains the library-only `--lib` behavior; build, Clippy and test profiles use Cargo's defaults.
 The profile still selects the manifest,
 source and toolchain roots, job budget, timeout, state directory and wrapper.
 
@@ -1587,27 +1645,28 @@ source and toolchain roots, job budget, timeout, state directory and wrapper.
 | Compilation profile | `--release` / `-r`, or one `--profile NAME` |
 | Test execution | `test` only: `--no-run`, `--doc`, `--no-fail-fast`, one optional test-name filter |
 | Test harness | `test` only: literal arguments after `--`, such as `--exact`, `--nocapture`, `--ignored` or `--test-threads=1` |
+| Clippy lint selection | `clippy` only: `--no-deps`, and the bounded lint controls after `--` described above |
 
 Value options accept separate arguments and `--option=value`; `-pPACKAGE` and
 `-FFEATURES` are also accepted. Repeated array-valued options retain every literal
 value in order. `--profile` occurs at most once and cannot be combined with
 `--release` or `-r`. Target and profile names use the same restricted name syntax
 as the native profile above; neither can select a JSON target specification or
-another file. All array entries, the optional profile, the test filter and
+another file. All array entries, the optional profile, the test filter, lint controls and
 harness arguments together share the
 128-value limit and the selected command arguments' 16 KiB byte budget, including
 option names. Each individual value is limited to 1,024 UTF-8 bytes.
 Cargo interprets package specifications and comma/space-separated feature lists.
 The native driver constructs both its nonexecuting unit-graph query and the
 subsequent compilation from the same command and selection. It requires a captured nightly Cargo
-with unit-graph support and derives the worker-only cache policy from the test
+with unit-graph support and derives the worker-only cache policy from the test/Clippy
 command or required build-script/procedural-macro units before exposing the cache endpoint. Selecting
 a different target or feature set can therefore retain local metadata caching
 when those executors are inactive. Source
 preparation still captures the locked graph; these selectors do not narrow the
 approved source boundary or replace the isolated generated-input admission checks.
 
-This mode accepts `check`, `build` and `test`. `run`, `bench`, Clippy and arbitrary
+This mode accepts `check`, `build`, `clippy` and `test`. `run`, `bench` and arbitrary
 subcommands are not admitted. `build --tests` and `build --benches` compile only;
 `test --no-run` also compiles without executing its harnesses. Ordinary `test`
 and `test --doc` run on every request, even when their compiled inputs are fresh.
@@ -1618,11 +1677,12 @@ The native driver supplies locked/offline
 mode, canonical compiler and output locations, and JSON diagnostics. Arguments
 that would override them, including `--config`, `--manifest-path`, `--target-dir`,
 `--message-format` and `-Z`, are refused as Cargo options. Harness arguments after
-`--` are accepted only for `test`. Set `jobs` and `manifest` in the profile. Launcher modes and
+`--` are accepted only for `test`; Clippy accepts its validated lint controls there.
+Set `jobs` and `manifest` in the profile. Launcher modes and
 local root-admission settings cannot be combined with this mode.
 
 Before the single native handoff, the launcher saves the resolved profile as
-`operation_root/<check-or-build-or-test>-<random>/profile.json` with mode 0600 in a mode 0700
+`operation_root/<command>-<random>/profile.json` with mode 0600 in a mode 0700
 directory. It prints that retained pathname on stderr, preserves the source
 profile, then replaces its own process with
 `rabsd --canonical-compile-local <retained-profile>`. Native exit status, signals,

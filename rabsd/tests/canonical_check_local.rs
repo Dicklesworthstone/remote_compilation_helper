@@ -1906,3 +1906,102 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     );
     worker.finish();
 }
+
+/// A warm check never supplies lint coverage. Clippy owns its current outcome;
+/// private state can be restored only for its exact source and lint selection.
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native Clippy components and RABS_CANONICAL_TEST_WRAPPER"]
+fn canonical_clippy_preserves_current_lints_and_separates_private_target_families() {
+    let (owner, mut profile) = native_fixture();
+    let toolchain = Path::new(profile["toolchain_root"].as_str().unwrap());
+    for component in ["cargo-clippy", "clippy-driver"] {
+        assert!(
+            toolchain.join("bin").join(component).is_file(),
+            "install native {component}"
+        );
+    }
+    let source = owner.path().join("source-a");
+    write(
+        &source,
+        "src/lib.rs",
+        r#"
+pub fn answer() -> u32 { return canonical_dep::answer(); }
+pub fn configured_lint(project_marker: u32) -> u32 { project_marker }
+"#,
+    );
+    write(&source, "clippy.toml", "disallowed-names = []\n");
+    profile["selection"] = json!({"lib":true});
+    profile["target_cache"] = json!({"runtime_epoch":"native-clippy-v1", "max_bytes":268435456});
+    let (code, _, output) = run(owner.path(), 1000, &profile);
+    assert_eq!(
+        code, 0,
+        "ordinary Cargo check must accept this lint-only problem: {output}"
+    );
+
+    let assert_lint_run = |events: &[Value], state: &str| {
+        let started = events
+            .iter()
+            .filter(|event| event["kind"] == "canonical-compilation-started")
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1, "{events:?}");
+        assert_eq!(started[0]["command"], "clippy");
+        assert_eq!(started[0]["lint_execution"], true);
+        assert_eq!(started[0]["lint_result_cache"], false);
+        assert_eq!(started[0]["private_target_state"], state);
+        assert!(
+            decisions(events, "execute").is_empty(),
+            "Clippy must not gain local rustc cache publication: {events:?}"
+        );
+        assert!(
+            decisions(events, "hit").is_empty(),
+            "without a worker Clippy must not acquire local compiler hits: {events:?}"
+        );
+    };
+    profile["command"] = json!("clippy");
+    profile["selection"] =
+        json!({"lib":true, "no_deps":true, "lint_args":["-Dclippy::needless_return"]});
+    let (code, events, output) = run(owner.path(), 1001, &profile);
+    assert_eq!(
+        code, 101,
+        "the warm check must not suppress Clippy: {output}"
+    );
+    assert!(output.contains("clippy::needless_return"), "{output}");
+    assert_lint_run(&events, "cold");
+
+    profile["selection"] = json!({"lib":true, "no_deps":true,
+        "lint_args":["-Aclippy::needless_return", "-Dclippy::disallowed_names"]});
+    for (number, state) in [(1002, "cold"), (1003, "restored")] {
+        let (code, events, output) = run(owner.path(), number, &profile);
+        assert_eq!(code, 0, "{output}");
+        assert_lint_run(&events, state);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "canonical-build-completed"),
+            "lint success is not a delivered build artifact: {events:?}"
+        );
+    }
+    profile["selection"]["lint_args"] = json!(["-Dclippy::needless_return"]);
+    let (code, events, output) = run(owner.path(), 1004, &profile);
+    assert_eq!(
+        code, 101,
+        "changed lint levels must report the current failure: {output}"
+    );
+    assert!(output.contains("clippy::needless_return"), "{output}");
+    assert_lint_run(&events, "cold");
+
+    profile["selection"]["lint_args"] =
+        json!(["-Aclippy::needless_return", "-Dclippy::disallowed_names"]);
+    write(
+        &source,
+        "clippy.toml",
+        "disallowed-names = [\"project_marker\"]\n",
+    );
+    let (code, events, output) = run(owner.path(), 1005, &profile);
+    assert_eq!(
+        code, 101,
+        "a configuration-only edit must change lint execution: {output}"
+    );
+    assert!(output.contains("clippy::disallowed_names"), "{output}");
+    assert_lint_run(&events, "cold");
+}

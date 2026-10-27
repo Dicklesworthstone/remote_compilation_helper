@@ -7,7 +7,7 @@
 //! network. It does not qualify cache serving or namespace enforcement.
 #![cfg(target_os = "linux")]
 
-use CompilationCommand::{Build, Check, Test};
+use CompilationCommand::{Build, Check, Clippy, Test};
 use rabs_sandbox::cargo_check::{
     CompilationCommand, CompilationSelection, validate_compilation_unit_graph,
 };
@@ -139,7 +139,11 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(self.tools.join("bin/cargo"));
+        self.tool_command("cargo")
+    }
+
+    fn tool_command(&self, name: &str) -> Command {
+        let mut command = Command::new(self.tools.join("bin").join(name));
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -151,12 +155,19 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_BUILD_JOBS", "1")
             .current_dir(self.root());
+        if name == "cargo-clippy" {
+            command.env("CARGO", self.tools.join("bin/cargo"));
+        }
         command
     }
 
     fn graph(&self, command: CompilationCommand, selection: CompilationSelection) -> Value {
-        let output = self
-            .command()
+        let mut invocation = if command == Clippy {
+            self.tool_command("cargo-clippy")
+        } else {
+            self.command()
+        };
+        invocation
             .args(selection.cargo_arguments(command).unwrap())
             .args([
                 "--offline",
@@ -164,9 +175,11 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 "--unit-graph",
                 "-Z",
                 "unstable-options",
-            ])
-            .output()
-            .unwrap();
+            ]);
+        if command == Clippy {
+            invocation.args(selection.runtime_arguments(command).unwrap());
+        }
+        let output = invocation.output().unwrap();
         assert!(
             output.status.success(),
             "selected {selection:?}: {}",
@@ -182,6 +195,15 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             .args(selection.cargo_arguments(Test).unwrap())
             .args(["--offline", "--locked", "--message-format=json"])
             .args(selection.runtime_arguments(Test).unwrap())
+            .output()
+            .unwrap()
+    }
+
+    fn clippy(&self, selection: &CompilationSelection) -> std::process::Output {
+        self.tool_command("cargo-clippy")
+            .args(selection.cargo_arguments(Clippy).unwrap())
+            .args(["--offline", "--locked", "--message-format=json"])
+            .args(selection.runtime_arguments(Clippy).unwrap())
             .output()
             .unwrap()
     }
@@ -215,6 +237,84 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             }
         }
         walk(self.owner.path());
+    }
+}
+
+#[test]
+fn real_clippy_unit_graph_preserves_selection_without_compilation_or_lint_authority() {
+    let fixture = Fixture::new();
+    for selection in [
+        CompilationSelection {
+            lib: true,
+            ..CompilationSelection::default()
+        },
+        CompilationSelection {
+            workspace: true,
+            all_targets: true,
+            all_features: true,
+            no_deps: true,
+            lint_args: vec![
+                "-D".into(),
+                "warnings".into(),
+                "-Aclippy::needless_return".into(),
+            ],
+            ..CompilationSelection::default()
+        },
+    ] {
+        let report =
+            validate_compilation_unit_graph(&fixture.graph(Clippy, selection), Clippy).unwrap();
+        assert!(report.requires_closed_dependency_execution());
+        assert!(!report.contains_doctests());
+    }
+    fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
+fn native_clippy_reports_current_lints_after_check_and_lint_option_changes() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root().join("ordinary/src/lib.rs"),
+        "pub fn answer() -> u32 { return 23; }\n",
+    )
+    .unwrap();
+    let checked = fixture
+        .command()
+        .args(["check", "--offline", "--locked", "-p", "ordinary", "--lib"])
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let mut selection = CompilationSelection {
+        packages: vec!["ordinary".into()],
+        lib: true,
+        no_deps: true,
+        lint_args: vec!["-Dclippy::needless_return".into()],
+        ..CompilationSelection::default()
+    };
+    for round in 0..2 {
+        let rejected = fixture.clippy(&selection);
+        assert_eq!(
+            rejected.status.code(),
+            Some(101),
+            "round {round}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stdout).contains("clippy::needless_return"),
+            "{}",
+            String::from_utf8_lossy(&rejected.stdout)
+        );
+        selection.lint_args = vec!["-Aclippy::needless_return".into()];
+        let allowed = fixture.clippy(&selection);
+        assert!(
+            allowed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        selection.lint_args = vec!["-Dclippy::needless_return".into()];
     }
 }
 
