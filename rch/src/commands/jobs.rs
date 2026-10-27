@@ -148,25 +148,50 @@ fn validate_admitted_cancellation(
     lease: &DurableJobLease,
     reply: &Value,
 ) -> Result<AdmittedCancellation> {
-    validate_admitted_cancellation_receipt(lease, reply).map_err(|error| {
-        // An unconfirmed receipt leaves this exact job's custody unresolved.
-        // Generic internal-error advice to restart or clear locks can erase it.
-        let mut api = rch_common::ApiError::from_code(rch_common::ErrorCode::CancelCleanupFailed)
-            .with_details(format!("{error:#}"));
-        api.message = "Cancellation outcome is unconfirmed".to_string();
-        api.remediation = vec![
-            format!(
-                "Observe the original job with `rch jobs attach {}`; its outcome is still uncertain",
-                lease.identity.local_wrapper_id
-            ),
-            format!(
-                "After the original wrapper stops, run `rch jobs recover {}` to reconcile the same job without replay",
-                lease.identity.local_wrapper_id
-            ),
-            "Keep its journal and reservations until terminal acknowledgement".to_string(),
-        ];
-        anyhow::Error::new(api)
-    })
+    validate_admitted_cancellation_receipt(lease, reply)
+        .map_err(|error| cancellation_unconfirmed_error(lease, error))
+}
+
+fn cancellation_unconfirmed_error(
+    lease: &DurableJobLease,
+    error: impl Into<anyhow::Error>,
+) -> anyhow::Error {
+    // A failed response leaves this exact job's custody unresolved. Include
+    // recovery in details too: plaintext output does not render remediation.
+    let error = error.into();
+    let recovery = format!(
+        "After the original wrapper stops, run `rch jobs recover {}` to reconcile the same job without replay",
+        lease.identity.local_wrapper_id
+    );
+    let mut api = rch_common::ApiError::from_code(rch_common::ErrorCode::CancelCleanupFailed)
+        .with_details(format!("{error:#}\n{recovery}"));
+    api.message = "Cancellation outcome is unconfirmed".to_string();
+    api.remediation = vec![
+        format!(
+            "Observe the original job with `rch jobs attach {}`; its outcome is still uncertain",
+            lease.identity.local_wrapper_id
+        ),
+        recovery,
+        "Keep its journal and reservations until terminal acknowledgement".to_string(),
+    ];
+    anyhow::Error::new(api)
+}
+
+fn parse_cancellation_response(lease: &DurableJobLease, response: &str) -> Result<Value> {
+    let parsed = (|| {
+        let (header, body) = response
+            .split_once("\r\n\r\n")
+            .or_else(|| response.split_once("\n\n"))
+            .with_context(|| format!("missing cancellation response body: {response:?}"))?;
+        let mut status = header.lines().next().unwrap_or_default().split_whitespace();
+        anyhow::ensure!(
+            matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")) && status.next() == Some("200"),
+            "daemon refused cancellation; response: {response:?}"
+        );
+        serde_json::from_str(body)
+            .with_context(|| format!("invalid cancellation response JSON: {response:?}"))
+    })();
+    parsed.map_err(|error| cancellation_unconfirmed_error(lease, error))
 }
 
 fn validate_admitted_cancellation_receipt(
@@ -566,25 +591,25 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         if cancel && lease.identity.remote_build_id.is_none() {
             // Admission may win after this snapshot. The daemon serializes the
             // decision with registration and cancels that exact active build.
-            let response = within_job_deadline(
-                deadline,
-                "queued cancellation",
-                super::send_daemon_command(&format!("POST /jobs/{wrapper_id}/cancel\n")),
-            )
+            let response = within_job_deadline(deadline, "queued cancellation", async {
+                super::send_daemon_command(&format!("POST /jobs/{wrapper_id}/cancel\n"))
+                    .await
+                    .map_err(|error| cancellation_unconfirmed_error(&lease, error))
+            })
             .await?;
-            let body = response
-                .split_once("\r\n\r\n")
-                .or_else(|| response.split_once("\n\n"))
-                .map(|(_, body)| body)
-                .context("missing queued cancellation response")?;
-            let mut reply: Value = serde_json::from_str(body)?;
-            validate_queued_cancellation(&wrapper_id, &reply)?;
+            let mut reply = parse_cancellation_response(&lease, &response)?;
+            validate_queued_cancellation(&wrapper_id, &reply)
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
             if reply["status"] == "cancelled_before_start" {
                 // Daemon cancellation already succeeded. A live wrapper owns
                 // its journal and acknowledges the selection response itself.
                 // Report deferred acknowledgment without overwriting that
                 // owner or misreporting its cancellation as a daemon failure.
-                reply["journal_acknowledged"] = json!(writer.confirm_selection_cancelled()?);
+                reply["journal_acknowledged"] = json!(
+                    writer
+                        .confirm_selection_cancelled()
+                        .map_err(|error| cancellation_unconfirmed_error(&lease, error))?
+                );
             } else if reply["status"] == "cancelled" {
                 let mut identity = lease.identity.clone();
                 identity.admit(
@@ -593,42 +618,53 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                         .context("missing cancelled build id")?,
                 );
                 let path = default_job_lease_directory().join(format!("{wrapper_id}.cancel"));
-                crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&identity)?)?;
+                crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&identity)?)
+                    .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
             }
             emit(ctx, &reply)?;
             return Ok(());
         }
-        let status = within_job_deadline(deadline, "job status", query(&lease)).await?;
+        let status = within_job_deadline(deadline, "job status", async {
+            query(&lease).await.map_err(|error| {
+                if cancel {
+                    cancellation_unconfirmed_error(&lease, error)
+                } else {
+                    error
+                }
+            })
+        })
+        .await?;
         if cancel {
             if status["status"] == "completed" {
-                let code = validate_completion(&lease, &status)?;
+                let code = validate_completion(&lease, &status)
+                    .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
                 emit(ctx, &completed_cancellation_report(&lease, code))?;
                 return Ok(());
             }
             let id = lease
                 .identity
                 .remote_build_id
-                .context("job has no admitted build")?;
-            anyhow::ensure!(
-                status["status"] == "active",
-                "daemon has no identity evidence for cancellation (status: {}); no process was signalled",
-                status["status"]
-            );
-            let response = within_job_deadline(
-                deadline,
-                "admitted cancellation",
+                .context("job has no admitted build")
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
+            if status["status"] != "active" {
+                return Err(cancellation_unconfirmed_error(
+                    &lease,
+                    anyhow::anyhow!(
+                        "daemon has no identity evidence for cancellation (status: {}); no process was signalled",
+                        status["status"]
+                    ),
+                ));
+            }
+            let response = within_job_deadline(deadline, "admitted cancellation", async {
                 super::send_daemon_command(&format!(
                     "POST /builds/{id}/cancel?local_wrapper_id={}\n",
                     wrapper_id
-                )),
-            )
+                ))
+                .await
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))
+            })
             .await?;
-            let body = response
-                .split_once("\r\n\r\n")
-                .or_else(|| response.split_once("\n\n"))
-                .map(|(_, b)| b)
-                .context("missing cancellation response")?;
-            let reply: Value = serde_json::from_str(body)?;
+            let reply = parse_cancellation_response(&lease, &response)?;
             if let AdmittedCancellation::AlreadyCompleted(code) =
                 validate_admitted_cancellation(&lease, &reply)?
             {
@@ -638,7 +674,8 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             // The original wrapper consumes this exact-identity receipt itself.
             // Never signal a PID obtained from a persisted lease.
             let path = default_job_lease_directory().join(format!("{wrapper_id}.cancel"));
-            crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&lease.identity)?)?;
+            crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&lease.identity)?)
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
             emit(
                 ctx,
                 &json!({"status":"cancelled", "identity":lease.identity, "wrapper_stop_requested":true}),
@@ -1511,10 +1548,64 @@ mod tests {
         )));
         assert!(guidance.contains("without replay"));
         assert!(guidance.contains("terminal acknowledgement"));
+        let plaintext = error.to_string();
+        assert!(plaintext.contains(&format!(
+            "rch jobs recover {}",
+            lease.identity.local_wrapper_id
+        )));
+        assert!(plaintext.contains("without replay"));
         assert!(!guidance.to_ascii_lowercase().contains("restart"));
         assert!(!guidance.to_ascii_lowercase().contains("clear"));
         assert!(!guidance.to_ascii_lowercase().contains("force"));
         assert_eq!(lease, before);
+    }
+
+    #[test]
+    fn cancellation_responses_require_successful_http_and_valid_json() {
+        for lease in [queued_lease(), admitted_lease()] {
+            let before = lease.clone();
+            let expected = if lease.identity.remote_build_id.is_some() {
+                json!({"status": "cancelled", "build_id": 42, "worker_id": "worker-a"})
+            } else {
+                json!({
+                    "status": "cancelled_before_start",
+                    "local_wrapper_id": lease.identity.local_wrapper_id,
+                    "exit_code": 130, "build_id": null,
+                })
+            };
+            let body = expected.to_string();
+            for header in ["HTTP/1.1 200 OK\r\n\r\n", "HTTP/1.0 200 OK\n\n"] {
+                assert_eq!(
+                    parse_cancellation_response(&lease, &format!("{header}{body}")).unwrap(),
+                    expected
+                );
+            }
+            for response in [
+                format!("HTTP/1.1 500 Internal Server Error\r\n\r\n{body}"),
+                format!("HTTP/1.1 401 Unauthorized\n\n{body}"),
+                format!("HTTP/9.9 200 OK\r\n\r\n{body}"),
+                body.clone(),
+                "HTTP/1.1 200 OK\r\n\r\n{invalid-json".to_string(),
+                "HTTP/1.1 200 OK".to_string(),
+                "HTTP/1.1 500 Failure\r\n\r\n\u{1b}[31m".to_string(),
+            ] {
+                let error = parse_cancellation_response(&lease, &response).unwrap_err();
+                let api = crate::top_level_api_error(&error);
+                assert_eq!(api.code, "RCH-E323");
+                assert!(
+                    api.details
+                        .as_deref()
+                        .unwrap()
+                        .contains(&format!("{response:?}"))
+                );
+                assert!(error.to_string().contains(&format!(
+                    "rch jobs recover {}",
+                    lease.identity.local_wrapper_id
+                )));
+                assert!(!error.to_string().contains('\u{1b}'));
+                assert_eq!(lease, before);
+            }
+        }
     }
 
     #[test]
