@@ -148,6 +148,31 @@ fn validate_admitted_cancellation(
     lease: &DurableJobLease,
     reply: &Value,
 ) -> Result<AdmittedCancellation> {
+    validate_admitted_cancellation_receipt(lease, reply).map_err(|error| {
+        // An unconfirmed receipt leaves this exact job's custody unresolved.
+        // Generic internal-error advice to restart or clear locks can erase it.
+        let mut api = rch_common::ApiError::from_code(rch_common::ErrorCode::CancelCleanupFailed)
+            .with_details(format!("{error:#}"));
+        api.message = "Cancellation outcome is unconfirmed".to_string();
+        api.remediation = vec![
+            format!(
+                "Observe the original job with `rch jobs attach {}`; its outcome is still uncertain",
+                lease.identity.local_wrapper_id
+            ),
+            format!(
+                "After the original wrapper stops, run `rch jobs recover {}` to reconcile the same job without replay",
+                lease.identity.local_wrapper_id
+            ),
+            "Keep its journal and reservations until terminal acknowledgement".to_string(),
+        ];
+        anyhow::Error::new(api)
+    })
+}
+
+fn validate_admitted_cancellation_receipt(
+    lease: &DurableJobLease,
+    reply: &Value,
+) -> Result<AdmittedCancellation> {
     if reply["status"] == "completed" {
         return validate_completion(lease, reply).map(AdmittedCancellation::AlreadyCompleted);
     }
@@ -1459,6 +1484,71 @@ mod tests {
                 AdmittedCancellation::AlreadyCompleted(code)
             );
         }
+    }
+
+    #[test]
+    fn unconfirmed_cancellation_retains_custody_and_same_job_recovery_guidance() {
+        let mut lease = admitted_lease();
+        lease.recovery = Some(json!({"retired": false, "sources_released": false}));
+        let before = lease.clone();
+        let reply = json!({
+            "status": "failed", "build_id": 42, "worker_id": "worker-a",
+            "message": "Cancellation unconfirmed; active build and reservations retained for retry",
+            "slots_released": 0,
+        });
+        let error = validate_admitted_cancellation(&lease, &reply).unwrap_err();
+        let api = crate::top_level_api_error(&error);
+        assert_eq!(api.code, "RCH-E323");
+        assert_eq!(api.message, "Cancellation outcome is unconfirmed");
+        let details = api.details.as_deref().unwrap();
+        assert!(details.contains("cancellation was not acknowledged"));
+        assert!(details.contains("reservations retained for retry"));
+        assert!(details.contains("worker-a"));
+        let guidance = api.remediation.join("\n");
+        assert!(guidance.contains(&format!(
+            "rch jobs recover {}",
+            lease.identity.local_wrapper_id
+        )));
+        assert!(guidance.contains("without replay"));
+        assert!(guidance.contains("terminal acknowledgement"));
+        assert!(!guidance.to_ascii_lowercase().contains("restart"));
+        assert!(!guidance.to_ascii_lowercase().contains("clear"));
+        assert!(!guidance.to_ascii_lowercase().contains("force"));
+        assert_eq!(lease, before);
+    }
+
+    #[test]
+    fn unconfirmed_cancellation_guidance_uses_own_identity_and_keeps_valid_twins() {
+        let lease = admitted_lease();
+        let valid = json!({
+            "status": "cancelled", "build_id": 42, "worker_id": "worker-a",
+            "local_wrapper_id": lease.identity.local_wrapper_id,
+        });
+        assert_eq!(
+            validate_admitted_cancellation(&lease, &valid).unwrap(),
+            AdmittedCancellation::StopWrapper
+        );
+        for (field, value) in [
+            ("build_id", json!(43)),
+            ("worker_id", json!("foreign-worker")),
+            ("local_wrapper_id", json!("foreign-wrapper")),
+        ] {
+            let mut reply = valid.clone();
+            reply[field] = value;
+            let error = validate_admitted_cancellation(&lease, &reply).unwrap_err();
+            let api = crate::top_level_api_error(&error);
+            assert_eq!(api.code, "RCH-E323");
+            let guidance = api.remediation.join("\n");
+            assert!(guidance.contains(&format!(
+                "rch jobs recover {}",
+                lease.identity.local_wrapper_id
+            )));
+            assert!(!guidance.contains("foreign-"));
+        }
+        assert_eq!(
+            validate_admitted_cancellation(&lease, &completion(&lease, 0)).unwrap(),
+            AdmittedCancellation::AlreadyCompleted(0)
+        );
     }
 
     #[test]
