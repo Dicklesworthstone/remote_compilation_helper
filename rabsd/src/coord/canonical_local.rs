@@ -1646,6 +1646,7 @@ mod tests {
                 config: TargetCacheConfig {
                     runtime_epoch: "host-1".into(),
                     max_bytes: 1024 * 1024,
+                    max_families: 8,
                 },
                 wrapper: [5; 32],
                 driver: "driver-1".into(),

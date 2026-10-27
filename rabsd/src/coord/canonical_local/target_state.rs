@@ -2,9 +2,10 @@
 //!
 //! The caller holds StateOwner through every operation and exposes only fresh
 //! workspace/target copies to Cargo. This cache never skips Cargo or authorizes
-//! action-result publication. One committed seed and one pending replacement
-//! may coexist: the temporary disk bound is twice max_bytes, plus bounded
-//! metadata. Failed captures preserve the previous committed seed.
+//! action-result publication. Compatibility families retain independent seeds
+//! under an aggregate snapshot-byte and count budget. One pending replacement may
+//! coexist: the temporary disk bound is twice max_bytes, plus bounded metadata.
+//! Failed captures preserve the committed families.
 
 use super::{create_private, private_directory};
 use crate::edge::live_facts::read_stable;
@@ -20,7 +21,7 @@ use rustix::fs::{CWD, Dir, Mode, OFlags, ResolveFlags, openat2};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,9 @@ use std::time::SystemTime;
 const VERSION: &str = "canonical-private-target-v1";
 const DIGEST_DOMAIN: &[u8] = b"rabs.canonical-private-target.metadata.v1\0";
 const METADATA: &str = "metadata.json";
+const FAMILIES_ROOT: &str = "private-target-v2";
+const LEGACY_ROOT: &str = "private-target-v1";
+const MAX_FAMILIES: usize = 32;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -46,6 +50,10 @@ fn default_max_bytes() -> u64 {
     1024 * 1024 * 1024
 }
 
+fn default_max_families() -> usize {
+    8
+}
+
 /// The epoch identifies host runtime inputs outside the captured Rust toolchain.
 /// The caller also binds it into the target compatibility key.
 #[derive(Debug, Deserialize)]
@@ -54,6 +62,8 @@ pub(super) struct TargetCacheConfig {
     pub runtime_epoch: String,
     #[serde(default = "default_max_bytes")]
     pub max_bytes: u64,
+    #[serde(default = "default_max_families")]
+    pub max_families: usize,
 }
 
 impl TargetCacheConfig {
@@ -70,6 +80,10 @@ impl TargetCacheConfig {
         require(
             self.max_bytes > 0 && self.max_bytes <= MAX_PRIVATE_TREE_BYTES,
             "target cache max_bytes must be between 1 and 8589934592",
+        )?;
+        require(
+            (1..=MAX_FAMILIES).contains(&self.max_families),
+            "target cache max_families must be between 1 and 32",
         )
     }
 }
@@ -270,57 +284,29 @@ fn validate_directory_only_tree(root: &File) -> io::Result<()> {
     visit(root, 0, &mut count)
 }
 
-/// One private owner under the caller's exclusive canonical StateOwner lock.
-pub(super) struct TargetState {
+/// One publication transaction, retained below a checked parent directory.
+struct TargetFamily {
     root: PathBuf,
     owner: File,
-    key: [u8; 32],
-    max_bytes: u64,
-    workspace: PathBuf,
-    manifest: SourceManifest,
-    source_times: SourceTimestamps,
+    parent: File,
 }
 
-impl TargetState {
-    pub fn open(
-        state_parent: &Path,
-        config: &TargetCacheConfig,
-        key: [u8; 32],
-        workspace: &Path,
-        manifest: &SourceManifest,
-    ) -> io::Result<Self> {
-        config.validate()?;
-        private_directory(state_parent)?;
-        let root = state_parent.join("private-target-v1");
-        match create_private(&root) {
-            Ok(()) => File::open(state_parent)?.sync_all()?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        let owner = open_child_directory(&File::open(state_parent)?, child_name(&root)?)?;
-        require(
-            !workspace.starts_with(&root) && !root.starts_with(workspace),
-            "private target cache and runtime workspace must be disjoint",
-        )?;
-        let source_times = SourceTimestamps::capture(workspace, manifest, &|| false)?;
-        let state = Self {
+impl TargetFamily {
+    fn open(root: PathBuf, parent: &File) -> io::Result<Self> {
+        Ok(Self {
+            owner: open_child_directory(parent, child_name(&root)?)?,
+            parent: parent.try_clone()?,
             root,
-            owner,
-            key,
-            max_bytes: config.max_bytes,
-            workspace: workspace.to_path_buf(),
-            manifest: manifest.clone(),
-            source_times,
-        };
-        state.recover()?;
-        Ok(state)
+        })
     }
 
     fn verify_owner(&self) -> io::Result<()> {
         let held = self.owner.metadata()?;
+        let child = open_child_directory(&self.parent, child_name(&self.root)?)?.metadata()?;
         let current = open_directory(&self.root)?.metadata()?;
         require(
-            (held.dev(), held.ino()) == (current.dev(), current.ino()),
+            (held.dev(), held.ino()) == (child.dev(), child.ino())
+                && (held.dev(), held.ino()) == (current.dev(), current.ino()),
             "private target cache owner was replaced",
         )
     }
@@ -425,12 +411,273 @@ impl TargetState {
         envelope.payload.target.validate()?;
         envelope.payload.source_times.validate()?;
         envelope.payload.source_manifest()?;
-        require(
-            envelope.payload.target.total_bytes() <= self.max_bytes,
-            "private target seed exceeds configured byte limit",
-        )?;
         self.verify_owner()?;
         Ok(Some(envelope.payload))
+    }
+
+    fn promote(&self) -> io::Result<()> {
+        self.verify_owner()?;
+        // Recency is only retention policy. Never alter a target or source
+        // timestamp to manufacture Cargo freshness.
+        self.owner
+            .set_times(FileTimes::new().set_modified(SystemTime::now()))?;
+        self.owner.sync_all()?;
+        self.verify_owner()
+    }
+
+    fn remove_empty(&self) -> io::Result<()> {
+        self.verify_owner()?;
+        require(
+            fs::read_dir(&self.root)?.next().is_none(),
+            "nonempty private target family cannot be retired",
+        )?;
+        self.verify_owner()?;
+        fs::remove_dir(&self.root)?;
+        self.parent.sync_all()
+    }
+}
+
+fn family_name(key: &[u8; 32]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn family_key(name: &OsStr) -> io::Result<[u8; 32]> {
+    let name = name
+        .to_str()
+        .ok_or_else(|| invalid("private target family name is not UTF-8"))?;
+    require(
+        name.len() == 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "private target family name must be a lowercase SHA-256 digest",
+    )?;
+    let mut key = [0; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte =
+            u8::from_str_radix(&name[index * 2..index * 2 + 2], 16).map_err(io::Error::other)?;
+    }
+    Ok(key)
+}
+
+struct RetainedFamily {
+    family: TargetFamily,
+    key: [u8; 32],
+    bytes: u64,
+    used: SystemTime,
+}
+
+/// No global mutable index is needed: the exclusive StateOwner serializes
+/// writers, and each bounded directory is its own recoverable transaction.
+struct TargetFamilies {
+    root: TargetFamily,
+    max_bytes: u64,
+    max_families: usize,
+}
+
+impl TargetFamilies {
+    fn open(state_parent: &Path, config: &TargetCacheConfig) -> io::Result<Self> {
+        private_directory(state_parent)?;
+        let parent = open_directory(state_parent)?;
+        let path = state_parent.join(FAMILIES_ROOT);
+        match create_private(&path) {
+            Ok(()) => parent.sync_all()?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        Ok(Self {
+            root: TargetFamily::open(path, &parent)?,
+            max_bytes: config.max_bytes,
+            max_families: config.max_families,
+        })
+    }
+
+    fn family(&self, key: &[u8; 32]) -> io::Result<TargetFamily> {
+        self.root.verify_owner()?;
+        let path = self.root.root.join(family_name(key));
+        match create_private(&path) {
+            Ok(()) => self.root.owner.sync_all()?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        TargetFamily::open(path, &self.root.owner)
+    }
+
+    /// Validate names and the hard entry count before traversing any family.
+    /// One extra directory permits a new family's in-flight candidate while
+    /// all committed seeds remain available until publication succeeds.
+    fn retained(&self) -> io::Result<Vec<RetainedFamily>> {
+        self.root.verify_owner()?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.root.root)? {
+            let entry = entry?;
+            let key = family_key(&entry.file_name())?;
+            require(
+                names.len() < MAX_FAMILIES + 1,
+                "private target family count exceeds its recovery bound",
+            )?;
+            names.push((entry.path(), key));
+        }
+        let mut retained = Vec::new();
+        for (path, key) in names {
+            let family = TargetFamily::open(path, &self.root.owner)?;
+            family.recover()?;
+            let seed = match family.load_seed() {
+                Ok(Some(seed)) if seed.key == key => seed,
+                Ok(None) => {
+                    family.remove_empty()?;
+                    continue;
+                }
+                // Metadata is not serving authority unless it matches this
+                // exact family. Retire through the same bounded, no-follow
+                // cleanup used by single-family recovery.
+                Ok(Some(_)) | Err(_) => {
+                    family.remove_generation("seed")?;
+                    family.remove_empty()?;
+                    continue;
+                }
+            };
+            let used = family.owner.metadata()?.modified()?;
+            retained.push(RetainedFamily {
+                bytes: seed.target.total_bytes(),
+                family,
+                key,
+                used,
+            });
+        }
+        self.root.verify_owner()?;
+        Ok(retained)
+    }
+
+    fn prune(&self, protect: Option<[u8; 32]>) -> io::Result<()> {
+        let mut retained = self.retained()?;
+        let mut bytes = retained.iter().try_fold(0u64, |total, family| {
+            total
+                .checked_add(family.bytes)
+                .ok_or_else(|| invalid("private target retained bytes overflow"))
+        })?;
+        let mut count = retained.len();
+        retained.sort_by_key(|entry| {
+            // A selected seed larger than a newly lowered budget cannot be
+            // protected. A freshly captured seed always fits by construction.
+            (
+                protect == Some(entry.key) && entry.bytes <= self.max_bytes,
+                entry.used,
+                entry.key,
+            )
+        });
+        for entry in retained {
+            if count <= self.max_families && bytes <= self.max_bytes {
+                break;
+            }
+            entry.family.remove_generation("seed")?;
+            entry.family.remove_empty()?;
+            bytes -= entry.bytes;
+            count -= 1;
+        }
+        self.root.verify_owner()
+    }
+
+    /// Move the recovered single-family format without copying target bytes.
+    /// A crash leaves the directory entirely at the old name or the new one;
+    /// existing v2 state wins if an older binary later recreated the v1 name.
+    fn migrate(&self, state_parent: &Path) -> io::Result<bool> {
+        self.root.verify_owner()?;
+        let path = state_parent.join(LEGACY_ROOT);
+        let parent = &self.root.parent;
+        if !present_directory(&path, parent)? {
+            return Ok(false);
+        }
+        let legacy = TargetFamily::open(path, parent)?;
+        legacy.recover()?;
+        let seed = match legacy.load_seed() {
+            Ok(Some(seed)) => seed,
+            Ok(None) => {
+                legacy.remove_empty()?;
+                return Ok(false);
+            }
+            Err(_) => {
+                legacy.remove_generation("seed")?;
+                legacy.remove_empty()?;
+                return Ok(false);
+            }
+        };
+        let name = family_name(&seed.key);
+        if present_directory(&self.root.root.join(&name), &self.root.owner)? {
+            legacy.remove_generation("seed")?;
+            legacy.remove_empty()?;
+            return Ok(false);
+        }
+        legacy.verify_owner()?;
+        self.root.verify_owner()?;
+        rustix::fs::renameat_with(
+            parent,
+            OsStr::new(LEGACY_ROOT),
+            &self.root.owner,
+            OsStr::new(&name),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
+        parent.sync_all()?;
+        self.root.owner.sync_all()?;
+        self.root.verify_owner()?;
+        let moved = TargetFamily::open(self.root.root.join(name), &self.root.owner)?;
+        let before = legacy.owner.metadata()?;
+        let after = moved.owner.metadata()?;
+        require(
+            (before.dev(), before.ino()) == (after.dev(), after.ino()),
+            "private target family changed during migration",
+        )?;
+        Ok(true)
+    }
+}
+
+/// One selected family under the caller's exclusive canonical StateOwner lock.
+pub(super) struct TargetState {
+    families: TargetFamilies,
+    family: TargetFamily,
+    key: [u8; 32],
+    max_bytes: u64,
+    workspace: PathBuf,
+    manifest: SourceManifest,
+    source_times: SourceTimestamps,
+}
+
+impl TargetState {
+    pub fn open(
+        state_parent: &Path,
+        config: &TargetCacheConfig,
+        key: [u8; 32],
+        workspace: &Path,
+        manifest: &SourceManifest,
+    ) -> io::Result<Self> {
+        config.validate()?;
+        require(
+            !workspace.starts_with(state_parent) && !state_parent.starts_with(workspace),
+            "private target cache and runtime workspace must be disjoint",
+        )?;
+        let source_times = SourceTimestamps::capture(workspace, manifest, &|| false)?;
+        let families = TargetFamilies::open(state_parent, config)?;
+        // Restore aggregate bounds before migration can introduce one family,
+        // then enforce the same limits before creating this operation's slot.
+        families.prune(Some(key))?;
+        if families.migrate(state_parent)? {
+            families.prune(Some(key))?;
+        }
+        let family = families.family(&key)?;
+        Ok(Self {
+            families,
+            family,
+            key,
+            max_bytes: config.max_bytes,
+            workspace: workspace.to_path_buf(),
+            manifest: manifest.clone(),
+            source_times,
+        })
+    }
+
+    fn verify_owner(&self) -> io::Result<()> {
+        self.families.root.verify_owner()?;
+        self.family.verify_owner()
     }
 
     /// On error the caller must discard the candidate target. A healthy seed
@@ -452,20 +699,26 @@ impl TargetState {
     }
 
     fn restore_inner(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
-        let seed = match self.load_seed() {
+        self.verify_owner()?;
+        let seed = match self.family.load_seed().and_then(|seed| {
+            if let Some(seed) = &seed {
+                require(
+                    seed.key == self.key && seed.target.total_bytes() <= self.max_bytes,
+                    "private target seed family or configured byte limit differs",
+                )?;
+            }
+            Ok(seed)
+        }) {
             Ok(Some(seed)) => seed,
             Ok(None) => return Ok(false),
             Err(error) => {
                 // Unreadable metadata cannot establish a bounded compatible
                 // generation. Retire it through the existing checked cleanup;
                 // later destination/source errors must not retire a valid one.
-                self.remove_generation("seed")?;
+                self.family.remove_generation("seed")?;
                 return Err(error);
             }
         };
-        if seed.key != self.key {
-            return Ok(false);
-        }
         require(
             !fresh_empty_target.starts_with(&self.workspace)
                 && !self.workspace.starts_with(fresh_empty_target),
@@ -485,7 +738,7 @@ impl TargetState {
             SystemTime::now(),
         )?;
         seed.target.restore_into_with_cloner(
-            &self.root.join("seed/target"),
+            &self.family.root.join("seed/target"),
             fresh_empty_target,
             &|| false,
             try_verified_reflink,
@@ -493,10 +746,13 @@ impl TargetState {
         wanted.restore_exact(&self.workspace, &self.manifest, &|| false)?;
         self.verify_owner()?;
         self.source_times = wanted;
+        self.family.promote()?;
         Ok(true)
     }
 
-    /// Called only after successful Cargo exit and full process/session drain.
+    /// Called only after the driver accepts Cargo's completed exit and drains
+    /// all processes/sessions. Normally failed tests may retain compilation
+    /// state; their outcome is never a cached test result.
     /// Snapshotting and cloning finish before the old seed is moved aside.
     pub fn capture(&self, target: &Path) -> io::Result<()> {
         self.verify_owner()?;
@@ -506,11 +762,11 @@ impl TargetState {
             "runtime workspace changed during Cargo execution",
         )?;
         let snapshot = PrivateTreeSnapshot::capture(target, self.max_bytes, &|| false)?;
-        let pending = self.root.join("pending");
-        let previous = self.root.join("previous");
+        let pending = self.family.root.join("pending");
+        let previous = self.family.root.join("previous");
         require(
-            !present_directory(&pending, &self.owner)?
-                && !present_directory(&previous, &self.owner)?,
+            !present_directory(&pending, &self.family.owner)?
+                && !present_directory(&previous, &self.family.owner)?,
             "unfinished private target publication requires recovery",
         )?;
         create_private(&pending)?;
@@ -550,13 +806,17 @@ impl TargetState {
         metadata.sync_all()?;
         File::open(&pending)?.sync_all()?;
         self.verify_owner()?;
-        let _pending = generation_members(&pending, &self.owner, true)?;
-        let seed = self.root.join("seed");
-        if present_directory(&seed, &self.owner)? {
+        let _pending = generation_members(&pending, &self.family.owner, true)?;
+        let seed = self.family.root.join("seed");
+        if present_directory(&seed, &self.family.owner)? {
             publish_new_directory(&seed, &previous)?;
         }
         publish_new_directory(&pending, &seed)?;
-        self.remove_generation("previous")?;
+        self.family.remove_generation("previous")?;
+        self.family.promote()?;
+        // Only a complete, durable candidate can displace another family.
+        // Startup repeats this bounded pruning after a crash at this frontier.
+        self.families.prune(Some(self.key))?;
         self.verify_owner()
     }
 }
@@ -579,6 +839,7 @@ mod tests {
         TargetCacheConfig {
             runtime_epoch: "runtime-1".into(),
             max_bytes: 1024 * 1024,
+            max_families: default_max_families(),
         }
     }
 
@@ -602,11 +863,50 @@ mod tests {
         fs::write(root.join("artifact"), value).unwrap();
     }
 
+    fn family_path(state: &Path, key: [u8; 32]) -> PathBuf {
+        state.join(FAMILIES_ROOT).join(family_name(&key))
+    }
+
+    fn capture_family(state: &Path, settings: &TargetCacheConfig, key: [u8; 32], value: &[u8]) {
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let target = private();
+        completed_target(target.path(), value);
+        TargetState::open(state, settings, key, workspace.path(), &manifest)
+            .unwrap()
+            .capture(target.path())
+            .unwrap();
+    }
+
+    fn restore_family(
+        state: &Path,
+        settings: &TargetCacheConfig,
+        key: [u8; 32],
+    ) -> Option<Vec<u8>> {
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let mut cache =
+            TargetState::open(state, settings, key, workspace.path(), &manifest).unwrap();
+        let target = private();
+        cache
+            .restore(target.path())
+            .unwrap()
+            .then(|| fs::read(target.path().join("artifact")).unwrap())
+    }
+
+    fn last_used(state: &Path, key: [u8; 32], seconds: u64) {
+        File::open(family_path(state, key))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
+            .unwrap();
+    }
+
     #[test]
     fn config_requires_explicit_bounded_runtime_epoch_and_snapshot_budget() {
         let defaults: TargetCacheConfig =
             serde_json::from_str(r#"{"runtime_epoch":"host.tools-1"}"#).unwrap();
         assert_eq!(defaults.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(defaults.max_families, 8);
         defaults.validate().unwrap();
         let long_epoch = "a".repeat(257);
         for value in ["", "bad epoch", "../host", "é", long_epoch.as_str()] {
@@ -629,11 +929,299 @@ mod tests {
                 .is_err()
             );
         }
+        for max_families in [0, MAX_FAMILIES + 1] {
+            assert!(
+                TargetCacheConfig {
+                    max_families,
+                    ..config()
+                }
+                .validate()
+                .is_err()
+            );
+        }
         assert!(serde_json::from_str::<TargetCacheConfig>(r#"{"max_bytes":100}"#).is_err());
         assert!(
             serde_json::from_str::<TargetCacheConfig>(r#"{"runtime_epoch":"x","unexpected":1}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn alternating_families_survive_restarts_and_evict_the_least_recent_use() {
+        let state = private();
+        let settings = TargetCacheConfig {
+            max_families: 2,
+            ..config()
+        };
+        capture_family(state.path(), &settings, [11; 32], b"first workspace");
+        capture_family(state.path(), &settings, [12; 32], b"second toolchain");
+        last_used(state.path(), [11; 32], 100);
+        last_used(state.path(), [12; 32], 200);
+
+        // A restore, even without another capture, persists promotion across
+        // the next independently opened owner. Merely selecting a family does
+        // not manufacture Cargo freshness or make the target a shared inode.
+        assert_eq!(
+            restore_family(state.path(), &settings, [11; 32]).as_deref(),
+            Some(b"first workspace".as_slice())
+        );
+        capture_family(state.path(), &settings, [13; 32], b"third profile");
+        assert!(!family_path(state.path(), [12; 32]).exists());
+        assert_eq!(
+            restore_family(state.path(), &settings, [11; 32]).as_deref(),
+            Some(b"first workspace".as_slice())
+        );
+        assert_eq!(
+            restore_family(state.path(), &settings, [13; 32]).as_deref(),
+            Some(b"third profile".as_slice())
+        );
+        assert_eq!(
+            fs::read_dir(state.path().join(FAMILIES_ROOT))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn byte_budget_is_aggregate_and_failed_candidates_do_not_evict_families() {
+        let state = private();
+        let settings = TargetCacheConfig {
+            max_bytes: 10,
+            ..config()
+        };
+        capture_family(state.path(), &settings, [14; 32], b"aaaaaa");
+        capture_family(state.path(), &settings, [15; 32], b"bbbb");
+        last_used(state.path(), [14; 32], 200);
+        last_used(state.path(), [15; 32], 100);
+
+        let workspace = private();
+        let manifest = source(workspace.path(), b"source");
+        let cache = TargetState::open(
+            state.path(),
+            &settings,
+            [16; 32],
+            workspace.path(),
+            &manifest,
+        )
+        .unwrap();
+        let oversized = private();
+        completed_target(oversized.path(), b"too large for the entire cache");
+        assert!(cache.capture(oversized.path()).is_err());
+        for key in [[14; 32], [15; 32]] {
+            assert!(family_path(state.path(), key).join("seed").exists());
+        }
+        drop(cache);
+
+        // This successful four-byte candidate is published before the older
+        // four-byte family is evicted. The six-byte seed remains usable.
+        capture_family(state.path(), &settings, [16; 32], b"cccc");
+        assert!(!family_path(state.path(), [15; 32]).exists());
+        assert_eq!(
+            restore_family(state.path(), &settings, [14; 32]).as_deref(),
+            Some(b"aaaaaa".as_slice())
+        );
+        assert_eq!(
+            restore_family(state.path(), &settings, [16; 32]).as_deref(),
+            Some(b"cccc".as_slice())
+        );
+        let families = TargetFamilies::open(state.path(), &settings)
+            .unwrap()
+            .retained()
+            .unwrap();
+        assert_eq!(families.iter().map(|entry| entry.bytes).sum::<u64>(), 10);
+    }
+
+    #[test]
+    fn empty_and_interrupted_new_families_preserve_committed_capacity() {
+        for partial in [false, true] {
+            let state = private();
+            let settings = TargetCacheConfig {
+                max_families: 1,
+                ..config()
+            };
+            capture_family(state.path(), &settings, [17; 32], b"committed");
+            let workspace = private();
+            let manifest = source(workspace.path(), b"source");
+            let candidate = TargetState::open(
+                state.path(),
+                &settings,
+                [18; 32],
+                workspace.path(),
+                &manifest,
+            )
+            .unwrap();
+            assert!(family_path(state.path(), [17; 32]).join("seed").exists());
+            if partial {
+                let pending = candidate.family.root.join("pending");
+                create_private(&pending).unwrap();
+                create_private(&pending.join("target")).unwrap();
+                completed_target(&pending.join("target"), b"not committed");
+            }
+            drop(candidate);
+            assert_eq!(
+                restore_family(state.path(), &settings, [17; 32]).as_deref(),
+                Some(b"committed".as_slice())
+            );
+            assert!(!family_path(state.path(), [18; 32]).exists());
+        }
+    }
+
+    #[test]
+    fn startup_enforces_lowered_limits_and_postpublication_crash_budget() {
+        let state = private();
+        let roomy = TargetCacheConfig {
+            max_families: 3,
+            ..config()
+        };
+        for byte in 19..=21 {
+            capture_family(state.path(), &roomy, [byte; 32], &[byte; 4]);
+            last_used(state.path(), [byte; 32], u64::from(byte));
+        }
+        // Three committed families are also the crash frontier when a
+        // two-family cache publishes a third before its pruning completes.
+        let bounded = TargetCacheConfig {
+            max_families: 2,
+            max_bytes: 8,
+            ..config()
+        };
+        assert_eq!(
+            restore_family(state.path(), &bounded, [19; 32]),
+            Some(vec![19; 4])
+        );
+        assert!(!family_path(state.path(), [20; 32]).exists());
+        assert!(family_path(state.path(), [21; 32]).join("seed").exists());
+
+        let too_small = TargetCacheConfig {
+            max_bytes: 3,
+            ..bounded
+        };
+        assert!(restore_family(state.path(), &too_small, [19; 32]).is_none());
+        assert!(!family_path(state.path(), [19; 32]).join("seed").exists());
+        assert!(!family_path(state.path(), [21; 32]).exists());
+    }
+
+    #[test]
+    fn legacy_seed_migrates_without_copying_and_recovers_interrupted_rotation() {
+        for rotated in [false, true] {
+            let state = private();
+            capture_family(state.path(), &config(), [22; 32], b"legacy target");
+            let current = family_path(state.path(), [22; 32]);
+            let retained_inode = fs::metadata(current.join("seed/target/artifact"))
+                .unwrap()
+                .ino();
+            let legacy = state.path().join(LEGACY_ROOT);
+            fs::rename(&current, &legacy).unwrap();
+            if rotated {
+                publish_new_directory(&legacy.join("seed"), &legacy.join("previous")).unwrap();
+                create_private(&legacy.join("pending")).unwrap();
+                create_private(&legacy.join("pending/target")).unwrap();
+                completed_target(&legacy.join("pending/target"), b"unfinished replacement");
+            }
+            assert_eq!(
+                restore_family(state.path(), &config(), [22; 32]).as_deref(),
+                Some(b"legacy target".as_slice())
+            );
+            assert!(!legacy.exists());
+            assert_eq!(
+                fs::metadata(current.join("seed/target/artifact"))
+                    .unwrap()
+                    .ino(),
+                retained_inode,
+                "migration must rename the retained tree, not recopy it"
+            );
+            assert!(!current.join("pending").exists());
+            assert!(!current.join("previous").exists());
+            // Reopening after the rename is the other migration crash state.
+            assert_eq!(
+                restore_family(state.path(), &config(), [22; 32]).as_deref(),
+                Some(b"legacy target".as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_migration_keeps_existing_family_and_an_unselected_family() {
+        for same_key in [false, true] {
+            let state = private();
+            let legacy_state = private();
+            capture_family(state.path(), &config(), [23; 32], b"newer family");
+            let legacy_key = if same_key { [23; 32] } else { [24; 32] };
+            capture_family(legacy_state.path(), &config(), legacy_key, b"older family");
+            fs::rename(
+                family_path(legacy_state.path(), legacy_key),
+                state.path().join(LEGACY_ROOT),
+            )
+            .unwrap();
+            assert_eq!(
+                restore_family(state.path(), &config(), [23; 32]).as_deref(),
+                Some(b"newer family".as_slice())
+            );
+            assert!(!state.path().join(LEGACY_ROOT).exists());
+            if !same_key {
+                assert_eq!(
+                    restore_family(state.path(), &config(), [24; 32]).as_deref(),
+                    Some(b"older family".as_slice())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_misnamed_family_cannot_supply_another_compatibility_key() {
+        let state = private();
+        capture_family(state.path(), &config(), [25; 32], b"wrong key");
+        capture_family(state.path(), &config(), [26; 32], b"unrelated valid family");
+        fs::rename(
+            family_path(state.path(), [25; 32]),
+            family_path(state.path(), [27; 32]),
+        )
+        .unwrap();
+        assert!(restore_family(state.path(), &config(), [27; 32]).is_none());
+        assert_eq!(
+            restore_family(state.path(), &config(), [26; 32]).as_deref(),
+            Some(b"unrelated valid family".as_slice())
+        );
+        assert!(!family_path(state.path(), [27; 32]).exists());
+    }
+
+    #[test]
+    fn family_discovery_refuses_unknown_names_symlinks_and_excessive_membership() {
+        for bad_entry in 0..3 {
+            let state = private();
+            let workspace = private();
+            let manifest = source(workspace.path(), b"source");
+            let outside = private();
+            fs::write(outside.path().join("must-remain"), b"unrelated").unwrap();
+            let root = state.path().join(FAMILIES_ROOT);
+            create_private(&root).unwrap();
+            match bad_entry {
+                0 => fs::write(root.join("unrelated"), b"do not remove").unwrap(),
+                1 => symlink(outside.path(), root.join(family_name(&[28; 32]))).unwrap(),
+                _ => {
+                    for index in 0..MAX_FAMILIES + 2 {
+                        let byte = u8::try_from(index).unwrap();
+                        create_private(&root.join(family_name(&[byte; 32]))).unwrap();
+                    }
+                }
+            }
+            let before = fs::read_dir(&root).unwrap().count();
+            assert!(
+                TargetState::open(
+                    state.path(),
+                    &config(),
+                    [29; 32],
+                    workspace.path(),
+                    &manifest
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+            assert_eq!(
+                fs::read(outside.path().join("must-remain")).unwrap(),
+                b"unrelated"
+            );
+        }
     }
 
     #[test]
@@ -705,7 +1293,7 @@ mod tests {
             fs::read(target.path().join("artifact")).unwrap(),
             b"completed Cargo target"
         );
-        let seed = state.path().join("private-target-v1/seed/target/artifact");
+        let seed = family_path(state.path(), [1; 32]).join("seed/target/artifact");
         assert_ne!(
             fs::metadata(&seed).unwrap().ino(),
             fs::metadata(target.path().join("artifact")).unwrap().ino()
@@ -713,7 +1301,7 @@ mod tests {
         fs::write(target.path().join("artifact"), b"later private output").unwrap();
         assert_eq!(fs::read(seed).unwrap(), b"completed Cargo target");
         next.capture(target.path()).unwrap();
-        assert!(!state.path().join("private-target-v1/previous").exists());
+        assert!(!family_path(state.path(), [1; 32]).join("previous").exists());
     }
 
     #[test]
@@ -776,8 +1364,16 @@ mod tests {
 
     #[test]
     fn corrupt_seed_is_replaced_by_the_same_successful_cold_operation() {
-        for corruption in 0..3 {
+        for (corruption, reopened) in [
+            (0, false),
+            (1, false),
+            (2, false),
+            (0, true),
+            (1, true),
+            (2, true),
+        ] {
             let state = private();
+            capture_family(state.path(), &config(), [30; 32], b"other family");
             let workspace = private();
             let manifest = source(workspace.path(), b"source");
             let target = private();
@@ -791,7 +1387,7 @@ mod tests {
             )
             .unwrap();
             cache.capture(target.path()).unwrap();
-            let seed = state.path().join("private-target-v1/seed");
+            let seed = family_path(state.path(), [4; 32]).join("seed");
             if corruption == 1 {
                 let mut envelope: SeedEnvelope =
                     serde_json::from_slice(&fs::read(seed.join(METADATA)).unwrap()).unwrap();
@@ -809,8 +1405,26 @@ mod tests {
             } else {
                 fs::write(seed.join("target/artifact"), b"corrupt artifact").unwrap();
             }
+            if reopened {
+                drop(cache);
+                cache = TargetState::open(
+                    state.path(),
+                    &config(),
+                    [4; 32],
+                    workspace.path(),
+                    &manifest,
+                )
+                .unwrap();
+            }
             let candidate = private();
-            assert!(cache.restore(candidate.path()).is_err());
+            let restored = cache.restore(candidate.path());
+            if reopened && corruption != 0 {
+                // Startup reads every bounded descriptor for accounting and
+                // retires malformed metadata before selecting the cold slot.
+                assert!(!restored.unwrap());
+            } else {
+                assert!(restored.is_err());
+            }
             // Corrupt metadata is retired immediately. A verified descriptor
             // with unusable target bytes is replaced only after Cargo has
             // produced a successful independent cold target. Neither case
@@ -832,6 +1446,11 @@ mod tests {
                 fs::read(fresh.path().join("artifact")).unwrap(),
                 b"original artifact"
             );
+            drop(recovered);
+            assert_eq!(
+                restore_family(state.path(), &config(), [30; 32]).as_deref(),
+                Some(b"other family".as_slice())
+            );
         }
     }
 
@@ -852,7 +1471,7 @@ mod tests {
             )
             .unwrap();
             cache.capture(target.path()).unwrap();
-            let seed = state.path().join("private-target-v1/seed");
+            let seed = family_path(state.path(), [9; 32]).join("seed");
             let metadata = fs::read(seed.join(METADATA)).unwrap();
             let candidate_owner = private();
             let candidate = if missing_destination {
@@ -920,7 +1539,7 @@ mod tests {
         .unwrap()
         .capture(old_target.path())
         .unwrap();
-        let seed = state.path().join("private-target-v1/seed");
+        let seed = family_path(state.path(), [10; 32]).join("seed");
         let metadata = fs::read(seed.join(METADATA)).unwrap();
 
         let edited_workspace = private();
@@ -986,7 +1605,7 @@ mod tests {
             )
             .unwrap();
             cache.capture(target.path()).unwrap();
-            let root = state.path().join("private-target-v1");
+            let root = family_path(state.path(), [5; 32]);
             create_private(&root.join("pending")).unwrap();
             create_private(&root.join("pending/target")).unwrap();
             if stage == 1 {
@@ -1037,7 +1656,7 @@ mod tests {
         )
         .unwrap();
         cache.capture(target.path()).unwrap();
-        let seed = state.path().join("private-target-v1/seed/target/artifact");
+        let seed = family_path(state.path(), [6; 32]).join("seed/target/artifact");
         completed_target(target.path(), b"oversized target bytes");
         assert!(cache.capture(target.path()).is_err());
         assert_eq!(fs::read(&seed).unwrap(), b"valid");

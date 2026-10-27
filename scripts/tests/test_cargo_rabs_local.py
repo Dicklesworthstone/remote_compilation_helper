@@ -165,8 +165,10 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def test_private_target_configuration_survives_exact_native_handoff(self):
         for cache in ({"runtime_epoch": "host-image-2026.10"},
-                      {"runtime_epoch": "image_v2", "max_bytes": 1024 ** 3},
-                      {"runtime_epoch": "a" * 256, "max_bytes": 8 * 1024 ** 3}):
+                      {"runtime_epoch": "image_v2", "max_bytes": 1024 ** 3, "max_families": 8},
+                      {"runtime_epoch": "single", "max_families": 1},
+                      {"runtime_epoch": "a" * 256, "max_bytes": 8 * 1024 ** 3,
+                       "max_families": 32}):
             with self.subTest(cache=cache):
                 self.profile["target_cache"] = cache
                 self.save()
@@ -185,7 +187,12 @@ class CanonicalLocalCargo(unittest.TestCase):
                       {"runtime_epoch": "v1", "max_bytes": True},
                       {"runtime_epoch": "v1", "max_bytes": 0},
                       {"runtime_epoch": "v1", "max_bytes": 8 * 1024 ** 3 + 1},
-                      {"runtime_epoch": "v1", "max_bytes": "1024"}):
+                      {"runtime_epoch": "v1", "max_bytes": "1024"},
+                      {"runtime_epoch": "v1", "max_families": True},
+                      {"runtime_epoch": "v1", "max_families": 0},
+                      {"runtime_epoch": "v1", "max_families": 33},
+                      {"runtime_epoch": "v1", "max_families": 2.5},
+                      {"runtime_epoch": "v1", "max_families": "8"}):
             with self.subTest(cache=cache):
                 self.profile["target_cache"] = cache
                 self.save()

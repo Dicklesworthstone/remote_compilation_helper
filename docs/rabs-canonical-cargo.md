@@ -1190,7 +1190,8 @@ add this optional object to the same profile:
 ```json
 "target_cache": {
   "runtime_epoch": "builder-image-2026.10",
-  "max_bytes": 1073741824
+  "max_bytes": 1073741824,
+  "max_families": 8
 }
 ```
 
@@ -1204,11 +1205,25 @@ the host linker and system libraries. It accepts 1–256 ASCII letters, digits,
 dots, underscores and hyphens. Omit `target_cache` to retain the original cold
 target behavior, including when exercising dependency-cache sampling.
 
-The default `max_bytes` is 1 GiB; the maximum is 8 GiB per complete target
-snapshot. One committed generation is retained below the profile's state root.
-Atomic replacement may temporarily retain both the previous and replacement
-generation, plus bounded metadata. Crash recovery recognizes only the fixed
-pending/previous/committed locations; pending data never becomes a usable seed.
+The default `max_bytes` is 1 GiB; the maximum is 8 GiB of retained snapshot
+bytes across all target families. `max_families` defaults to 8 and accepts 1–32. Each family
+retains one committed generation, so switching between compilation profiles,
+toolchains, runtime epochs or source-control configurations can return to a
+previous compatible target instead of always starting cold. A verified restore
+or successful capture refreshes that family's recency. When either budget is
+exceeded, the least recently used families are removed while preserving the
+newly committed family. Setting `max_families` to 1 selects single-family
+retention.
+
+A replacement is fully captured before other healthy families are evicted to
+make room for it. Startup also enforces newly lowered retention limits, giving
+the selected family preference when its snapshot fits the new byte budget.
+Atomic publication may temporarily retain the old aggregate plus one replacement
+of at most `max_bytes`, with bounded metadata. Recovery handles each family's
+pending/previous/committed transaction separately; pending data never becomes a
+usable seed. The earlier single-family store is validated and moved into the
+new family layout without copying its target files. Unknown entries or unsafe
+filesystem aliases refuse optional cache use instead of becoming cleanup targets.
 
 Every invocation still starts Cargo and admits its actual selected unit graph.
 A usable seed is verified and copied or reflinked into a new private target;
@@ -1234,6 +1249,9 @@ consumer as fresh. Pure Rust codegen has a similar gap: LLVM assembler
 `.incbin` reads can embed data without reporting it in rustc's dep-info.
 Changing only that data must not return an old archive or executable. The more
 selective source-edit reuse above remains available to compiler-only checks.
+With multiple families retained, returning to an earlier exact source snapshot
+can recover its own target state even after an intervening source edit or
+build selected a different family.
 
 The `canonical-compilation-started` stderr record reports
 `private_target_state` as `disabled`, `cold` or `restored`. A failed optional

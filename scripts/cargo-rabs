@@ -1810,7 +1810,7 @@ def canonical_local_profile(path):
     if profile.get("target_cache") is not None:
         cache = profile["target_cache"]
         if (type(cache) is not dict or "runtime_epoch" not in cache
-                or cache.keys() - {"runtime_epoch", "max_bytes"}):
+                or cache.keys() - {"runtime_epoch", "max_bytes", "max_families"}):
             raise SetupError("invalid local canonical target_cache fields")
         epoch = cache["runtime_epoch"]
         if (type(epoch) is not str or not 1 <= len(epoch) <= 256
@@ -1820,6 +1820,9 @@ def canonical_local_profile(path):
         if ("max_bytes" in cache and (type(cache["max_bytes"]) is not int
                 or not 1 <= cache["max_bytes"] <= 8 * 1024 ** 3)):
             raise SetupError("target_cache max_bytes must be an integer from 1 to 8589934592")
+        if ("max_families" in cache and (type(cache["max_families"]) is not int
+                or not 1 <= cache["max_families"] <= 32)):
+            raise SetupError("target_cache max_families must be an integer from 1 to 32")
     if profile.get("vendor") is not None and profile.get("cargo_home_source") is not None:
         raise SetupError("local canonical profile must select either vendor or cargo_home_source")
     manifest = canonical_path(profile.get("manifest", "Cargo.toml"))

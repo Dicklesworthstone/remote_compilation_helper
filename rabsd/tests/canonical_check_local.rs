@@ -523,7 +523,19 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
         );
     }
     profile["command"] = json!("build");
-    profile["target_cache"] = json!({"runtime_epoch":"native-fixture-v1", "max_bytes":268435456});
+    profile["target_cache"] = json!({"runtime_epoch":"native-fixture-v1",
+        "max_bytes":268435456, "max_families":2});
+
+    let families = || {
+        fs::read_dir(
+            owner
+                .path()
+                .join("state/canonical-compile-v1/private-target-v2"),
+        )
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<std::collections::BTreeSet<_>>()
+    };
 
     let state = |events: &[Value], expected: &str| {
         let started = events
@@ -565,6 +577,8 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     state(&events, "cold");
     freshness(&output, false, false);
     let (first_target, first_archives) = delivered_build(owner.path(), 100, &events, 42);
+    let initial_families = families();
+    assert_eq!(initial_families.len(), 1);
 
     profile["source_root"] = json!(second);
     let (code, events, output) = run(owner.path(), 101, &profile);
@@ -604,6 +618,11 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     state(&events, "cold");
     freshness(&output, false, false);
     delivered_build(owner.path(), 103, &events, 43);
+    let original_families = families()
+        .difference(&initial_families)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(original_families.len(), 1);
 
     profile["selection"] = json!({"features":["extra"]});
     let (code, events, output) = run(owner.path(), 104, &profile);
@@ -628,24 +647,37 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
         );
     }
 
+    // Checks use a separate source-edit policy. Returning to the exact build
+    // family must recover the completed executable and every Cargo fingerprint.
+    profile["command"] = json!("build");
+    let (code, events, output) = run(owner.path(), 107, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    delivered_build(owner.path(), 107, &events, 143);
+
     // Ambient host tools belong to the operator's runtime epoch. A changed
     // epoch cannot inherit Cargo's prior fingerprint state under the old one.
-    profile["command"] = json!("build");
     profile["target_cache"]["runtime_epoch"] = json!("native-fixture-v2");
-    let (code, events, output) = run(owner.path(), 107, &profile);
+    let (code, events, output) = run(owner.path(), 108, &profile);
     assert_eq!(code, 0, "{output}");
     state(&events, "cold");
     freshness(&output, false, false);
-    delivered_build(owner.path(), 107, &events, 143);
+    delivered_build(owner.path(), 108, &events, 143);
 
     // A rejected optional restore must not discard the adapter that captures
     // this command's successful cold Cargo output. The very next invocation
     // must be warm, including the workspace executable.
-    let seed_binary = owner
-        .path()
-        .join("state/canonical-compile-v1/private-target-v1/seed/target/debug/canonical_app");
+    let retained_families = families();
+    assert_eq!(retained_families.len(), 2);
+    let added = retained_families
+        .difference(&original_families)
+        .collect::<Vec<_>>();
+    assert_eq!(added.len(), 1);
+    let second_family = added[0].clone();
+    let seed_binary = second_family.join("seed/target/debug/canonical_app");
     fs::write(&seed_binary, b"corrupted private target").unwrap();
-    let (code, events, output) = run(owner.path(), 108, &profile);
+    let (code, events, output) = run(owner.path(), 109, &profile);
     assert_eq!(code, 0, "{output}");
     state(&events, "cold");
     freshness(&output, false, false);
@@ -655,13 +687,53 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
         }),
         "corrupted seed was not refused: {output}"
     );
-    delivered_build(owner.path(), 108, &events, 143);
+    delivered_build(owner.path(), 109, &events, 143);
 
-    let (code, events, output) = run(owner.path(), 109, &profile);
+    let (code, events, output) = run(owner.path(), 110, &profile);
     assert_eq!(code, 0, "{output}");
     state(&events, "restored");
     freshness(&output, true, true);
-    delivered_build(owner.path(), 109, &events, 143);
+    delivered_build(owner.path(), 110, &events, 143);
+
+    // A return to a previous runtime family restores its own complete Cargo
+    // state. Neither switching families nor repairing one corrupts the other.
+    for (number, epoch) in [(111, "native-fixture-v1"), (112, "native-fixture-v2")] {
+        profile["target_cache"]["runtime_epoch"] = json!(epoch);
+        let (code, events, output) = run(owner.path(), number, &profile);
+        assert_eq!(code, 0, "{output}");
+        state(&events, "restored");
+        freshness(&output, true, true);
+        delivered_build(owner.path(), number, &events, 143);
+        assert_eq!(families(), retained_families);
+    }
+
+    // The third family exceeds the configured count. Evict only the older
+    // successful family; keep the just-published state and the recent one.
+    profile["target_cache"]["runtime_epoch"] = json!("native-fixture-v3");
+    let (code, events, output) = run(owner.path(), 113, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    delivered_build(owner.path(), 113, &events, 143);
+    let retained = families();
+    assert_eq!(retained.len(), 2);
+    assert!(retained.contains(&second_family));
+    assert!(retained.is_disjoint(&original_families));
+
+    profile["target_cache"]["runtime_epoch"] = json!("native-fixture-v2");
+    let (code, events, output) = run(owner.path(), 114, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    delivered_build(owner.path(), 114, &events, 143);
+
+    profile["target_cache"]["runtime_epoch"] = json!("native-fixture-v1");
+    let (code, events, output) = run(owner.path(), 115, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    delivered_build(owner.path(), 115, &events, 143);
+    assert_eq!(families().len(), 2);
 }
 
 fn assert_test_execution(events: &[Value], state: &str, executed: bool) {
@@ -849,12 +921,7 @@ fn current_test_execution() {
             "fresh compilation state skipped or replayed a test execution: {output}"
         );
         assert_eq!(
-            fs::read_to_string(
-                owner.path().join(
-                    "state/canonical-compile-v1/private-target-v1/seed/target/test-executions"
-                )
-            )
-            .unwrap(),
+            fs::read_to_string(sole_retained_target(owner.path()).join("test-executions")).unwrap(),
             current.to_string(),
             "both passing and failing test runs must retain only current private state"
         );
@@ -909,10 +976,8 @@ pub fn answer() -> u32 { canonical_dep::answer() }
             true,
         );
         assert_eq!(
-            fs::read_to_string(owner.path().join(
-                "state/canonical-compile-v1/private-target-v1/seed/target/doctest-executions"
-            ))
-            .unwrap(),
+            fs::read_to_string(sole_retained_target(owner.path()).join("doctest-executions"))
+                .unwrap(),
             current.to_string(),
             "captured rustdoc must run this request's example despite warm compilation: {output}"
         );
@@ -930,6 +995,21 @@ pub fn answer() -> u32 { canonical_dep::answer() }
             .is_none(),
         "documentation tests must not retain operation owners or deliver test outcomes"
     );
+}
+
+fn sole_retained_target(root: &Path) -> PathBuf {
+    let families = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        families.len(),
+        1,
+        "this test must retain one compatible family"
+    );
+    let target = families[0].join("seed/target");
+    assert!(target.is_dir(), "the family must have a committed target");
+    target
 }
 
 fn read_bounded(path: &Path) -> Vec<u8> {
