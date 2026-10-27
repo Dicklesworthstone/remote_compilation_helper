@@ -930,6 +930,12 @@ impl DependencyExecContext {
         let Some((_, value)) = self.env.iter().find(|(name, _)| name == "LD_LIBRARY_PATH") else {
             return Ok(Vec::new());
         };
+        // Preserve Cargo's whole-empty binding verbatim while representing its
+        // zero search entries. Empty components in a nonempty colon list have
+        // different loader semantics and remain invalid absolute paths below.
+        if value.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut paths = Vec::new();
         for directory in value.split(':') {
             if !normalized_absolute(directory) {
@@ -3563,6 +3569,116 @@ mod tests {
                     [7; 32]
                 )
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_loader_list_is_preserved_in_every_execution_profile() {
+        for base in [
+            context(Vec::new()),
+            canonical_context(),
+            workspace_context(
+                DependencyExecutionMode::Metadata,
+                workspace_directories(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        ] {
+            let rebuild = |env| {
+                if base.workspace_execution_only() {
+                    DependencyExecContext::new_canonical_workspace_execution(
+                        base.execution_mode,
+                        base.cwd.clone(),
+                        base.out_dir.clone(),
+                        base.dependency_dirs.clone(),
+                        base.loader_dirs.clone(),
+                        base.artifact_roots.clone(),
+                        base.generated_root.clone(),
+                        base.source_directories.clone(),
+                        base.generated_directories.clone(),
+                        env,
+                        base.runtime_cohort_sha256,
+                    )
+                } else if base.canonical_cargo() {
+                    DependencyExecContext::new_canonical_cargo(
+                        base.execution_mode,
+                        base.source_root.clone(),
+                        base.cwd.clone(),
+                        base.out_dir.clone(),
+                        base.dependency_dirs.clone(),
+                        base.loader_dirs.clone(),
+                        base.artifact_roots.clone(),
+                        env,
+                        base.runtime_cohort_sha256,
+                    )
+                } else {
+                    DependencyExecContext::new_with_artifacts(
+                        base.source_root.clone(),
+                        base.cwd.clone(),
+                        base.toolchain_root.clone(),
+                        base.compiler.clone(),
+                        base.out_dir.clone(),
+                        base.dependency_dirs.clone(),
+                        base.loader_dirs.clone(),
+                        base.artifact_roots.clone(),
+                        env,
+                        base.runtime_cohort_sha256,
+                    )
+                }
+            };
+            let mut absent_env = base.env.clone();
+            absent_env.retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            let absent = rebuild(absent_env.clone()).unwrap();
+            assert!(
+                absent
+                    .loader_search_paths(Path::new("/retained/toolchain"))
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut empty_env = absent_env;
+            empty_env.push(("LD_LIBRARY_PATH".into(), String::new()));
+            let empty = rebuild(empty_env.clone()).unwrap();
+            assert_eq!(empty.version(), base.version());
+            assert!(
+                empty
+                    .env()
+                    .contains(&("LD_LIBRARY_PATH".into(), String::new()))
+            );
+            assert_ne!(empty.env(), absent.env());
+            assert!(
+                empty
+                    .loader_search_paths(Path::new("/retained/toolchain"))
+                    .unwrap()
+                    .is_empty()
+            );
+            for value in [
+                ":".to_owned(),
+                format!(":{}/lib", base.toolchain_root),
+                format!("{}/lib:", base.toolchain_root),
+                format!(
+                    "{}/lib::{}/lib/rustlib",
+                    base.toolchain_root, base.toolchain_root
+                ),
+            ] {
+                let mut invalid = empty_env.clone();
+                invalid
+                    .iter_mut()
+                    .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                    .unwrap()
+                    .1 = value.clone();
+                assert!(
+                    rebuild(invalid).is_err(),
+                    "{} must refuse {value:?}",
+                    base.version()
+                );
+            }
+            empty_env.push(("LD_PRELOAD".into(), String::new()));
+            assert!(
+                rebuild(empty_env).is_err(),
+                "an empty search list cannot bypass loader-control checks"
             );
         }
     }

@@ -10,8 +10,9 @@
 //! macros. Their presence, or a test command, disables local compiler-result authority for the whole
 //! operation; eligible dependency caching requires isolated workers. Pure graphs
 //! retain the existing evidence-gated metadata lane; archive codegen requires an
-//! isolated worker. Workspace crates and unsupported rustc invocations still
-//! compile normally in the namespace; this does not promote a workspace cache class.
+//! isolated worker. Selected workspace libraries can execute freshly on workers;
+//! unsupported rustc invocations compile normally in the namespace. Workspace
+//! results never gain action-cache publication or replay authority.
 
 mod target_state;
 
@@ -402,6 +403,7 @@ pub fn run_profile_with_release(
     let owner = Arc::new(
         tempfile::Builder::new()
             .prefix("rabs-compile-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&profile.operation_root)?,
     );
     let bundle = owner.path().join("bundle");
@@ -651,6 +653,9 @@ pub fn run_profile_with_release(
         ],
     )
     .map_err(io::Error::other)?;
+    let paths = paths
+        .with_workspace_units(graph.library_units())
+        .map_err(io::Error::other)?;
     let paths = if graph.requires_closed_dependency_execution() {
         paths
             .require_closed_dependency_execution()
@@ -1473,7 +1478,7 @@ mod tests {
     #[test]
     fn scoped_socket_refuses_generic_daemon_authority_and_drains_its_open_session() {
         use std::io::{BufRead, BufReader};
-        let owner = Arc::new(tempfile::tempdir().unwrap());
+        let owner = Arc::new(crate::test_util::private_tempdir());
         let mut mappings = Vec::new();
         for (visible, name) in [
             ("/__rabs/workspace", "source"),

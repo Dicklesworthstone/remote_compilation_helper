@@ -44,7 +44,9 @@ fn preparation(path: &Path, reason: impl ToString) -> ServeError {
 
 fn expected_paths(expected: &ExpectedOutputs) -> Option<&BTreeSet<String>> {
     match expected {
-        ExpectedOutputs::Exactly(paths) | ExpectedOutputs::WithDepInfo { paths, .. } => Some(paths),
+        ExpectedOutputs::Exactly(paths)
+        | ExpectedOutputs::WithDepInfo { paths, .. }
+        | ExpectedOutputs::CanonicalCargo { paths, .. } => Some(paths),
         ExpectedOutputs::WhateverWasCommitted => None,
     }
 }
@@ -60,8 +62,10 @@ type DirectoryMappings = Vec<(Vec<u8>, Vec<u8>)>;
 /// For example, `dep_info_mappings: [[".", "/home/agent/project"]]` resolves
 /// `src/lib.rs` and `target/debug/libcrate.rlib` in that subscriber only.
 fn directory_mappings(expected: &ExpectedOutputs) -> Result<DirectoryMappings, String> {
-    let ExpectedOutputs::WithDepInfo { mappings, .. } = expected else {
-        return Ok(Vec::new());
+    let mappings = match expected {
+        ExpectedOutputs::WithDepInfo { mappings, .. }
+        | ExpectedOutputs::CanonicalCargo { mappings, .. } => mappings,
+        _ => return Ok(Vec::new()),
     };
     if mappings.len() > MAX_MAPPINGS {
         return Err("too many dep-info mappings".into());
@@ -90,6 +94,11 @@ fn directory_mappings(expected: &ExpectedOutputs) -> Result<DirectoryMappings, S
     };
     let mut unique = BTreeMap::new();
     for (canonical, subscriber) in mappings {
+        if canonical.as_slice() == b"."
+            && matches!(expected, ExpectedOutputs::CanonicalCargo { .. })
+        {
+            return Err("canonical Cargo I/O mappings must name complete namespace roots".into());
+        }
         let canonical = if canonical.as_slice() == b"." {
             canonical.clone()
         } else {
@@ -113,6 +122,75 @@ fn directory_mappings(expected: &ExpectedOutputs) -> Result<DirectoryMappings, S
     let mut mappings: Vec<_> = unique.into_iter().collect();
     mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
     Ok(mappings)
+}
+
+/// Translate a canonical dep-info token for coordinator I/O only. Resolve
+/// relative paths against the explicit compiler cwd, then normalize within the
+/// selected retained root. Parent components cannot escape that root even
+/// temporarily. The original .d bytes are never changed by this projection.
+fn canonical_io_path(
+    token: &[u8],
+    working_directory: &[u8],
+    mappings: &DirectoryMappings,
+) -> Result<PathBuf, String> {
+    if working_directory.len() > MAX_MAPPING_PATH_BYTES
+        || !working_directory.starts_with(b"/__rabs/")
+        || working_directory
+            .iter()
+            .any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t' | b':'))
+        || working_directory
+            .split(|byte| *byte == b'/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+        || !mappings.iter().any(|(source, _)| {
+            source.strip_suffix(b"/") == Some(working_directory)
+                || working_directory.starts_with(source)
+        })
+    {
+        return Err("canonical dep-info cwd is outside its retained normalized roots".into());
+    }
+    if token.is_empty()
+        || token
+            .iter()
+            .any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t'))
+    {
+        return Err("canonical dep-info contains an invalid path".into());
+    }
+    let absolute = if token.starts_with(b"/") {
+        std::borrow::Cow::Borrowed(token)
+    } else {
+        let mut absolute = working_directory.to_vec();
+        absolute.push(b'/');
+        absolute.extend_from_slice(token);
+        std::borrow::Cow::Owned(absolute)
+    };
+    let (source, backing) = mappings
+        .iter()
+        .find(|(source, _)| absolute.starts_with(source))
+        .ok_or("canonical dep-info path is outside its retained roots")?;
+    let mut components = Vec::new();
+    for component in absolute[source.len()..].split(|byte| *byte == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." => {
+                components
+                    .pop()
+                    .ok_or("canonical dep-info path escapes its retained root")?;
+            }
+            component => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        return Err("canonical dep-info path does not name a file".into());
+    }
+    let mut projected = backing.clone();
+    for (index, component) in components.into_iter().enumerate() {
+        if index != 0 {
+            projected.push(b'/');
+        }
+        projected.extend_from_slice(component);
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(projected)))
 }
 
 /// Bound the rendered expansion BEFORE derivation allocates replacement tokens.
@@ -291,8 +369,9 @@ pub(super) fn prepare(
         ));
     }
 
-    // Every .d is byte-verified and derived before ANY target output is installed.
-    // Only private scratch files are written on a derivation/input refusal.
+    // Every .d is byte-verified and its complete I/O contract checked before ANY
+    // target output is installed. Canonical Cargo keeps its original bytes;
+    // ordinary subscribers receive a private derivation. Refusal writes scratch only.
     let mut dep_info = BTreeMap::new();
     let mut total_derived_bytes = 0_usize;
     let mut freshness = SystemTime::now();
@@ -323,8 +402,18 @@ pub(super) fn prepare(
                 "canonical dep-info exceeds byte limit",
             ));
         }
-        let expanded = check_expansion(&canonical, &mappings)
-            .map_err(|error| preparation(&output.destination, error))?;
+        let canonical_cwd = match expected {
+            ExpectedOutputs::CanonicalCargo {
+                working_directory, ..
+            } => Some(working_directory),
+            _ => None,
+        };
+        let expanded = if canonical_cwd.is_some() {
+            canonical.len()
+        } else {
+            check_expansion(&canonical, &mappings)
+                .map_err(|error| preparation(&output.destination, error))?
+        };
         total_derived_bytes = total_derived_bytes
             .checked_add(expanded)
             .filter(|total| *total <= MAX_TOTAL_DEP_INFO_BYTES)
@@ -334,20 +423,40 @@ pub(super) fn prepare(
                     "complete dep-info set exceeds byte limit",
                 )
             })?;
-        let derived = derive_subscriber_dep_info(&canonical, &mappings)
-            .map_err(|error| preparation(&output.destination, error.reason))?;
-        if derived.bytes.len() != expanded {
-            return Err(preparation(
-                &output.destination,
-                "dep-info derivation size differs from the validated grammar",
-            ));
-        }
-        let parsed = parse_dep_info(&derived.bytes)
-            .map_err(|error| preparation(&output.destination, error.reason))?;
+        let (derived, parsed) = if canonical_cwd.is_some() {
+            let parsed = parse_dep_info(&canonical)
+                .map_err(|error| preparation(&output.destination, error.reason))?;
+            if render_dep_info(&parsed) != canonical {
+                return Err(preparation(
+                    &output.destination,
+                    "canonical dep-info is outside the lossless grammar",
+                ));
+            }
+            (None, parsed)
+        } else {
+            let derived = derive_subscriber_dep_info(&canonical, &mappings)
+                .map_err(|error| preparation(&output.destination, error.reason))?;
+            if derived.bytes.len() != expanded {
+                return Err(preparation(
+                    &output.destination,
+                    "dep-info derivation size differs from the validated grammar",
+                ));
+            }
+            let parsed = parse_dep_info(&derived.bytes)
+                .map_err(|error| preparation(&output.destination, error.reason))?;
+            (Some(derived), parsed)
+        };
+        let io_path = |bytes: Vec<u8>| -> Result<PathBuf, ServeError> {
+            match canonical_cwd {
+                Some(cwd) => canonical_io_path(&bytes, cwd, &mappings)
+                    .map_err(|error| preparation(&output.destination, error)),
+                None => Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes))),
+            }
+        };
         let mut declared_target_seen = false;
         for line in parsed.lines {
             if let DepInfoLine::Rule { target, deps } = line {
-                let target = PathBuf::from(std::ffi::OsString::from_vec(target));
+                let target = io_path(target)?;
                 let normalized: PathBuf = target
                     .components()
                     .filter(|part| *part != Component::CurDir)
@@ -364,7 +473,7 @@ pub(super) fn prepare(
                     ));
                 }
                 for dep in deps {
-                    let input = PathBuf::from(std::ffi::OsString::from_vec(dep));
+                    let input = io_path(dep)?;
                     // rustc reports `include_str!("../../README.md")` from
                     // `src/` as `<abs>/src/../../README.md`. Publication's
                     // closure check already proved such a read inside the
@@ -395,7 +504,9 @@ pub(super) fn prepare(
                 "dep-info has no declared output target",
             ));
         }
-        dep_info.insert(output.destination.clone(), derived);
+        if let Some(derived) = derived {
+            dep_info.insert(output.destination.clone(), derived);
+        }
     }
     Ok(Ok(PreparedOutputs {
         outputs,
@@ -783,5 +894,143 @@ mod tests {
         canonical.push(b'\n');
         assert!(canonical.len() < MAX_DEP_INFO_BYTES);
         assert!(check_expansion(&canonical, &mappings).is_err());
+    }
+
+    #[test]
+    fn canonical_io_projection_resolves_only_inside_retained_roots() {
+        let contract = ExpectedOutputs::CanonicalCargo {
+            paths: BTreeSet::new(),
+            working_directory: b"/__rabs/workspace/member".to_vec(),
+            mappings: vec![
+                (b"/__rabs/workspace".to_vec(), b"/private/source".to_vec()),
+                (b"/__rabs/out/cargo".to_vec(), b"/private/target".to_vec()),
+            ],
+        };
+        let mappings = directory_mappings(&contract).unwrap();
+        let cwd = b"/__rabs/workspace/member";
+        for (logical, physical) in [
+            (&b"src/lib.rs"[..], "/private/source/member/src/lib.rs"),
+            (&b"../README.md"[..], "/private/source/README.md"),
+            (&b"src/../../README.md"[..], "/private/source/README.md"),
+            (
+                &b"/__rabs/out/cargo/debug/deps/libunit.rmeta"[..],
+                "/private/target/debug/deps/libunit.rmeta",
+            ),
+        ] {
+            assert_eq!(
+                canonical_io_path(logical, cwd, &mappings).unwrap(),
+                Path::new(physical)
+            );
+        }
+        for logical in [
+            &b"../../outside"[..],
+            b"/__rabs/workspace/../workspace/member/src/lib.rs",
+            b"/__rabs/workspace-other/src/lib.rs",
+            b"/unobserved/source.rs",
+            b"/__rabs/workspace",
+        ] {
+            assert!(
+                canonical_io_path(logical, cwd, &mappings).is_err(),
+                "{logical:?}"
+            );
+        }
+        assert!(canonical_io_path(b"src/lib.rs", b"/__rabs/unknown", &mappings).is_err());
+    }
+
+    #[test]
+    fn canonical_cargo_install_preserves_dep_info_and_uses_backing_input_freshness() {
+        use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+        use rabs_cas::digest_set::{DigestRequest, digest_set};
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::{LogicalOutput, ObjectId};
+
+        let directory = crate::test_util::private_tempdir();
+        let cas =
+            crate::janitor::store::mount_and_reconcile(&directory.path().join("cas")).unwrap();
+        let workspace = directory.path().join("source");
+        let target = directory.path().join("target");
+        std::fs::create_dir_all(workspace.join("member/src")).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::write(workspace.join("member/src/lib.rs"), b"pub fn unit() {}\n").unwrap();
+        std::fs::write(workspace.join("README.md"), b"workspace documentation\n").unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(workspace.join("README.md"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        let metadata = b"verified compiler metadata";
+        let dep_info = b"/__rabs/out/cargo/debug/deps/libunit.rmeta: src/lib.rs ../README.md\n\nsrc/lib.rs:\n../README.md:\n";
+        let put = |bytes: &[u8]| {
+            let id = digest_set(bytes, DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id;
+            put_if_absent(
+                cas.layout(),
+                &mut *cas.store().lock().unwrap(),
+                &id,
+                &mut &bytes[..],
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap();
+            ObjectId(id)
+        };
+        let mut manifest = rabs_cas::test_support::sample_manifest();
+        manifest.result_kind = ResultKind::Success;
+        manifest.artifact_bundle_root = None;
+        manifest.logical_outputs = vec![
+            LogicalOutput {
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libunit.rmeta"),
+                object: put(metadata),
+            },
+            LogicalOutput {
+                role: OutputRole::DepInfo,
+                virtual_path: RawBytes::from("unit.d"),
+                object: put(dep_info),
+            },
+        ];
+        let contract = ExpectedOutputs::CanonicalCargo {
+            paths: BTreeSet::from(["libunit.rmeta".into(), "unit.d".into()]),
+            working_directory: b"/__rabs/workspace/member".to_vec(),
+            mappings: vec![
+                (
+                    b"/__rabs/workspace".to_vec(),
+                    workspace.as_os_str().as_bytes().to_vec(),
+                ),
+                (
+                    b"/__rabs/out/cargo".to_vec(),
+                    target.as_os_str().as_bytes().to_vec(),
+                ),
+            ],
+        };
+        let destination = target.join("debug/deps");
+        let plan = match prepare(
+            &mut *cas.store().lock().unwrap(),
+            &manifest,
+            &destination,
+            &contract,
+        )
+        .unwrap()
+        {
+            Ok(plan) => plan,
+            Err(refusal) => panic!("canonical output plan refused: {refusal:?}"),
+        };
+        assert!(
+            plan.dep_info.is_empty(),
+            "canonical bytes must not be replaced by a backing-path derivation"
+        );
+        let selected = select_for_install(&mut *cas.store().lock().unwrap(), &plan).unwrap();
+        let prepared = stage_for_install(selected, &plan).unwrap();
+        let files = install_prepared(&mut *cas.store().lock().unwrap(), &plan, prepared).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(std::fs::read(destination.join("unit.d")).unwrap(), dep_info);
+        assert_eq!(
+            std::fs::read(destination.join("libunit.rmeta")).unwrap(),
+            metadata
+        );
+        for file in files {
+            assert!(std::fs::metadata(file).unwrap().modified().unwrap() >= future);
+        }
     }
 }

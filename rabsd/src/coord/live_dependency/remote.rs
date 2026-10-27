@@ -9,12 +9,14 @@
 
 use super::canonical::CanonicalPaths;
 use super::{
-    CanonicalActionResultManifest, CompletionOutcome, CompletionReport, CoordLive,
-    DependencyActionPlan, ExecutionAttempt, InstallResult, LiveDecision, LiveDependencyKey,
-    LiveDependencyLane, LiveDependencyRequest, MAX_TRANSCRIPT_BYTES, Path, PathBuf, ServeOutcome,
-    ToolchainGuard, TypedDigest, WorkerSessionOffer, canonicalize_compiler_transcript,
-    expected_outputs, known_installed_output, now_micros, read_stable, render_compiler_transcript,
+    CanonicalActionResultManifest, CapturedLocalResult, CompletionOutcome, CompletionReport,
+    CoordLive, DependencyActionPlan, ExecutionAttempt, InstallResult, LiveDecision,
+    LiveDependencyKey, LiveDependencyLane, LiveDependencyRequest, MAX_TRANSCRIPT_BYTES, Path,
+    PathBuf, ServeOutcome, ToolchainGuard, TypedDigest, WorkerSessionOffer,
+    canonicalize_compiler_transcript, known_installed_output, now_micros, read_stable,
+    render_compiler_transcript,
 };
+use crate::coord::live::RequestOwnedInstallError;
 use crate::coord::remote_dependency_transport::{
     RemoteDependencyReservation, RemoteDependencyTransport,
 };
@@ -26,7 +28,11 @@ use rabs_key::live_dependency::remote::{
     RemoteDependencyOutputClass, remote_dependency_isolation_policy, remote_dependency_key,
     remote_dependency_output_class, remote_dependency_shape, remote_empty_loader_directories,
 };
-use rabs_key::live_dependency::{DependencyDirectoryFact, ToolchainFacts};
+use rabs_key::live_dependency::{
+    DependencyDirectoryFact, DependencySourceKind, ToolchainFacts,
+    remote_workspace_execution_isolation_policy, remote_workspace_execution_key,
+    remote_workspace_execution_shape, workspace_input_directories,
+};
 use rabs_protocol::generation::AttemptAuthority;
 use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::OutputRole;
@@ -326,8 +332,19 @@ impl RemoteValidation {
             Some(paths) => paths.dependency_facts(&request.dependencies.directories)?,
             None => request.dependencies.directories.clone(),
         };
-        remote_dependency_shape(&request.plan, &directories, &toolchain)
-            .map_err(|error| error.to_string())?;
+        if request.is_execution_only() {
+            request
+                .canonical_paths
+                .as_ref()
+                .ok_or("workspace execution lost its retained Cargo graph")?
+                .require_workspace_execution(&request.plan)?;
+        }
+        let shape = if request.is_execution_only() {
+            remote_workspace_execution_shape(&request.plan, &directories, &toolchain)
+        } else {
+            remote_dependency_shape(&request.plan, &directories, &toolchain)
+        };
+        shape.map_err(|error| error.to_string())?;
         verify_execution_policy(&request.plan, &request.key, self.execution_mode)
     }
 
@@ -377,7 +394,12 @@ fn verify_execution_policy(
     if execution_mode(plan)? != mode {
         return Err("remote output class differs from the enforced execution mode".into());
     }
-    let policy = remote_dependency_isolation_policy(plan).map_err(|error| error.to_string())?;
+    let policy = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        remote_workspace_execution_isolation_policy(plan)
+    } else {
+        remote_dependency_isolation_policy(plan)
+    }
+    .map_err(|error| error.to_string())?;
     if key.descriptor.sandbox_semantic_policy != policy {
         return Err("remote descriptor does not bind the enforced read-closure policy".into());
     }
@@ -490,6 +512,12 @@ impl RemoteDependencies {
         if plan.canonical_cargo != canonical.is_some() {
             return Err("remote canonical key requires its retained driver capability".into());
         }
+        let workspace = plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly;
+        if workspace {
+            canonical
+                .ok_or("workspace execution requires its retained Cargo graph")?
+                .require_workspace_execution(plan)?;
+        }
         if argv.first().map(String::as_str) != Some(plan.compiler.as_str()) {
             return Err("remote argv does not name the observed compiler".into());
         }
@@ -500,8 +528,12 @@ impl RemoteDependencies {
         guard.verify_unchanged(Path::new(&physical.compiler))?;
         let root = guard.sysroot();
         let visible_root = visible_toolchain_root(guard, canonical)?;
-        remote_dependency_shape(plan, directories, &visible_root)
-            .map_err(|error| error.to_string())?;
+        let shape = if workspace {
+            remote_workspace_execution_shape(plan, directories, &visible_root)
+        } else {
+            remote_dependency_shape(plan, directories, &visible_root)
+        };
+        shape.map_err(|error| error.to_string())?;
         // Derive resource intent before copying a complete compiler tree. An
         // unrepresentable or differently keyed invocation cannot request work.
         dependency_execution_grant(plan, argv)?;
@@ -524,7 +556,12 @@ impl RemoteDependencies {
             Path::new(&physical.out_dir),
         )
         .map_err(|error| format!("edge runtime cohort: {error}"))?;
-        let key = remote_dependency_key(
+        let key_builder = if workspace {
+            remote_workspace_execution_key
+        } else {
+            remote_dependency_key
+        };
+        let key = key_builder(
             plan,
             toolchain,
             directories,
@@ -549,7 +586,24 @@ impl RemoteDependencies {
                 prefix: format!("dependencies/{index:04}"),
             })
             .collect();
-        let context = if plan.canonical_cargo {
+        let generated_directories =
+            rabs_key::live_dependency::generated_input_directories(plan, inputs)
+                .map_err(|error| error.to_string())?;
+        let context = if workspace {
+            DependencyExecContext::new_canonical_workspace_execution(
+                execution_mode(plan)?,
+                plan.cwd.clone(),
+                plan.out_dir.clone(),
+                plan.dependency_dirs.clone(),
+                empty_loader,
+                artifact_roots,
+                plan.generated_root.clone(),
+                workspace_input_directories(plan, inputs).map_err(|error| error.to_string())?,
+                generated_directories.clone(),
+                plan.execution_env.clone(),
+                runtime_bytes,
+            )
+        } else if plan.canonical_cargo {
             DependencyExecContext::new_canonical_cargo_with_generated(
                 execution_mode(plan)?,
                 plan.source_root.clone(),
@@ -579,10 +633,7 @@ impl RemoteDependencies {
         }
         .map_err(|error| error.to_string())?
         .with_execution_mode(execution_mode(plan)?)
-        .with_generated_directories(
-            rabs_key::live_dependency::generated_input_directories(plan, inputs)
-                .map_err(|error| error.to_string())?,
-        )
+        .with_generated_directories(generated_directories)
         .map_err(|error| error.to_string())?;
         verify_execution_policy(plan, &key, context.execution_mode())?;
         loader_witness.verify_absence(|| false).map_err(|error| {
@@ -705,10 +756,17 @@ impl LiveDependencyLane {
         {
             return LiveDecision::PassThrough(reason);
         }
-        let request = match self.preview(request, Some(&invocation.validation)) {
-            Ok(Ok(pending)) => return LiveDecision::Hit(pending),
-            Ok(Err(request)) => request,
-            Err(reason) => return LiveDecision::PassThrough(format!("serve-fault: {reason}")),
+        let request = if request.is_execution_only() {
+            // The action key arbitrates active execution ownership only. Every
+            // workspace caller needs its own fresh authenticated compiler run;
+            // neither an earlier publication nor a waiting peer is its result.
+            request
+        } else {
+            match self.preview(request, Some(&invocation.validation)) {
+                Ok(Ok(pending)) => return LiveDecision::Hit(pending),
+                Ok(Err(request)) => request,
+                Err(reason) => return LiveDecision::PassThrough(format!("serve-fault: {reason}")),
+            }
         };
         match self.coord.submitted_actor(&request.key.action_key) {
             Ok(Some(_)) => return LiveDecision::InFlight,
@@ -1007,19 +1065,30 @@ impl PendingRemote {
             .validation
             .verify(&attempt.request)
             .map_err(settled)?;
-        let (outcome, _) = attempt.publish_captured(captured).map_err(settled)?;
-        if !matches!(
-            outcome,
-            CompletionOutcome::Committed | CompletionOutcome::Verified
-        ) {
-            return Err(settled(format!("remote publication: {outcome:?}")));
-        }
-        attempt.settle();
+        let result = if attempt.request.is_execution_only() {
+            let result =
+                RequestOwnedResult::new(captured, attempt, &delivery, &wire).map_err(settled)?;
+            // No H011 offer, transcript index, winner or verification sample is
+            // written. Retire the dispatch before releasing the worker, while
+            // the affine capture owner keeps every result object pinned.
+            attempt.settle_checked().map_err(settled)?;
+            RemoteInstallAuthority::RequestOwned(Box::new(result))
+        } else {
+            let (outcome, _) = attempt.publish_captured(captured).map_err(settled)?;
+            if !matches!(
+                outcome,
+                CompletionOutcome::Committed | CompletionOutcome::Verified
+            ) {
+                return Err(settled(format!("remote publication: {outcome:?}")));
+            }
+            attempt.settle();
+            RemoteInstallAuthority::Published
+        };
         let attempt = owned
             .attempt
             .take()
-            .ok_or_else(|| ("published attempt owner missing".to_owned(), false))?;
-        // AdmittedRemote's session owner drops on return, after publication and
+            .ok_or_else(|| ("completed attempt owner missing".to_owned(), false))?;
+        // AdmittedRemote's session owner drops on return, after result custody and
         // before waiting for permission to write any caller destination.
         Ok(PendingRemoteInstall {
             attempt,
@@ -1027,6 +1096,7 @@ impl PendingRemote {
             manifest_key,
             canonical_transcript,
             validation: invocation.validation,
+            result,
         })
     }
 }
@@ -1082,6 +1152,8 @@ fn dependency_execution_request(
     let grant = dependency_execution_grant(plan, argv)?;
     if context.execution_mode() != execution_mode(plan)?
         || context.canonical_cargo() != plan.canonical_cargo
+        || context.workspace_execution_only()
+            != (plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly)
         || context.generated_root() != plan.generated_root.as_deref()
     {
         return Err(
@@ -1103,7 +1175,7 @@ fn dependency_execution_request(
 }
 
 fn context_value(context: &DependencyExecContext) -> Value {
-    json!({
+    let mut value = json!({
         "version":context.version(),
         "execution_mode":context.execution_mode().as_str(),
         "source_root":context.source_root(), "cwd":context.cwd(),
@@ -1116,7 +1188,11 @@ fn context_value(context: &DependencyExecContext) -> Value {
             "path":root.path, "prefix":root.prefix,
         })).collect::<Vec<_>>(),
         "env":context.env(), "runtime_cohort_sha256":hex(context.runtime_cohort_sha256()),
-    })
+    });
+    if context.workspace_execution_only() {
+        value["source_directories"] = json!(context.source_directories());
+    }
+    value
 }
 
 /// Release the exact session even if admission, upload, capture or publication
@@ -1184,6 +1260,7 @@ fn original_loader_search_paths(
         .execution_env
         .iter()
         .find(|(name, _)| name == "LD_LIBRARY_PATH")
+        .filter(|(_, value)| !value.is_empty())
         .map(|(_, value)| value.split(':').map(str::to_owned).collect::<Vec<_>>())
         .unwrap_or_default();
     Ok(physical_paths(&paths, canonical)?
@@ -1287,9 +1364,85 @@ pub enum RemoteResult {
     },
 }
 
+/// A fresh, authenticated, successfully drained execution's immutable output
+/// custody. Its private constructor is reached only through the remote receipt
+/// boundary. It is neither cloneable nor serializable and grants no action
+/// publication, cache lookup, evidence append or recovery execution authority.
+#[derive(Debug)]
+pub(in crate::coord) struct RequestOwnedResult {
+    captured: CapturedLocalResult,
+}
+
+impl RequestOwnedResult {
+    fn new(
+        captured: CapturedLocalResult,
+        attempt: &ExecutionAttempt,
+        delivery: &Delivery,
+        wire: &Value,
+    ) -> Result<Self, String> {
+        if !attempt.request.is_execution_only()
+            || !attempt.request.plan.canonical_cargo
+            || attempt.request.canonical_paths.is_none()
+            || attempt.remote_validation.is_none()
+            || delivery.receipt["exit_code"] != 0
+            || !delivery.receipt["stop_reason"].is_null()
+        {
+            return Err(
+                "request-owned result requires a successful canonical workspace execution".into(),
+            );
+        }
+        verify_receipt(delivery, wire, attempt.authority.as_ref())?;
+        if attempt.authority.as_ref() != Some(&captured.offer.authority) {
+            return Err("request-owned result differs from the admitted execution".into());
+        }
+        let result = Self { captured };
+        result.verify_binding(&attempt.key, &result.captured.manifest_key)?;
+        Ok(result)
+    }
+
+    pub(in crate::coord) fn manifest(&self) -> &CanonicalActionResultManifest {
+        &self.captured.offer.manifest
+    }
+
+    pub(in crate::coord) fn authority(&self) -> &AttemptAuthority {
+        &self.captured.offer.authority
+    }
+
+    pub(in crate::coord) fn verify_binding(
+        &self,
+        action_key: &TypedDigest,
+        manifest_key: &str,
+    ) -> Result<(), String> {
+        let offer = &self.captured.offer;
+        if &offer.authority.action_key != action_key
+            || &offer.manifest.action_key != action_key
+            || self.captured.manifest_key != manifest_key
+            || rabs_cas::metadata_store::digest_key(&offer.manifest_id.0) != manifest_key
+            || super::object_id(&rabs_cas::manifest_codec::encode_manifest_v1(
+                &offer.manifest,
+            ))? != offer.manifest_id.0
+        {
+            return Err(
+                "request-owned output identity differs from the acknowledged capture".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum RemoteInstallAuthority {
+    Published,
+    RequestOwned(Box<RequestOwnedResult>),
+}
+
+#[cfg(test)]
+mod request_owned_tests;
+
 /// A successful current producer, not an arbitrary cache-read capability.
-/// Its constructor requires actual execution, complete verified bytes, closure
-/// checks and H011 publication. Later requests still pass normal replay sampling.
+/// Dependency results have H011 publication; workspace results carry only
+/// affine custody of this request's fresh verified execution. Both wait for
+/// the same wrapper's manifest-specific acknowledgment before target writes.
 #[derive(Debug)]
 pub struct PendingRemoteInstall {
     attempt: ExecutionAttempt,
@@ -1297,6 +1450,7 @@ pub struct PendingRemoteInstall {
     manifest_key: String,
     canonical_transcript: Vec<u8>,
     validation: RemoteValidation,
+    result: RemoteInstallAuthority,
 }
 
 impl PendingRemoteInstall {
@@ -1311,8 +1465,8 @@ impl PendingRemoteInstall {
     }
 
     /// Called only after the wrapper acknowledges this exact captured result.
-    /// Full publication/quarantine/authority/materialization gates remain active;
-    /// cache-replay sampling does not discard this subscriber's own new execution.
+    /// Dependency publication gates remain active. An execution-only workspace
+    /// result uses its consumed request owner and never enters cache serving.
     #[must_use]
     pub fn install(self) -> InstallResult {
         let request = &self.attempt.request;
@@ -1325,13 +1479,38 @@ impl PendingRemoteInstall {
             Ok(physical) => physical,
             Err(reason) => return InstallResult::Declined(reason),
         };
-        match self.attempt.coord.serve_produced_result(
-            &self.attempt.key,
-            &self.manifest_key,
-            Path::new(&physical.out_dir),
-            &expected_outputs(plan),
-            now_micros(),
-        ) {
+        let expected = match request.installation_outputs() {
+            Ok(expected) => expected,
+            Err(reason) => return InstallResult::Declined(reason),
+        };
+        let installed_result = match self.result {
+            RemoteInstallAuthority::Published => self.attempt.coord.serve_produced_result(
+                &self.attempt.key,
+                &self.manifest_key,
+                Path::new(&physical.out_dir),
+                &expected,
+                now_micros(),
+            ),
+            RemoteInstallAuthority::RequestOwned(captured) => {
+                match self.attempt.coord.install_request_owned_result(
+                    *captured,
+                    &self.attempt.key,
+                    &self.manifest_key,
+                    Path::new(&physical.out_dir),
+                    &expected,
+                    || verify_request(request).and_then(|()| self.validation.verify(request)),
+                ) {
+                    Ok(files) => Ok(ServeOutcome::Served { files }),
+                    Err(RequestOwnedInstallError::Declined(reason)) => {
+                        return InstallResult::Declined(reason);
+                    }
+                    Err(RequestOwnedInstallError::Fault(reason)) => {
+                        return InstallResult::Fault(reason);
+                    }
+                }
+            }
+        };
+        match installed_result {
             Ok(ServeOutcome::Served { files }) => {
                 if files.len() != self.manifest.logical_outputs.len() {
                     return InstallResult::Fault(
@@ -2285,6 +2464,28 @@ mod execution_resource_tests {
                 .contains(owner.path().to_str().unwrap())
         );
         assert!(physical_paths(&["/unowned/lib".into()], Some(&paths)).is_err());
+        let mut empty_loader = fixture.plan.clone();
+        empty_loader
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "LD_LIBRARY_PATH")
+            .unwrap()
+            .1
+            .clear();
+        assert!(
+            original_loader_search_paths(&empty_loader, Some(&paths))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            empty_loader
+                .execution_env
+                .iter()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1,
+            ""
+        );
         std::fs::rename(owner.path().join("3"), owner.path().join("retained-target")).unwrap();
         std::fs::DirBuilder::new()
             .mode(0o700)

@@ -84,6 +84,104 @@ fn canonical_dependency_request() -> Value {
     request
 }
 
+fn canonical_workspace_request(archive: bool) -> Value {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    let mut request = canonical_generated_request(archive, true);
+    let context = &mut request["dependency_context"];
+    context["version"] = json!(CANONICAL_WORKSPACE_CONTEXT_VERSION);
+    context["source_root"] = json!("/__rabs/workspace");
+    context["cwd"] = json!("/__rabs/workspace");
+    context["source_directories"] = json!(["empty", "member", "member/src"]);
+    for pair in context["env"].as_array_mut().unwrap() {
+        if pair[0] == "CARGO_MANIFEST_DIR" {
+            pair[1] = json!("/__rabs/workspace/member");
+        }
+    }
+    context["env"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(["CARGO_PRIMARY_PACKAGE", "1"]));
+    *request["args"].as_array_mut().unwrap().last_mut().unwrap() = json!("member/src/lib.rs");
+    let files = vec![
+        SourceFile {
+            path: "package/member/src/lib.rs".into(),
+            len: 1,
+            sha256: [1; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "generated/nested/input.rs".into(),
+            len: 1,
+            sha256: [2; 32],
+            executable: false,
+        },
+    ];
+    let manifest = SourceManifest::new(files).unwrap();
+    request["source_manifest"] = json!({
+        "manifest_sha256":rabs_wkr::source_transfer::hex(&manifest.digest()),
+        "files":manifest.files().iter().map(|file| json!({
+            "path":file.path,"bytes":file.len,
+            "sha256":rabs_wkr::source_transfer::hex(&file.sha256),"executable":file.executable,
+        })).collect::<Vec<_>>()
+    });
+    request
+}
+
+#[test]
+fn workspace_decoder_preserves_primary_environment_relative_argv_and_both_input_trees() {
+    for archive in [false, true] {
+        let wire = canonical_workspace_request(archive);
+        let parsed = parse_exec_request(&wire).unwrap();
+        let context = parsed.dependency_context.as_ref().unwrap();
+        assert!(context.canonical_cargo() && context.workspace_execution_only());
+        assert_eq!(context.version(), CANONICAL_WORKSPACE_CONTEXT_VERSION);
+        assert_eq!(
+            context.source_directories(),
+            ["empty", "member", "member/src"]
+        );
+        assert_eq!(context.generated_directories(), ["nested"]);
+        assert_eq!(parsed.args.last().unwrap(), "member/src/lib.rs");
+        assert!(
+            context
+                .env()
+                .contains(&("CARGO_PRIMARY_PACKAGE".into(), "1".into()))
+        );
+        assert!(context.env().contains(&(
+            "CARGO_MANIFEST_DIR".into(),
+            "/__rabs/workspace/member".into()
+        )));
+        assert_eq!(wire, canonical_workspace_request(archive));
+    }
+}
+
+#[test]
+fn workspace_decoder_requires_its_exact_profile_and_complete_directory_shape() {
+    let valid = canonical_workspace_request(false);
+    for (field, value) in [
+        ("version", json!(CANONICAL_DEPENDENCY_CONTEXT_VERSION)),
+        ("source_root", json!("/__rabs/workspace/member")),
+        ("source_directories", Value::Null),
+        ("source_directories", json!(["member/src"])),
+        ("source_directories", json!(["../escape"])),
+        ("source_directories", json!(["member", "member"])),
+        ("execution_mode", json!("rlib")),
+    ] {
+        let mut request = valid.clone();
+        request["dependency_context"][field] = value;
+        assert!(parse_exec_request(&request).is_err(), "{field}");
+    }
+    let mut missing = valid;
+    missing["dependency_context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_directories");
+    assert!(parse_exec_request(&missing).is_err());
+    for mut request in [dependency_request(), canonical_dependency_request()] {
+        request["dependency_context"]["source_directories"] = json!([]);
+        assert!(parse_exec_request(&request).is_err());
+    }
+}
+
 #[test]
 fn canonical_dependency_decode_retains_exact_cargo_paths_and_closed_outputs() {
     let wire = canonical_dependency_request();
@@ -1204,6 +1302,50 @@ fn canonical_dependency_negotiation_binds_version_as_well_as_mode() {
     );
 }
 
+#[test]
+fn workspace_execution_requires_its_own_negotiated_version_in_both_modes() {
+    let mut report = report();
+    report.dependency_modes = vec![
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::Rlib,
+    ];
+    for (archive, mode) in [
+        (false, DependencyExecutionMode::Metadata),
+        (true, DependencyExecutionMode::Rlib),
+    ] {
+        let grant = json!({"dependency_context":CANONICAL_WORKSPACE_CONTEXT_VERSION,
+            "dependency_execution_mode":mode.as_str()});
+        let selected = dependency_context_selection(
+            &grant.to_string(),
+            &report.dependency_modes,
+            true,
+            true,
+            true,
+            true,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let workspace = parse_exec_request(&canonical_workspace_request(archive)).unwrap();
+        assert!(validate_execution_selection(&workspace, &report, Some(selected)).is_ok());
+        for version in [
+            DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+        ] {
+            assert!(
+                validate_execution_selection(
+                    &workspace,
+                    &report,
+                    Some(DependencySelection { version, mode }),
+                )
+                .is_err()
+            );
+        }
+        let dependency = parse_exec_request(&canonical_dependency_request()).unwrap();
+        assert!(validate_execution_selection(&dependency, &report, Some(selected)).is_err());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn canonical_dependency_version_swap_refuses_before_input_or_durable_admission() {
@@ -1383,7 +1525,8 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
         hello["dependency_contexts"],
         json!([
             DEPENDENCY_CONTEXT_VERSION,
-            CANONICAL_DEPENDENCY_CONTEXT_VERSION
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION
         ])
     );
     assert_eq!(hello["dependency_execution_modes"], json!([]));

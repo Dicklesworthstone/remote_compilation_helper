@@ -455,6 +455,77 @@ mod tests {
     }
 
     #[test]
+    fn empty_workspace_loader_list_remains_an_exact_keyed_binding() {
+        let (argv, mut env) = request();
+        env.iter_mut()
+            .find(|(name, _)| name == "LD_LIBRARY_PATH")
+            .unwrap()
+            .1
+            .clear();
+        let empty = from_request(&argv, &env, WORKSPACE);
+        assert_eq!(env_value(&empty.execution_env, "LD_LIBRARY_PATH"), Some(""));
+        assert_eq!(empty.execution_env, empty.keyed_env);
+        assert!(
+            remote::remote_loader_search_paths(&empty, TOOLCHAIN)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            remote::remote_empty_loader_directories(&empty, TOOLCHAIN)
+                .unwrap()
+                .is_empty()
+        );
+        let empty_key = key(&empty, &inputs(&empty)).unwrap();
+        let mut absent_env = env.clone();
+        absent_env.retain(|(name, _)| name != "LD_LIBRARY_PATH");
+        let absent = from_request(&argv, &absent_env, WORKSPACE);
+        let absent_key = key(&absent, &inputs(&absent)).unwrap();
+        assert_ne!(
+            empty_key.descriptor.environment,
+            absent_key.descriptor.environment
+        );
+        assert_ne!(empty_key.action_key, absent_key.action_key);
+
+        for value in [
+            ":",
+            ":/__rabs/toolchain/lib",
+            "/__rabs/toolchain/lib:",
+            "/__rabs/toolchain/lib::/__rabs/toolchain/lib/rustlib",
+        ] {
+            let mut changed = env.clone();
+            changed
+                .iter_mut()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1 = value.into();
+            assert!(
+                plan_canonical_workspace_execution(
+                    LiveRustcRequest {
+                        argv: &argv,
+                        env: &changed,
+                        cwd: WORKSPACE,
+                    },
+                    HOST,
+                )
+                .is_err(),
+                "nonempty loader lists cannot contain cwd-search components: {value:?}"
+            );
+        }
+        env.push(("LD_PRELOAD".into(), String::new()));
+        assert!(
+            plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &argv,
+                    env: &env,
+                    cwd: WORKSPACE
+                },
+                HOST,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn workspace_identity_is_distinct_and_all_dependency_cache_entrypoints_refuse_it() {
         let (mut argv, mut env) = request();
         // Even an otherwise external-looking lint/environment combination must

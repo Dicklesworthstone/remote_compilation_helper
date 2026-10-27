@@ -946,7 +946,46 @@ impl SourceUpload {
             request_manifest(request)?.as_ref() == Some(&self.manifest),
             "captured source differs from the saved execution manifest",
         )?;
-        if let SourceLayout::Dependency { generated, .. } = &self.layout {
+        if let SourceLayout::Dependency {
+            root, generated, ..
+        } = &self.layout
+        {
+            if request["dependency_context"]["version"]
+                == rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CONTEXT_VERSION
+            {
+                let captured = self
+                    .image
+                    .manifest(root)
+                    .ok_or_else(|| invalid("workspace source root was not captured"))?;
+                let mut directories = Vec::new();
+                let mut files = BTreeSet::new();
+                for (path, kind) in &captured.members {
+                    match kind {
+                        MemberKind::Directory => directories.push(path.clone()),
+                        MemberKind::Regular { .. } => {
+                            files.insert(format!("package/{path}"));
+                        }
+                        MemberKind::Symlink { .. } => {
+                            return Err(invalid("workspace execution source contains a symlink"));
+                        }
+                    }
+                }
+                rabs_sandbox::generated_source::validate_generated_directories(&directories)?;
+                let selected = self
+                    .manifest
+                    .files()
+                    .iter()
+                    .filter(|file| file.path.starts_with("package/"))
+                    .map(|file| file.path.clone())
+                    .collect::<BTreeSet<_>>();
+                require(
+                    request["dependency_context"]["source_root"] == rabs_sandbox::layout::WORKSPACE
+                        && request["dependency_context"]["source_directories"]
+                            == json!(directories)
+                        && selected == files,
+                    "workspace execution requires the exact complete sealed source tree",
+                )?;
+            }
             require(
                 generated.is_some() == request["dependency_context"]["generated_root"].is_string(),
                 "generated source selection differs from the execution context",
@@ -1415,6 +1454,64 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn workspace_execution_upload_requires_every_file_and_empty_directory_from_one_capture() {
+        use rabs_sandbox::dependency_context::CANONICAL_WORKSPACE_CONTEXT_VERSION;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::create_dir_all(root.path().join("empty/inner")).unwrap();
+        fs::write(
+            root.path().join("src/lib.rs"),
+            b"pub const README: &str = include_str!(\"../README\");\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("README"), b"sibling input\n").unwrap();
+        let image = Arc::new(
+            capture_sealed_source(
+                &[("workspace".into(), root.path().to_path_buf())],
+                false,
+                1,
+                4096,
+            )
+            .unwrap(),
+        );
+        let upload = SourceUpload::from_snapshot(
+            Arc::clone(&image),
+            "workspace",
+            &["README".into(), "src/lib.rs".into()],
+        )
+        .unwrap()
+        .with_dependency_artifacts(Vec::new())
+        .unwrap();
+        let request = json!({"kind":"canonical-exec","request_id":41,
+            "program":"/__rabs/toolchain/bin/rustc",
+            "source_manifest":upload.wire_manifest(),
+            "dependency_context":{"version":CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                "source_root":"/__rabs/workspace", "source_directories":["empty","empty/inner","src"],
+                "generated_root":null,"generated_directories":[]}});
+        upload.validate_request(&request).unwrap();
+        for directories in [
+            json!(["src"]),
+            json!(["empty", "empty/inner", "extra", "src"]),
+            Value::Null,
+        ] {
+            let mut changed = request.clone();
+            changed["dependency_context"]["source_directories"] = directories;
+            assert!(upload.validate_request(&changed).is_err());
+        }
+        let subset = SourceUpload::from_snapshot(image, "workspace", &["src/lib.rs".into()])
+            .unwrap()
+            .with_dependency_artifacts(Vec::new())
+            .unwrap();
+        let mut missing_sibling = request.clone();
+        missing_sibling["source_manifest"] = subset.wire_manifest();
+        assert!(subset.validate_request(&missing_sibling).is_err());
+        // Upload authority remains the sealed capture even if the mutable
+        // original changes after selection; execution rechecks its owner too.
+        fs::write(root.path().join("README"), b"changed after capture\n").unwrap();
+        upload.validate_request(&request).unwrap();
     }
 
     #[test]

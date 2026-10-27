@@ -12,9 +12,10 @@ use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
-    CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot,
-    DependencyExecContext, DependencyExecutionMode, DependencyIsolationSupport,
-    MAX_DEPENDENCY_DIRS, MAX_DEPENDENCY_ENV_ENTRIES,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
+    DependencyExecutionMode, DependencyIsolationSupport, MAX_DEPENDENCY_DIRS,
+    MAX_DEPENDENCY_ENV_ENTRIES,
 };
 use rabs_sandbox::generated_source::MAX_GENERATED_DIRECTORIES;
 use rabs_sandbox::process_context::{
@@ -191,6 +192,8 @@ pub fn parse_dependency_context(
     let object = value
         .as_object()
         .ok_or("dependency_context must be an object")?;
+    let workspace = object.get("version").and_then(serde_json::Value::as_str)
+        == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION);
     const REQUIRED: &[&str] = &[
         "version",
         "execution_mode",
@@ -205,15 +208,21 @@ pub fn parse_dependency_context(
         "runtime_cohort_sha256",
     ];
     if REQUIRED.iter().any(|field| !object.contains_key(*field))
+        || (workspace && !object.contains_key("source_directories"))
         || object.keys().any(|field| {
             !REQUIRED.contains(&field.as_str())
                 && field != "dependency_dirs"
                 && field != "loader_dirs"
                 && field != "generated_root"
+                && !(workspace && field == "source_directories")
         })
         || !matches!(
             object.get("version").and_then(serde_json::Value::as_str),
-            Some(DEPENDENCY_CONTEXT_VERSION | CANONICAL_DEPENDENCY_CONTEXT_VERSION)
+            Some(
+                DEPENDENCY_CONTEXT_VERSION
+                    | CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                    | CANONICAL_WORKSPACE_CONTEXT_VERSION
+            )
         )
     {
         return Err("dependency_context requires supported exact fields".to_owned());
@@ -334,7 +343,7 @@ pub fn parse_dependency_context(
         *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
-    if text("version")? == CANONICAL_DEPENDENCY_CONTEXT_VERSION {
+    if workspace || text("version")? == CANONICAL_DEPENDENCY_CONTEXT_VERSION {
         if text("toolchain_root")? != rabs_sandbox::layout::TOOLCHAIN
             || text("compiler")? != "/__rabs/toolchain/bin/rustc"
         {
@@ -342,6 +351,38 @@ pub fn parse_dependency_context(
                 "canonical dependency context requires retained package inputs and its fixed compiler"
                     .to_owned(),
             );
+        }
+        if workspace {
+            if text("source_root")? != rabs_sandbox::layout::WORKSPACE {
+                return Err("workspace execution requires the complete canonical workspace".into());
+            }
+            let source_directories = object
+                .get("source_directories")
+                .and_then(serde_json::Value::as_array)
+                .filter(|paths| paths.len() <= MAX_GENERATED_DIRECTORIES)
+                .ok_or("source_directories must be a bounded array")?
+                .iter()
+                .map(|path| {
+                    path.as_str()
+                        .map(str::to_owned)
+                        .ok_or("source_directories entries must be strings".to_owned())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            return DependencyExecContext::new_canonical_workspace_execution(
+                execution_mode,
+                text("cwd")?,
+                text("out_dir")?,
+                dirs,
+                loader_dirs,
+                artifact_roots,
+                generated_root,
+                source_directories,
+                generated_directories,
+                env,
+                runtime_cohort,
+            )
+            .map(Some)
+            .map_err(|error| error.to_string());
         }
         return DependencyExecContext::new_canonical_cargo_with_generated(
             execution_mode,
@@ -1026,6 +1067,8 @@ fn execute_canonical_inner(
     // excluding a file from a shared Cargo input/output directory.
     let mut dependency_inputs = None;
     let mut generated_inputs = None;
+    let mut workspace_inputs = None;
+    let mut retained_package = None;
     let prepared_spec = (|| -> Result<_, String> {
         if let Some(context) = &request.dependency_context {
             let source = source.ok_or("dependency execution lacks its source owner")?;
@@ -1069,6 +1112,10 @@ fn execute_canonical_inner(
                     execution_home,
                 )
                 .map_err(|error| error.to_string())?;
+            workspace_inputs = source
+                .prepare_dependency_source(request.request_id, context, &mut spec)
+                .map_err(|error| format!("workspace input preparation: {error}"))?;
+            retained_package = Some(source_root);
             generated_inputs = source
                 .prepare_dependency_generated(request.request_id, context, &mut spec)
                 .map_err(|error| format!("generated input preparation: {error}"))?;
@@ -1229,18 +1276,34 @@ fn execute_canonical_inner(
         }
     };
     let launch = if let Some(context) = &request.dependency_context {
-        rabs_sandbox::dependency_context::build_dependency_argv(
-            context,
-            &spec,
-            dependency_runtime
-                .as_ref()
-                .expect("dependency execution has a retained runtime"),
-            dependency_support
-                .as_ref()
-                .expect("dependency execution has its own isolation proof"),
-            &request.program,
-            &request.args,
-        )
+        let runtime = dependency_runtime
+            .as_ref()
+            .expect("dependency execution has a retained runtime");
+        let support = dependency_support
+            .as_ref()
+            .expect("dependency execution has its own isolation proof");
+        if context.workspace_execution_only() {
+            rabs_sandbox::dependency_context::build_workspace_dependency_argv(
+                context,
+                &spec,
+                runtime,
+                support,
+                &request.program,
+                &request.args,
+                retained_package
+                    .as_deref()
+                    .expect("dependency execution retains its sealed package"),
+            )
+        } else {
+            rabs_sandbox::dependency_context::build_dependency_argv(
+                context,
+                &spec,
+                runtime,
+                support,
+                &request.program,
+                &request.args,
+            )
+        }
     } else {
         build_canonical_argv(
             &spec,
@@ -1302,13 +1365,18 @@ fn execute_canonical_inner(
         )));
         return exec_error(request.request_id);
     }
-    if let Some(inputs) = &generated_inputs
-        && let Err(error) = inputs.verify()
-    {
-        let _ = control.retain_outputs(Err(format!(
-            "generated inputs changed before execution: {error}"
-        )));
-        return exec_error(request.request_id);
+    for (kind, inputs) in [
+        ("workspace", workspace_inputs.as_ref()),
+        ("generated", generated_inputs.as_ref()),
+    ] {
+        if let Some(inputs) = inputs
+            && let Err(error) = inputs.verify()
+        {
+            let _ = control.retain_outputs(Err(format!(
+                "{kind} inputs changed before execution: {error}"
+            )));
+            return exec_error(request.request_id);
+        }
     }
     // Verification may have spent the remaining lease or execution budget.
     // Do not start a compiler after that final input-preparation boundary.
@@ -1480,6 +1548,9 @@ fn execute_canonical_inner(
                         )
                     })
                     .and_then(|captured| {
+                        if let Some(inputs) = &workspace_inputs {
+                            inputs.verify()?;
+                        }
                         if let Some(inputs) = &generated_inputs {
                             inputs.verify()?;
                         }

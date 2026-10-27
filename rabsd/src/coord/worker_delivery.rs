@@ -25,7 +25,8 @@ use rabs_sandbox::artifact_tree::{
 };
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use rabs_sandbox::dependency_context::{
-    CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -90,6 +91,7 @@ pub(crate) fn negotiated_dependency_context(
     let version = match context.get("version").and_then(Value::as_str) {
         Some(DEPENDENCY_CONTEXT_VERSION) => DEPENDENCY_CONTEXT_VERSION,
         Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) => CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+        Some(CANONICAL_WORKSPACE_CONTEXT_VERSION) => CANONICAL_WORKSPACE_CONTEXT_VERSION,
         _ => return Err(invalid("unsupported dependency execution context")),
     };
     require(
@@ -2080,6 +2082,27 @@ mod tests {
     #[test]
     fn canonical_dependency_delivery_selects_the_exact_version_before_dispatch() {
         for (version, offered, execution_mode, accepted) in [
+            (
+                CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]),
+                "metadata",
+                true,
+            ),
+            (
+                CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]),
+                "rlib",
+                true,
+            ),
+            (
+                CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                json!([
+                    DEPENDENCY_CONTEXT_VERSION,
+                    CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                ]),
+                "metadata",
+                false,
+            ),
             (
                 CANONICAL_DEPENDENCY_CONTEXT_VERSION,
                 json!([CANONICAL_DEPENDENCY_CONTEXT_VERSION]),

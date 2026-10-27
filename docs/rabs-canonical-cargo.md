@@ -1172,9 +1172,52 @@ and release-authorization gates. `remote-offer`, `rabsd-remote-dependency-admitt
 and the worker's durable receipts distinguish real dispatch from local fallback.
 An incompatible worker or a refused action does not gain publication authority;
 fallback after dispatch still requires verified completion of remote execution.
-Workspace/primary crates continue under Cargo's normal compilation and freshness
-rules. Selected project executors never authorize local dependency cache capture
+Selected project executors never authorize local dependency cache capture
 or replay, even after a worker refusal.
+
+### Execute selected workspace libraries remotely
+
+The same configured worker pool can execute the project's own library units,
+including primary packages and local path dependencies, during canonical
+`check`, `build`, and the library-compilation portions of `test`. The coordinator
+matches each request to Cargo's retained selected unit graph: package, source,
+crate name/type, compilation mode, target and features must agree. Ordinary
+wrapper requests cannot enable this path by supplying canonical-looking names.
+
+This uses the separately negotiated `canonical-workspace-exec-v1` context.
+Workers must advertise that version and the requested `metadata` or `rlib`
+mode. Matching binaries and the worker setup above are sufficient; there is no
+new cache-enablement switch. Unsupported units continue through Cargo's
+ordinary compiler path. Native linking, procedural-macro consumers, test
+harnesses and incremental compiler state remain outside this per-library worker
+profile; build scripts execute through the existing canonical Cargo driver.
+
+Each accepted workspace request executes afresh. Its identity binds the entire
+retained workspace, including sibling files and empty directories, generated
+`OUT_DIR` contents and Cargo run records, exact Rust dependency artifacts,
+toolchain, runtime and original compiler environment. Relative source arguments,
+the workspace working directory, `CARGO_PRIMARY_PACKAGE` and the project's lint
+settings remain intact. Cargo's entirely empty `LD_LIBRARY_PATH` is preserved
+and modeled as zero search entries. Empty components in nonempty colon-separated
+lists still refuse because they can introduce current-directory lookup.
+The worker reconstructs an independent read-only source
+tree at `/__rabs/workspace`; generated files retain their separate read-only
+mount. It never receives the coordinator socket, Cargo home or mutable CAS.
+
+A complete authenticated result remains owned by that one request. After
+compiler/descendant drain, the coordinator verifies its output manifest and
+input generations, waits for the wrapper to acknowledge that exact manifest,
+then installs only the declared outputs. Canonical dep-info bytes stay unchanged;
+validation and freshness checks resolve their logical paths through the driver's
+retained backing mappings. Source, dependency, toolchain or coordinator changes
+refuse installation. A repeated request needs another fresh execution, and
+uncertain execution cannot authorize concurrent local fallback.
+
+Workspace results do not create an action-cache publication, serving entry,
+differential sample or replayable transcript index. This adds remote execution
+for eligible workspace libraries without granting workspace action-cache reuse.
+Cargo still owns command execution and freshness; the optional private target
+reuse described below has its existing independent rules and limits.
 
 ### Persistent reuse and command results
 

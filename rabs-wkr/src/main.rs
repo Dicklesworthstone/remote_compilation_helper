@@ -20,7 +20,8 @@ use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
 use rabs_sandbox::dependency_context::{
-    CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
 };
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
@@ -1845,7 +1846,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
-        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION],
+        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION],
         "dependency_execution_modes": report.dependency_modes.iter()
             .map(|mode| mode.as_str()).collect::<Vec<_>>(),
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
@@ -2223,10 +2224,16 @@ fn dependency_context_selection(
         Some(selected)
             if matches!(
                 selected.as_str(),
-                Some(DEPENDENCY_CONTEXT_VERSION | CANONICAL_DEPENDENCY_CONTEXT_VERSION)
+                Some(
+                    DEPENDENCY_CONTEXT_VERSION
+                        | CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                        | CANONICAL_WORKSPACE_CONTEXT_VERSION
+                )
             ) =>
         {
-            let version = if selected.as_str() == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) {
+            let version = if selected.as_str() == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION) {
+                CANONICAL_WORKSPACE_CONTEXT_VERSION
+            } else if selected.as_str() == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) {
                 CANONICAL_DEPENDENCY_CONTEXT_VERSION
             } else {
                 DEPENDENCY_CONTEXT_VERSION
