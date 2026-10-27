@@ -5701,6 +5701,122 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
 }
 
 #[test]
+fn clean_overlay_disk_budget_diagnostic_survives_saturated_ui_and_unconfirmed_completion() {
+    use super::transfer_orchestration::{
+        CompileUiState, capture_disk_budget_diagnostic,
+        ensure_remote_process_setup_after_completion,
+    };
+
+    let budget = rch_common::BuildDiskBudget {
+        max_growth_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+        min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+    };
+    let pipeline = TransferPipeline::new(
+        PathBuf::from("/tmp/disk-diagnostic-capture"),
+        "disk-diagnostic-capture".into(),
+        "abc123".into(),
+        TransferConfig::default(),
+    )
+    .with_disk_budget(Some(budget));
+    let setup_marker = pipeline.remote_process_setup_marker();
+    let deadline = setup_marker.strip_suffix("_IDENTITY_UNAVAILABLE").unwrap();
+    let failure = serde_json::json!({
+        "reason": "monitor_unavailable", "free_bytes": 0, "growth_bytes": 0,
+        "max_growth_bytes": budget.max_growth_bytes, "min_free_bytes": budget.min_free_bytes,
+        "started": true, "detail": "output scan deadline", "peak_output_bytes": 423_714_816,
+    });
+    let line = format!("{deadline}_DISK_BUDGET:{failure}\n");
+    let usage = serde_json::json!({
+        "max_growth_bytes": budget.max_growth_bytes, "min_free_bytes": budget.min_free_bytes,
+        "peak_output_bytes": 423_714_816, "peak_growth_bytes": 280_694_784,
+        "complete": false, "exit_code": null,
+    });
+    let usage_line = format!("{deadline}_DISK_USAGE:{usage}\n");
+
+    let mut state = CompileUiState::new(Some(CompilationProgress::new(
+        rch_common::ui::OutputContext::Machine,
+        "worker-diagnostic",
+        true,
+    )));
+    state.output = "x".repeat(256 * 1024);
+    let mut captured = String::new();
+    let mut emitted = String::new();
+    // Exercise the production cap first: ordinary output is retained for
+    // analysis but cannot grow the already full progress preview.
+    state.capture_stderr("ordinary overflow\n", &mut captured, false, |line| {
+        emitted.push_str(line);
+    });
+    assert!(state.output_truncated);
+    assert_eq!(state.output.len(), 256 * 1024);
+    assert!(emitted.is_empty());
+
+    let observed =
+        capture_disk_budget_diagnostic(&pipeline, &line, &mut state, &mut captured, |line| {
+            emitted.push_str(line)
+        })
+        .expect("the exact attempt-bound failure must reach the uncapped diagnostic sink");
+    assert!(observed.started);
+    assert_eq!(observed.reason, "monitor_unavailable");
+    assert_eq!(observed.detail, "output scan deadline");
+    assert_eq!(observed.peak_output_bytes, Some(423_714_816));
+    assert_eq!(emitted, line);
+    assert_eq!(captured, format!("ordinary overflow\n{line}"));
+    assert_eq!(state.output.len(), 256 * 1024);
+    assert!(state.output_truncated);
+
+    assert!(pipeline.parse_disk_usage_marker(&usage_line).is_none());
+    assert!(pipeline.parse_disk_usage_exit_code(&usage_line).is_none());
+    for ordinary in [&usage_line[..], "RCH_SCOPED_COMPLETION_UNCONFIRMED\n"] {
+        state.capture_stderr(ordinary, &mut captured, false, |line| {
+            emitted.push_str(line);
+        });
+    }
+    let result = rch_common::CommandResult {
+        exit_code: 255,
+        stdout: String::new(),
+        stderr: captured.clone(),
+        duration_ms: 0,
+    };
+    let error = ensure_remote_process_setup_after_completion(&pipeline, &result, None).unwrap_err();
+    assert!(is_remote_execution_unconfirmed(&error));
+    assert!(format!("{error:#}").contains("SSH execution exit 255"));
+    assert!(
+        error
+            .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            .is_none(),
+        "diagnostic retention must not turn unknown containment into a confirmed disk result"
+    );
+    assert_eq!(remote_failure_exit_code(&error), EXIT_BUILD_ERROR);
+    assert_eq!(
+        classify_remote_pipeline_failure(&error),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    assert!(
+        remote_pipeline_failure_summary(&WorkerId::new("worker-diagnostic"), &error)
+            .contains("ownership retained for recovery")
+    );
+    assert!(captured.contains(&line));
+    assert_eq!(emitted, line);
+
+    let other = TransferPipeline::new(
+        PathBuf::from("/tmp/disk-diagnostic-capture"),
+        "disk-diagnostic-capture".into(),
+        "abc123".into(),
+        TransferConfig::default(),
+    )
+    .with_disk_budget(Some(budget));
+    let retained_before = captured.clone();
+    assert!(
+        capture_disk_budget_diagnostic(&other, &line, &mut state, &mut captured, |line| emitted
+            .push_str(line),)
+        .is_none(),
+        "another attempt's nonce cannot become trusted disk-failure evidence"
+    );
+    assert_eq!(captured, retained_before);
+    assert_eq!(emitted, line);
+}
+
+#[test]
 fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
     let worker = WorkerId::new("hz3");
     for started in [false, true] {
