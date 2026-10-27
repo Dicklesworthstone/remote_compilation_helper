@@ -43,6 +43,10 @@ include!(concat!(env!("OUT_DIR"), "/nested/empty/../value.rs"));
 pub fn value() -> (&'static str, &'static str, &'static str, &'static str) {
     (SHARED, GENERATED, workspace_leaf_fixture::VALUE, BUILD_TOKEN)
 }
+#[cfg(feature = "native_fixture")]
+extern "C" { fn rabs_workspace_native_answer() -> u32; }
+#[cfg(feature = "native_fixture")]
+pub fn native_answer() -> u32 { unsafe { rabs_workspace_native_answer() } }
 "#;
 
 // A transparent wrapper around Cargo's selected real compiler. No simulated
@@ -944,6 +948,303 @@ fn actual_all_target_metadata_units(
     }
 }
 
+fn actual_native_workspace_archive(
+    root: &Path,
+    workspace: &Path,
+    wrapper: &Path,
+    toolchain: &Path,
+    facts: &ToolchainFacts,
+    runtime: &TypedDigest,
+) {
+    let record = root.join("records-native");
+    let layout = Layout {
+        workspace: workspace.to_owned(),
+        target: root.join("target-native"),
+        cargo_home: root.join("cargo-home"),
+        home: root.join("home"),
+        toolchain: toolchain.to_owned(),
+    };
+    let selected_command = || {
+        let mut command = cargo(&layout, wrapper, &record);
+        command
+            .args([
+                "build",
+                "--offline",
+                "--locked",
+                "--jobs=1",
+                "--package",
+                MEMBER,
+                "--lib",
+                "--features=native_fixture",
+                "--target-dir",
+            ])
+            .arg(&layout.target);
+        command
+    };
+    let graph: serde_json::Value = serde_json::from_slice(
+        &checked(selected_command().args(["--unit-graph", "-Z", "unstable-options"])).stdout,
+    )
+    .unwrap();
+    checked(&mut selected_command());
+    let actual = Recorded::load(&record.join(MEMBER));
+    let canonical = actual.canonical(&layout);
+    let plan =
+        plan_canonical_workspace_execution(canonical.request(), facts.host_triple().unwrap())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "actual Cargo native workspace request refused: {error}; {:?}",
+                    canonical.argv
+                )
+            });
+    assert_selected_unit(&graph, &layout, &plan, "build");
+    assert_eq!(
+        plan.source_kind,
+        DependencySourceKind::WorkspaceExecutionOnly
+    );
+    assert_eq!(
+        plan.invocation.native_libs,
+        ["static=rabs_workspace_answer"]
+    );
+    let generated = plan.generated_root.as_ref().unwrap();
+    let native_root = format!("{generated}/native");
+    assert!(
+        plan.invocation
+            .lib_search
+            .contains(&format!("native={native_root}"))
+    );
+    assert!(
+        plan.dependency_dirs
+            .iter()
+            .all(|directory| directory != &native_root)
+    );
+    let physical_generated = layout.physical(generated);
+    let archive = physical_generated.join("native/librabs_workspace_answer.a");
+    let archive_virtual = plan.generated_input_virtual_path("native/librabs_workspace_answer.a");
+    let directory_virtual = plan.generated_input_virtual_path("native");
+    // The real build script ran at physical fixture paths. Translate only the
+    // fixture's owned prefixes for the pure canonical key, just as for argv/env.
+    let script = layout.canonical(
+        &fs::read_to_string(physical_generated.parent().unwrap().join("run/stdout")).unwrap(),
+    );
+    assert!(script.contains(&format!("cargo::rustc-link-search=native={native_root}")));
+    let directories = observed_directories(&layout, &plan);
+    let externs = plan
+        .externs
+        .iter()
+        .filter_map(|external| match external {
+            PlannedExtern::File { path, .. } => Some(ExternFact {
+                path: path.clone(),
+                content_digest: object_file(&layout.physical(path)),
+            }),
+            PlannedExtern::Toolchain { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let key = |candidate: &DependencyActionPlan, inputs: &ActionInputManifest| {
+        remote_workspace_execution_key(
+            candidate,
+            facts,
+            &directories,
+            inputs,
+            Some(script.as_bytes()),
+            "/__rabs/toolchain",
+            &facts.sysroot_root_digest.bytes,
+            runtime,
+        )
+    };
+    let physical_output = layout.physical(&plan.out_dir);
+    let output = |suffix: &str| {
+        physical_output.join(
+            plan.output_names()
+                .into_iter()
+                .find(|name| name.ends_with(suffix))
+                .unwrap(),
+        )
+    };
+    let mut previous: Option<(ActionInputManifest, Vec<u8>, Vec<u8>, TypedDigest)> = None;
+    for answer in [37, 41] {
+        if answer == 41 {
+            // Rebuild outside every captured source/generated root, then replace
+            // only the static archive. This isolates archive-byte identity from
+            // source edits or stale intermediate C/object files in OUT_DIR.
+            let source = root.join("native-next.c");
+            let object = root.join("native-next.o");
+            let replacement = root.join("native-next.a");
+            fs::write(
+                &source,
+                "unsigned int rabs_workspace_native_answer(void) { return 41; }\n",
+            )
+            .unwrap();
+            checked(
+                Command::new("cc")
+                    .args(["-c", "-fPIC", "-o"])
+                    .arg(&object)
+                    .arg(&source),
+            );
+            checked(
+                Command::new("ar")
+                    .arg("crsD")
+                    .arg(&replacement)
+                    .arg(&object),
+            );
+            fs::copy(replacement, &archive).unwrap();
+        }
+        let inputs = observed_inputs(&layout, &plan);
+        let identity = key(&plan, &inputs).unwrap();
+        let replay = actual.replay(root, &format!("native-{answer}"));
+        assert!(
+            replay.status.success(),
+            "{}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        let dep_info = fs::read(output(".d")).unwrap();
+        let rlib = fs::read(output(".rlib")).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&dep_info).contains("librabs_workspace_answer.a"),
+            "the oracle must cover a real native read absent from rustc dep-info"
+        );
+        if let Some((old_inputs, old_dep_info, old_rlib, old_key)) = &previous {
+            assert_eq!(
+                inputs.directory_enumerations,
+                old_inputs.directory_enumerations
+            );
+            let changed = inputs
+                .inputs
+                .iter()
+                .zip(&old_inputs.inputs)
+                .filter(|(current, old)| current != old)
+                .map(|(current, old)| {
+                    assert_eq!(current.virtual_path, old.virtual_path);
+                    current.virtual_path.as_bytes()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                changed,
+                [archive_virtual.as_bytes()],
+                "only the retained archive changed"
+            );
+            assert_eq!(
+                &dep_info, old_dep_info,
+                "dep-info does not close native archive reads"
+            );
+            assert_ne!(&rlib, old_rlib, "real bundled object bytes must change");
+            assert_ne!(
+                &identity.action_key, old_key,
+                "archive bytes must bind fresh execution identity"
+            );
+        }
+        assert!(
+            live_dependency_key(
+                &plan,
+                facts,
+                &externs,
+                &directories,
+                Some(script.as_bytes()),
+                &inputs
+            )
+            .is_err()
+        );
+        assert!(
+            canonical_cargo_dependency_key(
+                &plan,
+                facts,
+                &externs,
+                &directories,
+                Some(script.as_bytes()),
+                &inputs
+            )
+            .is_err()
+        );
+        assert!(
+            remote_dependency_key(
+                &plan,
+                facts,
+                &directories,
+                &inputs,
+                Some(script.as_bytes()),
+                "/__rabs/toolchain",
+                &facts.sysroot_root_digest.bytes,
+                runtime
+            )
+            .is_err()
+        );
+
+        let mut missing = inputs.clone();
+        missing
+            .inputs
+            .retain(|input| input.virtual_path.as_bytes() != archive_virtual.as_bytes());
+        missing
+            .directory_enumerations
+            .iter_mut()
+            .find(|entry| entry.virtual_path.as_bytes() == directory_virtual.as_bytes())
+            .unwrap()
+            .entries
+            .retain(|entry| entry.as_bytes() != b"librabs_workspace_answer.a");
+        assert!(
+            key(&plan, &missing).is_err(),
+            "a complete tree without the selected archive must refuse"
+        );
+        let mut missing_tree = inputs.clone();
+        missing_tree
+            .directory_enumerations
+            .retain(|entry| entry.virtual_path.as_bytes() != directory_virtual.as_bytes());
+        assert!(
+            key(&plan, &missing_tree).is_err(),
+            "native lookup requires retained directory evidence"
+        );
+        let mut foreign = plan.clone();
+        *foreign
+            .invocation
+            .lib_search
+            .iter_mut()
+            .find(|path| path.starts_with("native="))
+            .unwrap() = "native=/__rabs/out/cargo/debug/build/other-package/out/native".into();
+        assert!(
+            key(&foreign, &inputs).is_err(),
+            "another package's OUT_DIR is not owned by this request"
+        );
+        let mut metadata = plan.clone();
+        metadata.invocation.emit = vec!["dep-info".into(), "metadata".into()];
+        metadata.outputs = rabs_key::output_derivation::derive_workspace_output_declarations(
+            &metadata.invocation,
+            &metadata.host_triple,
+        )
+        .unwrap();
+        assert!(
+            key(&metadata, &inputs).is_err(),
+            "native inputs cannot use metadata isolation"
+        );
+
+        let main = root.join(format!("native-main-{answer}.rs"));
+        let binary = root.join(format!("native-linked-{answer}"));
+        fs::write(&main, format!("fn main() {{ let answer = workspace_member_fixture::native_answer(); assert_eq!(answer, {answer}); println!(\"{{answer}}\"); }}\n")).unwrap();
+        let mut link = Command::new(toolchain.join("bin/rustc"));
+        link.arg(&main)
+            .args(["--edition=2021", "--crate-name=native_behavior", "--extern"])
+            .arg(format!("{MEMBER}={}", output(".rmeta").display()))
+            .arg("--extern")
+            .arg(format!("{MEMBER}={}", output(".rlib").display()))
+            .arg(format!("-Ldependency={}", physical_output.display()))
+            .arg("-o")
+            .arg(&binary);
+        for directory in &plan.dependency_dirs {
+            link.arg(format!(
+                "-Ldependency={}",
+                layout.physical(directory).display()
+            ));
+        }
+        // Cargo emits detached metadata: pass both the complete rmeta and
+        // its corresponding rlib for final linking, exactly as a downstream Rust
+        // consumer must. No native search path is supplied, so the workspace
+        // rlib must really contain the retained archive's object bytes.
+        checked(&mut link);
+        assert_eq!(
+            checked(&mut Command::new(&binary)).stdout,
+            format!("{answer}\n").as_bytes()
+        );
+        previous = Some((inputs, dep_info, rlib, identity.action_key));
+    }
+}
+
 #[test]
 fn actual_cargo_workspace_units_preserve_execution_and_refuse_dependency_cache_authority() {
     let scratch = tempfile::tempdir().unwrap();
@@ -983,6 +1284,7 @@ edition = "2021"
 [features]
 default = ["fixture_feature"]
 fixture_feature = []
+native_fixture = []
 [dependencies]
 workspace_leaf_fixture = { path = "../leaf" }
 [lints]
@@ -1070,6 +1372,20 @@ fn main() {
         "pub const GENERATED: &str = \"real generated value\";\n").unwrap();
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rustc-env=WORKSPACE_FIXTURE_BUILD_TOKEN=real-cargo-build-script");
+    if std::env::var_os("CARGO_FEATURE_NATIVE_FIXTURE").is_some() {
+        let native = out.join("native");
+        std::fs::create_dir(&native).unwrap();
+        let source = native.join("answer.c");
+        let object = native.join("answer.o");
+        let archive = native.join("librabs_workspace_answer.a");
+        std::fs::write(&source, "unsigned int rabs_workspace_native_answer(void) { return 37; }\n").unwrap();
+        assert!(std::process::Command::new("cc").args(["-c", "-fPIC", "-o"])
+            .arg(&object).arg(&source).status().unwrap().success());
+        assert!(std::process::Command::new("ar").arg("crsD")
+            .arg(&archive).arg(&object).status().unwrap().success());
+        println!("cargo::rustc-link-search=native={}", native.display());
+        println!("cargo::rustc-link-lib=static=rabs_workspace_answer");
+    }
 }
 "#,
     )
@@ -1389,4 +1705,5 @@ fn main() {
         }
     }
     actual_all_target_metadata_units(root, &workspace, &wrapper, &toolchain, &facts, &runtime);
+    actual_native_workspace_archive(root, &workspace, &wrapper, &toolchain, &facts, &runtime);
 }
