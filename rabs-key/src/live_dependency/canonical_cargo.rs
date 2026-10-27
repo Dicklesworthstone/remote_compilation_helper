@@ -41,6 +41,11 @@ const ISOLATION_PROFILE: &str = "canonical-cargo-external-metadata-v1: \
     namespace; coordinator-only publication with the ordinary evidence gates";
 
 pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "workspace execution-only plans cannot use canonical dependency authority".into(),
+        ));
+    }
     let mut presented = plan
         .execution_env
         .iter()
@@ -105,6 +110,9 @@ pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
                 return Err(LiveRefusal::NotDependencySource(plan.package_root.clone()));
             }
             directory_source(CARGO_HOME, &plan.package_root, true)?
+        }
+        DependencySourceKind::WorkspaceExecutionOnly => {
+            return Err(LiveRefusal::NotDependencySource(plan.package_root.clone()));
         }
     };
     if kind != plan.source_kind || root != plan.source_root || name != plan.source_dir_name {

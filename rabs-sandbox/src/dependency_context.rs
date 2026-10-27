@@ -29,6 +29,10 @@ pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v8";
 /// a compiler view. Version 4 binds every generated subdirectory, including
 /// empty directories, alongside the sealed files at canonical Cargo OUT_DIR.
 pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v4";
+/// Fresh execution of a Cargo-selected workspace library. This separately
+/// negotiated context carries the complete retained workspace directory tree;
+/// it grants no dependency-cache or workspace-result publication authority.
+pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-v1";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -253,8 +257,10 @@ pub struct DependencyArtifactRoot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyExecContext {
     canonical_cargo: bool,
+    workspace_execution_only: bool,
     execution_mode: DependencyExecutionMode,
     source_root: String,
+    source_directories: Vec<String>,
     generated_root: Option<String>,
     generated_directories: Vec<String>,
     cwd: String,
@@ -431,6 +437,7 @@ impl DependencyExecContext {
     ) -> Result<Self, DependencyContextError> {
         Self::new_in_profile(
             false,
+            false,
             source_root,
             cwd,
             toolchain_root,
@@ -500,6 +507,7 @@ impl DependencyExecContext {
     ) -> Result<Self, DependencyContextError> {
         Self::new_in_profile(
             true,
+            false,
             source_root,
             cwd,
             layout::TOOLCHAIN.to_owned(),
@@ -515,9 +523,81 @@ impl DependencyExecContext {
         .map(|context| context.with_execution_mode(mode))
     }
 
+    /// Execute one selected canonical workspace library against the complete
+    /// retained workspace, exact dependency candidates and optional generated
+    /// input tree. The caller must hold the driver's selected-unit capability;
+    /// neither this path validator nor a peer's request establishes membership.
+    /// CARGO_PRIMARY_PACKAGE and lint settings remain the compiler's own inputs.
+    ///
+    /// Source and generated inventories contain every relative subdirectory,
+    /// including empty ones, in sorted order with the roots excluded. Workers
+    /// independently pair them with the transferred files before constructing
+    /// private read-only backings. No source mount exposes the outer Cargo
+    /// target, Cargo home, control socket or uncaptured host workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_canonical_workspace_execution(
+        mode: DependencyExecutionMode,
+        cwd: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        generated_root: Option<String>,
+        source_directories: Vec<String>,
+        generated_directories: Vec<String>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        validate_generated_directories(&source_directories)
+            .map_err(|_| invalid("workspace source directory inventory is invalid"))?;
+        let mut context = Self::new_in_profile(
+            true,
+            true,
+            layout::WORKSPACE.to_owned(),
+            cwd,
+            layout::TOOLCHAIN.to_owned(),
+            format!("{}/bin/rustc", layout::TOOLCHAIN),
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            generated_root,
+            env,
+            runtime_cohort_sha256,
+        )?;
+        // The process cwd and Cargo's package directory must actually exist in
+        // the complete source image, not merely lie beneath its lexical root.
+        let manifest = context
+            .env
+            .iter()
+            .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+            .map(|(_, value)| value.as_str())
+            .expect("validated workspace manifest directory");
+        for path in [context.cwd.as_str(), manifest] {
+            if path != layout::WORKSPACE
+                && path
+                    .strip_prefix(&format!("{}/", layout::WORKSPACE))
+                    .is_none_or(|relative| {
+                        source_directories
+                            .binary_search_by(|candidate| candidate.as_str().cmp(relative))
+                            .is_err()
+                    })
+            {
+                return Err(invalid(
+                    "workspace cwd or package directory is absent from its source inventory",
+                ));
+            }
+        }
+        context.source_directories = source_directories;
+        context
+            .with_generated_directories(generated_directories)
+            .map(|context| context.with_execution_mode(mode))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_in_profile(
         canonical_cargo: bool,
+        workspace_execution_only: bool,
         source_root: String,
         cwd: String,
         toolchain_root: String,
@@ -536,9 +616,22 @@ impl DependencyExecContext {
                     .find(|(key, _)| key == name)
                     .map(|(_, value)| value.as_str())
             };
-            if ![layout::WORKSPACE, layout::CARGO_HOME]
-                .iter()
-                .any(|root| canonical_descendant(&source_root, root))
+            let source_allowed = if workspace_execution_only {
+                source_root == layout::WORKSPACE
+            } else {
+                [layout::WORKSPACE, layout::CARGO_HOME]
+                    .iter()
+                    .any(|root| canonical_descendant(&source_root, root))
+            };
+            let manifest_allowed = if workspace_execution_only {
+                environment("CARGO_MANIFEST_DIR").is_some_and(|directory| {
+                    directory == layout::WORKSPACE
+                        || canonical_descendant(directory, layout::WORKSPACE)
+                })
+            } else {
+                environment("CARGO_MANIFEST_DIR") == Some(cwd.as_str())
+            };
+            if !source_allowed
                 || toolchain_root != layout::TOOLCHAIN
                 || generated_root
                     .as_ref()
@@ -552,7 +645,7 @@ impl DependencyExecContext {
                 })
                 || environment("HOME") != Some(layout::HOME)
                 || environment("CARGO_HOME") != Some(layout::CARGO_HOME)
-                || environment("CARGO_MANIFEST_DIR") != Some(cwd.as_str())
+                || !manifest_allowed
             {
                 return Err(invalid(
                     "canonical dependency context has an invalid Cargo layout",
@@ -561,7 +654,7 @@ impl DependencyExecContext {
         }
         let valid_alias = |value: &str| {
             if canonical_cargo {
-                canonical_alias(value)
+                canonical_alias(value) || (workspace_execution_only && value == layout::WORKSPACE)
             } else {
                 valid_alias(value)
             }
@@ -693,8 +786,10 @@ impl DependencyExecContext {
         env.sort_by(|left, right| left.0.cmp(&right.0));
         let context = Self {
             canonical_cargo,
+            workspace_execution_only,
             execution_mode: DependencyExecutionMode::Metadata,
             source_root,
+            source_directories: Vec::new(),
             generated_root,
             generated_directories: Vec::new(),
             cwd,
@@ -714,7 +809,9 @@ impl DependencyExecContext {
 
     /// Exact wire version selected for this validated path profile.
     pub const fn version(&self) -> &'static str {
-        if self.canonical_cargo {
+        if self.workspace_execution_only {
+            CANONICAL_WORKSPACE_CONTEXT_VERSION
+        } else if self.canonical_cargo {
             CANONICAL_DEPENDENCY_CONTEXT_VERSION
         } else {
             DEPENDENCY_CONTEXT_VERSION
@@ -724,6 +821,12 @@ impl DependencyExecContext {
     /// Whether names came from a canonical Cargo planning namespace.
     pub const fn canonical_cargo(&self) -> bool {
         self.canonical_cargo
+    }
+
+    /// Whether this context permits only request-owned workspace execution.
+    /// It must never be interpreted as dependency cache or publication proof.
+    pub const fn workspace_execution_only(&self) -> bool {
+        self.workspace_execution_only
     }
 
     /// Select the independently negotiated output class after path validation.
@@ -742,6 +845,11 @@ impl DependencyExecContext {
     /// Original immutable package/snapshot root.
     pub fn source_root(&self) -> &str {
         &self.source_root
+    }
+    /// Complete sorted workspace source subdirectories, root excluded. This
+    /// inventory is explicit only in the workspace execution-only profile.
+    pub fn source_directories(&self) -> &[String] {
+        &self.source_directories
     }
     /// Original captured build-script output tree, when present.
     pub fn generated_root(&self) -> Option<&str> {
@@ -982,6 +1090,67 @@ pub fn build_dependency_argv(
     program: &str,
     args: &[String],
 ) -> Result<NamespaceLaunch, IsolationError> {
+    if context.workspace_execution_only() {
+        return Err(IsolationError::InvalidSpec {
+            reason: "workspace execution requires its retained source-owner package anchor".into(),
+        });
+    }
+    build_dependency_argv_with_package_anchor(context, spec, runtime, support, program, args, None)
+}
+
+/// Compile a workspace execution namespace after the source owner has rebuilt
+/// its complete directory topology in separate private storage. The source
+/// mount now names that rebuilt tree, while read-only dependency candidates
+/// remain anchored in the original sealed transfer bundle.
+///
+/// `retained_package` must come from the live source owner's verified
+/// dependency_root, never from a wire field or a guessed spec path. The caller
+/// must retain that owner and independently protect every exact source and
+/// artifact mount through completion. This only separates those two owned
+/// backings; it grants no authority to read arbitrary coordinator paths.
+#[allow(clippy::too_many_arguments)]
+pub fn build_workspace_dependency_argv(
+    context: &DependencyExecContext,
+    spec: &CanonicalNamespaceSpec,
+    runtime: &RetainedRuntime,
+    support: &DependencyIsolationSupport,
+    program: &str,
+    args: &[String],
+    retained_package: &Path,
+) -> Result<NamespaceLaunch, IsolationError> {
+    if !context.workspace_execution_only()
+        || !retained_package.is_absolute()
+        || retained_package.starts_with("/__rabs")
+        || retained_package.file_name() != Some(std::ffi::OsStr::new("package"))
+        || !std::fs::symlink_metadata(retained_package).is_ok_and(|metadata| metadata.is_dir())
+        || !std::fs::canonicalize(retained_package)
+            .is_ok_and(|canonical| canonical == retained_package)
+    {
+        return Err(IsolationError::InvalidSpec {
+            reason: "workspace execution lacks its ordinary retained package anchor".into(),
+        });
+    }
+    build_dependency_argv_with_package_anchor(
+        context,
+        spec,
+        runtime,
+        support,
+        program,
+        args,
+        Some(retained_package),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dependency_argv_with_package_anchor(
+    context: &DependencyExecContext,
+    spec: &CanonicalNamespaceSpec,
+    runtime: &RetainedRuntime,
+    support: &DependencyIsolationSupport,
+    program: &str,
+    args: &[String],
+    retained_package: Option<&Path>,
+) -> Result<NamespaceLaunch, IsolationError> {
     support.require_mode(context.execution_mode())?;
     let refuse = || IsolationError::InvalidSpec {
         reason: "dependency namespace differs from its validated context".to_owned(),
@@ -1016,8 +1185,8 @@ pub fn build_dependency_argv(
         if source.backing.file_name() != Some(std::ffi::OsStr::new("package")) {
             return Err(refuse());
         }
-        let retained = source
-            .backing
+        let retained = retained_package
+            .unwrap_or(&source.backing)
             .parent()
             .ok_or_else(refuse)?
             .join(&root.prefix);
@@ -1144,6 +1313,342 @@ mod tests {
 
     const CANONICAL_SOURCE: &str = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
     const CANONICAL_OUTPUT: &str = "/__rabs/out/cargo/debug/deps";
+
+    fn workspace_context(
+        mode: DependencyExecutionMode,
+        source_directories: Vec<String>,
+        generated_root: Option<&str>,
+        generated_directories: Vec<String>,
+        artifacts: Vec<DependencyArtifactRoot>,
+    ) -> Result<DependencyExecContext, DependencyContextError> {
+        let mut env = vec![
+            ("HOME".into(), layout::HOME.into()),
+            ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+            (
+                "CARGO_MANIFEST_DIR".into(),
+                "/__rabs/workspace/member".into(),
+            ),
+            ("CARGO_PKG_NAME".into(), "member".into()),
+            ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+            ("ARBITRARY_COMPILE_INPUT".into(), "exact value".into()),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!("{CANONICAL_OUTPUT}:/__rabs/toolchain/lib"),
+            ),
+        ];
+        if let Some(root) = generated_root {
+            env.push(("OUT_DIR".into(), root.into()));
+        }
+        DependencyExecContext::new_canonical_workspace_execution(
+            mode,
+            layout::WORKSPACE.into(),
+            CANONICAL_OUTPUT.into(),
+            vec![CANONICAL_OUTPUT.into()],
+            Vec::new(),
+            artifacts,
+            generated_root.map(str::to_owned),
+            source_directories,
+            generated_directories,
+            env,
+            [0; 32],
+        )
+    }
+
+    fn workspace_directories() -> Vec<String> {
+        vec!["empty".into(), "member".into(), "member/src".into()]
+    }
+
+    #[test]
+    fn workspace_context_negotiates_complete_source_and_preserves_primary_member_environment() {
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            let context =
+                workspace_context(mode, workspace_directories(), None, Vec::new(), Vec::new())
+                    .unwrap();
+            assert!(context.canonical_cargo());
+            assert!(context.workspace_execution_only());
+            assert_eq!(context.version(), CANONICAL_WORKSPACE_CONTEXT_VERSION);
+            assert_eq!(context.execution_mode(), mode);
+            assert_eq!(context.source_root(), layout::WORKSPACE);
+            assert_eq!(context.cwd(), layout::WORKSPACE);
+            assert_eq!(context.source_directories(), workspace_directories());
+            assert!(
+                context
+                    .env()
+                    .contains(&("CARGO_PRIMARY_PACKAGE".into(), "1".into()))
+            );
+            assert!(
+                context
+                    .env()
+                    .contains(&("ARBITRARY_COMPILE_INPUT".into(), "exact value".into()))
+            );
+            assert!(context.env().contains(&(
+                "CARGO_MANIFEST_DIR".into(),
+                "/__rabs/workspace/member".into()
+            )));
+            assert!(
+                DependencyExecContext::new_canonical_cargo(
+                    mode,
+                    context.source_root.clone(),
+                    context.cwd.clone(),
+                    context.out_dir.clone(),
+                    context.dependency_dirs.clone(),
+                    context.loader_dirs.clone(),
+                    Vec::new(),
+                    context.env.clone(),
+                    [0; 32],
+                )
+                .is_err(),
+                "the old dependency version cannot mount the complete workspace"
+            );
+        }
+        let dependency = canonical_context();
+        assert!(!dependency.workspace_execution_only());
+        assert!(dependency.source_directories().is_empty());
+    }
+
+    #[test]
+    fn workspace_context_rejects_incomplete_source_topology_and_unowned_cargo_directories() {
+        for directories in [
+            Vec::new(),
+            vec!["member/src".into()],
+            vec!["member".into(), "member".into()],
+            vec!["member/src".into(), "member".into()],
+            vec!["/member".into()],
+            vec!["member".into(), "member/../escape".into()],
+            vec!["member".into(), "member//src".into()],
+            vec!["member".into(), "member/./src".into()],
+        ] {
+            assert!(
+                workspace_context(
+                    DependencyExecutionMode::Metadata,
+                    directories,
+                    None,
+                    Vec::new(),
+                    Vec::new()
+                )
+                .is_err()
+            );
+        }
+        let valid = workspace_context(
+            DependencyExecutionMode::Metadata,
+            workspace_directories(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        for (cwd, manifest) in [
+            ("/__rabs/workspace/absent", "/__rabs/workspace/member"),
+            ("/__rabs/workspace", "/__rabs/workspace/absent"),
+            ("/__rabs/workspace", "/__rabs/cargo-home/registry/package"),
+            ("/__rabs/workspace/../home", "/__rabs/workspace/member"),
+            ("/outside/workspace", "/__rabs/workspace/member"),
+        ] {
+            let mut env = valid.env.clone();
+            env.iter_mut()
+                .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+                .unwrap()
+                .1 = manifest.into();
+            assert!(
+                DependencyExecContext::new_canonical_workspace_execution(
+                    DependencyExecutionMode::Metadata,
+                    cwd.into(),
+                    valid.out_dir.clone(),
+                    valid.dependency_dirs.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    workspace_directories(),
+                    Vec::new(),
+                    env,
+                    [0; 32],
+                )
+                .is_err(),
+                "cwd={cwd}, manifest={manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_context_retains_empty_generated_roots_and_refuses_parentless_generated_dirs() {
+        const ROOT: &str = "/__rabs/out/cargo/debug/build/member-123/out";
+        let empty = workspace_context(
+            DependencyExecutionMode::Rlib,
+            workspace_directories(),
+            Some(ROOT),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(empty.generated_root(), Some(ROOT));
+        assert!(empty.generated_directories().is_empty());
+        let full = workspace_context(
+            DependencyExecutionMode::Rlib,
+            workspace_directories(),
+            Some(ROOT),
+            vec!["nested".into(), "nested/empty".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(full.generated_directories(), &["nested", "nested/empty"]);
+        assert_ne!(empty, full);
+        for (root, directories) in [
+            (None, vec!["nested".into()]),
+            (Some(ROOT), vec!["nested/empty".into()]),
+            (Some(ROOT), vec!["nested".into(), "nested".into()]),
+            (Some(CANONICAL_OUTPUT), Vec::new()),
+            (Some("/__rabs/workspace/generated"), Vec::new()),
+        ] {
+            assert!(
+                workspace_context(
+                    DependencyExecutionMode::Metadata,
+                    workspace_directories(),
+                    root,
+                    directories,
+                    Vec::new()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_namespace_keeps_dependency_files_anchored_to_the_original_sealed_owner() {
+        let owner = tempfile::tempdir().unwrap();
+        let original = owner.path().join("original/package");
+        let rebuilt = owner.path().join("rebuilt/package");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(rebuilt.join("member/src")).unwrap();
+        std::fs::create_dir(rebuilt.join("empty")).unwrap();
+        let artifact = original
+            .parent()
+            .unwrap()
+            .join("dependencies/0000/libleaf.rmeta");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"retained exact dependency").unwrap();
+        let mut context = workspace_context(
+            DependencyExecutionMode::Metadata,
+            workspace_directories(),
+            None,
+            Vec::new(),
+            vec![DependencyArtifactRoot {
+                path: CANONICAL_OUTPUT.into(),
+                prefix: "dependencies/0000".into(),
+            }],
+        )
+        .unwrap();
+        let mut spec = context
+            .namespace(
+                &original,
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
+        spec.ro_binds
+            .iter_mut()
+            .find(|bind| bind.visible == Path::new(layout::WORKSPACE))
+            .unwrap()
+            .backing = rebuilt.clone();
+        let visible = Path::new(CANONICAL_OUTPUT).join("libleaf.rmeta");
+        spec.ro_binds.push(Bind::new(&artifact, &visible));
+        let support = fixture_support(context.execution_mode());
+        assert!(
+            build_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err(),
+            "workspace cannot borrow implicit dependency anchoring"
+        );
+        let launch = build_workspace_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &[],
+            &original,
+        )
+        .unwrap();
+        assert!(launch.argv.windows(3).any(|args| args[0] == "--ro-bind"
+            && args[1] == artifact.as_os_str()
+            && args[2] == visible.as_os_str()));
+        assert!(launch.argv.windows(3).any(|args| args[0] == "--ro-bind"
+            && args[1] == rebuilt.as_os_str()
+            && args[2] == layout::WORKSPACE));
+        let mut substituted = spec.clone();
+        substituted
+            .ro_binds
+            .iter_mut()
+            .find(|bind| bind.visible == visible)
+            .unwrap()
+            .backing = rebuilt
+            .parent()
+            .unwrap()
+            .join("dependencies/0000/libleaf.rmeta");
+        assert!(
+            build_workspace_dependency_argv(
+                &context,
+                &substituted,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &original
+            )
+            .is_err()
+        );
+        assert!(
+            build_workspace_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &rebuilt
+            )
+            .is_err(),
+            "a real but different anchor cannot reassign artifact custody"
+        );
+        let alias = owner.path().join("alias");
+        std::os::unix::fs::symlink(original.parent().unwrap(), &alias).unwrap();
+        assert!(
+            build_workspace_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &alias.join("package")
+            )
+            .is_err()
+        );
+        assert!(
+            build_workspace_dependency_argv(
+                &canonical_context(),
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &original
+            )
+            .is_err()
+        );
+    }
 
     fn canonical_context() -> DependencyExecContext {
         DependencyExecContext::new_canonical_cargo(

@@ -44,8 +44,54 @@ pub struct CompilationUnitGraph {
     /// Number of Cargo-selected root units.
     pub roots: usize,
     source_paths: Vec<String>,
+    library_units: Vec<CompilationLibraryUnit>,
     project_executors: bool,
     doctests: bool,
+}
+
+/// One ordinary library compilation selected by the captured Cargo graph.
+/// The driver must bind its source to retained mounts before using it to admit
+/// workspace execution. This record never grants result-cache authority.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompilationLibraryUnit {
+    package_id: String,
+    source_path: String,
+    crate_name: String,
+    crate_types: Vec<String>,
+    mode: String,
+    platform: Option<String>,
+    features: Vec<String>,
+}
+
+impl CompilationLibraryUnit {
+    /// Cargo's opaque selected package identity.
+    pub fn package_id(&self) -> &str {
+        &self.package_id
+    }
+    /// Exact normalized source path returned by Cargo.
+    pub fn source_path(&self) -> &str {
+        &self.source_path
+    }
+    /// Rust compiler spelling of the selected target name.
+    pub fn crate_name(&self) -> &str {
+        &self.crate_name
+    }
+    /// Selected ordinary Rust library output kinds.
+    pub fn crate_types(&self) -> &[String] {
+        &self.crate_types
+    }
+    /// Cargo selected check or build mode, excluding test harnesses.
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+    /// Explicit target platform, or Cargo's host platform.
+    pub fn platform(&self) -> Option<&str> {
+        self.platform.as_deref()
+    }
+    /// Sorted selected Cargo features.
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
 }
 
 impl CompilationUnitGraph {
@@ -54,6 +100,12 @@ impl CompilationUnitGraph {
     #[must_use]
     pub fn source_paths(&self) -> &[String] {
         &self.source_paths
+    }
+
+    /// Selected ordinary library compilations, retaining distinct features,
+    /// modes and target platforms even when several units share one source.
+    pub fn library_units(&self) -> &[CompilationLibraryUnit] {
+        &self.library_units
     }
 
     /// Project code can run while Cargo compiles this graph. A cache endpoint
@@ -234,6 +286,7 @@ pub fn validate_compilation_unit_graph(
 
     let mut packages = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
+    let mut library_units = BTreeSet::new();
     let mut project_executors = command == CompilationCommand::Test;
     let mut doctests = false;
     let mut dependencies = Vec::with_capacity(units.len());
@@ -299,6 +352,36 @@ pub fn validate_compilation_unit_graph(
                 "duplicate Cargo unit feature",
             )?;
         }
+        let crate_types = unit["target"]["crate_types"]
+            .as_array()
+            .expect("validated crate types");
+        let target_kinds = unit["target"]["kind"]
+            .as_array()
+            .expect("validated target kinds");
+        if class == TargetClass::Ordinary
+            && matches!(mode, "check" | "build")
+            && crate_types
+                .iter()
+                .all(|kind| matches!(kind.as_str(), Some("lib" | "rlib")))
+            && target_kinds
+                .iter()
+                .all(|kind| matches!(kind.as_str(), Some("lib" | "rlib")))
+        {
+            let mut crate_types = crate_types
+                .iter()
+                .map(|kind| kind.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            crate_types.sort();
+            library_units.insert(CompilationLibraryUnit {
+                package_id: text(&unit["pkg_id"], "package identity")?.to_owned(),
+                source_path: source.to_owned(),
+                crate_name: text(&unit["target"]["name"], "target name")?.replace('-', "_"),
+                crate_types,
+                mode: mode.to_owned(),
+                platform: unit["platform"].as_str().map(str::to_owned),
+                features: feature_names.into_iter().map(str::to_owned).collect(),
+            });
+        }
         let edges = unit["dependencies"]
             .as_array()
             .filter(|edges| edges.len() <= MAX_UNITS)
@@ -347,6 +430,7 @@ pub fn validate_compilation_unit_graph(
         packages: packages.len(),
         roots: selected.len(),
         source_paths: source_paths.into_iter().collect(),
+        library_units: library_units.into_iter().collect(),
         project_executors,
         doctests,
     })
@@ -438,6 +522,52 @@ mod tests {
         let report = validate_compilation_unit_graph(&graph, CompilationCommand::Check).unwrap();
         assert_eq!((report.units, report.packages, report.roots), (2, 1, 1));
         assert_eq!(report.source_paths().len(), 1);
+        assert_eq!(report.library_units().len(), 2);
+        assert_ne!(
+            report.library_units()[0].mode(),
+            report.library_units()[1].mode()
+        );
+        assert_ne!(
+            report.library_units()[0].features(),
+            report.library_units()[1].features()
+        );
+    }
+
+    #[test]
+    fn workspace_execution_membership_retains_only_selected_ordinary_libraries() {
+        let mut selected = graph();
+        selected["units"][0]["target"]["name"] = json!("project-library");
+        selected["units"][0]["features"] = json!(["z-last", "a-first"]);
+        let report = validate_compilation_unit_graph(&selected, CompilationCommand::Check).unwrap();
+        let unit = report
+            .library_units()
+            .iter()
+            .find(|unit| unit.crate_name() == "project_library")
+            .unwrap();
+        assert_eq!(unit.source_path(), "/__rabs/workspace/app/src/lib.rs");
+        assert_eq!(unit.features(), ["a-first", "z-last"]);
+        assert_eq!(unit.crate_types(), ["lib"]);
+        for (kind, crate_type, mode) in [
+            ("bin", "bin", "build"),
+            ("proc-macro", "proc-macro", "build"),
+            ("custom-build", "bin", "build"),
+            ("lib", "lib", "test"),
+            ("lib", "cdylib", "build"),
+        ] {
+            let mut excluded = graph();
+            excluded["units"][0]["target"]["kind"] = json!([kind]);
+            excluded["units"][0]["target"]["crate_types"] = json!([crate_type]);
+            excluded["units"][0]["mode"] = json!(mode);
+            excluded["units"][1]["mode"] = json!("build");
+            let report =
+                validate_compilation_unit_graph(&excluded, CompilationCommand::Build).unwrap();
+            assert_eq!(
+                report.library_units().len(),
+                1,
+                "{kind}/{crate_type}/{mode}"
+            );
+            assert_eq!(report.library_units()[0].crate_name(), "dependency");
+        }
     }
 
     #[test]

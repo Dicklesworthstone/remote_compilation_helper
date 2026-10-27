@@ -19,8 +19,9 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::TypedDigest;
 
 use super::{
-    DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveDependencyKey, LiveRefusal,
-    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path_in_profile, within,
+    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
+    LiveDependencyKey, LiveRefusal, PlannedExtern, ToolchainFacts, live_dependency_key,
+    plain_path_in_profile, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
@@ -158,6 +159,7 @@ pub fn remote_dependency_output_class(
 pub fn remote_dependency_isolation_policy(
     plan: &DependencyActionPlan,
 ) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    reject_workspace_cache_authority(plan)?;
     if plan.canonical_cargo {
         super::canonical_cargo::canonical_layout(plan)?;
         let (canonical_profile, execution_profile) =
@@ -379,9 +381,32 @@ pub fn remote_dependency_shape(
     directories: &[DependencyDirectoryFact],
     toolchain_root: &str,
 ) -> Result<(), RemoteDependencyRefusal> {
+    reject_workspace_cache_authority(plan)?;
     if plan.canonical_cargo {
         super::canonical_cargo::canonical_layout(plan)?;
     }
+    remote_execution_shape(plan, directories, toolchain_root)
+}
+
+fn reject_workspace_cache_authority(
+    plan: &DependencyActionPlan,
+) -> Result<(), RemoteDependencyRefusal> {
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "workspace execution-only plans have no remote dependency-cache authority".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Shared mechanical execution constraints. The public class-specific entry
+/// points validate their source/profile authority before reaching this helper.
+pub(super) fn remote_execution_shape(
+    plan: &DependencyActionPlan,
+    directories: &[DependencyDirectoryFact],
+    toolchain_root: &str,
+) -> Result<(), RemoteDependencyRefusal> {
     if directories.len() != plan.dependency_dirs.len()
         || plan
             .dependency_dirs
@@ -460,7 +485,7 @@ fn validate_generated_root(
 /// Resolve every explicit extern to its exact keyed candidate. The ordinary
 /// local planner labels a bare extern as toolchain-provided but does not prove
 /// that resolution cannot execute a proc macro, so this remote class refuses it.
-fn remote_extern_facts(
+pub(super) fn remote_extern_facts(
     plan: &DependencyActionPlan,
     directories: &[DependencyDirectoryFact],
 ) -> Result<Vec<ExternFact>, RemoteDependencyRefusal> {
@@ -562,6 +587,30 @@ pub fn remote_dependency_key(
             inputs,
         )?
     };
+    key.descriptor.sandbox_semantic_policy = remote_dependency_isolation_policy(plan)?;
+    bind_remote_execution_inputs(
+        &mut key,
+        plan,
+        toolchain_root,
+        retained_toolchain_sha256,
+        runtime,
+    )?;
+    Ok(key)
+}
+
+/// Bind the retained toolchain, exact archive placements and measured runtime
+/// without assigning source-class authority. Workspace callers replace the
+/// complete environment and execution policy with their separate contract.
+pub(super) fn bind_remote_execution_inputs(
+    key: &mut LiveDependencyKey,
+    plan: &DependencyActionPlan,
+    toolchain_root: &str,
+    retained_toolchain_sha256: &[u8; 32],
+    runtime: &TypedDigest,
+) -> Result<(), RemoteDependencyRefusal> {
+    if runtime.domain != RUNTIME_COHORT_DOMAIN {
+        return Err(RemoteDependencyRefusal::RuntimeIdentity);
+    }
     let output_class = remote_dependency_output_class(&plan.invocation)?;
     if output_class == RemoteDependencyOutputClass::Rlib {
         // An assembler `.incbin` can mention the original dependency/output
@@ -611,7 +660,6 @@ pub fn remote_dependency_key(
         .str("toolchain-dataset-v1")
         .bytes(retained_toolchain_sha256);
     key.descriptor.toolchain = compute(REMOTE_TOOLCHAIN_DOMAIN, &retained_toolchain.finish());
-    key.descriptor.sandbox_semantic_policy = remote_dependency_isolation_policy(plan)?;
     let codegen = |name: &str| {
         plan.invocation
             .codegen
@@ -649,7 +697,7 @@ pub fn remote_dependency_key(
     .contract_digest();
     key.action_key = compute_action_key(&key.descriptor).final_key;
     key.descriptor_digest = descriptor_digest(&descriptor_canonical_bytes(&key.descriptor));
-    Ok(key)
+    Ok(())
 }
 
 #[cfg(test)]
