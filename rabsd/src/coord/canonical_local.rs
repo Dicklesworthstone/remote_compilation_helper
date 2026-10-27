@@ -1,13 +1,13 @@
 //! Local canonical Cargo execution connected to the coordinator's rustc cache.
 //!
-//! This explicit profile runs a selected Cargo check or build offline and locked against
+//! This explicit profile runs a selected Cargo check, build or test offline and locked against
 //! captured inputs and a captured toolchain. Cargo itself runs at canonical
 //! paths, so unit hashes and rustc arguments are stable across checkouts. A
 //! fresh operation-scoped socket admits only rustc requests; the persistent
 //! CAS and the ordinary daemon socket are never visible to the build.
 //!
 //! The selected Cargo unit graph identifies active build scripts and procedural
-//! macros. Their presence disables local compiler-result authority for the whole
+//! macros. Their presence, or a test command, disables local compiler-result authority for the whole
 //! operation; eligible dependency caching requires isolated workers. Pure graphs
 //! retain the existing evidence-gated metadata lane; archive codegen requires an
 //! isolated worker. Workspace crates and unsupported rustc invocations still
@@ -55,6 +55,7 @@ use target_state::{TargetCacheConfig, TargetState};
 const PROFILE_VERSION: &str = "canonical-compile-local-v1";
 const CARGO: &str = "/__rabs/toolchain/bin/cargo";
 const RUSTC: &str = "/__rabs/toolchain/bin/rustc";
+const RUSTDOC: &str = "/__rabs/toolchain/bin/rustdoc";
 const TARGET: &str = "/__rabs/out/cargo";
 const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
@@ -300,7 +301,7 @@ impl Profile {
         cwd
     }
 
-    fn compilation_args(&self) -> io::Result<Vec<String>> {
+    fn compilation_prefix(&self) -> io::Result<Vec<String>> {
         let mut args = match &self.selection {
             Some(selection) => selection.cargo_arguments(self.command)?,
             None if self.command == CompilationCommand::Check => {
@@ -320,6 +321,34 @@ impl Profile {
         Ok(args)
     }
 
+    fn compilation_args(&self) -> io::Result<Vec<String>> {
+        let mut args = self.compilation_prefix()?;
+        if let Some(selection) = &self.selection {
+            args.extend(selection.runtime_arguments(self.command)?);
+        }
+        Ok(args)
+    }
+
+    fn graph_args(&self) -> io::Result<Vec<String>> {
+        let mut args = self.compilation_prefix()?;
+        // These are Cargo arguments. Harness arguments after `--` must never
+        // swallow the nonexecuting graph switch or alter the planning command.
+        args.extend([
+            "--unit-graph".into(),
+            "-Z".into(),
+            "unstable-options".into(),
+        ]);
+        Ok(args)
+    }
+
+    fn no_run(&self) -> bool {
+        self.command == CompilationCommand::Test
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.no_run)
+    }
+
     fn source_specification(&self) -> io::Result<Value> {
         let mut source = json!({"manifest":self.manifest});
         if let Some(vendor) = &self.vendor {
@@ -328,12 +357,17 @@ impl Profile {
         if let Some(home) = &self.cargo_home_source {
             source["cargo_home_source"] = json!(home);
         }
+        let mut environment =
+            json!({"CARGO_INCREMENTAL":"0", "CARGO_TARGET_DIR":TARGET, "RUSTC":RUSTC});
+        if self.command == CompilationCommand::Test {
+            environment["RUSTDOC"] = json!(RUSTDOC);
+        }
         Ok(json!({
             "kind":"canonical-exec", "request_id":1, "program":CARGO,
             "args":self.compilation_args()?, "toolchain_source":self.toolchain_root,
             "cargo_source":source,
             "command_context":{"version":"env-cwd-v1", "cwd":self.cwd(),
-                "env":{"CARGO_INCREMENTAL":"0", "CARGO_TARGET_DIR":TARGET, "RUSTC":RUSTC}}
+                "env":environment}
         }))
     }
 }
@@ -462,6 +496,9 @@ pub fn run_profile_with_release(
         ("CARGO_INCREMENTAL".into(), "0".into()),
         ("RUSTC".into(), RUSTC.into()),
     ]);
+    if profile.command == CompilationCommand::Test {
+        plan.extra_env.push(("RUSTDOC".into(), RUSTDOC.into()));
+    }
     let mut spec = plan.to_spec().map_err(|error| invalid(error.to_string()))?;
     spec.cwd = profile.cwd();
     // Source and HOME are immutable inside the build. In particular, mounting
@@ -488,12 +525,7 @@ pub fn run_profile_with_release(
     // establish which build scripts or proc macros a selected check executes.
     // The unit-graph query does not compile/run units, and the cache endpoint
     // does not exist yet. Unsupported Cargo versions fail closed here.
-    let mut graph_args = compilation_args.clone();
-    graph_args.extend([
-        "--unit-graph".into(),
-        "-Z".into(),
-        "unstable-options".into(),
-    ]);
+    let graph_args = profile.graph_args()?;
     let planned = execute(
         &spec,
         &support,
@@ -513,6 +545,16 @@ pub fn run_profile_with_release(
     }
     let graph: Value = serde_json::from_reader(planned.stdout.reader()?)?;
     let graph = validate_compilation_unit_graph(&graph, profile.command)?;
+    if graph.contains_doctests() && !profile.no_run() {
+        let rustdoc = paths
+            .physical(Path::new(RUSTDOC))
+            .map_err(io::Error::other)?;
+        let metadata = fs::symlink_metadata(rustdoc)?;
+        require(
+            metadata.is_file() && metadata.mode() & 0o111 != 0,
+            "selected doctests require the captured ordinary executable bin/rustdoc",
+        )?;
+    }
     for path in graph.source_paths() {
         let path = Path::new(path);
         require(
@@ -668,6 +710,8 @@ pub fn run_profile_with_release(
         "command":profile.command.as_str(), "namespace":"canonical",
         "cache_scope":"external-dependency-metadata-and-worker-rlib",
         "private_target_state":private_target_state,
+        "test_execution":profile.command == CompilationCommand::Test && !profile.no_run(),
+        "test_result_cache":false,
         "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
         "selected_units":graph.units, "selected_packages":graph.packages,
         "selected_roots":graph.roots})
@@ -698,16 +742,20 @@ pub fn run_profile_with_release(
         "canonical coordinator did not drain cleanly",
     )?;
     eprintln!("{}", receipt.to_json_line());
-    if output.status.success()
+    if (output.status.success()
+        || (profile.command == CompilationCommand::Test && output.status.code().is_some()))
         && let Some(cache) = &target_state
     {
         // Retain state only after compiler, session, publication and coordinator
         // drain. Delivered files remain independent of this saved generation.
+        // A normal test failure can retain compiled artifacts too. Cargo and
+        // the tests execute again on the next request; no test outcome is saved.
         if let Err(error) = cache.capture(&target_root) {
             target_state_warning("capture", &error);
         }
     }
-    if output.status.success() && profile.command == CompilationCommand::Build {
+    if output.status.success() && (profile.command == CompilationCommand::Build || profile.no_run())
+    {
         // No Cargo process, wrapper session or materializer remains. Verify
         // the retained target mapping once more before moving its completed
         // tree to a fresh private output owner. Captured source, toolchain,
@@ -723,6 +771,7 @@ pub fn run_profile_with_release(
         eprintln!(
             "{}",
             json!({"kind":"canonical-build-completed", "version":PROFILE_VERSION,
+                "command":profile.command.as_str(), "tests_executed":false,
                 "canonical_target":TARGET, "target_directory":delivered})
         );
     }
@@ -759,8 +808,19 @@ impl TargetReuseContext<'_> {
         )?;
         let toolchain = super::worker_delivery::toolchain_identity(self.request)?
             .ok_or_else(|| invalid("private target requires a captured toolchain"))?;
-        let args = compatible_arguments(CARGO, self.args, CargoArtifactMode::Compilation)
-            .unwrap_or_else(|| self.args.to_vec());
+        let test_execution = self.args.first().is_some_and(|command| command == "test")
+            && !self
+                .args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| arg == "--no-run");
+        let mode = if test_execution {
+            CargoArtifactMode::TestExecution
+        } else {
+            CargoArtifactMode::Compilation
+        };
+        let args =
+            compatible_arguments(CARGO, self.args, mode).unwrap_or_else(|| self.args.to_vec());
         // Build scripts, procedural macros and LLVM's assembler can read
         // captured data without reporting it to Cargo or rustc dep-info.
         // Retiming a file cannot dirty a unit that never declared that file:
@@ -821,8 +881,8 @@ fn target_state_warning(stage: &str, error: &io::Error) {
 
 /// Move, rather than recopy, a fully drained target to a newly allocated private
 /// owner on the same filesystem. There is no caller-selected overwrite target
-/// and no retained copy of source or toolchain inputs. Only successful builds
-/// call this; check/error/cancellation paths keep temporary target ownership.
+/// and no retained copy of source or toolchain inputs. Successful builds and
+/// test --no-run calls use this; other paths keep temporary target ownership.
 fn retain_build_target(parent: &Path, target: &Path) -> io::Result<PathBuf> {
     private_directory(parent)?;
     require(
@@ -1232,13 +1292,115 @@ mod tests {
                 "1"
             ])
         );
-        for command in ["test", "run", "bench", "rustc", "clippy"] {
+        for command in ["run", "bench", "rustc", "clippy"] {
             assert!(serde_json::from_value::<Profile>(json!({
                 "version":PROFILE_VERSION, "command":command,
                 "source_root":"/source", "toolchain_root":"/toolchain",
                 "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
             })).is_err());
         }
+    }
+
+    #[test]
+    fn test_command_keeps_runtime_arguments_out_of_planning_and_after_driver_controls() {
+        let profile: Profile = serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "command":"test",
+            "source_root":"/source", "toolchain_root":"/toolchain",
+            "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap",
+            "jobs":3, "selection":{"packages":["app"], "test":["integration"],
+                "no_fail_fast":true, "test_filter":"selected test",
+                "test_args":["--exact", "--nocapture", "--config", "literal harness value", ""]}
+        }))
+        .unwrap();
+        let args = profile.compilation_args().unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            &args[..separator],
+            [
+                "test",
+                "--no-fail-fast",
+                "--package",
+                "app",
+                "--test",
+                "integration",
+                "selected test",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+                "/__rabs/workspace/Cargo.toml",
+                "--message-format=json",
+                "--jobs",
+                "3"
+            ]
+        );
+        assert_eq!(
+            &args[separator + 1..],
+            [
+                "--exact",
+                "--nocapture",
+                "--config",
+                "literal harness value",
+                ""
+            ]
+        );
+        let graph = profile.graph_args().unwrap();
+        assert_eq!(&graph[..separator], &args[..separator]);
+        assert_eq!(
+            &graph[separator..],
+            ["--unit-graph", "-Z", "unstable-options"]
+        );
+        assert!(!graph.iter().any(|arg| arg == "--" || arg == "--config"));
+        let request = profile.source_specification().unwrap();
+        assert_eq!(request["args"], json!(args));
+        assert_eq!(request["command_context"]["env"]["RUSTDOC"], RUSTDOC);
+        assert!(!profile.no_run());
+    }
+
+    #[test]
+    fn test_no_run_comes_from_explicit_selection_and_does_not_change_the_default_command() {
+        let mut profile: Profile = serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "command":"test",
+            "source_root":"/source", "toolchain_root":"/toolchain",
+            "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap",
+            "selection":{"no_run":true}
+        }))
+        .unwrap();
+        assert!(profile.no_run());
+        assert!(
+            profile
+                .compilation_args()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--no-run")
+        );
+        assert!(
+            profile
+                .graph_args()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--no-run")
+        );
+        profile.selection = None;
+        assert!(!profile.no_run());
+        assert_eq!(
+            &profile.compilation_args().unwrap()[..2],
+            ["test", "--offline"]
+        );
+        profile.command = CompilationCommand::Check;
+        assert_eq!(
+            &profile.compilation_args().unwrap()[..2],
+            ["check", "--lib"]
+        );
+        assert!(
+            profile.source_specification().unwrap()["command_context"]["env"]
+                .get("RUSTDOC")
+                .is_none()
+        );
+        profile.selection = Some(CompilationSelection {
+            doc: true,
+            ..CompilationSelection::default()
+        });
+        assert!(profile.compilation_args().is_err());
     }
 
     #[test]
@@ -1595,6 +1757,54 @@ mod tests {
             check.key(),
             original,
             "check and codegen source policies are separate"
+        );
+    }
+
+    #[test]
+    fn private_target_tests_reuse_compiled_state_across_no_run_and_runtime_arguments() {
+        let mut tests = ReuseKeyFixture::new();
+        tests.args[0] = "test".into();
+        tests.closed_dependency_execution = true;
+        tests.spec.env.push(("RUSTDOC".into(), RUSTDOC.into()));
+        tests.args.push("--no-run".into());
+        let compiled = tests.key();
+
+        tests.args.pop();
+        assert_eq!(
+            tests.key(),
+            compiled,
+            "running tests may reuse their compiled state"
+        );
+        tests.args.extend([
+            "selected test".into(),
+            "--".into(),
+            "--exact".into(),
+            "--no-run".into(),
+        ]);
+        assert_eq!(
+            tests.key(),
+            compiled,
+            "a literal harness --no-run is not Cargo's mode"
+        );
+        *tests.args.last_mut().unwrap() = "--nocapture".into();
+        assert_eq!(
+            tests.key(),
+            compiled,
+            "test runtime choices do not change compilation"
+        );
+
+        tests.source = reuse_source(b"changed test source", b"manifest", None);
+        assert_ne!(
+            tests.key(),
+            compiled,
+            "test execution requires exact captured source"
+        );
+        tests.source = ReuseKeyFixture::new().source;
+        tests.args.insert(1, "--doc".into());
+        assert_ne!(
+            tests.key(),
+            compiled,
+            "doc selection retains its separate target family"
         );
     }
 

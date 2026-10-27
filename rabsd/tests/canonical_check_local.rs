@@ -599,8 +599,10 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     );
     let (code, events, output) = run(owner.path(), 103, &profile);
     assert_eq!(code, 0, "{output}");
-    state(&events, "restored");
-    freshness(&output, true, false);
+    // Code generation may consume source bytes absent from Cargo dep-info
+    // (for example assembler .incbin inputs). Its private state is source-exact.
+    state(&events, "cold");
+    freshness(&output, false, false);
     delivered_build(owner.path(), 103, &events, 43);
 
     profile["selection"] = json!({"features":["extra"]});
@@ -614,7 +616,8 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     for number in [105, 106] {
         let (code, events, output) = run(owner.path(), number, &profile);
         assert_eq!(code, 0, "{output}");
-        state(&events, "restored");
+        // Metadata-only checks have their own source-edit compatibility family.
+        state(&events, if number == 105 { "cold" } else { "restored" });
         if number == 106 {
             freshness(&output, true, true);
         }
@@ -659,6 +662,274 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     state(&events, "restored");
     freshness(&output, true, true);
     delivered_build(owner.path(), 109, &events, 143);
+}
+
+fn assert_test_execution(events: &[Value], state: &str, executed: bool) {
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{events:?}");
+    assert_eq!(started[0]["command"], "test");
+    assert_eq!(started[0]["private_target_state"], state, "{events:?}");
+    assert_eq!(started[0]["test_execution"], executed);
+    assert_eq!(started[0]["test_result_cache"], false);
+    assert_eq!(started[0]["workspace_cache"], false);
+    assert!(
+        decisions(events, "execute").is_empty() && decisions(events, "hit").is_empty(),
+        "project test code must not obtain local cache authority: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event["decision"] == "served"),
+        "{events:?}"
+    );
+    if executed {
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "canonical-build-completed"),
+            "an executed test outcome must not be delivered as a compilation result"
+        );
+    }
+}
+
+fn test_harness_artifacts(output: &str) -> Vec<Value> {
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event["reason"] == "compiler-artifact"
+                && event["target"]["name"] == "canonical_app"
+                && event["profile"]["test"] == true
+                && event["executable"].is_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "missing selected test harness: {output}"
+    );
+    artifacts
+}
+
+/// Warm compiler artifacts may eliminate compilation, never a current test
+/// execution. A counter in the writable private target makes the same harness
+/// change from success to failure without changing any captured source byte.
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes delivered and canonical Cargo test harnesses"]
+fn canonical_cargo_tests_deliver_no_run_artifacts_and_execute_each_current_run() {
+    let (owner, mut profile) = native_fixture();
+    write(
+        &owner.path().join("source-a"),
+        "src/lib.rs",
+        r#"pub fn answer() -> u32 { canonical_dep::answer() }
+#[test]
+fn current_test_execution() {
+    use std::io::{BufRead, BufReader, Write};
+    assert_eq!(answer(), 42);
+    let mut stream = std::os::unix::net::UnixStream::connect(std::env::var_os("RABS_SOCKET_PATH").unwrap()).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    let mut replies = BufReader::new(stream.try_clone().unwrap());
+    writeln!(stream, "{{\"kind\":\"hello\",\"transport\":{{\"current\":1,\"minimum_compatible\":1}},\"application\":{{\"current\":1,\"minimum_compatible\":1}}}}").unwrap();
+    let mut reply = String::new();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("hello-ok"));
+    writeln!(stream, "{{\"kind\":\"rustc-request\",\"argv\":[\"/__rabs/toolchain/bin/rustc\",\"--crate-name=forged-test\"],\"cwd\":\"/__rabs/workspace\",\"env\":[],\"remote_protocol\":1,\"local_capture_allowed\":true}}").unwrap();
+    reply.clear();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("canonical-project-executors-require-isolated-dependency-execution"));
+    assert!(reply.contains("pass-through"));
+    assert!(!reply.contains("\"attempt\""));
+    let path = std::path::Path::new("/__rabs/out/cargo/test-executions");
+    let previous: u32 = match std::fs::read_to_string(path) {
+        Ok(value) => value.parse().unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("{error}"),
+    };
+    let current = previous + 1;
+    std::fs::write(path, current.to_string()).unwrap();
+    println!("CANONICAL_CURRENT_TEST_EXECUTION={current}");
+    assert!(current < 3, "current test execution must report its present failure");
+}
+"#,
+    );
+    profile["command"] = json!("test");
+    profile["target_cache"] = json!({"runtime_epoch":"native-tests-v1", "max_bytes":268435456});
+    profile["selection"] = json!({"lib":true, "no_run":true});
+
+    let (code, events, output) = run(owner.path(), 200, &profile);
+    assert_eq!(code, 0, "{output}");
+    assert_test_execution(&events, "cold", false);
+    assert!(
+        !output.contains("CANONICAL_CURRENT_TEST_EXECUTION="),
+        "{output}"
+    );
+    let completed = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-build-completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "{output}");
+    assert_eq!(completed[0]["command"], "test");
+    assert_eq!(completed[0]["tests_executed"], false);
+    assert_eq!(completed[0]["canonical_target"], "/__rabs/out/cargo");
+    let target = PathBuf::from(completed[0]["target_directory"].as_str().unwrap());
+    assert_eq!(fs::canonicalize(&target).unwrap(), target);
+    let delivery_owner = target.parent().unwrap();
+    assert_eq!(delivery_owner.parent().unwrap(), owner.path().join("ops"));
+    assert_eq!(
+        fs::read_dir(delivery_owner)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        [std::ffi::OsString::from("target")],
+        "test delivery must retain only the completed target"
+    );
+    assert!(!target.join("test-executions").exists());
+    let artifacts = test_harness_artifacts(&output);
+    assert_eq!(artifacts[0]["fresh"], false, "{output}");
+    let relative = Path::new(artifacts[0]["executable"].as_str().unwrap())
+        .strip_prefix("/__rabs/out/cargo")
+        .unwrap();
+    let harness = target.join(relative);
+    let metadata = fs::symlink_metadata(&harness).unwrap();
+    assert!(
+        metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o111 != 0,
+        "no-run must deliver the actual linked Cargo test harness"
+    );
+
+    // Exercise the delivered executable without running its test body, which
+    // needs the live canonical endpoint. Cargo's reported path, not a guessed
+    // target layout, identifies the harness.
+    let mut command = Command::new(&harness);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--list")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let listed = ManagedProcessGroup::spawn_command(command, Attribution::default())
+        .unwrap()
+        .wait_with_bounded_drain_budget(
+            &DrainLimits::new(owner.path().join("delivered-test-list")),
+            16 * 1024,
+            || started.elapsed() > Duration::from_secs(10),
+        )
+        .unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(listed.residual_group_members, 0);
+    let mut listing = String::new();
+    listed
+        .stdout
+        .reader()
+        .unwrap()
+        .read_to_string(&mut listing)
+        .unwrap();
+    assert!(
+        listing.contains("current_test_execution: test"),
+        "{listing}"
+    );
+    assert!(!target.join("test-executions").exists());
+
+    profile["selection"] = json!({"lib":true, "test_filter":"current_test_execution",
+        "test_args":["--nocapture","--test-threads=1"]});
+    for current in 1..=4 {
+        let (code, events, output) = run(owner.path(), 200 + current, &profile);
+        assert_eq!(code, if current < 3 { 0 } else { 101 }, "{output}");
+        assert_test_execution(&events, "restored", true);
+        assert_eq!(
+            test_harness_artifacts(&output)[0]["fresh"],
+            true,
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("CANONICAL_CURRENT_TEST_EXECUTION={current}")),
+            "fresh compilation state skipped or replayed a test execution: {output}"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                owner.path().join(
+                    "state/canonical-compile-v1/private-target-v1/seed/target/test-executions"
+                )
+            )
+            .unwrap(),
+            current.to_string(),
+            "both passing and failing test runs must retain only current private state"
+        );
+        assert!(!target.join("test-executions").exists());
+    }
+    assert_eq!(
+        fs::read_dir(owner.path().join("ops")).unwrap().count(),
+        1,
+        "only the explicitly delivered no-run target may survive"
+    );
+}
+
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain with rustdoc and RABS_CANONICAL_TEST_WRAPPER; executes actual Cargo documentation tests"]
+fn canonical_cargo_doctests_execute_with_captured_rustdoc_and_preserve_failures() {
+    let (owner, mut profile) = native_fixture();
+    let rustdoc = Path::new(profile["toolchain_root"].as_str().unwrap()).join("bin/rustdoc");
+    let metadata = fs::symlink_metadata(rustdoc).unwrap();
+    assert!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "the captured native toolchain must contain its real rustdoc"
+    );
+    write(
+        &owner.path().join("source-a"),
+        "src/lib.rs",
+        r#"/// The same compiled documentation example must execute on every request.
+///
+/// ```
+/// assert_eq!(canonical_app::answer(), 42);
+/// let path = std::path::Path::new("/__rabs/out/cargo/doctest-executions");
+/// let previous: u32 = match std::fs::read_to_string(path) {
+///     Ok(value) => value.parse().unwrap(),
+///     Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+///     Err(error) => panic!("{error}"),
+/// };
+/// let current = previous + 1;
+/// std::fs::write(path, current.to_string()).unwrap();
+/// assert!(current < 3, "current documentation test must report its present failure");
+/// ```
+pub fn answer() -> u32 { canonical_dep::answer() }
+"#,
+    );
+    profile["command"] = json!("test");
+    profile["selection"] = json!({"doc":true, "test_args":["--nocapture","--test-threads=1"]});
+    profile["target_cache"] = json!({"runtime_epoch":"native-doctests-v1", "max_bytes":268435456});
+    for current in 1..=3 {
+        let (code, events, output) = run(owner.path(), 210 + current, &profile);
+        assert_eq!(code, if current < 3 { 0 } else { 101 }, "{output}");
+        assert_test_execution(
+            &events,
+            if current == 1 { "cold" } else { "restored" },
+            true,
+        );
+        assert_eq!(
+            fs::read_to_string(owner.path().join(
+                "state/canonical-compile-v1/private-target-v1/seed/target/doctest-executions"
+            ))
+            .unwrap(),
+            current.to_string(),
+            "captured rustdoc must run this request's example despite warm compilation: {output}"
+        );
+        if current == 3 {
+            assert!(
+                output.contains("current documentation test must report its present failure"),
+                "{output}"
+            );
+        }
+    }
+    assert!(
+        fs::read_dir(owner.path().join("ops"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "documentation tests must not retain operation owners or deliver test outcomes"
+    );
 }
 
 fn read_bounded(path: &Path) -> Vec<u8> {

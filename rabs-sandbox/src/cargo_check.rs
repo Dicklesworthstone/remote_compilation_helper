@@ -1,4 +1,4 @@
-//! Admission of the units Cargo actually selected for a check or build.
+//! Admission of the units Cargo actually selected for a check, build or test.
 //!
 //! `cargo metadata` describes packages, including optional and development
 //! dependencies that a particular command will never execute. Cargo's nightly
@@ -17,7 +17,9 @@
 //! packages, features or targets. A graph containing project executors requires
 //! closed per-action worker execution for dependency caching: project code can
 //! access the wrapper endpoint, so its claimed local completions are not trusted
-//! compiler evidence. Unknown modes and test/program execution remain refused.
+//! compiler evidence. Every test operation requires the same boundary because
+//! its test executables and doctests can reach that endpoint too. Unknown modes
+//! and unrelated program commands remain refused; test outcomes are not cached.
 
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -43,6 +45,7 @@ pub struct CompilationUnitGraph {
     pub roots: usize,
     source_paths: Vec<String>,
     project_executors: bool,
+    doctests: bool,
 }
 
 impl CompilationUnitGraph {
@@ -59,6 +62,14 @@ impl CompilationUnitGraph {
     #[must_use]
     pub fn requires_closed_dependency_execution(&self) -> bool {
         self.project_executors
+    }
+
+    /// Cargo selected documentation tests, so execution must bind the captured
+    /// rustdoc executable as well as Cargo and rustc. This is a tool requirement,
+    /// not permission to reuse a previously observed documentation-test result.
+    #[must_use]
+    pub fn contains_doctests(&self) -> bool {
+        self.doctests
     }
 }
 
@@ -178,6 +189,10 @@ fn index(value: &Value, units: usize) -> io::Result<usize> {
 /// without running them. The same mode is refused for `Check`. The caller must
 /// bind this command to both its trusted Cargo graph query and final invocation;
 /// a graph from `cargo test` never establishes compile-only execution authority.
+/// `Test` additionally admits `doctest` units and marks the entire operation as
+/// executing project code, including a `--no-run` selection. The command's
+/// no-run behavior remains Cargo's responsibility; it cannot restore local
+/// compiler-result authority through a graph that happens to have no executors.
 ///
 /// The parser deliberately does not reconstruct Cargo's feature resolver or
 /// package selection from `cargo metadata`. Multiple units for the same package
@@ -219,7 +234,8 @@ pub fn validate_compilation_unit_graph(
 
     let mut packages = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
-    let mut project_executors = false;
+    let mut project_executors = command == CompilationCommand::Test;
+    let mut doctests = false;
     let mut dependencies = Vec::with_capacity(units.len());
     let mut dependency_count = 0_usize;
     for (unit_index, unit) in units.iter().enumerate() {
@@ -234,12 +250,29 @@ pub fn validate_compilation_unit_graph(
             TargetClass::Ordinary | TargetClass::ProcMacro => match command {
                 CompilationCommand::Check => matches!(mode, "check" | "build"),
                 CompilationCommand::Build => matches!(mode, "build" | "test"),
+                CompilationCommand::Test => matches!(mode, "build" | "test" | "doctest"),
             },
         };
         require(
             allowed_mode,
             "selected Cargo compilation contains an unsupported execution mode for its command",
         )?;
+        if mode == "doctest" {
+            // Cargo's documentation tests operate on library targets, including
+            // procedural macro libraries. A binary/test/example source cannot
+            // borrow this mode to select an unrelated rustdoc command.
+            let kinds = unit["target"]["kind"]
+                .as_array()
+                .expect("validated target kinds");
+            require(
+                kinds.iter().all(|kind| {
+                    kind.as_str()
+                        .is_some_and(|kind| LIBRARY_TYPES.contains(&kind) || kind == "proc-macro")
+                }),
+                "Cargo doctest mode requires a library target",
+            )?;
+            doctests = true;
+        }
         project_executors |= class != TargetClass::Ordinary;
         source_paths.insert(source.to_owned());
         require(unit["profile"].is_object(), "Cargo unit profile is missing")?;
@@ -315,6 +348,7 @@ pub fn validate_compilation_unit_graph(
         roots: selected.len(),
         source_paths: source_paths.into_iter().collect(),
         project_executors,
+        doctests,
     })
 }
 
@@ -383,6 +417,7 @@ mod tests {
         let report = validate_compilation_unit_graph(&graph(), CompilationCommand::Check).unwrap();
         assert_eq!((report.units, report.packages, report.roots), (2, 2, 1));
         assert!(!report.requires_closed_dependency_execution());
+        assert!(!report.contains_doctests());
         assert_eq!(
             report.source_paths(),
             [
@@ -472,7 +507,11 @@ mod tests {
 
     #[test]
     fn admitted_project_executors_require_closed_dependency_execution_for_the_whole_graph() {
-        for command in [CompilationCommand::Check, CompilationCommand::Build] {
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+        ] {
             let graph = script_graph(command);
             let report = validate_compilation_unit_graph(&graph, command).unwrap();
             assert!(report.requires_closed_dependency_execution());
@@ -492,7 +531,11 @@ mod tests {
 
     #[test]
     fn build_script_execution_requires_its_exact_compiled_producer() {
-        for command in [CompilationCommand::Check, CompilationCommand::Build] {
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+        ] {
             for mutation in [
                 "no-producer",
                 "package",
@@ -697,6 +740,58 @@ mod tests {
                     "{kind}: {field}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_graphs_require_closed_cache_authority_even_without_build_scripts_or_macros() {
+        let mut graph = graph();
+        graph["units"][1]["mode"] = json!("build");
+        for mode in ["build", "test"] {
+            graph["units"][0]["mode"] = json!(mode);
+            let report = validate_compilation_unit_graph(&graph, CompilationCommand::Test).unwrap();
+            assert!(report.requires_closed_dependency_execution());
+            assert!(!report.contains_doctests());
+            // The identical compile graph under cargo build does not authorize
+            // test execution and therefore retains its previous local policy.
+            let build = validate_compilation_unit_graph(&graph, CompilationCommand::Build).unwrap();
+            assert!(!build.requires_closed_dependency_execution());
+        }
+    }
+
+    #[test]
+    fn doctests_require_test_command_and_report_captured_rustdoc_requirement() {
+        let mut graph = graph();
+        graph["units"][0]["mode"] = json!("doctest");
+        graph["units"][1]["mode"] = json!("build");
+        for kind in ["lib", "rlib", "proc-macro"] {
+            graph["units"][0]["target"]["kind"] = json!([kind]);
+            graph["units"][0]["target"]["crate_types"] = json!([kind]);
+            let report = validate_compilation_unit_graph(&graph, CompilationCommand::Test).unwrap();
+            assert!(report.contains_doctests());
+            assert!(report.requires_closed_dependency_execution());
+            assert_eq!((report.units, report.packages, report.roots), (2, 2, 1));
+            for command in [CompilationCommand::Check, CompilationCommand::Build] {
+                assert!(validate_compilation_unit_graph(&graph, command).is_err());
+            }
+        }
+        for kind in ["bin", "example", "test", "bench", "custom-build"] {
+            graph["units"][0]["target"]["kind"] = json!([kind]);
+            graph["units"][0]["target"]["crate_types"] = json!(["bin"]);
+            assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Test).is_err());
+        }
+    }
+
+    #[test]
+    fn test_command_never_admits_unrelated_program_or_documentation_modes() {
+        let mut graph = graph();
+        graph["units"][1]["mode"] = json!("build");
+        for mode in ["check", "run", "doc", "run-custom-build", "future-mode"] {
+            graph["units"][0]["mode"] = json!(mode);
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Test).is_err(),
+                "{mode}"
+            );
         }
     }
 }

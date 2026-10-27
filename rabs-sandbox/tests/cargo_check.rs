@@ -7,7 +7,7 @@
 //! network. It does not qualify cache serving or namespace enforcement.
 #![cfg(target_os = "linux")]
 
-use CompilationCommand::{Build, Check};
+use CompilationCommand::{Build, Check, Test};
 use rabs_sandbox::cargo_check::{
     CompilationCommand, CompilationSelection, validate_compilation_unit_graph,
 };
@@ -146,6 +146,7 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             .env("HOME", self.owner.path().join("home"))
             .env("CARGO_HOME", self.owner.path().join("home/cargo"))
             .env("RUSTC", self.tools.join("bin/rustc"))
+            .env("RUSTDOC", self.tools.join("bin/rustdoc"))
             .env("CARGO_TARGET_DIR", self.owner.path().join("target"))
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_BUILD_JOBS", "1")
@@ -174,6 +175,15 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(graph["version"], 1);
         graph
+    }
+
+    fn test(&self, selection: &CompilationSelection) -> std::process::Output {
+        self.command()
+            .args(selection.cargo_arguments(Test).unwrap())
+            .args(["--offline", "--locked", "--message-format=json"])
+            .args(selection.runtime_arguments(Test).unwrap())
+            .output()
+            .unwrap()
     }
 
     fn assert_no_compilation_or_project_execution(&self) {
@@ -1045,4 +1055,186 @@ fn native_build_compiles_test_harnesses_without_executing_the_tests() {
         fs::read(fixture.root().join("test-was-executed")).unwrap(),
         b"ran"
     );
+}
+
+#[test]
+fn real_cargo_test_graph_distinguishes_doctests_and_no_run_without_execution() {
+    let fixture = Fixture::new();
+    let selection = CompilationSelection {
+        packages: vec!["ordinary".into()],
+        ..CompilationSelection::default()
+    };
+    let default =
+        validate_compilation_unit_graph(&fixture.graph(Test, selection.clone()), Test).unwrap();
+    assert!(default.requires_closed_dependency_execution());
+    assert!(default.contains_doctests());
+    let no_run = validate_compilation_unit_graph(
+        &fixture.graph(
+            Test,
+            CompilationSelection {
+                no_run: true,
+                ..selection.clone()
+            },
+        ),
+        Test,
+    )
+    .unwrap();
+    assert!(no_run.requires_closed_dependency_execution());
+    // Cargo emits the same units for --no-run, including doctests it will not
+    // execute. Runtime authority must follow the bound command selection, not
+    // an inference that missing graph nodes prove compilation-only behavior.
+    assert_eq!(no_run, default);
+    let docs = validate_compilation_unit_graph(
+        &fixture.graph(
+            Test,
+            CompilationSelection {
+                doc: true,
+                ..selection
+            },
+        ),
+        Test,
+    )
+    .unwrap();
+    assert!(docs.requires_closed_dependency_execution());
+    assert!(docs.contains_doctests());
+    fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
+fn native_cargo_test_no_run_filters_repeat_execution_and_preserves_failure() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root().join("ordinary/src/lib.rs"),
+        r#"
+pub const VALUE: u32 = 23;
+#[test]
+fn selected_success() {
+    let marker = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
+        .join("unit-test-runs");
+    let mut runs = std::fs::read(&marker).unwrap_or_default();
+    runs.push(b'u');
+    std::fs::write(marker, runs).unwrap();
+    println!("selected-test-stdout");
+    assert_eq!(VALUE, 23);
+}
+#[test]
+#[ignore]
+fn selected_failure() {
+    panic!("selected-test-failure");
+}
+"#,
+    )
+    .unwrap();
+    let mut selection = CompilationSelection {
+        packages: vec!["ordinary".into()],
+        lib: true,
+        no_run: true,
+        ..CompilationSelection::default()
+    };
+    let graph =
+        validate_compilation_unit_graph(&fixture.graph(Test, selection.clone()), Test).unwrap();
+    assert!(graph.requires_closed_dependency_execution());
+    assert!(!graph.contains_doctests());
+    let compiled = fixture.test(&selection);
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&compiled.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|message| message["reason"] == "compiler-artifact"
+                && message["profile"]["test"] == true
+                && message["executable"]
+                    .as_str()
+                    .is_some_and(|path| fs::metadata(path).is_ok_and(|meta| meta.len() > 0)))
+    );
+    let marker = fixture.owner.path().join("target/unit-test-runs");
+    assert!(!marker.exists(), "cargo test --no-run executed its harness");
+
+    selection.no_run = false;
+    selection.test_filter = Some("selected_success".into());
+    selection.test_args = vec!["--exact".into(), "--nocapture".into()];
+    for runs in [b"u".as_slice(), b"uu".as_slice()] {
+        let executed = fixture.test(&selection);
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        let stdout = String::from_utf8(executed.stdout).unwrap();
+        assert!(stdout.contains("selected-test-stdout"));
+        assert!(!stdout.contains("selected-test-failure"));
+        assert_eq!(fs::read(&marker).unwrap(), runs);
+        assert!(
+            stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|message| message["reason"] == "compiler-artifact"
+                    && message["target"]["name"] == "ordinary"
+                    && message["fresh"] == true),
+            "the test must execute even when Cargo reuses its compiled harness"
+        );
+    }
+    selection.test_filter = Some("selected_failure".into());
+    selection.test_args.push("--ignored".into());
+    let failed = fixture.test(&selection);
+    assert_eq!(failed.status.code(), Some(101));
+    assert!(
+        String::from_utf8_lossy(&failed.stdout).contains("selected-test-failure")
+            || String::from_utf8_lossy(&failed.stderr).contains("selected-test-failure")
+    );
+    assert_eq!(fs::read(marker).unwrap(), b"uu");
+}
+
+#[test]
+fn native_cargo_doctests_execute_again_on_fresh_builds_and_return_test_failure() {
+    let fixture = Fixture::new();
+    let source = fixture.root().join("ordinary/src/lib.rs");
+    fs::write(
+        &source,
+        r#"
+/// ```
+/// let marker = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
+///     .join("doctest-runs");
+/// let mut runs = std::fs::read(&marker).unwrap_or_default();
+/// runs.push(b'd');
+/// std::fs::write(marker, runs).unwrap();
+/// assert_eq!(ordinary::answer(), 23);
+/// ```
+pub fn answer() -> u32 { 23 }
+"#,
+    )
+    .unwrap();
+    let selection = CompilationSelection {
+        packages: vec!["ordinary".into()],
+        doc: true,
+        ..CompilationSelection::default()
+    };
+    let graph =
+        validate_compilation_unit_graph(&fixture.graph(Test, selection.clone()), Test).unwrap();
+    assert!(graph.requires_closed_dependency_execution());
+    assert!(graph.contains_doctests());
+    let marker = fixture.owner.path().join("target/doctest-runs");
+    for runs in [b"d".as_slice(), b"dd".as_slice()] {
+        let executed = fixture.test(&selection);
+        assert!(
+            executed.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&executed.stdout),
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(fs::read(&marker).unwrap(), runs);
+    }
+    fs::write(
+        source,
+        "/// ```\n/// assert_eq!(ordinary::answer(), 99);\n/// ```\npub fn answer() -> u32 { 23 }\n",
+    )
+    .unwrap();
+    let failed = fixture.test(&selection);
+    assert_eq!(failed.status.code(), Some(101));
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("test result: FAILED"));
+    assert_eq!(fs::read(marker).unwrap(), b"dd");
 }

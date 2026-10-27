@@ -3,7 +3,8 @@
 //! These are target/feature selectors, not arbitrary Cargo arguments. The
 //! driver supplies the retained manifest, offline/locked mode, compiler,
 //! output directory and job budget itself. Both the nonexecuting unit-graph
-//! query and the subsequent compilation use this exact argument vector.
+//! query and the subsequent compilation use the same Cargo selection. Test
+//! harness arguments form a separate tail, after the driver's Cargo options.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -14,18 +15,18 @@ const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 
 /// The captured Cargo command, separate from package and target selectors.
 ///
-/// Neither command runs the requested programs, tests or benchmarks. Cargo
-/// still runs selected build scripts and loads procedural macros while
-/// compiling; the validated unit graph marks that operation for closed-worker
-/// cache authority. `Build` may compile test and benchmark harnesses, but only
-/// Cargo's `test`, `bench` and `run` commands execute them; those commands are
-/// deliberately absent from this profile.
+/// `Check` and `Build` compile without running the requested targets. `Test`
+/// also runs Cargo's selected tests and doctests unless `no_run` is selected;
+/// test outcomes are never action-cache results. Cargo can run build scripts
+/// and load procedural macros in all three commands. The validated unit graph
+/// selects the required closed-worker boundary for compiler cache authority.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CompilationCommand {
     #[default]
     Check,
     Build,
+    Test,
 }
 
 impl CompilationCommand {
@@ -34,6 +35,7 @@ impl CompilationCommand {
         match self {
             Self::Check => "check",
             Self::Build => "build",
+            Self::Test => "test",
         }
     }
 }
@@ -71,6 +73,17 @@ pub struct CompilationSelection {
     /// and inheritance in the captured workspace. The unit graph and actual
     /// compilation use the same value, including `test` and its development units.
     pub profile: Option<String>,
+    /// Select documentation tests, only for the `Test` command.
+    pub doc: bool,
+    /// Compile Cargo's test executables without running them.
+    pub no_run: bool,
+    /// Let Cargo run the remaining test executables after one fails.
+    pub no_fail_fast: bool,
+    /// Cargo's optional positional test-name filter, passed as one argument.
+    pub test_filter: Option<String>,
+    /// Literal test-harness arguments. These are appended after `--`, never
+    /// interpreted as Cargo configuration, source, toolchain or output options.
+    pub test_args: Vec<String>,
 }
 
 fn invalid(reason: &str) -> io::Error {
@@ -99,6 +112,15 @@ impl CompilationSelection {
     /// Leading options, control bytes and oversized requests are refused here
     /// before any source capture or command planning can start.
     pub fn cargo_arguments(&self, command: CompilationCommand) -> io::Result<Vec<String>> {
+        if command != CompilationCommand::Test
+            && (self.doc
+                || self.no_run
+                || self.no_fail_fast
+                || self.test_filter.is_some()
+                || !self.test_args.is_empty())
+        {
+            return Err(invalid("test selection requires the Cargo test command"));
+        }
         if !self.exclude.is_empty() && !self.workspace {
             return Err(invalid(
                 "Cargo compilation exclusions require workspace selection",
@@ -132,7 +154,9 @@ impl CompilationSelection {
             ("--target", &self.target),
         ];
         let count = values.iter().map(|(_, values)| values.len()).sum::<usize>()
-            + usize::from(self.profile.is_some());
+            + usize::from(self.profile.is_some())
+            + usize::from(self.test_filter.is_some())
+            + self.test_args.len();
         if count > MAX_VALUES {
             return Err(invalid("Cargo compilation selection has too many values"));
         }
@@ -148,6 +172,9 @@ impl CompilationSelection {
             (self.benches, "--benches"),
             (self.all_targets, "--all-targets"),
             (self.release, "--release"),
+            (self.doc, "--doc"),
+            (self.no_run, "--no-run"),
+            (self.no_fail_fast, "--no-fail-fast"),
         ] {
             if enabled {
                 args.push(option.to_owned());
@@ -170,12 +197,44 @@ impl CompilationSelection {
             args.push("--profile".into());
             args.push(profile.clone());
         }
-        if args.iter().map(String::len).sum::<usize>() > MAX_ARGUMENT_BYTES {
+        if let Some(filter) = &self.test_filter {
+            if filter.len() > MAX_VALUE_BYTES
+                || filter.starts_with('-')
+                || filter.chars().any(char::is_control)
+            {
+                return Err(invalid("invalid Cargo test-name filter"));
+            }
+            args.push(filter.clone());
+        }
+        if self
+            .test_args
+            .iter()
+            .any(|arg| arg.len() > MAX_VALUE_BYTES || arg.chars().any(char::is_control))
+        {
+            return Err(invalid("invalid test-harness argument"));
+        }
+        let runtime_bytes = self.test_args.iter().map(String::len).sum::<usize>()
+            + if self.test_args.is_empty() { 0 } else { 2 };
+        if args.iter().map(String::len).sum::<usize>() + runtime_bytes > MAX_ARGUMENT_BYTES {
             return Err(invalid(
                 "Cargo compilation selection exceeds its argument byte budget",
             ));
         }
         Ok(args)
+    }
+
+    /// Construct the literal test-harness tail after validating the entire
+    /// selection, including its shared count and byte limits. Append this only
+    /// after all driver-owned Cargo options. Unit-graph queries omit the tail:
+    /// their selected compilation units do not depend on test-harness options.
+    pub fn runtime_arguments(&self, command: CompilationCommand) -> io::Result<Vec<String>> {
+        self.cargo_arguments(command)?;
+        if self.test_args.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(std::iter::once("--".to_owned())
+            .chain(self.test_args.iter().cloned())
+            .collect())
     }
 }
 
@@ -206,6 +265,12 @@ mod tests {
                 .cargo_arguments(CompilationCommand::Build)
                 .unwrap(),
             ["build"]
+        );
+        assert_eq!(
+            CompilationSelection::default()
+                .cargo_arguments(CompilationCommand::Test)
+                .unwrap(),
+            ["test"]
         );
     }
 
@@ -531,6 +596,7 @@ mod tests {
         for (text, expected) in [
             ("check", CompilationCommand::Check),
             ("build", CompilationCommand::Build),
+            ("test", CompilationCommand::Test),
         ] {
             let command: CompilationCommand = serde_json::from_value(json!(text)).unwrap();
             assert_eq!(command, expected);
@@ -538,7 +604,6 @@ mod tests {
         }
         for value in [
             json!("run"),
-            json!("test"),
             json!("bench"),
             json!("doc"),
             json!("check --config=bad"),
@@ -548,6 +613,154 @@ mod tests {
             json!({}),
         ] {
             assert!(serde_json::from_value::<CompilationCommand>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn test_selection_keeps_harness_arguments_after_driver_owned_cargo_options() {
+        let selection: CompilationSelection = serde_json::from_value(json!({
+            "workspace":true,
+            "no_run":true,
+            "no_fail_fast":true,
+            "test_filter":"roundtrip::exact value",
+            "test_args":["--nocapture", "--test-threads=1", "--manifest-path=/not-cargo"]
+        }))
+        .unwrap();
+        let decoded: CompilationSelection =
+            serde_json::from_value(serde_json::to_value(&selection).unwrap()).unwrap();
+        assert_eq!(decoded, selection);
+        let mut args = selection.cargo_arguments(CompilationCommand::Test).unwrap();
+        assert_eq!(
+            args,
+            [
+                "test",
+                "--workspace",
+                "--no-run",
+                "--no-fail-fast",
+                "roundtrip::exact value"
+            ]
+        );
+        args.extend(["--offline".into(), "--locked".into()]);
+        args.extend(
+            selection
+                .runtime_arguments(CompilationCommand::Test)
+                .unwrap(),
+        );
+        assert_eq!(
+            &args[5..],
+            [
+                "--offline",
+                "--locked",
+                "--",
+                "--nocapture",
+                "--test-threads=1",
+                "--manifest-path=/not-cargo"
+            ]
+        );
+        assert_eq!(
+            CompilationSelection {
+                doc: true,
+                ..CompilationSelection::default()
+            }
+            .cargo_arguments(CompilationCommand::Test)
+            .unwrap(),
+            ["test", "--doc"]
+        );
+    }
+
+    #[test]
+    fn test_only_controls_cannot_change_check_or_build_semantics() {
+        for value in [
+            json!({"doc":true}),
+            json!({"no_run":true}),
+            json!({"no_fail_fast":true}),
+            json!({"test_filter":""}),
+            json!({"test_args":["--nocapture"]}),
+        ] {
+            let selection: CompilationSelection = serde_json::from_value(value).unwrap();
+            for command in [CompilationCommand::Check, CompilationCommand::Build] {
+                assert!(selection.cargo_arguments(command).is_err());
+                assert!(selection.runtime_arguments(command).is_err());
+            }
+            assert!(selection.cargo_arguments(CompilationCommand::Test).is_ok());
+        }
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+        ] {
+            assert!(
+                CompilationSelection::default()
+                    .runtime_arguments(command)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_and_compilation_selection_share_one_bounded_argument_budget() {
+        let mut selection = CompilationSelection {
+            test_args: vec!["--nocapture".into(); MAX_VALUES],
+            ..CompilationSelection::default()
+        };
+        assert!(
+            selection
+                .runtime_arguments(CompilationCommand::Test)
+                .is_ok()
+        );
+        selection.test_filter = Some("selected".into());
+        assert!(selection.cargo_arguments(CompilationCommand::Test).is_err());
+        selection.test_args.pop();
+        assert!(
+            selection
+                .runtime_arguments(CompilationCommand::Test)
+                .is_ok()
+        );
+        selection.packages.push("package".into());
+        assert!(selection.cargo_arguments(CompilationCommand::Test).is_err());
+        selection.packages.clear();
+        selection.test_args = vec!["a".repeat(MAX_VALUE_BYTES); MAX_VALUES - 1];
+        assert!(
+            selection
+                .runtime_arguments(CompilationCommand::Test)
+                .is_err()
+        );
+        selection.test_args = vec!["a".repeat(MAX_VALUE_BYTES + 1)];
+        assert!(
+            selection
+                .runtime_arguments(CompilationCommand::Test)
+                .is_err()
+        );
+        for value in ["--config=bad", "filter\0", "filter\n"] {
+            selection.test_args.clear();
+            selection.test_filter = Some(value.into());
+            assert!(selection.cargo_arguments(CompilationCommand::Test).is_err());
+        }
+        selection.test_filter = None;
+        for value in ["test\0", "test\n"] {
+            selection.test_args = vec![value.into()];
+            assert!(
+                selection
+                    .runtime_arguments(CompilationCommand::Test)
+                    .is_err()
+            );
+        }
+        selection.test_args = vec![String::new()];
+        assert_eq!(
+            selection
+                .runtime_arguments(CompilationCommand::Test)
+                .unwrap(),
+            ["--", ""]
+        );
+        for value in [
+            json!({"doc":"true"}),
+            json!({"no_run":1}),
+            json!({"test_filter":["a"]}),
+            json!({"test_args":"--nocapture"}),
+            json!({"test_args":[true]}),
+        ] {
+            assert!(serde_json::from_value::<CompilationSelection>(value).is_err());
         }
     }
 }

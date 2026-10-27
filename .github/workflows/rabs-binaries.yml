@@ -73,7 +73,7 @@ jobs:
           python3 tests/test_rabs_worker_cache_diagnostics.py -v
       - name: Canonical Cargo frontend (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_canonical.py -v
-      - name: Selected local canonical builds and checks (native driver is an explicit fixture)
+      - name: Selected local canonical builds, checks and tests (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_local.py -v
       - name: Explicit canonical build inputs (native driver is an explicit fixture)
         run: python3 -I -S scripts/tests/test_cargo_rabs_environment.py -v
@@ -225,6 +225,22 @@ jobs:
         run: |
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs \
+            -- --ignored --exact --nocapture
+      - name: Canonical Cargo delivers no-run tests and always executes current harnesses
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_tests_deliver_no_run_artifacts_and_execute_each_current_run \
+            -- --ignored --exact --nocapture
+      - name: Canonical Cargo executes current documentation tests with captured rustdoc
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_cargo_doctests_execute_with_captured_rustdoc_and_preserve_failures \
             -- --ignored --exact --nocapture
       - name: Canonical Cargo sends real metadata work over authenticated worker transport
         timeout-minutes: 30
