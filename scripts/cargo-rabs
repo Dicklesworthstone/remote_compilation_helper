@@ -63,7 +63,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
   --rabs-canonical FILE  Build, check, lint, test, run or bench on a canonical worker.
-  --rabs-canonical-local FILE  Build, check, lint or test in the local canonical namespace.
+  --rabs-canonical-local FILE  Build, check, lint, test, run or bench in the local canonical namespace.
   --rabs-recover DIR     Recover a retained canonical operation; never execute it again.
   --help                Show this help without starting a daemon or Cargo.
 
@@ -73,7 +73,7 @@ canonical compilation driver. The profile version is canonical-compile-local-v1;
 docs/rabs-canonical-cargo.md for its explicit source, toolchain, state, operation
 and wrapper paths. With no Cargo arguments this mode selects ordinary `check`.
 Package, workspace, feature, target-kind/named-target, built-in compilation target
-and compilation profile selection are accepted with `check`, `build`, `clippy` or `test`. These
+and compilation profile selection are accepted with `check`, `build`, `clippy`, `test` or `bench`. These
 command arguments replace the profile's command and selection, including an
 empty selection for ordinary `check`; the manifest and jobs come from the profile.
 Cargo's actual unit graph determines admission before the cache endpoint is exposed.
@@ -83,6 +83,13 @@ at the private output path reported by the native driver. `build --tests` and
 `test --no-run` compile harnesses without running them. `test` runs the selected
 tests and doctests on every invocation; a filter, --doc, --no-fail-fast and literal
 harness arguments after `--` are supported. Test results are never cached.
+`run` selects one binary or example in one package and passes program arguments
+after `--` unchanged. `bench` accepts ordinary target selection, a benchmark
+filter and literal harness arguments after `--`; --no-run compiles without
+running benchmarks. Bench uses Cargo's release profile unless --profile selects
+another profile. Run and benchmark bodies execute afresh on every invocation.
+Executing Run/Bench requires nonterminal stdin: redirect from a pipe, file or
+/dev/null. Bench --no-run and earlier commands retain closed stdin.
 `clippy` requires captured cargo-clippy and clippy-driver executables, supports
 --no-deps and bounded lint controls after `--`, and starts the captured Clippy
 command on every invocation. Cargo controls lint freshness. Clippy results never become rustc cache hits;
@@ -1706,20 +1713,22 @@ def canonical_local_selection(args):
     syntax; no flag can select a compiler, manifest, config or output root.
     """
     args = list(args) if args else ["check"]
-    if args[0] not in ("check", "build", "test", "clippy"):
-        raise SetupError("local canonical mode supports cargo check, build, clippy or test only")
-    testing = args[0] == "test"
+    if args[0] not in ("check", "build", "test", "clippy", "run", "bench"):
+        raise SetupError("local canonical mode supports cargo check, build, clippy, test, run or bench only")
+    testing = args[0] in ("test", "bench")
     clippy = args[0] == "clippy"
+    running = args[0] == "run"
     flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS)
 
-    def checked_value(value, *, empty=False, options=False):
+    def checked_value(value, *, empty=False, options=False, controls=False):
         try:
             encoded = value.encode("utf-8")
         except UnicodeError as error:
             raise SetupError("local canonical selection must be UTF-8") from error
         if ((not empty and not encoded) or len(encoded) > 1024
                 or (not options and value.startswith("-"))
-                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
+                or "\0" in value
+                or (not controls and any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value))):
             raise SetupError("invalid local canonical Cargo selection value")
         return value
 
@@ -1727,17 +1736,19 @@ def canonical_local_selection(args):
     at = 1
     while at < len(args):
         if args[at] == "--":
-            if not testing and not clippy:
-                raise SetupError("argument tails require the local canonical test or clippy command")
+            if not testing and not clippy and not running:
+                raise SetupError("argument tails require the local canonical test, bench, run or clippy command")
             if args[at + 1:]:
-                tail = [checked_value(value, empty=True, options=True) for value in args[at + 1:]]
+                tail = [checked_value(value, empty=True, options=True, controls=running)
+                        for value in args[at + 1:]]
                 if clippy:
                     canonical_clippy_lints(tail)
-                selection["lint_args" if clippy else "test_args"] = tail
+                field = "lint_args" if clippy else "run_args" if running else "test_args"
+                selection[field] = tail
             break
         if testing and not args[at].startswith("-"):
             if "test_filter" in selection:
-                raise SetupError("local canonical test accepts one Cargo test-name filter")
+                raise SetupError("local canonical test or bench accepts one Cargo name filter")
             selection["test_filter"] = checked_value(args[at], empty=True)
             at += 1
             continue
@@ -1746,7 +1757,9 @@ def canonical_local_selection(args):
             option = "--release"
         if option in flags and not separator:
             if option in LOCAL_TEST_FLAGS and not testing:
-                raise SetupError("test selection requires the local canonical test command")
+                raise SetupError("harness selection requires the local canonical test or bench command")
+            if option == "--doc" and args[0] != "test":
+                raise SetupError("documentation tests require the local canonical test command")
             if option in LOCAL_CLIPPY_FLAGS and not clippy:
                 raise SetupError("lint selection requires the local canonical clippy command")
             selection[flags[option]] = True
@@ -1781,13 +1794,23 @@ def canonical_local_selection(args):
         at += 1
     count = sum(len(selection.get(field, [])) for field in LOCAL_COMPILATION_VALUES.values())
     count += int("profile" in selection) + int("test_filter" in selection) + len(selection.get("test_args", []))
-    count += len(selection.get("lint_args", []))
+    count += len(selection.get("lint_args", [])) + len(selection.get("run_args", []))
     if count > 128:
         raise SetupError("local canonical selection has too many values")
     if selection.get("exclude") and not selection.get("workspace"):
         raise SetupError("local canonical --exclude requires --workspace")
     if selection.get("release") and "profile" in selection:
         raise SetupError("local canonical --release conflicts with --profile")
+    if args[0] == "bench" and selection.get("release"):
+        raise SetupError("Cargo bench already uses its optimized default; select --profile instead of --release")
+    if running and (
+            any(selection.get(field) for field in (
+                "workspace", "exclude", "lib", "bins", "tests", "examples", "benches",
+                "all_targets", "test", "bench"))
+            or len(selection.get("packages", [])) > 1
+            or len(selection.get("target", [])) > 1
+            or len(selection.get("bin", [])) + len(selection.get("example", [])) > 1):
+        raise SetupError("local canonical run selects at most one package, target platform and binary or example")
     # This is the native deterministic compilation prefix, including option bytes.
     size = len(args[0])
     size += sum(len(option) for option, field in flags.items() if selection.get(field))
@@ -1798,7 +1821,7 @@ def canonical_local_selection(args):
         size += len("--profile") + len(selection["profile"].encode("utf-8"))
     if "test_filter" in selection:
         size += len(selection["test_filter"].encode("utf-8"))
-    for field in ("test_args", "lint_args"):
+    for field in ("test_args", "lint_args", "run_args"):
         if selection.get(field):
             size += 2 + sum(len(value.encode("utf-8")) for value in selection[field])
     if size > 16 * 1024:
@@ -1814,8 +1837,8 @@ def canonical_local_profile(path):
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
-    if profile.get("command", "check") not in ("check", "build", "test", "clippy"):
-        raise SetupError("local canonical command must be check, build, clippy or test")
+    if profile.get("command", "check") not in ("check", "build", "test", "clippy", "run", "bench"):
+        raise SetupError("local canonical command must be check, build, clippy, test, run or bench")
     for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
         if name in profile and (type(profile[name]) is not int or not 1 <= profile[name] <= maximum):
             raise SetupError("local canonical " + name + " must be an integer from 1 to " + str(maximum))
@@ -1871,7 +1894,7 @@ def canonical_local_profile(path):
     if profile.get("selection") is not None:
         selection = profile["selection"]
         flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS)
-        allowed = set(flags.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile", "test_filter", "test_args", "lint_args"}
+        allowed = set(flags.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile", "test_filter", "test_args", "lint_args", "run_args"}
         if type(selection) is not dict or selection.keys() - allowed:
             raise SetupError("invalid local canonical profile selection fields")
         original_args = [profile.get("command", "check")]
@@ -1894,14 +1917,15 @@ def canonical_local_profile(path):
             if type(selection["test_filter"]) is not str:
                 raise SetupError("local canonical test filter must be a string or null")
             original_args.append(selection["test_filter"])
-        for field, command in (("test_args", "test"), ("lint_args", "clippy")):
+        for field, commands in (("test_args", ("test", "bench")),
+                                ("lint_args", ("clippy",)), ("run_args", ("run",))):
             if field in selection:
                 if (type(selection[field]) is not list
                         or any(type(value) is not str for value in selection[field])):
                     raise SetupError("local canonical " + field + " must be a string array")
                 if selection[field]:
-                    if profile.get("command", "check") != command:
-                        raise SetupError("local canonical " + field + " requires command " + command)
+                    if profile.get("command", "check") not in commands:
+                        raise SetupError("local canonical " + field + " requires command " + " or ".join(commands))
                     original_args.extend(["--"] + selection[field])
         canonical_local_selection(original_args)
     return profile

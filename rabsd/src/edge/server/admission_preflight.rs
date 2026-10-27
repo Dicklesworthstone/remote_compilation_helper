@@ -325,14 +325,14 @@ mod tests {
             native.retain(|arg| arg != "--emit=metadata,dep-info");
             native.push("--emit=dep-info,metadata,link".into());
             native.extend(extra.iter().map(|arg| (*arg).to_owned()));
-            assert!(matches!(
-                workspace_rejection(LiveRustcRequest {
-                    argv: &native,
-                    cwd: "/__rabs/workspace",
-                    env: &generated,
-                }),
-                Some(LiveRefusal::SearchPath(_))
-            ));
+            let candidate = LiveRustcRequest {
+                argv: &native,
+                cwd: "/__rabs/workspace",
+                env: &generated,
+            };
+            assert_eq!(workspace_rejection(candidate), None);
+            assert!(rejection(candidate).is_some());
+            assert!(remote_rejection(candidate).is_some());
         }
         env.push(("LD_PRELOAD".into(), "/unretained.so".into()));
         assert!(
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn workspace_metadata_bins_and_harnesses_do_not_borrow_dependency_or_link_authority() {
-        use rabs_key::live_dependency::workspace_execution::plan_canonical_workspace_execution;
+        use rabs_key::live_dependency::plan_canonical_workspace_execution;
 
         for (crate_type, harness, test_cfg) in [
             (Some("bin"), false, false),

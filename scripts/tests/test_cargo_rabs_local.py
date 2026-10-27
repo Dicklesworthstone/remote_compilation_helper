@@ -31,7 +31,7 @@ assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-compile-local", sys.ar
 path = pathlib.Path(sys.argv[2])
 profile = json.loads(path.read_bytes())
 assert profile["version"] == "canonical-compile-local-v1"
-assert profile["command"] in ("check", "build", "test", "clippy")
+assert profile["command"] in ("check", "build", "test", "clippy", "run", "bench")
 assert "selection" in profile
 record = {"pid":os.getpid(), "argv":sys.argv, "profile":profile,
           "retained":str(path), "file_mode":stat.S_IMODE(path.stat().st_mode),
@@ -361,6 +361,158 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(status, 0, stderr.decode(errors="replace"))
         self.assertEqual(self.records()[-1]["profile"]["selection"], {})
 
+    def test_run_selectors_and_exact_program_arguments_reach_native_driver_once(self):
+        original = self.profile_path.read_bytes()
+        literal = ["", "雪 ☃", "--config=program-value", "--manifest-path=program-input",
+                   "--rabs-remote", "--", "line\nbreak", "tab\tvalue", "carriage\rreturn",
+                   "control\x01value", "unicode\u0085control"]
+        cases = (
+            (["run"], {}),
+            (["run", "--"], {}),
+            (["run", "-papp", "--bin=cli", "--target=host-tuple", "--profile=dev",
+              "-Ffast", "--no-default-features", "--"] + literal,
+             {"packages": ["app"], "bin": ["cli"], "target": ["host-tuple"],
+              "profile": "dev", "features": ["fast"], "no_default_features": True,
+              "run_args": literal}),
+            (["run", "--example", "client", "--all-features", "-r", "--", "--help", ""],
+             {"example": ["client"], "all_features": True, "release": True,
+              "run_args": ["--help", ""]}),
+        )
+        for args, expected in cases:
+            with self.subTest(args=args):
+                status, stdout, stderr, pid = self.invoke(args, input=b"program stdin\x00\xff")
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                self.assertEqual(stdout, b"fixture check stdout\x00\xff\n")
+                record = self.records()[-1]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(bytes.fromhex(record["input"]), b"program stdin\x00\xff")
+                self.assertEqual(record["profile"], dict(self.profile, command="run", selection=expected))
+                self.assertEqual(record["argv"], [str(self.driver), "--canonical-compile-local", record["retained"]])
+                self.assertTrue(Path(record["retained"]).parent.name.startswith("run-"))
+                self.assertEqual(self.profile_path.read_bytes(), original)
+        self.assertEqual(len(self.records()), len(cases))
+        self.assertEqual(len(list(self.operations.iterdir())), len(cases))
+
+    def test_bench_selection_filters_profiles_and_literal_tail_reach_native_driver_once(self):
+        cases = (
+            (["bench"], {}),
+            (["bench", "--workspace", "--exclude=slow", "--bench=throughput", "--no-run"],
+             {"workspace": True, "exclude": ["slow"], "bench": ["throughput"], "no_run": True}),
+            (["bench", "--package=core", "--profile=dev", "--no-fail-fast", "hash::雪",
+              "--", "--exact", "--nocapture", ""],
+             {"packages": ["core"], "profile": "dev", "no_fail_fast": True,
+              "test_filter": "hash::雪", "test_args": ["--exact", "--nocapture", ""]}),
+            (["bench", "--lib", "--features=fast", "--all-features", "",
+              "--", "--config=not-cargo", "--unit-graph", "--rabs-remote"],
+             {"lib": True, "features": ["fast"], "all_features": True, "test_filter": "",
+              "test_args": ["--config=not-cargo", "--unit-graph", "--rabs-remote"]}),
+            (["bench", "--no-run", "filter", "--", "--ignored"],
+             {"no_run": True, "test_filter": "filter", "test_args": ["--ignored"]}),
+        )
+        for args, expected in cases:
+            with self.subTest(args=args):
+                status, _, stderr, pid = self.invoke(args)
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                record = self.records()[-1]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(record["profile"], dict(self.profile, command="bench", selection=expected))
+                self.assertTrue(Path(record["retained"]).parent.name.startswith("bench-"))
+        self.assertEqual(len(self.records()), len(cases))
+        self.assertEqual(len(list(self.operations.iterdir())), len(cases))
+
+    def test_saved_run_and_bench_profiles_are_validated_then_replaced_without_merging_tails(self):
+        for command, saved in (
+            ("run", {"packages": ["saved"], "bin": ["saved-cli"],
+                     "run_args": ["", "saved\nargument", "--config=program"]}),
+            ("bench", {"bench": ["saved-bench"], "no_run": True,
+                       "test_filter": "saved-filter", "test_args": ["--nocapture"]}),
+        ):
+            self.profile.update(command=command, selection=saved)
+            self.save()
+            original = self.profile_path.read_bytes()
+            for args, expected_command, expected_selection in (
+                (["run", "--", "fresh"], "run", {"run_args": ["fresh"]}),
+                (["bench", "new-filter", "--", "--exact"], "bench",
+                 {"test_filter": "new-filter", "test_args": ["--exact"]}),
+                ([], "check", {}),
+            ):
+                with self.subTest(saved_command=command, args=args):
+                    status, _, stderr, _ = self.invoke(args)
+                    self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                    record = self.records()[-1]["profile"]
+                    self.assertEqual(record["command"], expected_command)
+                    self.assertEqual(record["selection"], expected_selection)
+                    self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_run_refuses_multiple_targets_harness_controls_and_cargo_authority_overrides(self):
+        for args in (
+            ["run", "--workspace"], ["run", "--exclude=other"], ["run", "--lib"],
+            ["run", "--bins"], ["run", "--tests"], ["run", "--examples"],
+            ["run", "--benches"], ["run", "--all-targets"], ["run", "--test=one"],
+            ["run", "--bench=one"], ["run", "-pfirst", "-psecond"],
+            ["run", "--bin=one", "--bin=two"], ["run", "--example=one", "--example=two"],
+            ["run", "--bin=one", "--example=two"],
+            ["run", "--target=host-tuple", "--target=x86_64-unknown-linux-gnu"],
+            ["run", "--doc"], ["run", "--no-run"], ["run", "--no-fail-fast"],
+            ["run", "--no-deps"], ["run", "program-argument-without-separator"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+        for command in ("run", "bench"):
+            for option in ("--config=other", "--manifest-path=other/Cargo.toml", "--target-dir=/other",
+                           "--message-format=json", "--jobs=2", "--unit-graph", "-Zunstable-options"):
+                with self.subTest(command=command, option=option):
+                    self.assert_refused([command, option])
+        for args in (["bench", "--doc"], ["bench", "--no-deps"],
+                     ["bench", "--release"], ["bench", "-r"],
+                     ["bench", "first-filter", "second-filter"]):
+            self.assert_refused(args)
+
+    def test_run_argument_bounds_preserve_controls_but_reject_nul_and_share_all_budgets(self):
+        exact = ["run", "--"] + [""] * 128
+        self.assertEqual(launcher.canonical_local_selection(exact)["run_args"], [""] * 128)
+        self.assert_refused(exact + ["one-more"])
+        mixed = ["run", "-papp", "--bin=cli", "--target=host-tuple", "--profile=dev", "-Ffast", "--"] + ["arg"] * 123
+        self.assertEqual(len(launcher.canonical_local_selection(mixed)["run_args"]), 123)
+        self.assert_refused(mixed + ["one-more"])
+        for value in ("a" * 1024, "雪" * 341):
+            status, _, stderr, _ = self.invoke(["run", "--", value])
+            self.assertEqual(status, 0, stderr.decode(errors="replace"))
+            self.assertEqual(self.records()[-1]["profile"]["selection"]["run_args"], [value])
+        for value in ("a" * 1025, "雪" * 342):
+            self.assert_refused(["run", "--", value])
+        with self.assertRaises(launcher.SetupError):
+            launcher.canonical_local_selection(["run", "--", "bad\0argument"])
+        self.assert_refused(["run", "--"] + ["a" * 1024] * 16)
+        near = ["run", "--profile=" + "a" * 1000, "--"] + ["a" * 1000] * 15
+        self.assertEqual(len(launcher.canonical_local_selection(near)["run_args"]), 15)
+        self.assert_refused(near[:2] + ["-p" + "a" * 1000] + near[2:])
+
+    def test_saved_runtime_fields_cannot_cross_command_or_argument_boundaries(self):
+        original = dict(self.profile)
+        for command, selection in (
+            ("run", {"run_args": None}), ("run", {"run_args": "arg"}),
+            ("run", {"run_args": [True]}), ("run", {"run_args": ["bad\0argument"]}),
+            ("run", {"run_args": ["雪" * 342]}), ("run", {"run_args": [""] * 129}),
+            ("run", {"run_args": ["a" * 1024] * 16}),
+            ("run", {"test_filter": "filter"}), ("run", {"test_args": ["--nocapture"]}),
+            ("run", {"lint_args": ["-Dwarnings"]}), ("run", {"workspace": True}),
+            ("run", {"packages": ["one", "two"]}),
+            ("run", {"bin": ["one"], "example": ["two"]}),
+            ("bench", {"doc": True}), ("bench", {"release": True}),
+            ("bench", {"run_args": ["argument"]}),
+            ("bench", {"test_args": ["bad\nargument"]}),
+            ("bench", {"test_filter": "bad\u0085filter"}),
+        ):
+            with self.subTest(command=command, selection=selection):
+                self.profile = dict(original, command=command, selection=selection)
+                self.save()
+                self.assert_refused(["run"])
+        for command in ("check", "build", "test", "clippy", "bench"):
+            self.profile = dict(original, command=command, selection={"run_args": ["argument"]})
+            self.save()
+            self.assert_refused(["run"])
+
     def test_named_packages_features_and_targets_reach_the_retained_native_profile(self):
         args = ["check", "--workspace", "--exclude=integration-*", "-p", "core@1.0.0",
                 "-papp", "--package=third", "--features", "app/fast,core/serde",
@@ -442,7 +594,7 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def test_commands_authority_options_and_missing_values_refuse_before_handoff(self):
         rejected = [
-            ["run"], ["bench"], ["doc"], ["rustc"], ["+nightly", "check"],
+            ["doc"], ["rustc"], ["+nightly", "check"],
             ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
             ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
             ["check", "--message-format=json"], ["check", "-Zunstable-options"],
@@ -559,7 +711,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         for change in (
             {"version": "canonical-cargo-v1"}, {"version": "canonical-check-local-v1"},
             {"env": {"RABS_SOCKET_PATH": "/other"}},
-            {"command": "run"}, {"command": "build --config=other"},
+            {"command": "execute"}, {"command": "build --config=other"},
             {"command": None}, {"command": True}, {"command": ["build"]},
             {"command": {"build": True}}, {"command": "Build"},
             {"jobs": True}, {"timeout_seconds": 7201}, {"manifest": "../Cargo.toml"},
@@ -634,12 +786,13 @@ class CanonicalLocalCargo(unittest.TestCase):
                 launcher.canonical_local_invocation(str(self.profile_path), ["check"], self.env)
 
     def test_native_failure_is_returned_once_without_fallback(self):
-        for command in ("check", "build", "test"):
+        commands = ["check", "build", "test", "run", "bench"]
+        for command in commands:
             status, _, stderr, _ = self.invoke([command], dict(self.env, TEST_EXIT="101"))
             self.assertEqual(status, 101, stderr.decode(errors="replace"))
-        self.assertEqual(len(self.records()), 3)
-        self.assertEqual(len(list(self.operations.iterdir())), 3)
-        self.assertEqual([record["profile"]["command"] for record in self.records()], ["check", "build", "test"])
+        self.assertEqual(len(self.records()), len(commands))
+        self.assertEqual(len(list(self.operations.iterdir())), len(commands))
+        self.assertEqual([record["profile"]["command"] for record in self.records()], commands)
 
     def test_missing_driver_and_recursive_driver_refuse_before_creating_intent(self):
         self.assert_refused(["check"], dict(self.env, CARGO_RABS_DAEMON=str(self.root / "missing")))
@@ -664,6 +817,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertIn(b"build --tests", stdout)
         self.assertIn(b"test --no-run", stdout)
         self.assertIn(b"Test results are never cached", stdout)
+        self.assertIn(b"Run and benchmark bodies execute afresh", stdout)
         self.assertFalse(self.record.exists())
         self.assertEqual(list(self.operations.iterdir()), [])
 

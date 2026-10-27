@@ -3,8 +3,8 @@
 //! These are target/feature selectors, not arbitrary Cargo arguments. The
 //! driver supplies the retained manifest, offline/locked mode, compiler,
 //! output directory and job budget itself. Both the nonexecuting unit-graph
-//! query and the subsequent compilation use the same Cargo selection. Test
-//! harness and Clippy lint arguments form separate tails after the driver's
+//! query and the subsequent compilation use the same Cargo selection. Program,
+//! test/benchmark harness and Clippy lint arguments form separate tails after the driver's
 //! Cargo options.
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,9 @@ const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 ///
 /// `Check` and `Build` compile without running the requested targets. `Test`
 /// also runs Cargo's selected tests and doctests unless `no_run` is selected;
-/// test outcomes are never action-cache results. `Clippy` checks the selected
+/// test outcomes are never action-cache results. `Run` executes the selected
+/// binary/example, and `Bench` runs selected benchmarks unless `no_run` is set.
+/// Their bodies and outcomes are never cached. `Clippy` checks the selected
 /// targets with the captured lint driver, whose results are never rustc cache
 /// results. Cargo can run build scripts and load procedural macros in every
 /// command. The validated unit graph
@@ -31,6 +33,8 @@ pub enum CompilationCommand {
     Build,
     Test,
     Clippy,
+    Run,
+    Bench,
 }
 
 impl CompilationCommand {
@@ -41,6 +45,8 @@ impl CompilationCommand {
             Self::Build => "build",
             Self::Test => "test",
             Self::Clippy => "clippy",
+            Self::Run => "run",
+            Self::Bench => "bench",
         }
     }
 }
@@ -80,15 +86,19 @@ pub struct CompilationSelection {
     pub profile: Option<String>,
     /// Select documentation tests, only for the `Test` command.
     pub doc: bool,
-    /// Compile Cargo's test executables without running them.
+    /// Compile Cargo's test or benchmark executables without running them.
     pub no_run: bool,
-    /// Let Cargo run the remaining test executables after one fails.
+    /// Let Cargo run the remaining test or benchmark executables after one fails.
     pub no_fail_fast: bool,
-    /// Cargo's optional positional test-name filter, passed as one argument.
+    /// Cargo's optional positional test/benchmark filter, passed as one argument.
     pub test_filter: Option<String>,
     /// Literal test-harness arguments. These are appended after `--`, never
     /// interpreted as Cargo configuration, source, toolchain or output options.
     pub test_args: Vec<String>,
+    /// Literal program arguments after `cargo run --`. These never become Cargo
+    /// options and may contain empty strings, Unicode or control bytes other
+    /// than NUL, which cannot be represented in a process argument.
+    pub run_args: Vec<String>,
     /// Lint only the selected packages, leaving dependency rustc compilation to
     /// Cargo. This flag belongs to Clippy rather than to ordinary Cargo check.
     pub no_deps: bool,
@@ -178,14 +188,44 @@ impl CompilationSelection {
     /// Leading options, control bytes and oversized requests are refused here
     /// before any source capture or command planning can start.
     pub fn cargo_arguments(&self, command: CompilationCommand) -> io::Result<Vec<String>> {
-        if command != CompilationCommand::Test
-            && (self.doc
-                || self.no_run
-                || self.no_fail_fast
-                || self.test_filter.is_some()
-                || !self.test_args.is_empty())
+        if self.doc && command != CompilationCommand::Test {
+            return Err(invalid(
+                "documentation tests require the Cargo test command",
+            ));
+        }
+        if !matches!(
+            command,
+            CompilationCommand::Test | CompilationCommand::Bench
+        ) && (self.no_run
+            || self.no_fail_fast
+            || self.test_filter.is_some()
+            || !self.test_args.is_empty())
         {
-            return Err(invalid("test selection requires the Cargo test command"));
+            return Err(invalid(
+                "harness selection requires the Cargo test or bench command",
+            ));
+        }
+        if command != CompilationCommand::Run && !self.run_args.is_empty() {
+            return Err(invalid("program arguments require the Cargo run command"));
+        }
+        if command == CompilationCommand::Run
+            && (self.workspace
+                || !self.exclude.is_empty()
+                || self.packages.len() > 1
+                || self.lib
+                || self.bins
+                || self.tests
+                || self.examples
+                || self.benches
+                || self.all_targets
+                || !self.test.is_empty()
+                || !self.bench.is_empty()
+                || self.bin.len() + self.example.len() > 1
+                || self.target.len() > 1)
+        {
+            return Err(invalid(
+                "Cargo run selects one package and one binary or example",
+            ));
         }
         if command != CompilationCommand::Clippy && (self.no_deps || !self.lint_args.is_empty()) {
             return Err(invalid(
@@ -201,6 +241,11 @@ impl CompilationSelection {
         if self.release && self.profile.is_some() {
             return Err(invalid(
                 "choose release or an explicit Cargo compilation profile, not both",
+            ));
+        }
+        if command == CompilationCommand::Bench && self.release {
+            return Err(invalid(
+                "Cargo bench selects its compilation profile with --profile",
             ));
         }
         if self.target.iter().any(|target| !ordinary_name(target)) {
@@ -229,6 +274,7 @@ impl CompilationSelection {
             + usize::from(self.profile.is_some())
             + usize::from(self.test_filter.is_some())
             + self.test_args.len()
+            + self.run_args.len()
             + self.lint_args.len();
         if count > MAX_VALUES {
             return Err(invalid("Cargo compilation selection has too many values"));
@@ -287,11 +333,14 @@ impl CompilationSelection {
         {
             return Err(invalid("invalid test-harness argument"));
         }
-        let tail = if command == CompilationCommand::Clippy {
-            &self.lint_args
-        } else {
-            &self.test_args
-        };
+        if self
+            .run_args
+            .iter()
+            .any(|arg| arg.len() > MAX_VALUE_BYTES || arg.contains('\0'))
+        {
+            return Err(invalid("invalid program argument"));
+        }
+        let tail = self.argument_tail(command);
         let runtime_bytes =
             tail.iter().map(String::len).sum::<usize>() + if tail.is_empty() { 0 } else { 2 };
         if args.iter().map(String::len).sum::<usize>() + runtime_bytes > MAX_ARGUMENT_BYTES {
@@ -302,23 +351,27 @@ impl CompilationSelection {
         Ok(args)
     }
 
-    /// Construct the test-harness or Clippy lint tail after validating the entire
+    /// Construct the program, harness or Clippy lint tail after validating the entire
     /// selection, including its shared count and byte limits. Append this only
     /// after all driver-owned Cargo options. Unit-graph queries omit test-harness
     /// arguments, but retain Clippy lint arguments for the same driver invocation.
     pub fn runtime_arguments(&self, command: CompilationCommand) -> io::Result<Vec<String>> {
         self.cargo_arguments(command)?;
-        let tail = if command == CompilationCommand::Clippy {
-            &self.lint_args
-        } else {
-            &self.test_args
-        };
+        let tail = self.argument_tail(command);
         if tail.is_empty() {
             return Ok(Vec::new());
         }
         Ok(std::iter::once("--".to_owned())
             .chain(tail.iter().cloned())
             .collect())
+    }
+
+    fn argument_tail(&self, command: CompilationCommand) -> &[String] {
+        match command {
+            CompilationCommand::Clippy => &self.lint_args,
+            CompilationCommand::Run => &self.run_args,
+            _ => &self.test_args,
+        }
     }
 }
 
@@ -682,14 +735,14 @@ mod tests {
             ("build", CompilationCommand::Build),
             ("test", CompilationCommand::Test),
             ("clippy", CompilationCommand::Clippy),
+            ("run", CompilationCommand::Run),
+            ("bench", CompilationCommand::Bench),
         ] {
             let command: CompilationCommand = serde_json::from_value(json!(text)).unwrap();
             assert_eq!(command, expected);
             assert_eq!(serde_json::to_value(command).unwrap(), json!(text));
         }
         for value in [
-            json!("run"),
-            json!("bench"),
             json!("doc"),
             json!("check --config=bad"),
             json!("Build"),
@@ -779,6 +832,189 @@ mod tests {
                     .runtime_arguments(command)
                     .unwrap()
                     .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn run_program_arguments_remain_literal_after_driver_options() {
+        let selection: CompilationSelection = serde_json::from_value(json!({
+            "packages":["app@1.0.0"], "bin":["server"], "profile":"dev",
+            "run_args":["", "雪", "--manifest-path=/not-cargo", "--no-run", "line\nvalue"]
+        }))
+        .unwrap();
+        let mut args = selection.cargo_arguments(CompilationCommand::Run).unwrap();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--package",
+                "app@1.0.0",
+                "--bin",
+                "server",
+                "--profile",
+                "dev"
+            ]
+        );
+        args.extend(["--offline".into(), "--locked".into()]);
+        args.extend(
+            selection
+                .runtime_arguments(CompilationCommand::Run)
+                .unwrap(),
+        );
+        assert_eq!(
+            &args[7..],
+            [
+                "--offline",
+                "--locked",
+                "--",
+                "",
+                "雪",
+                "--manifest-path=/not-cargo",
+                "--no-run",
+                "line\nvalue"
+            ]
+        );
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+            CompilationCommand::Bench,
+            CompilationCommand::Clippy,
+        ] {
+            assert!(selection.cargo_arguments(command).is_err());
+        }
+        for value in [
+            "invalid\0argument".to_owned(),
+            "a".repeat(MAX_VALUE_BYTES + 1),
+        ] {
+            assert!(
+                CompilationSelection {
+                    run_args: vec![value],
+                    ..CompilationSelection::default()
+                }
+                .cargo_arguments(CompilationCommand::Run)
+                .is_err()
+            );
+        }
+        assert!(
+            CompilationSelection {
+                run_args: vec!["".into(); MAX_VALUES + 1],
+                ..CompilationSelection::default()
+            }
+            .cargo_arguments(CompilationCommand::Run)
+            .is_err()
+        );
+        assert!(
+            CompilationSelection {
+                run_args: vec!["a".repeat(MAX_VALUE_BYTES); 17],
+                ..CompilationSelection::default()
+            }
+            .cargo_arguments(CompilationCommand::Run)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_selects_one_runnable_target_without_harness_or_lint_authority() {
+        for value in [
+            json!({"workspace":true}),
+            json!({"lib":true}),
+            json!({"bins":true}),
+            json!({"tests":true}),
+            json!({"examples":true}),
+            json!({"benches":true}),
+            json!({"all_targets":true}),
+            json!({"packages":["one","two"]}),
+            json!({"bin":["one"],"example":["two"]}),
+            json!({"bin":["one","two"]}),
+            json!({"test":["test"]}),
+            json!({"bench":["bench"]}),
+            json!({"doc":true}),
+            json!({"no_run":true}),
+            json!({"no_fail_fast":true}),
+            json!({"no_deps":true}),
+            json!({"test_filter":"selected"}),
+            json!({"test_args":["--exact"]}),
+            json!({"lint_args":["-D","warnings"]}),
+            json!({"target":["host-tuple","other"]}),
+        ] {
+            let selection: CompilationSelection = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                selection.cargo_arguments(CompilationCommand::Run).is_err(),
+                "{value}"
+            );
+        }
+        for value in [
+            json!({}),
+            json!({"packages":["app"]}),
+            json!({"bin":["server"]}),
+            json!({"example":["demo"]}),
+            json!({"target":["host-tuple"],"release":true}),
+        ] {
+            let selection: CompilationSelection = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                selection.cargo_arguments(CompilationCommand::Run).is_ok(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn bench_keeps_cargos_profile_and_harness_arguments_without_running_no_run() {
+        assert_eq!(
+            CompilationSelection::default()
+                .cargo_arguments(CompilationCommand::Bench)
+                .unwrap(),
+            ["bench"]
+        );
+        let selection: CompilationSelection = serde_json::from_value(json!({
+            "bench":["throughput"], "profile":"dev", "no_fail_fast":true,
+            "test_filter":"selected", "test_args":["--exact", "", "--nocapture"]
+        }))
+        .unwrap();
+        assert_eq!(
+            selection
+                .cargo_arguments(CompilationCommand::Bench)
+                .unwrap(),
+            [
+                "bench",
+                "--no-fail-fast",
+                "--bench",
+                "throughput",
+                "--profile",
+                "dev",
+                "selected"
+            ]
+        );
+        assert_eq!(
+            selection
+                .runtime_arguments(CompilationCommand::Bench)
+                .unwrap(),
+            ["--", "--exact", "", "--nocapture"]
+        );
+        assert_eq!(
+            CompilationSelection {
+                no_run: true,
+                ..CompilationSelection::default()
+            }
+            .cargo_arguments(CompilationCommand::Bench)
+            .unwrap(),
+            ["bench", "--no-run"]
+        );
+        for value in [
+            json!({"doc":true}),
+            json!({"release":true}),
+            json!({"run_args":["program"]}),
+            json!({"lint_args":["-D","warnings"]}),
+            json!({"no_deps":true}),
+        ] {
+            let selection: CompilationSelection = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Bench)
+                    .is_err(),
+                "{value}"
             );
         }
     }

@@ -60,5 +60,9 @@ rabs-replay = { path = "../rabs-replay" }
 # only; the pin matches rabs-asupersync's exact-revision rule (bead A003).
 asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519", default-features = false, features = ["proc-macros", "test-internals"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Exercise real terminal refusal and inherited pipe input at the CLI boundary.
+rustix = { version = "1.1.4", features = ["pty", "pipe"] }
+
 [lints.rust]
 unsafe_code = "forbid"

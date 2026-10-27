@@ -906,26 +906,33 @@ Per-action admission/placement,
 coordinator-only cache publication, cross-worker reuse, real compiler-skip evidence,
 performance gates and the required canary/soak are not completed by this frontend.
 
-## Local canonical builds and checks with dependency caching
+## Local canonical Cargo commands with dependency caching
 
 `rabsd --canonical-compile-local PROFILE.json` runs the captured native Cargo as
-`cargo check`, `cargo build`, `cargo clippy` or `cargo test`, always offline and locked, with the selected packages, features and targets
+`cargo check`, `cargo build`, `cargo clippy`, `cargo test`, `cargo run` or
+`cargo bench`, always offline and locked, with the selected packages, features and targets
 inside the canonical namespace and connects
 its rustc requests to an operation-owned coordinator. Eligible external registry,
 locked Git and verified directory-source libraries use the existing metadata
 cache or the isolated worker archive lane, including cold-result publication,
 differential verification and compiler-skip gates. Successful builds retain their
-completed target tree and report its usable host path. `test --no-run` delivers
-its compiled harnesses the same way; ordinary tests and doctests execute on every
-invocation and return their current result. Cargo plans the units at `/__rabs/workspace` with the captured
+completed target tree and report its usable host path. `test --no-run` and
+`bench --no-run` deliver their compiled harnesses the same way. Tests, doctests,
+programs and benchmarks execute on every invocation and return their current
+result. Cargo plans the units at `/__rabs/workspace` with the captured
 compiler at `/__rabs/toolchain/bin/rustc` and target at `/__rabs/out/cargo`, so moving
 the original checkout does not introduce a different host path into that unit's
 arguments or metadata output.
 
 The local profile asks the captured Cargo to plan the **actual selected build
-units** with `--unit-graph -Z unstable-options` on the selected `check`, `build`, `clippy` or `test`, using the same Cargo
-selection, captured configuration and canonical paths as execution. Harness
-arguments after `--` are supplied only to the actual test invocation. Clippy's
+units** with `--unit-graph -Z unstable-options` on the selected `check`, `build`,
+`clippy`, `test` or `bench`, using the same Cargo selection, captured configuration
+and canonical paths as execution. For `run`, captured metadata and Cargo's own
+package resolution identify the selected binary or executable example; the
+driver plans that exact target with `cargo build --bin/--example`. This avoids
+the pinned Cargo's unsupported `run --unit-graph` path while retaining the
+original `cargo run` command for execution. Program and harness arguments after
+`--` are supplied only to the actual execution. Clippy's
 validated lint arguments are retained for both planning and execution, after
 the driver's Cargo options. Planning
 does not compile or run project units, and finishes before a wrapper or cache
@@ -937,7 +944,10 @@ other workspace members do not enable that requirement unless Cargo selects
 their executors. `build --tests`, `build --benches` and `build --all-targets`
 may compile harnesses; they never run tests or benchmarks. `test` admits the
 selected test and library-doctest units and always requires isolated-worker
-authority for dependency caching, including when `--no-run` is selected. Cargo
+authority for dependency caching, including when `--no-run` is selected. `run`
+and `bench` also always require that isolated-worker authority, including
+`bench --no-run`. Run graphs must select one executable build root; benchmark
+graphs admit their selected build/test units without admitting doctests. Cargo
 can emit the same unit graph with or without `--no-run`; the retained command
 selection determines whether the harnesses execute. Unknown graph versions, modes, target kinds, malformed edges,
 cycles, unreachable units and sources outside the retained inputs also refuse.
@@ -956,7 +966,7 @@ archive actions with `dep-info` and `link`, optionally also `metadata`, require
 the worker's separately admitted closed archive namespace before they can publish
 or replay a cache result. With no suitable worker, Cargo still builds those
 archives in its own namespace, without granting those local archive results cache
-authority. Test commands and graphs containing active build scripts or procedural macros also
+authority. Test, Run and Bench commands and graphs containing active build scripts or procedural macros also
 require that isolated worker lane for metadata cache publication and replay.
 Project executors can access the operation's wrapper socket; they cannot turn a
 claimed local completion into trusted cache evidence. The retained graph policy
@@ -1019,20 +1029,30 @@ For an already vendored project, save this profile with your actual absolute pat
 rabsd --canonical-compile-local ./canonical-compile.json
 ```
 
-`command` is `check` by default, `build`, `clippy`, or `test`. The profile and native entry point
+`command` is `check` by default, `build`, `clippy`, `test`, `run` or `bench`.
+The profile and native entry point
 replace `canonical-check-local-v1` and `--canonical-check-local`; install matching
 tools and update saved local profiles. `manifest` defaults to `Cargo.toml`, `jobs`
 to 1 and `timeout_seconds` to 1800.
 Omitting `selection` for `check` retains the library-only `check --lib` behavior;
-omitting it for `build`, `clippy` or `test` uses Cargo's ordinary default members and targets. Setting
+omitting it for `build`, `clippy`, `test`, `run` or `bench` uses Cargo's ordinary
+default members and targets. Setting
 `"selection": {}` uses Cargo's ordinary default members and targets. A selection
 can specify `workspace`, `packages`, `exclude`, `features`, `all_features`,
 `no_default_features`, `lib`, `bins`, `tests`, `examples`, `benches`, `all_targets`,
 the named-target arrays `bin`, `test`, `example`, `bench`, the compilation-target
 array `target`, and either `release` or the optional profile-name string `profile`.
-For `test`, it also accepts `doc`, `no_run`, `no_fail_fast`, an optional
-`test_filter` string and the literal `test_args` array. These test-only fields
-cannot change a `check`, `build` or `clippy` command. For `clippy`, the selection
+For `test` and `bench`, it also accepts `no_run`, `no_fail_fast`, an optional
+`test_filter` string and the literal `test_args` array. `doc` is accepted only
+for `test`. These harness fields cannot change another command. Bench uses
+Cargo's optimized benchmark profile by default and accepts `profile`, but
+rejects `release`, matching Cargo's `bench` options.
+For `run`, the selection accepts one package, one compilation target, and at
+most one named binary or example, with no workspace or plural target selectors.
+The literal `run_args` array supplies the program's arguments after `--`;
+it cannot change another command. If no binary or example is named, Cargo's
+selected default members and `default-run` choose the target, with ambiguity
+reported before execution. For `clippy`, the selection
 also accepts `no_deps` and a `lint_args` array containing bounded lint controls;
 these fields cannot change another command.
 An empty `target` and absent or null `profile` retain Cargo's defaults. Exclusions
@@ -1066,7 +1086,8 @@ into a private Cargo home. It does not inherit that cache's user configuration,
 credentials or unrelated expanded sources. The source, toolchain, state,
 operation and optional Cargo-cache roots must be disjoint ordinary absolute
 directories. The wrapper must be an ordinary executable outside the captured
-source and mutable state/operation roots. Commands other than `check`, `build`, `clippy` and `test`, mount declarations
+source and mutable state/operation roots. Commands other than `check`, `build`,
+`clippy`, `test`, `run` and `bench`, mount declarations
 and environment overrides are not profile fields.
 
 Preparation captures the selected toolchain before its Cargo metadata planning
@@ -1074,10 +1095,11 @@ and uses those captured Cargo/rustc binaries with a controlled environment.
 The actual graph proof and compilation then run in the canonical namespace. The source
 workspace and HOME are read-only there. HOME contains the retained wrapper and
 the fresh operation socket; private Cargo state and the target are writable.
-Tests use the same view. Write temporary files through `TMPDIR` (`/__rabs/tmp`)
-or the private target selected by `CARGO_TARGET_DIR`; tests that write into the
-source checkout or HOME will fail. Networking is isolated, so tests cannot rely
-on external services. These runtime constraints apply to doctests too, and
+Tests, programs and benchmarks use the same view. Write temporary files through
+`TMPDIR` (`/__rabs/tmp`) or the private target selected by `CARGO_TARGET_DIR`;
+executed code that writes into the source checkout or HOME will fail. Networking
+is isolated, so these commands cannot rely on external services. These runtime
+constraints apply to doctests too, and
 failures retain Cargo's status rather than retrying outside the namespace.
 The build sees neither the persistent CAS nor the ordinary daemon endpoint.
 Its scoped endpoint accepts rustc requests only and refuses status, generic
@@ -1090,7 +1112,7 @@ capability; a wrapper-supplied path or environment flag cannot construct one.
 The local Cargo driver also accepts the existing pinned dependency-worker
 configuration from its operator environment. With no worker configuration it
 keeps the local metadata lane only for compiler-only check/build graphs without
-project executors. Test/Clippy commands and graphs with build scripts or procedural
+project executors. Test, Clippy, Run and Bench commands and graphs with build scripts or procedural
 macros compile without local action-cache authority.
 To use workers, install matching `rabsd`, `rabs-wrap` and
 `rabs-wkr` binaries and provision the mutual-TLS credentials described in
@@ -1300,6 +1322,47 @@ that rustc dep-info would not observe. An identical Clippy request can restore
 verified private Cargo state; it still starts the selected Cargo/Clippy command.
 Lint outcomes are never shared action-cache results or delivered build artifacts.
 
+### Run programs and benchmarks with reusable compilation
+
+The local profile also runs a selected binary or executable example and Cargo's
+benchmark harnesses. Eligible library compilations can use isolated workers;
+the final links and requested program or benchmark bodies execute in the local
+canonical namespace.
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- run --bin analyze \
+  -- --format=json < input.json
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- bench --bench throughput \
+  selected -- --exact </dev/null
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- bench --bench throughput --no-run
+```
+
+Run's `run_args` and Bench's `test_filter`/`test_args` are literal runtime values.
+Empty arguments, Unicode and option-looking program arguments survive the
+handoff. They never enter graph planning as Cargo options. `harness = false`
+benchmark targets retain Cargo's custom-harness behavior. Bench defaults to
+Cargo's optimized benchmark profile; use `--profile NAME` for another profile.
+
+This is a **noninteractive execution profile**. Executing Run and Bench commands
+inherit pipe, file or null stdin. A terminal stdin is rejected before source
+capture or coordinator startup because the managed Cargo process group does not
+own terminal foreground control. Redirect input, use `</dev/null`, or deliver a
+binary with `build` and run it outside this profile when it needs an interactive
+terminal. `bench --no-run` does not consume stdin or require this redirection.
+Existing Check, Build, Clippy and Test commands retain closed stdin. The source
+workspace and HOME remain read-only, temporary and target directories are
+private and writable, and external networking remains unavailable.
+
+Optional private target reuse can restore compiled artifacts across changes to
+program arguments or benchmark filters. Every invocation still starts the
+original Cargo command and reruns the requested body. A normally exited failing
+program or benchmark may retain its compiled state, but Cargo's current numeric
+exit status is preserved and the execution result is never cached. The driver's execution
+records report `run_execution` or `benchmark_execution` and explicitly keep
+program/benchmark result caching disabled. `bench --no-run` delivers the complete
+compiled target tree through the same retained-artifact contract as Build and
+`test --no-run`.
+
 ### Persistent reuse and command results
 
 The driver owns `state_root/canonical-compile-v1`, including its CAS and exclusive
@@ -1364,7 +1427,7 @@ separate the seed family. Immutable registry/Git/vendor inputs remain exact.
 This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
 
-Code-generating builds, all test/Clippy commands, and selected graphs with build scripts
+Code-generating builds, all Test, Clippy, Run and Bench commands, and selected graphs with build scripts
 or procedural macros use the **complete captured source identity** for private target reuse. An unchanged capture can
 reuse its verified target, but any captured file edit starts that graph with a
 cold target. Procedural macros may read data through ordinary filesystem calls
@@ -1384,9 +1447,10 @@ restore keeps its partial copy unmounted and runs the current command cold;
 a failed save preserves Cargo's actual result. Both report a
 `canonical-target-state-unavailable` diagnostic. A new seed is saved only after
 complete compiler/session/coordinator drain and either successful Cargo execution
-or a normally exited `test` command. A failing test may therefore retain its
-compiled artifacts for the next invocation; the tests still execute again, and
-the previous success or failure is never served as a test result.
+or a normally exited Test, Run or Bench command. A failing test, program or
+benchmark may therefore retain its compiled artifacts for the next invocation;
+its body still executes again, and the previous success or failure is never
+served as the current command's result.
 That same successful cold command can replace a seed after a failed restore.
 An ineligible source edit or a failed private destination preserves a healthy
 committed seed until that replacement succeeds.
@@ -1435,7 +1499,7 @@ publication or verification sample. A check returns diagnostics and success/fail
 its temporary target is released after optional private state capture. Persistent reusable dependency results remain
 in the profile's CAS.
 
-A successful `build` or `test --no-run` moves its complete target tree, after that clean drain, to
+A successful `build`, `test --no-run` or `bench --no-run` moves its complete target tree, after that clean drain, to
 a fresh private `operation_root/rabs-build-<random>/target` directory. The move
 preserves the actual artifacts, executable permissions and inodes without a second
 copy. Captured source, toolchain, Cargo home and control sockets stay in the
@@ -1451,9 +1515,10 @@ the reported target directory for the same relative output path. For example,
 `/__rabs/out/cargo/release/server` is available as
 `<target_directory>/release/server`; an explicit target triple adds its usual
 subdirectory. A retained binary may be run directly when its normal target and
-runtime requirements are met. RABS does not run it as part of `build` or
-`test --no-run`. Test harnesses retain Cargo's ordinary names under `debug/deps`
-or the selected target/profile directory. Each delivered command
+runtime requirements are met. RABS does not run it as part of `build`,
+`test --no-run` or `bench --no-run`. Test and benchmark harnesses retain Cargo's
+ordinary names under `debug/deps`, `release/deps` or the selected target/profile
+directory. Each delivered command
 has its own retained outputs; this is artifact delivery, not a shared writable
 target cache or a request to skip Cargo's current command.
 
@@ -1478,6 +1543,10 @@ execution markers to remain absent. Test cases then verify filtering, repeated
 execution when Cargo reports a fresh harness, doctest execution and the current
 failure exit status. Clippy cases plan without compiling, then prove that lint
 failures remain visible after a successful check and changes to lint levels.
+Run cases resolve a default binary while excluding an invalid unrelated binary,
+preserve literal arguments and binary input, and execute again when Cargo reports
+fresh artifacts. Bench cases exercise custom harnesses, optimized and explicit
+profiles, no-run compilation, repeated current execution and failures.
 A wrong-profile negative control must fail compilation. These
 cases validate command selection and its real Cargo outputs; they do not substitute
 for the isolated worker/cache fixtures below.
@@ -1500,6 +1569,16 @@ RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
   cargo test -p rabsd --test canonical_check_local --locked \
     canonical_clippy_preserves_current_lints_and_separates_private_target_families \
     -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_run_preserves_default_target_input_arguments_and_every_current_exit \
+    -- --ignored --exact --nocapture
+
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_bench_delivers_no_run_then_executes_each_current_custom_harness \
+    -- --ignored --exact --nocapture
 ```
 
 These cases check delivered no-run harnesses, execution of each current test
@@ -1507,7 +1586,11 @@ request, the captured rustdoc, failure propagation and refusal of local cache
 authority from test code. The Clippy fixture checks cold/warm target reuse,
 current lint failures after a warm check, lint-level and configuration changes,
 and refusal of local rustc cache authority. It also requires the captured Clippy
-components. These tests must actually execute on a supported host; an
+components. Run checks a real stdin pipe and current success/failure after
+restored private state; Bench checks retained no-run output and current harness
+execution after restore. The ordinary unignored CLI tests also use a real PTY to
+verify terminal refusal happens before profile-root access. These tests must
+actually execute on a supported host; an
 ignored fixture or a namespace-capability refusal is not passing evidence.
 
 The full compiler-skip test is explicitly opt-in because it needs the complete
@@ -1641,7 +1724,8 @@ the delivered executable to use the new generated value.
 ### Select local Cargo units from the Cargo command line
 
 The installed `cargo-rabs` launcher accepts the same local profile and turns
-ordinary build/check/clippy/test selectors into the native driver's typed command and selection:
+ordinary Build, Check, Clippy, Test, Run and Bench selectors into the native
+driver's typed command and selection:
 
 ```sh
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- check
@@ -1660,13 +1744,19 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --no-
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core --doc
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- test -p core roundtrip \
   --no-fail-fast -- --exact --nocapture --test-threads=1
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- run -p app --bin server \
+  -- --input=sample.json </dev/null
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- bench -p core --bench throughput \
+  -- --test </dev/null
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- bench -p core --no-run
 ```
 
 Omitting the Cargo arguments selects `check`. Explicit command-line selection
 replaces the profile's `command` and entire `selection` object; it never merges with saved
 features or targets. An empty selection uses Cargo's ordinary default members
 and targets. Directly invoking `rabsd` with a check profile that omits `selection`
-retains the library-only `--lib` behavior; build, Clippy and test profiles use Cargo's defaults.
+retains the library-only `--lib` behavior; Build, Clippy, Test, Run and Bench
+profiles use Cargo's defaults.
 The profile still selects the manifest,
 source and toolchain roots, job budget, timeout, state directory and wrapper.
 
@@ -1677,9 +1767,10 @@ source and toolchain roots, job budget, timeout, state directory and wrapper.
 | Target kinds | `--lib`, `--bins`, `--tests`, `--examples`, `--benches`, `--all-targets` |
 | Named targets | `--bin`, `--test`, `--example`, `--bench` |
 | Compilation targets | Repeated `--target` with built-in target names or `host-tuple` |
-| Compilation profile | `--release` / `-r`, or one `--profile NAME` |
-| Test execution | `test` only: `--no-run`, `--doc`, `--no-fail-fast`, one optional test-name filter |
-| Test harness | `test` only: literal arguments after `--`, such as `--exact`, `--nocapture`, `--ignored` or `--test-threads=1` |
+| Compilation profile | `--release` / `-r`, or one `--profile NAME`; `bench` accepts only the latter and defaults to optimized compilation |
+| Test/benchmark execution | `test` and `bench`: `--no-run`, `--no-fail-fast`, one optional name filter; `--doc` is Test-only |
+| Test/benchmark harness | `test` and `bench`: literal arguments after `--`, such as `--exact`, `--nocapture`, `--ignored` or `--test-threads=1` |
+| Program execution | `run`: at most one package, one compilation target, and one named `--bin` or `--example`; literal program arguments after `--` |
 | Clippy lint selection | `clippy` only: `--no-deps`, and the bounded lint controls after `--` described above |
 
 Value options accept separate arguments and `--option=value`; `-pPACKAGE` and
@@ -1687,32 +1778,38 @@ Value options accept separate arguments and `--option=value`; `-pPACKAGE` and
 value in order. `--profile` occurs at most once and cannot be combined with
 `--release` or `-r`. Target and profile names use the same restricted name syntax
 as the native profile above; neither can select a JSON target specification or
-another file. All array entries, the optional profile, the test filter, lint controls and
-harness arguments together share the
+another file. Run excludes workspace and plural target selection. All array
+entries, the optional profile, the test/benchmark filter, lint controls, program
+arguments and harness arguments together share the
 128-value limit and the selected command arguments' 16 KiB byte budget, including
 option names. Each individual value is limited to 1,024 UTF-8 bytes.
 Cargo interprets package specifications and comma/space-separated feature lists.
-The native driver constructs both its nonexecuting unit-graph query and the
-subsequent compilation from the same command and selection. It requires a captured nightly Cargo
-with unit-graph support and derives the worker-only cache policy from the test/Clippy
-command or required build-script/procedural-macro units before exposing the cache endpoint. Selecting
+The native driver constructs its nonexecuting unit-graph query and subsequent
+compilation from the same selection. Run resolves its one executable target
+through captured Cargo metadata/package identity and plans that target as a
+Build, then invokes the original Run command. It requires a captured nightly
+Cargo with unit-graph support and derives the worker-only cache policy from the
+Test, Clippy, Run or Bench command or required build-script/procedural-macro units
+before exposing the cache endpoint. Selecting
 a different target or feature set can therefore retain local metadata caching
 when those executors are inactive. Source
 preparation still captures the locked graph; these selectors do not narrow the
 approved source boundary or replace the isolated generated-input admission checks.
 
-This mode accepts `check`, `build`, `clippy` and `test`. `run`, `bench` and arbitrary
+This mode accepts `check`, `build`, `clippy`, `test`, `run` and `bench`. Arbitrary
 subcommands are not admitted. `build --tests` and `build --benches` compile only;
-`test --no-run` also compiles without executing its harnesses. Ordinary `test`
-and `test --doc` run on every request, even when their compiled inputs are fresh.
-The filter and harness arguments are retained as separate typed fields; the
-driver appends the harness tail after its own Cargo options. No argument after
+`test --no-run` and `bench --no-run` also compile without executing their harnesses.
+Ordinary Test, doctest, Run and Bench bodies run on every request, even when their
+compiled inputs are fresh. Program arguments, filters and harness arguments are
+retained as separate typed fields; the driver appends the runtime tail after
+its own Cargo options. No argument after
 that separator can become a Cargo configuration or planning option.
 The native driver supplies locked/offline
 mode, canonical compiler and output locations, and JSON diagnostics. Arguments
 that would override them, including `--config`, `--manifest-path`, `--target-dir`,
-`--message-format` and `-Z`, are refused as Cargo options. Harness arguments after
-`--` are accepted only for `test`; Clippy accepts its validated lint controls there.
+`--message-format` and `-Z`, are refused as Cargo options. Arguments after `--`
+are program arguments for Run and harness arguments for Test or Bench; Clippy
+accepts its validated lint controls there.
 Set `jobs` and `manifest` in the profile. Launcher modes and
 local root-admission settings cannot be combined with this mode.
 

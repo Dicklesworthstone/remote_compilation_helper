@@ -1,4 +1,4 @@
-//! Admission of the units Cargo actually selected for a check, build, Clippy or test.
+//! Admission of the units Cargo selected for check, build, Clippy, test, run or bench.
 //!
 //! `cargo metadata` describes packages, including optional and development
 //! dependencies that a particular command will never execute. Cargo's nightly
@@ -17,9 +17,9 @@
 //! packages, features or targets. A graph containing project executors requires
 //! closed per-action worker execution for dependency caching: project code can
 //! access the wrapper endpoint, so its claimed local completions are not trusted
-//! compiler evidence. Every test operation requires the same boundary because
-//! its test executables and doctests can reach that endpoint too. Unknown modes
-//! and unrelated program commands remain refused; test outcomes are not cached.
+//! compiler evidence. Test, run and bench operations require the same boundary
+//! because their executables can reach that endpoint too. Unknown modes remain
+//! refused; program, test and benchmark outcomes are not cached.
 
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -33,6 +33,101 @@ const MAX_DEPENDENCIES: usize = 262_144;
 const MAX_FEATURES: usize = 4_096;
 const MAX_TEXT: usize = 8_192;
 const LIBRARY_TYPES: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib"];
+
+/// Resolve the compilation target of `cargo run` without running a program.
+///
+/// Cargo's run command cannot reliably emit a unit graph: the pinned Cargo
+/// attempts to retrieve an executable after its graph-only compiler returns.
+/// The driver instead asks Cargo metadata for the selected workspace's default
+/// members and default-run declarations, then queries `cargo build` for the
+/// exact binary/example. The final command remains the user's original run.
+/// An explicit package spec is resolved by the captured `cargo pkgid`, supplied
+/// here as `package_id`; this function does not approximate Cargo's spec parser.
+/// Named bin/example selectors are already exact Cargo selectors and need no
+/// metadata resolution. The subsequent graph must have one runnable root.
+pub fn run_build_selection(
+    selection: &CompilationSelection,
+    metadata: &Value,
+    package_id: Option<&str>,
+) -> io::Result<CompilationSelection> {
+    selection.cargo_arguments(CompilationCommand::Run)?;
+    let mut compilation = selection.clone();
+    compilation.run_args.clear();
+    if !selection.bin.is_empty() || !selection.example.is_empty() {
+        return Ok(compilation);
+    }
+    require(
+        metadata["version"].as_u64() == Some(1),
+        "unsupported Cargo metadata version",
+    )?;
+    let packages = metadata["packages"]
+        .as_array()
+        .filter(|packages| packages.len() <= MAX_UNITS)
+        .ok_or_else(|| invalid("Cargo metadata packages are missing or excessive"))?;
+    require(
+        selection.packages.is_empty() == package_id.is_none(),
+        "run package selection requires its captured Cargo pkgid result",
+    )?;
+    let selected = if let Some(package) = package_id {
+        vec![package]
+    } else {
+        metadata["workspace_default_members"]
+            .as_array()
+            .filter(|members| !members.is_empty() && members.len() <= MAX_UNITS)
+            .ok_or_else(|| invalid("Cargo metadata has no bounded default members"))?
+            .iter()
+            .map(|id| text(id, "default package identity"))
+            .collect::<io::Result<Vec<_>>>()?
+    };
+    let mut bins = Vec::new();
+    let mut defaults = Vec::new();
+    let mut selected_ids = BTreeSet::new();
+    for id in selected {
+        require(
+            selected_ids.insert(id),
+            "duplicate default package identity",
+        )?;
+        let matching = packages
+            .iter()
+            .filter(|package| package["id"] == id)
+            .collect::<Vec<_>>();
+        require(
+            matching.len() == 1,
+            "selected run package is not a unique captured workspace member",
+        )?;
+        let package = matching[0];
+        if !package["default_run"].is_null() {
+            defaults.push(text(&package["default_run"], "default-run target")?);
+        }
+        let targets = package["targets"]
+            .as_array()
+            .filter(|targets| targets.len() <= MAX_UNITS)
+            .ok_or_else(|| invalid("Cargo package targets are missing or excessive"))?;
+        for target in targets {
+            if target["kind"] == serde_json::json!(["bin"]) {
+                bins.push(text(&target["name"], "binary target")?);
+            }
+        }
+    }
+    // Cargo selects a unique default-run across the selected packages. With
+    // zero or several defaults it requires a unique binary instead; packages
+    // without binaries do not make an otherwise unambiguous run ambiguous.
+    let name = if defaults.len() == 1 {
+        defaults[0]
+    } else if bins.len() == 1 {
+        bins[0]
+    } else {
+        return Err(invalid(
+            "cargo run cannot determine one binary; select --bin/--example or set one default-run",
+        ));
+    };
+    require(
+        bins.iter().filter(|bin| **bin == name).count() == 1,
+        "cargo run selected an absent or ambiguous binary; specify its package and --bin",
+    )?;
+    compilation.bin.push(name.to_owned());
+    Ok(compilation)
+}
 
 /// A validated selected compilation graph. Counts are explanatory, not authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,8 +359,9 @@ fn index(value: &Value, units: usize) -> io::Result<usize> {
 /// without running them. The same mode is refused for `Check`. The caller must
 /// bind this command to both its trusted Cargo graph query and final invocation;
 /// a graph from `cargo test` never establishes compile-only execution authority.
-/// `Test` additionally admits `doctest` units and marks the entire operation as
-/// executing project code, including a `--no-run` selection. The command's
+/// `Test` additionally admits `doctest` units. `Bench` uses build/test units;
+/// `Run` requires the build graph of exactly one binary/example. All three mark
+/// the entire operation as executing project code, including a `--no-run` selection. The command's
 /// no-run behavior remains Cargo's responsibility; it cannot restore local
 /// compiler-result authority through a graph that happens to have no executors.
 ///
@@ -306,6 +402,20 @@ pub fn validate_compilation_unit_graph(
             "duplicate Cargo unit graph root",
         )?;
     }
+    if command == CompilationCommand::Run {
+        require(
+            selected.len() == 1,
+            "cargo run requires exactly one runnable graph root",
+        )?;
+        let root = &units[*selected.first().expect("validated nonempty roots")];
+        require(
+            root["mode"] == "build"
+                && matches!(root["target"]["kind"].as_array().map(Vec::as_slice),
+                Some([kind]) if kind == "bin" || kind == "example")
+                && root["target"]["crate_types"] == serde_json::json!(["bin"]),
+            "cargo run graph root must be its selected binary or executable example",
+        )?;
+    }
 
     let mut packages = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
@@ -316,7 +426,10 @@ pub fn validate_compilation_unit_graph(
     // compiler dep-info and must never acquire local rustc-result authority.
     let mut project_executors = matches!(
         command,
-        CompilationCommand::Test | CompilationCommand::Clippy
+        CompilationCommand::Test
+            | CompilationCommand::Clippy
+            | CompilationCommand::Run
+            | CompilationCommand::Bench
     );
     let mut doctests = false;
     let mut dependencies = Vec::with_capacity(units.len());
@@ -334,8 +447,11 @@ pub fn validate_compilation_unit_graph(
                 CompilationCommand::Check | CompilationCommand::Clippy => {
                     matches!(mode, "check" | "build")
                 }
-                CompilationCommand::Build => matches!(mode, "build" | "test"),
+                CompilationCommand::Build | CompilationCommand::Bench => {
+                    matches!(mode, "build" | "test")
+                }
                 CompilationCommand::Test => matches!(mode, "build" | "test" | "doctest"),
+                CompilationCommand::Run => mode == "build",
             },
         };
         require(
@@ -1111,6 +1227,112 @@ mod tests {
             graph["units"][0]["mode"] = json!(mode);
             assert!(
                 validate_compilation_unit_graph(&graph, CompilationCommand::Test).is_err(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_resolves_defaults_and_cargo_package_identity_without_rewriting_runtime_arguments() {
+        let metadata = json!({"version":1, "workspace_default_members":["app", "other"],
+            "packages":[
+                {"id":"app", "default_run":"server", "targets":[
+                    {"name":"app", "kind":["lib"]}, {"name":"server", "kind":["bin"]},
+                    {"name":"admin", "kind":["bin"]}]},
+                {"id":"other", "targets":[{"name":"other", "kind":["bin"]}]}]});
+        let mut selection = CompilationSelection {
+            features: vec!["app/fast".into()],
+            run_args: vec!["--unit-graph".into(), "".into()],
+            ..CompilationSelection::default()
+        };
+        let planned = run_build_selection(&selection, &metadata, None).unwrap();
+        assert_eq!(planned.bin, ["server"]);
+        assert_eq!(planned.features, selection.features);
+        assert!(planned.run_args.is_empty());
+        assert!(
+            planned.packages.is_empty(),
+            "target resolution must preserve package/feature selection"
+        );
+        assert_eq!(
+            selection.run_args,
+            ["--unit-graph", ""],
+            "runtime arguments changed"
+        );
+        selection.packages = vec!["other@1.0.0".into()];
+        assert_eq!(
+            run_build_selection(&selection, &metadata, Some("other"))
+                .unwrap()
+                .bin,
+            ["other"]
+        );
+        assert!(run_build_selection(&selection, &metadata, None).is_err());
+        assert!(run_build_selection(&selection, &metadata, Some("absent")).is_err());
+        selection.example = vec!["demo".into()];
+        assert_eq!(
+            run_build_selection(&selection, &Value::Null, None)
+                .unwrap()
+                .example,
+            ["demo"]
+        );
+    }
+
+    #[test]
+    fn run_default_resolution_refuses_ambiguity_and_respects_metadata_default_members() {
+        let mut metadata = json!({"version":1, "workspace_default_members":["app", "other"],
+            "packages":[
+                {"id":"app", "targets":[{"name":"app", "kind":["bin"]}]},
+                {"id":"other", "targets":[{"name":"other", "kind":["bin"]}]}]});
+        let selection = CompilationSelection::default();
+        assert!(run_build_selection(&selection, &metadata, None).is_err());
+        metadata["workspace_default_members"] = json!(["app"]);
+        assert_eq!(
+            run_build_selection(&selection, &metadata, None)
+                .unwrap()
+                .bin,
+            ["app"]
+        );
+        metadata["packages"][0]["default_run"] = json!("missing");
+        assert!(run_build_selection(&selection, &metadata, None).is_err());
+        metadata["packages"][0]["default_run"] = json!("app");
+        metadata["packages"][1]["default_run"] = json!("other");
+        metadata["workspace_default_members"] = json!(["app", "other"]);
+        assert!(run_build_selection(&selection, &metadata, None).is_err());
+        metadata["packages"][1]["default_run"] = Value::Null;
+        metadata["packages"][1]["targets"][0]["name"] = json!("app");
+        assert!(run_build_selection(&selection, &metadata, None).is_err());
+    }
+
+    #[test]
+    fn run_and_bench_graphs_require_closed_worker_authority_and_never_admit_doctests() {
+        let mut graph = graph();
+        for unit in graph["units"].as_array_mut().unwrap() {
+            unit["mode"] = json!("build");
+        }
+        for kind in ["bin", "example"] {
+            graph["units"][0]["target"]["kind"] = json!([kind]);
+            graph["units"][0]["target"]["crate_types"] = json!(["bin"]);
+            let report = validate_compilation_unit_graph(&graph, CompilationCommand::Run).unwrap();
+            assert!(report.requires_closed_dependency_execution());
+            assert!(!report.contains_doctests());
+            assert_eq!(
+                report.workspace_units().len(),
+                1,
+                "only the prerequisite library may offload codegen"
+            );
+        }
+        graph["roots"] = json!([0, 1]);
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Run).is_err());
+        graph["roots"] = json!([0]);
+        graph["units"][0]["target"]["kind"] = json!(["bench"]);
+        graph["units"][0]["mode"] = json!("test");
+        let report = validate_compilation_unit_graph(&graph, CompilationCommand::Bench).unwrap();
+        assert!(report.requires_closed_dependency_execution());
+        assert!(!report.contains_doctests());
+        assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Run).is_err());
+        for mode in ["check", "doctest", "bench", "run", "doc"] {
+            graph["units"][0]["mode"] = json!(mode);
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Bench).is_err(),
                 "{mode}"
             );
         }

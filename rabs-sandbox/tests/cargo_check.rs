@@ -7,14 +7,15 @@
 //! network. It does not qualify cache serving or namespace enforcement.
 #![cfg(target_os = "linux")]
 
-use CompilationCommand::{Build, Check, Clippy, Test};
+use CompilationCommand::{Bench, Build, Check, Clippy, Run, Test};
 use rabs_sandbox::cargo_check::{
-    CompilationCommand, CompilationSelection, validate_compilation_unit_graph,
+    CompilationCommand, CompilationSelection, run_build_selection, validate_compilation_unit_graph,
 };
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 struct Fixture {
     owner: tempfile::TempDir,
@@ -167,8 +168,17 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         } else {
             self.command()
         };
+        let planned = if command == Run {
+            self.run_build_selection(&selection)
+        } else {
+            selection.clone()
+        };
         invocation
-            .args(selection.cargo_arguments(command).unwrap())
+            .args(
+                planned
+                    .cargo_arguments(if command == Run { Build } else { command })
+                    .unwrap(),
+            )
             .args([
                 "--offline",
                 "--locked",
@@ -188,6 +198,64 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(graph["version"], 1);
         graph
+    }
+
+    fn run_build_selection(&self, selection: &CompilationSelection) -> CompilationSelection {
+        if !selection.bin.is_empty() || !selection.example.is_empty() {
+            return run_build_selection(selection, &Value::Null, None).unwrap();
+        }
+        let metadata = self
+            .command()
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version=1",
+                "--offline",
+                "--locked",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            metadata.status.success(),
+            "{}",
+            String::from_utf8_lossy(&metadata.stderr)
+        );
+        let metadata: Value = serde_json::from_slice(&metadata.stdout).unwrap();
+        let package = selection.packages.first().map(|spec| {
+            let output = self
+                .command()
+                .args(["pkgid", "--offline", "--locked", "--package", spec])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        });
+        run_build_selection(selection, &metadata, package.as_deref()).unwrap()
+    }
+
+    fn runtime(
+        &self,
+        command: CompilationCommand,
+        selection: &CompilationSelection,
+        input: &[u8],
+    ) -> std::process::Output {
+        assert!(matches!(command, Run | Bench));
+        let mut child = self
+            .command()
+            .args(selection.cargo_arguments(command).unwrap())
+            .args(["--offline", "--locked", "--message-format=json"])
+            .args(selection.runtime_arguments(command).unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
     }
 
     fn test(&self, selection: &CompilationSelection) -> std::process::Output {
@@ -1046,6 +1114,246 @@ fn compilation_must_not_run_this_test() {
         assert!(!fixture.root().join("test-was-executed").exists());
         assert!(!fixture.root().join("program-was-executed").exists());
     }
+}
+
+#[test]
+fn native_run_resolves_default_binary_preserves_stdin_and_arguments_and_reexecutes_warm_programs() {
+    let fixture = Fixture::new();
+    let manifest = fs::read_to_string(fixture.root().join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root().join("Cargo.toml"),
+        manifest.replacen(
+            "[package]",
+            "[package]\ndefault-run = 'selected_graph_app'",
+            1,
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.root().join("src/bin")).unwrap();
+    fs::write(
+        fixture.root().join("src/bin/unselected.rs"),
+        "compile_error!(\"run selected an unrelated binary\");fn main(){}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("ordinary/src/lib.rs"),
+        "pub const VALUE: u32 = 37;\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("src/lib.rs"),
+        "pub const VALUE: u32 = ordinary::VALUE;\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("src/main.rs"),
+        r#"use std::io::{Read, Write};
+fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    println!("RUN:{}:{args:?}", selected_graph_app::VALUE);
+    std::io::stdout().write_all(&input).unwrap();
+    if args.iter().any(|arg| arg == "--fail") { std::process::exit(7); }
+}
+"#,
+    )
+    .unwrap();
+    let mut selection = CompilationSelection {
+        run_args: vec![
+            "".into(),
+            "雪".into(),
+            "--manifest-path=/not-cargo".into(),
+            "line\nvalue".into(),
+        ],
+        ..CompilationSelection::default()
+    };
+    let graph = fixture.graph(Run, selection.clone());
+    let report = validate_compilation_unit_graph(&graph, Run).unwrap();
+    assert!(report.requires_closed_dependency_execution());
+    assert_eq!(report.roots, 1);
+    assert!(
+        !graph["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|unit| unit["target"]["name"] == "unselected")
+    );
+    fixture.assert_no_compilation_or_project_execution();
+    let input = b"piped input\0\xff\n";
+    for number in 0..2 {
+        let output = fixture.runtime(Run, &selection, input);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = format!("RUN:37:{:?}\n", selection.run_args).into_bytes();
+        expected.extend(input);
+        assert!(
+            output.stdout.ends_with(&expected),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let artifacts = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        assert!(!artifacts.is_empty());
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| artifact["fresh"] == (number == 1))
+        );
+    }
+    selection.packages = vec!["selected_graph_app@0.1.0".into()];
+    validate_compilation_unit_graph(&fixture.graph(Run, selection.clone()), Run).unwrap();
+    selection.run_args.push("--fail".into());
+    let failed = fixture.runtime(Run, &selection, input);
+    assert_eq!(
+        failed.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(failed.stdout.ends_with(input));
+
+    fs::create_dir_all(fixture.root().join("examples")).unwrap();
+    fs::write(
+        fixture.root().join("examples/demo.rs"),
+        "fn main(){println!(\"EXAMPLE:{}\", selected_graph_app::VALUE);}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("dev-macro/src/lib.rs"),
+        "extern crate proc_macro;\n",
+    )
+    .unwrap();
+    let example = CompilationSelection {
+        example: vec!["demo".into()],
+        ..CompilationSelection::default()
+    };
+    validate_compilation_unit_graph(&fixture.graph(Run, example.clone()), Run).unwrap();
+    let output = fixture.runtime(Run, &example, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"EXAMPLE:37\n"));
+}
+
+#[test]
+fn native_bench_respects_custom_harness_no_run_optimized_default_and_current_execution() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.root().join("benches")).unwrap();
+    let manifest = fs::read_to_string(fixture.root().join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root().join("Cargo.toml"),
+        format!("{manifest}\n[[bench]]\nname='timing'\npath='benches/timing.rs'\nharness=false\n"),
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("ordinary/src/lib.rs"),
+        "pub const VALUE: u32 = 42;\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("src/lib.rs"),
+        "pub const VALUE: u32 = ordinary::VALUE;\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("src/main.rs"),
+        "fn main(){panic!(\"bench must not run the application\");}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root().join("dev-macro/src/lib.rs"),
+        "extern crate proc_macro;\n",
+    )
+    .unwrap();
+    fs::write(fixture.root().join("benches/timing.rs"), r#"fn main() {
+    assert_eq!(selected_graph_app::VALUE, 42);
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    std::fs::write("benchmark-args", args.join("\0")).unwrap();
+    let previous: u32 = std::fs::read_to_string("benchmark-count").ok().map(|value| value.parse().unwrap()).unwrap_or(0);
+    std::fs::write("benchmark-count", (previous + 1).to_string()).unwrap();
+    println!("BENCH:{}:{}", previous + 1, cfg!(debug_assertions));
+    if args.iter().any(|arg| arg == "--fail") { std::process::exit(11); }
+}
+"#).unwrap();
+    let mut selection = CompilationSelection {
+        bench: vec!["timing".into()],
+        no_run: true,
+        ..CompilationSelection::default()
+    };
+    let graph = fixture.graph(Bench, selection.clone());
+    let report = validate_compilation_unit_graph(&graph, Bench).unwrap();
+    assert!(report.requires_closed_dependency_execution());
+    assert!(!report.contains_doctests());
+    let root = graph["roots"][0].as_u64().unwrap() as usize;
+    assert_eq!(graph["units"][root]["mode"], "test");
+    assert_eq!(graph["units"][root]["profile"]["opt_level"], "3");
+    fixture.assert_no_compilation_or_project_execution();
+    let compiled = fixture.runtime(Bench, &selection, &[]);
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(!fixture.root().join("benchmark-count").exists());
+    selection.no_run = false;
+    selection.test_filter = Some("selected".into());
+    selection.test_args = vec!["--literal-program-option".into(), "".into(), "雪".into()];
+    for number in 1..=2 {
+        let output = fixture.runtime(Bench, &selection, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("BENCH:{number}:false")));
+        assert_eq!(
+            fs::read_to_string(fixture.root().join("benchmark-count")).unwrap(),
+            number.to_string()
+        );
+        let arguments = fs::read_to_string(fixture.root().join("benchmark-args")).unwrap();
+        let arguments = arguments.split('\0').collect::<Vec<_>>();
+        assert!(arguments.contains(&"selected") && arguments.contains(&"--bench"));
+        assert!(
+            arguments
+                .windows(3)
+                .any(|args| args == ["--literal-program-option", "", "雪"])
+        );
+        let artifacts = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        assert!(
+            !artifacts.is_empty() && artifacts.iter().all(|artifact| artifact["fresh"] == true)
+        );
+    }
+    selection.profile = Some("dev".into());
+    let output = fixture.runtime(Bench, &selection, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("BENCH:3:true"));
+    selection.test_args.push("--fail".into());
+    let failed = fixture.runtime(Bench, &selection, &[]);
+    assert!(
+        !failed.status.success(),
+        "a warm benchmark failure must remain a failure"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root().join("benchmark-count")).unwrap(),
+        "4"
+    );
 }
 
 #[test]

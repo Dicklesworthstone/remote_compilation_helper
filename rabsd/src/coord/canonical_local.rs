@@ -1,13 +1,13 @@
 //! Local canonical Cargo execution connected to the coordinator's rustc cache.
 //!
-//! This explicit profile runs a selected Cargo check, build, test or Clippy offline and locked against
+//! This explicit profile runs selected Cargo check, build, test, run, bench or Clippy offline and locked against
 //! captured inputs and a captured toolchain. Cargo itself runs at canonical
 //! paths, so unit hashes and rustc arguments are stable across checkouts. A
 //! fresh operation-scoped socket admits only rustc requests; the persistent
 //! CAS and the ordinary daemon socket are never visible to the build.
 //!
 //! The selected Cargo unit graph identifies active build scripts and procedural
-//! macros. Their presence, or a test/Clippy command, disables local compiler-result authority for the whole
+//! macros. Their presence, or a test/run/bench/Clippy command, disables local compiler-result authority for the whole
 //! operation; eligible dependency caching requires isolated workers. Pure check/build graphs
 //! retain the existing evidence-gated metadata lane; archive codegen requires an
 //! isolated worker. Selected workspace compilations can execute freshly on workers;
@@ -34,7 +34,7 @@ use rabs_sandbox::canonical_namespace::{
     CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
 };
 use rabs_sandbox::cargo_check::{
-    CompilationCommand, CompilationSelection, validate_compilation_unit_graph,
+    CompilationCommand, CompilationSelection, run_build_selection, validate_compilation_unit_graph,
 };
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
@@ -43,7 +43,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -313,12 +313,20 @@ impl Profile {
     }
 
     fn compilation_prefix(&self) -> io::Result<Vec<String>> {
-        let mut args = match &self.selection {
-            Some(selection) => selection.cargo_arguments(self.command)?,
-            None if self.command == CompilationCommand::Check => {
+        self.selected_prefix(self.command, self.selection.as_ref())
+    }
+
+    fn selected_prefix(
+        &self,
+        command: CompilationCommand,
+        selection: Option<&CompilationSelection>,
+    ) -> io::Result<Vec<String>> {
+        let mut args = match selection {
+            Some(selection) => selection.cargo_arguments(command)?,
+            None if command == CompilationCommand::Check => {
                 vec!["check".into(), "--lib".into()]
             }
-            None => vec![self.command.as_str().into()],
+            None => vec![command.as_str().into()],
         };
         args.extend([
             "--offline".into(),
@@ -340,8 +348,17 @@ impl Profile {
         Ok(args)
     }
 
-    fn graph_args(&self) -> io::Result<Vec<String>> {
-        let mut args = self.compilation_prefix()?;
+    fn graph_args(&self, run_selection: Option<&CompilationSelection>) -> io::Result<Vec<String>> {
+        let mut args = if self.command == CompilationCommand::Run {
+            self.selected_prefix(
+                CompilationCommand::Build,
+                Some(run_selection.ok_or_else(|| {
+                    invalid("Cargo run graph requires a resolved runnable target")
+                })?),
+            )?
+        } else {
+            self.compilation_prefix()?
+        };
         // These are Cargo arguments. Harness arguments after `--` must never
         // swallow the nonexecuting graph switch or alter the planning command.
         args.extend([
@@ -358,11 +375,28 @@ impl Profile {
     }
 
     fn no_run(&self) -> bool {
-        self.command == CompilationCommand::Test
-            && self
-                .selection
-                .as_ref()
-                .is_some_and(|selection| selection.no_run)
+        matches!(
+            self.command,
+            CompilationCommand::Test | CompilationCommand::Bench
+        ) && self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.no_run)
+    }
+
+    fn inherits_stdin(&self) -> bool {
+        self.command == CompilationCommand::Run
+            || (self.command == CompilationCommand::Bench && !self.no_run())
+    }
+
+    fn validate_stdin(&self, terminal: bool) -> io::Result<()> {
+        // Managed children have their own process group. Reading the caller's
+        // controlling terminal could stop that group with SIGTTIN; supporting
+        // interactive job control needs a separate, owned terminal/session.
+        require(
+            !self.inherits_stdin() || !terminal,
+            "canonical run/bench requires nonterminal stdin: redirect input from a pipe, file, or /dev/null, or run a delivered build outside this noninteractive profile",
+        )
     }
 
     fn source_specification(&self) -> io::Result<Value> {
@@ -391,6 +425,88 @@ impl Profile {
     }
 }
 
+/// Resolve only the graph query's run target. Every probe runs the captured
+/// Cargo inside the same immutable namespace before a wrapper endpoint exists.
+/// The actual run command and its program arguments remain unchanged.
+fn resolve_run_selection(
+    profile: &Profile,
+    spec: &CanonicalNamespaceSpec,
+    support: &HostIsolationSupport,
+    owner: &Path,
+    timeout: Duration,
+    stopped: &AtomicBool,
+) -> io::Result<CompilationSelection> {
+    let selection = profile.selection.clone().unwrap_or_default();
+    if !selection.bin.is_empty() || !selection.example.is_empty() {
+        return run_build_selection(&selection, &Value::Null, None);
+    }
+    let metadata_args = vec![
+        "metadata".into(),
+        "--no-deps".into(),
+        "--format-version=1".into(),
+        "--offline".into(),
+        "--locked".into(),
+        "--manifest-path".into(),
+        profile.manifest_path(),
+    ];
+    let metadata = execute(
+        spec,
+        support,
+        CARGO,
+        &metadata_args,
+        CargoOutput::Capture {
+            directory: owner.join("run-metadata-drain"),
+            maximum: MAX_GRAPH_BYTES,
+        },
+        timeout,
+        stopped,
+    )?;
+    if !metadata.status.success() {
+        replay(&metadata)?;
+        return Err(invalid(
+            "captured Cargo metadata could not resolve the run target",
+        ));
+    }
+    let metadata: Value = serde_json::from_reader(metadata.stdout.reader()?)?;
+    let package_id = if let Some(package) = selection.packages.first() {
+        let args = vec![
+            "pkgid".into(),
+            "--offline".into(),
+            "--locked".into(),
+            "--manifest-path".into(),
+            profile.manifest_path(),
+            "--package".into(),
+            package.clone(),
+        ];
+        let output = execute(
+            spec,
+            support,
+            CARGO,
+            &args,
+            CargoOutput::Capture {
+                directory: owner.join("run-package-drain"),
+                maximum: MAX_GRAPH_BYTES,
+            },
+            timeout,
+            stopped,
+        )?;
+        if !output.status.success() {
+            replay(&output)?;
+            return Err(invalid(
+                "captured Cargo pkgid could not resolve the selected run package",
+            ));
+        }
+        Some(
+            io::read_to_string(output.stdout.reader()?)?
+                .trim_end_matches(['\n', '\r'])
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    run_build_selection(&selection, &metadata, package_id.as_deref())
+}
+
 /// Run the explicit local profile with the SAME release policy and build
 /// identity as the normal daemon. This entry point intentionally has no
 /// implicit advisory-policy overload.
@@ -408,6 +524,9 @@ pub fn run_profile_with_release(
     let (_, bytes) = read_stable(path, 64 * 1024)?;
     let profile: Profile =
         serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+    // Refuse unsupported terminal input before validating source roots,
+    // acquiring state, probing namespaces, or capturing any source bytes.
+    profile.validate_stdin(std::io::stdin().is_terminal())?;
     profile.validate()?;
     let state = StateOwner::acquire(&profile.state_root)?;
     let support = HostIsolationSupport::probe();
@@ -560,7 +679,19 @@ pub fn run_profile_with_release(
     // establish which build scripts or proc macros a selected check executes.
     // The unit-graph query does not compile/run units, and the cache endpoint
     // does not exist yet. Unsupported Cargo versions fail closed here.
-    let graph_args = profile.graph_args()?;
+    let run_selection = if profile.command == CompilationCommand::Run {
+        Some(resolve_run_selection(
+            &profile,
+            &spec,
+            &support,
+            owner.path(),
+            timeout,
+            &stopped,
+        )?)
+    } else {
+        None
+    };
+    let graph_args = profile.graph_args(run_selection.as_ref())?;
     let planned = execute(
         &spec,
         &support,
@@ -752,6 +883,9 @@ pub fn run_profile_with_release(
         "private_target_state":private_target_state,
         "test_execution":profile.command == CompilationCommand::Test && !profile.no_run(),
         "test_result_cache":false,
+        "run_execution":profile.command == CompilationCommand::Run,
+        "benchmark_execution":profile.command == CompilationCommand::Bench && !profile.no_run(),
+        "program_result_cache":false, "benchmark_result_cache":false,
         "lint_execution":profile.command == CompilationCommand::Clippy,
         "lint_result_cache":false,
         "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
@@ -763,7 +897,9 @@ pub fn run_profile_with_release(
         &support,
         profile.program(),
         &compilation_args,
-        CargoOutput::Inherit,
+        CargoOutput::Inherit {
+            inherit_stdin: profile.inherits_stdin(),
+        },
         timeout,
         &stopped,
     );
@@ -786,13 +922,16 @@ pub fn run_profile_with_release(
     )?;
     eprintln!("{}", receipt.to_json_line());
     if (output.status.success()
-        || (profile.command == CompilationCommand::Test && output.status.code().is_some()))
+        || (matches!(
+            profile.command,
+            CompilationCommand::Test | CompilationCommand::Run | CompilationCommand::Bench
+        ) && output.status.code().is_some()))
         && let Some(cache) = &target_state
     {
         // Retain state only after compiler, session, publication and coordinator
         // drain. Delivered files remain independent of this saved generation.
-        // A normal test failure can retain compiled artifacts too. Cargo and
-        // the tests execute again on the next request; no test outcome is saved.
+        // A normal program/harness failure can retain compiled artifacts too.
+        // Cargo and the requested bodies execute again; no outcome is saved.
         if let Err(error) = cache.capture(&target_root) {
             target_state_warning("capture", &error);
         }
@@ -852,16 +991,16 @@ impl TargetReuseContext<'_> {
         )?;
         let toolchain = super::worker_delivery::toolchain_identity(self.request)?
             .ok_or_else(|| invalid("private target requires a captured toolchain"))?;
-        let test_execution = self.args.first().is_some_and(|command| command == "test")
-            && !self
-                .args
-                .iter()
-                .take_while(|arg| arg.as_str() != "--")
-                .any(|arg| arg == "--no-run");
-        let mode = if test_execution {
-            CargoArtifactMode::TestExecution
-        } else {
-            CargoArtifactMode::Compilation
+        let no_run = self
+            .args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "--no-run");
+        let mode = match self.args.first().map(String::as_str) {
+            Some("test") if !no_run => CargoArtifactMode::TestExecution,
+            Some("bench") if !no_run => CargoArtifactMode::BenchExecution,
+            Some("run") => CargoArtifactMode::RunExecution,
+            _ => CargoArtifactMode::Compilation,
         };
         let args = compatible_arguments(self.program, self.args, mode)
             .unwrap_or_else(|| self.args.to_vec());
@@ -927,7 +1066,7 @@ fn target_state_warning(stage: &str, error: &io::Error) {
 /// Move, rather than recopy, a fully drained target to a newly allocated private
 /// owner on the same filesystem. There is no caller-selected overwrite target
 /// and no retained copy of source or toolchain inputs. Successful builds and
-/// test --no-run calls use this; other paths keep temporary target ownership.
+/// Test/bench --no-run calls use this; other paths keep temporary target ownership.
 fn retain_build_target(parent: &Path, target: &Path) -> io::Result<PathBuf> {
     private_directory(parent)?;
     require(
@@ -978,7 +1117,7 @@ fn capture_wrapper(source: &Path, destination: &Path) -> io::Result<()> {
 
 enum CargoOutput {
     Capture { directory: PathBuf, maximum: u64 },
-    Inherit,
+    Inherit { inherit_stdin: bool },
 }
 
 fn execute(
@@ -993,13 +1132,23 @@ fn execute(
     let launch = build_canonical_argv(spec, support, program, args)
         .map_err(|error| invalid(error.to_string()))?;
     let mut command = command_for(&launch);
-    command.stdin(Stdio::null());
     let (limits, maximum) = match output {
         CargoOutput::Capture { directory, maximum } => {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             (DrainLimits::new(directory), maximum)
         }
-        CargoOutput::Inherit => {
+        CargoOutput::Inherit { inherit_stdin } => {
+            // Only the explicit noninteractive run/bench executor consumes
+            // caller input. Planning probes and earlier compilation/test
+            // commands keep their original EOF behavior.
+            command.stdin(if inherit_stdin {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
             // No forwarding thread or retained copy stands between Cargo and
             // its consumer. A slow pipe reader backpressures the child, while
             // the supervisor can still cancel the entire group. With no piped
@@ -1338,7 +1487,7 @@ mod tests {
                 "1"
             ])
         );
-        for command in ["run", "bench", "rustc", "doc"] {
+        for command in ["rustc", "doc"] {
             assert!(serde_json::from_value::<Profile>(json!({
                 "version":PROFILE_VERSION, "command":command,
                 "source_root":"/source", "toolchain_root":"/toolchain",
@@ -1367,7 +1516,7 @@ mod tests {
             &args[separator + 1..],
             ["-D", "warnings", "-Aclippy::needless_return"]
         );
-        let graph = profile.graph_args().unwrap();
+        let graph = profile.graph_args(None).unwrap();
         assert_eq!(&graph[..separator], &args[..separator]);
         assert_eq!(
             &graph[separator..separator + 3],
@@ -1425,7 +1574,7 @@ mod tests {
                 ""
             ]
         );
-        let graph = profile.graph_args().unwrap();
+        let graph = profile.graph_args(None).unwrap();
         assert_eq!(&graph[..separator], &args[..separator]);
         assert_eq!(
             &graph[separator..],
@@ -1457,7 +1606,7 @@ mod tests {
         );
         assert!(
             profile
-                .graph_args()
+                .graph_args(None)
                 .unwrap()
                 .iter()
                 .any(|arg| arg == "--no-run")
@@ -1483,6 +1632,113 @@ mod tests {
             ..CompilationSelection::default()
         });
         assert!(profile.compilation_args().is_err());
+    }
+
+    #[test]
+    fn only_current_run_and_bench_execution_inherit_nonterminal_stdin() {
+        for (command, no_run, inherits_stdin) in [
+            (CompilationCommand::Run, false, true),
+            (CompilationCommand::Bench, false, true),
+            (CompilationCommand::Bench, true, false),
+            (CompilationCommand::Test, false, false),
+            (CompilationCommand::Test, true, false),
+            (CompilationCommand::Check, false, false),
+            (CompilationCommand::Build, false, false),
+            (CompilationCommand::Clippy, false, false),
+        ] {
+            let profile: Profile = serde_json::from_value(json!({
+                "version":PROFILE_VERSION, "command":command.as_str(),
+                "source_root":"/source", "toolchain_root":"/toolchain",
+                "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap",
+                "selection":{"no_run":no_run}
+            }))
+            .unwrap();
+            assert_eq!(profile.inherits_stdin(), inherits_stdin, "{command:?}");
+            assert!(profile.validate_stdin(false).is_ok(), "{command:?}");
+            assert_eq!(
+                profile.validate_stdin(true).is_err(),
+                inherits_stdin,
+                "{command:?}, no_run={no_run}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_plans_exact_build_target_and_preserves_its_actual_program_tail() {
+        let profile: Profile = serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "command":"run", "source_root":"/source",
+            "toolchain_root":"/toolchain", "state_root":"/state", "operation_root":"/operations",
+            "wrapper":"/bin/rabs-wrap", "selection":{"example":["demo"], "profile":"dev",
+                "run_args":["--unit-graph", "--no-run", "", "line\nvalue"]}
+        }))
+        .unwrap();
+        let selected =
+            run_build_selection(profile.selection.as_ref().unwrap(), &Value::Null, None).unwrap();
+        let graph = profile.graph_args(Some(&selected)).unwrap();
+        assert_eq!(
+            &graph[..5],
+            ["build", "--example", "demo", "--profile", "dev"]
+        );
+        assert!(!graph.iter().any(|arg| arg == "--" || arg == "--no-run"));
+        assert_eq!(graph.iter().filter(|arg| *arg == "--unit-graph").count(), 1);
+        assert!(
+            profile.graph_args(None).is_err(),
+            "run must never plan an unselected build graph"
+        );
+        let args = profile.compilation_args().unwrap();
+        assert_eq!(args[0], "run");
+        let tail = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            &args[tail + 1..],
+            ["--unit-graph", "--no-run", "", "line\nvalue"]
+        );
+        assert!(
+            !profile.no_run(),
+            "a literal program argument cannot change Cargo's execution mode"
+        );
+        assert!(profile.inherits_stdin());
+        assert!(profile.validate_stdin(true).is_err());
+        assert_eq!(profile.source_specification().unwrap()["args"], json!(args));
+    }
+
+    #[test]
+    fn bench_planning_omits_runtime_tail_and_no_run_retains_compilation_delivery() {
+        let mut profile: Profile = serde_json::from_value(json!({
+            "version":PROFILE_VERSION, "command":"bench", "source_root":"/source",
+            "toolchain_root":"/toolchain", "state_root":"/state", "operation_root":"/operations",
+            "wrapper":"/bin/rabs-wrap", "selection":{"bench":["timing"], "test_filter":"selected",
+                "test_args":["--exact", "--no-run", ""]}
+        }))
+        .unwrap();
+        let args = profile.compilation_args().unwrap();
+        let tail = args.iter().position(|arg| arg == "--").unwrap();
+        let graph = profile.graph_args(None).unwrap();
+        assert_eq!(&graph[..tail], &args[..tail]);
+        assert_eq!(&graph[tail..], ["--unit-graph", "-Z", "unstable-options"]);
+        assert!(!profile.no_run());
+        assert!(profile.inherits_stdin());
+        assert!(profile.validate_stdin(true).is_err());
+        assert!(!args.iter().any(|arg| arg == "--release"));
+        profile.selection = Some(CompilationSelection {
+            bench: vec!["timing".into()],
+            no_run: true,
+            ..CompilationSelection::default()
+        });
+        assert!(profile.no_run());
+        assert!(!profile.inherits_stdin());
+        assert!(profile.validate_stdin(true).is_ok());
+        assert!(
+            profile
+                .graph_args(None)
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--no-run")
+        );
+        assert!(
+            profile.source_specification().unwrap()["command_context"]["env"]
+                .get("RUSTDOC")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1947,6 +2203,53 @@ mod tests {
             deny_then_allow,
             "later lint levels can override earlier ones"
         );
+    }
+
+    #[test]
+    fn private_run_and_bench_targets_reuse_compilation_but_bind_source_and_profile() {
+        for command in ["run", "bench"] {
+            let mut fixture = ReuseKeyFixture::new();
+            fixture.closed_dependency_execution = true;
+            fixture.args[0] = command.into();
+            let original = fixture.key();
+            fixture
+                .args
+                .extend(["--".into(), "--no-run".into(), "".into(), "雪".into()]);
+            assert_eq!(
+                fixture.key(),
+                original,
+                "{command} runtime arguments cannot skip a body or fragment its compile state"
+            );
+            fixture
+                .args
+                .truncate(fixture.args.iter().position(|arg| arg == "--").unwrap());
+            if command == "bench" {
+                fixture.args.push("--no-run".into());
+                assert_eq!(
+                    fixture.key(),
+                    original,
+                    "bench no-run and execution may share compiled artifacts"
+                );
+                fixture.args.pop();
+            }
+            fixture.args.extend([
+                "--profile".into(),
+                if command == "bench" { "dev" } else { "release" }.into(),
+            ]);
+            assert_ne!(
+                fixture.key(),
+                original,
+                "{command} compilation profile changed"
+            );
+            fixture.args.truncate(fixture.args.len() - 2);
+            fixture.source =
+                reuse_source(b"changed program or benchmark source", b"manifest", None);
+            assert_ne!(
+                fixture.key(),
+                original,
+                "{command} must retain its complete source family"
+            );
+        }
     }
 
     #[test]

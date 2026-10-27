@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -270,6 +270,31 @@ fn run_with_environment(
     profile: &Value,
     environment: &[(String, String)],
 ) -> (i32, Vec<Value>, String) {
+    run_with_stdin(root, number, profile, environment, Stdio::null())
+}
+
+fn run_with_input(
+    root: &Path,
+    number: u32,
+    profile: &Value,
+    environment: &[(String, String)],
+    input: &[u8],
+) -> (i32, Vec<Value>, String) {
+    // Keep this fixture write below PIPE_BUF so it cannot block before the
+    // child starts. EOF follows the exact input bytes through the real pipe.
+    assert!(input.len() <= 4096);
+    let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    fs::File::from(writer).write_all(input).unwrap();
+    run_with_stdin(root, number, profile, environment, Stdio::from(reader))
+}
+
+fn run_with_stdin(
+    root: &Path,
+    number: u32,
+    profile: &Value,
+    environment: &[(String, String)],
+    stdin: Stdio,
+) -> (i32, Vec<Value>, String) {
     let path = root.join(format!("profile-{number}.json"));
     fs::write(&path, serde_json::to_vec(profile).unwrap()).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
@@ -281,7 +306,7 @@ fn run_with_environment(
         .envs(environment.iter().map(|(name, value)| (name, value)))
         .args(["--canonical-compile-local"])
         .arg(path)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // No ambient compiler, wrapper, loader flags or daemon socket survives.
@@ -336,6 +361,63 @@ fn cli_rejects_profile_environment_instead_of_granting_an_ambient_mount_capabili
     assert_eq!(code, 2, "{output}");
     assert!(output.contains("unknown field `env`"), "{output}");
     assert!(!output.contains("canonical-compilation-started"));
+}
+
+#[test]
+fn cli_refuses_executing_run_and_bench_terminal_input_before_touching_profile_roots() {
+    use rustix::pty::{OpenptFlags, ioctl_tiocgptpeer, openpt, unlockpt};
+
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("config.toml"), "[rabs]\n").unwrap();
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+    let terminal = openpt(flags).unwrap();
+    unlockpt(&terminal).unwrap();
+    for (number, command, selection, refused) in [
+        (0, "run", json!({"run_args":["--no-run"]}), true),
+        (1, "bench", json!({"test_args":["--no-run"]}), true),
+        (2, "bench", json!({"no_run":true}), false),
+    ] {
+        // None of these paths exists. A terminal refusal must happen before
+        // source validation/capture, namespace probes, or operation allocation.
+        let profile = json!({"version":"canonical-compile-local-v1", "command":command,
+            "source_root":root.path().join("missing-source"),
+            "toolchain_root":root.path().join("missing-toolchain"),
+            "state_root":root.path().join("missing-state"),
+            "operation_root":root.path().join("missing-operations"),
+            "wrapper":root.path().join("missing-wrapper"), "selection":selection});
+        let stdin = fs::File::from(ioctl_tiocgptpeer(&terminal, flags).unwrap());
+        assert!(stdin.is_terminal(), "the fixture must use an actual PTY");
+        let (code, events, output) =
+            run_with_stdin(root.path(), number, &profile, &[], Stdio::from(stdin));
+        assert_eq!(code, if refused { 2 } else { 1 }, "{output}");
+        assert_eq!(
+            output.contains("canonical run/bench requires nonterminal stdin"),
+            refused,
+            "{output}"
+        );
+        if refused {
+            assert!(output.contains("/dev/null"), "{output}");
+            assert!(output.contains("delivered build"), "{output}");
+        } else {
+            assert!(output.contains("No such file or directory"), "{output}");
+        }
+        assert!(events.is_empty(), "{output}");
+        assert!(
+            !output.contains("canonical-compilation-started"),
+            "{output}"
+        );
+        for path in ["missing-source", "missing-state", "missing-operations"] {
+            assert!(!root.path().join(path).exists(), "{output}");
+        }
+
+        // The same executing profiles accept an actual pipe and reach normal
+        // source validation. Full Cargo execution checks the byte stream below.
+        let (code, _, output) =
+            run_with_input(root.path(), number + 10, &profile, &[], b"piped input\n");
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("No such file or directory"), "{output}");
+        assert!(!output.contains("requires nonterminal stdin"), "{output}");
+    }
 }
 
 fn decisions(events: &[Value], decision: &str) -> BTreeMap<String, String> {
@@ -1077,6 +1159,207 @@ pub fn answer() -> u32 { canonical_dep::answer() }
             .is_none(),
         "documentation tests must not retain operation owners or deliver test outcomes"
     );
+}
+
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes current programs with inherited input and private Cargo freshness"]
+fn canonical_cargo_run_preserves_default_target_input_arguments_and_every_current_exit() {
+    let (owner, mut profile) = native_fixture();
+    let source = owner.path().join("source-a");
+    let manifest = fs::read_to_string(source.join("Cargo.toml")).unwrap();
+    write(
+        &source,
+        "Cargo.toml",
+        manifest.replacen("[package]", "[package]\ndefault-run='canonical_app'", 1),
+    );
+    write(
+        &source,
+        "src/bin/unselected.rs",
+        "compile_error!(\"run selected the wrong binary\"); fn main() {}\n",
+    );
+    write(
+        &source,
+        "src/main.rs",
+        r#"use std::io::{BufRead, BufReader, Read, Write};
+fn main() {
+    assert_eq!(canonical_app::answer(), 42);
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    assert_eq!(&args[..4], &["--literal", "", "雪", "line\nvalue"]);
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap();
+    assert_eq!(input, "current program input\n");
+    let mut stream = std::os::unix::net::UnixStream::connect(std::env::var_os("RABS_SOCKET_PATH").unwrap()).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    let mut replies = BufReader::new(stream.try_clone().unwrap());
+    writeln!(stream, "{{\"kind\":\"hello\",\"transport\":{{\"current\":1,\"minimum_compatible\":1}},\"application\":{{\"current\":1,\"minimum_compatible\":1}}}}").unwrap();
+    let mut reply = String::new(); replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("hello-ok"));
+    writeln!(stream, "{{\"kind\":\"rustc-request\",\"argv\":[\"/__rabs/toolchain/bin/rustc\",\"--crate-name=forged-run\"],\"cwd\":\"/__rabs/workspace\",\"env\":[],\"remote_protocol\":1,\"local_capture_allowed\":true}}").unwrap();
+    reply.clear(); replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("canonical-project-executors-require-isolated-dependency-execution"));
+    assert!(!reply.contains("\"attempt\""));
+    let path = "/__rabs/out/cargo/program-executions";
+    let count: u32 = std::fs::read_to_string(path).ok().map(|value| value.parse().unwrap()).unwrap_or(0) + 1;
+    std::fs::write(path, count.to_string()).unwrap();
+    println!("CURRENT_PROGRAM_EXECUTION={count}");
+    if args.iter().any(|arg| arg == "--fail") { std::process::exit(7); }
+}
+"#,
+    );
+    profile["command"] = json!("run");
+    profile["selection"] = json!({"run_args":["--literal", "", "雪", "line\nvalue"]});
+    profile["target_cache"] = json!({"runtime_epoch":"native-run-v1", "max_bytes":268435456});
+    for number in 1..=4 {
+        if number == 3 {
+            profile["selection"]["run_args"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("--fail"));
+        }
+        let (code, events, output) = run_with_input(
+            owner.path(),
+            3000 + number,
+            &profile,
+            &[],
+            b"current program input\n",
+        );
+        assert_eq!(code, if number < 3 { 0 } else { 7 }, "{output}");
+        let started = events
+            .iter()
+            .find(|event| event["kind"] == "canonical-compilation-started")
+            .unwrap();
+        assert_eq!(started["run_execution"], true);
+        assert_eq!(started["program_result_cache"], false);
+        assert_eq!(
+            started["private_target_state"],
+            if number == 1 { "cold" } else { "restored" }
+        );
+        assert!(
+            decisions(&events, "execute").is_empty() && decisions(&events, "hit").is_empty(),
+            "{output}"
+        );
+        assert!(
+            !events.iter().any(|event| event["decision"] == "served"
+                || event["kind"] == "canonical-build-completed"),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("CURRENT_PROGRAM_EXECUTION={number}")),
+            "{output}"
+        );
+        assert_eq!(
+            fs::read_to_string(sole_retained_target(owner.path()).join("program-executions"))
+                .unwrap(),
+            number.to_string()
+        );
+        let binary = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| {
+                event["reason"] == "compiler-artifact" && event["target"]["kind"] == json!(["bin"])
+            })
+            .unwrap();
+        assert_eq!(binary["fresh"], number != 1, "{output}");
+    }
+    assert!(
+        fs::read_dir(owner.path().join("ops"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes custom benchmarks and verifies no-run delivery plus warm execution"]
+fn canonical_cargo_bench_delivers_no_run_then_executes_each_current_custom_harness() {
+    let (owner, mut profile) = native_fixture();
+    let source = owner.path().join("source-a");
+    let manifest = fs::read_to_string(source.join("Cargo.toml")).unwrap();
+    write(
+        &source,
+        "Cargo.toml",
+        format!("{manifest}\n[[bench]]\nname='timing'\npath='benches/timing.rs'\nharness=false\n"),
+    );
+    write(
+        &source,
+        "benches/timing.rs",
+        r#"fn main() {
+    assert_eq!(canonical_app::answer(), 42);
+    assert!(!cfg!(debug_assertions), "bench lost its default release profile");
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    assert!(args.iter().any(|arg| arg == "selected"));
+    assert!(args.windows(3).any(|args| args == ["--literal", "", "雪"]));
+    let path = "/__rabs/out/cargo/benchmark-executions";
+    let count: u32 = std::fs::read_to_string(path).ok().map(|value| value.parse().unwrap()).unwrap_or(0) + 1;
+    std::fs::write(path, count.to_string()).unwrap();
+    println!("CURRENT_BENCHMARK_EXECUTION={count}");
+    if count >= 3 { std::process::exit(11); }
+}
+"#,
+    );
+    profile["command"] = json!("bench");
+    profile["selection"] = json!({"bench":["timing"], "no_run":true});
+    profile["target_cache"] = json!({"runtime_epoch":"native-bench-v1", "max_bytes":268435456});
+    let (code, events, output) = run(owner.path(), 3100, &profile);
+    assert_eq!(code, 0, "{output}");
+    assert!(!output.contains("CURRENT_BENCHMARK_EXECUTION="), "{output}");
+    let delivered = events
+        .iter()
+        .find(|event| event["kind"] == "canonical-build-completed")
+        .unwrap();
+    assert_eq!(delivered["command"], "bench");
+    let delivered_target = PathBuf::from(delivered["target_directory"].as_str().unwrap());
+    assert!(!delivered_target.join("benchmark-executions").exists());
+    let benchmark = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["reason"] == "compiler-artifact" && event["target"]["name"] == "timing")
+        .unwrap();
+    let relative = Path::new(benchmark["executable"].as_str().unwrap())
+        .strip_prefix("/__rabs/out/cargo")
+        .unwrap();
+    let executable = fs::symlink_metadata(delivered_target.join(relative)).unwrap();
+    assert!(
+        executable.is_file()
+            && executable.len() > 0
+            && executable.permissions().mode() & 0o111 != 0
+    );
+    profile["selection"] =
+        json!({"bench":["timing"], "test_filter":"selected", "test_args":["--literal", "", "雪"]});
+    for number in 1..=4 {
+        let (code, events, output) = run(owner.path(), 3100 + number, &profile);
+        if number < 3 {
+            assert_eq!(code, 0, "{output}");
+        } else {
+            assert_ne!(code, 0, "{output}");
+        }
+        let started = events
+            .iter()
+            .find(|event| event["kind"] == "canonical-compilation-started")
+            .unwrap();
+        assert_eq!(started["benchmark_execution"], true);
+        assert_eq!(started["benchmark_result_cache"], false);
+        assert_eq!(started["private_target_state"], "restored");
+        assert!(
+            decisions(&events, "execute").is_empty() && decisions(&events, "hit").is_empty(),
+            "{output}"
+        );
+        assert!(
+            !events.iter().any(|event| event["decision"] == "served"
+                || event["kind"] == "canonical-build-completed"),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("CURRENT_BENCHMARK_EXECUTION={number}")),
+            "{output}"
+        );
+        assert_eq!(
+            fs::read_to_string(sole_retained_target(owner.path()).join("benchmark-executions"))
+                .unwrap(),
+            number.to_string()
+        );
+        assert!(!delivered_target.join("benchmark-executions").exists());
+    }
 }
 
 fn sole_retained_target(root: &Path) -> PathBuf {

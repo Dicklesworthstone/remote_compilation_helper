@@ -2347,16 +2347,15 @@ mod execution_resource_tests {
                 ("CARGO_PKG_NAME".into(), "workspace_app".into()),
                 ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
             ];
-            let plan =
-                rabs_key::live_dependency::workspace_execution::plan_canonical_workspace_execution(
-                    LiveRustcRequest {
-                        argv: &argv,
-                        cwd: "/__rabs/workspace",
-                        env: &env,
-                    },
-                    "x86_64-unknown-linux-gnu",
-                )
-                .unwrap();
+            let plan = rabs_key::live_dependency::plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: "/__rabs/workspace",
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
             let context = DependencyExecContext::new_canonical_workspace_execution(
                 DependencyExecutionMode::Metadata,
                 plan.cwd.clone(),
