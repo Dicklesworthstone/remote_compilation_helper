@@ -169,6 +169,80 @@ fn syntactic_acceptance_does_not_bless_paths_or_output_aliases() {
     }
 }
 
+#[test]
+fn generated_static_archives_reach_only_retained_canonical_remote_planning() {
+    use super::{canonical_remote_rejection, remote_rejection};
+    use rabs_key::live_dependency::{
+        plan_canonical_cargo_dependency_action, plan_canonical_remote_dependency_action,
+    };
+
+    let package = "/__rabs/cargo-home/registry/src/pinned/native-1.0.0";
+    let generated = "/__rabs/out/cargo/debug/build/native-hash/out";
+    let argv = vec![
+        "/__rabs/toolchain/bin/rustc".into(),
+        "--crate-name=native".into(),
+        "--crate-type=lib".into(),
+        "--emit=dep-info,metadata,link".into(),
+        "--error-format=json".into(),
+        "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+        "--cap-lints=allow".into(),
+        "-Ldependency=/__rabs/out/cargo/debug/deps".into(),
+        format!("-Lnative={generated}/native"),
+        "-lstatic=answer".into(),
+        format!("{package}/src/lib.rs"),
+    ];
+    let env = vec![
+        ("HOME".into(), "/__rabs/home".into()),
+        ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+        ("CARGO_MANIFEST_DIR".into(), package.into()),
+        ("CARGO_PKG_NAME".into(), "native".into()),
+        ("OUT_DIR".into(), generated.into()),
+    ];
+    let candidate = LiveRustcRequest {
+        argv: &argv,
+        cwd: package,
+        env: &env,
+    };
+    assert_eq!(canonical_remote_rejection(candidate), None);
+    assert!(remote_rejection(candidate).is_some());
+    assert!(rejection(candidate).is_some());
+    assert!(plan_canonical_remote_dependency_action(candidate, HOSTS[0], None).is_ok());
+    assert!(plan_canonical_cargo_dependency_action(candidate, HOSTS[0], None).is_err());
+
+    for extra in [
+        "-Lnative=/usr/lib",
+        "-Lnative=/__rabs/out/cargo/debug/build/other/out",
+        "-Lnative=/__rabs/out/cargo/debug/build/native-hash/outside",
+        "-lanswer",
+        "-ldylib=answer",
+        "-lstatic:-bundle=answer",
+        "-lstatic=../answer",
+        "--emit=dep-info,metadata",
+    ] {
+        let mut unsupported = argv.clone();
+        unsupported.push(extra.into());
+        assert!(
+            canonical_remote_rejection(LiveRustcRequest {
+                argv: &unsupported,
+                cwd: package,
+                env: &env,
+            })
+            .is_some(),
+            "{extra}"
+        );
+    }
+    let mut primary = env.clone();
+    primary.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+    assert!(matches!(
+        canonical_remote_rejection(LiveRustcRequest {
+            argv: &argv,
+            cwd: package,
+            env: &primary,
+        }),
+        Some(LiveRefusal::RefusedEnv(_))
+    ));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn actual_edge_passes_unservable_consumers_through_without_preparing() {

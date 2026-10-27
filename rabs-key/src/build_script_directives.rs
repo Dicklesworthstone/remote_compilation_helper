@@ -361,7 +361,8 @@ mod environment_binding_tests {
     };
     use crate::typed_digest::compute;
     use rabs_protocol::input_evidence::{
-        ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        ActionInputManifest, DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType,
+        PositiveInput,
     };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
@@ -422,6 +423,13 @@ mod environment_binding_tests {
                 file_type: InputFileType::Regular,
                 executable: false,
                 symlink_resolution: Vec::new(),
+            }],
+            // Even an empty generated tree has a captured root directory.
+            // These environment tests retain the same complete-tree evidence
+            // required by production generated-input keying.
+            directory_enumerations: vec![DirectoryEnumeration {
+                virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                entries: Vec::new(),
             }],
             ..ActionInputManifest::default()
         };

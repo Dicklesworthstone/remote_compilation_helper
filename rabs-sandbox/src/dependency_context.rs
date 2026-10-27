@@ -3245,6 +3245,204 @@ mod tests {
         runtime.verify(|| false).unwrap();
     }
 
+    /// Use the actual production archive view, including the retained sparse
+    /// runtime, without requiring the broader Cargo namespace's private procfs.
+    /// Native objects must come from the captured tree; a thin archive cannot
+    /// read an original host object merely because that object still exists.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap, cc, GNU ar, and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_canonical_archive_bundles_retained_native_inputs_and_denies_thin_escape() {
+        use std::process::Command;
+
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Rlib);
+        assert!(support.is_supported(), "{support:?}");
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("bundle/package");
+        let generated = owner.path().join("bundle/generated/native");
+        let original = owner.path().join("original");
+        let output = owner.path().join("output");
+        let home = owner.path().join("home");
+        let empty = owner.path().join("empty");
+        for directory in [&source, &generated, &original, &output, &home, &empty] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let checked = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{command:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            result
+        };
+        std::fs::write(
+            original.join("answer.c"),
+            "unsigned int rabs_native_answer(void) { return 37; }\n",
+        )
+        .unwrap();
+        checked(
+            Command::new("cc")
+                .args(["-c", "-fPIC", "-o"])
+                .arg(original.join("answer.o"))
+                .arg(original.join("answer.c")),
+        );
+        checked(
+            Command::new("ar")
+                .arg("crsD")
+                .arg(original.join("libretained.a"))
+                .arg(original.join("answer.o")),
+        );
+        checked(
+            Command::new("ar")
+                .arg("crsTD")
+                .arg(original.join("libthin.a"))
+                .arg(original.join("answer.o")),
+        );
+        assert!(
+            std::fs::read(original.join("libthin.a"))
+                .unwrap()
+                .starts_with(b"!<thin>\n"),
+            "the escape case must be an actual thin archive"
+        );
+        for name in ["libretained.a", "libthin.a"] {
+            std::fs::copy(original.join(name), generated.join(name)).unwrap();
+        }
+        // Corrupt only the original archive after the private snapshot exists.
+        // The original object deliberately remains readable on the host for
+        // the thin-archive escape oracle below.
+        std::fs::write(original.join("libretained.a"), b"not an archive").unwrap();
+        std::fs::write(
+            source.join("lib.rs"),
+            "unsafe extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer() -> u32 { unsafe { rabs_native_answer() } }\n",
+        )
+        .unwrap();
+        let control = owner.path().join("host-control");
+        std::fs::create_dir(&control).unwrap();
+        // Prove this compiler actually accepts the same thin archive when
+        // its original object is visible. A generic unsupported-archive error
+        // must never stand in for successful namespace confinement.
+        checked(
+            Command::new(toolchain.join("bin/rustc"))
+                .arg(source.join("lib.rs"))
+                .args([
+                    "--crate-name=thin_control",
+                    "--edition=2024",
+                    "--crate-type=rlib",
+                    "--emit=dep-info,metadata,link",
+                    "-lstatic=thin",
+                ])
+                .arg("--out-dir")
+                .arg(&control)
+                .arg(format!("-Lnative={}", original.display())),
+        );
+        assert!(control.join("libthin_control.rlib").is_file());
+        let runtime = crate::runtime_cohort::retain_runtime_cohort(
+            &toolchain.join("bin/rustc"),
+            &toolchain,
+            &[toolchain.join("lib")],
+            &output,
+            owner.path(),
+            || false,
+        )
+        .unwrap();
+        let generated_root = "/__rabs/out/cargo/debug/build/native-hash/out";
+        let context = DependencyExecContext::new_canonical_cargo_with_generated(
+            DependencyExecutionMode::Rlib,
+            CANONICAL_SOURCE.into(),
+            CANONICAL_SOURCE.into(),
+            CANONICAL_OUTPUT.into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(generated_root.into()),
+            vec![
+                ("HOME".into(), layout::HOME.into()),
+                ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+                ("CARGO_MANIFEST_DIR".into(), CANONICAL_SOURCE.into()),
+                ("LD_LIBRARY_PATH".into(), "/__rabs/toolchain/lib".into()),
+                ("OUT_DIR".into(), generated_root.into()),
+            ],
+            runtime.cohort().bytes,
+        )
+        .unwrap()
+        .with_generated_directories(vec!["native".into()])
+        .unwrap();
+        context.prepare_empty_backings(&empty).unwrap();
+        let spec = context
+            .namespace(&source, &toolchain, &output, &empty, &home)
+            .unwrap();
+        let compile = |library: &str, name: &str| {
+            let args = vec![
+                "lib.rs".into(),
+                format!("--crate-name={name}"),
+                "--edition=2024".into(),
+                "--crate-type=rlib".into(),
+                "--emit=dep-info,metadata,link".into(),
+                format!("--out-dir={}", context.out_dir()),
+                format!("-Lnative={generated_root}/native"),
+                format!("-lstatic={library}"),
+            ];
+            let launch = build_dependency_argv(
+                &context,
+                &spec,
+                &runtime,
+                &support,
+                context.compiler(),
+                &args,
+            )
+            .unwrap();
+            crate::canonical_namespace::command_for(&launch)
+                .output()
+                .unwrap()
+        };
+        let built = compile("retained", "native_bridge");
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        assert!(
+            !std::fs::read_to_string(output.join("native_bridge.d"))
+                .unwrap()
+                .contains("libretained.a"),
+            "the archive is a real compiler input absent from dep-info"
+        );
+        let main = owner.path().join("main.rs");
+        std::fs::write(
+            &main,
+            "fn main() { assert_eq!(native_bridge::answer(), 37); println!(\"{}\", native_bridge::answer()); }\n",
+        )
+        .unwrap();
+        let binary = owner.path().join("linked-native");
+        checked(
+            Command::new(toolchain.join("bin/rustc"))
+                .arg(&main)
+                .arg("--edition=2024")
+                .arg("--extern")
+                .arg(format!(
+                    "native_bridge={}",
+                    output.join("libnative_bridge.rlib").display()
+                ))
+                .arg("-o")
+                .arg(&binary),
+        );
+        assert_eq!(checked(&mut Command::new(&binary)).stdout, b"37\n");
+        let denied = compile("thin", "native_escape");
+        assert!(
+            !denied.status.success(),
+            "thin archive unexpectedly read the unmounted original host object"
+        );
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("error"));
+        assert!(!output.join("libnative_escape.rlib").exists());
+        runtime.verify(|| false).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn retained_candidate_roots_bind_first_use_prefixes_without_reordering_inputs() {

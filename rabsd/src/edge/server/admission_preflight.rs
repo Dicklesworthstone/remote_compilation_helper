@@ -8,7 +8,9 @@
 //! or classify a directory source without its captured checksum witness.
 
 use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
-use rabs_key::live_dependency::remote::remote_dependency_output_class;
+use rabs_key::live_dependency::remote::{
+    remote_dependency_output_class, validate_generated_native_inputs,
+};
 use rabs_key::live_dependency::{
     LiveRefusal, LiveRustcRequest, check_dependency_cache_read_closure,
 };
@@ -21,7 +23,7 @@ mod sysroot_preflight;
 /// Keep this deliberately small; differential tests below require supported
 /// requests to continue to the full planner, not become false cache misses.
 pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
-    rejection_for(request, false, false)
+    rejection_for(request, PreflightMode::LocalDependency)
 }
 
 /// A configured remote worker can enforce the archive read-closure profile.
@@ -30,21 +32,34 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
 /// dispatch, publication or installation. An unavailable remote lane never
 /// turns this preliminary check into local codegen cache authority.
 pub(super) fn remote_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
-    rejection_for(request, true, false)
+    rejection_for(request, PreflightMode::RemoteDependency)
 }
 
 /// Only the retained canonical Cargo unit capability can select this preflight.
 /// Primary-package environment, original lint settings and workspace cwd remain
 /// compiler inputs; the later pure planner and unit matcher grant execution.
 pub(super) fn workspace_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
-    rejection_for(request, true, true)
+    rejection_for(request, PreflightMode::WorkspaceExecutionOnly)
 }
 
-fn rejection_for(
-    request: LiveRustcRequest<'_>,
-    remote: bool,
-    workspace: bool,
-) -> Option<LiveRefusal> {
+/// Only a retained canonical Cargo operation may prepare generated static
+/// archives. Canonical-looking wrapper paths do not select this entry point;
+/// the driver owns the complete generated-tree capture and worker-only policy.
+pub(super) fn canonical_remote_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
+    rejection_for(request, PreflightMode::CanonicalRemoteDependency)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreflightMode {
+    LocalDependency,
+    RemoteDependency,
+    CanonicalRemoteDependency,
+    WorkspaceExecutionOnly,
+}
+
+fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<LiveRefusal> {
+    let remote = mode != PreflightMode::LocalDependency;
+    let workspace = mode == PreflightMode::WorkspaceExecutionOnly;
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
     if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -155,33 +170,40 @@ fn rejection_for(
     {
         return Some(LiveRefusal::NativeCpu);
     }
-    dependency_inputs_rejection(&invocation)
-        .or_else(|| sysroot_preflight::rejection(&invocation))
-        // Use the SAME option model as final derivation, not a second flag
-        // list or a fabricated host triple. Supported threaded compiles keep
-        // going; incremental/save-temps/unknown modes never start cold hashing.
-        .or_else(|| {
-            check_dependency_output_options(&invocation)
-                .err()
-                .map(|error| LiveRefusal::Outputs(error.to_string()))
-        })
+    dependency_inputs_rejection(
+        &invocation,
+        env_value("OUT_DIR"),
+        mode == PreflightMode::CanonicalRemoteDependency,
+    )
+    .or_else(|| sysroot_preflight::rejection(&invocation))
+    // Use the SAME option model as final derivation, not a second flag
+    // list or a fabricated host triple. Supported threaded compiles keep
+    // going; incremental/save-temps/unknown modes never start cold hashing.
+    .or_else(|| {
+        check_dependency_output_options(&invocation)
+            .err()
+            .map(|error| LiveRefusal::Outputs(error.to_string()))
+    })
 }
 
-fn dependency_inputs_rejection(invocation: &NormalizedRustcInvocation) -> Option<LiveRefusal> {
-    if let Some(library) = invocation.native_libs.first() {
-        return Some(LiveRefusal::NativeLibrary(library.clone()));
+fn dependency_inputs_rejection(
+    invocation: &NormalizedRustcInvocation,
+    generated_root: Option<&str>,
+    canonical_remote: bool,
+) -> Option<LiveRefusal> {
+    if let Err(refusal) =
+        validate_generated_native_inputs(invocation, generated_root, canonical_remote)
+    {
+        return Some(refusal);
     }
     // A proc-macro PRODUCER is rejected above, but the ordinary lib/rlib
-    // that CONSUMES it cannot enter this unsandboxed class either. Likewise,
-    // build scripts commonly add native search directories even without -l.
-    // Neither needs a host probe, source capture, or dependency enumeration
+    // that CONSUMES it cannot enter this class either.
+    // Unbound native search paths also refuse above, including those without
+    // -l. Only canonical archive executions may continue with native searches
+    // wholly inside their retained generated tree. These checks need neither
+    // a host probe, source capture, nor dependency enumeration
     // to establish this refusal. Let Cargo make progress immediately rather
     // than spend the wrapper's cold-readiness budget on an impossible hit.
-    for entry in &invocation.lib_search {
-        if !entry.starts_with("dependency=") {
-            return Some(LiveRefusal::SearchPath(entry.clone()));
-        }
-    }
     for (_, path) in &invocation.externs {
         let Some(path) = path else {
             // A bare --extern can name a toolchain crate. Only the full
@@ -276,6 +298,31 @@ mod tests {
         assert!(rejection(request).is_some());
         assert!(remote_rejection(request).is_some());
         assert_eq!(workspace_rejection(request), None);
+        let mut generated = env.clone();
+        generated.push((
+            "OUT_DIR".into(),
+            "/__rabs/out/cargo/debug/build/member-hash/out".into(),
+        ));
+        for extra in [
+            vec!["-Lnative=/__rabs/out/cargo/debug/build/member-hash/out"],
+            vec![
+                "-Lnative=/__rabs/out/cargo/debug/build/member-hash/out",
+                "-lstatic=answer",
+            ],
+        ] {
+            let mut native = argv.clone();
+            native.retain(|arg| arg != "--emit=metadata,dep-info");
+            native.push("--emit=dep-info,metadata,link".into());
+            native.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            assert!(matches!(
+                workspace_rejection(LiveRustcRequest {
+                    argv: &native,
+                    cwd: "/__rabs/workspace",
+                    env: &generated,
+                }),
+                Some(LiveRefusal::SearchPath(_))
+            ));
+        }
         env.push(("LD_PRELOAD".into(), "/unretained.so".into()));
         assert!(
             workspace_rejection(LiveRustcRequest {

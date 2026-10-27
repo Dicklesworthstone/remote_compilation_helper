@@ -273,3 +273,122 @@ fn assembler_input_changes_rlib_without_changing_dep_info_and_cannot_serve() {
         "codegen actually consumed the changed external bytes"
     );
 }
+
+/// Rustc bundles a native static archive into an rlib without listing that
+/// archive in dep-info. Both command-line and source-attribute selection need
+/// the complete generated-tree evidence used by the canonical worker class.
+/// This is a real compiler/linker oracle; it does not claim namespace or daemon
+/// serving evidence, which belongs to the separate native integration fixtures.
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_static_archive_changes_executable_without_changing_dep_info() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("bridge.rs");
+    let generated = directory.path().join("generated/native");
+    let out = directory.path().join("out");
+    std::fs::create_dir_all(&generated).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    let checked = |command: &mut Command| {
+        let output = command.output().expect("run real native compiler/linker");
+        assert!(
+            output.status.success(),
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    for attribute in [false, true] {
+        std::fs::write(
+            &source,
+            format!(
+                "{}unsafe extern \"C\" {{ fn rabs_native_answer() -> u32; }}\npub fn answer() -> u32 {{ unsafe {{ rabs_native_answer() }} }}\n",
+                if attribute {
+                    "#[link(name=\"rabs_answer\", kind=\"static\")]\n"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        let mut previous = None;
+        for answer in [37, 41] {
+            std::fs::write(
+                generated.join("answer.c"),
+                format!("unsigned int rabs_native_answer(void) {{ return {answer}; }}\n"),
+            )
+            .unwrap();
+            checked(
+                Command::new("cc")
+                    .args(["-c", "-fPIC", "-o"])
+                    .arg(generated.join("answer.o"))
+                    .arg(generated.join("answer.c")),
+            );
+            checked(
+                Command::new("ar")
+                    .arg("crsD")
+                    .arg(generated.join("librabs_answer.a"))
+                    .arg(generated.join("answer.o")),
+            );
+            let mut compiler = Command::new("rustc");
+            compiler
+                .arg(&source)
+                .args([
+                    "--crate-name=native_bridge",
+                    "--crate-type=rlib",
+                    "--edition=2024",
+                    "--emit=dep-info,metadata,link",
+                    "--error-format=json",
+                    "--cap-lints=allow",
+                ])
+                .arg("--out-dir")
+                .arg(&out)
+                .arg(format!("-Lnative={}", generated.display()));
+            if !attribute {
+                compiler.arg("-lstatic=rabs_answer");
+            }
+            checked(&mut compiler);
+            let dep_info = std::fs::read(out.join("native_bridge.d")).unwrap();
+            let archive = std::fs::read(out.join("libnative_bridge.rlib")).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&dep_info).contains("librabs_answer.a"),
+                "the oracle must exercise an input outside rustc's dep-info"
+            );
+            if let Some((old_dep_info, old_archive)) = previous {
+                assert_eq!(dep_info, old_dep_info, "only the native object changed");
+                assert_ne!(archive, old_archive, "native bytes must affect the rlib");
+            }
+            previous = Some((dep_info, archive));
+
+            let main = directory.path().join("main.rs");
+            std::fs::write(
+                &main,
+                format!(
+                    "fn main() {{ assert_eq!(native_bridge::answer(), {answer}); println!(\"{{}}\", native_bridge::answer()); }}\n"
+                ),
+            )
+            .unwrap();
+            let binary = directory
+                .path()
+                .join(format!("native-{attribute}-{answer}"));
+            // No native search path is supplied at final linking: a bundled
+            // object must be sufficient, rather than a deferred library name.
+            checked(
+                Command::new("rustc")
+                    .arg(&main)
+                    .arg("--edition=2024")
+                    .arg("--extern")
+                    .arg(format!(
+                        "native_bridge={}",
+                        out.join("libnative_bridge.rlib").display()
+                    ))
+                    .arg("-o")
+                    .arg(&binary),
+            );
+            assert_eq!(
+                checked(&mut Command::new(&binary)).stdout,
+                format!("{answer}\n").as_bytes(),
+                "delivered native code must have the current behavior"
+            );
+        }
+    }
+}

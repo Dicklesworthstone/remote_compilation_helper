@@ -199,24 +199,56 @@ transfer without reopening mutable target paths.
 A populated dependency search directory may be disjoint from the action's
 output directory or may be that same directory. In the shared case, the worker
 places each retained dependency file above its private writable output mount
-as a separate read-only bind. Bare toolchain externs, proc macros,
-native libraries and executable/shared-library linker output remain local. Build scripts themselves
-also continue to run locally.
+as a separate read-only bind. Bare toolchain externs, proc macros and
+executable/shared-library linker output remain local. Ordinary dependency
+execution also refuses native library inputs; the canonical Cargo archive
+extension below admits a bounded generated-static-library case. Build scripts
+themselves continue to run locally.
 These limits apply to each compiler action; they do not prevent Cargo from
 continuing with other units.
 
 Both dependency classes may consume a previously completed Cargo build
 script's generated `OUT_DIR` tree. Admission binds the exact captured Cargo
 build-script output record, the original `OUT_DIR` path and every generated
-file, including an explicitly captured empty tree. A tree containing empty
-subdirectories stays on the local protocol because the current file transfer
-cannot reproduce those directories; a truly empty root is supported.
+file, including an explicitly captured empty tree. The transfer also retains
+every generated directory, including empty subdirectories.
 Generated file contents, directory membership and empty-directory topology
 select a different key. The
 captured `rustc-env` directives must agree with the compiler environment. Every
 source or generated path reported by dep-info must belong to the captured
 input closure. This does not cache or replay
 the build script's execution.
+
+**Generated native static archives in canonical Cargo builds.** A canonical
+remote external-dependency `lib`/`rlib` compilation may use `-L native=PATH` when every native search
+directory is the current package's captured `OUT_DIR` or one of its declared
+subdirectories. Explicit library arguments must have exactly `-l static=NAME`
+form, and a matching `libNAME.a` must appear in the captured generated files
+under one of those search directories. Source `#[link]` attributes may use the
+same closed search view. The complete generated tree, native search order,
+library arguments and Cargo build-script record all participate in the key;
+native actions also have a distinct isolation policy. Pure Rust action keys
+retain their existing policy.
+
+The worker independently validates the native argument shape and directory
+topology before execution. Rustc bundles the retained native objects into its
+returned rlib inside the existing closed archive namespace, with no external
+linker, general host filesystem, procfs or entropy devices. Thin-archive members
+must also resolve within retained inputs; a reference to an unmounted host
+object fails the private compile. The existing verified-drain fallback handles
+that failure before output installation. This uses the existing canonical v4
+context and generated-tree transfer; older workers that reject native arguments
+continue through that same fallback boundary.
+
+This extension is automatic for eligible canonical dependency workers during
+`cargo rabs --rabs-canonical-local PROFILE.json -- build ...`. It does not add
+local native-result capture. Metadata-only checks, system or dynamic library
+searches, library modifiers/renaming, and native search paths belonging to a
+different package's `OUT_DIR` continue locally. In particular, a native search
+path propagated through a larger dependency graph is not implicitly included
+in the current package's captured generated tree. Fresh workspace execution is
+also outside this extension: a selected workspace library consuming such a
+propagated path compiles locally without action-cache publication or replay.
 
 The worker keeps the original source, generated-input, output and toolchain
 path spellings and full compiler environment inside private mounts. The
@@ -593,6 +625,41 @@ It compiles an archive containing captured `.incbin` bytes and refuses attempts
 to read host-only files, procfs or `/dev/urandom`. This proves the production
 sandbox boundary; the worker and live Cargo fixtures establish the broader
 remote execution and replay behavior when run successfully.
+
+The generated-native sandbox regression uses that same production archive
+view, links and executes the returned rlib, and requires a thin archive's
+attempt to read an unmounted original host object to fail:
+
+```sh
+RABS_TEST_TOOLCHAIN_ROOT="$(rustc --print sysroot)" \
+  cargo test -p rabs-sandbox --lib \
+    real_canonical_archive_bundles_retained_native_inputs_and_denies_thin_escape \
+    -- --ignored --nocapture
+```
+
+It also needs `cc` and GNU `ar`. The lightweight compiler conformance test
+`bundled_static_archive_changes_executable_without_changing_dep_info` in
+`rabs-key/tests/live_dependency_out_dir_conformance.rs` proves that native
+archive edits change the executable even though rustc's dep-info is unchanged.
+It requires no namespaces and makes no claim about remote serving.
+
+For the complete Cargo, authenticated-worker, cache and artifact-delivery path:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local \
+    canonical_cargo_build_bundles_generated_native_archives_replays_and_invalidates_them \
+    -- --ignored --nocapture
+```
+
+This fixture requires the full Cargo namespace and OpenSSL as well. It demands
+actual remote cold samples, subsequent cache replay across worktrees, a working
+delivered executable, and a new remote result when only the native generator's
+workspace input changes. The independent Rust dependency must remain a hit.
+The workspace consumer must stay local and uncached while its two external
+dependencies offload or replay; the delivered binary exercises the native code.
+An ignored test or an unsupported-host result is not execution evidence.
 
 ## Run one delivery
 

@@ -178,6 +178,46 @@ fn generated_dependency(root: &Path) {
     );
 }
 
+fn generated_native_dependency(root: &Path) {
+    write(root, "generated-value.txt", "2\n");
+    vendor(
+        root,
+        "canonical_dep",
+        BTreeMap::from([
+            (
+                "Cargo.toml",
+                "[package]\nname='canonical_dep'\nversion='1.0.0'\nedition='2021'\n[dependencies]\ncanonical_leaf='=1.0.0'\n",
+            ),
+            (
+                "build.rs",
+                r#"fn main() {
+    let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let input = package.parent().unwrap().parent().unwrap().join("generated-value.txt");
+    let value: u32 = std::fs::read_to_string(&input).unwrap().trim().parse().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("native");
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("answer.c"), format!("unsigned int rabs_native_answer(void) {{ return {value}; }}\n")).unwrap();
+    assert!(std::process::Command::new("/usr/bin/cc")
+        .args(["-c", "-fPIC", "-o"])
+        .arg(output.join("answer.o")).arg(output.join("answer.c"))
+        .status().unwrap().success());
+    assert!(std::process::Command::new("/usr/bin/ar")
+        .arg("crsD").arg(output.join("librabs_answer.a")).arg(output.join("answer.o"))
+        .status().unwrap().success());
+    println!("cargo:rerun-if-changed={}", input.display());
+    println!("cargo:rustc-link-search=native={}", output.display());
+    println!("cargo:rustc-link-lib=static=rabs_answer");
+}
+"#,
+            ),
+            (
+                "src/lib.rs",
+                "extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer()->u32 { canonical_leaf::answer() + unsafe { rabs_native_answer() } }\n",
+            ),
+        ]),
+    );
+}
+
 fn run(root: &Path, number: u32, profile: &Value) -> (i32, Vec<Value>, String) {
     run_with_environment(root, number, profile, &[])
 }
@@ -1425,6 +1465,27 @@ fn assert_fresh_workspace_execution(
     key
 }
 
+fn assert_local_native_workspace(events: &[Value], output: &str) {
+    for decision in ["remote-offer", "hit", "execute"] {
+        assert!(
+            !decisions(events, decision).contains_key("canonical_app"),
+            "the workspace consumer of a propagated native path must remain local and uncached: {output}"
+        );
+    }
+    assert!(
+        events.iter().any(|event| {
+            event["kind"] == "rabsd-live-dependency"
+                && event["crate"] == "canonical_app"
+                && event["decision"] == "shadow"
+                && matches!(
+                    event["reason"].as_str(),
+                    Some("LIVE_DEP_SEARCH_PATH" | "LIVE_DEP_NATIVE_LIB")
+                )
+        }),
+        "the actual workspace invocation must refuse its propagated native input: {output}"
+    );
+}
+
 /// Validate the delivered user output, including a real executable consuming
 /// the remotely produced or replayed archives. The driver may retain only the
 /// target tree after its coordinator, wrapper sessions and compiler have drained.
@@ -1595,11 +1656,42 @@ fn canonical_cargo_build_offloads_generated_archives_and_delivers_current_genera
     remote_dependency_replay("build", GeneratedDependency::Leaf);
 }
 
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated native archive execution, remote cache replay and linked binary validation"]
+fn canonical_cargo_build_bundles_generated_native_archives_replays_and_invalidates_them() {
+    remote_dependency_replay("build", GeneratedDependency::NativeConsumer);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GeneratedDependency {
     None,
     Leaf,
     Consumer,
+    NativeConsumer,
+}
+
+impl GeneratedDependency {
+    fn generated_consumer(self) -> bool {
+        matches!(self, Self::Consumer | Self::NativeConsumer)
+    }
+
+    fn assert_answer(self, root: &Path, answer: u32, workspace_edit: bool) {
+        if self == Self::NativeConsumer {
+            // FFI cannot be evaluated in a Rust const assertion. The delivered
+            // executable calls this assertion after linking the returned rlib,
+            // proving that the bundled native object has the current behavior.
+            write(
+                root,
+                "src/lib.rs",
+                format!(
+                    "#[cfg(not(feature=\"remote_workspace\"))]\ncompile_error!(\"selected workspace feature was lost\");\nconst _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: &str = include_str!(\"../workspace-readme.txt\");\npub fn answer()->u32 {{ let answer = canonical_dep::answer(); assert_eq!(answer, {answer}); answer+{} }}\n",
+                    u32::from(workspace_edit)
+                ),
+            );
+        } else {
+            assert_answer(root, answer, workspace_edit);
+        }
+    }
 }
 
 /// Exercise the production native CLI, wrapper, remote executor, CAS sampling,
@@ -1609,6 +1701,10 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     profile["command"] = json!(command);
     profile["selection"] = json!({"features":["remote_workspace"]});
     let build = command == "build";
+    // Cargo propagates the dependency's native search path to its consumers.
+    // The workspace lane has no authority to capture another package's OUT_DIR.
+    let workspace_remote = generated != GeneratedDependency::NativeConsumer;
+    let remote_unit_count = 2 + usize::from(workspace_remote);
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
     match generated {
@@ -1621,11 +1717,16 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             generated_dependency(&first);
             generated_dependency(&second);
         }
+        GeneratedDependency::NativeConsumer => {
+            assert!(build, "native archive replay requires actual codegen");
+            generated_native_dependency(&first);
+            generated_native_dependency(&second);
+        }
     }
     workspace_execution_feature(&first);
     workspace_execution_feature(&second);
-    assert_answer(&first, 42, false);
-    assert_answer(&second, 42, true);
+    generated.assert_answer(&first, 42, false);
+    generated.assert_answer(&second, 42, true);
     let (mut worker, environment) = NativeWorker::start(owner.path());
     let mut first_keys = None;
     let mut receipt: Option<Value> = None;
@@ -1660,8 +1761,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         let offered = decisions(&events, "remote-offer");
         assert_eq!(
             offered.len(),
-            3,
-            "both dependencies and the workspace library must use the actual worker: {output}"
+            remote_unit_count,
+            "every eligible unit must use the actual worker: {output}"
         );
         assert!(
             offered.contains_key("canonical_leaf") && offered.contains_key("canonical_dep"),
@@ -1691,7 +1792,16 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             )),
             "{output}"
         );
-        assert_fresh_workspace_execution(owner.path(), &events, &output, &mut workspace_attempts);
+        if workspace_remote {
+            assert_fresh_workspace_execution(
+                owner.path(),
+                &events,
+                &output,
+                &mut workspace_attempts,
+            );
+        } else {
+            assert_local_native_workspace(&events, &output);
+        }
         let dependency_keys = offered
             .into_iter()
             .filter(|(name, _)| name != "canonical_app")
@@ -1708,8 +1818,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         if let Some(previous) = &receipt {
             assert!(
                 next["request_id"].as_u64().unwrap()
-                    >= previous["request_id"].as_u64().unwrap() + 3,
-                "both dependencies and the workspace library must advance actual worker admission"
+                    >= previous["request_id"].as_u64().unwrap() + remote_unit_count as u64,
+                "every eligible unit must advance actual worker admission"
             );
         }
         receipt = Some(next);
@@ -1720,7 +1830,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         .filter(|event| event["kind"] == "worker-toolchain-acquired")
         .count();
     assert_eq!(
-        before_replay, 9,
+        before_replay,
+        3 * remote_unit_count,
         "every qualifying production must reach the native worker executor"
     );
     // Repeat the unchanged workload after the dependencies qualify for cache
@@ -1753,24 +1864,40 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
             2,
             "{output}"
         );
-        let workspace_key = assert_fresh_workspace_execution(
-            owner.path(),
-            &events,
-            &output,
-            &mut workspace_attempts,
-        );
-        assert_eq!(
-            decisions(&events, "remote-offer"),
-            BTreeMap::from([("canonical_app".to_owned(), workspace_key)]),
-            "only the workspace library must execute while dependencies replay: {output}"
-        );
+        if workspace_remote {
+            let workspace_key = assert_fresh_workspace_execution(
+                owner.path(),
+                &events,
+                &output,
+                &mut workspace_attempts,
+            );
+            assert_eq!(
+                decisions(&events, "remote-offer"),
+                BTreeMap::from([("canonical_app".to_owned(), workspace_key)]),
+                "only the workspace library must execute while dependencies replay: {output}"
+            );
+        } else {
+            assert_local_native_workspace(&events, &output);
+            assert!(
+                decisions(&events, "remote-offer").is_empty(),
+                "both native fixture dependencies must replay while the workspace compiles locally: {output}"
+            );
+        }
         assert!(decisions(&events, "execute").is_empty(), "{output}");
         let next = worker.completed_receipt();
-        assert!(
-            next["request_id"].as_u64().unwrap()
-                > receipt.as_ref().unwrap()["request_id"].as_u64().unwrap(),
-            "workspace execution reused an earlier worker receipt"
-        );
+        if workspace_remote {
+            assert!(
+                next["request_id"].as_u64().unwrap()
+                    > receipt.as_ref().unwrap()["request_id"].as_u64().unwrap(),
+                "workspace execution reused an earlier worker receipt"
+            );
+        } else {
+            assert_eq!(
+                Some(&next),
+                receipt.as_ref(),
+                "warm native dependencies unexpectedly executed again"
+            );
+        }
         receipt = Some(next);
         assert_eq!(
             worker
@@ -1778,8 +1905,8 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
                 .into_iter()
                 .filter(|event| event["kind"] == "worker-toolchain-acquired")
                 .count(),
-            before_replay + (number as usize - 3),
-            "each successful warm workload must perform one fresh workspace execution"
+            before_replay + usize::from(workspace_remote) * (number as usize - 3),
+            "each warm workload must execute only its eligible workspace library"
         );
     }
 
@@ -1801,7 +1928,7 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         source(&second, 41);
         workspace_execution_feature(&second);
     }
-    assert_answer(&second, 43, false);
+    generated.assert_answer(&second, 43, false);
     let (code, events, output) = run_with_environment(owner.path(), 6, &profile, &environment);
     assert_eq!(
         code, 0,
@@ -1811,7 +1938,7 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         let (target, archives) = delivered_build(owner.path(), 6, &events, 43);
         assert!(retained_targets.insert(target));
         let previous = first_archives.as_ref().unwrap();
-        if generated == GeneratedDependency::Consumer {
+        if generated.generated_consumer() {
             assert_eq!(
                 archives["canonical_leaf"], previous["canonical_leaf"],
                 "editing a generator input changed the independent leaf archive"
@@ -1828,17 +1955,21 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         );
     }
     let changed = decisions(&events, "remote-offer");
-    let changed_names: &[&str] = if generated == GeneratedDependency::Consumer {
+    let changed_names: &[&str] = if generated.generated_consumer() {
         &["canonical_dep"]
     } else {
         &["canonical_leaf", "canonical_dep"]
     };
     assert_eq!(
         changed.len(),
-        changed_names.len() + 1,
-        "changed dependencies and the workspace library must execute remotely: {output}"
+        changed_names.len() + usize::from(workspace_remote),
+        "changed dependencies and the eligible workspace library must execute remotely: {output}"
     );
-    assert_fresh_workspace_execution(owner.path(), &events, &output, &mut workspace_attempts);
+    if workspace_remote {
+        assert_fresh_workspace_execution(owner.path(), &events, &output, &mut workspace_attempts);
+    } else {
+        assert_local_native_workspace(&events, &output);
+    }
     let first_keys = first_keys.unwrap();
     for name in changed_names {
         assert_ne!(
@@ -1854,7 +1985,7 @@ fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
         );
     }
     let hits = decisions(&events, "hit");
-    if generated == GeneratedDependency::Consumer {
+    if generated.generated_consumer() {
         assert_eq!(
             hits,
             BTreeMap::from([(

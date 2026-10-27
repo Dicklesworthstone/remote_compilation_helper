@@ -385,6 +385,8 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     }
     let rejection = if workspace_requested {
         admission_preflight::workspace_rejection(candidate)
+    } else if remote_requested && live.canonical.is_some() {
+        admission_preflight::canonical_remote_rejection(candidate)
     } else if remote_requested {
         admission_preflight::remote_rejection(candidate)
     } else {

@@ -305,6 +305,152 @@ fn canonical_generated_request(archive: bool, populated: bool) -> Value {
     request
 }
 
+fn canonical_native_request() -> Value {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    let mut request = canonical_generated_request(true, true);
+    request["args"].as_array_mut().unwrap().extend([
+        json!("-L"),
+        json!("native=/__rabs/out/cargo/debug/build/leaf-hash/out/nested"),
+        json!("-l"),
+        json!("static=native"),
+    ]);
+    let manifest = SourceManifest::new(vec![
+        SourceFile {
+            path: "package/src/lib.rs".into(),
+            len: 1,
+            sha256: [1; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "generated/nested/input.rs".into(),
+            len: 1,
+            sha256: [2; 32],
+            executable: false,
+        },
+        SourceFile {
+            path: "generated/nested/libnative.a".into(),
+            len: 8,
+            sha256: [3; 32],
+            executable: false,
+        },
+    ])
+    .unwrap();
+    request["source_manifest"]["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "path":"generated/nested/libnative.a", "bytes":8,
+            "sha256":"03".repeat(32), "executable":false,
+        }));
+    request["source_manifest"]["manifest_sha256"] =
+        json!(rabs_wkr::source_transfer::hex(&manifest.digest()));
+    request
+}
+
+#[test]
+fn canonical_native_archive_request_requires_closed_generated_inputs() {
+    let request = canonical_native_request();
+    let original = request.clone();
+    let parsed = parse_exec_request(&request).unwrap();
+    let context = parsed.dependency_context.unwrap();
+    assert!(context.canonical_cargo());
+    assert_eq!(context.execution_mode(), DependencyExecutionMode::Rlib);
+    assert_eq!(context.generated_directories(), &["nested"]);
+    assert!(
+        parsed
+            .args
+            .iter()
+            .any(|argument| argument == "static=native")
+    );
+    assert_eq!(
+        request, original,
+        "worker decoding must preserve native argv"
+    );
+
+    // An undeclared directory cannot be acquired just by spelling it beneath
+    // OUT_DIR. Its complete topology belongs to the transferred input view.
+    let mut missing_directory = request.clone();
+    missing_directory["dependency_context"]["generated_directories"] = json!([]);
+    assert!(parse_exec_request(&missing_directory).is_err());
+    let mut metadata = canonical_generated_request(false, true);
+    metadata["args"].as_array_mut().unwrap().extend([
+        json!("-Lnative=/__rabs/out/cargo/debug/build/leaf-hash/out/nested"),
+        json!("-lstatic=native"),
+    ]);
+    assert!(parse_exec_request(&metadata).is_err());
+    let mut ordinary = dependency_request();
+    ordinary["args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("-Lnative=/work/generated"), json!("-lstatic=native")]);
+    assert!(parse_exec_request(&ordinary).is_err());
+}
+
+#[test]
+fn workspace_execution_cannot_inherit_generated_native_dependency_authority() {
+    for archive in [false, true] {
+        let baseline = canonical_workspace_request(archive);
+        assert!(parse_exec_request(&baseline).is_ok());
+        for extra in [
+            vec!["-Lnative=/__rabs/out/cargo/debug/build/leaf-hash/out/nested"],
+            vec![
+                "-Lnative=/__rabs/out/cargo/debug/build/leaf-hash/out/nested",
+                "-lstatic=native",
+            ],
+            vec!["-lstatic=native"],
+        ] {
+            let mut request = baseline.clone();
+            request["args"]
+                .as_array_mut()
+                .unwrap()
+                .extend(extra.iter().map(|argument| json!(argument)));
+            let error = parse_exec_request(&request).unwrap_err();
+            assert!(
+                error.contains("dependency generated native inputs"),
+                "archive={archive}, {extra:?}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_native_archives_refuse_system_dynamic_and_escaping_searches() {
+    for extra in [
+        vec!["-l", "native"],
+        vec!["-l", "dylib=native"],
+        vec!["-l", "framework=native"],
+        vec!["-l", "static:-bundle=native"],
+        vec!["-l", "static=native:renamed"],
+        vec!["-l", "static=../native"],
+        vec!["-L", "native=/usr/lib"],
+        vec!["-L", "native=/__rabs/out/cargo/debug/build/other/out"],
+        vec![
+            "-L",
+            "native=/__rabs/out/cargo/debug/build/leaf-hash/outside",
+        ],
+        vec![
+            "-L",
+            "native=/__rabs/out/cargo/debug/build/leaf-hash/out/../outside",
+        ],
+        vec![
+            "-L",
+            "native=/__rabs/out/cargo/debug/build/leaf-hash/out/nested/../nested",
+        ],
+        vec![
+            "-L",
+            "all=/__rabs/out/cargo/debug/build/leaf-hash/out/nested",
+        ],
+        vec!["-L", "/__rabs/out/cargo/debug/build/leaf-hash/out/nested"],
+    ] {
+        let mut request = canonical_native_request();
+        request["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|argument| json!(argument)));
+        assert!(parse_exec_request(&request).is_err(), "{extra:?}");
+    }
+}
+
 #[test]
 fn canonical_generated_context_decodes_empty_and_populated_trees_in_both_modes() {
     for archive in [false, true] {

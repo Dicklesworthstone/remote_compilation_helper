@@ -9,9 +9,9 @@
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
 use super::{
-    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, LiveDependencyKey,
-    LiveRefusal, LiveRustcRequest, ToolchainFacts, captured_action_key, env_value,
-    normalized_generated_relative, plain_path_in_profile, plan_in_profile, within,
+    DependencyActionPlan, DependencyDirectoryFact, DependencyPlanningMode, DependencySourceKind,
+    LiveDependencyKey, LiveRefusal, LiveRustcRequest, ToolchainFacts, captured_action_key,
+    env_value, normalized_generated_relative, plain_path_in_profile, plan_in_profile, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
@@ -85,6 +85,13 @@ pub fn workspace_source_path(plan: &DependencyActionPlan) -> Result<String, Live
 }
 
 pub(super) fn workspace_layout(plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
+    // Canonical workspace execution shares mechanical worker checks with
+    // external dependencies, but it has no generated-native execution authority.
+    remote::validate_generated_native_inputs(
+        &plan.invocation,
+        plan.generated_root.as_deref(),
+        false,
+    )?;
     if !plan.canonical_cargo
         || plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly
         || plan.source_root != WORKSPACE
@@ -164,7 +171,12 @@ pub fn plan_canonical_workspace_execution(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    let plan = plan_in_profile(request, host_triple, None, true, true)?;
+    let plan = plan_in_profile(
+        request,
+        host_triple,
+        None,
+        DependencyPlanningMode::WorkspaceExecutionOnly,
+    )?;
     workspace_layout(&plan)?;
     remote::remote_dependency_output_class(&plan.invocation)
         .map_err(|error| LiveRefusal::Facts(error.to_string()))?;
@@ -769,6 +781,62 @@ mod tests {
                 .is_err(),
                 "{extra:?}"
             );
+        }
+    }
+
+    #[test]
+    fn generated_native_archives_cannot_inherit_workspace_execution_authority() {
+        let (mut argv, mut env) = request();
+        argv[8] = "--emit=dep-info,metadata,link".into();
+        env.push(("OUT_DIR".into(), GENERATED.into()));
+        let archive = from_request(&argv, &env, WORKSPACE);
+        let mut manifest = inputs(&archive);
+        manifest
+            .directory_enumerations
+            .push(listing(archive.generated_virtual_root(), &["libanswer.a"]));
+        manifest.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(
+                archive
+                    .generated_input_virtual_path("libanswer.a")
+                    .into_bytes(),
+            ),
+            object: ObjectId(compute("rabs.test.workspace-input.v1", b"native archive")),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        key(&archive, &manifest).unwrap();
+        for extra in [
+            vec![format!("-Lnative={GENERATED}")],
+            vec!["-lstatic=answer".into()],
+            vec![format!("-Lnative={GENERATED}"), "-lstatic=answer".into()],
+        ] {
+            let mut changed = argv.clone();
+            changed.extend(extra);
+            assert!(
+                plan_canonical_workspace_execution(
+                    LiveRustcRequest {
+                        argv: &changed,
+                        env: &env,
+                        cwd: WORKSPACE,
+                    },
+                    HOST,
+                )
+                .is_err(),
+                "generated native inputs remain outside the workspace execution class"
+            );
+            let mut forged = archive.clone();
+            forged.invocation = crate::invocation::parse(&changed, None).unwrap();
+            assert!(remote_workspace_execution_isolation_policy(&forged).is_err());
+            assert!(
+                remote_workspace_execution_shape(&forged, &directories(&forged), TOOLCHAIN)
+                    .is_err()
+            );
+            assert!(
+                remote::remote_execution_shape(&forged, &directories(&forged), TOOLCHAIN).is_err(),
+                "shared mechanics must not treat canonical workspace context as native authority"
+            );
+            assert!(key(&forged, &manifest).is_err());
         }
     }
 

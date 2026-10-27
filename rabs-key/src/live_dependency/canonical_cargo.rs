@@ -10,8 +10,8 @@
 //! has a minimal hermetic input view.
 
 use super::{
-    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
-    LiveDependencyKey, LiveRefusal, LiveRustcRequest, ToolchainFacts,
+    DependencyActionPlan, DependencyDirectoryFact, DependencyPlanningMode, DependencySourceKind,
+    ExternFact, LiveDependencyKey, LiveRefusal, LiveRustcRequest, ToolchainFacts,
     check_dependency_cache_read_closure, dependency_key, dependency_source, directory_source,
     env_value, plain_path_in_profile, plan_with_directory_manifest, within,
 };
@@ -46,6 +46,11 @@ pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
             "workspace execution-only plans cannot use canonical dependency authority".into(),
         ));
     }
+    super::remote::validate_generated_native_inputs(
+        &plan.invocation,
+        plan.generated_root.as_deref(),
+        plan.canonical_cargo,
+    )?;
     let mut presented = plan
         .execution_env
         .iter()
@@ -156,7 +161,12 @@ pub fn plan_canonical_cargo_dependency_action(
     host_triple: &str,
     directory_source_checksum: Option<TypedDigest>,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    let plan = plan_with_directory_manifest(request, host_triple, directory_source_checksum, true)?;
+    let plan = plan_with_directory_manifest(
+        request,
+        host_triple,
+        directory_source_checksum,
+        DependencyPlanningMode::CanonicalLocal,
+    )?;
     local_metadata_layout(&plan)?;
     check_dependency_cache_read_closure(&plan.invocation)?;
     Ok(plan)
@@ -164,8 +174,9 @@ pub fn plan_canonical_cargo_dependency_action(
 
 /// Plan an external dependency for an enforced canonical worker execution.
 ///
-/// Unlike local capture, this admits pure Rust archive emission and a complete
-/// generated OUT_DIR captured with its exact Cargo build-script stdout. The caller
+/// Unlike local capture, this admits Rust archive emission and a complete
+/// generated OUT_DIR captured with its exact Cargo build-script stdout, including
+/// static native libraries bundled from that retained tree. The caller
 /// must retain canonical-driver ownership and use the remote key, independently
 /// negotiated output mode and matching closed namespace before lookup or
 /// execution. In particular, an archive may not fall through to local capture:
@@ -173,13 +184,18 @@ pub fn plan_canonical_cargo_dependency_action(
 ///
 /// # Errors
 /// Ordinary source/layout refusals and output classes other than exact metadata
-/// plus dep-info or pure Rust archives with dep-info and optional metadata.
+/// plus dep-info or Rust archives with dep-info and optional metadata.
 pub fn plan_canonical_remote_dependency_action(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
     directory_source_checksum: Option<TypedDigest>,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    let plan = plan_with_directory_manifest(request, host_triple, directory_source_checksum, true)?;
+    let plan = plan_with_directory_manifest(
+        request,
+        host_triple,
+        directory_source_checksum,
+        DependencyPlanningMode::CanonicalRemote,
+    )?;
     canonical_layout(&plan)?;
     super::remote::remote_dependency_output_class(&plan.invocation)
         .map_err(|error| LiveRefusal::Facts(error.to_string()))?;

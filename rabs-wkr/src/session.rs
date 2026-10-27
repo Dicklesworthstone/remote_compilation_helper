@@ -431,6 +431,7 @@ pub fn validate_dependency_execution(
     use rabs_key::invocation::SourceInput;
     use rabs_key::live_dependency::remote::{
         RemoteDependencyOutputClass, remote_dependency_output_class,
+        validate_generated_native_inputs,
     };
     use std::collections::BTreeSet;
     use std::path::{Component, Path};
@@ -443,6 +444,35 @@ pub fn validate_dependency_execution(
     let invocation = rabs_key::invocation::parse(&argv, None)
         .map_err(|error| format!("dependency invocation: {error:?}"))?;
     let class = remote_dependency_output_class(&invocation).map_err(|error| error.to_string())?;
+    // Native archives are an extension of the closed canonical rlib view,
+    // never of ordinary metadata, workspace execution or host-native lookup.
+    // The source transfer retains the complete generated tree; the compiler
+    // can resolve only these declared directories and its other sealed inputs.
+    let native_directories = validate_generated_native_inputs(
+        &invocation,
+        context.generated_root(),
+        context.canonical_cargo() && !context.workspace_execution_only(),
+    )
+    .map_err(|error| format!("dependency generated native inputs: {error}"))?;
+    for directory in &native_directories {
+        let relative = Path::new(directory)
+            .strip_prefix(
+                context
+                    .generated_root()
+                    .ok_or("native input lacks OUT_DIR")?,
+            )
+            .map_err(|_| "native input is outside the retained generated tree")?;
+        if !relative.as_os_str().is_empty()
+            && !context
+                .generated_directories()
+                .iter()
+                .any(|declared| Path::new(declared) == relative)
+        {
+            return Err(
+                "native search directory is absent from the retained generated tree".into(),
+            );
+        }
+    }
     match (context.execution_mode(), class) {
         (DependencyExecutionMode::Metadata, RemoteDependencyOutputClass::Metadata) => {
             if !context.canonical_cargo() {
@@ -468,7 +498,6 @@ pub fn validate_dependency_execution(
             .map_err(|error| format!("dependency archive outputs: {error}"))?;
     if request.program != context.compiler()
         || invocation.out_dir.as_deref() != Some(context.out_dir())
-        || !invocation.native_libs.is_empty()
         || invocation
             .codegen
             .iter()
@@ -495,11 +524,14 @@ pub fn validate_dependency_execution(
         return Err("dependency archive source is outside the retained package".into());
     }
     for search in &invocation.lib_search {
-        if search
+        let dependency = search
             .strip_prefix("dependency=")
-            .is_none_or(|path| !context.dependency_dirs().iter().any(|root| root == path))
-        {
-            return Err("dependency archive has an undeclared or native search directory".into());
+            .is_some_and(|path| context.dependency_dirs().iter().any(|root| root == path));
+        let native = search
+            .strip_prefix("native=")
+            .is_some_and(|path| native_directories.iter().any(|root| root == path));
+        if !dependency && !native {
+            return Err("dependency archive has an undeclared search directory".into());
         }
     }
     for (_, path) in &invocation.externs {

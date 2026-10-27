@@ -766,7 +766,7 @@ pub fn plan_dependency_action(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    plan_with_directory_manifest(request, host_triple, None, false)
+    plan_with_directory_manifest(request, host_triple, None, DependencyPlanningMode::Ordinary)
 }
 
 /// Plan a Cargo directory-source dependency after the edge observed a valid
@@ -782,7 +782,20 @@ pub fn plan_directory_dependency_action(
     host_triple: &str,
     checksum_document: TypedDigest,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    plan_with_directory_manifest(request, host_triple, Some(checksum_document), false)
+    plan_with_directory_manifest(
+        request,
+        host_triple,
+        Some(checksum_document),
+        DependencyPlanningMode::Ordinary,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DependencyPlanningMode {
+    Ordinary,
+    CanonicalLocal,
+    CanonicalRemote,
+    WorkspaceExecutionOnly,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -790,15 +803,9 @@ fn plan_with_directory_manifest(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
     directory_source_manifest: Option<TypedDigest>,
-    canonical_cargo: bool,
+    mode: DependencyPlanningMode,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    plan_in_profile(
-        request,
-        host_triple,
-        directory_source_manifest,
-        canonical_cargo,
-        false,
-    )
+    plan_in_profile(request, host_triple, directory_source_manifest, mode)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -806,9 +813,10 @@ fn plan_in_profile(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
     directory_source_manifest: Option<TypedDigest>,
-    canonical_cargo: bool,
-    workspace_execution_only: bool,
+    mode: DependencyPlanningMode,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
+    let canonical_cargo = mode != DependencyPlanningMode::Ordinary;
+    let workspace_execution_only = mode == DependencyPlanningMode::WorkspaceExecutionOnly;
     // Environment first: it is the cheapest way out of the class.
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
@@ -888,7 +896,9 @@ fn plan_in_profile(
     {
         return Err(LiveRefusal::NativeCpu);
     }
-    if let Some(library) = invocation.native_libs.first() {
+    if mode != DependencyPlanningMode::CanonicalRemote
+        && let Some(library) = invocation.native_libs.first()
+    {
         return Err(LiveRefusal::NativeLibrary(library.clone()));
     }
     let source = match &invocation.source {
@@ -927,6 +937,11 @@ fn plan_in_profile(
     {
         return Err(LiveRefusal::UnrepresentablePath(root.clone()));
     }
+    remote::validate_generated_native_inputs(
+        &invocation,
+        generated_root.as_deref(),
+        mode == DependencyPlanningMode::CanonicalRemote,
+    )?;
     let mut dependency_dirs = Vec::new();
     let mut add_directory = |path: &str| -> Result<(), LiveRefusal> {
         if !plain_path_in_profile(path, canonical_cargo)
@@ -954,6 +969,12 @@ fn plan_in_profile(
         Ok(())
     };
     for entry in &invocation.lib_search {
+        // These inputs belong to the complete generated tree, not to Rust's
+        // crate-candidate inventory. The bounded remote validator above has
+        // already proved every native directory is within the exact OUT_DIR.
+        if mode == DependencyPlanningMode::CanonicalRemote && entry.starts_with("native=") {
+            continue;
+        }
         let path = entry
             .strip_prefix("dependency=")
             .ok_or_else(|| LiveRefusal::SearchPath(entry.clone()))?;
@@ -1040,10 +1061,11 @@ fn invocation_component(plan: &DependencyActionPlan) -> TypedDigest {
         virtual_invocation.out_dir = Some(CANONICAL_OUT_DIR.to_owned());
     }
     for entry in &mut virtual_invocation.lib_search {
-        let root = entry
-            .strip_prefix("dependency=")
-            .expect("planned dependency search");
-        *entry = format!("dependency={}", plan.virtual_dependency_path(root));
+        if let Some(root) = entry.strip_prefix("dependency=") {
+            *entry = format!("dependency={}", plan.virtual_dependency_path(root));
+        }
+        // Generated native searches preserve their exact canonical spelling
+        // and ordering. They are never projected onto a dependency/output root.
     }
     for (_, path) in &mut virtual_invocation.externs {
         if let Some(path) = path {
@@ -1266,6 +1288,11 @@ pub fn live_dependency_key(
             "canonical Cargo plans require their distinct dependency-key policy".into(),
         ));
     }
+    remote::validate_generated_native_inputs(
+        &plan.invocation,
+        plan.generated_root.as_deref(),
+        false,
+    )?;
     dependency_key(
         plan,
         toolchain,
