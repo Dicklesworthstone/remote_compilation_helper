@@ -387,6 +387,35 @@ execution retain their existing local path. `--rabs-require-daemon` guarantees
 matching daemon setup, not remote execution of every Cargo action. The original
 three-variable singleton configuration and its status fields remain supported.
 
+### Reuse uploaded sources and dependency archives
+
+Workers retain a digest-verified input cache across sessions and restarts by
+default. Its objects live in `source-files-v1` below the worker's existing
+private journal directory and have a 512 MiB aggregate allowance. Source files,
+generated inputs and Rust dependency archives share this cache; objects larger
+than 4 MiB are reusable too, up to the existing 512 MiB source-projection limit.
+Every hit is fully hashed into a private snapshot before populating a fresh
+execution receiver. Hashing and copying use 64 KiB buffers, and the final source
+seal remains required even when no file bytes need uploading.
+
+For a directly launched worker, `--source-cache-bytes N` overrides
+`RABS_WORKER_SOURCE_CACHE_BYTES`. Both accept 0–8589934592 bytes; `0` disables
+input reuse. For example:
+
+```sh
+rabs-wkr --coordinator 192.0.2.10:7092 --worker-id leaf-worker --source-cache-bytes 1073741824
+```
+
+`RABS_SOURCE_CACHE_DIR` optionally selects another existing absolute private
+directory instead of the journal directory. Reducing the allowance trims older
+retained objects when the next source upload seals. Cache corruption or eviction costs
+another upload; retained readers have independent snapshots, and execution
+never shares writable inodes with cached objects. Capacity bounds retained
+objects; transfer staging and one in-flight verification snapshot require
+additional temporary space. Lookup, copy and cache population use the original
+input deadline. This cache saves input transport; compilation, result
+publication and Cargo target-state policies retain their existing checks.
+
 ### Share a CPU budget between workers on the same host
 
 Separate worker processes can serve different coordinators or worker-pool slots

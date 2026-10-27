@@ -41,7 +41,7 @@ use rabs_wkr::session::{
     probe_capability, sample_pressure,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
-use rabs_wkr::source_transfer::{self, SourceOwner};
+use rabs_wkr::source_transfer::{self, SourceCache, SourceOwner};
 use rabs_wkr::toolchain_transfer::{self, ToolchainOwner, ToolchainReply, ToolchainTransferTask};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
@@ -501,6 +501,47 @@ fn target_cache_limit(
     ))
 }
 
+fn source_cache_limit(
+    argument: Option<&str>,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<u64, String> {
+    let (name, value) = match argument {
+        Some(value) => ("--source-cache-bytes", value),
+        None => match environment {
+            Some(value) => (
+                "RABS_WORKER_SOURCE_CACHE_BYTES",
+                value
+                    .to_str()
+                    .ok_or("RABS_WORKER_SOURCE_CACHE_BYTES must be ASCII decimal digits")?,
+            ),
+            None => return Ok(source_transfer::DEFAULT_SOURCE_CACHE_BYTES),
+        },
+    };
+    if !value.is_empty()
+        && value.len() <= 10
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(bytes) = value.parse::<u64>()
+        && bytes <= source_transfer::MAX_SOURCE_CACHE_BYTES
+    {
+        return Ok(bytes);
+    }
+    Err(format!(
+        "{name} requires 1..10 decimal digits representing 0 to 8589934592 bytes"
+    ))
+}
+
+fn prepare_source_cache(
+    journal_root: &std::path::Path,
+    directory: Option<&std::ffi::OsStr>,
+    bytes: u64,
+) -> io::Result<Option<SourceCache>> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let root = directory.map_or(journal_root, std::path::Path::new);
+    SourceCache::open(root, bytes).map(Some)
+}
+
 fn target_cache_epoch(
     argument: Option<&str>,
     environment: Option<&std::ffi::OsStr>,
@@ -560,10 +601,13 @@ fn main() {
         Some("--help") => {
             println!(
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
-                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
+                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--source-cache-bytes N] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Reconnects with bounded backoff after session loss; execution is never replayed.\n\
                  --once performs one session only, without reconnecting.\n\
+                 --source-cache-bytes or RABS_WORKER_SOURCE_CACHE_BYTES bounds verified input reuse (default 536870912; 0 disables).\n\
+                 Source bytes persist below the private worker state directory; RABS_SOURCE_CACHE_DIR selects another private directory.\n\
+                 Inputs are reverified and copied into a fresh receiver before every execution.\n\
                  --target-cache-bytes or RABS_WORKER_TARGET_CACHE_BYTES enables bounded private Cargo seeds (default 0/off).\n\
                  --target-cache-epoch or RABS_WORKER_TARGET_CACHE_EPOCH also retains seeds across restarts.\n\
                  Change the epoch before updating host tools, libraries or other runtime inputs.\n\
@@ -599,6 +643,7 @@ fn main() {
     let mut once = false;
     let mut target_cache_argument = None;
     let mut target_epoch_argument = None;
+    let mut source_cache_argument = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -609,15 +654,15 @@ fn main() {
                 }
             }
             "--once" => once = true,
-            "--target-cache-bytes" | "--target-cache-epoch" => {
+            "--target-cache-bytes" | "--target-cache-epoch" | "--source-cache-bytes" => {
                 let Some(value) = iter.next() else {
                     eprintln!("rabs-wkr: {arg} requires a value");
                     std::process::exit(2);
                 };
-                if arg == "--target-cache-bytes" {
-                    target_cache_argument = Some(value.as_str());
-                } else {
-                    target_epoch_argument = Some(value.as_str());
+                match arg.as_str() {
+                    "--target-cache-bytes" => target_cache_argument = Some(value.as_str()),
+                    "--target-cache-epoch" => target_epoch_argument = Some(value.as_str()),
+                    _ => source_cache_argument = Some(value.as_str()),
                 }
             }
             other => {
@@ -650,6 +695,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let source_cache_bytes = match source_cache_limit(
+        source_cache_argument,
+        std::env::var_os("RABS_WORKER_SOURCE_CACHE_BYTES").as_deref(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("rabs-wkr: {error}");
+            std::process::exit(2);
+        }
+    };
     let host_budget = match HostBudget::from_environment() {
         Ok(budget) => budget,
         Err(error) => {
@@ -666,6 +721,17 @@ fn main() {
         Err(error) => {
             eprintln!("rabs-wkr: durable ownership unavailable: {error}");
             std::process::exit(1);
+        }
+    };
+    let source_cache = match prepare_source_cache(
+        journal.storage_root(),
+        std::env::var_os("RABS_SOURCE_CACHE_DIR").as_deref(),
+        source_cache_bytes,
+    ) {
+        Ok(cache) => cache,
+        Err(error) => {
+            eprintln!("rabs-wkr: source cache configuration: {error}");
+            std::process::exit(2);
         }
     };
     let target_cache = if target_cache_bytes == 0 {
@@ -709,6 +775,7 @@ fn main() {
         reconnect::RuntimeResources {
             host_budget,
             target_cache,
+            source_cache,
         },
     ));
 }
@@ -1341,6 +1408,7 @@ where
         toolchain_reuse_enabled,
         dependency_mode,
         input_budgets,
+        None,
         launch,
         heartbeat,
     )
@@ -1366,6 +1434,7 @@ async fn drive_session_with_reader<S, L, H>(
     toolchain_reuse_enabled: bool,
     dependency_mode: Option<DependencySelection>,
     input_budgets: InputBudgets,
+    source_cache: Option<SourceCache>,
     mut launch: L,
     mut heartbeat: H,
 ) -> Result<(), String>
@@ -1400,13 +1469,11 @@ where
     let mut pending_output: Option<PendingOutput> = None;
     let mut last_output_ack: Option<OutputIdentity> = None;
     let mut artifact_transfer = ArtifactTransferState::default();
-    let mut source_transfer = if toolchain_transfer_enabled {
-        SourceTransferTask::with_input_budget(
-            rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET,
-        )
-    } else {
-        SourceTransferTask::default()
-    };
+    let mut source_transfer = SourceTransferTask::with_configuration(
+        toolchain_transfer_enabled
+            .then_some(rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET),
+        source_cache,
+    );
     let mut toolchain_transfer = ToolchainTransferTask::with_reuse(toolchain_reuse_enabled);
     let mut input_deadline = InputDeadline::new(input_budgets);
     let mut deferred = DeferredFrames::default();
@@ -2024,6 +2091,7 @@ async fn session_loop(
         reuse_toolchain,
         dependency_context,
         InputBudgets::default(),
+        resources.source_cache.clone(),
         |request, timeout, artifacts, source, toolchain, lease| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
@@ -2336,6 +2404,130 @@ mod tests {
     mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;
+
+    #[test]
+    fn source_cache_settings_enable_bounded_default_and_allow_explicit_disable() {
+        use std::ffi::OsStr;
+        assert_eq!(source_cache_limit(None, None).unwrap(), 512 * 1024 * 1024);
+        assert_eq!(
+            source_cache_limit(None, Some(OsStr::new("1073741824"))).unwrap(),
+            1 << 30
+        );
+        assert_eq!(
+            source_cache_limit(Some("0"), Some(OsStr::new("invalid"))).unwrap(),
+            0
+        );
+        assert_eq!(
+            source_cache_limit(Some("8589934592"), None).unwrap(),
+            source_transfer::MAX_SOURCE_CACHE_BYTES
+        );
+        for value in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1\n",
+            "1.5",
+            "8589934593",
+            "99999999999",
+        ] {
+            assert!(source_cache_limit(Some(value), None).is_err(), "{value:?}");
+            assert!(
+                source_cache_limit(None, Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let invalid = OsStr::from_bytes(b"\xff");
+            assert!(source_cache_limit(None, Some(invalid)).is_err());
+            assert_eq!(source_cache_limit(Some("0"), Some(invalid)).unwrap(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_cache_default_directory_reuses_across_sessions_and_disable_omits_it() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        fn exchange(task: &mut SourceTransferTask, frame: &serde_json::Value) -> serde_json::Value {
+            task.submit(frame, true, false).unwrap();
+            wait(poll_fn(|cx| task.poll_completion(cx)))
+                .unwrap()
+                .response
+                .unwrap()
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bytes = b"real source bytes";
+        let digest = Sha256::digest(bytes).into();
+        let manifest = rabs_sandbox::source_transfer::SourceManifest::new(vec![
+            rabs_sandbox::source_transfer::SourceFile {
+                path: "lib.rs".into(),
+                len: bytes.len() as u64,
+                sha256: digest,
+                executable: false,
+            },
+        ])
+        .unwrap();
+        let manifest = serde_json::json!({"manifest_sha256":source_transfer::hex(&manifest.digest()), "files":[{
+            "path":"lib.rs", "bytes":bytes.len(), "sha256":source_transfer::hex(&digest), "executable":false,
+        }]});
+        let begin = serde_json::json!({"kind":"source-begin", "request_id":41, "manifest":manifest, "allow_cached_files":true});
+        let seal = serde_json::json!({"kind":"source-seal", "request_id":41, "manifest_sha256":manifest["manifest_sha256"]});
+        let capacity = source_cache_limit(None, None).unwrap();
+        let mut cold = SourceTransferTask::with_configuration(
+            None,
+            prepare_source_cache(root.path(), None, capacity).unwrap(),
+        );
+        assert_eq!(
+            exchange(&mut cold, &begin)["missing_files"],
+            serde_json::json!(["lib.rs"])
+        );
+        exchange(
+            &mut cold,
+            &serde_json::json!({"kind":"source-chunk", "request_id":41,
+            "manifest_sha256":manifest["manifest_sha256"], "path":"lib.rs", "offset":0,
+            "data_hex":source_transfer::hex(bytes), "chunk_sha256":source_transfer::hex(&digest)}),
+        );
+        assert_eq!(exchange(&mut cold, &seal)["sealed"], true);
+        drop(cold);
+        assert!(root.path().join("source-files-v1").is_dir());
+
+        let mut warm = SourceTransferTask::with_configuration(
+            None,
+            prepare_source_cache(root.path(), None, capacity).unwrap(),
+        );
+        let reply = exchange(&mut warm, &begin);
+        assert_eq!(reply["missing_files"], serde_json::json!([]));
+        assert_eq!(reply["source_reused_bytes"], bytes.len());
+        assert_eq!(reply["sealed"], false);
+        assert_eq!(exchange(&mut warm, &seal)["sealed"], true);
+        drop(warm);
+
+        let mut disabled = SourceTransferTask::with_configuration(
+            None,
+            prepare_source_cache(root.path(), None, 0).unwrap(),
+        );
+        let reply = exchange(&mut disabled, &begin);
+        assert_eq!(reply["missing_files"], serde_json::json!(["lib.rs"]));
+        assert_eq!(reply["source_reused_bytes"], 0);
+        assert!(
+            prepare_source_cache(
+                root.path(),
+                Some(std::ffi::OsStr::new("relative")),
+                capacity
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_source_cache(root.path(), Some(std::ffi::OsStr::new("relative")), 0)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn target_cache_settings_default_to_off_and_cli_overrides_environment() {
@@ -3054,6 +3246,7 @@ mod tests {
                 false,
                 None,
                 InputBudgets::default(),
+                None,
                 |_, _, _, _, _, _| panic!("control frames must not launch execution"),
                 pressure,
             ))

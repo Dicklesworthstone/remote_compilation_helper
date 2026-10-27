@@ -10,7 +10,7 @@
 //! blocking kernel filesystem call: cleanup joins the worker rather than
 //! detaching it or exposing a late successful seal after cancellation.
 
-use crate::source_transfer::{SourceOwner, SourceTransferState};
+use crate::source_transfer::{SourceCache, SourceOwner, SourceTransferState};
 use serde_json::Value;
 use std::io;
 use std::sync::{Arc, Mutex, mpsc};
@@ -62,8 +62,17 @@ impl Default for SourceTransferTask {
 }
 
 impl SourceTransferTask {
-    pub fn with_input_budget(input_budget: std::time::Duration) -> Self {
-        Self::with_source(SourceTransferState::with_input_budget(input_budget))
+    /// The worker prepares this bounded cache once, outside the control reactor.
+    /// Every transfer still owns a fresh receiver and one fixed input deadline.
+    pub fn with_configuration(
+        input_budget: Option<std::time::Duration>,
+        cache: Option<SourceCache>,
+    ) -> Self {
+        let source = input_budget.map_or_else(
+            SourceTransferState::default,
+            SourceTransferState::with_input_budget,
+        );
+        Self::with_source(source.with_cache(cache))
     }
 
     fn with_source(source: SourceTransferState) -> Self {
