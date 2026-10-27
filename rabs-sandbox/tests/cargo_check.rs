@@ -7,7 +7,7 @@
 //! network. It does not qualify cache serving or namespace enforcement.
 #![cfg(target_os = "linux")]
 
-use CompilationCommand::{Build, Check};
+use CompilationCommand::{Build, Check, Test};
 use rabs_sandbox::cargo_check::{
     CompilationCommand, CompilationSelection, validate_compilation_unit_graph,
 };
@@ -146,6 +146,7 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             .env("HOME", self.owner.path().join("home"))
             .env("CARGO_HOME", self.owner.path().join("home/cargo"))
             .env("RUSTC", self.tools.join("bin/rustc"))
+            .env("RUSTDOC", self.tools.join("bin/rustdoc"))
             .env("CARGO_TARGET_DIR", self.owner.path().join("target"))
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_BUILD_JOBS", "1")
@@ -174,6 +175,15 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(graph["version"], 1);
         graph
+    }
+
+    fn test(&self, selection: &CompilationSelection) -> std::process::Output {
+        self.command()
+            .args(selection.cargo_arguments(Test).unwrap())
+            .args(["--offline", "--locked", "--message-format=json"])
+            .args(selection.runtime_arguments(Test).unwrap())
+            .output()
+            .unwrap()
     }
 
     fn assert_no_compilation_or_project_execution(&self) {
@@ -209,7 +219,7 @@ pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
 }
 
 #[test]
-fn real_cargo_unit_graph_admits_only_selected_pure_check_units() {
+fn real_cargo_unit_graph_distinguishes_pure_checks_from_selected_project_executors() {
     let fixture = Fixture::new();
     // Metadata contains both executable packages even though this library
     // check does not select either. A package-wide ban therefore rejects a
@@ -249,6 +259,7 @@ fn real_cargo_unit_graph_admits_only_selected_pure_check_units() {
         },
     );
     let admitted = validate_compilation_unit_graph(&default, Check).unwrap();
+    assert!(!admitted.requires_closed_dependency_execution());
     assert_eq!(
         (admitted.units, admitted.packages, admitted.roots),
         (2, 2, 1)
@@ -343,7 +354,11 @@ fn real_cargo_unit_graph_admits_only_selected_pure_check_units() {
             .iter()
             .any(|unit| unit["mode"] == "run-custom-build")
     );
-    assert!(validate_compilation_unit_graph(&script, Check).is_err());
+    assert!(
+        validate_compilation_unit_graph(&script, Check)
+            .unwrap()
+            .requires_closed_dependency_execution()
+    );
     let development = fixture.graph(
         Check,
         CompilationSelection {
@@ -358,7 +373,11 @@ fn real_cargo_unit_graph_admits_only_selected_pure_check_units() {
             .iter()
             .any(|unit| unit["target"]["kind"] == serde_json::json!(["proc-macro"]))
     );
-    assert!(validate_compilation_unit_graph(&development, Check).is_err());
+    assert!(
+        validate_compilation_unit_graph(&development, Check)
+            .unwrap()
+            .requires_closed_dependency_execution()
+    );
     fixture.assert_no_compilation_or_project_execution();
 }
 
@@ -438,7 +457,7 @@ fn real_cargo_graph_retains_each_compilation_target_and_named_profile() {
 }
 
 #[test]
-fn a_test_profile_does_not_bypass_selected_proc_macro_admission() {
+fn a_test_profile_cannot_hide_its_selected_proc_macro_execution_policy() {
     let fixture = Fixture::new();
     let pure = fixture.graph(
         Check,
@@ -448,7 +467,11 @@ fn a_test_profile_does_not_bypass_selected_proc_macro_admission() {
             ..CompilationSelection::default()
         },
     );
-    validate_compilation_unit_graph(&pure, Check).unwrap();
+    assert!(
+        !validate_compilation_unit_graph(&pure, Check)
+            .unwrap()
+            .requires_closed_dependency_execution()
+    );
     let development = fixture.graph(
         Check,
         CompilationSelection {
@@ -464,12 +487,16 @@ fn a_test_profile_does_not_bypass_selected_proc_macro_admission() {
             .iter()
             .any(|unit| unit["target"]["kind"] == serde_json::json!(["proc-macro"]))
     );
-    assert!(validate_compilation_unit_graph(&development, Check).is_err());
+    assert!(
+        validate_compilation_unit_graph(&development, Check)
+            .unwrap()
+            .requires_closed_dependency_execution()
+    );
     fixture.assert_no_compilation_or_project_execution();
 }
 
 #[test]
-fn one_unsafe_target_refuses_a_multi_target_check_before_any_project_execution() {
+fn one_project_executor_requires_closed_dependency_execution_for_a_multi_target_check() {
     let fixture = Fixture::new();
     let host = host_target(&fixture);
     // The executable dependency is selected only for WebAssembly. Querying
@@ -510,7 +537,11 @@ optional_script = { path = "optional-script" }
             ..CompilationSelection::default()
         },
     );
-    validate_compilation_unit_graph(&native, Check).unwrap();
+    assert!(
+        !validate_compilation_unit_graph(&native, Check)
+            .unwrap()
+            .requires_closed_dependency_execution()
+    );
     for targets in [
         vec!["wasm32-unknown-unknown".to_owned()],
         vec![host, "wasm32-unknown-unknown".to_owned()],
@@ -530,7 +561,11 @@ optional_script = { path = "optional-script" }
                 .iter()
                 .any(|unit| unit["mode"] == "run-custom-build")
         );
-        assert!(validate_compilation_unit_graph(&graph, Check).is_err());
+        assert!(
+            validate_compilation_unit_graph(&graph, Check)
+                .unwrap()
+                .requires_closed_dependency_execution()
+        );
     }
     fixture.assert_no_compilation_or_project_execution();
 }
@@ -654,7 +689,7 @@ fn unavailable_target_or_profile_never_falls_back_to_default_units() {
 }
 
 #[test]
-fn real_cargo_build_graph_admits_compile_only_targets_and_rejects_project_executors() {
+fn real_cargo_build_graph_admits_compile_only_targets_and_identifies_project_executors() {
     let fixture = Fixture::new();
     let library = fixture.graph(
         Build,
@@ -664,6 +699,7 @@ fn real_cargo_build_graph_admits_compile_only_targets_and_rejects_project_execut
         },
     );
     let admitted = validate_compilation_unit_graph(&library, Build).unwrap();
+    assert!(!admitted.requires_closed_dependency_execution());
     assert_eq!(
         (admitted.units, admitted.packages, admitted.roots),
         (2, 2, 1)
@@ -710,9 +746,134 @@ fn real_cargo_build_graph_admits_compile_only_targets_and_rejects_project_execut
         },
     ] {
         let graph = fixture.graph(Build, selection);
-        assert!(validate_compilation_unit_graph(&graph, Build).is_err());
+        assert!(
+            validate_compilation_unit_graph(&graph, Build)
+                .unwrap()
+                .requires_closed_dependency_execution()
+        );
     }
     fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
+fn real_compilation_consumes_generated_source_and_proc_macros_without_running_tests() {
+    for command in [Check, Build] {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.root().join("Cargo.toml"),
+            r#"
+[package]
+name = "selected_graph_app"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+members = ["ordinary"]
+exclude = ["optional-script", "dev-macro"]
+resolver = "2"
+[dependencies]
+ordinary = { path = "ordinary" }
+optional_script = { path = "optional-script" }
+dev_macro = { path = "dev-macro" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.root().join("ordinary/src/lib.rs"),
+            "pub const VALUE: u32 = 3;\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root().join("optional-script/build.rs"),
+            r#"
+fn main() {
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("generated.rs"), "pub const VALUE: u32 = 19;\n").unwrap();
+    println!("cargo::rerun-if-changed=build.rs");
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.root().join("optional-script/src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root().join("dev-macro/src/lib.rs"),
+            r#"
+extern crate proc_macro;
+#[proc_macro]
+pub fn value(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    eprintln!("RABS_GRAPH_PROC_MACRO_EXECUTED");
+    "23u32".parse().unwrap()
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.root().join("src/lib.rs"),
+            r#"
+pub const VALUE: u32 = ordinary::VALUE + optional_script::VALUE + dev_macro::value!();
+const _: [(); 45] = [(); VALUE as usize];
+#[test]
+fn compilation_must_not_run_this_test() {
+    std::fs::write("test-was-executed", b"unexpected").unwrap();
+    panic!("Cargo check/build must not run tests");
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.root().join("src/main.rs"),
+            "fn main() { std::fs::write(\"program-was-executed\", b\"unexpected\").unwrap(); }\n",
+        )
+        .unwrap();
+        let selection = CompilationSelection {
+            lib: true,
+            tests: true,
+            ..CompilationSelection::default()
+        };
+        let graph = fixture.graph(command, selection.clone());
+        let admitted = validate_compilation_unit_graph(&graph, command).unwrap();
+        assert!(admitted.requires_closed_dependency_execution());
+        fixture.assert_no_compilation_or_project_execution();
+
+        let compiled = fixture
+            .command()
+            .args(selection.cargo_arguments(command).unwrap())
+            .args(["--offline", "--locked", "--message-format=json"])
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{command:?}: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&compiled.stderr).contains("RABS_GRAPH_PROC_MACRO_EXECUTED")
+        );
+        let messages: Vec<Value> = String::from_utf8(compiled.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let generated = messages
+            .iter()
+            .find(|event| event["reason"] == "build-script-executed")
+            .expect("the selected build script must actually run");
+        let output = Path::new(generated["out_dir"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(output.join("generated.rs")).unwrap(),
+            "pub const VALUE: u32 = 19;\n"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|event| event["reason"] == "build-finished" && event["success"] == true)
+        );
+        assert!(!fixture.root().join("test-was-executed").exists());
+        assert!(!fixture.root().join("program-was-executed").exists());
+    }
 }
 
 #[test]
@@ -894,4 +1055,186 @@ fn native_build_compiles_test_harnesses_without_executing_the_tests() {
         fs::read(fixture.root().join("test-was-executed")).unwrap(),
         b"ran"
     );
+}
+
+#[test]
+fn real_cargo_test_graph_distinguishes_doctests_and_no_run_without_execution() {
+    let fixture = Fixture::new();
+    let selection = CompilationSelection {
+        packages: vec!["ordinary".into()],
+        ..CompilationSelection::default()
+    };
+    let default =
+        validate_compilation_unit_graph(&fixture.graph(Test, selection.clone()), Test).unwrap();
+    assert!(default.requires_closed_dependency_execution());
+    assert!(default.contains_doctests());
+    let no_run = validate_compilation_unit_graph(
+        &fixture.graph(
+            Test,
+            CompilationSelection {
+                no_run: true,
+                ..selection.clone()
+            },
+        ),
+        Test,
+    )
+    .unwrap();
+    assert!(no_run.requires_closed_dependency_execution());
+    // Cargo emits the same units for --no-run, including doctests it will not
+    // execute. Runtime authority must follow the bound command selection, not
+    // an inference that missing graph nodes prove compilation-only behavior.
+    assert_eq!(no_run, default);
+    let docs = validate_compilation_unit_graph(
+        &fixture.graph(
+            Test,
+            CompilationSelection {
+                doc: true,
+                ..selection
+            },
+        ),
+        Test,
+    )
+    .unwrap();
+    assert!(docs.requires_closed_dependency_execution());
+    assert!(docs.contains_doctests());
+    fixture.assert_no_compilation_or_project_execution();
+}
+
+#[test]
+fn native_cargo_test_no_run_filters_repeat_execution_and_preserves_failure() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root().join("ordinary/src/lib.rs"),
+        r#"
+pub const VALUE: u32 = 23;
+#[test]
+fn selected_success() {
+    let marker = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
+        .join("unit-test-runs");
+    let mut runs = std::fs::read(&marker).unwrap_or_default();
+    runs.push(b'u');
+    std::fs::write(marker, runs).unwrap();
+    println!("selected-test-stdout");
+    assert_eq!(VALUE, 23);
+}
+#[test]
+#[ignore]
+fn selected_failure() {
+    panic!("selected-test-failure");
+}
+"#,
+    )
+    .unwrap();
+    let mut selection = CompilationSelection {
+        packages: vec!["ordinary".into()],
+        lib: true,
+        no_run: true,
+        ..CompilationSelection::default()
+    };
+    let graph =
+        validate_compilation_unit_graph(&fixture.graph(Test, selection.clone()), Test).unwrap();
+    assert!(graph.requires_closed_dependency_execution());
+    assert!(!graph.contains_doctests());
+    let compiled = fixture.test(&selection);
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&compiled.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|message| message["reason"] == "compiler-artifact"
+                && message["profile"]["test"] == true
+                && message["executable"]
+                    .as_str()
+                    .is_some_and(|path| fs::metadata(path).is_ok_and(|meta| meta.len() > 0)))
+    );
+    let marker = fixture.owner.path().join("target/unit-test-runs");
+    assert!(!marker.exists(), "cargo test --no-run executed its harness");
+
+    selection.no_run = false;
+    selection.test_filter = Some("selected_success".into());
+    selection.test_args = vec!["--exact".into(), "--nocapture".into()];
+    for runs in [b"u".as_slice(), b"uu".as_slice()] {
+        let executed = fixture.test(&selection);
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        let stdout = String::from_utf8(executed.stdout).unwrap();
+        assert!(stdout.contains("selected-test-stdout"));
+        assert!(!stdout.contains("selected-test-failure"));
+        assert_eq!(fs::read(&marker).unwrap(), runs);
+        assert!(
+            stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|message| message["reason"] == "compiler-artifact"
+                    && message["target"]["name"] == "ordinary"
+                    && message["fresh"] == true),
+            "the test must execute even when Cargo reuses its compiled harness"
+        );
+    }
+    selection.test_filter = Some("selected_failure".into());
+    selection.test_args.push("--ignored".into());
+    let failed = fixture.test(&selection);
+    assert_eq!(failed.status.code(), Some(101));
+    assert!(
+        String::from_utf8_lossy(&failed.stdout).contains("selected-test-failure")
+            || String::from_utf8_lossy(&failed.stderr).contains("selected-test-failure")
+    );
+    assert_eq!(fs::read(marker).unwrap(), b"uu");
+}
+
+#[test]
+fn native_cargo_doctests_execute_again_on_fresh_builds_and_return_test_failure() {
+    let fixture = Fixture::new();
+    let source = fixture.root().join("ordinary/src/lib.rs");
+    fs::write(
+        &source,
+        r#"
+/// ```
+/// let marker = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
+///     .join("doctest-runs");
+/// let mut runs = std::fs::read(&marker).unwrap_or_default();
+/// runs.push(b'd');
+/// std::fs::write(marker, runs).unwrap();
+/// assert_eq!(ordinary::answer(), 23);
+/// ```
+pub fn answer() -> u32 { 23 }
+"#,
+    )
+    .unwrap();
+    let selection = CompilationSelection {
+        packages: vec!["ordinary".into()],
+        doc: true,
+        ..CompilationSelection::default()
+    };
+    let graph =
+        validate_compilation_unit_graph(&fixture.graph(Test, selection.clone()), Test).unwrap();
+    assert!(graph.requires_closed_dependency_execution());
+    assert!(graph.contains_doctests());
+    let marker = fixture.owner.path().join("target/doctest-runs");
+    for runs in [b"d".as_slice(), b"dd".as_slice()] {
+        let executed = fixture.test(&selection);
+        assert!(
+            executed.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&executed.stdout),
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(fs::read(&marker).unwrap(), runs);
+    }
+    fs::write(
+        source,
+        "/// ```\n/// assert_eq!(ordinary::answer(), 99);\n/// ```\npub fn answer() -> u32 { 23 }\n",
+    )
+    .unwrap();
+    let failed = fixture.test(&selection);
+    assert_eq!(failed.status.code(), Some(101));
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("test result: FAILED"));
+    assert_eq!(fs::read(marker).unwrap(), b"dd");
 }

@@ -36,8 +36,10 @@ use rabs_sandbox::dependency_context::{
 };
 use rabs_sandbox::loader_directories::{LoaderDirectoryWitness, observe_loader_directories};
 use rabs_sandbox::runtime_cohort::observe_runtime_cohort;
+#[cfg(test)]
+use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
-    PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain,
+    PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain_with_cloner,
 };
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
@@ -548,7 +550,7 @@ impl RemoteDependencies {
             })
             .collect();
         let context = if plan.canonical_cargo {
-            DependencyExecContext::new_canonical_cargo(
+            DependencyExecContext::new_canonical_cargo_with_generated(
                 execution_mode(plan)?,
                 plan.source_root.clone(),
                 plan.cwd.clone(),
@@ -556,6 +558,7 @@ impl RemoteDependencies {
                 plan.dependency_dirs.clone(),
                 empty_loader,
                 artifact_roots,
+                plan.generated_root.clone(),
                 plan.execution_env.clone(),
                 runtime_bytes,
             )
@@ -631,12 +634,13 @@ impl RemoteDependencies {
                     capture_guard.verify_unchanged(&capture_compiler)?;
                     let directory =
                         toolchain_staging_directory(&state).map_err(|error| error.to_string())?;
-                    let image = capture_toolchain(
+                    let image = capture_toolchain_with_cloner(
                         capture_guard.sysroot(),
                         &directory.path().join("tree"),
                         None,
                         &ToolchainLimits::default(),
                         || stopped.load(Ordering::Acquire),
+                        rabs_cas::materialization::try_verified_reflink,
                     )
                     .map_err(|error| format!("capture complete original toolchain: {error}"))?;
                     capture_guard.verify_unchanged(&capture_compiler)?;
@@ -1073,8 +1077,12 @@ fn dependency_execution_request(
     let grant = dependency_execution_grant(plan, argv)?;
     if context.execution_mode() != execution_mode(plan)?
         || context.canonical_cargo() != plan.canonical_cargo
+        || context.generated_root() != plan.generated_root.as_deref()
     {
-        return Err("worker context does not enforce this dependency output class".into());
+        return Err(
+            "worker context does not enforce this dependency output and generated-input contract"
+                .into(),
+        );
     }
     Ok(json!({
         "kind":"canonical-exec", "request_id":request_id,
@@ -2055,6 +2063,10 @@ mod execution_resource_tests {
         }
 
         fn canonical_with_outputs(emit: &str) -> Self {
+            Self::canonical_with_generated(emit, None)
+        }
+
+        fn canonical_with_generated(emit: &str, generated_root: Option<&str>) -> Self {
             let package = "/__rabs/cargo-home/registry/src/index/parallel-1.0.0";
             let output = "/__rabs/out/cargo/debug/deps";
             let argv = vec![
@@ -2070,7 +2082,7 @@ mod execution_resource_tests {
                 "-L".into(),
                 format!("dependency={output}"),
             ];
-            let env = vec![
+            let mut env = vec![
                 ("HOME".into(), "/__rabs/home".into()),
                 ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
                 ("CARGO_MANIFEST_DIR".into(), package.into()),
@@ -2080,6 +2092,9 @@ mod execution_resource_tests {
                     format!("{output}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
                 ),
             ];
+            if let Some(root) = generated_root {
+                env.push(("OUT_DIR".into(), root.into()));
+            }
             let plan = rabs_key::live_dependency::plan_canonical_remote_dependency_action(
                 LiveRustcRequest {
                     argv: &argv,
@@ -2090,7 +2105,7 @@ mod execution_resource_tests {
                 None,
             )
             .unwrap();
-            let context = DependencyExecContext::new_canonical_cargo(
+            let context = DependencyExecContext::new_canonical_cargo_with_generated(
                 execution_mode(&plan).unwrap(),
                 plan.source_root.clone(),
                 plan.cwd.clone(),
@@ -2098,6 +2113,7 @@ mod execution_resource_tests {
                 plan.dependency_dirs.clone(),
                 remote_empty_loader_directories(&plan, "/__rabs/toolchain").unwrap(),
                 Vec::new(),
+                plan.generated_root.clone(),
                 plan.execution_env.clone(),
                 [0x11; 32],
             )
@@ -2180,6 +2196,36 @@ mod execution_resource_tests {
                 fixture.request().is_err(),
                 "metadata namespace must not authorize archive codegen"
             );
+        }
+    }
+
+    #[test]
+    fn canonical_generated_request_retains_exact_input_binding_in_both_output_modes() {
+        let root = "/__rabs/out/cargo/debug/build/parallel-123/out";
+        for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
+            let mut fixture = Fixture::canonical_with_generated(emit, Some(root));
+            let request = fixture.request().unwrap();
+            assert_eq!(request["dependency_context"]["generated_root"], root);
+            assert_eq!(
+                request["dependency_context"]["version"],
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION
+            );
+            assert_eq!(request["args"], json!(fixture.argv[1..]));
+            assert_eq!(
+                request["dependency_context"]["env"],
+                json!(fixture.plan.execution_env)
+            );
+
+            // Neither a context without a generated mount nor a context for
+            // another completed Cargo run may execute this keyed invocation.
+            fixture.context = Fixture::canonical_with_outputs(emit).context;
+            assert!(fixture.request().is_err());
+            fixture.context = Fixture::canonical_with_generated(
+                emit,
+                Some("/__rabs/out/cargo/debug/build/parallel-456/out"),
+            )
+            .context;
+            assert!(fixture.request().is_err());
         }
     }
 

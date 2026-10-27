@@ -155,6 +155,89 @@ fn canonical_archive_request(separate_metadata: bool) -> Value {
     request
 }
 
+fn canonical_generated_request(archive: bool, populated: bool) -> Value {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    let mut request = if archive {
+        canonical_archive_request(true)
+    } else {
+        canonical_dependency_request()
+    };
+    let generated = "/__rabs/out/cargo/debug/build/leaf-hash/out";
+    request["dependency_context"]["generated_root"] = json!(generated);
+    request["dependency_context"]["loader_dirs"] = json!(["/__rabs/out/cargo/debug"]);
+    request["dependency_context"]["env"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!(["OUT_DIR", generated]),
+            json!([
+                "LD_LIBRARY_PATH",
+                "/__rabs/out/cargo/debug:/__rabs/toolchain/lib"
+            ]),
+        ]);
+    if populated {
+        let manifest = SourceManifest::new(vec![
+            SourceFile {
+                path: "package/src/lib.rs".into(),
+                len: 1,
+                sha256: [1; 32],
+                executable: false,
+            },
+            SourceFile {
+                path: "generated/nested/input.rs".into(),
+                len: 1,
+                sha256: [2; 32],
+                executable: false,
+            },
+        ])
+        .unwrap();
+        request["source_manifest"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "path":"generated/nested/input.rs", "bytes":1,
+                "sha256":"02".repeat(32), "executable":false,
+            }));
+        request["source_manifest"]["manifest_sha256"] =
+            json!(rabs_wkr::source_transfer::hex(&manifest.digest()));
+    }
+    request
+}
+
+#[test]
+fn canonical_generated_context_decodes_empty_and_populated_trees_in_both_modes() {
+    for archive in [false, true] {
+        for populated in [false, true] {
+            let wire = canonical_generated_request(archive, populated);
+            let original = wire.clone();
+            let parsed = parse_exec_request(&wire).unwrap();
+            let context = parsed.dependency_context.unwrap();
+            assert_eq!(context.version(), "canonical-dependency-exec-v3");
+            assert!(context.canonical_cargo());
+            assert_eq!(
+                context.execution_mode(),
+                if archive {
+                    DependencyExecutionMode::Rlib
+                } else {
+                    DependencyExecutionMode::Metadata
+                }
+            );
+            assert_eq!(
+                context.generated_root(),
+                Some("/__rabs/out/cargo/debug/build/leaf-hash/out")
+            );
+            assert!(context.env().contains(&(
+                "OUT_DIR".into(),
+                "/__rabs/out/cargo/debug/build/leaf-hash/out".into()
+            )));
+            assert_eq!(
+                wire, original,
+                "decoder changed the retained input contract"
+            );
+        }
+    }
+}
+
 #[test]
 fn canonical_archive_decode_preserves_mode_paths_and_complete_output_contract() {
     for separate_metadata in [false, true] {
@@ -177,6 +260,7 @@ fn canonical_archive_decode_preserves_mode_paths_and_complete_output_contract() 
         }
         for (field, value) in [
             ("version", json!("canonical-dependency-exec-v1")),
+            ("version", json!("canonical-dependency-exec-v2")),
             ("version", json!(DEPENDENCY_CONTEXT_VERSION)),
             ("execution_mode", json!("metadata")),
             ("generated_root", json!("/__rabs/out/cargo/debug/generated")),
@@ -185,6 +269,88 @@ fn canonical_archive_decode_preserves_mode_paths_and_complete_output_contract() 
             request["dependency_context"][field] = value;
             assert!(parse_exec_request(&request).is_err(), "{field}");
         }
+    }
+}
+
+#[test]
+fn canonical_generated_dependency_decode_requires_v3_and_exact_owned_out_dir() {
+    let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+    for mut request in [
+        canonical_dependency_request(),
+        canonical_archive_request(true),
+    ] {
+        request["dependency_context"]["generated_root"] = json!(generated);
+        request["dependency_context"]["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(["OUT_DIR", generated]));
+        let original = request.clone();
+        let parsed = parse_exec_request(&request).unwrap();
+        let context = parsed.dependency_context.unwrap();
+        assert_eq!(context.version(), "canonical-dependency-exec-v3");
+        assert_eq!(context.generated_root(), Some(generated));
+        assert!(
+            context
+                .env()
+                .contains(&("OUT_DIR".into(), generated.into()))
+        );
+        assert_eq!(request, original, "decoding changed exact request identity");
+
+        for version in [
+            "canonical-dependency-exec-v1",
+            "canonical-dependency-exec-v2",
+            DEPENDENCY_CONTEXT_VERSION,
+        ] {
+            let mut obsolete = request.clone();
+            obsolete["dependency_context"]["version"] = json!(version);
+            assert!(parse_exec_request(&obsolete).is_err(), "{version}");
+        }
+        for root in [
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug",
+            "/__rabs/out/cargo/debug/deps",
+            "/__rabs/out/cargo/debug/deps/generated",
+            "/__rabs/out/cargo/debug/build/../out",
+            "/__rabs/out/cargo-other/generated",
+            "/__rabs/workspace/generated",
+            "/__rabs/cargo-home/generated",
+            "/__rabs/cargo-home/registry/src/pinned/leaf-1.0.0/generated",
+            "/__rabs/toolchain/generated",
+            "/__rabs/home/control",
+            "/usr/generated",
+        ] {
+            let mut invalid = request.clone();
+            invalid["dependency_context"]["generated_root"] = json!(root);
+            *invalid["dependency_context"]["env"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap() = json!(["OUT_DIR", root]);
+            assert!(parse_exec_request(&invalid).is_err(), "{root}");
+        }
+        for value in ["", "/__rabs/out/cargo/another-out"] {
+            let mut mismatched = request.clone();
+            *mismatched["dependency_context"]["env"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap() = json!(["OUT_DIR", value]);
+            assert!(parse_exec_request(&mismatched).is_err());
+        }
+        let mut missing_root = request.clone();
+        missing_root["dependency_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generated_root");
+        assert!(parse_exec_request(&missing_root).is_err());
+        let mut missing_environment = request.clone();
+        missing_environment["dependency_context"]["env"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(parse_exec_request(&missing_environment).is_err());
+        request["dependency_context"]["generated_root"] = Value::Null;
+        assert!(parse_exec_request(&request).is_err());
     }
 }
 
@@ -753,6 +919,7 @@ fn dependency_context_requires_exact_negotiation_and_complete_authenticated_tran
         json!("dependency-exec-v6"),
         json!("dependency-exec-v999"),
         json!("canonical-dependency-exec-v1"),
+        json!("canonical-dependency-exec-v2"),
     ] {
         assert!(
             dependency_context_selection(
@@ -874,6 +1041,25 @@ fn canonical_dependency_negotiation_binds_version_as_well_as_mode() {
     .unwrap();
     assert_eq!(selected.version, CANONICAL_DEPENDENCY_CONTEXT_VERSION);
     assert_eq!(selected.mode, DependencyExecutionMode::Metadata);
+    for previous in [
+        "canonical-dependency-exec-v1",
+        "canonical-dependency-exec-v2",
+    ] {
+        let mut old = grant.clone();
+        old["dependency_context"] = json!(previous);
+        assert!(
+            dependency_context_selection(
+                &old.to_string(),
+                &[DependencyExecutionMode::Metadata],
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+            .is_err()
+        );
+    }
     for flags in [
         [false, true, true, true, true],
         [true, false, true, true, true],

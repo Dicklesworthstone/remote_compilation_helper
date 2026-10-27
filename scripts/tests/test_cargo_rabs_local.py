@@ -31,7 +31,7 @@ assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-compile-local", sys.ar
 path = pathlib.Path(sys.argv[2])
 profile = json.loads(path.read_bytes())
 assert profile["version"] == "canonical-compile-local-v1"
-assert profile["command"] in ("check", "build")
+assert profile["command"] in ("check", "build", "test")
 assert "selection" in profile
 record = {"pid":os.getpid(), "argv":sys.argv, "profile":profile,
           "retained":str(path), "file_mode":stat.S_IMODE(path.stat().st_mode),
@@ -149,8 +149,11 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertNotIn("AMBIENT_INPUT", retained.read_text())
 
     def test_default_check_replaces_saved_selection_with_cargo_defaults(self):
-        self.profile["command"] = "build"
-        self.profile["selection"] = {"lib": True, "features": ["from-profile"]}
+        self.profile["command"] = "test"
+        self.profile["selection"] = {
+            "lib": True, "features": ["from-profile"], "no_run": True,
+            "test_filter": "saved-filter", "test_args": ["--nocapture"],
+        }
         self.save()
         for args in ([], ["check"]):
             status, _, stderr, _ = self.invoke(args)
@@ -159,6 +162,34 @@ class CanonicalLocalCargo(unittest.TestCase):
             self.assertEqual(self.records()[-1]["profile"]["selection"], {})
         self.assertEqual(len(list(self.operations.iterdir())), 2)
         self.assertNotEqual(self.records()[0]["retained"], self.records()[1]["retained"])
+
+    def test_private_target_configuration_survives_exact_native_handoff(self):
+        for cache in ({"runtime_epoch": "host-image-2026.10"},
+                      {"runtime_epoch": "image_v2", "max_bytes": 1024 ** 3},
+                      {"runtime_epoch": "a" * 256, "max_bytes": 8 * 1024 ** 3}):
+            with self.subTest(cache=cache):
+                self.profile["target_cache"] = cache
+                self.save()
+                status, _, stderr, _ = self.invoke(["build", "--features=fast"])
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                retained = self.records()[-1]["profile"]
+                self.assertEqual(retained["target_cache"], cache)
+                self.assertEqual(retained["selection"], {"features": ["fast"]})
+
+    def test_private_target_configuration_is_bounded_before_native_handoff(self):
+        for cache in (True, "enabled", {}, {"runtime_epoch": ""},
+                      {"runtime_epoch": "a" * 257}, {"runtime_epoch": "host/image"},
+                      {"runtime_epoch": "host\nimage"}, {"runtime_epoch": "höst"},
+                      {"runtime_epoch": None}, {"runtime_epoch": True},
+                      {"runtime_epoch": "v1", "root": "/other"},
+                      {"runtime_epoch": "v1", "max_bytes": True},
+                      {"runtime_epoch": "v1", "max_bytes": 0},
+                      {"runtime_epoch": "v1", "max_bytes": 8 * 1024 ** 3 + 1},
+                      {"runtime_epoch": "v1", "max_bytes": "1024"}):
+            with self.subTest(cache=cache):
+                self.profile["target_cache"] = cache
+                self.save()
+                self.assert_refused(["check"])
 
     def test_build_selectors_and_compile_only_harnesses_reach_the_native_driver_once(self):
         self.profile["command"] = "check"
@@ -183,6 +214,64 @@ class CanonicalLocalCargo(unittest.TestCase):
                 self.assertEqual(self.profile_path.read_bytes(), original)
         self.assertEqual(len(self.records()), 3)
         self.assertEqual(len(list(self.operations.iterdir())), 3)
+
+    def test_test_selectors_filters_and_literal_harness_tail_reach_native_driver_once(self):
+        self.profile["command"] = "build"
+        self.profile["selection"] = {"lib": True, "features": ["from-profile"]}
+        self.save()
+        original = self.profile_path.read_bytes()
+        cases = (
+            (["test"], {}),
+            (["test", "--workspace", "--no-run", "--test=roundtrip", "--target=host-tuple"],
+             {"workspace": True, "no_run": True, "test": ["roundtrip"], "target": ["host-tuple"]}),
+            (["test", "--package=core", "--doc", "--no-fail-fast", "smoke::雪", "--", "--nocapture", "--test-threads=1"],
+             {"packages": ["core"], "doc": True, "no_fail_fast": True,
+              "test_filter": "smoke::雪", "test_args": ["--nocapture", "--test-threads=1"]}),
+            (["test", "selected test", "--lib", "--features=fast", "--", "--exact", "--ignored"],
+             {"test_filter": "selected test", "lib": True, "features": ["fast"],
+              "test_args": ["--exact", "--ignored"]}),
+            (["test", "--", "--manifest-path=/not-cargo", "--unit-graph", "--config=not-cargo", ""],
+             {"test_args": ["--manifest-path=/not-cargo", "--unit-graph", "--config=not-cargo", ""]}),
+            (["test", "", "--"], {"test_filter": ""}),
+        )
+        for args, expected in cases:
+            with self.subTest(args=args):
+                status, _, stderr, pid = self.invoke(args)
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                record = self.records()[-1]
+                self.assertEqual(record["pid"], pid)
+                self.assertEqual(record["profile"], dict(self.profile, command="test", selection=expected))
+                self.assertEqual(record["argv"], [str(self.driver), "--canonical-compile-local", record["retained"]])
+                self.assertTrue(Path(record["retained"]).parent.name.startswith("test-"))
+                self.assertEqual(self.profile_path.read_bytes(), original)
+        self.assertEqual(len(self.records()), len(cases))
+        self.assertEqual(len(list(self.operations.iterdir())), len(cases))
+
+    def test_saved_test_selection_is_validated_then_replaced_by_explicit_command(self):
+        self.profile["command"] = "test"
+        self.profile["selection"] = {
+            "doc": True, "no_fail_fast": True, "packages": ["saved-package"],
+            "test_filter": "saved-filter", "test_args": ["--nocapture"],
+        }
+        self.save()
+        original = self.profile_path.read_bytes()
+        for args, command, selection in (
+            (["test", "--no-run", "--lib"], "test", {"no_run": True, "lib": True}),
+            (["test", "--", "--list"], "test", {"test_args": ["--list"]}),
+            (["build", "--tests"], "build", {"tests": True}),
+        ):
+            with self.subTest(args=args):
+                status, _, stderr, _ = self.invoke(args)
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                record = self.records()[-1]
+                self.assertEqual(record["profile"]["command"], command)
+                self.assertEqual(record["profile"]["selection"], selection)
+                self.assertEqual(self.profile_path.read_bytes(), original)
+        self.profile["selection"] = {"test_filter": None, "test_args": [], "no_run": False}
+        self.save()
+        status, _, stderr, _ = self.invoke(["test"])
+        self.assertEqual(status, 0, stderr.decode(errors="replace"))
+        self.assertEqual(self.records()[-1]["profile"]["selection"], {})
 
     def test_named_packages_features_and_targets_reach_the_retained_native_profile(self):
         args = ["check", "--workspace", "--exclude=integration-*", "-p", "core@1.0.0",
@@ -265,7 +354,7 @@ class CanonicalLocalCargo(unittest.TestCase):
 
     def test_commands_authority_options_and_missing_values_refuse_before_handoff(self):
         rejected = [
-            ["test"], ["run"], ["bench"], ["doc"], ["clippy"], ["+nightly", "check"],
+            ["run"], ["bench"], ["doc"], ["clippy"], ["+nightly", "check"],
             ["check", "--config", "build.rustc=other"], ["check", "--config=other"],
             ["check", "--target-dir=/other"], ["check", "--manifest-path", "other/Cargo.toml"],
             ["check", "--message-format=json"], ["check", "-Zunstable-options"],
@@ -292,6 +381,48 @@ class CanonicalLocalCargo(unittest.TestCase):
         ):
             with self.subTest(args=args):
                 self.assert_refused(args)
+
+    def test_test_controls_cannot_override_cargo_authority_or_change_other_commands(self):
+        for args in (
+            ["test", "--config=other"], ["test", "--target-dir=/other"],
+            ["test", "--manifest-path", "other/Cargo.toml"], ["test", "--message-format=json"],
+            ["test", "--out-dir=/other"], ["test", "--artifact-dir=/other"],
+            ["test", "--jobs=2"], ["test", "-Zunstable-options"],
+            ["test", "--unit-graph"], ["test", "--run"],
+            ["test", "one-filter", "another-filter"], ["test", "--no-run=true"],
+            ["test", "--doc=true"], ["test", "--no-fail-fast=false"],
+            ["test", "--profile=dev", "--release"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(args)
+        for command in ("check", "build"):
+            for option in ("--doc", "--no-run", "--no-fail-fast"):
+                with self.subTest(command=command, option=option):
+                    self.assert_refused([command, option])
+            self.assert_refused([command, "--", "--nocapture"])
+
+    def test_test_filter_and_harness_values_share_native_bounds_and_reject_controls(self):
+        exact = ["test", "--"] + ["--nocapture"] * 128
+        self.assertEqual(len(launcher.canonical_local_selection(exact)["test_args"]), 128)
+        self.assert_refused(exact + ["one-more"])
+        self.assert_refused(["test", "filter", "--"] + ["--nocapture"] * 128)
+        mixed = ["test", "--package=app", "filter", "--"] + ["--nocapture"] * 126
+        self.assertEqual(len(launcher.canonical_local_selection(mixed)["test_args"]), 126)
+        self.assert_refused(mixed + ["one-more"])
+        for value in ("a" * 1025, "雪" * 342, "bad\nvalue", "bad\rvalue", "bad\u0085value"):
+            with self.subTest(value=value):
+                self.assert_refused(["test", value])
+                self.assert_refused(["test", "--", value])
+        for args in (["test", "bad\0filter"], ["test", "--", "bad\0argument"]):
+            with self.subTest(args=args):
+                with self.assertRaises(launcher.SetupError):
+                    launcher.canonical_local_selection(args)
+        self.assertEqual(launcher.canonical_local_selection(["test", "a" * 1024])["test_filter"], "a" * 1024)
+        self.assertEqual(launcher.canonical_local_selection(["test", "--", "雪" * 341])["test_args"], ["雪" * 341])
+        self.assert_refused(["test", "--"] + ["a" * 1024] * 16)
+        near = ["test"] + [item for _ in range(15) for item in ("--features", "a" * 1000)]
+        self.assertEqual(len(launcher.canonical_local_selection(near + ["--", "a" * 1000])["test_args"]), 1)
+        self.assert_refused(near + ["filter", "--", "a" * 1000, "a" * 1000])
 
     def test_target_specs_profile_paths_conflicts_and_duplicate_profiles_refuse_before_handoff(self):
         for option in ("--target", "--profile"):
@@ -340,7 +471,7 @@ class CanonicalLocalCargo(unittest.TestCase):
         for change in (
             {"version": "canonical-cargo-v1"}, {"version": "canonical-check-local-v1"},
             {"env": {"RABS_SOCKET_PATH": "/other"}},
-            {"command": "test"}, {"command": "run"}, {"command": "build --config=other"},
+            {"command": "run"}, {"command": "build --config=other"},
             {"command": None}, {"command": True}, {"command": ["build"]},
             {"command": {"build": True}}, {"command": "Build"},
             {"jobs": True}, {"timeout_seconds": 7201}, {"manifest": "../Cargo.toml"},
@@ -365,6 +496,30 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.save()
         self.profile_path.write_text(self.profile_path.read_text()[:-1] + ',"version":"canonical-compile-local-v1"}')
         self.assert_refused(["check"])
+
+    def test_invalid_saved_test_fields_refuse_before_retaining_native_intent(self):
+        original = dict(self.profile)
+        for selection in (
+            {"doc": "true"}, {"no_run": 1}, {"no_fail_fast": None},
+            {"test_filter": ["filter"]}, {"test_filter": True},
+            {"test_filter": "invalid\nfilter"}, {"test_filter": "bad\0filter"},
+            {"test_args": "--nocapture"}, {"test_args": None}, {"test_args": [True]},
+            {"test_args": ["bad\u0085argument"]}, {"test_args": ["bad\0argument"]},
+            {"test_args": ["a" * 1025]}, {"test_args": ["--nocapture"] * 129},
+            {"test_filter": "filter", "test_args": ["--nocapture"] * 128},
+            {"runtime_args": ["--nocapture"]},
+        ):
+            with self.subTest(selection=selection):
+                self.profile = dict(original, command="test", selection=selection)
+                self.save()
+                self.assert_refused(["test"])
+        for command in ("check", "build"):
+            for selection in ({"doc": True}, {"no_run": True}, {"no_fail_fast": True},
+                              {"test_filter": "filter"}, {"test_args": ["--nocapture"]}):
+                with self.subTest(command=command, selection=selection):
+                    self.profile = dict(original, command=command, selection=selection)
+                    self.save()
+                    self.assert_refused(["test"])
 
     def test_unsafe_storage_overlap_and_symlink_profiles_refuse_before_writes(self):
         self.operations.chmod(0o755)
@@ -391,12 +546,12 @@ class CanonicalLocalCargo(unittest.TestCase):
                 launcher.canonical_local_invocation(str(self.profile_path), ["check"], self.env)
 
     def test_native_failure_is_returned_once_without_fallback(self):
-        for command in ("check", "build"):
+        for command in ("check", "build", "test"):
             status, _, stderr, _ = self.invoke([command], dict(self.env, TEST_EXIT="101"))
             self.assertEqual(status, 101, stderr.decode(errors="replace"))
-        self.assertEqual(len(self.records()), 2)
-        self.assertEqual(len(list(self.operations.iterdir())), 2)
-        self.assertEqual([record["profile"]["command"] for record in self.records()], ["check", "build"])
+        self.assertEqual(len(self.records()), 3)
+        self.assertEqual(len(list(self.operations.iterdir())), 3)
+        self.assertEqual([record["profile"]["command"] for record in self.records()], ["check", "build", "test"])
 
     def test_missing_driver_and_recursive_driver_refuse_before_creating_intent(self):
         self.assert_refused(["check"], dict(self.env, CARGO_RABS_DAEMON=str(self.root / "missing")))
@@ -419,6 +574,8 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertIn(b"--rabs-canonical-local", stdout)
         self.assertIn(b"canonical-compile-local-v1", stdout)
         self.assertIn(b"build --tests", stdout)
+        self.assertIn(b"test --no-run", stdout)
+        self.assertIn(b"Test results are never cached", stdout)
         self.assertFalse(self.record.exists())
         self.assertEqual(list(self.operations.iterdir()), [])
 

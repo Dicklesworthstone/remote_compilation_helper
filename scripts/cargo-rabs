@@ -63,7 +63,7 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
   --rabs-canonical FILE  Build, check, lint, test, run or bench on a canonical worker.
-  --rabs-canonical-local FILE  Build or check selected Cargo units in the local canonical namespace.
+  --rabs-canonical-local FILE  Build, check or test in the local canonical namespace.
   --rabs-recover DIR     Recover a retained canonical operation; never execute it again.
   --help                Show this help without starting a daemon or Cargo.
 
@@ -73,15 +73,22 @@ canonical compilation driver. The profile version is canonical-compile-local-v1;
 docs/rabs-canonical-cargo.md for its explicit source, toolchain, state, operation
 and wrapper paths. With no Cargo arguments this mode selects ordinary `check`.
 Package, workspace, feature, target-kind/named-target, built-in compilation target
-and compilation profile selection are accepted with `check` or `build`. These
+and compilation profile selection are accepted with `check`, `build` or `test`. These
 command arguments replace the profile's command and selection, including an
 empty selection for ordinary `check`; the manifest and jobs come from the profile.
 Cargo's actual unit graph determines admission before the cache endpoint is exposed.
 Supported external metadata and isolated archive dependencies may earn a compiler
-skip; workspace units still compile. Successful builds retain their target tree
-at the private output path reported by the native driver. `build --tests` compiles
-harnesses without running them. Build scripts and procedural
-macros required by the selected units currently refuse this mode.
+skip; workspace units use Cargo's ordinary freshness decisions. Successful builds retain their target tree
+at the private output path reported by the native driver. `build --tests` and
+`test --no-run` compile harnesses without running them. `test` runs the selected
+tests and doctests on every invocation; a filter, --doc, --no-fail-fast and literal
+harness arguments after `--` are supported. Test results are never cached.
+Selected build scripts and procedural macros run
+under Cargo; those builds use only isolated dependency workers for cache
+publication and replay. Without a worker, their units compile normally without
+local action-cache authority. Generated-input and proc-macro units retain their
+existing per-action cache restrictions. The optional target_cache profile field
+retains verified private Cargo target state under an explicit host runtime epoch.
 The launcher retains the exact native profile in a new private operation
 directory and execs rabsd once. It starts no ordinary daemon, Cargo or RCH itself,
 and never falls back or retries. Native namespace, source capture, release
@@ -1683,6 +1690,7 @@ LOCAL_COMPILATION_VALUES = {
     "--bin": "bin", "--test": "test", "--example": "example", "--bench": "bench",
     "--target": "target",
 }
+LOCAL_TEST_FLAGS = {"--doc": "doc", "--no-run": "no_run", "--no-fail-fast": "no_fail_fast"}
 
 
 def canonical_local_selection(args):
@@ -1693,16 +1701,45 @@ def canonical_local_selection(args):
     syntax; no flag can select a compiler, manifest, config or output root.
     """
     args = list(args) if args else ["check"]
-    if args[0] not in ("check", "build"):
-        raise SetupError("local canonical mode supports cargo check or build only")
+    if args[0] not in ("check", "build", "test"):
+        raise SetupError("local canonical mode supports cargo check, build or test only")
+    testing = args[0] == "test"
+    flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS)
+
+    def checked_value(value, *, empty=False, options=False):
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError as error:
+            raise SetupError("local canonical selection must be UTF-8") from error
+        if ((not empty and not encoded) or len(encoded) > 1024
+                or (not options and value.startswith("-"))
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
+            raise SetupError("invalid local canonical Cargo selection value")
+        return value
+
     selection = {}
     at = 1
     while at < len(args):
+        if args[at] == "--":
+            if not testing:
+                raise SetupError("test-harness arguments require the local canonical test command")
+            if args[at + 1:]:
+                selection["test_args"] = [checked_value(value, empty=True, options=True)
+                                          for value in args[at + 1:]]
+            break
+        if testing and not args[at].startswith("-"):
+            if "test_filter" in selection:
+                raise SetupError("local canonical test accepts one Cargo test-name filter")
+            selection["test_filter"] = checked_value(args[at], empty=True)
+            at += 1
+            continue
         option, separator, value = args[at].partition("=")
         if option == "-r" and not separator:
             option = "--release"
-        if option in LOCAL_COMPILATION_FLAGS and not separator:
-            selection[LOCAL_COMPILATION_FLAGS[option]] = True
+        if option in flags and not separator:
+            if option in LOCAL_TEST_FLAGS and not testing:
+                raise SetupError("test selection requires the local canonical test command")
+            selection[flags[option]] = True
             at += 1
             continue
         if option in ("-p", "-F"):
@@ -1717,13 +1754,7 @@ def canonical_local_selection(args):
             if at >= len(args):
                 raise SetupError("missing value for " + option)
             value = args[at]
-        try:
-            value_bytes = value.encode("utf-8")
-        except UnicodeError as error:
-            raise SetupError("local canonical selection must be UTF-8") from error
-        if (not value_bytes or len(value_bytes) > 1024 or value.startswith("-")
-                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
-            raise SetupError("invalid local canonical Cargo selection value")
+        checked_value(value)
         if option in ("--target", "--profile") and (
                 not value.isascii() or not value[0].isalnum()
                 or any(not (char.isalnum() or char in "-_") for char in value)):
@@ -1738,18 +1769,26 @@ def canonical_local_selection(args):
         if count + int("profile" in selection) > 128:
             raise SetupError("local canonical selection has too many values")
         at += 1
+    count = sum(len(selection.get(field, [])) for field in LOCAL_COMPILATION_VALUES.values())
+    count += int("profile" in selection) + int("test_filter" in selection) + len(selection.get("test_args", []))
+    if count > 128:
+        raise SetupError("local canonical selection has too many values")
     if selection.get("exclude") and not selection.get("workspace"):
         raise SetupError("local canonical --exclude requires --workspace")
     if selection.get("release") and "profile" in selection:
         raise SetupError("local canonical --release conflicts with --profile")
     # This is the native deterministic compilation prefix, including option bytes.
     size = len(args[0])
-    size += sum(len(option) for option, field in LOCAL_COMPILATION_FLAGS.items() if selection.get(field))
+    size += sum(len(option) for option, field in flags.items() if selection.get(field))
     size += sum(len(option) + len(value.encode("utf-8"))
                 for option, field in LOCAL_COMPILATION_VALUES.items()
                 for value in selection.get(field, []))
     if "profile" in selection:
         size += len("--profile") + len(selection["profile"].encode("utf-8"))
+    if "test_filter" in selection:
+        size += len(selection["test_filter"].encode("utf-8"))
+    if selection.get("test_args"):
+        size += 2 + sum(len(value.encode("utf-8")) for value in selection["test_args"])
     if size > 16 * 1024:
         raise SetupError("local canonical selection exceeds its argument byte budget")
     return selection
@@ -1759,15 +1798,28 @@ def canonical_local_profile(path):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
     required = {"version", "source_root", "toolchain_root", "state_root", "operation_root", "wrapper"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
-    if profile.get("command", "check") not in ("check", "build"):
-        raise SetupError("local canonical command must be check or build")
+    if profile.get("command", "check") not in ("check", "build", "test"):
+        raise SetupError("local canonical command must be check, build or test")
     for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
         if name in profile and (type(profile[name]) is not int or not 1 <= profile[name] <= maximum):
             raise SetupError("local canonical " + name + " must be an integer from 1 to " + str(maximum))
+    if profile.get("target_cache") is not None:
+        cache = profile["target_cache"]
+        if (type(cache) is not dict or "runtime_epoch" not in cache
+                or cache.keys() - {"runtime_epoch", "max_bytes"}):
+            raise SetupError("invalid local canonical target_cache fields")
+        epoch = cache["runtime_epoch"]
+        if (type(epoch) is not str or not 1 <= len(epoch) <= 256
+                or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                       for character in epoch)):
+            raise SetupError("target_cache runtime_epoch must be a bounded ASCII host-runtime identifier")
+        if ("max_bytes" in cache and (type(cache["max_bytes"]) is not int
+                or not 1 <= cache["max_bytes"] <= 8 * 1024 ** 3)):
+            raise SetupError("target_cache max_bytes must be an integer from 1 to 8589934592")
     if profile.get("vendor") is not None and profile.get("cargo_home_source") is not None:
         raise SetupError("local canonical profile must select either vendor or cargo_home_source")
     manifest = canonical_path(profile.get("manifest", "Cargo.toml"))
@@ -1803,11 +1855,12 @@ def canonical_local_profile(path):
         raise SetupError("local canonical wrapper must be outside source, state and operation roots")
     if profile.get("selection") is not None:
         selection = profile["selection"]
-        allowed = set(LOCAL_COMPILATION_FLAGS.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile"}
+        flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS)
+        allowed = set(flags.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile", "test_filter", "test_args"}
         if type(selection) is not dict or selection.keys() - allowed:
             raise SetupError("invalid local canonical profile selection fields")
         original_args = [profile.get("command", "check")]
-        for option, field in LOCAL_COMPILATION_FLAGS.items():
+        for option, field in flags.items():
             if field in selection and type(selection[field]) is not bool:
                 raise SetupError("local canonical selection " + field + " must be a boolean")
             if selection.get(field):
@@ -1822,6 +1875,16 @@ def canonical_local_profile(path):
             if type(selection["profile"]) is not str:
                 raise SetupError("local canonical selection profile must be a string or null")
             original_args.extend(("--profile", selection["profile"]))
+        if selection.get("test_filter") is not None:
+            if type(selection["test_filter"]) is not str:
+                raise SetupError("local canonical test filter must be a string or null")
+            original_args.append(selection["test_filter"])
+        if "test_args" in selection:
+            if (type(selection["test_args"]) is not list
+                    or any(type(value) is not str for value in selection["test_args"])):
+                raise SetupError("local canonical test_args must be a string array")
+            if selection["test_args"]:
+                original_args.extend(["--"] + selection["test_args"])
         canonical_local_selection(original_args)
     return profile
 

@@ -696,10 +696,10 @@ fn custom_profiles_reuse_only_the_same_captured_compilation_family() {
     )
     .unwrap();
     let edited = inputs(source.path(), &names);
-    assert_eq!(
+    assert_ne!(
         key(&build, &plan, &edited),
         expected,
-        "source edits can reuse the same custom profile"
+        "opaque captured Cargo configuration keeps source bytes exact"
     );
     assert_ne!(
         target_key(scope(), &build, &edited, &spec, &support(), &plan, 1).unwrap(),
@@ -903,7 +903,7 @@ fn clippy_compatibility_keeps_selections_lints_companions_and_cargo_families_sep
     assert_ne!(
         target_key(scope(), &request, &edited, &spec, &support(), &plan, 1).unwrap(),
         exact,
-        "source edits change exact identity while remaining eligible for a private Clippy seed"
+        "source edits change exact identity; acquisition must still validate the prior metadata inventory"
     );
 }
 
@@ -2523,7 +2523,7 @@ fn real_cargo_build_test_and_check_reuse_targets_and_execute_tests_again() {
 }
 
 #[test]
-fn real_cargo_failed_compile_retains_completed_dependencies_for_the_fixed_source() {
+fn real_cargo_failed_compile_reuses_exact_source_but_fixed_codegen_starts_cold() {
     let fixture = CargoFixture::with_dependency();
     let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
     let source = fixture.workspace.join("src/main.rs");
@@ -2548,8 +2548,8 @@ fn real_cargo_failed_compile_retains_completed_dependencies_for_the_fixed_source
 
     fs::write(&source, original).unwrap();
     fixture.fresh_upload_timestamps();
-    let fixed = fixture.command(&cache, "build", &[], true);
-    fixed.assert_fresh("hot_dep", false, true);
+    let fixed = fixture.command(&cache, "build", &[], false);
+    fixed.assert_fresh("hot_dep", false, false);
     fixed.assert_fresh("hot_fixture", false, false);
     let warm = fixture.command(&cache, "build", &[], true);
     warm.assert_all_fresh();
@@ -2582,13 +2582,13 @@ fn real_cargo_failed_tests_reuse_compilation_but_execute_and_fail_each_time() {
 
     fs::write(&source, original).unwrap();
     fixture.fresh_upload_timestamps();
-    let fixed = fixture.command(&cache, "test", &[], true);
-    fixed.assert_fresh("hot_dep", false, true);
+    let fixed = fixture.command(&cache, "test", &[], false);
+    fixed.assert_fresh("hot_dep", false, false);
     fixed.assert_fresh("hot_fixture", true, false);
-    assert_eq!(fixed.test_runs, 3);
+    assert_eq!(fixed.test_runs, 1);
     let warm = fixture.command(&cache, "test", &[], true);
     warm.assert_all_fresh();
-    assert_eq!(warm.test_runs, 4);
+    assert_eq!(warm.test_runs, 2);
 }
 
 #[test]
@@ -2778,7 +2778,7 @@ fn real_cargo_feature_selections_reuse_private_dependencies_and_current_generate
 }
 
 #[test]
-fn real_clippy_source_edits_relint_without_rebuilding_dependencies_or_suppressing_failures() {
+fn real_clippy_executor_graph_edits_start_cold_and_still_report_lint_failures() {
     let fixture = CargoFixture::with_dependency();
     let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
     let deny = [
@@ -2802,8 +2802,8 @@ fn real_clippy_source_edits_relint_without_rebuilding_dependencies_or_suppressin
     )
     .unwrap();
     let retained = cache.state.lock().unwrap().entries.len();
-    let failed = fixture.command_with_status(&cache, "clippy", &deny, true, 101);
-    failed.assert_fresh("hot_dep", false, true);
+    let failed = fixture.command_with_status(&cache, "clippy", &deny, false, 101);
+    failed.assert_fresh("hot_dep", false, false);
     failed.assert_output_contains("needless_return");
     assert_eq!(
         cache.state.lock().unwrap().entries.len(),
@@ -2844,8 +2844,8 @@ fn real_clippy_source_edits_relint_without_rebuilding_dependencies_or_suppressin
     )
     .unwrap();
     fixture.fresh_upload_timestamps();
-    let fixed = fixture.command(&cache, "clippy", &deny, true);
-    fixed.assert_fresh("hot_dep", false, true);
+    let fixed = fixture.command(&cache, "clippy", &deny, false);
+    fixed.assert_fresh("hot_dep", false, false);
     fixed.assert_fresh("hot_fixture", false, false);
     fixture
         .command(&cache, "clippy", &deny, true)

@@ -367,6 +367,17 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     };
     let remote_requested =
         live.remote.is_some() && request.get("remote_protocol").and_then(Value::as_u64) == Some(1);
+    // Project executors can connect to this operation-visible endpoint. Their
+    // local completion claims cannot populate or serve the cache. A configured
+    // worker protocol may proceed toward independent closed execution; without
+    // it, ordinary Cargo compilation continues without even warming facts.
+    let local_capture = live
+        .canonical
+        .as_ref()
+        .map_or(Ok(()), |paths| paths.require_local_capture());
+    if !remote_requested && let Err(reason) = &local_capture {
+        return refuse(reason);
+    }
     let rejection = if remote_requested {
         admission_preflight::remote_rejection(candidate)
     } else {
@@ -472,41 +483,46 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         },
         None => plan.clone(),
     };
-    let (package, dependencies) =
-        match input_preparation::observe(&live.facts, &physical_plan, may_wait) {
-            Ok(observed) => observed,
-            Err(input_preparation::InputMiss::PackageAndDependenciesPending) => {
-                log(
-                    "preparing",
-                    &[
-                        ("crate", unit),
-                        ("reason", PendingFacts::Dependencies.reason()),
-                    ],
-                );
-                return preparing(unit, PendingFacts::Package);
-            }
-            Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
-                return preparing(unit, PendingFacts::Package);
-            }
-            Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
-                return preparing(unit, PendingFacts::Dependencies);
-            }
-            Err(input_preparation::InputMiss::Package(miss)) => {
-                log(
-                    "pass-through",
-                    &[
-                        ("crate", unit),
-                        ("package", &plan.package_root),
-                        ("source", &plan.source_root),
-                        ("reason", &miss.to_string()),
-                    ],
-                );
-                return Decided::Reply(pass_through(&miss.to_string()));
-            }
-            Err(input_preparation::InputMiss::Dependencies(miss)) => {
-                return refuse(&miss.to_string());
-            }
-        };
+    let (package, dependencies) = match input_preparation::observe(
+        &live.facts,
+        &plan,
+        &physical_plan,
+        live.canonical.as_deref(),
+        may_wait,
+    ) {
+        Ok(observed) => observed,
+        Err(input_preparation::InputMiss::PackageAndDependenciesPending) => {
+            log(
+                "preparing",
+                &[
+                    ("crate", unit),
+                    ("reason", PendingFacts::Dependencies.reason()),
+                ],
+            );
+            return preparing(unit, PendingFacts::Package);
+        }
+        Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Package);
+        }
+        Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Dependencies);
+        }
+        Err(input_preparation::InputMiss::Package(miss)) => {
+            log(
+                "pass-through",
+                &[
+                    ("crate", unit),
+                    ("package", &plan.package_root),
+                    ("source", &plan.source_root),
+                    ("reason", &miss.to_string()),
+                ],
+            );
+            return Decided::Reply(pass_through(&miss.to_string()));
+        }
+        Err(input_preparation::InputMiss::Dependencies(miss)) => {
+            return refuse(&miss.to_string());
+        }
+    };
     if let Err(reason) = package.verify_generated_disjoint(&physical_plan) {
         return refuse(&reason);
     }
@@ -575,7 +591,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     } else {
         dependencies.directories.clone()
     };
-    let key_result = if live.canonical.is_some() {
+    let key_result = if let Err(reason) = local_capture {
+        // Keep a refusal, not a usable local key, across every remote warming,
+        // keying, worker-unavailable and execution-refusal fallback below.
+        Err(rabs_key::live_dependency::LiveRefusal::Facts(reason))
+    } else if live.canonical.is_some() {
         rabs_key::live_dependency::canonical_cargo_dependency_key(
             &plan,
             &toolchain,
@@ -1105,6 +1125,71 @@ mod completion_capture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_code_cannot_enable_local_capture_by_claiming_a_remote_protocol() {
+        use crate::coord::live::CoordLive;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let owner = Arc::new(crate::test_util::private_tempdir());
+        let roots = [
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/toolchain",
+            "/__rabs/out/cargo",
+            "/__rabs/home",
+        ];
+        let mappings = roots
+            .iter()
+            .enumerate()
+            .map(|(index, visible)| {
+                let backing = owner.path().join(index.to_string());
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&backing)
+                    .unwrap();
+                (PathBuf::from(visible), backing)
+            })
+            .collect();
+        let paths = CanonicalPaths::new(Arc::clone(&owner), mappings)
+            .unwrap()
+            .require_closed_dependency_execution()
+            .unwrap();
+        // A genuine coordinator with no worker (or CAS) configured. Neither
+        // source nor compiler exists: this denial must precede observation.
+        let coord = Arc::new(CoordLive::new());
+        let live = LiveEdge::canonical(LiveDependencyLane::new(coord), paths);
+        for protocol in [Value::Null, json!(0), json!(1), json!(2)] {
+            let request = json!({
+                "kind":"rustc-request", "remote_protocol":protocol,
+                "wait_for_inflight":true,
+                "argv":["/__rabs/toolchain/bin/rustc", "--crate-name=leaf"],
+                "cwd":"/__rabs/cargo-home/registry/src/index/leaf-1.0.0",
+                "env":[], "local_capture_allowed":true, "canonical_project_executors":false,
+            });
+            let Decided::Reply(reply) = decide(&live, &request) else {
+                panic!("project executor must not obtain a local attempt, hit or warming task");
+            };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["decision"], "pass-through");
+            assert_eq!(
+                reply["reason"],
+                "canonical-project-executors-require-isolated-dependency-execution"
+            );
+            assert_eq!(reply["compiler_skip_authorized"], false);
+            for absent in ["attempt", "action_key", "env"] {
+                assert!(reply.get(absent).is_none(), "{reply}");
+            }
+        }
+        for index in 0..roots.len() {
+            assert_eq!(
+                std::fs::read_dir(owner.path().join(index.to_string()))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
 
     #[test]
     fn preparing_facts_has_neither_action_identity_nor_execution_or_install_authority() {

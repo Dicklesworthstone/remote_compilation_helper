@@ -53,6 +53,10 @@ fn vendor(root: &Path, name: &str, files: BTreeMap<&str, &str>) -> String {
 }
 
 fn source(root: &Path, value: u32) {
+    source_with_generated(root, value, false);
+}
+
+fn source_with_generated(root: &Path, value: u32, generated: bool) {
     write(
         root,
         "Cargo.toml",
@@ -90,18 +94,37 @@ fn source(root: &Path, value: u32) {
         "[package]\nname='dev_macro'\nversion='1.0.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
     );
     write(root, "dev-macro/src/lib.rs", "extern crate proc_macro;\n");
-    let leaf_source = format!("pub const fn answer()->u32 {{ {value} }}\n");
-    let leaf = vendor(
-        root,
-        "canonical_leaf",
-        BTreeMap::from([
-            (
-                "Cargo.toml",
-                "[package]\nname='canonical_leaf'\nversion='1.0.0'\nedition='2021'\n",
-            ),
-            ("src/lib.rs", leaf_source.as_str()),
-        ]),
-    );
+    let leaf_source = if generated {
+        "const _: &str = env!(\"CANONICAL_BUILD_MARKER\");\ninclude!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n".to_owned()
+    } else {
+        format!("pub const fn answer()->u32 {{ {value} }}\n")
+    };
+    let mut leaf_files = BTreeMap::from([
+        (
+            "Cargo.toml",
+            "[package]\nname='canonical_leaf'\nversion='1.0.0'\nedition='2021'\n",
+        ),
+        ("src/lib.rs", leaf_source.as_str()),
+    ]);
+    if generated {
+        // Only Cargo's build script can read this workspace input. The remote
+        // compiler receives the resulting OUT_DIR tree, not the outer workspace.
+        // Editing this input leaves every vendored package byte unchanged.
+        write(root, "generated-value.txt", value.to_string());
+        leaf_files.insert(
+            "build.rs",
+            r#"fn main() {
+    let value = std::fs::read_to_string("../../generated-value.txt").unwrap();
+    let value: u32 = value.trim().parse().unwrap();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("value.rs"), format!("pub const fn answer()->u32 {{ {value} }}\n")).unwrap();
+    println!("cargo::rerun-if-changed=../../generated-value.txt");
+    println!("cargo::rustc-env=CANONICAL_BUILD_MARKER=generated");
+}
+"#,
+        );
+    }
+    let leaf = vendor(root, "canonical_leaf", leaf_files);
     let dep = vendor(
         root,
         "canonical_dep",
@@ -122,6 +145,36 @@ fn source(root: &Path, value: u32) {
         format!(
             "version=4\n\n[[package]]\nname='canonical_app'\nversion='0.1.0'\ndependencies=['canonical_dep','dev_macro','optional_build']\n\n[[package]]\nname='canonical_dep'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{dep}'\ndependencies=['canonical_leaf']\n\n[[package]]\nname='canonical_leaf'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{leaf}'\n\n[[package]]\nname='dev_macro'\nversion='1.0.0'\n\n[[package]]\nname='optional_build'\nversion='1.0.0'\n"
         ),
+    );
+}
+
+fn generated_dependency(root: &Path) {
+    write(root, "generated-value.txt", "2\n");
+    vendor(
+        root,
+        "canonical_dep",
+        BTreeMap::from([
+            (
+                "Cargo.toml",
+                "[package]\nname='canonical_dep'\nversion='1.0.0'\nedition='2021'\n[dependencies]\ncanonical_leaf='=1.0.0'\n",
+            ),
+            (
+                "build.rs",
+                r#"fn main() {
+    let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let input = package.parent().unwrap().parent().unwrap().join("generated-value.txt");
+    let value: u32 = std::fs::read_to_string(&input).unwrap().trim().parse().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("generated.rs"), format!("const GENERATED_OFFSET: u32 = {value};\n")).unwrap();
+    println!("cargo:rerun-if-changed={}", input.display());
+}
+"#,
+            ),
+            (
+                "src/lib.rs",
+                "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub const fn answer()->u32 { canonical_leaf::answer()+GENERATED_OFFSET }\n",
+            ),
+        ]),
     );
 }
 
@@ -339,29 +392,98 @@ fn canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_
         "stale changed-source hit: {output}"
     );
 
-    // Inactive optional and development executors did not block the actual
-    // library checks above. Selecting either executor must still refuse before
-    // exposing the dependency cache endpoint or executing its project code.
+    // Active build scripts and procedural macros must now compile successfully.
+    // Their operation cannot reuse the local cache populated above: project
+    // code can reach the wrapper socket and must not claim local completions.
+    write(
+        &second,
+        "optional-build/build.rs",
+        r#"
+use std::io::{BufRead, BufReader, Write};
+fn main() {
+    let mut stream = std::os::unix::net::UnixStream::connect(std::env::var_os("RABS_SOCKET_PATH").unwrap()).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    let mut replies = BufReader::new(stream.try_clone().unwrap());
+    writeln!(stream, "{{\"kind\":\"hello\",\"transport\":{{\"current\":1,\"minimum_compatible\":1}},\"application\":{{\"current\":1,\"minimum_compatible\":1}}}}").unwrap();
+    let mut reply = String::new();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("hello-ok"));
+    writeln!(stream, "{{\"kind\":\"rustc-request\",\"argv\":[\"/__rabs/toolchain/bin/rustc\",\"--crate-name=forged\"],\"cwd\":\"/__rabs/workspace\",\"env\":[],\"remote_protocol\":1,\"local_capture_allowed\":true}}").unwrap();
+    reply.clear();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("canonical-project-executors-require-isolated-dependency-execution"));
+    assert!(reply.contains("pass-through"));
+    assert!(!reply.contains("\"attempt\""));
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("value.rs"), "pub const GENERATED: usize = 17;\n").unwrap();
+    println!("cargo::warning=CANONICAL_BUILD_SCRIPT_EXECUTED_WITHOUT_LOCAL_CAPTURE");
+    println!("cargo::rerun-if-changed=build.rs");
+}
+"#,
+    );
+    write(
+        &second,
+        "optional-build/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
+    );
+    write(
+        &second,
+        "dev-macro/src/lib.rs",
+        r#"
+extern crate proc_macro;
+#[proc_macro]
+pub fn value(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    eprintln!("CANONICAL_PROC_MACRO_EXECUTED");
+    "23usize".parse().unwrap()
+}
+"#,
+    );
+    write(
+        &second,
+        "src/lib.rs",
+        r#"
+pub fn answer() -> u32 { canonical_dep::answer() }
+#[cfg(feature = "optional_build")]
+const _: [(); 17] = [(); optional_build::GENERATED];
+#[cfg(test)]
+const _: [(); 23] = [(); dev_macro::value!()];
+#[test]
+fn must_not_execute() { panic!("canonical check ran a test"); }
+"#,
+    );
     for (number, selection) in [
         (6, json!({"lib":true, "features":["optional_build"]})),
         (7, json!({"tests":true})),
     ] {
         profile["selection"] = selection;
         let (code, events, output) = run(owner.path(), number, &profile);
-        assert_ne!(code, 0, "executor-bearing graph was admitted: {output}");
+        assert_eq!(code, 0, "executor-bearing compilation failed: {output}");
         assert!(
-            output.contains("build scripts or procedural macros"),
+            output.contains(if number == 6 {
+                "CANONICAL_BUILD_SCRIPT_EXECUTED_WITHOUT_LOCAL_CAPTURE"
+            } else {
+                "CANONICAL_PROC_MACRO_EXECUTED"
+            }),
             "{output}"
         );
         assert!(
-            !output.contains("inactive build script must never execute"),
+            output.contains("canonical-project-executors-require-isolated-dependency-execution"),
             "{output}"
         );
         assert!(
-            !events
+            events
                 .iter()
                 .any(|event| event["kind"] == "canonical-compilation-started"),
-            "selected executor reached cache admission: {output}"
+            "selected executor never reached canonical compilation: {output}"
+        );
+        assert!(
+            decisions(&events, "execute").is_empty() && decisions(&events, "hit").is_empty(),
+            "executor-bearing operation obtained local compiler authority: {output}"
+        );
+        assert!(
+            !events.iter().any(|event| event["decision"] == "served"),
+            "{output}"
         );
     }
     assert!(
@@ -370,6 +492,443 @@ fn canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_
             .next()
             .is_none(),
         "completed operations retained mutable targets or live endpoints"
+    );
+}
+
+/// This exercises Cargo's private fingerprints, not shared action-cache
+/// authorization: a warm build must report `fresh` even for workspace units,
+/// while edits and feature changes still execute the affected compiler units.
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; actual canonical target reuse and delivered executable validation"]
+fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (owner, mut profile) = native_fixture();
+    let second = owner.path().join("source-b");
+    for name in ["source-a", "source-b"] {
+        let root = owner.path().join(name);
+        let manifest = root.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            format!(
+                "{}\n[features]\nextra=[]\n",
+                fs::read_to_string(&manifest).unwrap()
+            ),
+        )
+        .unwrap();
+        write(
+            &root,
+            "src/main.rs",
+            "fn main(){println!(\"{}\",canonical_app::answer()+u32::from(cfg!(feature=\"extra\"))*100);}\n",
+        );
+    }
+    profile["command"] = json!("build");
+    profile["target_cache"] = json!({"runtime_epoch":"native-fixture-v1", "max_bytes":268435456});
+
+    let state = |events: &[Value], expected: &str| {
+        let started = events
+            .iter()
+            .filter(|event| event["kind"] == "canonical-compilation-started")
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["private_target_state"], expected, "{events:?}");
+        assert_eq!(started[0]["workspace_cache"], false);
+    };
+    let freshness = |output: &str, dependencies: bool, workspace: bool| {
+        let artifacts = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        for (name, expected) in [
+            ("canonical_leaf", dependencies),
+            ("canonical_dep", dependencies),
+            ("canonical_app", workspace),
+        ] {
+            let selected = artifacts
+                .iter()
+                .filter(|event| event["target"]["name"] == name)
+                .collect::<Vec<_>>();
+            assert!(
+                !selected.is_empty(),
+                "missing real Cargo artifact for {name}: {output}"
+            );
+            assert!(
+                selected.iter().all(|event| event["fresh"] == expected),
+                "unexpected Cargo freshness for {name}: {output}"
+            );
+        }
+    };
+
+    let (code, events, output) = run(owner.path(), 100, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    let (first_target, first_archives) = delivered_build(owner.path(), 100, &events, 42);
+
+    profile["source_root"] = json!(second);
+    let (code, events, output) = run(owner.path(), 101, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    let (warm_target, warm_archives) = delivered_build(owner.path(), 101, &events, 42);
+    assert_ne!(first_target, warm_target);
+    assert_eq!(first_archives, warm_archives);
+    assert!(decisions(&events, "execute").is_empty());
+    assert!(decisions(&events, "hit").is_empty());
+    let first_binary = first_target.join("target/debug/canonical_app");
+    let warm_binary = warm_target.join("target/debug/canonical_app");
+    let first_inode = fs::metadata(&first_binary).unwrap();
+    let warm_inode = fs::metadata(&warm_binary).unwrap();
+    assert_ne!(
+        (first_inode.dev(), first_inode.ino()),
+        (warm_inode.dev(), warm_inode.ino())
+    );
+    fs::write(&first_binary, b"caller replaced its delivered binary").unwrap();
+
+    let (code, events, output) = run(owner.path(), 102, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    delivered_build(owner.path(), 102, &events, 42);
+
+    write(
+        &second,
+        "src/lib.rs",
+        "pub fn answer()->u32 { canonical_dep::answer()+1 }\n",
+    );
+    let (code, events, output) = run(owner.path(), 103, &profile);
+    assert_eq!(code, 0, "{output}");
+    // Code generation may consume source bytes absent from Cargo dep-info
+    // (for example assembler .incbin inputs). Its private state is source-exact.
+    state(&events, "cold");
+    freshness(&output, false, false);
+    delivered_build(owner.path(), 103, &events, 43);
+
+    profile["selection"] = json!({"features":["extra"]});
+    let (code, events, output) = run(owner.path(), 104, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, false);
+    delivered_build(owner.path(), 104, &events, 143);
+
+    profile["command"] = json!("check");
+    for number in [105, 106] {
+        let (code, events, output) = run(owner.path(), number, &profile);
+        assert_eq!(code, 0, "{output}");
+        // Metadata-only checks have their own source-edit compatibility family.
+        state(&events, if number == 105 { "cold" } else { "restored" });
+        if number == 106 {
+            freshness(&output, true, true);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "canonical-build-completed")
+        );
+    }
+
+    // Ambient host tools belong to the operator's runtime epoch. A changed
+    // epoch cannot inherit Cargo's prior fingerprint state under the old one.
+    profile["command"] = json!("build");
+    profile["target_cache"]["runtime_epoch"] = json!("native-fixture-v2");
+    let (code, events, output) = run(owner.path(), 107, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    delivered_build(owner.path(), 107, &events, 143);
+
+    // A rejected optional restore must not discard the adapter that captures
+    // this command's successful cold Cargo output. The very next invocation
+    // must be warm, including the workspace executable.
+    let seed_binary = owner
+        .path()
+        .join("state/canonical-compile-v1/private-target-v1/seed/target/debug/canonical_app");
+    fs::write(&seed_binary, b"corrupted private target").unwrap();
+    let (code, events, output) = run(owner.path(), 108, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    assert!(
+        events.iter().any(|event| {
+            event["kind"] == "canonical-target-state-unavailable" && event["stage"] == "restore"
+        }),
+        "corrupted seed was not refused: {output}"
+    );
+    delivered_build(owner.path(), 108, &events, 143);
+
+    let (code, events, output) = run(owner.path(), 109, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    delivered_build(owner.path(), 109, &events, 143);
+}
+
+fn assert_test_execution(events: &[Value], state: &str, executed: bool) {
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{events:?}");
+    assert_eq!(started[0]["command"], "test");
+    assert_eq!(started[0]["private_target_state"], state, "{events:?}");
+    assert_eq!(started[0]["test_execution"], executed);
+    assert_eq!(started[0]["test_result_cache"], false);
+    assert_eq!(started[0]["workspace_cache"], false);
+    assert!(
+        decisions(events, "execute").is_empty() && decisions(events, "hit").is_empty(),
+        "project test code must not obtain local cache authority: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event["decision"] == "served"),
+        "{events:?}"
+    );
+    if executed {
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "canonical-build-completed"),
+            "an executed test outcome must not be delivered as a compilation result"
+        );
+    }
+}
+
+fn test_harness_artifacts(output: &str) -> Vec<Value> {
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event["reason"] == "compiler-artifact"
+                && event["target"]["name"] == "canonical_app"
+                && event["profile"]["test"] == true
+                && event["executable"].is_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "missing selected test harness: {output}"
+    );
+    artifacts
+}
+
+/// Warm compiler artifacts may eliminate compilation, never a current test
+/// execution. A counter in the writable private target makes the same harness
+/// change from success to failure without changing any captured source byte.
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes delivered and canonical Cargo test harnesses"]
+fn canonical_cargo_tests_deliver_no_run_artifacts_and_execute_each_current_run() {
+    let (owner, mut profile) = native_fixture();
+    write(
+        &owner.path().join("source-a"),
+        "src/lib.rs",
+        r#"pub fn answer() -> u32 { canonical_dep::answer() }
+#[test]
+fn current_test_execution() {
+    use std::io::{BufRead, BufReader, Write};
+    assert_eq!(answer(), 42);
+    let mut stream = std::os::unix::net::UnixStream::connect(std::env::var_os("RABS_SOCKET_PATH").unwrap()).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    let mut replies = BufReader::new(stream.try_clone().unwrap());
+    writeln!(stream, "{{\"kind\":\"hello\",\"transport\":{{\"current\":1,\"minimum_compatible\":1}},\"application\":{{\"current\":1,\"minimum_compatible\":1}}}}").unwrap();
+    let mut reply = String::new();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("hello-ok"));
+    writeln!(stream, "{{\"kind\":\"rustc-request\",\"argv\":[\"/__rabs/toolchain/bin/rustc\",\"--crate-name=forged-test\"],\"cwd\":\"/__rabs/workspace\",\"env\":[],\"remote_protocol\":1,\"local_capture_allowed\":true}}").unwrap();
+    reply.clear();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("canonical-project-executors-require-isolated-dependency-execution"));
+    assert!(reply.contains("pass-through"));
+    assert!(!reply.contains("\"attempt\""));
+    let path = std::path::Path::new("/__rabs/out/cargo/test-executions");
+    let previous: u32 = match std::fs::read_to_string(path) {
+        Ok(value) => value.parse().unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("{error}"),
+    };
+    let current = previous + 1;
+    std::fs::write(path, current.to_string()).unwrap();
+    println!("CANONICAL_CURRENT_TEST_EXECUTION={current}");
+    assert!(current < 3, "current test execution must report its present failure");
+}
+"#,
+    );
+    profile["command"] = json!("test");
+    profile["target_cache"] = json!({"runtime_epoch":"native-tests-v1", "max_bytes":268435456});
+    profile["selection"] = json!({"lib":true, "no_run":true});
+
+    let (code, events, output) = run(owner.path(), 200, &profile);
+    assert_eq!(code, 0, "{output}");
+    assert_test_execution(&events, "cold", false);
+    assert!(
+        !output.contains("CANONICAL_CURRENT_TEST_EXECUTION="),
+        "{output}"
+    );
+    let completed = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-build-completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "{output}");
+    assert_eq!(completed[0]["command"], "test");
+    assert_eq!(completed[0]["tests_executed"], false);
+    assert_eq!(completed[0]["canonical_target"], "/__rabs/out/cargo");
+    let target = PathBuf::from(completed[0]["target_directory"].as_str().unwrap());
+    assert_eq!(fs::canonicalize(&target).unwrap(), target);
+    let delivery_owner = target.parent().unwrap();
+    assert_eq!(delivery_owner.parent().unwrap(), owner.path().join("ops"));
+    assert_eq!(
+        fs::read_dir(delivery_owner)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        [std::ffi::OsString::from("target")],
+        "test delivery must retain only the completed target"
+    );
+    assert!(!target.join("test-executions").exists());
+    let artifacts = test_harness_artifacts(&output);
+    assert_eq!(artifacts[0]["fresh"], false, "{output}");
+    let relative = Path::new(artifacts[0]["executable"].as_str().unwrap())
+        .strip_prefix("/__rabs/out/cargo")
+        .unwrap();
+    let harness = target.join(relative);
+    let metadata = fs::symlink_metadata(&harness).unwrap();
+    assert!(
+        metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o111 != 0,
+        "no-run must deliver the actual linked Cargo test harness"
+    );
+
+    // Exercise the delivered executable without running its test body, which
+    // needs the live canonical endpoint. Cargo's reported path, not a guessed
+    // target layout, identifies the harness.
+    let mut command = Command::new(&harness);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--list")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let listed = ManagedProcessGroup::spawn_command(command, Attribution::default())
+        .unwrap()
+        .wait_with_bounded_drain_budget(
+            &DrainLimits::new(owner.path().join("delivered-test-list")),
+            16 * 1024,
+            || started.elapsed() > Duration::from_secs(10),
+        )
+        .unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(listed.residual_group_members, 0);
+    let mut listing = String::new();
+    listed
+        .stdout
+        .reader()
+        .unwrap()
+        .read_to_string(&mut listing)
+        .unwrap();
+    assert!(
+        listing.contains("current_test_execution: test"),
+        "{listing}"
+    );
+    assert!(!target.join("test-executions").exists());
+
+    profile["selection"] = json!({"lib":true, "test_filter":"current_test_execution",
+        "test_args":["--nocapture","--test-threads=1"]});
+    for current in 1..=4 {
+        let (code, events, output) = run(owner.path(), 200 + current, &profile);
+        assert_eq!(code, if current < 3 { 0 } else { 101 }, "{output}");
+        assert_test_execution(&events, "restored", true);
+        assert_eq!(
+            test_harness_artifacts(&output)[0]["fresh"],
+            true,
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("CANONICAL_CURRENT_TEST_EXECUTION={current}")),
+            "fresh compilation state skipped or replayed a test execution: {output}"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                owner.path().join(
+                    "state/canonical-compile-v1/private-target-v1/seed/target/test-executions"
+                )
+            )
+            .unwrap(),
+            current.to_string(),
+            "both passing and failing test runs must retain only current private state"
+        );
+        assert!(!target.join("test-executions").exists());
+    }
+    assert_eq!(
+        fs::read_dir(owner.path().join("ops")).unwrap().count(),
+        1,
+        "only the explicitly delivered no-run target may survive"
+    );
+}
+
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain with rustdoc and RABS_CANONICAL_TEST_WRAPPER; executes actual Cargo documentation tests"]
+fn canonical_cargo_doctests_execute_with_captured_rustdoc_and_preserve_failures() {
+    let (owner, mut profile) = native_fixture();
+    let rustdoc = Path::new(profile["toolchain_root"].as_str().unwrap()).join("bin/rustdoc");
+    let metadata = fs::symlink_metadata(rustdoc).unwrap();
+    assert!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "the captured native toolchain must contain its real rustdoc"
+    );
+    write(
+        &owner.path().join("source-a"),
+        "src/lib.rs",
+        r#"/// The same compiled documentation example must execute on every request.
+///
+/// ```
+/// assert_eq!(canonical_app::answer(), 42);
+/// let path = std::path::Path::new("/__rabs/out/cargo/doctest-executions");
+/// let previous: u32 = match std::fs::read_to_string(path) {
+///     Ok(value) => value.parse().unwrap(),
+///     Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+///     Err(error) => panic!("{error}"),
+/// };
+/// let current = previous + 1;
+/// std::fs::write(path, current.to_string()).unwrap();
+/// assert!(current < 3, "current documentation test must report its present failure");
+/// ```
+pub fn answer() -> u32 { canonical_dep::answer() }
+"#,
+    );
+    profile["command"] = json!("test");
+    profile["selection"] = json!({"doc":true, "test_args":["--nocapture","--test-threads=1"]});
+    profile["target_cache"] = json!({"runtime_epoch":"native-doctests-v1", "max_bytes":268435456});
+    for current in 1..=3 {
+        let (code, events, output) = run(owner.path(), 210 + current, &profile);
+        assert_eq!(code, if current < 3 { 0 } else { 101 }, "{output}");
+        assert_test_execution(
+            &events,
+            if current == 1 { "cold" } else { "restored" },
+            true,
+        );
+        assert_eq!(
+            fs::read_to_string(owner.path().join(
+                "state/canonical-compile-v1/private-target-v1/seed/target/doctest-executions"
+            ))
+            .unwrap(),
+            current.to_string(),
+            "captured rustdoc must run this request's example despite warm compilation: {output}"
+        );
+        if current == 3 {
+            assert!(
+                output.contains("current documentation test must report its present failure"),
+                "{output}"
+            );
+        }
+    }
+    assert!(
+        fs::read_dir(owner.path().join("ops"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "documentation tests must not retain operation owners or deliver test outcomes"
     );
 }
 
@@ -807,23 +1366,65 @@ fn delivered_build(
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo/TLS worker/cache execution"]
 fn canonical_cargo_offloads_real_dependency_samples_then_replays_across_worktrees() {
-    remote_dependency_replay("check");
+    remote_dependency_replay("check", GeneratedDependency::None);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual Cargo build/TLS worker/archive cache and linked binary execution"]
 fn canonical_cargo_build_offloads_archives_replays_and_delivers_a_working_binary() {
-    remote_dependency_replay("build");
+    remote_dependency_replay("build", GeneratedDependency::None);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/cache execution"]
+fn canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir() {
+    remote_dependency_replay("check", GeneratedDependency::Consumer);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/archive execution"]
+fn canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output() {
+    remote_dependency_replay("build", GeneratedDependency::Consumer);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-source Cargo/TLS worker/cache execution"]
+fn canonical_cargo_offloads_generated_dependency_metadata_and_invalidates_generated_bytes() {
+    remote_dependency_replay("check", GeneratedDependency::Leaf);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-source archive cache and linked binary execution"]
+fn canonical_cargo_build_offloads_generated_archives_and_delivers_current_generated_code() {
+    remote_dependency_replay("build", GeneratedDependency::Leaf);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GeneratedDependency {
+    None,
+    Leaf,
+    Consumer,
 }
 
 /// Exercise the production native CLI, wrapper, remote executor, CAS sampling,
 /// exact delivery and invalidation using the same dependency graph in each mode.
-fn remote_dependency_replay(command: &str) {
+fn remote_dependency_replay(command: &str, generated: GeneratedDependency) {
     let (owner, mut profile) = native_fixture();
     profile["command"] = json!(command);
     let build = command == "build";
     let first = owner.path().join("source-a");
     let second = owner.path().join("source-b");
+    match generated {
+        GeneratedDependency::None => {}
+        GeneratedDependency::Leaf => {
+            source_with_generated(&first, 40, true);
+            source_with_generated(&second, 40, true);
+        }
+        GeneratedDependency::Consumer => {
+            generated_dependency(&first);
+            generated_dependency(&second);
+        }
+    }
     assert_answer(&first, 42, false);
     assert_answer(&second, 42, true);
     let (mut worker, environment) = NativeWorker::start(owner.path());
@@ -960,7 +1561,23 @@ fn remote_dependency_replay(command: &str) {
         before_replay
     );
 
-    source(&second, 41);
+    if generated != GeneratedDependency::None {
+        // This edit changes only the build script's workspace input. Package
+        // source, Cargo stdout directives and rustc-env stay identical; the
+        // completed generated bytes must invalidate the selected action and
+        // its consumers while independent dependencies remain reusable.
+        write(
+            &second,
+            "generated-value.txt",
+            if generated == GeneratedDependency::Leaf {
+                "41"
+            } else {
+                "3\n"
+            },
+        );
+    } else {
+        source(&second, 41);
+    }
     assert_answer(&second, 43, false);
     let (code, events, output) = run_with_environment(owner.path(), 5, &profile, &environment);
     assert_eq!(
@@ -970,76 +1587,90 @@ fn remote_dependency_replay(command: &str) {
     if build {
         let (target, archives) = delivered_build(owner.path(), 5, &events, 43);
         assert!(retained_targets.insert(target));
-        for name in ["canonical_leaf", "canonical_dep"] {
+        let previous = first_archives.as_ref().unwrap();
+        if generated == GeneratedDependency::Consumer {
+            assert_eq!(
+                archives["canonical_leaf"], previous["canonical_leaf"],
+                "editing a generator input changed the independent leaf archive"
+            );
+        } else {
             assert_ne!(
-                archives[name],
-                first_archives.as_ref().unwrap()[name],
-                "changed source reused stale {name} archive bytes"
+                archives["canonical_leaf"], previous["canonical_leaf"],
+                "changed source or generated input reused stale canonical_leaf archive bytes"
             );
         }
+        assert_ne!(
+            archives["canonical_dep"], previous["canonical_dep"],
+            "changed dependency inputs reused stale consumer archive bytes"
+        );
     }
     let changed = decisions(&events, "remote-offer");
+    let changed_names: &[&str] = if generated == GeneratedDependency::Consumer {
+        &["canonical_dep"]
+    } else {
+        &["canonical_leaf", "canonical_dep"]
+    };
     assert_eq!(
         changed.len(),
-        2,
-        "both the changed leaf and its metadata consumer must execute remotely: {output}"
+        changed_names.len(),
+        "changed dependency inputs must execute remotely: {output}"
     );
     let first_keys = first_keys.unwrap();
-    for name in ["canonical_leaf", "canonical_dep"] {
+    for name in changed_names {
         assert_ne!(
-            changed[name], first_keys[name],
+            changed[*name], first_keys[*name],
             "stale {name} action identity"
         );
         assert!(
             events
                 .iter()
                 .any(|event| event["kind"] == "rabsd-remote-dependency-executed"
-                    && event["key"] == changed[name]),
+                    && event["key"] == changed[*name]),
             "{name} did not complete remotely: {output}"
         );
     }
-    assert!(
-        decisions(&events, "hit").is_empty() && decisions(&events, "execute").is_empty(),
-        "{output}"
-    );
-    let before_refusal = worker.completed_receipt();
-    let before_refusal_executions = worker
-        .events()
-        .into_iter()
-        .filter(|event| event["kind"] == "worker-toolchain-acquired")
-        .count();
+    let hits = decisions(&events, "hit");
+    if generated == GeneratedDependency::Consumer {
+        assert_eq!(
+            hits,
+            BTreeMap::from([(
+                "canonical_leaf".to_owned(),
+                first_keys["canonical_leaf"].clone()
+            )]),
+            "the unchanged leaf must replay while its generated-input consumer rebuilds: {output}"
+        );
+    } else {
+        assert!(hits.is_empty(), "{output}");
+    }
+    assert!(decisions(&events, "execute").is_empty(), "{output}");
+    // This fixture's selected script deliberately panics. Cargo must actually
+    // run it and preserve that failure, while every dependency cache attempt
+    // remains under worker authority rather than local wrapper claims.
     profile["selection"] = json!({"lib":true,"features":["optional_build"]});
     let (code, events, output) = run_with_environment(owner.path(), 6, &profile, &environment);
-    assert_ne!(code, 0, "selected build script reached execution: {output}");
+    assert_ne!(
+        code, 0,
+        "the selected failing build script was skipped: {output}"
+    );
     assert!(
-        output.contains("build scripts or procedural macros"),
+        output.contains("inactive build script must never execute"),
         "{output}"
     );
     assert!(
-        !output.contains("inactive build script must never execute"),
+        events
+            .iter()
+            .any(|event| event["kind"] == "canonical-compilation-started"),
         "{output}"
     );
     assert!(
         !events
             .iter()
-            .any(|event| event["kind"] == "canonical-compilation-started"
-                || event["kind"] == "canonical-build-completed"
-                || event["kind"] == "rabsd-live-dependency"
-                || event["kind"] == "rabsd-remote-dependency-executed"),
+            .any(|event| event["kind"] == "canonical-build-completed"),
         "{output}"
     );
-    assert_eq!(
-        worker.completed_receipt(),
-        before_refusal,
-        "graph refusal admitted a worker action"
-    );
-    assert_eq!(
-        worker
-            .events()
-            .into_iter()
-            .filter(|event| event["kind"] == "worker-toolchain-acquired")
-            .count(),
-        before_refusal_executions
+    assert!(
+        decisions(&events, "execute").is_empty(),
+        "project executors must never turn remote refusal into local cache admission: {output}"
     );
     let retained = fs::read_dir(owner.path().join("ops"))
         .unwrap()

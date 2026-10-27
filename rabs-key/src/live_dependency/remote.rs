@@ -20,7 +20,7 @@ use rabs_protocol::result_identity::TypedDigest;
 
 use super::{
     DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveDependencyKey, LiveRefusal,
-    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path, plain_path_in_profile, within,
+    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path_in_profile, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
@@ -86,7 +86,7 @@ pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
     exact private output capture, runtime/input revalidation, authenticated delivery \
     and coordinator-only publication; full-result readiness";
 
-const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-remote-metadata-v2: canonical-dependency-exec-v2 negotiated \
+const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-remote-metadata-v3: canonical-dependency-exec-v3 negotiated \
     separately from dependency-exec-v7; coordinator-owned canonical Cargo \
     planning and retained logical-to-physical mappings; exact canonical rustc \
     argv, cwd, environment and replay bytes; external registry, Git or checked \
@@ -94,11 +94,13 @@ const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-rem
     toolchain and candidate inventories with independently matched retained ELF \
     runtime; no outer Cargo workspace, complete Cargo home or coordinator control \
     socket mounted; existing authenticated delivery, input revalidation, closure, \
-    sampling and release authorization remain required; no workspace, archive, \
-    generated-input, build-script or proc-macro authority";
+    sampling and release authorization remain required; complete generated OUT_DIR \
+    retained read-only at its exact canonical spelling, including an empty tree, \
+    with exact persisted Cargo stdout and matching rustc-env directives keyed; \
+    no workspace, archive, build-script execution or proc-macro authority";
 
-const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rlib-v1: \
-    canonical-dependency-exec-v2 rlib mode negotiated independently from metadata \
+const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rlib-v2: \
+    canonical-dependency-exec-v3 rlib mode negotiated independently from metadata \
     and ordinary dependency-exec-v7; coordinator-owned canonical Cargo planning \
     and retained logical-to-physical mappings; exact canonical rustc argv, cwd, \
     environment and replay bytes; complete immutable external registry, Git or \
@@ -109,8 +111,10 @@ const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rl
     all assembler include/incbin inputs must resolve within retained keyed bytes \
     or fail; existing exact output validation, authenticated delivery, input \
     revalidation, sampling and release authorization required; no local codegen \
-    capture, workspace publication, generated inputs, build scripts, proc macros \
-    or native linking";
+    capture or workspace publication; complete generated OUT_DIR retained read-only \
+    at its exact canonical spelling, including an empty tree, with exact persisted \
+    Cargo stdout and matching rustc-env directives keyed; no build-script execution, \
+    proc macros or native linking";
 
 /// Output and isolation class selected from a bounded compiler invocation.
 /// This is not execution or serving authority: the caller must enforce the
@@ -430,8 +434,9 @@ fn validate_generated_root(
         return Ok(());
     };
     let overlaps = |other: &str| root == other || within(root, other) || within(other, root);
-    if !plain_path(root)
+    if !plain_path_in_profile(root, plan.canonical_cargo)
         || root.contains(&plan.out_dir)
+        || (!plan.canonical_cargo && overlaps("/__rabs"))
         || [
             plan.source_root.as_str(),
             plan.out_dir.as_str(),
@@ -440,8 +445,7 @@ fn validate_generated_root(
         .into_iter()
         .chain(plan.dependency_dirs.iter().map(String::as_str))
         .chain([
-            "/__rabs", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys",
-            "/run",
+            "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys", "/run",
         ])
         .any(overlaps)
     {
@@ -762,6 +766,14 @@ mod tests {
     }
 
     fn canonical_plan_with_emit(out_dir: &str, emit: &str) -> DependencyActionPlan {
+        canonical_plan_with_generated(out_dir, emit, None)
+    }
+
+    fn canonical_plan_with_generated(
+        out_dir: &str,
+        emit: &str,
+        generated: Option<&str>,
+    ) -> DependencyActionPlan {
         let package = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
         let argv = [
             "/__rabs/toolchain/bin/rustc".to_owned(),
@@ -777,7 +789,7 @@ mod tests {
             "-L".into(),
             format!("dependency={out_dir}"),
         ];
-        let env = [
+        let mut env = vec![
             ("HOME".into(), "/__rabs/home".into()),
             ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
             ("CARGO_MANIFEST_DIR".into(), package.into()),
@@ -787,12 +799,26 @@ mod tests {
                 format!("{out_dir}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
             ),
         ];
+        if let Some(root) = generated {
+            env.push(("OUT_DIR".into(), root.into()));
+            env.push(("BUILD_LABEL".into(), "pinned".into()));
+        }
         let request = LiveRustcRequest {
             argv: &argv,
             cwd: package,
             env: &env,
         };
-        if emit.contains("link") {
+        if generated.is_some() {
+            assert!(
+                super::super::plan_canonical_cargo_dependency_action(
+                    request,
+                    "x86_64-unknown-linux-gnu",
+                    None,
+                )
+                .is_err(),
+                "generated inputs cannot select local metadata capture"
+            );
+        } else if emit.contains("link") {
             assert!(matches!(
                 super::super::plan_canonical_cargo_dependency_action(
                     request,
@@ -870,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_remote_context_cannot_borrow_generated_or_host_path_authority() {
+    fn canonical_remote_context_cannot_borrow_unobserved_generated_or_host_path_authority() {
         let original = canonical_plan("/__rabs/out/cargo/debug/deps");
         let mut generated = original.clone();
         generated.generated_root = Some("/__rabs/out/cargo/debug/build/leaf/out".into());
@@ -1651,10 +1677,300 @@ mod tests {
             &directories(plan),
             inputs,
             record,
-            TOOLCHAIN,
+            if plan.canonical_cargo {
+                "/__rabs/toolchain"
+            } else {
+                TOOLCHAIN
+            },
             &[41; 32],
             &compute(RUNTIME_COHORT_DOMAIN, b"same-runtime"),
         )
+    }
+
+    #[test]
+    fn canonical_generated_compiles_bind_complete_tree_and_cargo_record_in_both_output_modes() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        let mut keys = Vec::new();
+        for emit in [
+            "dep-info,metadata",
+            "dep-info,link",
+            "dep-info,metadata,link",
+        ] {
+            let plan =
+                canonical_plan_with_generated("/__rabs/out/cargo/debug/deps", emit, Some(root));
+            let retained = generated_inputs(&plan);
+            let original = generated_key(&plan, &retained, Some(record)).unwrap();
+            assert!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    Some(record),
+                    &retained,
+                )
+                .is_err(),
+                "a canonical local completion cannot acquire generated-input authority"
+            );
+            let mut changed = retained.clone();
+            changed.inputs.last_mut().unwrap().object =
+                ObjectId(compute("rabs.test.v1", b"pub const VALUE: u32 = 99;"));
+            assert_ne!(
+                generated_key(&plan, &changed, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "generated bytes, including assembler inputs, are semantic"
+            );
+            let mut added = retained.clone();
+            let mut file = added.inputs.last().unwrap().clone();
+            file.virtual_path =
+                RawBytes::new(plan.generated_input_virtual_path("extra.bin").into_bytes());
+            added.inputs.push(file);
+            assert_ne!(
+                generated_key(&plan, &added, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "complete generated membership is semantic"
+            );
+            assert_ne!(
+                generated_key(
+                    &plan,
+                    &retained,
+                    Some(
+                        b"cargo::rustc-env=BUILD_LABEL=pinned\ncargo::rerun-if-changed=input.dat\n"
+                    )
+                )
+                .unwrap()
+                .action_key,
+                original.action_key,
+                "the exact Cargo record is semantic"
+            );
+            assert!(generated_key(&plan, &retained, None).is_err());
+            assert!(
+                generated_key(
+                    &plan,
+                    &retained,
+                    Some(b"cargo::rustc-env=BUILD_LABEL=stale\n")
+                )
+                .is_err()
+            );
+            let moved = canonical_plan_with_generated(
+                "/__rabs/out/cargo/debug/deps",
+                emit,
+                Some("/__rabs/out/cargo/debug/build/other-unit/out"),
+            );
+            assert_ne!(
+                generated_key(&moved, &retained, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "original canonical OUT_DIR spelling is retained"
+            );
+            assert_eq!(
+                original.action_key,
+                compute_action_key(&original.descriptor).final_key
+            );
+            keys.push(original.action_key);
+        }
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
+    }
+
+    #[test]
+    fn canonical_empty_generated_tree_is_keyed_without_inventing_a_generated_file() {
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some("/__rabs/out/cargo/debug/build/leaf-unit/out"),
+        );
+        let source_only = inputs(&plan);
+        let empty = generated_key(&plan, &source_only, Some(b"")).unwrap();
+        let no_generated = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let absent = generated_key(&no_generated, &inputs(&no_generated), None).unwrap();
+        assert_ne!(empty.action_key, absent.action_key);
+        assert_ne!(
+            empty.descriptor.negative_dependencies,
+            absent.descriptor.negative_dependencies
+        );
+        assert!(generated_key(&plan, &source_only, None).is_err());
+        assert!(generated_key(&no_generated, &inputs(&no_generated), Some(b"")).is_err());
+        assert_ne!(
+            empty.action_key,
+            generated_key(&plan, &generated_inputs(&plan), Some(b""))
+                .unwrap()
+                .action_key
+        );
+    }
+
+    #[test]
+    fn canonical_generated_stdout_requires_matching_keyed_rustc_env() {
+        let mut plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some("/__rabs/out/cargo/debug/build/leaf-generated/out"),
+        );
+        let stdout = b"cargo::rustc-env=GENERATED_LABEL=one\n";
+        assert!(generated_key(&plan, &inputs(&plan), Some(stdout)).is_err());
+        plan.execution_env
+            .push(("GENERATED_LABEL".into(), "one".into()));
+        plan.keyed_env
+            .push(("GENERATED_LABEL".into(), "one".into()));
+        plan.execution_env.sort();
+        plan.keyed_env.sort();
+        let original = generated_key(&plan, &inputs(&plan), Some(stdout)).unwrap();
+        let changed_stdout = b"cargo::rustc-env=GENERATED_LABEL=two\n";
+        assert!(generated_key(&plan, &inputs(&plan), Some(changed_stdout)).is_err());
+        for environment in [&mut plan.execution_env, &mut plan.keyed_env] {
+            environment
+                .iter_mut()
+                .find(|(name, _)| name == "GENERATED_LABEL")
+                .unwrap()
+                .1 = "two".into();
+        }
+        assert_ne!(
+            original.action_key,
+            generated_key(&plan, &inputs(&plan), Some(changed_stdout))
+                .unwrap()
+                .action_key
+        );
+        assert!(generated_key(&plan, &inputs(&plan), Some(stdout)).is_err());
+        assert!(generated_key(&plan, &inputs(&plan), Some(b"cargo::rustc-env=broken\n")).is_err());
+    }
+
+    #[test]
+    fn canonical_generated_paths_and_dep_info_cannot_escape_the_retained_tree() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some(root),
+        );
+        let retained = generated_inputs(&plan);
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        generated_key(&plan, &retained, Some(record)).unwrap();
+        let raw = format!(
+            "{}/leaf.d: {}/src/lib.rs {root}/nested/generated.rs\n# env-dep:OUT_DIR={root}\n",
+            plan.out_dir, plan.source_root
+        );
+        let captured = |path: &str| {
+            retained
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        assert!(
+            super::super::dep_info_closure_violation(&plan, raw.as_bytes(), captured).is_none()
+        );
+        assert_eq!(
+            super::super::canonicalize_placements(raw.as_bytes(), &plan).unwrap(),
+            raw.as_bytes()
+        );
+        let diagnostic = format!(
+            "{{\"$message_type\":\"diagnostic\",\"message\":\"generated input {root}/nested/generated.rs\"}}\n"
+        );
+        assert_eq!(
+            super::super::canonicalize_compiler_transcript(diagnostic.as_bytes(), &plan).unwrap(),
+            diagnostic.as_bytes(),
+        );
+        let uncaptured = raw.replace("nested/generated.rs", "nested/missing.rs");
+        assert!(
+            super::super::dep_info_closure_violation(&plan, uncaptured.as_bytes(), captured)
+                .is_some()
+        );
+        let escaped = raw.replace(
+            &format!("{root}/nested/generated.rs"),
+            "/__rabs/home/control/rustc.sock",
+        );
+        assert!(
+            super::super::dep_info_closure_violation(&plan, escaped.as_bytes(), |_| true).is_some(),
+            "a claimed capture cannot authorize a read outside the package and generated tree"
+        );
+
+        for bad in [
+            "/__rabs/home/control",
+            "/__rabs/cargo-home/registry/generated",
+            "/__rabs/workspace/generated",
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug/deps",
+            "/__rabs/out/cargo/debug/deps/nested",
+            "/__rabs/out/cargo/debug",
+            "/__rabs/out/cargo/../escape",
+            "/__rabs/out/cargo-other/debug/build/leaf/out",
+            "/__rabs/toolchain/generated",
+            "/tmp/host-generated",
+            "/usr/generated",
+        ] {
+            let mut bad_plan = plan.clone();
+            bad_plan.generated_root = Some(bad.into());
+            for env in [&mut bad_plan.execution_env, &mut bad_plan.keyed_env] {
+                env.iter_mut()
+                    .find(|(name, _)| name == "OUT_DIR")
+                    .unwrap()
+                    .1 = bad.into();
+            }
+            assert!(
+                generated_key(&bad_plan, &retained, Some(record)).is_err(),
+                "{bad}"
+            );
+        }
+        let mut missing = plan.clone();
+        missing.generated_root = None;
+        assert!(generated_key(&missing, &retained, Some(record)).is_err());
+        let mut duplicate = plan.clone();
+        duplicate
+            .execution_env
+            .push(("OUT_DIR".into(), root.into()));
+        assert!(generated_key(&duplicate, &retained, Some(record)).is_err());
+        let mut missing_environment = plan.clone();
+        missing_environment
+            .execution_env
+            .retain(|(name, _)| name != "OUT_DIR");
+        assert!(generated_key(&missing_environment, &retained, Some(record)).is_err());
+        let mut mismatched_environment = plan.clone();
+        mismatched_environment
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "OUT_DIR")
+            .unwrap()
+            .1 = "/__rabs/out/cargo/debug/build/other-unit/out".into();
+        assert!(generated_key(&mismatched_environment, &retained, Some(record)).is_err());
+        let mut candidate_alias = plan.clone();
+        candidate_alias.dependency_dirs.push(root.into());
+        assert!(generated_key(&candidate_alias, &retained, Some(record)).is_err());
+    }
+
+    #[test]
+    fn canonical_generated_loader_parent_stays_empty_and_cannot_load_generated_libraries() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some(root),
+        );
+        // Cargo puts this ancestor on its loader path. It remains an empty
+        // skeleton above the separately bound read-only generated input tree.
+        assert!(
+            remote_empty_loader_directories(&plan, "/__rabs/toolchain")
+                .unwrap()
+                .contains(&"/__rabs/out/cargo/debug".to_owned())
+        );
+        remote_dependency_shape(&plan, &directories(&plan), "/__rabs/toolchain").unwrap();
+        for loader in [root.to_owned(), format!("{root}/lib")] {
+            let mut changed = plan.clone();
+            changed
+                .execution_env
+                .iter_mut()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1 = loader;
+            assert!(matches!(
+                remote_dependency_shape(&changed, &directories(&changed), "/__rabs/toolchain"),
+                Err(RemoteDependencyRefusal::LoaderEnvironment(_))
+            ));
+        }
     }
 
     #[test]

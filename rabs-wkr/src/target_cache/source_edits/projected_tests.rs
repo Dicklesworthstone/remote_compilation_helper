@@ -268,7 +268,8 @@ fn forged_compatibility_cannot_restore_an_edited_source_with_different_cache_byt
     );
     let (attempt, restored) = restore_fixture(&cache, original.clone());
     let restored = restored.unwrap();
-    let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+    let plan =
+        ArtifactPlan::new_tree("cargo".into(), vec!["debug/deps/libfixture.rmeta".into()]).unwrap();
     let fresh = PreparedArtifacts::new(plan.clone()).unwrap();
     let mut spec = CanonicalNamespaceSpec::new();
     spec.ro_binds.push(Bind {
@@ -445,7 +446,7 @@ impl RegistryFixture {
 }
 
 #[test]
-fn real_offline_registry_cargo_keeps_dependencies_fresh_after_a_workspace_edit() {
+fn real_offline_registry_cargo_codegen_edits_start_cold_with_the_current_projection() {
     let fixture = RegistryFixture::new();
     let target = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
     let first = fixture.run(&target, false);
@@ -455,9 +456,9 @@ fn real_offline_registry_cargo_keeps_dependencies_fresh_after_a_workspace_edit()
     fixture
         .cargo
         .edit("src/main.rs", main.replace("+ 0 }", "+ 2 }"));
-    let edited = fixture.run(&target, true);
-    edited.fresh("registry_dep", true);
-    edited.fresh("edit_dep", true);
+    let edited = fixture.run(&target, false);
+    edited.fresh("registry_dep", false);
+    edited.fresh("edit_dep", false);
     edited.fresh("edit_app", false);
     assert_eq!(edited.output.unwrap().0, b"53\n");
     // The admitted Cargo-home partition remains byte-exact while the CURRENT
@@ -474,9 +475,9 @@ fn real_offline_registry_cargo_keeps_dependencies_fresh_after_a_workspace_edit()
             main.replace("+ 0 }", "+ bonus::value() }")
         ),
     );
-    let added = fixture.run(&target, true);
-    added.fresh("registry_dep", true);
-    added.fresh("edit_dep", true);
+    let added = fixture.run(&target, false);
+    added.fresh("registry_dep", false);
+    added.fresh("edit_dep", false);
     added.fresh("edit_app", false);
     assert_eq!(added.output.unwrap().0, b"55\n");
     fs::rename(
@@ -491,8 +492,8 @@ fn real_offline_registry_cargo_keeps_dependencies_fresh_after_a_workspace_edit()
             main.replace("+ 0 }", "+ renamed::value() }")
         ),
     );
-    let renamed = fixture.run(&target, true);
-    renamed.fresh("registry_dep", true);
+    let renamed = fixture.run(&target, false);
+    renamed.fresh("registry_dep", false);
     renamed.fresh("edit_app", false);
     assert_eq!(renamed.output.unwrap().0, b"55\n");
     fs::rename(
@@ -503,9 +504,9 @@ fn real_offline_registry_cargo_keeps_dependencies_fresh_after_a_workspace_edit()
     fixture
         .cargo
         .edit("src/main.rs", main.replace("+ 0 }", "+ 5 }"));
-    let removed = fixture.run(&target, true);
-    removed.fresh("registry_dep", true);
-    removed.fresh("edit_dep", true);
+    let removed = fixture.run(&target, false);
+    removed.fresh("registry_dep", false);
+    removed.fresh("edit_dep", false);
     removed.fresh("edit_app", false);
     let expected = removed.output.unwrap();
     assert_eq!(expected.0, b"56\n");
@@ -529,7 +530,7 @@ fn real_offline_registry_cargo_keeps_dependencies_fresh_after_a_workspace_edit()
 }
 
 #[test]
-fn real_offline_registry_cargo_reuses_dependencies_after_embedded_data_edits() {
+fn real_offline_registry_cargo_data_edits_start_cold_but_exact_sources_remain_fresh() {
     let fixture = RegistryFixture::new();
     write(&fixture.cargo.source, "assets/number.txt", b"2");
     let main = fs::read_to_string(fixture.cargo.source.join("src/main.rs")).unwrap();
@@ -545,9 +546,9 @@ fn real_offline_registry_cargo_reuses_dependencies_after_embedded_data_edits() {
     first.fresh("registry_dep", false);
     assert_eq!(first.output.unwrap().0, b"53\n");
     fixture.cargo.edit("assets/number.txt", b"7");
-    let edited = fixture.run(&target, true);
-    edited.fresh("registry_dep", true);
-    edited.fresh("edit_dep", true);
+    let edited = fixture.run(&target, false);
+    edited.fresh("registry_dep", false);
+    edited.fresh("edit_dep", false);
     edited.fresh("edit_app", false);
     let expected = edited.output.unwrap();
     assert_eq!(expected.0, b"58\n");

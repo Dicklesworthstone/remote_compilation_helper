@@ -441,14 +441,17 @@ fn main() {
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
                  CANONICAL LOCAL: rabsd --canonical-compile-local <profile.json>\n\
-                 Captures source/toolchain, then runs selected cargo check/build --offline --locked at canonical paths.\n\
+                 Captures source/toolchain, then runs selected cargo check/build/test --offline --locked at canonical paths.\n\
                  profile version canonical-compile-local-v1 requires source_root, toolchain_root, state_root,\n\
                  operation_root and wrapper absolute paths; state/operation roots must already be private (0700).\n\
                  Optional manifest (Cargo.toml), vendor or cargo_home_source, jobs (1), timeout_seconds (1800).\n\
-                 command is check (default) or build; selection chooses packages, features, targets and profiles.\n\
-                 A check without selection means --lib; builds retain their completed target directory.\n\
+                 command is check (default), build or test; selection chooses packages, features, targets and profiles.\n\
+                 A check without selection means --lib; build and test --no-run retain their completed target directory.\n\
+                 Test selection accepts doc, no_run, no_fail_fast, test_filter and literal test_args after --.\n\
+                 Tests/doctests execute on every request; doctests use captured rustdoc and failures retain Cargo's status.\n\
                  Linux namespaces and nightly Cargo unit-graph planning are required.\n\
-                 The selected units must not execute build scripts/proc macros; inactive targets are allowed.\n\
+                 Tests and selected build-script/proc-macro graphs require isolated workers for dependency cache authority.\n\
+                 Without a worker those units compile normally; source/HOME are read-only and networking is isolated.\n\
                  External metadata and isolated worker archives use the evidence-gated cache; workspace crates compile normally.\n\
                  This mode honors the configured build identity and release authorization policy.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\

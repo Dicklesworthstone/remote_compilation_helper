@@ -151,7 +151,9 @@ pub(crate) fn target_key(
 /// Ordinary Cargo can reuse one private target across build, check and test,
 /// including different package and target selections. Clippy uses a separate
 /// family and retains every selection and lint control while sharing its own
-/// prior targets across source edits.
+/// prior targets across eligible source edits. A normalized key is only a
+/// candidate: acquisition permits changed-source reuse only when the complete
+/// prior target contains compiler metadata and no codegen or project executors.
 /// This secondary key never changes action identity or permits result replay:
 /// the current command executes with its original argv and artifact contract.
 /// Unknown argument forms retain exact-key reuse only.
@@ -170,19 +172,19 @@ pub(crate) fn target_compatibility_key(
     let mut value = target_key_description(scope, request, inputs, spec, support, plan, grant)?;
     let clippy = request.program == "/__rabs/toolchain/bin/cargo-clippy";
     value["version"] = serde_json::json!(if clippy {
-        "rabs.private-clippy-commands.v1"
+        "rabs.private-clippy-commands.v2"
     } else {
-        "rabs.private-cargo-selections.v1"
+        "rabs.private-cargo-selections.v2"
     });
     value["args"] = serde_json::json!(args);
     value["cargo_mode"] = serde_json::json!("current-cargo-contract-required-v1");
-    if let Some(source) = source_edits::identity(inputs) {
+    if let Some(source) = source_edits::metadata_context_identity(inputs, spec) {
         // This is only a private Cargo seed family, never an action key.
         // Actual changed bytes remain in the exact key and current manifest.
         value["version"] = serde_json::json!(if clippy {
-            "rabs.private-clippy-source-edits.v1"
+            "rabs.private-clippy-source-edits.v2"
         } else {
-            "rabs.private-cargo-selection-source-edits.v1"
+            "rabs.private-cargo-selection-source-edits.v2"
         });
         value["source"] = serde_json::json!(source);
         value["workspace"] = serde_json::json!(source);
@@ -214,7 +216,7 @@ fn target_key_description(
     ro.sort();
     rw.sort();
     let mut value = serde_json::json!({
-        "version":"rabs.private-cargo-target.v1",
+        "version":"rabs.private-cargo-target.v2",
         "scope":scope.0,
         "source":inputs.full_source_digest,
         "workspace":inputs.manifest.digest(),
@@ -361,6 +363,8 @@ impl TargetCache {
                         state.entries.iter().rev().find(|seed| {
                             seed.compatible == Some(compatible)
                                 && !seed.invalidated.load(Ordering::Acquire)
+                                && (seed.source_manifest.digest() == inputs.manifest.digest()
+                                    || source_edits::metadata_seed(seed))
                         })
                     })
                 })
