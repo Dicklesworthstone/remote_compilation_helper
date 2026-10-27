@@ -1169,6 +1169,15 @@ separate the seed family. Immutable registry/Git/vendor inputs remain exact.
 This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
 
+Selected graphs with build scripts or procedural macros use the **complete
+captured source identity** for private target reuse. An unchanged capture can
+reuse its verified target, but any captured file edit starts that graph with a
+cold target. Procedural macros may read data through ordinary filesystem calls
+that do not appear in rustc's dependency information; changing only such a file
+must invalidate the prior expansion even when Cargo would otherwise report the
+consumer as fresh. The more selective source-edit reuse above remains available
+to graphs containing only ordinary compiler units.
+
 The `canonical-compilation-started` stderr record reports
 `private_target_state` as `disabled`, `cold` or `restored`. A failed optional
 restore keeps its partial copy unmounted and runs the current command cold;

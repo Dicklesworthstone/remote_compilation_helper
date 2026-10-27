@@ -761,8 +761,17 @@ impl TargetReuseContext<'_> {
             .ok_or_else(|| invalid("private target requires a captured toolchain"))?;
         let args = compatible_arguments(CARGO, self.args, CargoArtifactMode::Compilation)
             .unwrap_or_else(|| self.args.to_vec());
-        let source = source_edit_identity(self.workspace, self.full_source, self.projection)
-            .unwrap_or(self.full_source);
+        // Build scripts and procedural macros can read captured source/data
+        // without reporting it to Cargo or rustc dep-info. Retiming an edited
+        // file cannot dirty a unit that never declared that file. Such graphs
+        // may reuse an identical snapshot, but every captured source change
+        // must select a cold target until their complete reads are tracked.
+        let source = if self.closed_dependency_execution {
+            self.full_source
+        } else {
+            source_edit_identity(self.workspace, self.full_source, self.projection)
+                .unwrap_or(self.full_source)
+        };
         let mut ro: Vec<_> = self
             .spec
             .ro_binds
@@ -1607,5 +1616,56 @@ mod tests {
         assert_ne!(pure.key(), executors.key());
         executors.closed_dependency_execution = false;
         assert_eq!(pure.key(), executors.key());
+    }
+
+    #[test]
+    fn private_target_executor_graph_binds_untracked_source_bytes_and_membership() {
+        use rabs_sandbox::source_transfer::SourceFile;
+
+        let source_with_data = |bytes: Option<&[u8]>| {
+            let mut files = ReuseKeyFixture::new().source.files().to_vec();
+            if let Some(bytes) = bytes {
+                files.push(SourceFile {
+                    path: "macro-input.txt".into(),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: false,
+                });
+            }
+            SourceManifest::new(files).unwrap()
+        };
+        let mut fixture = ReuseKeyFixture::new();
+        fixture.closed_dependency_execution = true;
+        fixture.source = source_with_data(Some(b"first expansion"));
+        let original = fixture.key();
+
+        for bind in fixture
+            .spec
+            .ro_binds
+            .iter_mut()
+            .chain(&mut fixture.spec.rw_binds)
+        {
+            bind.backing = PathBuf::from("/other-checkout/independent-backing");
+        }
+        assert_eq!(fixture.key(), original, "identical relocated inputs reuse");
+        fixture.source = source_with_data(Some(b"other expansion"));
+        assert_ne!(
+            fixture.key(),
+            original,
+            "untracked data bytes dirty executors"
+        );
+        fixture.source = source_with_data(None);
+        assert_ne!(
+            fixture.key(),
+            original,
+            "missing untracked data dirties executors"
+        );
+
+        let mut cached = ReuseKeyFixture::with_captured_cache(b"workspace", b"dependency");
+        cached.closed_dependency_execution = true;
+        let before = cached.key();
+        let mut edited = ReuseKeyFixture::with_captured_cache(b"edited workspace", b"dependency");
+        edited.closed_dependency_execution = true;
+        assert_ne!(edited.key(), before, "projected source remains exact too");
     }
 }
