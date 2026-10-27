@@ -1062,10 +1062,138 @@ pub fn value(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
     }
 
     #[test]
+    fn real_cargo_assembler_untracked_reads_require_exact_source_identity() {
+        let (owner, root, home, tools) = workspace_fixture();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            root.join("library/Cargo.toml"),
+            "[package]\nname='artifact_library'\nversion='0.1.0'\nedition='2024'\nbuild=false\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("library/src/lib.rs"),
+            r#"
+core::arch::global_asm!(concat!(
+    ".pushsection .rodata.rabs_payload,\"a\"\n.incbin \"",
+    env!("CARGO_MANIFEST_DIR"), "/payload.bin\"\n.popsection"
+));
+pub const VALUE:u32=42;
+"#,
+        )
+        .unwrap();
+        const OLD: &[u8] = b"RABS_UNTRACKED_ASSEMBLER_PAYLOAD_OLD_735891";
+        const NEW: &[u8] = b"RABS_UNTRACKED_ASSEMBLER_PAYLOAD_NEW_735891";
+        fs::write(root.join("library/payload.bin"), OLD).unwrap();
+        let source = manifest(&root);
+        let times = SourceTimestamps::capture(&root, &source, &|| false).unwrap();
+        let target = owner.path().join("assembler-target");
+        private(&target);
+        let archive = |wanted: &[u8], unwanted: &[u8]| {
+            let files = fs::read_dir(target.join("debug/deps"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("libartifact_library")
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "rlib")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(files.len(), 1, "one actual library archive");
+            let bytes = fs::read(&files[0]).unwrap();
+            assert!(bytes.windows(wanted.len()).any(|window| window == wanted));
+            assert!(
+                !bytes
+                    .windows(unwanted.len())
+                    .any(|window| window == unwanted)
+            );
+        };
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            false,
+            false,
+        );
+        archive(OLD, NEW);
+        let retained = owner.path().join("assembler-seed");
+        let snapshot = seed(&target, &retained);
+        restore(
+            &target,
+            &retained,
+            &snapshot,
+            &owner.path().join("assembler-cold-output"),
+        );
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            true,
+            true,
+        );
+        archive(OLD, NEW);
+        fs::write(root.join("library/payload.bin"), NEW).unwrap();
+        let edited = manifest(&root);
+        assert_ne!(source.digest(), edited.digest());
+        assert_eq!(
+            source_edit_identity(&source, source.digest(), None),
+            source_edit_identity(&edited, edited.digest(), None)
+        );
+        let current = SourceTimestamps::capture(&root, &edited, &|| false).unwrap();
+        times
+            .for_edits(&source, &edited, &current, &snapshot, SystemTime::now())
+            .unwrap()
+            .restore_exact(&root, &edited, &|| false)
+            .unwrap();
+        restore(
+            &target,
+            &retained,
+            &snapshot,
+            &owner.path().join("assembler-identical-output"),
+        );
+        // Negative control: LLVM's .incbin file read is absent from rustc
+        // dep-info. Cargo keeps the archive fresh despite the newer input.
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            true,
+            true,
+        );
+        archive(OLD, NEW);
+        fs::rename(
+            &target,
+            owner.path().join("assembler-stale-negative-control"),
+        )
+        .unwrap();
+        private(&target);
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            false,
+            false,
+        );
+        archive(NEW, OLD);
+        let updated_seed = owner.path().join("assembler-updated-seed");
+        let updated_snapshot = seed(&target, &updated_seed);
+        restore(
+            &target,
+            &updated_seed,
+            &updated_snapshot,
+            &owner.path().join("assembler-current-output"),
+        );
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            true,
+            true,
+        );
+        archive(NEW, OLD);
+    }
+
+    #[test]
     fn real_cargo_private_snapshots_restore_freshness_and_rebuild_edited_sources() {
         let (owner, root, home, tools) = workspace_fixture();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        // Match the canonical compile profile's ordinary compiler-only class.
+        // Exercise snapshot/timestamp mechanics with tracked inputs. This is
+        // not codegen-reuse authority: production build keys bind exact source
+        // because other programs may use untracked assembler input reads.
         // The existing fixture's dormant build.rs remains a captured input.
         fs::write(
             root.join("library/Cargo.toml"),

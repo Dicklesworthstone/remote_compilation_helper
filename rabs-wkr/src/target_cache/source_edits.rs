@@ -3,7 +3,9 @@
 //! Cargo tracks local/path-package source mtimes, but does not do so for registry
 //! and Git packages. Keep all directory-source packages (identified by their
 //! checksum document), Cargo/tool configuration and executable inputs exact.
-//! Local source and data files may be edited, added, removed or renamed. Isolated
+//! Only compiler metadata seeds may survive source/data edits. Executable
+//! project code and the integrated assembler can read inputs Cargo never tracks;
+//! retiming those inputs cannot invalidate an already compiled target. Isolated
 //! Cargo-home projections bind their validated cache partition byte-for-byte
 //! before normalizing workspace inputs. The legacy visible-prefix projection
 //! remains exact-source only.
@@ -24,12 +26,232 @@ use super::{Seed, SourceTimes, WorkspaceInputs, checkpoint, invalid};
 use rabs_sandbox::cargo_target::SourceEditPolicy;
 #[cfg(all(test, target_os = "linux"))]
 use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::time::SystemTime;
+
+/// Source-edit normalization is deliberately narrower than exact-source Cargo
+/// target reuse. Native callers may supply controls outside the preparing
+/// launcher's bounded profile, so the worker checks its own actual inputs.
+/// Refusal here keeps command-family reuse with the complete source digest.
+#[cfg(target_os = "linux")]
+pub(super) fn metadata_context_identity(
+    inputs: &WorkspaceInputs,
+    spec: &rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+) -> Option<[u8; 32]> {
+    use rabs_sandbox::artifact_tree::TreeInventory;
+    use std::io::Read;
+
+    if !metadata_environment(&spec.env)
+        || inputs.manifest.files().iter().any(|file| {
+            let path = Path::new(&file.path);
+            file.executable
+                || matches!(
+                    path.extension().and_then(std::ffi::OsStr::to_str),
+                    Some("so" | "dylib" | "dll" | "rlib" | "rmeta")
+                )
+                || file.path.contains(".so.")
+                || (matches!(
+                    path.file_name().and_then(std::ffi::OsStr::to_str),
+                    Some("config" | "config.toml")
+                ) && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == ".cargo"))
+        })
+    {
+        return None;
+    }
+    let family = identity(inputs)?;
+    let tree = TreeInventory::scan(
+        &inputs.root,
+        &BTreeSet::new(),
+        rabs_sandbox::source_transfer::MAX_SOURCE_BYTES,
+        &|| false,
+    )
+    .ok()?;
+    let mut remaining = 8 * 1024 * 1024_u64;
+    for manifest in inputs.manifest.files().iter().filter(|file| {
+        Path::new(&file.path)
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
+    }) {
+        if manifest.len > 1024 * 1024 {
+            return None;
+        }
+        remaining = remaining.checked_sub(manifest.len)?;
+        let mut file = tree.open_file(&manifest.path).ok()?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(manifest.len + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 != manifest.len
+            || <[u8; 32]>::from(Sha256::digest(&bytes)) != manifest.sha256
+        {
+            return None;
+        }
+        tree.verify_file(&manifest.path, &file).ok()?;
+        let manifest: toml::Value = toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
+        // Unstable Cargo manifest extensions can inject a codegen backend or
+        // compiler flags before metadata emission. Their presence is enough
+        // to require exact-source reuse; spelling is parsed, not substring-
+        // matched, so quoted/escaped TOML keys cannot bypass the boundary.
+        if manifest.as_table()?.contains_key("cargo-features")
+            || manifest
+                .get("profile")
+                .is_some_and(profile_injects_compiler)
+        {
+            return None;
+        }
+    }
+    tree.verify(&|| false).ok()?;
+    Some(family)
+}
+
+#[cfg(target_os = "linux")]
+fn profile_injects_compiler(value: &toml::Value) -> bool {
+    value.as_table().is_some_and(|fields| {
+        fields.iter().any(|(name, value)| {
+            matches!(name.as_str(), "rustflags" | "codegen-backend")
+                || profile_injects_compiler(value)
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn metadata_context_identity(
+    _: &WorkspaceInputs,
+    _: &rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+) -> Option<[u8; 32]> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn metadata_environment(environment: &[(String, String)]) -> bool {
+    environment.iter().all(|(name, value)| {
+        if value.is_empty() {
+            return true;
+        }
+        match name.as_str() {
+            "CARGO" => value == "/__rabs/toolchain/bin/cargo",
+            "RUSTC" => value == "/__rabs/toolchain/bin/rustc",
+            "RUSTDOC" => value == "/__rabs/toolchain/bin/rustdoc",
+            "RUSTFLAGS" | "RUSTDOCFLAGS" => scalar_metadata_flags(value.split_whitespace()),
+            "CARGO_ENCODED_RUSTFLAGS" | "CARGO_ENCODED_RUSTDOCFLAGS" => {
+                scalar_metadata_flags(value.split('\u{1f}'))
+            }
+            "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "RUSTC_BOOTSTRAP" | "GLIBC_TUNABLES" => {
+                false
+            }
+            _ => {
+                !name.starts_with("LD_")
+                    && !name.starts_with("DYLD_")
+                    && !name.starts_with("CLIPPY_")
+                    && !name.starts_with("CARGO_PROFILE_")
+                    && !name.starts_with("CARGO_UNSTABLE_")
+                    && !(name.starts_with("CARGO_")
+                        && [
+                            "RUSTFLAGS",
+                            "RUSTDOCFLAGS",
+                            "RUSTC",
+                            "RUSTDOC",
+                            "WRAPPER",
+                            "LINKER",
+                            "RUNNER",
+                            "CONFIG",
+                        ]
+                        .iter()
+                        .any(|control| name.contains(control)))
+            }
+        }
+    })
+}
+
+/// Only scalar controls with no path, plugin, search or executable semantics.
+/// Other perfectly valid flags retain exact-source targets; this is not a
+/// second rustc parser and does not reject the user's compilation itself.
+#[cfg(target_os = "linux")]
+fn scalar_metadata_flags<'a>(mut flags: impl Iterator<Item = &'a str>) -> bool {
+    while let Some(flag) = flags.next() {
+        let value = match flag {
+            "-C" => flags.next(),
+            "-Zincremental-info" => continue,
+            "-Z" if flags.next() == Some("incremental-info") => continue,
+            _ => flag.strip_prefix("-C"),
+        };
+        if !matches!(value, Some("debuginfo=0" | "debuginfo=1" | "debuginfo=2")) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate the COMPLETE retained inventory, including old persisted seeds,
+/// rather than trusting a cached eligibility bit. Only metadata, dep-info and
+/// Cargo's nonexecuting bookkeeping may remain fresh across a source change.
+/// A generated file, executable, archive, object, proc macro, incremental tree
+/// or unknown output makes the seed exact-source-only before any clone begins.
+pub(super) fn metadata_seed(seed: &Seed) -> bool {
+    let mut metadata = false;
+    for (name, file) in &seed.tree.files {
+        if file.mode & 0o111 != 0 {
+            return false;
+        }
+        if matches!(name.as_str(), "CACHEDIR.TAG" | ".rustc_info.json") {
+            continue;
+        }
+        let parts: Vec<_> = name.split('/').collect();
+        let Some(leaf) = parts.last() else {
+            return false;
+        };
+        if *leaf == ".cargo-lock" && parts.len() <= 3 {
+            continue;
+        }
+        if parts
+            .iter()
+            .any(|part| matches!(*part, "build" | "incremental"))
+        {
+            return false;
+        }
+        if parts.len() >= 3 && parts[parts.len() - 2] == "deps" {
+            if leaf.ends_with(".rmeta") {
+                metadata = true;
+                continue;
+            }
+            if leaf.ends_with(".d") {
+                continue;
+            }
+        }
+        if parts.len() >= 4 && parts[parts.len() - 3] == ".fingerprint" {
+            let unit = leaf
+                .strip_prefix("dep-")
+                .or_else(|| leaf.strip_prefix("output-"))
+                .unwrap_or(leaf);
+            if *leaf == "invoked.timestamp"
+                || [
+                    "lib-",
+                    "bin-",
+                    "example-",
+                    "test-lib-",
+                    "test-bin-",
+                    "test-example-",
+                    "test-integration-test-",
+                    "test-bench-",
+                ]
+                .iter()
+                .any(|prefix| unit.starts_with(prefix))
+            {
+                continue;
+            }
+        }
+        return false;
+    }
+    metadata
+}
 
 /// A length-framed family digest retains every non-editable input's name, mode
 /// and bytes. Editable source/data membership is checked by the timestamp planner,
@@ -64,6 +286,11 @@ pub(super) fn timestamps(
     if family.is_none() || family != seed.edit_family {
         return Err(invalid(
             "source edit is outside the retained Cargo seed family",
+        ));
+    }
+    if !metadata_seed(seed) {
+        return Err(invalid(
+            "source edits require a compiler metadata seed without codegen or project executors",
         ));
     }
     let previous: BTreeMap<_, _> = seed
@@ -277,10 +504,27 @@ mod tests {
     }
 
     pub(super) fn stage_fixture(cache: &Arc<TargetCache>, input: WorkspaceInputs) {
+        stage_fixture_with_extra(cache, input, None);
+    }
+
+    fn stage_fixture_with_extra(
+        cache: &Arc<TargetCache>,
+        input: WorkspaceInputs,
+        extra: Option<&str>,
+    ) {
         // Structural target-cache fixture, not a claim of Cargo execution.
-        let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+        let plan =
+            ArtifactPlan::new_tree("cargo".into(), vec!["debug/deps/libfixture.rmeta".into()])
+                .unwrap();
         let target = PreparedArtifacts::new(plan.clone()).unwrap();
-        fs::write(target.backing().join("artifact"), b"retained target").unwrap();
+        write(
+            target.backing(),
+            "debug/deps/libfixture.rmeta",
+            b"retained metadata fixture",
+        );
+        if let Some(extra) = extra {
+            write(target.backing(), extra, b"opaque retained product");
+        }
         let captured = target
             .capture_with_dependency_inputs(None, || false)
             .unwrap();
@@ -308,7 +552,9 @@ mod tests {
         cache: &Arc<TargetCache>,
         input: WorkspaceInputs,
     ) -> (super::super::TargetAttempt, Option<PreparedArtifacts>) {
-        let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+        let plan =
+            ArtifactPlan::new_tree("cargo".into(), vec!["debug/deps/libfixture.rmeta".into()])
+                .unwrap();
         cache
             .acquire(
                 TargetKey(input.full_source_digest),
@@ -397,12 +643,103 @@ mod tests {
     }
 
     #[test]
+    fn codegen_and_executor_seeds_cannot_reuse_changed_sources_even_with_a_matching_family() {
+        for extra in [
+            "debug/deps/libdependency.rlib",
+            "debug/deps/libreader.so",
+            "debug/deps/libreader.dylib",
+            "debug/deps/unit.o",
+            "debug/build/producer-hash/build-script-build",
+            "debug/build/producer-hash/out/generated.rs",
+            "debug/incremental/unit/work-products.bin",
+            "debug/unknown-product",
+        ] {
+            let source = source();
+            let original = observe(source.path());
+            let cache = Arc::new(TargetCache::new(4096).unwrap());
+            stage_fixture_with_extra(&cache, original.clone(), Some(extra));
+            // Identical captures retain the useful complete private target.
+            assert!(restore_fixture(&cache, original).1.is_some(), "{extra}");
+            write(
+                source.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 2 }\n",
+            );
+            let current = observe(source.path());
+            let (attempt, restored) = restore_fixture(&cache, current.clone());
+            assert!(
+                restored.is_none(),
+                "{extra}: codegen cannot borrow metadata reuse"
+            );
+            assert!(
+                attempt.inputs.runtime_owner.is_none(),
+                "refuse before cloning"
+            );
+            assert_eq!(attempt.inputs.manifest.digest(), current.manifest.digest());
+            assert_eq!(
+                cache.state.lock().unwrap().entries.len(),
+                1,
+                "keep the exact-source seed"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_edit_context_refuses_opaque_compiler_controls_and_source_executables() {
+        let source = source();
+        let mut spec = CanonicalNamespaceSpec::new();
+        let original = observe(source.path());
+        assert!(metadata_context_identity(&original, &spec).is_some());
+        for (name, value) in [
+            (
+                "RUSTFLAGS",
+                "--extern=reader=/__rabs/toolchain/lib/libreader.so",
+            ),
+            (
+                "CARGO_ENCODED_RUSTFLAGS",
+                "-Z\u{1f}codegen-backend=/__rabs/workspace/backend.so",
+            ),
+            ("RUSTC_WRAPPER", "/__rabs/workspace/wrapper"),
+            ("CARGO_BUILD_RUSTC_WRAPPER", "/__rabs/workspace/wrapper"),
+            (
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                "--cfg=hidden",
+            ),
+            ("LD_PRELOAD", "/__rabs/workspace/plugin.so"),
+        ] {
+            spec.env = vec![(name.into(), value.into())];
+            assert!(
+                metadata_context_identity(&original, &spec).is_none(),
+                "{name}"
+            );
+        }
+        spec.env = vec![("RUSTFLAGS".into(), "-C debuginfo=0".into())];
+        assert!(metadata_context_identity(&original, &spec).is_some());
+        write(
+            source.path(),
+            "Cargo.toml",
+            "\"cargo\\u002dfeatures\"=['codegen-backend']\n[package]\nname='fixture'\n",
+        );
+        assert!(metadata_context_identity(&observe(source.path()), &spec).is_none());
+        write(source.path(), "Cargo.toml", "[package]\nname='fixture'\n");
+        write(source.path(), "reader.so", b"prebuilt macro");
+        assert!(metadata_context_identity(&observe(source.path()), &spec).is_none());
+        let config = self::source();
+        write(
+            config.path(),
+            ".cargo/config.toml",
+            "[build]\nrustc-wrapper='helper'\n",
+        );
+        assert!(metadata_context_identity(&observe(config.path()), &spec).is_none());
+    }
+
+    #[test]
     fn edited_copy_is_newer_than_fingerprints_without_touching_the_seal_or_target_times() {
         let source = source();
         let cache = Arc::new(TargetCache::new(4096).unwrap());
         stage_fixture(&cache, observe(source.path()));
         let seed = Arc::clone(&cache.state.lock().unwrap().entries[0]);
-        let target_time = seed.tree.files["artifact"].modified;
+        let target_time = seed.tree.files["debug/deps/libfixture.rmeta"].modified;
         let old_source = seed.source.clone();
         write(
             source.path(),
@@ -430,7 +767,7 @@ mod tests {
             old_source.directories["dep"]
         );
         assert_eq!(
-            fs::metadata(restored.backing().join("artifact"))
+            fs::metadata(restored.backing().join("debug/deps/libfixture.rmeta"))
                 .unwrap()
                 .modified()
                 .unwrap(),
@@ -549,7 +886,9 @@ mod tests {
         let changed = observe(root.path());
         let before = SourceTimes::capture(&changed, &|| false).unwrap();
         let stopped = std::cell::Cell::new(false);
-        let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+        let plan =
+            ArtifactPlan::new_tree("cargo".into(), vec!["debug/deps/libfixture.rmeta".into()])
+                .unwrap();
         let result = cache.acquire(
             TargetKey(changed.manifest.digest()),
             identity(&changed).map(TargetKey),
@@ -577,7 +916,7 @@ mod tests {
             let cache = Arc::new(TargetCache::new(4096).unwrap());
             stage_fixture(&cache, observe(root.path()));
             let seed = Arc::clone(&cache.state.lock().unwrap().entries[0]);
-            let target_time = seed.tree.files["artifact"].modified;
+            let target_time = seed.tree.files["debug/deps/libfixture.rmeta"].modified;
             let retained = seed.source.clone();
             match operation {
                 "add" => write(root.path(), "src/new/deep.rs", b"new Rust source"),
@@ -659,7 +998,7 @@ mod tests {
                 assert!(!attempt.times.directories.contains_key("src/nested"));
             }
             assert_eq!(
-                fs::metadata(restored.backing().join("artifact"))
+                fs::metadata(restored.backing().join("debug/deps/libfixture.rmeta"))
                     .unwrap()
                     .modified()
                     .unwrap(),
@@ -778,7 +1117,8 @@ mod tests {
             }
             let changed = observe(root.path());
             let before = SourceTimes::capture(&changed, &|| false).unwrap();
-            let latest = seed.tree.files["artifact"].modified + Duration::from_secs(10);
+            let latest =
+                seed.tree.files["debug/deps/libfixture.rmeta"].modified + Duration::from_secs(10);
             assert!(timestamps(&seed, &changed, latest, &|| false).is_err());
             let (attempt, restored) = restore_fixture(&cache, changed.clone());
             assert!(restored.is_none());
@@ -806,7 +1146,9 @@ mod tests {
         );
         let stop = std::cell::Cell::new(false);
         let output_path = std::cell::RefCell::new(None::<PathBuf>);
-        let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+        let plan =
+            ArtifactPlan::new_tree("cargo".into(), vec!["debug/deps/libfixture.rmeta".into()])
+                .unwrap();
         let result = cache.acquire(
             TargetKey(current.manifest.digest()),
             identity(&current).map(TargetKey),
@@ -839,7 +1181,9 @@ mod tests {
             "src/added.rs",
             b"different bytes after observation",
         );
-        let plan = ArtifactPlan::new_tree("cargo".into(), vec!["artifact".into()]).unwrap();
+        let plan =
+            ArtifactPlan::new_tree("cargo".into(), vec!["debug/deps/libfixture.rmeta".into()])
+                .unwrap();
         assert!(
             cache
                 .acquire(
@@ -1199,7 +1543,90 @@ fn main() { println!("{}", answer()); }
     }
 
     #[test]
-    fn real_incremental_state_stays_private_and_survives_edits_and_worker_restart() {
+    fn real_cargo_check_metadata_reuses_unchanged_dependencies_after_source_and_data_edits() {
+        let fixture = CargoFixture::new();
+        let manifest = fs::read_to_string(fixture.source.join("Cargo.toml")).unwrap();
+        fixture.edit(
+            "Cargo.toml",
+            manifest.replace("edition='2021'", "edition='2021'\nbuild=false"),
+        );
+        write(&fixture.source, "value.txt", b"1");
+        fixture.edit("src/main.rs", "fn main(){let _=edit_dep::value()+include_str!(\"../value.txt\").parse::<u32>().unwrap();}\n");
+        let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+        let cold = fixture.run(&cache, "check", false);
+        cold.fresh("edit_dep", false);
+        cold.fresh("edit_app", false);
+        fixture.edit("value.txt", b"2");
+        let edited = fixture.run(&cache, "check", true);
+        edited.fresh("edit_dep", true);
+        edited.fresh("edit_app", false);
+        fixture.run(&cache, "check", true).fresh("edit_app", true);
+        fixture.edit("src/main.rs", "fn main(){let _=edit_dep::value()+3;}\n");
+        let changed = fixture.run(&cache, "check", true);
+        changed.fresh("edit_dep", true);
+        changed.fresh("edit_app", false);
+    }
+
+    #[test]
+    fn real_cargo_worker_target_refuses_stale_untracked_macro_reads_after_a_data_edit() {
+        let fixture = CargoFixture::new();
+        write(
+            &fixture.source,
+            "reader/Cargo.toml",
+            "[package]\nname='untracked_reader'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+        );
+        write(
+            &fixture.source,
+            "reader/src/lib.rs",
+            r#"extern crate proc_macro;
+#[proc_macro] pub fn value(_:proc_macro::TokenStream)->proc_macro::TokenStream {
+    let root=std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
+    std::fs::read_to_string(std::path::Path::new(&root).join("macro-value.txt")).unwrap().parse().unwrap()
+}
+"#,
+        );
+        let manifest = fs::read_to_string(fixture.source.join("Cargo.toml")).unwrap();
+        fixture.edit(
+            "Cargo.toml",
+            format!("{manifest}untracked_reader={{path='reader'}}\n"),
+        );
+        fixture.edit(
+            "src/main.rs",
+            MAIN.replace("OFFSET", "untracked_reader::value!()"),
+        );
+        write(&fixture.source, "macro-value.txt", b"1u32");
+        let lock = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&fixture.source)
+            .output()
+            .unwrap();
+        assert!(
+            lock.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
+        assert_eq!(
+            fixture.run(&cache, "build", false).output.unwrap().0,
+            b"12\n"
+        );
+        assert_eq!(
+            fixture.run(&cache, "build", true).output.unwrap().0,
+            b"12\n"
+        );
+        fixture.edit("macro-value.txt", b"2u32");
+        // The real target pool must refuse before cloning the old fingerprint.
+        // Merely retiming macro-value.txt would leave Cargo's consumer fresh.
+        let changed = fixture.run(&cache, "build", false);
+        changed.fresh("edit_app", false);
+        assert_eq!(changed.output.unwrap().0, b"13\n");
+        let repeat = fixture.run(&cache, "build", true);
+        repeat.fresh("edit_app", true);
+        assert_eq!(repeat.output.unwrap().0, b"13\n");
+    }
+
+    #[test]
+    fn real_incremental_state_stays_private_but_source_edits_start_cold_after_restart() {
         let fixture = CargoFixture::with_incremental();
         let disk = private_directory("rabs-real-incremental-target-").unwrap();
         let capacity = 128 * 1024 * 1024;
@@ -1222,30 +1649,30 @@ fn main() { println!("{}", answer()); }
         }
         drop(cache);
 
-        // Preserve the uploaded file's old mtime: the real source-edit planner
-        // must invalidate Cargo while rustc still reuses its verified session.
+        // Preserve the uploaded file's old mtime. Codegen state cannot survive
+        // a source change without an enforced closure for assembler reads.
         fixture.edit("src/main.rs", MAIN.replace("OFFSET", "2"));
         let cache = Arc::new(
             TargetCache::open_persistent(capacity, disk.path(), "native-incremental-v1").unwrap(),
         );
-        let edited = fixture.run(&cache, "build", true);
-        edited.fresh("edit_dep", true);
+        let edited = fixture.run(&cache, "build", false);
+        edited.fresh("edit_dep", false);
         edited.fresh("edit_app", false);
         assert_eq!(edited.output.unwrap().0, b"13\n");
-        assert!(
-            edited.incremental_reused_files > 0,
-            "rustc did not reuse prior state"
-        );
+        assert_eq!(edited.incremental_reused_files, 0);
+        let repeat = fixture.run(&cache, "build", true);
+        repeat.fresh("edit_dep", true);
+        repeat.fresh("edit_app", true);
         drop(cache);
 
         fixture.edit("dep/src/lib.rs", "pub fn value() -> u32 { 2 }\n");
         let cache = Arc::new(
             TargetCache::open_persistent(capacity, disk.path(), "native-incremental-v1").unwrap(),
         );
-        let dependent = fixture.run(&cache, "build", true);
+        let dependent = fixture.run(&cache, "build", false);
         dependent.fresh("edit_dep", false);
         dependent.fresh("edit_app", false);
-        assert!(dependent.incremental_reused_files > 0);
+        assert_eq!(dependent.incremental_reused_files, 0);
         let expected = dependent.output.unwrap();
         assert_eq!(expected.0, b"14\n");
         let rebuilt = fixture.run(
@@ -1272,24 +1699,24 @@ fn main() { println!("{}", answer()); }
     }
 
     #[test]
-    fn real_cargo_edits_rebuild_changed_units_keep_dependencies_and_match_a_cold_build() {
+    fn real_cargo_codegen_edits_start_cold_and_match_an_independent_build() {
         let fixture = CargoFixture::new();
         let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
         let cold = fixture.run(&cache, "build", false);
         cold.fresh("edit_dep", false);
         assert_eq!(cold.output.unwrap().0, b"11\n");
         fixture.edit("src/main.rs", MAIN.replace("OFFSET", "2"));
-        let edited = fixture.run(&cache, "build", true);
-        edited.fresh("edit_dep", true);
+        let edited = fixture.run(&cache, "build", false);
+        edited.fresh("edit_dep", false);
         edited.fresh("edit_app", false);
         assert_eq!(edited.output.unwrap().0, b"13\n");
         fixture.edit("build.rs", BUILD.replace("GENERATED", "20"));
-        let generated = fixture.run(&cache, "build", true);
-        generated.fresh("edit_dep", true);
+        let generated = fixture.run(&cache, "build", false);
+        generated.fresh("edit_dep", false);
         generated.fresh("build-script-build", false);
         assert_eq!(generated.output.unwrap().0, b"23\n");
         fixture.edit("dep/src/lib.rs", "pub fn value() -> u32 { 2 }\n");
-        let dependent = fixture.run(&cache, "build", true);
+        let dependent = fixture.run(&cache, "build", false);
         dependent.fresh("edit_dep", false);
         dependent.fresh("edit_app", false);
         let expected = dependent.output.unwrap();
@@ -1305,7 +1732,7 @@ fn main() { println!("{}", answer()); }
     }
 
     #[test]
-    fn real_cargo_embedded_text_and_binary_edits_reuse_dependencies_and_match_cold_outputs() {
+    fn real_cargo_codegen_data_edits_start_cold_then_exact_source_reuses_outputs() {
         let fixture = CargoFixture::new();
         write(&fixture.source, "assets/number.txt", b"2");
         write(&fixture.source, "assets/number.bin", [3]);
@@ -1320,19 +1747,18 @@ fn main() { println!("{}", answer()); }
         let first = fixture.run(&cache, "build", false);
         first.fresh("edit_dep", false);
         assert_eq!(first.output.unwrap().0, b"16\n");
-        // Same-length byte changes with the original mtime must invalidate the
-        // application through rustc's recorded include dependencies, while its
-        // unchanged local dependency and build-script compiler remain fresh.
+        // A complete codegen seed may also contain untracked assembler or
+        // executor reads. Every changed capture selects a cold target.
         fixture.edit("assets/number.txt", b"5");
-        let text = fixture.run(&cache, "build", true);
-        text.fresh("edit_dep", true);
-        text.fresh("build-script-build", true);
+        let text = fixture.run(&cache, "build", false);
+        text.fresh("edit_dep", false);
+        text.fresh("build-script-build", false);
         text.fresh("edit_app", false);
         assert_eq!(text.output.unwrap().0, b"19\n");
         fixture.edit("assets/number.bin", [7]);
-        let binary = fixture.run(&cache, "build", true);
-        binary.fresh("edit_dep", true);
-        binary.fresh("build-script-build", true);
+        let binary = fixture.run(&cache, "build", false);
+        binary.fresh("edit_dep", false);
+        binary.fresh("build-script-build", false);
         binary.fresh("edit_app", false);
         let expected = binary.output.unwrap();
         assert_eq!(expected.0, b"23\n");
@@ -1360,14 +1786,14 @@ fn main() { println!("{}", answer()); }
         let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
         assert_eq!(fixture.run(&cache, "test", false).test_runs, 1);
         fixture.edit("src/main.rs", MAIN.replace("OFFSET", "7"));
-        let edited = fixture.run(&cache, "test", true);
-        edited.fresh("edit_dep", true);
+        let edited = fixture.run(&cache, "test", false);
+        edited.fresh("edit_dep", false);
         assert_eq!(
-            edited.test_runs, 2,
+            edited.test_runs, 1,
             "compiled state is never a cached test result"
         );
         let unchanged = fixture.run(&cache, "test", true);
-        assert_eq!(unchanged.test_runs, 3);
+        assert_eq!(unchanged.test_runs, 2);
         let mut manifest = fs::read(fixture.source.join("Cargo.toml")).unwrap();
         manifest.extend_from_slice(b"\n# changed Cargo manifest\n");
         fixture.edit("Cargo.toml", manifest);
@@ -1377,7 +1803,7 @@ fn main() { println!("{}", answer()); }
     }
 
     #[test]
-    fn real_cargo_module_add_rename_remove_reuses_dependencies_and_matches_cold_outputs() {
+    fn real_cargo_codegen_module_membership_changes_start_cold_and_match_outputs() {
         let fixture = CargoFixture::new();
         let cache = Arc::new(TargetCache::new(128 * 1024 * 1024).unwrap());
         assert_eq!(
@@ -1393,8 +1819,8 @@ fn main() { println!("{}", answer()); }
             "src/main.rs",
             format!("mod extra;\n{}", MAIN.replace("OFFSET", "extra::bonus()")),
         );
-        let added = fixture.run(&cache, "build", true);
-        added.fresh("edit_dep", true);
+        let added = fixture.run(&cache, "build", false);
+        added.fresh("edit_dep", false);
         added.fresh("edit_app", false);
         assert_eq!(added.output.unwrap().0, b"14\n");
 
@@ -1410,8 +1836,8 @@ fn main() { println!("{}", answer()); }
                 MAIN.replace("OFFSET", "renamed::bonus()")
             ),
         );
-        let renamed = fixture.run(&cache, "build", true);
-        renamed.fresh("edit_dep", true);
+        let renamed = fixture.run(&cache, "build", false);
+        renamed.fresh("edit_dep", false);
         renamed.fresh("edit_app", false);
         assert_eq!(renamed.output.unwrap().0, b"14\n");
 
@@ -1420,11 +1846,11 @@ fn main() { println!("{}", answer()); }
             fixture.root.path().join("retired-module.rs"),
         )
         .unwrap();
-        // Different from the initial exact key: this must restore the most
-        // recent compatible seed and genuinely handle the removed member.
+        // Different from the initial exact key: the removed member must not
+        // be resurrected from any older compiled target.
         fixture.edit("src/main.rs", MAIN.replace("OFFSET", "5"));
-        let removed = fixture.run(&cache, "build", true);
-        removed.fresh("edit_dep", true);
+        let removed = fixture.run(&cache, "build", false);
+        removed.fresh("edit_dep", false);
         removed.fresh("edit_app", false);
         let expected = removed.output.unwrap();
         assert_eq!(expected.0, b"16\n");
@@ -1482,11 +1908,11 @@ fn main() {
             b"106\n"
         );
         fixture.edit(&left, b"7");
-        let edited = fixture.run(&cache, "build", true);
-        edited.fresh("edit_dep", true);
-        edited.fresh("build-script-build", true);
+        let edited = fixture.run(&cache, "build", false);
+        edited.fresh("edit_dep", false);
+        edited.fresh("build-script-build", false);
         edited.fresh("edit_app", false);
-        assert_eq!(edited.output.unwrap().0, b"211\n");
+        assert_eq!(edited.output.unwrap().0, b"111\n");
         write(&fixture.source, &added, b"5");
         File::open(fixture.source.join(&added))
             .unwrap()
@@ -1494,27 +1920,27 @@ fn main() {
                 FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
             )
             .unwrap();
-        let added = fixture.run(&cache, "build", true);
-        added.fresh("edit_dep", true);
-        assert_eq!(added.output.unwrap().0, b"316\n");
+        let added = fixture.run(&cache, "build", false);
+        added.fresh("edit_dep", false);
+        assert_eq!(added.output.unwrap().0, b"116\n");
         fs::rename(
             fixture.source.join("scan/nested"),
             fixture.root.path().join("removed-scan"),
         )
         .unwrap();
-        let removed = fixture.run(&cache, "build", true);
-        removed.fresh("edit_dep", true);
-        assert_eq!(removed.output.unwrap().0, b"413\n");
+        let removed = fixture.run(&cache, "build", false);
+        removed.fresh("edit_dep", false);
+        assert_eq!(removed.output.unwrap().0, b"113\n");
         fs::rename(
             fixture.source.join("scan/new"),
             fixture.source.join("scan/renamed"),
         )
         .unwrap();
-        let renamed = fixture.run(&cache, "build", true);
-        renamed.fresh("edit_dep", true);
+        let renamed = fixture.run(&cache, "build", false);
+        renamed.fresh("edit_dep", false);
         assert_eq!(
             renamed.output.unwrap().0,
-            b"513\n",
+            b"113\n",
             "same-byte rename must rerun the scanner"
         );
         // An exact repeat must remain genuinely fresh, not invalidate the
@@ -1523,7 +1949,7 @@ fn main() {
         unchanged.fresh("edit_dep", true);
         unchanged.fresh("build-script-build", true);
         unchanged.fresh("edit_app", true);
-        assert_eq!(unchanged.output.unwrap().0, b"513\n");
+        assert_eq!(unchanged.output.unwrap().0, b"113\n");
     }
 
     #[test]
@@ -1555,12 +1981,12 @@ fn main() {
             fixture.root.path().join("removed-input"),
         )
         .unwrap();
-        let removed = fixture.run(&cache, "build", true);
-        removed.fresh("edit_dep", true);
-        assert_eq!(removed.output.unwrap().0, b"203\n");
+        let removed = fixture.run(&cache, "build", false);
+        removed.fresh("edit_dep", false);
+        assert_eq!(removed.output.unwrap().0, b"103\n");
         assert_eq!(
             fixture.run(&cache, "build", true).output.unwrap().0,
-            b"203\n"
+            b"103\n"
         );
     }
 }

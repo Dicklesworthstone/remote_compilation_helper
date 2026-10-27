@@ -5,7 +5,7 @@ ordinary completed compile, lint or program failures, then seed later builds wit
 independently owned copies. Cargo or Clippy executes on every request and
 decides which compilation steps are fresh. This accelerates repeated commands,
 ordinary build/check/test/run/bench transitions, changes to package or target selection,
-and Clippy runs across local source and data edits. Every request still executes
+and eligible compiler-only metadata checks across local source and data edits. Every request still executes
 its current command and verifies its current result.
 
 ## Enable it on a worker
@@ -108,7 +108,7 @@ continue to return their complete regular-file trees.
 The retained seed contains the complete target, including rustc's dep-graph,
 query-cache and work products. A new execution receives its own writable copy;
 the retained seed and concurrent attempts share no writable inodes. Cargo and
-rustc validate that state during the current command. Normal edits can reuse
+rustc validate that state during the current command. Identical source captures can reuse
 it, and persistent mode can retain it across worker restarts under the same
 runtime epoch. Requested tests, programs and benchmarks always execute again.
 
@@ -233,13 +233,31 @@ including that actual grant, participates in the match.
 
 ### Reuse after local source and data edits
 
-For a workspace with local/path packages, a compatible target can survive edits,
-additions, removals and renames of ordinary non-executable source and data files.
-This includes `.rs` files and `build.rs`, text and binary assets consumed through
-`include_str!` or `include_bytes!`, and schemas, templates, headers or other
-inputs tracked by build scripts. Cargo applies its usual dep-info and
-`rerun-if-changed` rules to the current bytes and restored target. Build scripts
-remain responsible for declaring the inputs they read.
+For a workspace with local/path packages, a compiler-only metadata target can
+survive edits, additions, removals and renames of ordinary source and data files.
+Before cloning a changed-source seed, the worker checks its complete retained
+inventory. It must contain only `.rmeta`, dep-info, and ordinary Cargo fingerprint
+or bookkeeping files. A compiled archive, executable, proc-macro library, build
+script, generated output, incremental tree or unknown product makes that seed
+exact-source-only. The worker rechecks old persisted seeds using the same rule.
+
+This boundary prevents stale output from procedural macros and build scripts
+that read files without declaring them, and from LLVM assembler `.incbin`
+reads omitted from rustc dep-info. Making an untracked file newer cannot dirty
+a Cargo unit that never recorded it. Compiled builds and executor-bearing
+checks therefore start cold after source changes. Identical captures still
+reuse complete private targets across supported command and selection changes.
+Compiler-only check seeds can still keep unchanged dependencies fresh after
+ordinary Rust, `include_str!`, or `include_bytes!` edits.
+
+The worker also keeps source bytes exact when supplied controls make this
+metadata class ambiguous: source executables or prebuilt Rust/dynamic libraries,
+captured `.cargo/config` files, Cargo manifests using unstable `cargo-features`
+or compiler-injecting profile settings,
+compiler wrappers, loader injection, or compiler flags outside the bounded
+scalar profile. These are optional target-reuse restrictions; the original
+requested compilation still executes. The target-policy epoch separates older
+generations that could have retained stale outputs under a broader policy.
 
 `Cargo.toml`, `Cargo.lock`, `rust-toolchain`, `rust-toolchain.toml`, `clippy.toml`,
 `.clippy.toml`, all `.cargo` and `.git` descendants, `.gitignore`, `.gitattributes`,
@@ -271,8 +289,8 @@ Unchanged files receive their retained timestamps in the new private workspace.
 Edited or added files and all surviving parent directories of changed, added,
 removed or renamed files receive the current worker time. On membership changes,
 ancestor `Cargo.toml` files also receive that time, without changing their bytes,
-so default package-scanning build scripts cannot miss a deletion with no changed
-file left behind. Unrelated packages retain their previous timestamps.
+so membership changes also invalidate the appropriate Cargo package records.
+Unrelated metadata-only packages retain their previous timestamps.
 
 The current worker time must be strictly later than every retained source and
 target timestamp, including Cargo's fingerprint and build-script records.
@@ -296,8 +314,9 @@ or a test, application or benchmark fails. The worker can retain that complete p
 restore it for the next command. Cargo reads its own fingerprints, rebuilds
 unfinished or changed units, and executes the requested programs again. A repeated
 failing command still returns its nonzero status and current diagnostics;
-fixing the source can reuse completed dependencies without treating the earlier
-failure as a successful result.
+fixing the source can reuse an eligible metadata-only seed without treating the
+earlier failure as a successful result. A failure seed containing codegen or
+project executors requires the identical captured source.
 
 Failure seeds have no successful artifact offer. Missing final outputs are
 never invented, and no failed target tree is delivered as a completed build.

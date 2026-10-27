@@ -311,13 +311,20 @@ allowing Cargo to skip compilation it considers fresh. An exact invocation is
 preferred; compatible `build`, `check`, `test`, `run` and `bench` commands can
 share a target when their other compilation settings match. Cargo still executes
 each current request, including its selected programs and runtime arguments.
-Ordinary local source and data edits can retain compiled dependencies: changed
-inputs and their surviving ancestor directories receive timestamps newer than
-the retained target, and Cargo applies its own freshness checks. Embedded text
-or binary assets and declared build-script inputs follow the same path. Cargo
-manifests, lockfiles, configuration, executable inputs, immutable dependency
-sources, environment, toolchain, feature, or effective job-grant changes still
-start with a fresh target.
+Ordinary local source and data edits can retain compiler metadata from an
+eligible check. The complete retained target must contain only metadata,
+dep-info and recognized Cargo bookkeeping. Changed inputs and their surviving
+ancestor directories receive timestamps newer than the retained target, and
+Cargo applies its own freshness checks. A target containing archives, object
+files, executables, generated outputs or incremental state requires the complete
+source capture to remain identical. Procedural macros, build scripts and the
+integrated assembler can read files that Cargo does not track; retiming those
+files cannot make a previously compiled consumer stale. Compiler injection,
+captured Cargo configuration and ambiguous manifest controls also disable
+source-edit reuse. Manifests, lockfiles, immutable dependency sources,
+environment, toolchain and effective job-grant changes select a different
+target family. An older eligible metadata seed can still be selected when a
+newer codegen seed cannot be reused after an edit.
 
 A completed ordinary compiler, test, run or benchmark failure can also retain its private
 target after verified process cleanup. The next request executes Cargo again
@@ -563,8 +570,10 @@ options; the launcher does not change optimization settings to enable reuse.
 
 Enable [worker-local target retention](rabs-target-state.md) to keep useful state
 between operations. Every execution still runs its requested Cargo command in a
-private target tree. A compatible seed can contain the complete prior incremental
-state, and rustc decides which work products remain usable after source edits.
+private target tree. With identical captured source, a compatible seed can
+contain the complete prior incremental state. A source edit starts a fresh
+target when the retained inventory contains codegen or incremental products;
+those products do not inherit the metadata-only source-edit policy.
 Changing the explicit incremental policy, compiler, profile, target or
 other keyed compilation controls selects a different target family. Without
 target retention, the command uses fresh private incremental storage.
