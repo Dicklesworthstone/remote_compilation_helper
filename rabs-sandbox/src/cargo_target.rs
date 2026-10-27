@@ -17,6 +17,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// Verified private target copies and Cargo source timestamp restoration.
+#[cfg(target_os = "linux")]
+pub mod state;
+
 /// Which local source/data files Cargo may recheck after a private seed restore.
 /// Directory sources are immutable as a whole: Cargo does not track their
 /// ordinary source mtimes as it tracks local/path packages.

@@ -782,6 +782,316 @@ fn real_cargo_source_edit_family_reuses_dependencies_across_commands_and_members
     );
 }
 
+/// The driver keeps Cargo-visible paths stable while replacing their hidden
+/// backing directories. These stock-Cargo tests reproduce that replacement at
+/// one stable host path, exercising the production snapshot/timestamp helpers.
+/// They establish private-copy and Cargo freshness behavior; the separate
+/// canonical driver tests establish namespace relocation and cache serving.
+mod private_target_state {
+    use super::*;
+    use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
+    use std::fs::File;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::time::SystemTime;
+
+    const BUDGET: u64 = 128 * 1024 * 1024;
+
+    fn private(path: &Path) {
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
+
+    fn manifest(root: &Path) -> SourceManifest {
+        let captured = capture_sealed_source(
+            &[("workspace".to_owned(), root.to_path_buf())],
+            false,
+            3,
+            1024 * 1024,
+        )
+        .unwrap();
+        SourceManifest::new(
+            captured
+                .manifest("workspace")
+                .unwrap()
+                .members
+                .iter()
+                .filter_map(|(path, member)| match member {
+                    MemberKind::Regular {
+                        size,
+                        content_sha256,
+                        mode,
+                        ..
+                    } => Some(SourceFile {
+                        path: path.clone(),
+                        len: *size,
+                        sha256: *content_sha256,
+                        executable: mode & 0o111 != 0,
+                    }),
+                    MemberKind::Directory => None,
+                    MemberKind::Symlink { .. } => panic!("fixture has no source symlinks"),
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn compile(
+        tools: &Path,
+        root: &Path,
+        home: &Path,
+        target: &Path,
+        mode: &str,
+        selection: &[&str],
+    ) -> Vec<serde_json::Value> {
+        let output = cargo(tools, root, home)
+            .args([
+                mode,
+                "--workspace",
+                "--offline",
+                "--locked",
+                "--message-format=json",
+                "--target-dir",
+            ])
+            .arg(target)
+            .args(selection)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode} {selection:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let report = CargoArtifactReport::read(
+            output.stdout.as_slice(),
+            target.to_str().unwrap(),
+            CargoArtifactMode::Compilation,
+        )
+        .unwrap();
+        assert!(!validated_products(target, &report).is_empty());
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .collect()
+    }
+
+    fn freshness(artifacts: &[serde_json::Value], library: bool, app: bool) {
+        for (name, expected) in [("artifact_library", library), ("artifact_app", app)] {
+            let selected = artifacts
+                .iter()
+                .filter(|artifact| artifact["target"]["name"] == name)
+                .collect::<Vec<_>>();
+            assert_eq!(selected.len(), 1, "one compiled target for {name}");
+            assert_eq!(selected[0]["fresh"], expected, "{name}: {artifacts:?}");
+        }
+    }
+
+    fn run(target: &Path, expected: u32) {
+        let output = Command::new(target.join("debug/artifact_app"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, format!("{expected}\n").as_bytes());
+    }
+
+    fn seed(target: &Path, destination: &Path) -> PrivateTreeSnapshot {
+        let snapshot = PrivateTreeSnapshot::capture(target, BUDGET, &|| false).unwrap();
+        assert!(snapshot.total_bytes() > 0);
+        private(destination);
+        snapshot
+            .restore_into(target, destination, &|| false)
+            .unwrap();
+        snapshot
+    }
+
+    fn restore(target: &Path, seed: &Path, snapshot: &PrivateTreeSnapshot, retired: &Path) {
+        fs::rename(target, retired).unwrap();
+        private(target);
+        snapshot.restore_into(seed, target, &|| false).unwrap();
+        let installed = fs::metadata(target.join("debug/artifact_app")).unwrap();
+        let retained = fs::metadata(seed.join("debug/artifact_app")).unwrap();
+        let delivered = fs::metadata(retired.join("debug/artifact_app")).unwrap();
+        assert_ne!(
+            (installed.dev(), installed.ino()),
+            (retained.dev(), retained.ino())
+        );
+        assert_ne!(
+            (delivered.dev(), delivered.ino()),
+            (retained.dev(), retained.ino())
+        );
+    }
+
+    #[test]
+    fn real_cargo_private_snapshots_restore_freshness_and_rebuild_edited_sources() {
+        let (owner, root, home, tools) = workspace_fixture();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        // Match the canonical compile profile's ordinary compiler-only class.
+        // The existing fixture's dormant build.rs remains a captured input.
+        fs::write(
+            root.join("library/Cargo.toml"),
+            "[package]\nname='artifact_library'\nversion='0.1.0'\nedition='2024'\nbuild=false\n",
+        )
+        .unwrap();
+        fs::write(root.join("library/src/lib.rs"), "pub const VALUE:u32=42;\n").unwrap();
+        fs::write(
+            root.join("app/Cargo.toml"),
+            "[package]\nname='artifact_app'\nversion='0.1.0'\nedition='2024'\n\
+             [dependencies]\nartifact_library={path='../library'}\n\
+             [features]\nextra=[]\n",
+        )
+        .unwrap();
+        let app_source = |extra: u32| {
+            format!(
+                "fn main(){{println!(\"{{}}\",artifact_library::VALUE+{extra}+u32::from(cfg!(feature=\"extra\"))*100);}}\n"
+            )
+        };
+        fs::write(root.join("app/src/main.rs"), app_source(0)).unwrap();
+        let source = manifest(&root);
+        let times = SourceTimestamps::capture(&root, &source, &|| false).unwrap();
+        let target = owner.path().join("private-target");
+        private(&target);
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            false,
+            false,
+        );
+        run(&target, 42);
+
+        let retained = owner.path().join("retained-target");
+        let snapshot = seed(&target, &retained);
+        let old_source = owner.path().join("source-before-recapture");
+        fs::rename(&root, &old_source).unwrap();
+        private(&root);
+        // Real source recapture creates independent files with new mtimes.
+        // Restoring those times is necessary for Cargo's existing fingerprints.
+        for file in source.files() {
+            let destination = root.join(&file.path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(old_source.join(&file.path), &destination).unwrap();
+            File::open(destination)
+                .unwrap()
+                .set_modified(SystemTime::now())
+                .unwrap();
+        }
+        times.restore_exact(&root, &source, &|| false).unwrap();
+        let delivered = owner.path().join("delivered-cold-target");
+        restore(&target, &retained, &snapshot, &delivered);
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            true,
+            true,
+        );
+        run(&target, 42);
+
+        // A caller may mutate its delivered executable. The retained seed and
+        // the next private target must never share that writable inode.
+        fs::write(
+            delivered.join("debug/artifact_app"),
+            b"caller replaced output",
+        )
+        .unwrap();
+        restore(
+            &target,
+            &retained,
+            &snapshot,
+            &owner.path().join("delivered-warm-target"),
+        );
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            true,
+            true,
+        );
+        run(&target, 42);
+
+        fs::write(root.join("app/src/main.rs"), app_source(1)).unwrap();
+        let edited = manifest(&root);
+        assert_ne!(edited.digest(), source.digest());
+        assert_eq!(
+            source_edit_identity(&edited, edited.digest(), None),
+            source_edit_identity(&source, source.digest(), None),
+        );
+        let current_times = SourceTimestamps::capture(&root, &edited, &|| false).unwrap();
+        let edited_times = times
+            .for_edits(
+                &source,
+                &edited,
+                &current_times,
+                &snapshot,
+                SystemTime::now(),
+            )
+            .unwrap();
+        edited_times
+            .restore_exact(&root, &edited, &|| false)
+            .unwrap();
+        restore(
+            &target,
+            &retained,
+            &snapshot,
+            &owner.path().join("delivered-before-edit"),
+        );
+        freshness(
+            &compile(&tools, &root, &home, &target, "build", &[]),
+            true,
+            false,
+        );
+        run(&target, 43);
+
+        let edited_seed = owner.path().join("edited-seed");
+        let edited_snapshot = seed(&target, &edited_seed);
+        restore(
+            &target,
+            &edited_seed,
+            &edited_snapshot,
+            &owner.path().join("delivered-edited"),
+        );
+        freshness(
+            &compile(
+                &tools,
+                &root,
+                &home,
+                &target,
+                "build",
+                &["--features=extra"],
+            ),
+            true,
+            false,
+        );
+        run(&target, 143);
+
+        // Check emits its own compiler artifacts. Run it once, retain the real
+        // result, then demand Cargo's fresh report from an independently copied
+        // target generation instead of assuming build/check compatibility.
+        compile(&tools, &root, &home, &target, "check", &[]);
+        let checked_seed = owner.path().join("checked-seed");
+        let checked_snapshot = seed(&target, &checked_seed);
+        restore(
+            &target,
+            &checked_seed,
+            &checked_snapshot,
+            &owner.path().join("delivered-checked"),
+        );
+        freshness(
+            &compile(&tools, &root, &home, &target, "check", &[]),
+            true,
+            true,
+        );
+
+        // The metadata document is not authority for altered retained bytes.
+        // A corrupt seed must be rejected before the caller selects it as the
+        // next target; there is deliberately no Cargo run after this refusal.
+        fs::write(checked_seed.join("debug/artifact_app"), b"corrupt seed").unwrap();
+        let rejected = owner.path().join("rejected-private-target");
+        private(&rejected);
+        assert!(
+            checked_snapshot
+                .restore_into(&checked_seed, &rejected, &|| false)
+                .is_err()
+        );
+        run(&target, 143);
+    }
+}
+
 #[test]
 fn real_clippy_uses_captured_companions_and_denied_lints_cannot_report_success() {
     let (owner, root, home, tools) = workspace_fixture();
