@@ -78,10 +78,14 @@ command arguments replace the profile's command and selection, including an
 empty selection for ordinary `check`; the manifest and jobs come from the profile.
 Cargo's actual unit graph determines admission before the cache endpoint is exposed.
 Supported external metadata and isolated archive dependencies may earn a compiler
-skip; workspace units still compile. Successful builds retain their target tree
+skip; workspace units use Cargo's ordinary freshness decisions. Successful builds retain their target tree
 at the private output path reported by the native driver. `build --tests` compiles
-harnesses without running them. Build scripts and procedural
-macros required by the selected units currently refuse this mode.
+harnesses without running them. Selected build scripts and procedural macros run
+under Cargo; those builds use only isolated dependency workers for cache
+publication and replay. Without a worker, their units compile normally without
+local action-cache authority. Generated-input and proc-macro units retain their
+existing per-action cache restrictions. The optional target_cache profile field
+retains verified private Cargo target state under an explicit host runtime epoch.
 The launcher retains the exact native profile in a new private operation
 directory and execs rabsd once. It starts no ordinary daemon, Cargo or RCH itself,
 and never falls back or retries. Native namespace, source capture, release

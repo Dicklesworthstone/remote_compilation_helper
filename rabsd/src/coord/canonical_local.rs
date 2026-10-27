@@ -6,11 +6,12 @@
 //! fresh operation-scoped socket admits only rustc requests; the persistent
 //! CAS and the ordinary daemon socket are never visible to the build.
 //!
-//! The actual selected Cargo unit graph must contain no build scripts or
-//! procedural macros. Inactive package targets do not grant code execution.
-//! Eligible external dependencies use the existing evidence-gated lane;
-//! archive codegen requires an isolated worker. Workspace crates and unsupported rustc invocations still compile
-//! normally in the namespace; this does not promote a workspace cache class.
+//! The selected Cargo unit graph identifies active build scripts and procedural
+//! macros. Their presence disables local compiler-result authority for the whole
+//! operation; eligible dependency caching requires isolated workers. Pure graphs
+//! retain the existing evidence-gated metadata lane; archive codegen requires an
+//! isolated worker. Workspace crates and unsupported rustc invocations still
+//! compile normally in the namespace; this does not promote a workspace cache class.
 
 mod target_state;
 
@@ -559,6 +560,7 @@ pub fn run_profile_with_release(
                 args: &compilation_args,
                 build_identity: &build_identity,
                 wrapper: Sha256::digest(&wrapper).into(),
+                closed_dependency_execution: graph.requires_closed_dependency_execution(),
             }
             .key(config)?;
             let mut cache =
@@ -598,6 +600,13 @@ pub fn run_profile_with_release(
         ],
     )
     .map_err(io::Error::other)?;
+    let paths = if graph.requires_closed_dependency_execution() {
+        paths
+            .require_closed_dependency_execution()
+            .map_err(io::Error::other)?
+    } else {
+        paths
+    };
     let socket = control.join("rustc.sock");
     // sockaddr_un includes its terminating NUL. Refuse before boot, rather
     // than silently selecting a shorter socket outside this operation owner.
@@ -727,6 +736,7 @@ struct TargetReuseContext<'a> {
     args: &'a [String],
     build_identity: &'a str,
     wrapper: [u8; 32],
+    closed_dependency_execution: bool,
 }
 
 impl TargetReuseContext<'_> {
@@ -771,7 +781,11 @@ impl TargetReuseContext<'_> {
             "ro":ro, "rw":rw, "output":TARGET,
             "bubblewrap":self.support.bubblewrap,
             "userns":self.support.unprivileged_userns,
-            "runtime":"fresh-home+captured-or-empty-cargo-home+no-project-executors-v1"
+            "runtime":if self.closed_dependency_execution {
+                "fresh-home+captured-or-empty-cargo-home+isolated-dependency-cache-v1"
+            } else {
+                "fresh-home+captured-or-empty-cargo-home+no-project-executors-v1"
+            }
         });
         Ok(Sha256::digest(serde_json::to_vec(&identity)?).into())
     }
@@ -1403,6 +1417,7 @@ mod tests {
         config: TargetCacheConfig,
         wrapper: [u8; 32],
         driver: String,
+        closed_dependency_execution: bool,
     }
 
     impl ReuseKeyFixture {
@@ -1452,6 +1467,7 @@ mod tests {
                 },
                 wrapper: [5; 32],
                 driver: "driver-1".into(),
+                closed_dependency_execution: false,
             }
         }
 
@@ -1470,6 +1486,7 @@ mod tests {
                 args: &self.args,
                 build_identity: &self.driver,
                 wrapper: self.wrapper,
+                closed_dependency_execution: self.closed_dependency_execution,
             }
             .key(&self.config)
             .unwrap()
@@ -1571,5 +1588,15 @@ mod tests {
             b"changed dependency bytes",
         );
         assert_ne!(first.key(), changed_cache.key());
+    }
+
+    #[test]
+    fn private_target_key_separates_project_executor_policy_from_local_capture_authority() {
+        let pure = ReuseKeyFixture::new();
+        let mut executors = ReuseKeyFixture::new();
+        executors.closed_dependency_execution = true;
+        assert_ne!(pure.key(), executors.key());
+        executors.closed_dependency_execution = false;
+        assert_eq!(pure.key(), executors.key());
     }
 }

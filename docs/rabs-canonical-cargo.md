@@ -915,10 +915,12 @@ The local profile asks the captured Cargo to plan the **actual selected build
 units** with `--unit-graph -Z unstable-options` on the selected `check` or `build`, using the same command
 arguments, captured configuration and canonical paths as execution. Planning
 does not compile or run project units, and finishes before a wrapper or cache
-endpoint is exposed. A selected build script or procedural macro refuses the
-operation. Inactive optional dependencies, development targets and other
-workspace members containing those executors no longer prevent a safe library
-or package compilation. `build --tests`, `build --benches` and `build --all-targets`
+endpoint is exposed. Selected build scripts and procedural macros execute under
+Cargo. A build-script run must name its matching compiled producer, and the
+complete graph retains a coordinator-owned requirement that dependency caching
+use isolated workers. Inactive optional dependencies, development targets and
+other workspace members do not enable that requirement unless Cargo selects
+their executors. `build --tests`, `build --benches` and `build --all-targets`
 may compile harnesses; they never run tests or benchmarks. Their compile-only
 unit modes are admitted only when the trusted command is `build`. Unknown graph versions, modes, target kinds, malformed edges,
 cycles, unreachable units and sources outside the retained inputs also refuse.
@@ -937,8 +939,22 @@ archive actions with `dep-info` and `link`, optionally also `metadata`, require
 the worker's separately admitted closed archive namespace before they can publish
 or replay a cache result. With no suitable worker, Cargo still builds those
 archives in its own namespace, without granting those local archive results cache
-authority. Workspace publication, build-script/proc-macro execution, generated
-inputs, native linking and other codegen classes retain their separate gates.
+authority. Graphs containing active build scripts or procedural macros also
+require that isolated worker lane for metadata cache publication and replay.
+Project executors can access the operation's wrapper socket; they cannot turn a
+claimed local completion into trusted cache evidence. The retained graph policy
+therefore blocks local lookup, capture and publication even when a worker is
+missing, busy or refuses the action. Without a suitable worker the current
+compilation proceeds through Cargo with no local action-cache authority.
+
+Build-script producers, proc-macro producers/consumers, units with generated
+`OUT_DIR` inputs, workspace/primary packages and native-link inputs retain their
+per-action cache restrictions and compile normally. Eligible independent pure
+dependencies may use the isolated worker cache. Dynamic-library candidates in a
+dependency search directory still conservatively prevent that directory's
+admission; this change does not claim complete per-unit acceleration for every
+macro-heavy graph. Build-script failure and generated-source errors preserve
+Cargo's failure status. No script, macro, test or program result cache is added.
 
 ### Create and run the local profile
 
@@ -1039,7 +1055,9 @@ capability; a wrapper-supplied path or environment flag cannot construct one.
 
 The local Cargo driver also accepts the existing pinned dependency-worker
 configuration from its operator environment. With no worker configuration it
-keeps the local lane. To use workers, install matching `rabsd`, `rabs-wrap` and
+keeps the local metadata lane only for graphs without project executors; graphs
+with build scripts or procedural macros compile without action-cache authority.
+To use workers, install matching `rabsd`, `rabs-wrap` and
 `rabs-wkr` binaries and provision the mutual-TLS credentials described in
 [live dependency worker setup](rabs-worker-delivery.md#run-the-live-cargo-dependency-worker).
 Run the worker's normal outward reconnect loop against the configured listener,
@@ -1099,8 +1117,9 @@ and release-authorization gates. `remote-offer`, `rabsd-remote-dependency-admitt
 and the worker's durable receipts distinguish real dispatch from local fallback.
 An incompatible worker or a refused action does not gain publication authority;
 fallback after dispatch still requires verified completion of remote execution.
-Workspace/primary crates continue to compile under Cargo, and the selected-graph
-build-script/procedural-macro gate remains in force.
+Workspace/primary crates continue under Cargo's normal compilation and freshness
+rules. Selected project executors never authorize local dependency cache capture
+or replay, even after a worker refusal.
 
 ### Persistent reuse and command results
 
@@ -1234,7 +1253,8 @@ cargo test -p rabs-sandbox --test cargo_check --locked -- --nocapture
 
 The sandbox Cargo tests invoke the actual installed nightly Cargo and rustc.
 They check selected feature/target/profile graphs, real check metadata, build
-archives, a linked binary and compiled test harnesses. Deliberately executable
+archives, generated Rust from a build script, a functioning procedural macro,
+a linked binary and compiled test harnesses. Deliberately executable
 test/program markers remain absent until the fixture explicitly runs the
 produced binary. A wrong-profile negative control must fail compilation. These
 cases validate command selection and its real Cargo outputs; they do not substitute
@@ -1257,8 +1277,10 @@ It requires three actual cold/sample compiles with identical action identities,
 then requires verified hits in a different checkout and fresh target after a
 workspace source edit. Unused optional build-script and development proc-macro
 dependencies are present throughout those checks. A subsequent dependency edit
-must compile, while explicitly selecting either executor must refuse the graph
-before the cache endpoint is exposed. The test
+must compile. Explicitly selecting either executor must execute its real code
+and validate the generated result without borrowing the earlier local cache
+authority. The script also connects to the wrapper socket and attempts to claim
+local capture; the retained operation policy must refuse that claim. The test
 does not inject publication rows or verification samples. An ignored test or a
 namespace-support refusal is not end-to-end success evidence; run this test on a
 capable host before enabling the profile operationally.
@@ -1279,8 +1301,9 @@ This requires OpenSSL and full canonical namespace support. It requires three
 completed remote compilations of each of two dependencies, then verifies that a
 relocated check serves both from cache without advancing the worker's execution
 receipts. A changed dependency must produce the changed metadata consumed by a
-compile-time check in the root package. Selecting a build script must refuse
-before either cache admission or another worker execution. It does not inject
+compile-time check in the root package. Selecting the fixture's deliberately
+failing build script must execute it and retain Cargo's failure, without falling
+back to local cache capture. It does not inject
 cache rows, samples or delivery receipts. Merely adding or ignoring this fixture
 is not native execution evidence; run it on a capable host to qualify the new
 canonical remote metadata path. Neither metadata bridge test establishes workspace
@@ -1306,7 +1329,7 @@ The build fixture requires three real remote archive executions for each of two
 dependencies, then verifies a relocated warm build without additional worker
 executions. It compares delivered `.rlib` bytes and executes the final linked
 binary, edits a dependency and requires new keys and changed outputs, and checks
-that selecting a build script cannot create a completed build delivery. The
+that the failing build script cannot create a completed build delivery. The
 sandbox fixture separately compiles an actual `.incbin` payload whose bytes appear
 in the archive but not rustc's dep-info, then verifies that unkeyed host/process/
 entropy inputs are inaccessible. These are runnable acceptance tests, not a
@@ -1358,9 +1381,10 @@ option names. Each individual value is limited to 1,024 UTF-8 bytes.
 Cargo interprets package specifications and comma/space-separated feature lists.
 The native driver constructs both its nonexecuting unit-graph query and the
 subsequent compilation from the same command and selection. It requires a captured nightly Cargo
-with unit-graph support and refuses required build-script/procedural-macro units
-before exposing the cache endpoint. Selecting a different target or feature set
-can therefore admit a command whose unused targets need those executors. Source
+with unit-graph support and derives the worker-only cache policy from required
+build-script/procedural-macro units before exposing the cache endpoint. Selecting
+a different target or feature set can therefore retain local metadata caching
+when those executors are inactive. Source
 preparation still captures the locked graph; these selectors do not narrow the
 approved source boundary or authorize generated-input caching.
 

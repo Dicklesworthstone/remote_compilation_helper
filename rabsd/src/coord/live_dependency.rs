@@ -121,6 +121,9 @@ impl LiveDependencyRequest {
         if self.plan.canonical_cargo != self.canonical_paths.is_some() {
             return Err("canonical compiler plan lacks its retained driver capability".into());
         }
+        if let Some(paths) = &self.canonical_paths {
+            paths.require_local_capture()?;
+        }
         check_dependency_cache_read_closure(&self.plan.invocation)
             .map_err(|refusal| refusal.to_string())?;
         self.verify_output_contract()

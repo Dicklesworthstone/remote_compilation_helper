@@ -37,6 +37,7 @@ struct Mount {
 pub struct CanonicalPaths {
     _owner: Arc<tempfile::TempDir>,
     mounts: Vec<Mount>,
+    closed_dependency_execution_required: bool,
 }
 
 fn ordinary_absolute(path: &Path) -> bool {
@@ -117,7 +118,33 @@ impl CanonicalPaths {
         Ok(Arc::new(Self {
             _owner: owner,
             mounts,
+            closed_dependency_execution_required: false,
         }))
+    }
+
+    /// Bind the selected Cargo graph's execution policy before sharing this
+    /// capability with the rustc endpoint. Build scripts and procedural macros
+    /// can access that endpoint, so wrapper-supplied local completion claims
+    /// cannot establish compiler evidence for any unit in their operation.
+    /// Independent closed worker executions retain their existing authority.
+    pub(crate) fn require_closed_dependency_execution(
+        mut self: Arc<Self>,
+    ) -> Result<Arc<Self>, String> {
+        let paths = Arc::get_mut(&mut self).ok_or(
+            "canonical execution policy must be bound before sharing its mount capability",
+        )?;
+        paths.closed_dependency_execution_required = true;
+        Ok(self)
+    }
+
+    /// Local capture and local-key replay are both refused for an operation
+    /// whose graph may execute project code. The flag is never a wire field.
+    pub(crate) fn require_local_capture(&self) -> Result<(), String> {
+        if self.closed_dependency_execution_required {
+            Err("canonical-project-executors-require-isolated-dependency-execution".into())
+        } else {
+            Ok(())
+        }
     }
 
     fn verify_mount(mount: &Mount) -> Result<(), String> {
@@ -307,6 +334,189 @@ mod tests {
         ] {
             assert!(paths.physical(Path::new(path)).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn project_executor_policy_is_bound_before_sharing_and_never_grants_local_capture() {
+        let (_owner, paths) = fixture();
+        assert!(paths.require_local_capture().is_ok());
+        let paths = paths.require_closed_dependency_execution().unwrap();
+        assert_eq!(
+            paths.require_local_capture().unwrap_err(),
+            "canonical-project-executors-require-isolated-dependency-execution"
+        );
+        let retained = Arc::clone(&paths);
+        assert!(paths.require_closed_dependency_execution().is_err());
+        assert!(retained.require_local_capture().is_err());
+        // Observation and output installation still use the same bounded,
+        // retained mounts after worker authority has been required.
+        assert!(
+            retained
+                .physical(Path::new("/__rabs/out/cargo/debug/deps"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn coordinator_rejects_a_local_key_even_if_an_executor_request_bypasses_the_edge() {
+        use super::super::{LiveDecision, LiveDependencyLane, LiveDependencyRequest};
+        use crate::coord::live::CoordLive;
+        use crate::edge::live_facts::{FactsMiss, LiveFacts};
+        use rabs_key::live_dependency::{
+            LiveRustcRequest, canonical_cargo_dependency_key,
+            plan_canonical_cargo_dependency_action,
+        };
+        use rabs_protocol::input_evidence::{
+            ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        };
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let (owner, paths) = fixture();
+        let package = "/__rabs/cargo-home/registry/src/fixture-index/leaf-1.0.0";
+        let output = "/__rabs/out/cargo/debug/deps";
+        let physical_package = paths.physical(Path::new(package)).unwrap();
+        let physical_output = paths.physical(Path::new(output)).unwrap();
+        let toolchain = owner.path().join("2");
+        for directory in [
+            &physical_package,
+            &physical_output,
+            &toolchain.join("bin"),
+            &toolchain.join("lib/rustlib/x86_64-unknown-linux-gnu/lib"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            physical_package.join("lib.rs"),
+            b"pub const VALUE:u32=42;\n",
+        )
+        .unwrap();
+        std::fs::write(toolchain.join("lib/libdriver.so"), b"runtime fixture").unwrap();
+        std::fs::write(
+            toolchain.join("lib/rustlib/x86_64-unknown-linux-gnu/lib/libcore.rlib"),
+            b"sysroot fixture",
+        )
+        .unwrap();
+        let compiler = toolchain.join("bin/rustc");
+        // Identity probes only: this test exercises actual coordinator gates,
+        // not compiler execution or canonical namespace enforcement.
+        std::fs::write(
+            &compiler,
+            concat!(
+                "#!/bin/sh\ncase \"$*\" in\n",
+                "'-vV') printf 'rustc fixture\\nhost: x86_64-unknown-linux-gnu\\n';;\n",
+                "'--print sysroot') printf '%s\\n' \"${0%/bin/rustc}\";;\n",
+                "*) exit 64;;\nesac\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let argv = vec![
+            "/__rabs/toolchain/bin/rustc".into(),
+            "--crate-name=leaf".into(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata".into(),
+            "--cap-lints=allow".into(),
+            "--error-format=json".into(),
+            format!("--out-dir={output}"),
+            format!("{package}/lib.rs"),
+        ];
+        let env = vec![
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_MANIFEST_DIR".into(), package.into()),
+            ("CARGO_PKG_NAME".into(), "leaf".into()),
+        ];
+        let plan = plan_canonical_cargo_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package,
+                env: &env,
+            },
+            "x86_64-unknown-linux-gnu",
+            None,
+        )
+        .unwrap();
+        let physical = paths.project_plan(&plan).unwrap();
+        let facts = LiveFacts::new();
+        let package = facts
+            .package(&physical_package, plan.source_kind, None)
+            .unwrap();
+        let dependencies = facts.dependencies(&physical).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let toolchain_facts = loop {
+            match facts.toolchain(&compiler, &[]) {
+                Ok(facts) => break facts,
+                Err(FactsMiss::Pending) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture facts did not become ready"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fixture compiler facts: {error}"),
+            }
+        };
+        let toolchain_guard = facts.toolchain_guard(&compiler, &toolchain_facts).unwrap();
+        let inputs = ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs: package
+                .files
+                .iter()
+                .map(|(relative, object, executable)| PositiveInput {
+                    virtual_path: RawBytes::new(plan.input_virtual_path(relative).into_bytes()),
+                    object: ObjectId(object.clone()),
+                    file_type: InputFileType::Regular,
+                    executable: *executable,
+                    symlink_resolution: Vec::new(),
+                })
+                .collect(),
+            ..ActionInputManifest::default()
+        };
+        let key = canonical_cargo_dependency_key(
+            &plan,
+            &toolchain_facts,
+            &[],
+            &paths.dependency_facts(&dependencies.directories).unwrap(),
+            None,
+            &inputs,
+        )
+        .unwrap();
+        let mut request = LiveDependencyRequest {
+            key,
+            plan,
+            inputs,
+            package,
+            dependencies,
+            toolchain: toolchain_guard,
+            externs: Vec::new(),
+            canonical_paths: Some(paths),
+        };
+        assert!(
+            request.verify_read_closure().is_ok(),
+            "metadata contract is locally admissible without project code"
+        );
+        let paths = request
+            .canonical_paths
+            .take()
+            .unwrap()
+            .require_closed_dependency_execution()
+            .unwrap();
+        request.canonical_paths = Some(paths);
+        let reason = "canonical-project-executors-require-isolated-dependency-execution";
+        assert_eq!(request.verify_read_closure().unwrap_err(), reason);
+        assert_eq!(
+            request.verify_enforced_read_closure(None).unwrap_err(),
+            reason
+        );
+        let lane = LiveDependencyLane::new(Arc::new(CoordLive::new()));
+        let LiveDecision::PassThrough(rejected) = lane.decide(request) else {
+            panic!("a constructed local key must not produce a local hit or attempt");
+        };
+        assert_eq!(rejected, reason);
+        assert_eq!(std::fs::read_dir(physical_output).unwrap().count(), 0);
     }
 
     #[test]

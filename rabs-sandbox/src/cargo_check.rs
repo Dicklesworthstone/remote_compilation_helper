@@ -6,15 +6,18 @@
 //! compiler/build-script units without building them. The canonical driver
 //! obtains this graph from its captured Cargo before exposing a cache endpoint.
 //!
-//! This validator accepts only a bounded graph of ordinary Rust compiler units.
+//! This validator accepts a bounded graph of Cargo compilation units, including
+//! build scripts and procedural macros that Cargo must execute while compiling.
 //! It does not infer feature resolution, grant cache authority, or establish
 //! provenance from JSON alone. The caller must run the trusted captured Cargo
 //! with the same command selection, semantic environment, configuration and
 //! mount view as the subsequent compilation, and bind every returned source path to
 //! its captured input roots. The driver may add its trusted wrapper and socket
 //! control variables only after admission; these controls cannot select Cargo
-//! packages, features or targets. Build scripts, proc macros and unknown unit modes
-//! remain outside this profile even if their outputs could otherwise be cached.
+//! packages, features or targets. A graph containing project executors requires
+//! closed per-action worker execution for dependency caching: project code can
+//! access the wrapper endpoint, so its claimed local completions are not trusted
+//! compiler evidence. Unknown modes and test/program execution remain refused.
 
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -39,6 +42,7 @@ pub struct CompilationUnitGraph {
     /// Number of Cargo-selected root units.
     pub roots: usize,
     source_paths: Vec<String>,
+    project_executors: bool,
 }
 
 impl CompilationUnitGraph {
@@ -47,6 +51,14 @@ impl CompilationUnitGraph {
     #[must_use]
     pub fn source_paths(&self) -> &[String] {
         &self.source_paths
+    }
+
+    /// Project code can run while Cargo compiles this graph. A cache endpoint
+    /// visible to that code must not accept local wrapper-completion claims;
+    /// only independently supervised closed worker executions may supply hits.
+    #[must_use]
+    pub fn requires_closed_dependency_execution(&self) -> bool {
+        self.project_executors
     }
 }
 
@@ -88,7 +100,14 @@ fn ordinary_absolute(path: &str) -> bool {
             .all(|part| !matches!(part, "" | "." | ".."))
 }
 
-fn target_source(unit: &Value) -> io::Result<&str> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetClass {
+    Ordinary,
+    BuildScript,
+    ProcMacro,
+}
+
+fn target_source(unit: &Value) -> io::Result<(&str, TargetClass)> {
     let target = &unit["target"];
     require(target.is_object(), "Cargo unit target is missing")?;
     text(&target["name"], "target name")?;
@@ -105,13 +124,11 @@ fn target_source(unit: &Value) -> io::Result<&str> {
         let mut seen = BTreeSet::new();
         for kind in kinds {
             let kind = text(kind, "target kind")?;
-            require(
-                !matches!(kind, "custom-build" | "proc-macro"),
-                "selected Cargo compilation contains build scripts or procedural macros",
-            )?;
             let allowed = LIBRARY_TYPES.contains(&kind)
                 || kind == "bin"
-                || (field == "kind" && matches!(kind, "example" | "test" | "bench"));
+                || kind == "proc-macro"
+                || (field == "kind"
+                    && matches!(kind, "example" | "test" | "bench" | "custom-build"));
             require(allowed, "unknown Cargo unit target kind or crate type")?;
             require(seen.insert(kind), "duplicate Cargo unit target kind")?;
         }
@@ -119,7 +136,28 @@ fn target_source(unit: &Value) -> io::Result<&str> {
     for field in ["doc", "doctest", "test"] {
         optional_bool(target, field)?;
     }
-    Ok(source)
+    let kinds = target["kind"].as_array().expect("validated target kinds");
+    let crate_types = target["crate_types"]
+        .as_array()
+        .expect("validated crate types");
+    let contains = |values: &[Value], kind: &str| values.iter().any(|value| value == kind);
+    let exact = |values: &[Value], kind: &str| values.len() == 1 && values[0] == kind;
+    let class = if contains(kinds, "custom-build") {
+        require(
+            exact(kinds, "custom-build") && exact(crate_types, "bin"),
+            "Cargo build-script targets require exactly custom-build kind and bin crate type",
+        )?;
+        TargetClass::BuildScript
+    } else if contains(kinds, "proc-macro") || contains(crate_types, "proc-macro") {
+        require(
+            exact(kinds, "proc-macro") && exact(crate_types, "proc-macro"),
+            "Cargo procedural-macro targets require matching exclusive kind and crate type",
+        )?;
+        TargetClass::ProcMacro
+    } else {
+        TargetClass::Ordinary
+    };
+    Ok((source, class))
 }
 
 fn index(value: &Value, units: usize) -> io::Result<usize> {
@@ -130,7 +168,7 @@ fn index(value: &Value, units: usize) -> io::Result<usize> {
         .ok_or_else(|| invalid("Cargo unit graph index is absent or outside its units"))
 }
 
-/// Validate a version-1, nonexecuting Cargo unit graph for a selected command.
+/// Validate a version-1 Cargo compilation graph for a selected command.
 ///
 /// All nodes are validated, including any node not reachable from a selected
 /// root. Unreachable nodes, cycles, invalid dependency references and unknown
@@ -145,11 +183,15 @@ fn index(value: &Value, units: usize) -> io::Result<usize> {
 /// package selection from `cargo metadata`. Multiple units for the same package
 /// are normal, and retained source paths must be checked by the caller against
 /// the actual captured source/Cargo-home mounts before execution.
+/// `run-custom-build` requires a custom-build binary target and a dependency on
+/// that same package's compiled build script. Build-script and procedural-macro
+/// units require the caller to disable local compiler-result authority for the
+/// entire operation via [`CompilationUnitGraph::requires_closed_dependency_execution`].
 ///
 /// # Errors
 /// Returns `InvalidInput` for malformed, excessive or unsupported graphs, or
-/// for any selected build-script/proc-macro/execution mode outside ordinary
-/// Rust compilation. This is an execution eligibility check only, never a
+/// for any selected execution mode outside the chosen Cargo compilation command.
+/// This is an execution eligibility check only, never a
 /// result-publication or compiler-skip authorization.
 pub fn validate_compilation_unit_graph(
     graph: &Value,
@@ -177,25 +219,29 @@ pub fn validate_compilation_unit_graph(
 
     let mut packages = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
+    let mut project_executors = false;
     let mut dependencies = Vec::with_capacity(units.len());
     let mut dependency_count = 0_usize;
     for (unit_index, unit) in units.iter().enumerate() {
         require(unit.is_object(), "Cargo graph unit is not an object")?;
         packages.insert(text(&unit["pkg_id"], "package identity")?);
         let mode = text(&unit["mode"], "unit mode")?;
-        require(
-            mode != "run-custom-build",
-            "selected Cargo compilation contains build scripts or procedural macros",
-        )?;
-        let compile_only = match command {
-            CompilationCommand::Check => matches!(mode, "check" | "build"),
-            CompilationCommand::Build => matches!(mode, "build" | "test"),
+        let (source, class) = target_source(unit)?;
+        let allowed_mode = match class {
+            // Running a build script is part of compilation, but the same
+            // mode on an ordinary binary cannot authorize program execution.
+            TargetClass::BuildScript => matches!(mode, "build" | "run-custom-build"),
+            TargetClass::Ordinary | TargetClass::ProcMacro => match command {
+                CompilationCommand::Check => matches!(mode, "check" | "build"),
+                CompilationCommand::Build => matches!(mode, "build" | "test"),
+            },
         };
         require(
-            compile_only,
+            allowed_mode,
             "selected Cargo compilation contains an unsupported execution mode for its command",
         )?;
-        source_paths.insert(target_source(unit)?.to_owned());
+        project_executors |= class != TargetClass::Ordinary;
+        source_paths.insert(source.to_owned());
         require(unit["profile"].is_object(), "Cargo unit profile is missing")?;
         match unit.get("platform") {
             Some(Value::Null) => {}
@@ -245,12 +291,30 @@ pub fn validate_compilation_unit_graph(
         }
         dependencies.push(next);
     }
+    for (unit_index, unit) in units.iter().enumerate() {
+        if unit["mode"] == "run-custom-build" {
+            let producers = dependencies[unit_index]
+                .iter()
+                .filter(|&&dependency| {
+                    let producer = &units[dependency];
+                    producer["mode"] == "build"
+                        && producer["pkg_id"] == unit["pkg_id"]
+                        && producer["target"] == unit["target"]
+                })
+                .count();
+            require(
+                producers == 1,
+                "Cargo build-script execution must depend on its matching compiled build script",
+            )?;
+        }
+    }
     validate_reachability(&dependencies, &selected)?;
     Ok(CompilationUnitGraph {
         units: units.len(),
         packages: packages.len(),
         roots: selected.len(),
         source_paths: source_paths.into_iter().collect(),
+        project_executors,
     })
 }
 
@@ -318,6 +382,7 @@ mod tests {
     fn selected_compiler_graph_retains_unique_source_paths_and_counts() {
         let report = validate_compilation_unit_graph(&graph(), CompilationCommand::Check).unwrap();
         assert_eq!((report.units, report.packages, report.roots), (2, 2, 1));
+        assert!(!report.requires_closed_dependency_execution());
         assert_eq!(
             report.source_paths(),
             [
@@ -359,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn scripts_macros_and_unknown_execution_modes_refuse_before_execution() {
+    fn inconsistent_executor_targets_and_unknown_execution_modes_refuse() {
         for field in ["kind", "crate_types"] {
             for kind in ["custom-build", "proc-macro", "future-target"] {
                 let mut graph = graph();
@@ -388,6 +453,79 @@ mod tests {
         let mut graph = graph();
         graph["units"][0]["is_std"] = json!(true);
         assert!(validate_compilation_unit_graph(&graph, CompilationCommand::Check).is_err());
+    }
+
+    fn script_graph(command: CompilationCommand) -> Value {
+        let mut app = unit("app", &[1]);
+        app["mode"] = json!(command.as_str());
+        let mut compiled = unit("generator", &[]);
+        compiled["mode"] = json!("build");
+        compiled["target"]["kind"] = json!(["custom-build"]);
+        compiled["target"]["crate_types"] = json!(["bin"]);
+        compiled["target"]["name"] = json!("build-script-build");
+        compiled["target"]["src_path"] = json!("/__rabs/workspace/generator/build.rs");
+        let mut run = compiled.clone();
+        run["mode"] = json!("run-custom-build");
+        run["dependencies"] = json!([{"index":2,"extern_crate_name":"build_script_build"}]);
+        json!({"version":1,"units":[app,run,compiled],"roots":[0]})
+    }
+
+    #[test]
+    fn admitted_project_executors_require_closed_dependency_execution_for_the_whole_graph() {
+        for command in [CompilationCommand::Check, CompilationCommand::Build] {
+            let graph = script_graph(command);
+            let report = validate_compilation_unit_graph(&graph, command).unwrap();
+            assert!(report.requires_closed_dependency_execution());
+            assert_eq!((report.units, report.packages, report.roots), (3, 2, 1));
+            assert_eq!(report.source_paths().len(), 2);
+
+            let mut macros = graph;
+            macros["units"].as_array_mut().unwrap().pop();
+            macros["units"][1]["mode"] = json!("build");
+            macros["units"][1]["dependencies"] = json!([]);
+            macros["units"][1]["target"]["kind"] = json!(["proc-macro"]);
+            macros["units"][1]["target"]["crate_types"] = json!(["proc-macro"]);
+            let report = validate_compilation_unit_graph(&macros, command).unwrap();
+            assert!(report.requires_closed_dependency_execution());
+        }
+    }
+
+    #[test]
+    fn build_script_execution_requires_its_exact_compiled_producer() {
+        for command in [CompilationCommand::Check, CompilationCommand::Build] {
+            for mutation in [
+                "no-producer",
+                "package",
+                "source",
+                "target-name",
+                "producer-mode",
+            ] {
+                let mut graph = script_graph(command);
+                match mutation {
+                    "no-producer" => graph["units"][1]["dependencies"] = json!([]),
+                    "package" => graph["units"][2]["pkg_id"] = json!("different-package"),
+                    "source" => {
+                        graph["units"][2]["target"]["src_path"] =
+                            json!("/__rabs/workspace/generator/other.rs")
+                    }
+                    "target-name" => graph["units"][2]["target"]["name"] = json!("other-script"),
+                    "producer-mode" => graph["units"][2]["mode"] = json!("check"),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    validate_compilation_unit_graph(&graph, command).is_err(),
+                    "{mutation}"
+                );
+            }
+            for mode in ["check", "test", "run", "doc", "doctest"] {
+                let mut graph = script_graph(command);
+                graph["units"][1]["mode"] = json!(mode);
+                assert!(
+                    validate_compilation_unit_graph(&graph, command).is_err(),
+                    "{mode}"
+                );
+            }
+        }
     }
 
     #[test]

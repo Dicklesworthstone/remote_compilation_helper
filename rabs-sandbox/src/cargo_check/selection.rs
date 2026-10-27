@@ -14,9 +14,12 @@ const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 
 /// The captured Cargo command, separate from package and target selectors.
 ///
-/// Neither command runs project executables. `Build` may compile test and
-/// benchmark harnesses, but only Cargo's `test`, `bench` and `run` commands
-/// execute them; those commands are deliberately absent from this profile.
+/// Neither command runs the requested programs, tests or benchmarks. Cargo
+/// still runs selected build scripts and loads procedural macros while
+/// compiling; the validated unit graph marks that operation for closed-worker
+/// cache authority. `Build` may compile test and benchmark harnesses, but only
+/// Cargo's `test`, `bench` and `run` commands execute them; those commands are
+/// deliberately absent from this profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CompilationCommand {

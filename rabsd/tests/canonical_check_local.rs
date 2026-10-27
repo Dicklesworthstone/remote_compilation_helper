@@ -339,29 +339,98 @@ fn canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_
         "stale changed-source hit: {output}"
     );
 
-    // Inactive optional and development executors did not block the actual
-    // library checks above. Selecting either executor must still refuse before
-    // exposing the dependency cache endpoint or executing its project code.
+    // Active build scripts and procedural macros must now compile successfully.
+    // Their operation cannot reuse the local cache populated above: project
+    // code can reach the wrapper socket and must not claim local completions.
+    write(
+        &second,
+        "optional-build/build.rs",
+        r#"
+use std::io::{BufRead, BufReader, Write};
+fn main() {
+    let mut stream = std::os::unix::net::UnixStream::connect(std::env::var_os("RABS_SOCKET_PATH").unwrap()).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    let mut replies = BufReader::new(stream.try_clone().unwrap());
+    writeln!(stream, "{{\"kind\":\"hello\",\"transport\":{{\"current\":1,\"minimum_compatible\":1}},\"application\":{{\"current\":1,\"minimum_compatible\":1}}}}").unwrap();
+    let mut reply = String::new();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("hello-ok"));
+    writeln!(stream, "{{\"kind\":\"rustc-request\",\"argv\":[\"/__rabs/toolchain/bin/rustc\",\"--crate-name=forged\"],\"cwd\":\"/__rabs/workspace\",\"env\":[],\"remote_protocol\":1,\"local_capture_allowed\":true}}").unwrap();
+    reply.clear();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("canonical-project-executors-require-isolated-dependency-execution"));
+    assert!(reply.contains("pass-through"));
+    assert!(!reply.contains("\"attempt\""));
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("value.rs"), "pub const GENERATED: usize = 17;\n").unwrap();
+    println!("cargo::warning=CANONICAL_BUILD_SCRIPT_EXECUTED_WITHOUT_LOCAL_CAPTURE");
+    println!("cargo::rerun-if-changed=build.rs");
+}
+"#,
+    );
+    write(
+        &second,
+        "optional-build/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
+    );
+    write(
+        &second,
+        "dev-macro/src/lib.rs",
+        r#"
+extern crate proc_macro;
+#[proc_macro]
+pub fn value(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    eprintln!("CANONICAL_PROC_MACRO_EXECUTED");
+    "23usize".parse().unwrap()
+}
+"#,
+    );
+    write(
+        &second,
+        "src/lib.rs",
+        r#"
+pub fn answer() -> u32 { canonical_dep::answer() }
+#[cfg(feature = "optional_build")]
+const _: [(); 17] = [(); optional_build::GENERATED];
+#[cfg(test)]
+const _: [(); 23] = [(); dev_macro::value!()];
+#[test]
+fn must_not_execute() { panic!("canonical check ran a test"); }
+"#,
+    );
     for (number, selection) in [
         (6, json!({"lib":true, "features":["optional_build"]})),
         (7, json!({"tests":true})),
     ] {
         profile["selection"] = selection;
         let (code, events, output) = run(owner.path(), number, &profile);
-        assert_ne!(code, 0, "executor-bearing graph was admitted: {output}");
+        assert_eq!(code, 0, "executor-bearing compilation failed: {output}");
         assert!(
-            output.contains("build scripts or procedural macros"),
+            output.contains(if number == 6 {
+                "CANONICAL_BUILD_SCRIPT_EXECUTED_WITHOUT_LOCAL_CAPTURE"
+            } else {
+                "CANONICAL_PROC_MACRO_EXECUTED"
+            }),
             "{output}"
         );
         assert!(
-            !output.contains("inactive build script must never execute"),
+            output.contains("canonical-project-executors-require-isolated-dependency-execution"),
             "{output}"
         );
         assert!(
-            !events
+            events
                 .iter()
                 .any(|event| event["kind"] == "canonical-compilation-started"),
-            "selected executor reached cache admission: {output}"
+            "selected executor never reached canonical compilation: {output}"
+        );
+        assert!(
+            decisions(&events, "execute").is_empty() && decisions(&events, "hit").is_empty(),
+            "executor-bearing operation obtained local compiler authority: {output}"
+        );
+        assert!(
+            !events.iter().any(|event| event["decision"] == "served"),
+            "{output}"
         );
     }
     assert!(
@@ -1143,44 +1212,34 @@ fn remote_dependency_replay(command: &str) {
         decisions(&events, "hit").is_empty() && decisions(&events, "execute").is_empty(),
         "{output}"
     );
-    let before_refusal = worker.completed_receipt();
-    let before_refusal_executions = worker
-        .events()
-        .into_iter()
-        .filter(|event| event["kind"] == "worker-toolchain-acquired")
-        .count();
+    // This fixture's selected script deliberately panics. Cargo must actually
+    // run it and preserve that failure, while every dependency cache attempt
+    // remains under worker authority rather than local wrapper claims.
     profile["selection"] = json!({"lib":true,"features":["optional_build"]});
     let (code, events, output) = run_with_environment(owner.path(), 6, &profile, &environment);
-    assert_ne!(code, 0, "selected build script reached execution: {output}");
+    assert_ne!(
+        code, 0,
+        "the selected failing build script was skipped: {output}"
+    );
     assert!(
-        output.contains("build scripts or procedural macros"),
+        output.contains("inactive build script must never execute"),
         "{output}"
     );
     assert!(
-        !output.contains("inactive build script must never execute"),
+        events
+            .iter()
+            .any(|event| event["kind"] == "canonical-compilation-started"),
         "{output}"
     );
     assert!(
         !events
             .iter()
-            .any(|event| event["kind"] == "canonical-compilation-started"
-                || event["kind"] == "canonical-build-completed"
-                || event["kind"] == "rabsd-live-dependency"
-                || event["kind"] == "rabsd-remote-dependency-executed"),
+            .any(|event| event["kind"] == "canonical-build-completed"),
         "{output}"
     );
-    assert_eq!(
-        worker.completed_receipt(),
-        before_refusal,
-        "graph refusal admitted a worker action"
-    );
-    assert_eq!(
-        worker
-            .events()
-            .into_iter()
-            .filter(|event| event["kind"] == "worker-toolchain-acquired")
-            .count(),
-        before_refusal_executions
+    assert!(
+        decisions(&events, "execute").is_empty(),
+        "project executors must never turn remote refusal into local cache admission: {output}"
     );
     let retained = fs::read_dir(owner.path().join("ops"))
         .unwrap()
