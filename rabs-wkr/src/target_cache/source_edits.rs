@@ -208,13 +208,23 @@ pub(super) fn metadata_seed(seed: &Seed) -> bool {
         let Some(leaf) = parts.last() else {
             return false;
         };
+        if parts.contains(&"incremental") {
+            return false;
+        }
+        if *leaf == "CACHEDIR.TAG" && parts.len() == 2 {
+            continue;
+        }
         if *leaf == ".cargo-lock" && parts.len() <= 3 {
             continue;
         }
-        if parts
-            .iter()
-            .any(|part| matches!(*part, "build" | "incremental"))
-        {
+        if *leaf == ".cargo-build-lock" && matches!(parts.len(), 2 | 3) {
+            continue;
+        }
+        if let Some(is_metadata) = metadata_unit_file(&parts) {
+            metadata |= is_metadata;
+            continue;
+        }
+        if parts.contains(&"build") {
             return false;
         }
         if parts.len() >= 3 && parts[parts.len() - 2] == "deps" {
@@ -251,6 +261,74 @@ pub(super) fn metadata_seed(seed: &Seed) -> bool {
         return false;
     }
     metadata
+}
+
+/// Current Cargo separates compiler units from legacy build-script output as
+/// <profile>/build/<package>/<unit-hash>/{out,fingerprint}/<file>, optionally
+/// below a target triple. Admit that exact shape, not arbitrary build/out trees.
+/// The compiler products must name the same unit hash as their parent; all
+/// generated data, codegen products and unknown bookkeeping still refuse.
+fn metadata_unit_file(parts: &[&str]) -> Option<bool> {
+    let prefix = parts.len().checked_sub(5)?;
+    if !matches!(prefix, 1 | 2) {
+        return None;
+    }
+    let ["build", _package, hash, directory, leaf] = &parts[prefix..] else {
+        return None;
+    };
+    if hash.len() != 16
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    match *directory {
+        "out" => {
+            let (stem, metadata) = leaf
+                .strip_suffix(".rmeta")
+                .map(|stem| (stem, true))
+                .or_else(|| leaf.strip_suffix(".d").map(|stem| (stem, false)))?;
+            let (name, file_hash) = stem.rsplit_once('-')?;
+            let name = if metadata {
+                name.strip_prefix("lib")?
+            } else {
+                name
+            };
+            (file_hash == *hash && compiler_unit_name(name)).then_some(metadata)
+        }
+        "fingerprint" => {
+            if *leaf == "invoked.timestamp" {
+                return Some(false);
+            }
+            let unit = leaf
+                .strip_prefix("dep-")
+                .or_else(|| leaf.strip_prefix("output-"))
+                .unwrap_or(leaf);
+            let unit = unit.strip_suffix(".json").unwrap_or(unit);
+            [
+                "lib-",
+                "bin-",
+                "example-",
+                "test-lib-",
+                "test-bin-",
+                "test-example-",
+                "test-integration-test-",
+                "test-bench-",
+            ]
+            .iter()
+            .any(|prefix| unit.strip_prefix(prefix).is_some_and(compiler_unit_name))
+            .then_some(false)
+        }
+        _ => None,
+    }
+}
+
+fn compiler_unit_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 /// A length-framed family digest retains every non-editable input's name, mode
@@ -565,6 +643,211 @@ mod tests {
                 &|| false,
             )
             .unwrap()
+    }
+
+    fn modern_metadata_inventory(prefix: &str) -> Vec<(String, u32)> {
+        // Recorded from the pinned Cargo's native and explicit-host-target
+        // checks. This fixture validates acquisition structure, not compiler
+        // bytes or a claimed native Cargo freshness result.
+        let mut files = vec![
+            ".rustc_info.json".to_owned(),
+            "CACHEDIR.TAG".to_owned(),
+            "debug/.cargo-lock".to_owned(),
+            "debug/.cargo-build-lock".to_owned(),
+        ];
+        if let Some((target, _)) = prefix.split_once('/') {
+            files.extend([
+                format!("{target}/CACHEDIR.TAG"),
+                format!("{prefix}/.cargo-lock"),
+                format!("{prefix}/.cargo-build-lock"),
+            ]);
+        }
+        let unit = format!("{prefix}/build/fixture/0123456789abcdef");
+        files.extend([
+            format!("{unit}/fingerprint/lib-fixture"),
+            format!("{unit}/fingerprint/dep-lib-fixture"),
+            format!("{unit}/fingerprint/lib-fixture.json"),
+            format!("{unit}/fingerprint/invoked.timestamp"),
+            format!("{unit}/out/libfixture-0123456789abcdef.rmeta"),
+            format!("{unit}/out/fixture-0123456789abcdef.d"),
+        ]);
+        files.into_iter().map(|name| (name, 0o644)).collect()
+    }
+
+    fn stage_metadata_inventory(
+        cache: &Arc<TargetCache>,
+        input: WorkspaceInputs,
+        prefix: &str,
+        files: &[(String, u32)],
+    ) -> ArtifactPlan {
+        let required = files
+            .iter()
+            .find(|(name, _)| name.ends_with(".rmeta"))
+            .unwrap()
+            .0
+            .clone();
+        let plan = ArtifactPlan::new_tree("cargo".into(), vec![required]).unwrap();
+        let target = PreparedArtifacts::new(plan.clone()).unwrap();
+        for (name, mode) in files {
+            write(target.backing(), name, b"structural metadata inventory");
+            fs::set_permissions(
+                target.backing().join(name),
+                fs::Permissions::from_mode(*mode),
+            )
+            .unwrap();
+        }
+        // Cargo creates this empty directory even with incremental disabled.
+        // Its presence is harmless; any retained incremental file still refuses.
+        fs::create_dir_all(target.backing().join(prefix).join("incremental")).unwrap();
+        let captured = target
+            .capture_with_dependency_inputs(None, || false)
+            .unwrap();
+        let (attempt, restored) = cache
+            .acquire(
+                TargetKey(input.full_source_digest),
+                identity(&input).map(TargetKey),
+                input,
+                || PreparedArtifacts::new(plan.clone()),
+                1,
+                &|| false,
+            )
+            .unwrap();
+        assert!(restored.is_none());
+        attempt
+            .stage(&target, &captured, &|| false)
+            .unwrap()
+            .unwrap()
+            .publish();
+        plan
+    }
+
+    #[test]
+    fn modern_metadata_inventory_reuses_changed_sources_through_target_acquisition() {
+        for prefix in ["debug", "x86_64-unknown-linux-gnu/debug"] {
+            let source = source();
+            let cache = Arc::new(TargetCache::new(32 * 1024).unwrap());
+            let files = modern_metadata_inventory(prefix);
+            let plan = stage_metadata_inventory(&cache, observe(source.path()), prefix, &files);
+            write(
+                source.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 2 }\n",
+            );
+            let changed = observe(source.path());
+            let (attempt, restored) = cache
+                .acquire(
+                    TargetKey(changed.full_source_digest),
+                    identity(&changed).map(TargetKey),
+                    changed,
+                    || PreparedArtifacts::new(plan),
+                    2,
+                    &|| false,
+                )
+                .unwrap();
+            let restored = restored.expect("complete modern metadata seed must survive an edit");
+            assert!(attempt.inputs.runtime_owner.is_some());
+            assert_eq!(
+                fs::read(attempt.inputs.root.join("src/lib.rs")).unwrap(),
+                b"pub fn answer() -> u32 { 2 }\n"
+            );
+            for (name, mode) in files {
+                let metadata = fs::metadata(restored.backing().join(&name)).unwrap();
+                assert_eq!(metadata.permissions().mode() & 0o777, mode, "{name}");
+            }
+            assert!(restored.backing().join(prefix).join("incremental").is_dir());
+        }
+    }
+
+    #[test]
+    fn modern_metadata_layout_cannot_hide_generated_codegen_or_unknown_outputs() {
+        let unit = "debug/build/fixture/0123456789abcdef";
+        for (extra, mode) in [
+            (
+                "debug/build/legacy-hash/build-script-build".to_owned(),
+                0o644,
+            ),
+            ("debug/build/legacy-hash/out/generated.rs".to_owned(), 0o644),
+            (format!("{unit}/out/generated.rs"), 0o644),
+            (
+                format!("{unit}/out/libfixture-0123456789abcdef.rlib"),
+                0o644,
+            ),
+            (format!("{unit}/out/libfixture-0123456789abcdef.so"), 0o644),
+            (
+                format!("{unit}/out/libfixture-0123456789abcdef.dylib"),
+                0o644,
+            ),
+            (format!("{unit}/out/fixture-0123456789abcdef.o"), 0o644),
+            (format!("{unit}/out/fixture-0123456789abcdef"), 0o644),
+            (format!("{unit}/fingerprint/build-script-build"), 0o644),
+            (format!("{unit}/fingerprint/lib-fixture.unknown"), 0o644),
+            (
+                format!("{unit}/out/libfixture-fedcba9876543210.rmeta"),
+                0o644,
+            ),
+            (
+                "debug/build/fixture/not-a-unit-hash/out/libfixture.rmeta".to_owned(),
+                0o644,
+            ),
+            (
+                format!("{unit}/out/nested/libfixture-0123456789abcdef.rmeta"),
+                0o644,
+            ),
+            ("debug/incremental/unit/work-products.bin".to_owned(), 0o644),
+            (
+                "debug/incremental/build/fixture/0123456789abcdef/out/libfixture-0123456789abcdef.rmeta"
+                    .to_owned(),
+                0o644,
+            ),
+            ("incremental/CACHEDIR.TAG".to_owned(), 0o644),
+            ("debug/incremental/.cargo-build-lock".to_owned(), 0o644),
+            ("debug/unknown-product".to_owned(), 0o644),
+            (
+                format!("{unit}/out/libfixture-0123456789abcdef.rmeta"),
+                0o755,
+            ),
+            ("debug/.cargo-build-lock".to_owned(), 0o755),
+        ] {
+            let source = source();
+            let original = observe(source.path());
+            let cache = Arc::new(TargetCache::new(32 * 1024).unwrap());
+            let mut files = modern_metadata_inventory("debug");
+            files.push((extra.clone(), mode));
+            let plan = stage_metadata_inventory(&cache, original.clone(), "debug", &files);
+            let (_, unchanged) = cache
+                .acquire(
+                    TargetKey(original.full_source_digest),
+                    identity(&original).map(TargetKey),
+                    original,
+                    || PreparedArtifacts::new(plan),
+                    2,
+                    &|| false,
+                )
+                .unwrap();
+            assert!(
+                unchanged.is_some(),
+                "{extra}: exact source remains reusable"
+            );
+            write(
+                source.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 2 }\n",
+            );
+            let changed = observe(source.path());
+            let (attempt, restored) = cache
+                .acquire(
+                    TargetKey(changed.full_source_digest),
+                    identity(&changed).map(TargetKey),
+                    changed,
+                    || panic!("{extra}: refuse changed-source restoration before allocation"),
+                    3,
+                    &|| false,
+                )
+                .unwrap();
+            assert!(restored.is_none(), "{extra}");
+            assert!(attempt.inputs.runtime_owner.is_none(), "{extra}");
+            assert_eq!(cache.state.lock().unwrap().entries.len(), 1, "{extra}");
+        }
     }
 
     #[test]

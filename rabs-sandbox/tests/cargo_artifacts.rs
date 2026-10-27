@@ -1088,22 +1088,22 @@ pub const VALUE:u32=42;
         let times = SourceTimestamps::capture(&root, &source, &|| false).unwrap();
         let target = owner.path().join("assembler-target");
         private(&target);
-        let archive = |wanted: &[u8], unwanted: &[u8]| {
-            let files = fs::read_dir(target.join("debug/deps"))
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
+        let archive = |artifacts: &[serde_json::Value], wanted: &[u8], unwanted: &[u8]| {
+            // Cargo owns its intermediate layout. Resolve the actual archive
+            // from this invocation's report, including the newer per-unit
+            // build/<package>/<hash>/out layout and ordinary output aliases.
+            let files = artifacts
+                .iter()
+                .filter(|artifact| artifact["target"]["name"] == "artifact_library")
+                .flat_map(|artifact| artifact["filenames"].as_array().unwrap())
+                .map(|path| Path::new(path.as_str().unwrap()))
                 .filter(|path| {
-                    path.file_name()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .starts_with("libartifact_library")
-                        && path
-                            .extension()
-                            .is_some_and(|extension| extension == "rlib")
+                    path.extension()
+                        .is_some_and(|extension| extension == "rlib")
                 })
                 .collect::<Vec<_>>();
             assert_eq!(files.len(), 1, "one actual library archive");
+            assert!(files[0].starts_with(&target));
             let bytes = fs::read(&files[0]).unwrap();
             assert!(bytes.windows(wanted.len()).any(|window| window == wanted));
             assert!(
@@ -1112,12 +1112,9 @@ pub const VALUE:u32=42;
                     .any(|window| window == unwanted)
             );
         };
-        freshness(
-            &compile(&tools, &root, &home, &target, "build", &[]),
-            false,
-            false,
-        );
-        archive(OLD, NEW);
+        let artifacts = compile(&tools, &root, &home, &target, "build", &[]);
+        freshness(&artifacts, false, false);
+        archive(&artifacts, OLD, NEW);
         let retained = owner.path().join("assembler-seed");
         let snapshot = seed(&target, &retained);
         restore(
@@ -1126,12 +1123,9 @@ pub const VALUE:u32=42;
             &snapshot,
             &owner.path().join("assembler-cold-output"),
         );
-        freshness(
-            &compile(&tools, &root, &home, &target, "build", &[]),
-            true,
-            true,
-        );
-        archive(OLD, NEW);
+        let artifacts = compile(&tools, &root, &home, &target, "build", &[]);
+        freshness(&artifacts, true, true);
+        archive(&artifacts, OLD, NEW);
         fs::write(root.join("library/payload.bin"), NEW).unwrap();
         let edited = manifest(&root);
         assert_ne!(source.digest(), edited.digest());
@@ -1153,24 +1147,18 @@ pub const VALUE:u32=42;
         );
         // Negative control: LLVM's .incbin file read is absent from rustc
         // dep-info. Cargo keeps the archive fresh despite the newer input.
-        freshness(
-            &compile(&tools, &root, &home, &target, "build", &[]),
-            true,
-            true,
-        );
-        archive(OLD, NEW);
+        let artifacts = compile(&tools, &root, &home, &target, "build", &[]);
+        freshness(&artifacts, true, true);
+        archive(&artifacts, OLD, NEW);
         fs::rename(
             &target,
             owner.path().join("assembler-stale-negative-control"),
         )
         .unwrap();
         private(&target);
-        freshness(
-            &compile(&tools, &root, &home, &target, "build", &[]),
-            false,
-            false,
-        );
-        archive(NEW, OLD);
+        let artifacts = compile(&tools, &root, &home, &target, "build", &[]);
+        freshness(&artifacts, false, false);
+        archive(&artifacts, NEW, OLD);
         let updated_seed = owner.path().join("assembler-updated-seed");
         let updated_snapshot = seed(&target, &updated_seed);
         restore(
@@ -1179,12 +1167,9 @@ pub const VALUE:u32=42;
             &updated_snapshot,
             &owner.path().join("assembler-current-output"),
         );
-        freshness(
-            &compile(&tools, &root, &home, &target, "build", &[]),
-            true,
-            true,
-        );
-        archive(NEW, OLD);
+        let artifacts = compile(&tools, &root, &home, &target, "build", &[]);
+        freshness(&artifacts, true, true);
+        archive(&artifacts, NEW, OLD);
     }
 
     #[test]
