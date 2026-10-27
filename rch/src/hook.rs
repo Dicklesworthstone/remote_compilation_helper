@@ -3384,9 +3384,10 @@ async fn selected_clean_overlay_cargo_tree(
         };
         entries.insert(
             target.clone(),
-            SelectedCargoEntry::File(Some(String::from_utf8(bytes).with_context(|| {
-                format!("selected Cargo metadata is not UTF-8: {}", target.display())
-            })?)),
+            // Unreferenced Cargo.toml files may be arbitrary fixture bytes.
+            // Reachable manifests and all selected configs still require text
+            // when the inventory-only semantic traversal admits them.
+            SelectedCargoEntry::File(String::from_utf8(bytes).ok()),
         );
     }
     spec.verify_overlay_unchanged(project_root)?;
@@ -3422,8 +3423,9 @@ async fn validate_clean_overlay_cargo_sources(
             );
         }
     }
-    let primary_manifest = primary_directory.join("Cargo.toml");
-    validate_selected_cargo_tree_at(&entries, &primary_manifest)?;
+    let mut primary_manifest = primary_directory.join("Cargo.toml");
+    let mut manifest_selected = false;
+    let mut inline_configs = Vec::new();
     let (tokens, cargo_index) = cargo_target_dir::managed_clean_overlay_cargo_tokens(command)?;
     // Changing cwd also changes Cargo's configuration search. Until that
     // search is represented in the selected-source plan, do not guess.
@@ -3471,6 +3473,15 @@ async fn validate_clean_overlay_cargo_sources(
                     "Cargo manifest argument is not selected Cargo metadata: {}",
                     path.display()
                 );
+                anyhow::ensure!(
+                    !manifest_selected,
+                    "multiple Cargo manifest selectors are not admitted"
+                );
+                manifest_selected = true;
+                // Retain the selected logical manifest location. The common
+                // validator refuses file aliases whose Cargo-relative source
+                // base would differ from the resolved metadata location.
+                primary_manifest = primary_directory.join(value);
             } else {
                 // Inline TOML is parsed by the same dependency-path validator.
                 // File-based --config needs an explicit selected-file mapping;
@@ -3478,15 +3489,14 @@ async fn validate_clean_overlay_cargo_sources(
                 let _: toml::Value = toml::from_str(value).context(
                     "clean-overlay supports inline TOML --config only; config files are not admitted",
                 )?;
-                validate_selected_cargo_config_at(
-                    &entries,
-                    &primary_manifest,
-                    primary_directory,
-                    value,
-                )?;
+                inline_configs.push(value);
             }
         }
         index += 1;
+    }
+    validate_selected_cargo_tree_at(&entries, &primary_manifest)?;
+    for value in inline_configs {
+        validate_selected_cargo_config_at(&entries, &primary_manifest, primary_directory, value)?;
     }
     spec.verify_overlay_unchanged(project_root)?;
     Ok(())

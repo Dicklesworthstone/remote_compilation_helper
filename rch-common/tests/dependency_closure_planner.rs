@@ -96,6 +96,83 @@ fn planner_single_repo_generates_ready_plan() {
 }
 
 #[test]
+fn planner_keeps_excluded_fixture_bytes_inert_until_the_same_manifest_is_active() {
+    let fixture = TopologyFixture::new("selected-fixture-members");
+    let workspace = fixture.canonical_root.join("workspace");
+    let app = workspace.join("app");
+    let negative = workspace.join("fixtures/negative");
+    write_lib_crate(&app, "app", &[]);
+    write_lib_crate(&negative, "negative", &[]);
+    let app_manifest = "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n";
+    let root = "[workspace]\nmembers=['app','fixtures/*']\nexclude=['fixtures']\ndefault-members=['app','fixtures/negative']\nresolver='2'\n";
+    let negative_manifest = "[package]\nname='negative'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nforeign={path='/absolute/unpublished'}\n";
+    fs::write(workspace.join("Cargo.toml"), root).unwrap();
+    fs::write(app.join("Cargo.toml"), app_manifest).unwrap();
+    fs::write(negative.join("Cargo.toml"), negative_manifest).unwrap();
+    for entrypoint in [&workspace, &app] {
+        let plan = build_dependency_closure_plan_with_policy(entrypoint, &fixture.policy());
+        assert!(plan.is_ready(), "{plan:#?}");
+        assert!(!plan.sync_roots().contains(&negative));
+        assert_eq!(
+            fs::read(negative.join("Cargo.toml")).unwrap(),
+            negative_manifest.as_bytes()
+        );
+    }
+    for section in [
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+        "dev_dependencies",
+        "build_dependencies",
+        "target.'cfg(windows)'.dependencies",
+        "target.'cfg(windows)'.dev-dependencies",
+        "target.'cfg(windows)'.build-dependencies",
+        "target.'cfg(windows)'.dev_dependencies",
+        "target.'cfg(windows)'.build_dependencies",
+    ] {
+        fs::write(app.join("Cargo.toml"), format!("{app_manifest}\n[{section}]\nrenamed={{package='negative',path='../fixtures/negative'}}\n")).unwrap();
+        let plan = build_dependency_closure_plan_with_policy(&app, &fixture.policy());
+        assert_eq!(
+            plan.state,
+            DependencyClosurePlanState::FailOpen,
+            "{section}: {plan:#?}"
+        );
+        assert!(
+            format!("{plan:#?}").contains("/absolute/unpublished"),
+            "{section}: {plan:#?}"
+        );
+        assert_eq!(
+            fs::read(negative.join("Cargo.toml")).unwrap(),
+            negative_manifest.as_bytes()
+        );
+    }
+    fs::write(app.join("Cargo.toml"), app_manifest).unwrap();
+    for active in [
+        "[workspace]\nmembers=['app','fixtures/*','fixtures/negative']\nexclude=['fixtures']\nresolver='2'\n",
+        "[workspace]\nmembers=['app','fixtures/*']\nexclude=['fixtures/n*']\nresolver='2'\n",
+    ] {
+        fs::write(workspace.join("Cargo.toml"), active).unwrap();
+        let plan = build_dependency_closure_plan_with_policy(&workspace, &fixture.policy());
+        assert_eq!(
+            plan.state,
+            DependencyClosurePlanState::FailOpen,
+            "{plan:#?}"
+        );
+        assert_eq!(
+            fs::read(negative.join("Cargo.toml")).unwrap(),
+            negative_manifest.as_bytes()
+        );
+    }
+    fs::write(workspace.join("Cargo.toml"), root).unwrap();
+    let restored = build_dependency_closure_plan_with_policy(&workspace, &fixture.policy());
+    assert!(restored.is_ready(), "{restored:#?}");
+    assert_eq!(
+        fs::read(negative.join("Cargo.toml")).unwrap(),
+        negative_manifest.as_bytes()
+    );
+}
+
+#[test]
 fn planner_multi_repo_produces_deterministic_dependency_first_order() {
     let fixture = TopologyFixture::new("multi");
     let config = MultiRepoFixtureConfig::new(

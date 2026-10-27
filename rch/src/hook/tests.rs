@@ -144,6 +144,200 @@ fn init_clean_overlay_test_repo() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn clean_overlay_fixture_bytes_are_data_until_the_same_manifest_is_selected() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    let bad_build = b"[package]\nname='bad-build'\nversion='0.1.0'\nbuild='build.rs'\n";
+    let bad_path = b"[package]\nname='bad-path'\nversion='0.1.0'\n[dependencies]\nforeign={path='/absolute/unpublished'}\n";
+    for (name, bytes) in [
+        ("build", bad_build.as_slice()),
+        ("path", bad_path.as_slice()),
+        ("opaque", &[0xff, 0xfe]),
+    ] {
+        let directory = root.join("fixtures").join(name);
+        std::fs::create_dir_all(directory.join("src")).unwrap();
+        std::fs::write(directory.join("Cargo.toml"), bytes).unwrap();
+        std::fs::write(directory.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+    git_output(&root, &["add", "fixtures"]).await.unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "retain negative fixture bytes",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    validate_clean_overlay_cargo_sources(&root, &spec, "cargo check --all-targets")
+        .await
+        .unwrap();
+    let selected = selected_clean_overlay_cargo_tree(&root, &spec)
+        .await
+        .unwrap();
+    for (name, bytes, diagnostic) in [
+        ("build", bad_build.as_slice(), "build.rs"),
+        ("path", bad_path.as_slice(), "/absolute/unpublished"),
+        ("opaque", &[0xff, 0xfe], "Cargo metadata"),
+    ] {
+        let relative = format!("fixtures/{name}/Cargo.toml");
+        assert!(selected.contains_key(Path::new(&relative)));
+        let error = validate_clean_overlay_cargo_sources(
+            &root,
+            &spec,
+            &format!("cargo check --manifest-path {relative}"),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+        assert_eq!(std::fs::read(root.join(&relative)).unwrap(), bytes);
+        assert_eq!(
+            git_output_bytes(&root, &["cat-file", "blob", &format!("HEAD:{relative}")])
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+    validate_clean_overlay_cargo_sources(&root, &spec, "cargo check --all-targets")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn clean_overlay_actual_manifest_selector_precedes_workspace_semantics() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='bad-root'\nversion='0.1.0'\nbuild='missing.rs'",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("nested/src")).unwrap();
+    std::fs::write(
+        root.join("nested/Cargo.toml"),
+        "[package]\nname='standalone'\nversion='0.1.0'\n[workspace]",
+    )
+    .unwrap();
+    std::fs::write(root.join("nested/src/lib.rs"), "pub fn standalone() {}\n").unwrap();
+    git_output(&root, &["add", "Cargo.toml", "nested"])
+        .await
+        .unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "independent nested workspace",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        validate_clean_overlay_cargo_sources(&root, &spec, "cargo check")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("missing.rs")
+    );
+    for command in [
+        "cargo check --manifest-path nested/Cargo.toml",
+        "cargo check --manifest-path=nested/Cargo.toml --config 'build.jobs=1'",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap();
+    }
+    assert!(
+        validate_clean_overlay_cargo_sources(
+            &root,
+            &spec,
+            "cargo check --manifest-path nested/Cargo.toml --manifest-path Cargo.toml"
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_manifest_file_alias_does_not_replace_the_selected_source_base() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir_all(root.join("fixtures/literal/src")).unwrap();
+    std::fs::create_dir_all(root.join("fixtures/alias/src")).unwrap();
+    std::fs::write(
+        root.join("fixtures/literal/Cargo.toml"),
+        "[package]\nname='literal'\nversion='0.1.0'\nbuild='build.rs'",
+    )
+    .unwrap();
+    std::fs::write(root.join("fixtures/literal/build.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        root.join("fixtures/literal/src/lib.rs"),
+        "pub fn literal() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fixtures/alias/src/lib.rs"),
+        "pub fn alias() {}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../literal/Cargo.toml",
+        root.join("fixtures/alias/Cargo.toml"),
+    )
+    .unwrap();
+    git_output(&root, &["add", "fixtures"]).await.unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "retain manifest alias fixture",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    for command in [
+        "cargo check",
+        "cargo check --manifest-path fixtures/literal/Cargo.toml",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap();
+    }
+    let error = validate_clean_overlay_cargo_sources(
+        &root,
+        &spec,
+        "cargo check --manifest-path fixtures/alias/Cargo.toml",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("manifest file symlinks"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn clean_overlay_cargo_preflight_reads_selected_base_not_ambient_manifest() {
     let _guard = test_guard!();
     let root = init_clean_overlay_test_repo().keep();
@@ -1008,7 +1202,7 @@ fn join_exec_command_keeps_leading_assignments_as_assignments() {
         "printf '%s|%s' \"$RCH_T_A\" \"$RCH_T_B\"".to_string(),
     ];
     let joined = join_exec_command(&parts);
-    let output = std::process::Command::new("sh")
+    let output = std::process::Command::new("sh") // ubs:ignore — executes only the fixed assignment/printf argv above to check real shell quoting.
         .arg("-c")
         .arg(&joined)
         .output()
@@ -5095,7 +5289,7 @@ fn cargo_profile_forwarding_binds_settings_and_preserves_shell_precedence() {
         ),
     ] {
         let bound = bind_cargo_profile_command(command, &environment, &layer0, settings.clone());
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new("sh") // ubs:ignore — fixed printf cases and fixture-only profile settings exercise real shell environment precedence.
             .args(["-c", &bound])
             .env_clear()
             .output()
