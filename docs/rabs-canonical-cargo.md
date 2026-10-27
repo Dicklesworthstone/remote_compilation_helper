@@ -1112,7 +1112,7 @@ mixed or invalid explicit settings refuse startup. Credentials and transport
 state remain outside the Cargo namespace; no normal daemon needs to be started
 for this operation-owned coordinator.
 
-The worker must explicitly advertise `canonical-dependency-exec-v3` and support
+The worker must explicitly advertise `canonical-dependency-exec-v4` and support
 the selected `metadata` or `rlib` execution mode. Both peers retain that exact version and mode through
 authenticated admission. An older worker cannot silently reinterpret the request
 as ordinary-path dependency execution, and metadata support does not authorize an
@@ -1125,13 +1125,14 @@ control socket and persistent CAS are not exposed to that compiler.
 
 For a library with `OUT_DIR`, the coordinator requires Cargo's completed
 `root-output` record to name that exact canonical path and captures its byte-exact
-persisted stdout alongside every file in the generated tree. Empty generated
-trees have an explicit private owner. The path must be below
+persisted stdout alongside every file and directory in the generated tree.
+Directory-only trees and empty subdirectories are retained, keyed and rebuilt
+under an explicit private owner. The path must be below
 `/__rabs/out/cargo`, disjoint from compiler outputs and dependency search roots;
 the worker mounts it read-only at the original logical name. The action key
-binds the complete generated contents, the persisted Cargo directives and the
+binds the complete generated contents and directory listings, the persisted Cargo directives and the
 presented environment. Source and record generations are checked again before
-publication and installation. A changed generated file therefore cannot reuse
+publication and installation. A changed generated file or directory therefore cannot reuse
 the earlier consumer result even when its package source and build script are
 unchanged. These inputs authorize only an independently supervised compiler
 execution; they do not authorize local result capture or cache the script's

@@ -1191,6 +1191,13 @@ pub const SOURCE: &str = file!();
             .unwrap()
             .with_execution_mode(mode)
         };
+        let context = context
+            .with_generated_directories(if with_generated {
+                vec!["nested".into()]
+            } else {
+                Vec::new()
+            })
+            .unwrap();
         let request = CanonicalExecRequest {
             request_id,
             program: visible_compiler.clone(),

@@ -35,7 +35,7 @@ DEFAULT_STARTUP_MS = 5000
 MAX_STARTUP_MS = 30000
 OWNER_RECEIPT = "daemon-owner.json"
 MAX_OWNER_RECEIPT = 2048
-DEPENDENCY_CONTEXT = "dependency-exec-v7"
+DEPENDENCY_CONTEXT = "dependency-exec-v8"
 DEPENDENCY_WORKER_KEYS = (
     "RABS_DEPENDENCY_WORKER_LISTEN",
     "RABS_DEPENDENCY_WORKER_ID",
@@ -202,7 +202,7 @@ with exactly listen, worker_id and worker_spki_sha256 fields. Pool listeners,
 IDs and pins must each be unique; pool and singleton settings cannot be mixed.
 New daemons also require the existing RABS_COORD_TLS_* credentials. The connected
 daemon must advertise the exact normalized worker configuration, including pool
-order, and dependency-exec-v7 capability. A different, local-only or older daemon
+order, and dependency-exec-v8 capability. A different, local-only or older daemon
 produces a setup error and an explicit stock-Cargo fallback; use
 --rabs-require-daemon to refuse setup instead. Settings never reconfigure an
 attached daemon. A matching configuration does not promise a connected worker

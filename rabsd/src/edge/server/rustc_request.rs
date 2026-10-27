@@ -538,6 +538,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     }
     let mut inputs = ActionInputManifest {
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+        directory_enumerations: match package.generated_directory_enumerations(&plan) {
+            Ok(enumerations) => enumerations,
+            Err(reason) => return refuse(&reason),
+        },
         inputs: package
             .files
             .iter()

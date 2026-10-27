@@ -165,7 +165,8 @@ fn try_actual_key(
     toolchain: &ToolchainFacts,
 ) -> Result<rabs_key::live_dependency::LiveDependencyKey, rabs_key::live_dependency::LiveRefusal> {
     use rabs_protocol::input_evidence::{
-        ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        ActionInputManifest, DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType,
+        PositiveInput,
     };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
@@ -174,13 +175,18 @@ fn try_actual_key(
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
         ..ActionInputManifest::default()
     };
-    let mut roots = vec![(Path::new(&plan.source_root), plan.source_virtual_root())];
+    let mut roots = vec![(
+        Path::new(&plan.source_root),
+        plan.source_virtual_root(),
+        false,
+    )];
     if let Some(root) = &plan.generated_root {
-        roots.push((Path::new(root), plan.generated_virtual_root()));
+        roots.push((Path::new(root), plan.generated_virtual_root(), true));
     }
-    for (root, visible) in roots {
+    for (root, visible, generated) in roots {
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
+            let mut entries = Vec::new();
             for entry in std::fs::read_dir(&directory).unwrap() {
                 let entry = entry.unwrap();
                 if directory == root
@@ -188,6 +194,9 @@ fn try_actual_key(
                     && entry.file_name() == ".git"
                 {
                     continue;
+                }
+                if generated {
+                    entries.push(RawBytes::new(entry.file_name().as_encoded_bytes().to_vec()));
                 }
                 let path = entry.path();
                 let meta = std::fs::symlink_metadata(&path).unwrap();
@@ -209,6 +218,23 @@ fn try_actual_key(
                         symlink_resolution: Vec::new(),
                     });
                 }
+            }
+            if generated {
+                entries.sort();
+                inputs.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        if directory == root {
+                            visible.clone()
+                        } else {
+                            format!(
+                                "{visible}/{}",
+                                directory.strip_prefix(root).unwrap().to_str().unwrap()
+                            )
+                        }
+                        .into_bytes(),
+                    ),
+                    entries,
+                });
             }
         }
     }

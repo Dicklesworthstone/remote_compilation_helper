@@ -14,6 +14,7 @@ use crate::canonical_namespace::{
     Bind, CanonicalNamespaceSpec, HostIsolationSupport, IsolationError, NamespaceBoundary,
     NamespaceLaunch, push_binds, push_common_prelude, push_env, push_host_usr,
 };
+use crate::generated_source::validate_generated_directories;
 use crate::layout;
 use crate::runtime_cohort::RetainedRuntime;
 use std::collections::BTreeSet;
@@ -21,13 +22,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
-pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v7";
+pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v8";
 /// Separately negotiated canonical Cargo dependency execution. This is not a
 /// pathname-based extension of the original-path context: both peers must
 /// select this version and its output mode before canonical aliases can enter
-/// a compiler view. Version 3 additionally admits a complete sealed generated
-/// input tree at its canonical Cargo OUT_DIR in either execution mode.
-pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v3";
+/// a compiler view. Version 4 binds every generated subdirectory, including
+/// empty directories, alongside the sealed files at canonical Cargo OUT_DIR.
+pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v4";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -255,6 +256,7 @@ pub struct DependencyExecContext {
     execution_mode: DependencyExecutionMode,
     source_root: String,
     generated_root: Option<String>,
+    generated_directories: Vec<String>,
     cwd: String,
     toolchain_root: String,
     compiler: String,
@@ -694,6 +696,7 @@ impl DependencyExecContext {
             execution_mode: DependencyExecutionMode::Metadata,
             source_root,
             generated_root,
+            generated_directories: Vec::new(),
             cwd,
             toolchain_root,
             compiler,
@@ -743,6 +746,35 @@ impl DependencyExecContext {
     /// Original captured build-script output tree, when present.
     pub fn generated_root(&self) -> Option<&str> {
         self.generated_root.as_deref()
+    }
+    /// Complete sorted generated subdirectories relative to OUT_DIR. The root
+    /// itself is implicit; the worker checks this inventory against the paired
+    /// sealed generated files before constructing its private read-only tree.
+    pub fn generated_directories(&self) -> &[String] {
+        &self.generated_directories
+    }
+
+    /// Bind the complete captured generated-directory inventory to this
+    /// execution. No directories may exist without a generated input root.
+    /// File collisions and file-parent coverage require the separately retained
+    /// source manifest and are checked before execution, never assumed here.
+    ///
+    /// # Errors
+    /// A missing root, unsafe path, unsorted or duplicate name, missing parent,
+    /// or directory inventory exceeding the negotiated bound.
+    pub fn with_generated_directories(
+        mut self,
+        directories: Vec<String>,
+    ) -> Result<Self, DependencyContextError> {
+        if self.generated_root.is_none() && !directories.is_empty() {
+            return Err(invalid(
+                "dependency generated directories require a generated root",
+            ));
+        }
+        validate_generated_directories(&directories)
+            .map_err(|_| invalid("dependency generated directory inventory is invalid"))?;
+        self.generated_directories = directories;
+        Ok(self)
     }
     /// Original compiler working directory.
     pub fn cwd(&self) -> &str {
@@ -1157,7 +1189,7 @@ mod tests {
                 context.runtime_cohort_sha256,
             )
             .is_err(),
-            "ordinary dependency-exec-v7 cannot reinterpret canonical paths"
+            "ordinary dependency-exec-v8 cannot reinterpret canonical paths"
         );
         let spec = context
             .namespace(
@@ -1239,7 +1271,7 @@ mod tests {
             DependencyExecutionMode::Rlib,
         ] {
             let context = canonical_generated_context(generated, mode).unwrap();
-            assert_eq!(context.version(), "canonical-dependency-exec-v3");
+            assert_eq!(context.version(), "canonical-dependency-exec-v4");
             assert_eq!(context.generated_root(), Some(generated));
             assert_eq!(context.execution_mode(), mode);
             assert!(
@@ -1874,6 +1906,63 @@ mod tests {
     }
 
     #[test]
+    fn generated_directory_context_binds_complete_tree_in_both_path_profiles() {
+        let root = "/work/build/generated/unit/out";
+        let original = generated_context(
+            Some(root),
+            vec![("OUT_DIR".to_owned(), root.to_owned())],
+            Vec::new(),
+        )
+        .unwrap();
+        let canonical = canonical_generated_context(
+            "/__rabs/out/cargo/debug/build/leaf-123/out",
+            DependencyExecutionMode::Rlib,
+        )
+        .unwrap();
+        assert_eq!(original.version(), "dependency-exec-v8");
+        assert_eq!(canonical.version(), "canonical-dependency-exec-v4");
+        for context in [original, canonical] {
+            assert!(context.generated_directories().is_empty());
+            let populated = context
+                .clone()
+                .with_generated_directories(vec!["empty".into(), "empty/child".into()])
+                .unwrap();
+            assert_eq!(populated.generated_directories(), &["empty", "empty/child"]);
+            assert_ne!(populated, context);
+            assert_eq!(populated.generated_root(), context.generated_root());
+            assert_eq!(populated.env(), context.env());
+            for directories in [
+                vec!["empty/child".into()],
+                vec!["empty".into(), "empty".into()],
+                vec!["empty".into(), "empty/../other".into()],
+                vec!["z".into(), "a".into()],
+                vec!["/absolute".into()],
+            ] {
+                assert!(
+                    context
+                        .clone()
+                        .with_generated_directories(directories)
+                        .is_err()
+                );
+            }
+        }
+        for context in [context(Vec::new()), canonical_context()] {
+            assert!(context.generated_root().is_none());
+            assert!(
+                context
+                    .clone()
+                    .with_generated_directories(Vec::new())
+                    .is_ok()
+            );
+            assert!(
+                context
+                    .with_generated_directories(vec!["empty".into()])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn generated_root_and_out_dir_environment_form_one_exact_contract() {
         let root = "/work/build/generated/unit/out";
         let env = vec![("OUT_DIR".to_owned(), root.to_owned())];
@@ -2141,7 +2230,7 @@ mod tests {
             metadata.runtime_cohort_sha256,
         )
         .unwrap();
-        assert_eq!(archive.version(), "canonical-dependency-exec-v3");
+        assert_eq!(archive.version(), "canonical-dependency-exec-v4");
         assert_archive_mode_namespace(archive);
     }
 

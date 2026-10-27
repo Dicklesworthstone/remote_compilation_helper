@@ -578,7 +578,12 @@ impl RemoteDependencies {
             )
         }
         .map_err(|error| error.to_string())?
-        .with_execution_mode(execution_mode(plan)?);
+        .with_execution_mode(execution_mode(plan)?)
+        .with_generated_directories(
+            rabs_key::live_dependency::generated_input_directories(plan, inputs)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         verify_execution_policy(plan, &key, context.execution_mode())?;
         loader_witness.verify_absence(|| false).map_err(|error| {
             format!("original loader directories changed during keying: {error}")
@@ -1103,6 +1108,7 @@ fn context_value(context: &DependencyExecContext) -> Value {
         "execution_mode":context.execution_mode().as_str(),
         "source_root":context.source_root(), "cwd":context.cwd(),
         "generated_root":context.generated_root(),
+        "generated_directories":context.generated_directories(),
         "toolchain_root":context.toolchain_root(), "compiler":context.compiler(),
         "out_dir":context.out_dir(), "dependency_dirs":context.dependency_dirs(),
         "loader_dirs":context.loader_dirs(),
@@ -2204,8 +2210,16 @@ mod execution_resource_tests {
         let root = "/__rabs/out/cargo/debug/build/parallel-123/out";
         for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
             let mut fixture = Fixture::canonical_with_generated(emit, Some(root));
+            fixture.context = fixture
+                .context
+                .with_generated_directories(vec!["empty".into(), "empty/child".into()])
+                .unwrap();
             let request = fixture.request().unwrap();
             assert_eq!(request["dependency_context"]["generated_root"], root);
+            assert_eq!(
+                request["dependency_context"]["generated_directories"],
+                json!(["empty", "empty/child"])
+            );
             assert_eq!(
                 request["dependency_context"]["version"],
                 CANONICAL_DEPENDENCY_CONTEXT_VERSION

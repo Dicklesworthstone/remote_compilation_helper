@@ -43,12 +43,12 @@ pub const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str =
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
-pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v6: \
+pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v7: \
     Linux worker namespace; subscriber paths preserved; complete regular-file \
     dependency source, exact toolchain and complete crate-candidate inventories \
     mounted read-only; explicit rmeta and complete rlib extern bytes retained; \
     complete generated OUT_DIR tree retained read-only at its original path, \
-    including an empty tree, with exact captured Cargo stdout and rustc-env \
+    including every empty directory and exact keyed directory listing, with captured Cargo stdout and rustc-env \
     directives bound; build-script execution is not cached; no bare extern, \
     proc-macro or native inputs; metadata and dep-info \
     only; shared input/output roots use exact read-only file mounts above private \
@@ -57,7 +57,7 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
     receive private empty backings; outputs private until complete authenticated \
     delivery; network denied; compiler environment preserved by dependency-env-v2 \
     except process-local jobserver descriptors; all loader paths within the exact \
-    toolchain or independently observed dependency-exec-v6 directories without \
+    toolchain or independently observed dependency-exec-v8 directories without \
     dynamic libraries, including Cargo output parents; selected host ELF runtime \
     bytes, exact loader symlink topology and loader cache captured and mounted \
     read-only in a sparse /usr view without other host /usr or /etc/alternatives \
@@ -72,11 +72,12 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
 /// integrated assembler may read `.incbin` files without listing them in
 /// dep-info; it must not see procfs, randomness devices, or the host filesystem.
 /// This policy is never evidence for an unsandboxed local archive compilation.
-pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
-    dependency-exec-v7 rlib execution mode; original subscriber paths preserved; \
+pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v2: \
+    dependency-exec-v8 rlib execution mode; original subscriber paths preserved; \
     complete regular-file package, generated OUT_DIR, exact toolchain, Rust \
     dependency candidate inventories and observed selected ELF runtime retained \
-    read-only; exact compiler environment except process-local jobserver descriptors; \
+    read-only; generated trees include every empty directory and exact keyed directory listing; \
+    exact compiler environment except process-local jobserver descriptors; \
     network denied; no procfs or general device filesystem, only deterministic \
     /dev/null; fresh private empty home, temporary and output storage; LLVM \
     integrated archive codegen only with no proc macros, native link inputs, \
@@ -86,8 +87,8 @@ pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
     exact private output capture, runtime/input revalidation, authenticated delivery \
     and coordinator-only publication; full-result readiness";
 
-const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-remote-metadata-v3: canonical-dependency-exec-v3 negotiated \
-    separately from dependency-exec-v7; coordinator-owned canonical Cargo \
+const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-remote-metadata-v4: canonical-dependency-exec-v4 negotiated \
+    separately from dependency-exec-v8; coordinator-owned canonical Cargo \
     planning and retained logical-to-physical mappings; exact canonical rustc \
     argv, cwd, environment and replay bytes; external registry, Git or checked \
     directory-source metadata and dep-info only; closed worker package, complete \
@@ -95,13 +96,14 @@ const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-rem
     runtime; no outer Cargo workspace, complete Cargo home or coordinator control \
     socket mounted; existing authenticated delivery, input revalidation, closure, \
     sampling and release authorization remain required; complete generated OUT_DIR \
-    retained read-only at its exact canonical spelling, including an empty tree, \
+    retained read-only at its exact canonical spelling, including every empty directory \
+    and exact keyed directory listing, \
     with exact persisted Cargo stdout and matching rustc-env directives keyed; \
     no workspace, archive, build-script execution or proc-macro authority";
 
-const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rlib-v2: \
-    canonical-dependency-exec-v3 rlib mode negotiated independently from metadata \
-    and ordinary dependency-exec-v7; coordinator-owned canonical Cargo planning \
+const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rlib-v3: \
+    canonical-dependency-exec-v4 rlib mode negotiated independently from metadata \
+    and ordinary dependency-exec-v8; coordinator-owned canonical Cargo planning \
     and retained logical-to-physical mappings; exact canonical rustc argv, cwd, \
     environment and replay bytes; complete immutable external registry, Git or \
     checked directory-source package, toolchain, exact Rust candidate inventories \
@@ -112,7 +114,8 @@ const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rl
     or fail; existing exact output validation, authenticated delivery, input \
     revalidation, sampling and release authorization required; no local codegen \
     capture or workspace publication; complete generated OUT_DIR retained read-only \
-    at its exact canonical spelling, including an empty tree, with exact persisted \
+    at its exact canonical spelling, including every empty directory and exact keyed \
+    directory listing, with exact persisted \
     Cargo stdout and matching rustc-env directives keyed; no build-script execution, \
     proc macros or native linking";
 
@@ -655,7 +658,7 @@ mod tests {
     use super::*;
     use crate::live_dependency::{LiveRustcRequest, plan_dependency_action};
     use rabs_protocol::input_evidence::{
-        INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
     };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
@@ -731,6 +734,15 @@ mod tests {
                     executable: false,
                     symlink_resolution: Vec::new(),
                 })
+                .collect(),
+            directory_enumerations: plan
+                .generated_root
+                .as_ref()
+                .map(|_| DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: Vec::new(),
+                })
+                .into_iter()
                 .collect(),
             ..ActionInputManifest::default()
         }
@@ -1653,6 +1665,11 @@ mod tests {
 
     fn generated_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
         let mut inputs = inputs(plan);
+        inputs.directory_enumerations[0].entries = vec![RawBytes::from("nested")];
+        inputs.directory_enumerations.push(DirectoryEnumeration {
+            virtual_path: RawBytes::new(plan.generated_input_virtual_path("nested").into_bytes()),
+            entries: vec![RawBytes::from("generated.rs")],
+        });
         inputs.inputs.push(PositiveInput {
             virtual_path: RawBytes::new(
                 plan.generated_input_virtual_path("nested/generated.rs")
@@ -1728,12 +1745,41 @@ mod tests {
             file.virtual_path =
                 RawBytes::new(plan.generated_input_virtual_path("extra.bin").into_bytes());
             added.inputs.push(file);
+            added.directory_enumerations[0]
+                .entries
+                .insert(0, RawBytes::from("extra.bin"));
             assert_ne!(
                 generated_key(&plan, &added, Some(record))
                     .unwrap()
                     .action_key,
                 original.action_key,
                 "complete generated membership is semantic"
+            );
+            let mut empty_directories = retained.clone();
+            empty_directories.directory_enumerations[0]
+                .entries
+                .insert(0, RawBytes::from("empty"));
+            empty_directories.directory_enumerations.extend([
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("empty").into_bytes(),
+                    ),
+                    entries: vec![RawBytes::from("child")],
+                },
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("empty/child")
+                            .into_bytes(),
+                    ),
+                    entries: Vec::new(),
+                },
+            ]);
+            assert_ne!(
+                generated_key(&plan, &empty_directories, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "empty generated directories remain semantic in every remote output mode"
             );
             assert_ne!(
                 generated_key(
@@ -2018,6 +2064,9 @@ mod tests {
         member.virtual_path =
             RawBytes::new(plan.generated_input_virtual_path("new.rs").into_bytes());
         added.inputs.push(member);
+        added.directory_enumerations[0]
+            .entries
+            .push(RawBytes::from("new.rs"));
         assert_ne!(
             remote.action_key,
             generated_key(&plan, &added, Some(record))

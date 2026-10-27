@@ -118,12 +118,12 @@ pub use canonical_cargo::{
     plan_canonical_remote_dependency_action,
 };
 
-/// Key epoch of the live dependency class. Epoch 5 limits transcript placement
-/// rewriting to declared rustc artifact events. Earlier entries could rewrite
-/// source-authored diagnostics, so they must not supply replay evidence.
-/// Complete environment keying, dynamic-dependency refusal and acknowledged
-/// immutable capture remain required.
-pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 5;
+/// Key epoch of the live dependency class. Epoch 6 requires the complete
+/// generated-directory topology, including empty directories, in input evidence.
+/// Earlier file-only keys must not serve generated-tree results. Exact artifact
+/// transcript rewriting, complete environment keying, dynamic-dependency refusal
+/// and acknowledged immutable capture remain required.
+pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 6;
 /// Projection epoch: exact (unprojected) dependency artifacts.
 pub const LIVE_DEPENDENCY_PROJECTION_EPOCH: u32 = 1;
 /// Canonical spelling of the invocation's out-dir in keys, committed
@@ -150,14 +150,15 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// The registry isolation profile. Deliberately plain: it is NOT a
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
-pub const ISOLATION_PROFILE: &str = "live-dependency-v7: unsandboxed local edge process; \
+pub const ISOLATION_PROFILE: &str = "live-dependency-v8: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete registry package \
      tree with a real directory root revalidated on every observation; closure enforced \
      after execution by dep-info traversal bounded to the observed source root; proc-macro \
      consumption refused; generated compiler inputs captured as a complete disjoint \
-     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
+     regular-file OUT_DIR tree with every directory and immediate-child listing keyed, \
+     including empty directories, with exact OUT_DIR spelling keyed and generation revalidated; \
      build-script execution is not cached; exact crate-locator candidates of every \
      dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
      dynamic candidates refused because regular dependencies can reexport procedural macros; \
@@ -165,7 +166,7 @@ pub const ISOLATION_PROFILE: &str = "live-dependency-v7: unsandboxed local edge 
 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
-pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v6: unsandboxed local edge process; \
+pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v7: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete Cargo Git checkout \
@@ -173,7 +174,8 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v6: unsandboxed loc
      real directory root revalidated on every observation; closure enforced after execution \
      by dep-info traversal bounded to the observed source root, Git metadata reads refused; \
      proc-macro consumption refused; generated compiler inputs captured as a complete disjoint \
-     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
+     regular-file OUT_DIR tree with every directory and immediate-child listing keyed, \
+     including empty directories, with exact OUT_DIR spelling keyed and generation revalidated; \
      build-script execution is not cached; exact crate-locator candidates of every \
      dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
      dynamic candidates refused because regular dependencies can reexport procedural macros; \
@@ -182,7 +184,7 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v6: unsandboxed loc
 /// Directory sources retain their real paths and complete package contents.
 /// The checksum document identifies the source class, never the file closure:
 /// even files absent from its `files` map are captured, hashed and revalidated.
-pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v3: unsandboxed local edge process; \
+pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v4: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete Cargo directory-source \
@@ -192,7 +194,8 @@ pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v3: uns
      symlinks and source-policy exclusions refuse capture; dep-info reads bounded to the \
      source and generated trees; proc-macro consumption and native link inputs refused; \
      dynamic dependency candidates refused because regular dependencies can reexport procedural macros; \
-     generated inputs captured as a complete disjoint regular-file OUT_DIR tree with exact \
+     generated inputs captured as a complete disjoint regular-file OUT_DIR tree with every \
+     directory and immediate-child listing keyed, including empty directories, with exact \
      OUT_DIR spelling keyed and generation revalidated; build-script execution is not cached; \
      exact dependency-directory crate candidates revalidated before serving and after execution";
 
@@ -1234,10 +1237,10 @@ fn dependency_key(
     }
     validate_build_script_output(plan, build_script_output)?;
     validate_directory_source_manifest(plan, inputs)?;
+    generated_input_directories(plan, inputs)?;
     let root = format!("{}/", plan.source_virtual_root());
     let generated = format!("{}/", plan.generated_virtual_root());
     if inputs.inputs.is_empty()
-        || !inputs.directory_enumerations.is_empty()
         || !inputs.approved_generated_objects.is_empty()
         || inputs.inputs.iter().any(|input| {
             input.file_type != InputFileType::Regular
@@ -1306,7 +1309,7 @@ fn dependency_key(
             }
         }
         if let Some(generated_root) = &plan.generated_root {
-            enc.str("complete-generated-input-tree-enumeration-v1")
+            enc.str("complete-generated-input-tree-enumeration-v2")
                 .str(generated_root)
                 .str(&plan.generated_virtual_root());
         }
@@ -1383,6 +1386,140 @@ fn dependency_key(
         action_key,
         descriptor_digest,
     })
+}
+
+/// Validate the complete generated-tree directory closure bound into an action
+/// input manifest, returning sorted relative subdirectories excluding the root.
+/// Every directory, including an empty OUT_DIR itself, needs one exact listing
+/// of immediate file and directory names. Files and directories may not collide,
+/// every parent must be declared, and no listing outside OUT_DIR is accepted.
+///
+/// Callers supply observations from the same coherent capture as the positive
+/// file objects. This pure check proves their consistency, not that a caller
+/// observed a live filesystem or acquired authority to execute an action.
+///
+/// # Errors
+/// [`LiveRefusal::Facts`] for missing, unsafe, duplicate, unbounded or inconsistent
+/// generated input evidence, or directory evidence without a generated root.
+pub fn generated_input_directories(
+    plan: &DependencyActionPlan,
+    inputs: &ActionInputManifest,
+) -> Result<Vec<String>, LiveRefusal> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let refuse = || {
+        LiveRefusal::Facts(
+            "generated inputs require complete normalized directory listings matching every captured file"
+                .into(),
+        )
+    };
+    if plan.generated_root.is_none() {
+        return if inputs.directory_enumerations.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(refuse())
+        };
+    }
+    // Match the independently bounded generated-directory execution contract.
+    // The generated root occupies one additional enumeration but no relative
+    // directory name in the worker context.
+    if inputs.directory_enumerations.is_empty() || inputs.directory_enumerations.len() > 4097 {
+        return Err(refuse());
+    }
+    let root = plan.generated_virtual_root();
+    let prefix = format!("{root}/");
+    let mut declared = BTreeMap::new();
+    for enumeration in &inputs.directory_enumerations {
+        let path =
+            std::str::from_utf8(enumeration.virtual_path.as_bytes()).map_err(|_| refuse())?;
+        let relative = if path == root {
+            ""
+        } else {
+            let relative = path.strip_prefix(&prefix).ok_or_else(refuse)?;
+            if !normalized_generated_relative(relative) {
+                return Err(refuse());
+            }
+            relative
+        };
+        if declared.insert(relative, enumeration).is_some()
+            || enumeration
+                .entries
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || enumeration.entries.iter().any(|entry| {
+                std::str::from_utf8(entry.as_bytes()).map_or(true, |entry| {
+                    entry.contains('/') || !normalized_generated_relative(entry)
+                })
+            })
+        {
+            return Err(refuse());
+        }
+    }
+    if !declared.contains_key("") {
+        return Err(refuse());
+    }
+    let mut expected: BTreeMap<&str, BTreeSet<&str>> = declared
+        .keys()
+        .map(|directory| (*directory, BTreeSet::new()))
+        .collect();
+    for relative in declared.keys().filter(|relative| !relative.is_empty()) {
+        let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
+        let children = expected.get_mut(parent).ok_or_else(refuse)?;
+        if !children.insert(name) {
+            return Err(refuse());
+        }
+    }
+    for input in &inputs.inputs {
+        if input.virtual_path.as_bytes() == root.as_bytes() {
+            return Err(refuse());
+        }
+        let Some(relative) = input
+            .virtual_path
+            .as_bytes()
+            .strip_prefix(prefix.as_bytes())
+        else {
+            continue;
+        };
+        let relative = std::str::from_utf8(relative).map_err(|_| refuse())?;
+        if !normalized_generated_relative(relative)
+            || input.file_type != InputFileType::Regular
+            || !input.symlink_resolution.is_empty()
+            || declared.contains_key(relative)
+        {
+            return Err(refuse());
+        }
+        let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
+        if !expected.get_mut(parent).ok_or_else(refuse)?.insert(name) {
+            return Err(refuse());
+        }
+    }
+    for (relative, enumeration) in &declared {
+        let children = &expected[relative];
+        if enumeration.entries.len() != children.len()
+            || enumeration
+                .entries
+                .iter()
+                .zip(children)
+                .any(|(actual, expected)| actual.as_bytes() != expected.as_bytes())
+        {
+            return Err(refuse());
+        }
+    }
+    Ok(declared
+        .keys()
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| (*relative).to_owned())
+        .collect())
+}
+
+fn normalized_generated_relative(path: &str) -> bool {
+    path.len() <= 1024
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && path.split('/').count() <= 32
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
 }
 
 fn validate_directory_source_manifest(
@@ -2022,7 +2159,9 @@ fn observed_input_virtual_path(plan: &DependencyActionPlan, absolute: &str) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rabs_protocol::input_evidence::{INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput};
+    use rabs_protocol::input_evidence::{
+        DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput,
+    };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
 
@@ -2213,6 +2352,15 @@ mod tests {
         ActionInputManifest {
             schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
             inputs: vec![input("Cargo.toml", 10), input("src/lib.rs", lib_tag)],
+            directory_enumerations: plan
+                .generated_root
+                .as_ref()
+                .map(|_| DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
             ..ActionInputManifest::default()
         }
     }
@@ -2896,6 +3044,7 @@ mod tests {
             executable: false,
             symlink_resolution: Vec::new(),
         });
+        manifest.directory_enumerations[0].entries = vec![RawBytes::from("value.rs")];
         let keyed = |plan: &DependencyActionPlan, manifest: &ActionInputManifest| {
             live_dependency_key(plan, &toolchain(), &externs(plan, 20), manifest)
                 .unwrap()
@@ -2950,6 +3099,164 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn generated_listing(
+        plan: &DependencyActionPlan,
+        relative: &str,
+        entries: &[&str],
+    ) -> DirectoryEnumeration {
+        DirectoryEnumeration {
+            virtual_path: RawBytes::new(
+                if relative.is_empty() {
+                    plan.generated_virtual_root()
+                } else {
+                    plan.generated_input_virtual_path(relative)
+                }
+                .into_bytes(),
+            ),
+            entries: entries.iter().map(|entry| RawBytes::from(*entry)).collect(),
+        }
+    }
+
+    #[test]
+    fn generated_empty_directory_topology_changes_action_identity() {
+        let plan = plan_for(OUT_A, &[], &[("OUT_DIR", "/work/generated")]).unwrap();
+        let empty = inputs(&plan, 11);
+        assert!(
+            generated_input_directories(&plan, &empty)
+                .unwrap()
+                .is_empty()
+        );
+        let keyed = |manifest: &ActionInputManifest| {
+            live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), manifest)
+                .unwrap()
+                .action_key
+        };
+        let empty_key = keyed(&empty);
+        let mut directories = empty.clone();
+        directories.directory_enumerations = vec![
+            generated_listing(&plan, "", &["empty"]),
+            generated_listing(&plan, "empty", &[]),
+        ];
+        assert_eq!(
+            generated_input_directories(&plan, &directories).unwrap(),
+            ["empty"]
+        );
+        let directory_key = keyed(&directories);
+        assert_ne!(empty_key, directory_key);
+
+        let mut renamed = empty.clone();
+        renamed.directory_enumerations = vec![
+            generated_listing(&plan, "", &["renamed"]),
+            generated_listing(&plan, "renamed", &[]),
+        ];
+        assert_ne!(directory_key, keyed(&renamed));
+
+        let mut nested = directories.clone();
+        nested.directory_enumerations[1] = generated_listing(&plan, "empty", &["child"]);
+        nested
+            .directory_enumerations
+            .push(generated_listing(&plan, "empty/child", &[]));
+        assert_eq!(
+            generated_input_directories(&plan, &nested).unwrap(),
+            ["empty", "empty/child"]
+        );
+        assert_ne!(directory_key, keyed(&nested));
+        assert_ne!(empty_key, keyed(&nested));
+        nested.directory_enumerations.reverse();
+        let mut ordered = nested.clone();
+        ordered.directory_enumerations.reverse();
+        assert_eq!(keyed(&nested), keyed(&ordered));
+        assert_eq!(empty.inputs, directories.inputs);
+        assert_eq!(empty.inputs, nested.inputs);
+    }
+
+    #[test]
+    fn generated_directory_evidence_must_match_every_file_and_directory() {
+        let plan = plan_for(OUT_A, &[], &[("OUT_DIR", "/work/generated")]).unwrap();
+        let mut good = inputs(&plan, 11);
+        good.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(
+                plan.generated_input_virtual_path("nested/value.rs")
+                    .into_bytes(),
+            ),
+            object: ObjectId(digest(42)),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        good.directory_enumerations = vec![
+            generated_listing(&plan, "", &["empty", "nested"]),
+            generated_listing(&plan, "empty", &["child"]),
+            generated_listing(&plan, "empty/child", &[]),
+            generated_listing(&plan, "nested", &["value.rs"]),
+        ];
+        assert_eq!(
+            generated_input_directories(&plan, &good).unwrap(),
+            ["empty", "empty/child", "nested"]
+        );
+        assert!(live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &good).is_ok());
+        for fault in 0..15 {
+            let mut invalid = good.clone();
+            match fault {
+                0 => invalid.directory_enumerations.clear(),
+                1 => {
+                    invalid.directory_enumerations.remove(0);
+                }
+                2 => {
+                    invalid.directory_enumerations.remove(1);
+                }
+                3 => {
+                    invalid.directory_enumerations.remove(3);
+                }
+                4 => invalid
+                    .directory_enumerations
+                    .push(good.directory_enumerations[0].clone()),
+                5 => invalid.directory_enumerations[1].virtual_path = RawBytes::from("/outside"),
+                6 => invalid.directory_enumerations[0]
+                    .entries
+                    .push(RawBytes::from("unobserved")),
+                7 => {
+                    invalid.directory_enumerations[0].entries = vec![
+                        RawBytes::from("empty"),
+                        RawBytes::from("empty"),
+                        RawBytes::from("nested"),
+                    ]
+                }
+                8 => invalid.directory_enumerations[0].entries.reverse(),
+                9 => invalid.directory_enumerations[0].entries[0] = RawBytes::from("../escape"),
+                10 => invalid.directory_enumerations[3].entries.clear(),
+                11 => {
+                    invalid.inputs.last_mut().unwrap().virtual_path =
+                        RawBytes::new(plan.generated_input_virtual_path("nested").into_bytes())
+                }
+                12 => {
+                    invalid.inputs.last_mut().unwrap().virtual_path = RawBytes::new(
+                        plan.generated_input_virtual_path("nested/../value.rs")
+                            .into_bytes(),
+                    )
+                }
+                13 => invalid.inputs.last_mut().unwrap().file_type = InputFileType::Symlink,
+                14 => {
+                    invalid.directory_enumerations[2].virtual_path = RawBytes::new(
+                        plan.generated_input_virtual_path("empty/./child")
+                            .into_bytes(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                generated_input_directories(&plan, &invalid).is_err(),
+                "fault {fault}"
+            );
+            assert!(
+                live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &invalid).is_err(),
+                "fault {fault}"
+            );
+        }
+        let no_generated = plan_for(OUT_A, &[], &[]).unwrap();
+        assert!(generated_input_directories(&no_generated, &good).is_err());
     }
 
     #[test]
@@ -3607,8 +3914,8 @@ mod tests {
             };
             let current =
                 live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &manifest).unwrap();
-            assert_eq!(current.descriptor.key_epoch, 5);
-            for previous_epoch in [1, 2, 3, 4] {
+            assert_eq!(current.descriptor.key_epoch, 6);
+            for previous_epoch in [1, 2, 3, 4, 5] {
                 let mut previous = current.descriptor.clone();
                 previous.key_epoch = previous_epoch;
                 assert_ne!(current.action_key, compute_action_key(&previous).final_key);

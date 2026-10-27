@@ -16,6 +16,7 @@ use rabs_sandbox::dependency_context::{
     DependencyExecContext, DependencyExecutionMode, DependencyIsolationSupport,
     MAX_DEPENDENCY_DIRS, MAX_DEPENDENCY_ENV_ENTRIES,
 };
+use rabs_sandbox::generated_source::MAX_GENERATED_DIRECTORIES;
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -199,6 +200,7 @@ pub fn parse_dependency_context(
         "compiler",
         "out_dir",
         "artifact_roots",
+        "generated_directories",
         "env",
         "runtime_cohort_sha256",
     ];
@@ -269,6 +271,18 @@ pub fn parse_dependency_context(
     };
     let dirs = directories("dependency_dirs")?;
     let loader_dirs = directories("loader_dirs")?;
+    let generated_directories = object
+        .get("generated_directories")
+        .and_then(serde_json::Value::as_array)
+        .filter(|paths| paths.len() <= MAX_GENERATED_DIRECTORIES)
+        .ok_or("generated_directories must be a bounded array")?
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .map(str::to_owned)
+                .ok_or("generated_directories entries must be strings".to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let generated_root = match object.get("generated_root") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
@@ -341,6 +355,7 @@ pub fn parse_dependency_context(
             env,
             runtime_cohort,
         )
+        .and_then(|context| context.with_generated_directories(generated_directories))
         .map(Some)
         .map_err(|error| error.to_string());
     }
@@ -357,6 +372,7 @@ pub fn parse_dependency_context(
         env,
         runtime_cohort,
     )
+    .and_then(|context| context.with_generated_directories(generated_directories))
     .map(|context| Some(context.with_execution_mode(execution_mode)))
     .map_err(|error| error.to_string())
 }
