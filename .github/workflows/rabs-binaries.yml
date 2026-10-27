@@ -218,6 +218,14 @@ jobs:
           cargo test --release -p rabsd --test canonical_check_local --locked \
             canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_source \
             -- --ignored --exact --nocapture
+      - name: Canonical Cargo reuses private targets and rebuilds edited workspace units
+        timeout-minutes: 30
+        env:
+          RABS_CANONICAL_TEST_WRAPPER: ${{ github.workspace }}/target/release/rabs-wrap
+        run: |
+          cargo test --release -p rabsd --test canonical_check_local --locked \
+            canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs \
+            -- --ignored --exact --nocapture
       - name: Canonical Cargo sends real metadata work over authenticated worker transport
         timeout-minutes: 30
         env:

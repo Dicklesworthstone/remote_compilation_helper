@@ -160,6 +160,34 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(len(list(self.operations.iterdir())), 2)
         self.assertNotEqual(self.records()[0]["retained"], self.records()[1]["retained"])
 
+    def test_private_target_configuration_survives_exact_native_handoff(self):
+        for cache in ({"runtime_epoch": "host-image-2026.10"},
+                      {"runtime_epoch": "image_v2", "max_bytes": 1024 ** 3},
+                      {"runtime_epoch": "a" * 256, "max_bytes": 8 * 1024 ** 3}):
+            with self.subTest(cache=cache):
+                self.profile["target_cache"] = cache
+                self.save()
+                status, _, stderr, _ = self.invoke(["build", "--features=fast"])
+                self.assertEqual(status, 0, stderr.decode(errors="replace"))
+                retained = self.records()[-1]["profile"]
+                self.assertEqual(retained["target_cache"], cache)
+                self.assertEqual(retained["selection"], {"features": ["fast"]})
+
+    def test_private_target_configuration_is_bounded_before_native_handoff(self):
+        for cache in (True, "enabled", {}, {"runtime_epoch": ""},
+                      {"runtime_epoch": "a" * 257}, {"runtime_epoch": "host/image"},
+                      {"runtime_epoch": "host\nimage"}, {"runtime_epoch": "höst"},
+                      {"runtime_epoch": None}, {"runtime_epoch": True},
+                      {"runtime_epoch": "v1", "root": "/other"},
+                      {"runtime_epoch": "v1", "max_bytes": True},
+                      {"runtime_epoch": "v1", "max_bytes": 0},
+                      {"runtime_epoch": "v1", "max_bytes": 8 * 1024 ** 3 + 1},
+                      {"runtime_epoch": "v1", "max_bytes": "1024"}):
+            with self.subTest(cache=cache):
+                self.profile["target_cache"] = cache
+                self.save()
+                self.assert_refused(["check"])
+
     def test_build_selectors_and_compile_only_harnesses_reach_the_native_driver_once(self):
         self.profile["command"] = "check"
         self.profile["selection"] = {"lib": True, "features": ["from-profile"]}

@@ -12,6 +12,8 @@
 //! archive codegen requires an isolated worker. Workspace crates and unsupported rustc invocations still compile
 //! normally in the namespace; this does not promote a workspace cache class.
 
+mod target_state;
+
 use super::live::{CoordLive, cluster_id};
 use super::live_dependency::LiveDependencyLane;
 use super::live_dependency::canonical::CanonicalPaths;
@@ -33,8 +35,11 @@ use rabs_sandbox::cargo_check::{
     CompilationCommand, CompilationSelection, validate_compilation_unit_graph,
 };
 use rabs_sandbox::cargo_home::CargoHomeProjection;
+use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -44,6 +49,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use target_state::{TargetCacheConfig, TargetState};
 
 const PROFILE_VERSION: &str = "canonical-compile-local-v1";
 const CARGO: &str = "/__rabs/toolchain/bin/cargo";
@@ -78,6 +84,9 @@ struct Profile {
     jobs: u32,
     #[serde(default = "default_timeout")]
     timeout_seconds: u64,
+    /// Private Cargo freshness across invocations. The operator must advance
+    /// the epoch when host tools/libraries visible through /usr change.
+    target_cache: Option<TargetCacheConfig>,
 }
 
 fn default_manifest() -> String {
@@ -208,6 +217,9 @@ impl Profile {
             (1..=7200).contains(&self.timeout_seconds),
             "timeout_seconds must be between 1 and 7200",
         )?;
+        if let Some(cache) = &self.target_cache {
+            cache.validate()?;
+        }
         self.compilation_args()?;
         require(
             relative_member(&self.manifest),
@@ -371,7 +383,7 @@ pub fn run_profile_with_release(
     let source_root = source
         .sealed_root()
         .ok_or_else(|| invalid("source was not sealed"))?;
-    let cargo_home = request
+    let cargo_projection = request
         .get("cargo_home")
         .map(|home| {
             let version = home["version"]
@@ -380,20 +392,55 @@ pub fn run_profile_with_release(
             let prefix = home["prefix"]
                 .as_str()
                 .ok_or_else(|| invalid("Cargo home prefix missing"))?;
-            CargoHomeProjection::for_version(version, prefix, source.manifest())?.prepare(
-                &source,
-                &owner.path().join("inputs"),
-                || false,
-            )
+            CargoHomeProjection::for_version(version, prefix, source.manifest())
         })
         .transpose()?;
-    let workspace = cargo_home
+    let cargo_home = cargo_projection
+        .as_ref()
+        .map(|projection| projection.prepare(&source, &owner.path().join("inputs"), || false))
+        .transpose()?;
+    let captured_workspace = cargo_home
         .as_ref()
         .and_then(|home| home.projected_workspace())
         .unwrap_or(source_root)
         .to_path_buf();
+    let workspace_manifest = cargo_projection
+        .as_ref()
+        .and_then(CargoHomeProjection::workspace_manifest)
+        .unwrap_or(source.manifest());
+    // Timestamp restoration may only touch an independently owned runtime
+    // view. Keep the original sealed source/projection and its witnesses exact.
+    let mut target_reuse_enabled = profile.target_cache.is_some();
+    let workspace = if target_reuse_enabled {
+        let copy = || -> io::Result<PathBuf> {
+            let runtime = owner.path().join("runtime-workspace");
+            create_private(&runtime)?;
+            let snapshot =
+                PrivateTreeSnapshot::capture(&captured_workspace, MAX_SOURCE_BYTES, &|| false)?;
+            snapshot.restore_into_with_cloner(
+                &captured_workspace,
+                &runtime,
+                &|| false,
+                rabs_cas::materialization::try_verified_reflink,
+            )?;
+            Ok(runtime)
+        };
+        match copy() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                // A failed optional copy is never mounted. Verify the original
+                // exact inputs again, then execute cold without retiming them.
+                SourceTimestamps::capture(&captured_workspace, workspace_manifest, &|| false)?;
+                target_state_warning("workspace-copy", &error);
+                target_reuse_enabled = false;
+                captured_workspace
+            }
+        }
+    } else {
+        captured_workspace
+    };
     let home_root = owner.path().join("home");
-    let target_root = owner.path().join("target");
+    let mut target_root = owner.path().join("target");
     create_private(&home_root)?;
     create_private(&target_root)?;
     let cargo_root = if let Some(home) = &cargo_home {
@@ -424,9 +471,9 @@ pub fn run_profile_with_release(
     let paths = CanonicalPaths::new(
         owner.clone(),
         vec![
-            ("/__rabs/workspace".into(), workspace),
-            ("/__rabs/cargo-home".into(), cargo_root),
-            ("/__rabs/toolchain".into(), toolchain),
+            ("/__rabs/workspace".into(), workspace.clone()),
+            ("/__rabs/cargo-home".into(), cargo_root.clone()),
+            ("/__rabs/toolchain".into(), toolchain.clone()),
             (TARGET.into(), target_root.clone()),
             ("/__rabs/home".into(), home_root.clone()),
         ],
@@ -483,6 +530,74 @@ pub fn run_profile_with_release(
     let control = home_root.join("control");
     create_private(&control)?;
     capture_wrapper(&profile.wrapper, &control.join("rabs-wrap"))?;
+    // Planning ran without an endpoint. Bind the retained wrapper and complete
+    // execution environment before selecting private state for this command.
+    spec.env.extend([
+        ("RUSTC_WRAPPER".into(), WRAPPER.into()),
+        ("RABS_SOCKET_PATH".into(), SOCKET.into()),
+        (
+            "RABS_BREAKER_FILE".into(),
+            "/__rabs/cargo-home/.rabs-breaker".into(),
+        ),
+    ]);
+    let mut private_target_state = if profile.target_cache.is_some() {
+        "cold"
+    } else {
+        "disabled"
+    };
+    let mut target_state = None;
+    if target_reuse_enabled && let Some(config) = &profile.target_cache {
+        let prepare = || -> io::Result<(TargetState, Option<PathBuf>)> {
+            let (_, wrapper) = read_stable(&control.join("rabs-wrap"), 128 * 1024 * 1024)?;
+            let key = TargetReuseContext {
+                request: &request,
+                workspace: workspace_manifest,
+                full_source: source.manifest().digest(),
+                projection: cargo_projection.as_ref(),
+                spec: &spec,
+                support: &support,
+                args: &compilation_args,
+                build_identity: &build_identity,
+                wrapper: Sha256::digest(&wrapper).into(),
+            }
+            .key(config)?;
+            let mut cache =
+                TargetState::open(&state.root, config, key, &workspace, workspace_manifest)?;
+            let candidate = owner.path().join("restored-target");
+            create_private(&candidate)?;
+            let restored = cache.restore(&candidate)?;
+            Ok((cache, restored.then_some(candidate)))
+        };
+        match prepare() {
+            Ok((cache, restored)) => {
+                target_state = Some(cache);
+                if let Some(restored) = restored {
+                    let output = spec
+                        .rw_binds
+                        .iter_mut()
+                        .find(|bind| bind.visible == Path::new(TARGET))
+                        .ok_or_else(|| invalid("canonical target mount missing"))?;
+                    output.backing.clone_from(&restored);
+                    target_root = restored;
+                    private_target_state = "restored";
+                }
+            }
+            Err(error) => target_state_warning("restore", &error),
+        }
+    }
+    // A failed restore remains in unmounted private staging. The live endpoint
+    // receives only the completely selected target's retained inode capability.
+    let paths = CanonicalPaths::new(
+        owner.clone(),
+        vec![
+            ("/__rabs/workspace".into(), workspace),
+            ("/__rabs/cargo-home".into(), cargo_root),
+            ("/__rabs/toolchain".into(), toolchain),
+            (TARGET.into(), target_root.clone()),
+            ("/__rabs/home".into(), home_root.clone()),
+        ],
+    )
+    .map_err(io::Error::other)?;
     let socket = control.join("rustc.sock");
     // sockaddr_un includes its terminating NUL. Refuse before boot, rather
     // than silently selecting a shorter socket outside this operation owner.
@@ -529,19 +644,12 @@ pub fn run_profile_with_release(
         worker: Some(worker),
     };
     wait_ready(&server, &socket, &coord, &stopped)?;
-    spec.env.extend([
-        ("RUSTC_WRAPPER".into(), WRAPPER.into()),
-        ("RABS_SOCKET_PATH".into(), SOCKET.into()),
-        (
-            "RABS_BREAKER_FILE".into(),
-            "/__rabs/cargo-home/.rabs-breaker".into(),
-        ),
-    ]);
     eprintln!(
         "{}",
         json!({"kind":"canonical-compilation-started", "version":PROFILE_VERSION,
         "command":profile.command.as_str(), "namespace":"canonical",
         "cache_scope":"external-dependency-metadata-and-worker-rlib",
+        "private_target_state":private_target_state,
         "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
         "selected_units":graph.units, "selected_packages":graph.packages,
         "selected_roots":graph.roots})
@@ -572,6 +680,15 @@ pub fn run_profile_with_release(
         "canonical coordinator did not drain cleanly",
     )?;
     eprintln!("{}", receipt.to_json_line());
+    if output.status.success()
+        && let Some(cache) = &target_state
+    {
+        // Retain state only after compiler, session, publication and coordinator
+        // drain. Delivered files remain independent of this saved generation.
+        if let Err(error) = cache.capture(&target_root) {
+            target_state_warning("capture", &error);
+        }
+    }
     if output.status.success() && profile.command == CompilationCommand::Build {
         // No Cargo process, wrapper session or materializer remains. Verify
         // the retained target mapping once more before moving its completed
@@ -596,6 +713,76 @@ pub fn run_profile_with_release(
         .status
         .code()
         .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(1)))
+}
+
+/// Only private Cargo freshness uses this compatibility family. Every command
+/// still runs with its original arguments; no action-cache authority follows.
+struct TargetReuseContext<'a> {
+    request: &'a Value,
+    workspace: &'a SourceManifest,
+    full_source: [u8; 32],
+    projection: Option<&'a CargoHomeProjection>,
+    spec: &'a CanonicalNamespaceSpec,
+    support: &'a HostIsolationSupport,
+    args: &'a [String],
+    build_identity: &'a str,
+    wrapper: [u8; 32],
+}
+
+impl TargetReuseContext<'_> {
+    fn key(&self, config: &TargetCacheConfig) -> io::Result<[u8; 32]> {
+        use rabs_sandbox::cargo_artifacts::CargoArtifactMode;
+        use rabs_sandbox::cargo_target::{compatible_arguments, source_edit_identity};
+        config.validate()?;
+        require(
+            !self.spec.allows_network(),
+            "private target requires a closed network",
+        )?;
+        let toolchain = super::worker_delivery::toolchain_identity(self.request)?
+            .ok_or_else(|| invalid("private target requires a captured toolchain"))?;
+        let args = compatible_arguments(CARGO, self.args, CargoArtifactMode::Compilation)
+            .unwrap_or_else(|| self.args.to_vec());
+        let source = source_edit_identity(self.workspace, self.full_source, self.projection)
+            .unwrap_or(self.full_source);
+        let mut ro: Vec<_> = self
+            .spec
+            .ro_binds
+            .iter()
+            .map(|bind| &bind.visible)
+            .collect();
+        let mut rw: Vec<_> = self
+            .spec
+            .rw_binds
+            .iter()
+            .map(|bind| &bind.visible)
+            .collect();
+        ro.sort();
+        rw.sort();
+        let identity = json!({
+            "version":"canonical-private-cargo-target-v1",
+            "runtime_epoch":config.runtime_epoch,
+            "driver":self.build_identity, "wrapper":self.wrapper,
+            "source_family":source,
+            "projection":self.projection.map(|home| (home.version(), home.prefix())),
+            "toolchain":{"sha256":toolchain.sha256,
+                "files":toolchain.files,"bytes":toolchain.bytes},
+            "program":CARGO, "args":args, "cwd":self.spec.cwd,
+            "env":self.spec.env, "hostname":self.spec.hostname,
+            "ro":ro, "rw":rw, "output":TARGET,
+            "bubblewrap":self.support.bubblewrap,
+            "userns":self.support.unprivileged_userns,
+            "runtime":"fresh-home+captured-or-empty-cargo-home+no-project-executors-v1"
+        });
+        Ok(Sha256::digest(serde_json::to_vec(&identity)?).into())
+    }
+}
+
+fn target_state_warning(stage: &str, error: &io::Error) {
+    eprintln!(
+        "{}",
+        json!({"kind":"canonical-target-state-unavailable",
+        "stage":stage, "reason":error.to_string(), "action_cache_authority":false})
+    );
 }
 
 /// Move, rather than recopy, a fully drained target to a newly allocated private
@@ -1179,5 +1366,210 @@ mod tests {
         assert!(stopped.load(Ordering::Acquire));
         assert!(!coord.available());
         assert_eq!(activity.active_sessions(), 0);
+    }
+
+    fn reuse_source(source: &[u8], manifest: &[u8], cache: Option<&[u8]>) -> SourceManifest {
+        use rabs_sandbox::source_transfer::SourceFile;
+        let mut files = vec![("Cargo.toml", manifest), ("src/lib.rs", source)];
+        if let Some(cache) = cache {
+            files.push((
+                "captured-cargo/registry/src/index-123/dependency-1.0.0/src/lib.rs",
+                cache,
+            ));
+        }
+        SourceManifest::new(
+            files
+                .into_iter()
+                .map(|(path, bytes)| SourceFile {
+                    path: path.into(),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// Pure key inputs only; this capability fixture never executes a namespace
+    /// and makes no assertion about this test host's measured isolation support.
+    struct ReuseKeyFixture {
+        request: Value,
+        source: SourceManifest,
+        projection: Option<CargoHomeProjection>,
+        spec: CanonicalNamespaceSpec,
+        support: HostIsolationSupport,
+        args: Vec<String>,
+        config: TargetCacheConfig,
+        wrapper: [u8; 32],
+        driver: String,
+    }
+
+    impl ReuseKeyFixture {
+        fn new() -> Self {
+            let mut plan = CanonicalMountPlan::new(
+                "/physical/toolchain",
+                "/physical/workspace",
+                "/physical/cargo",
+                "/physical/home",
+            );
+            plan.out_units.push(UnitMount {
+                unit: "cargo".into(),
+                backing: "/physical/target".into(),
+            });
+            let mut spec = plan.to_spec().unwrap();
+            make_read_only(&mut spec, "/__rabs/workspace").unwrap();
+            make_read_only(&mut spec, "/__rabs/home").unwrap();
+            Self {
+                request: json!({"toolchain_identity":{
+                    "version":rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION,
+                    "sha256":"ab".repeat(32),"files":7,"bytes":1024}}),
+                source: reuse_source(b"pub const VALUE:u8=1;", b"manifest", None),
+                projection: None,
+                spec,
+                support: HostIsolationSupport {
+                    bubblewrap: Some("pure-key-fixture".into()),
+                    unprivileged_userns: true,
+                    overlayfs: false,
+                    cgroup_v2: false,
+                    landlock: false,
+                },
+                args: [
+                    "build",
+                    "--offline",
+                    "--locked",
+                    "--manifest-path",
+                    "/__rabs/workspace/Cargo.toml",
+                    "--message-format=json",
+                    "--jobs",
+                    "2",
+                ]
+                .map(str::to_owned)
+                .into(),
+                config: TargetCacheConfig {
+                    runtime_epoch: "host-1".into(),
+                    max_bytes: 1024 * 1024,
+                },
+                wrapper: [5; 32],
+                driver: "driver-1".into(),
+            }
+        }
+
+        fn key(&self) -> [u8; 32] {
+            TargetReuseContext {
+                request: &self.request,
+                workspace: self
+                    .projection
+                    .as_ref()
+                    .and_then(CargoHomeProjection::workspace_manifest)
+                    .unwrap_or(&self.source),
+                full_source: self.source.digest(),
+                projection: self.projection.as_ref(),
+                spec: &self.spec,
+                support: &self.support,
+                args: &self.args,
+                build_identity: &self.driver,
+                wrapper: self.wrapper,
+            }
+            .key(&self.config)
+            .unwrap()
+        }
+
+        fn with_captured_cache(source: &[u8], cache: &[u8]) -> Self {
+            use rabs_sandbox::cargo_home::ISOLATED_CARGO_HOME_SOURCE_VERSION;
+            let mut fixture = Self::new();
+            fixture.source = reuse_source(source, b"manifest", Some(cache));
+            fixture.projection = Some(
+                CargoHomeProjection::for_version(
+                    ISOLATED_CARGO_HOME_SOURCE_VERSION,
+                    "captured-cargo",
+                    &fixture.source,
+                )
+                .unwrap(),
+            );
+            fixture
+        }
+    }
+
+    #[test]
+    fn private_target_key_reuses_only_cargo_compatible_commands_selections_and_source_edits() {
+        let fixture = ReuseKeyFixture::new();
+        let original = fixture.key();
+        let mut changed = ReuseKeyFixture::new();
+        changed.args[0] = "check".into();
+        changed
+            .args
+            .extend(["--features".into(), "extra".into(), "--lib".into()]);
+        changed.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None);
+        assert_eq!(changed.key(), original);
+
+        changed.source = reuse_source(b"pub const VALUE:u8=2;", b"changed manifest", None);
+        assert_ne!(changed.key(), original);
+        for arguments in [
+            ["--target", "aarch64-unknown-linux-gnu"],
+            ["--profile", "release"],
+        ] {
+            let mut changed = ReuseKeyFixture::new();
+            changed.args.extend(arguments.map(str::to_owned));
+            assert_ne!(changed.key(), original, "{arguments:?}");
+        }
+        let mut changed = ReuseKeyFixture::new();
+        *changed.args.last_mut().unwrap() = "4".into();
+        assert_ne!(changed.key(), original, "job grant is an exact input");
+    }
+
+    #[test]
+    fn private_target_key_excludes_physical_roots_but_binds_runtime_and_execution_inputs() {
+        let original = ReuseKeyFixture::new().key();
+        let mut relocated = ReuseKeyFixture::new();
+        for (index, bind) in relocated
+            .spec
+            .ro_binds
+            .iter_mut()
+            .chain(&mut relocated.spec.rw_binds)
+            .enumerate()
+        {
+            bind.backing = PathBuf::from(format!("/relocated/backing-{index}"));
+        }
+        relocated.spec.ro_binds.reverse();
+        relocated.spec.rw_binds.reverse();
+        relocated.config.max_bytes *= 2;
+        assert_eq!(relocated.key(), original);
+
+        let mut changed = ReuseKeyFixture::new();
+        changed.config.runtime_epoch = "host-2".into();
+        assert_ne!(changed.key(), original);
+        let mut changed = ReuseKeyFixture::new();
+        changed.wrapper = [6; 32];
+        assert_ne!(changed.key(), original);
+        let mut changed = ReuseKeyFixture::new();
+        changed.driver = "driver-2".into();
+        assert_ne!(changed.key(), original);
+        let mut changed = ReuseKeyFixture::new();
+        changed.request["toolchain_identity"]["sha256"] = json!("cd".repeat(32));
+        assert_ne!(changed.key(), original);
+        let mut changed = ReuseKeyFixture::new();
+        changed
+            .spec
+            .env
+            .push(("RUSTFLAGS".into(), "-C opt-level=2".into()));
+        assert_ne!(changed.key(), original);
+        let mut changed = ReuseKeyFixture::new();
+        changed.spec.cwd = "/__rabs/workspace/member".into();
+        assert_ne!(changed.key(), original);
+    }
+
+    #[test]
+    fn private_target_key_keeps_captured_dependency_cache_bytes_exact_across_local_edits() {
+        let first =
+            ReuseKeyFixture::with_captured_cache(b"old workspace source", b"dependency bytes");
+        let edited =
+            ReuseKeyFixture::with_captured_cache(b"edited workspace source", b"dependency bytes");
+        assert_eq!(first.key(), edited.key());
+        let changed_cache = ReuseKeyFixture::with_captured_cache(
+            b"edited workspace source",
+            b"changed dependency bytes",
+        );
+        assert_ne!(first.key(), changed_cache.key());
     }
 }

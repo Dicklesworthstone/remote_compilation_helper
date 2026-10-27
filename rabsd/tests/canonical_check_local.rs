@@ -373,6 +373,147 @@ fn canonical_cargo_earns_cross_worktree_dependency_hits_and_invalidates_changed_
     );
 }
 
+/// This exercises Cargo's private fingerprints, not shared action-cache
+/// authorization: a warm build must report `fresh` even for workspace units,
+/// while edits and feature changes still execute the affected compiler units.
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; actual canonical target reuse and delivered executable validation"]
+fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (owner, mut profile) = native_fixture();
+    let second = owner.path().join("source-b");
+    for name in ["source-a", "source-b"] {
+        let root = owner.path().join(name);
+        let manifest = root.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            format!(
+                "{}\n[features]\nextra=[]\n",
+                fs::read_to_string(&manifest).unwrap()
+            ),
+        )
+        .unwrap();
+        write(
+            &root,
+            "src/main.rs",
+            "fn main(){println!(\"{}\",canonical_app::answer()+u32::from(cfg!(feature=\"extra\"))*100);}\n",
+        );
+    }
+    profile["command"] = json!("build");
+    profile["target_cache"] = json!({"runtime_epoch":"native-fixture-v1", "max_bytes":268435456});
+
+    let state = |events: &[Value], expected: &str| {
+        let started = events
+            .iter()
+            .filter(|event| event["kind"] == "canonical-compilation-started")
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["private_target_state"], expected, "{events:?}");
+        assert_eq!(started[0]["workspace_cache"], false);
+    };
+    let freshness = |output: &str, dependencies: bool, workspace: bool| {
+        let artifacts = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["reason"] == "compiler-artifact")
+            .collect::<Vec<_>>();
+        for (name, expected) in [
+            ("canonical_leaf", dependencies),
+            ("canonical_dep", dependencies),
+            ("canonical_app", workspace),
+        ] {
+            let selected = artifacts
+                .iter()
+                .filter(|event| event["target"]["name"] == name)
+                .collect::<Vec<_>>();
+            assert!(
+                !selected.is_empty(),
+                "missing real Cargo artifact for {name}: {output}"
+            );
+            assert!(
+                selected.iter().all(|event| event["fresh"] == expected),
+                "unexpected Cargo freshness for {name}: {output}"
+            );
+        }
+    };
+
+    let (code, events, output) = run(owner.path(), 100, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    let (first_target, first_archives) = delivered_build(owner.path(), 100, &events, 42);
+
+    profile["source_root"] = json!(second);
+    let (code, events, output) = run(owner.path(), 101, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    let (warm_target, warm_archives) = delivered_build(owner.path(), 101, &events, 42);
+    assert_ne!(first_target, warm_target);
+    assert_eq!(first_archives, warm_archives);
+    assert!(decisions(&events, "execute").is_empty());
+    assert!(decisions(&events, "hit").is_empty());
+    let first_binary = first_target.join("target/debug/canonical_app");
+    let warm_binary = warm_target.join("target/debug/canonical_app");
+    let first_inode = fs::metadata(&first_binary).unwrap();
+    let warm_inode = fs::metadata(&warm_binary).unwrap();
+    assert_ne!(
+        (first_inode.dev(), first_inode.ino()),
+        (warm_inode.dev(), warm_inode.ino())
+    );
+    fs::write(&first_binary, b"caller replaced its delivered binary").unwrap();
+
+    let (code, events, output) = run(owner.path(), 102, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    delivered_build(owner.path(), 102, &events, 42);
+
+    write(
+        &second,
+        "src/lib.rs",
+        "pub fn answer()->u32 { canonical_dep::answer()+1 }\n",
+    );
+    let (code, events, output) = run(owner.path(), 103, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, false);
+    delivered_build(owner.path(), 103, &events, 43);
+
+    profile["selection"] = json!({"features":["extra"]});
+    let (code, events, output) = run(owner.path(), 104, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, false);
+    delivered_build(owner.path(), 104, &events, 143);
+
+    profile["command"] = json!("check");
+    for number in [105, 106] {
+        let (code, events, output) = run(owner.path(), number, &profile);
+        assert_eq!(code, 0, "{output}");
+        state(&events, "restored");
+        if number == 106 {
+            freshness(&output, true, true);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "canonical-build-completed")
+        );
+    }
+
+    // Ambient host tools belong to the operator's runtime epoch. A changed
+    // epoch cannot inherit Cargo's prior fingerprint state under the old one.
+    profile["command"] = json!("build");
+    profile["target_cache"]["runtime_epoch"] = json!("native-fixture-v2");
+    let (code, events, output) = run(owner.path(), 107, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    delivered_build(owner.path(), 107, &events, 143);
+}
+
 fn read_bounded(path: &Path) -> Vec<u8> {
     const MAXIMUM: u64 = 4 * 1024 * 1024;
     let mut bytes = Vec::new();

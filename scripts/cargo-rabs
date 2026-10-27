@@ -1759,7 +1759,7 @@ def canonical_local_profile(path):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
     required = {"version", "source_root", "toolchain_root", "state_root", "operation_root", "wrapper"}
-    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection"}
+    optional = {"manifest", "vendor", "cargo_home_source", "jobs", "timeout_seconds", "command", "selection", "target_cache"}
     if (not required <= profile.keys() or profile.keys() - required - optional
             or profile["version"] != "canonical-compile-local-v1"):
         raise SetupError("invalid canonical-compile-local-v1 profile fields")
@@ -1768,6 +1768,19 @@ def canonical_local_profile(path):
     for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
         if name in profile and (type(profile[name]) is not int or not 1 <= profile[name] <= maximum):
             raise SetupError("local canonical " + name + " must be an integer from 1 to " + str(maximum))
+    if profile.get("target_cache") is not None:
+        cache = profile["target_cache"]
+        if (type(cache) is not dict or "runtime_epoch" not in cache
+                or cache.keys() - {"runtime_epoch", "max_bytes"}):
+            raise SetupError("invalid local canonical target_cache fields")
+        epoch = cache["runtime_epoch"]
+        if (type(epoch) is not str or not 1 <= len(epoch) <= 256
+                or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                       for character in epoch)):
+            raise SetupError("target_cache runtime_epoch must be a bounded ASCII host-runtime identifier")
+        if ("max_bytes" in cache and (type(cache["max_bytes"]) is not int
+                or not 1 <= cache["max_bytes"] <= 8 * 1024 ** 3)):
+            raise SetupError("target_cache max_bytes must be an integer from 1 to 8589934592")
     if profile.get("vendor") is not None and profile.get("cargo_home_source") is not None:
         raise SetupError("local canonical profile must select either vendor or cargo_home_source")
     manifest = canonical_path(profile.get("manifest", "Cargo.toml"))

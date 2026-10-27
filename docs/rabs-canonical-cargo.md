@@ -1111,6 +1111,56 @@ keeps the local profile's lifecycle independent of a normal daemon's CAS. Use a
 dedicated state parent and retain it across commands; each command gets a fresh
 private target and source/toolchain capture under `operation_root`.
 
+To retain Cargo's own private target state between local canonical commands,
+add this optional object to the same profile:
+
+```json
+"target_cache": {
+  "runtime_epoch": "builder-image-2026.10",
+  "max_bytes": 1073741824
+}
+```
+
+`runtime_epoch` is an operator-selected identifier for this host's tools and
+libraries. Change it whenever host compiler/linker/runtime files visible through
+the namespace's read-only `/usr` view change. Captured Rust toolchain bytes,
+wrapper bytes, driver build identity, canonical environment and namespace,
+Cargo target/profile and immutable source controls are bound automatically.
+An epoch is required because a captured Rust toolchain alone does not identify
+the host linker and system libraries. It accepts 1–256 ASCII letters, digits,
+dots, underscores and hyphens. Omit `target_cache` to retain the original cold
+target behavior, including when exercising dependency-cache sampling.
+
+The default `max_bytes` is 1 GiB; the maximum is 8 GiB per complete target
+snapshot. One committed generation is retained below the profile's state root.
+Atomic replacement may temporarily retain both the previous and replacement
+generation, plus bounded metadata. Crash recovery recognizes only the fixed
+pending/previous/committed locations; pending data never becomes a usable seed.
+
+Every invocation still starts Cargo and admits its actual selected unit graph.
+A usable seed is verified and copied or reflinked into a new private target;
+its stored files are never mounted writable. Unchanged captured source files
+receive their previous timestamps in a separate runtime workspace. Eligible
+local source/data edits are stamped after every retained fingerprint; removed
+or renamed inputs also dirty their surviving parent directories and manifests.
+Cargo then decides which units rebuild. Ordinary build/check, package and
+feature selections can reuse compatible state; toolchain, target/profile,
+runtime epoch, lockfile, manifest, configuration and captured dependency changes
+separate the seed family. Immutable registry/Git/vendor inputs remain exact.
+This allows workspace crates to stay fresh without granting them action-cache
+publication or skipping Cargo's current command.
+
+The `canonical-compilation-started` stderr record reports
+`private_target_state` as `disabled`, `cold` or `restored`. A failed optional
+restore keeps its partial copy unmounted and runs the current command cold;
+a failed save preserves Cargo's successful result. Both report a
+`canonical-target-state-unavailable` diagnostic. A new seed is saved only after
+successful Cargo execution and complete compiler/session/coordinator drain.
+Failed or cancelled commands cannot replace a successful seed. Checks can now
+retain reusable state too. Successful build delivery still owns separate files,
+so editing or running a previously delivered binary cannot alter the seed or
+another invocation's outputs.
+
 The ordinary fixed sampling policy requires an initial successful compiler
 result and two matching real compiler comparisons before a subsequent eligible
 request can skip rustc. Repeating the same eligible command four times against the same
@@ -1123,7 +1173,8 @@ profile grants no release verdict or preverified cache entry.
 The stderr decision trail records `rabsd-live-dependency` events such as
 `execute`, `hit`, `served`, and the specific reason for a fallback. A `hit` is an
 offer; `served` follows the accepted, verified installation. Workspace crates
-continue through the compiler even on a warm dependency cache. Editing a
+continue through the compiler even on a warm dependency action cache unless
+Cargo itself finds them fresh in an explicitly enabled private target. Editing a
 dependency's captured source or changing its exact upstream artifact inventory
 changes the key or refuses reuse. Unsupported actions preserve ordinary rustc
 execution rather than borrowing the external dependency class's evidence.
@@ -1146,7 +1197,7 @@ to the scoped endpoint is sealed and the coordinator retains authority while
 acknowledged captures finish publication. This drain has a 60-second deadline;
 expiration is reported as an error rather than silently losing the last unit's
 publication or verification sample. A check returns diagnostics and success/failure;
-its temporary target is released. Persistent reusable dependency results remain
+its temporary target is released after optional private state capture. Persistent reusable dependency results remain
 in the profile's CAS.
 
 A successful `build` moves its complete target tree, after that clean drain, to
