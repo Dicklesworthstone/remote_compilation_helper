@@ -581,6 +581,31 @@ fn canonical_private_targets_reuse_relocated_builds_and_preserve_current_outputs
     state(&events, "cold");
     freshness(&output, false, false);
     delivered_build(owner.path(), 107, &events, 143);
+
+    // A rejected optional restore must not discard the adapter that captures
+    // this command's successful cold Cargo output. The very next invocation
+    // must be warm, including the workspace executable.
+    let seed_binary = owner
+        .path()
+        .join("state/canonical-compile-v1/private-target-v1/seed/target/debug/canonical_app");
+    fs::write(&seed_binary, b"corrupted private target").unwrap();
+    let (code, events, output) = run(owner.path(), 108, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "cold");
+    freshness(&output, false, false);
+    assert!(
+        events.iter().any(|event| {
+            event["kind"] == "canonical-target-state-unavailable" && event["stage"] == "restore"
+        }),
+        "corrupted seed was not refused: {output}"
+    );
+    delivered_build(owner.path(), 108, &events, 143);
+
+    let (code, events, output) = run(owner.path(), 109, &profile);
+    assert_eq!(code, 0, "{output}");
+    state(&events, "restored");
+    freshness(&output, true, true);
+    delivered_build(owner.path(), 109, &events, 143);
 }
 
 fn read_bounded(path: &Path) -> Vec<u8> {

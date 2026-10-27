@@ -566,9 +566,18 @@ pub fn run_profile_with_release(
             let mut cache =
                 TargetState::open(&state.root, config, key, &workspace, workspace_manifest)?;
             let candidate = owner.path().join("restored-target");
-            create_private(&candidate)?;
-            let restored = cache.restore(&candidate)?;
-            Ok((cache, restored.then_some(candidate)))
+            let restored = match create_private(&candidate).and_then(|()| cache.restore(&candidate))
+            {
+                Ok(restored) => restored.then_some(candidate),
+                Err(error) => {
+                    // A failed optional restore still permits a successful
+                    // cold Cargo execution to replace the seed in this run.
+                    // The failed candidate never enters the namespace.
+                    target_state_warning("restore", &error);
+                    None
+                }
+            };
+            Ok((cache, restored))
         };
         match prepare() {
             Ok((cache, restored)) => {

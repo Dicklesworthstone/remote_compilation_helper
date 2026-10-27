@@ -1175,6 +1175,9 @@ restore keeps its partial copy unmounted and runs the current command cold;
 a failed save preserves Cargo's successful result. Both report a
 `canonical-target-state-unavailable` diagnostic. A new seed is saved only after
 successful Cargo execution and complete compiler/session/coordinator drain.
+That same successful cold command can replace a seed after a failed restore.
+An ineligible source edit or a failed private destination preserves a healthy
+committed seed until that replacement succeeds.
 Failed or cancelled commands cannot replace a successful seed. Checks can now
 retain reusable state too. Successful build delivery still owns separate files,
 so editing or running a previously delivered binary cannot alter the seed or

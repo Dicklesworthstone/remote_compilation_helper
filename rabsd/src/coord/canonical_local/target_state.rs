@@ -433,21 +433,35 @@ impl TargetState {
         Ok(Some(envelope.payload))
     }
 
-    /// On error the caller must discard the candidate target and this adapter;
-    /// any partly retimed runtime workspace is safe only with a cold target.
+    /// On error the caller must discard the candidate target. A healthy seed
+    /// must survive a failed private destination or an ineligible source edit;
+    /// neither means that the committed Cargo state is corrupt. The adapter
+    /// remains available to capture a successful cold execution in this same
+    /// operation, including after an unusable target seed was encountered.
     pub fn restore(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
         let result = self.restore_inner(fresh_empty_target);
         if result.is_err() {
-            // Prevent a corrupt seed from poisoning all subsequent commands.
-            // Recovery removal still validates containment and bounded shape.
-            self.remove_generation("seed")?;
+            // Timestamp restoration may have failed after changing only part
+            // of the independent workspace. Re-observe its exact input bytes
+            // and current times before a cold Cargo execution can become a
+            // replacement seed. The sealed source is never retimed.
+            self.source_times =
+                SourceTimestamps::capture(&self.workspace, &self.manifest, &|| false)?;
         }
         result
     }
 
     fn restore_inner(&mut self, fresh_empty_target: &Path) -> io::Result<bool> {
-        let Some(seed) = self.load_seed()? else {
-            return Ok(false);
+        let seed = match self.load_seed() {
+            Ok(Some(seed)) => seed,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                // Unreadable metadata cannot establish a bounded compatible
+                // generation. Retire it through the existing checked cleanup;
+                // later destination/source errors must not retire a valid one.
+                self.remove_generation("seed")?;
+                return Err(error);
+            }
         };
         if seed.key != self.key {
             return Ok(false);
@@ -761,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_metadata_or_target_is_refused_and_retired_before_reseeding() {
+    fn corrupt_seed_is_replaced_by_the_same_successful_cold_operation() {
         for corruption in 0..3 {
             let state = private();
             let workspace = private();
@@ -797,7 +811,12 @@ mod tests {
             }
             let candidate = private();
             assert!(cache.restore(candidate.path()).is_err());
-            assert!(!seed.exists());
+            // Corrupt metadata is retired immediately. A verified descriptor
+            // with unusable target bytes is replaced only after Cargo has
+            // produced a successful independent cold target. Neither case
+            // requires another cold command before a healthy seed is retained.
+            assert_eq!(seed.exists(), corruption == 0);
+            cache.capture(target.path()).unwrap();
             drop(cache);
             let mut recovered = TargetState::open(
                 state.path(),
@@ -808,9 +827,139 @@ mod tests {
             )
             .unwrap();
             let fresh = private();
-            assert!(!recovered.restore(fresh.path()).unwrap());
-            recovered.capture(target.path()).unwrap();
+            assert!(recovered.restore(fresh.path()).unwrap());
+            assert_eq!(
+                fs::read(fresh.path().join("artifact")).unwrap(),
+                b"original artifact"
+            );
         }
+    }
+
+    #[test]
+    fn failed_destination_keeps_committed_seed_and_accepts_a_cold_replacement() {
+        for missing_destination in [false, true] {
+            let state = private();
+            let workspace = private();
+            let manifest = source(workspace.path(), b"source");
+            let target = private();
+            completed_target(target.path(), b"committed artifact");
+            let mut cache = TargetState::open(
+                state.path(),
+                &config(),
+                [9; 32],
+                workspace.path(),
+                &manifest,
+            )
+            .unwrap();
+            cache.capture(target.path()).unwrap();
+            let seed = state.path().join("private-target-v1/seed");
+            let metadata = fs::read(seed.join(METADATA)).unwrap();
+            let candidate_owner = private();
+            let candidate = if missing_destination {
+                candidate_owner.path().join("not-created")
+            } else {
+                completed_target(candidate_owner.path(), b"unrelated destination bytes");
+                candidate_owner.path().to_path_buf()
+            };
+            let error = cache.restore(&candidate).unwrap_err();
+            if missing_destination {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+            assert_eq!(fs::read(seed.join(METADATA)).unwrap(), metadata);
+            assert_eq!(
+                fs::read(seed.join("target/artifact")).unwrap(),
+                b"committed artifact"
+            );
+
+            // The caller keeps this adapter, runs Cargo with its original
+            // cold target, and captures only after successful process drain.
+            completed_target(target.path(), b"successful cold replacement");
+            cache.capture(target.path()).unwrap();
+            drop(cache);
+            let next_workspace = private();
+            source(next_workspace.path(), b"source");
+            let mut next = TargetState::open(
+                state.path(),
+                &config(),
+                [9; 32],
+                next_workspace.path(),
+                &manifest,
+            )
+            .unwrap();
+            let next_target = private();
+            assert!(next.restore(next_target.path()).unwrap());
+            assert_eq!(
+                fs::read(next_target.path().join("artifact")).unwrap(),
+                b"successful cold replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn ineligible_edit_keeps_healthy_seed_until_successful_cold_replacement() {
+        let state = private();
+        let old_workspace = private();
+        let old_manifest = source(old_workspace.path(), b"old source");
+        let old_target = private();
+        completed_target(old_target.path(), b"old artifact");
+        // A host clock step backwards cannot safely order this edit after the
+        // retained target. It does not invalidate the old target's own bytes.
+        File::open(old_target.path().join("artifact"))
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(86_400)),
+            )
+            .unwrap();
+        TargetState::open(
+            state.path(),
+            &config(),
+            [10; 32],
+            old_workspace.path(),
+            &old_manifest,
+        )
+        .unwrap()
+        .capture(old_target.path())
+        .unwrap();
+        let seed = state.path().join("private-target-v1/seed");
+        let metadata = fs::read(seed.join(METADATA)).unwrap();
+
+        let edited_workspace = private();
+        let edited_manifest = source(edited_workspace.path(), b"edited source");
+        let mut cache = TargetState::open(
+            state.path(),
+            &config(),
+            [10; 32],
+            edited_workspace.path(),
+            &edited_manifest,
+        )
+        .unwrap();
+        let candidate = private();
+        let error = cache.restore(candidate.path()).unwrap_err();
+        assert!(error.to_string().contains("clock cannot order"));
+        assert_eq!(fs::read(seed.join(METADATA)).unwrap(), metadata);
+        assert_eq!(
+            fs::read(seed.join("target/artifact")).unwrap(),
+            b"old artifact"
+        );
+        assert_eq!(fs::read_dir(candidate.path()).unwrap().count(), 0);
+
+        let cold_target = private();
+        completed_target(cold_target.path(), b"artifact from edited source");
+        cache.capture(cold_target.path()).unwrap();
+        drop(cache);
+        let mut next = TargetState::open(
+            state.path(),
+            &config(),
+            [10; 32],
+            edited_workspace.path(),
+            &edited_manifest,
+        )
+        .unwrap();
+        assert!(next.restore(candidate.path()).unwrap());
+        assert_eq!(
+            fs::read(candidate.path().join("artifact")).unwrap(),
+            b"artifact from edited source"
+        );
     }
 
     #[test]
