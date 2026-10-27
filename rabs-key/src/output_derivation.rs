@@ -297,6 +297,10 @@ pub fn derive_dependency_output_declarations(
 /// Ordinary libraries retain the dependency adapter's file-only codegen
 /// contract. Binary and test-harness compilations are additionally supported
 /// only when rustc emits exactly metadata and dep-info, as in `cargo check`.
+/// Cargo's custom `harness = false` tests and benches omit both `--test` and
+/// `--crate-type`; their explicit `--cfg test` is retained without rewriting
+/// the invocation. The coordinator separately requires a selected test/bench
+/// root for this form.
 /// Their `.rmeta` is a required, ordinarily empty file: it is neither omitted
 /// nor evidence that an executable or test result exists. The caller must bind
 /// the selected Cargo unit and retain request-owned execution and installation;
@@ -349,7 +353,9 @@ fn check_compilation_output_kind(
         && test_count <= 1
         && ((invocation.crate_types.len() == 1
             && matches!(invocation.crate_types[0].as_str(), "lib" | "rlib" | "bin"))
-            || (test_count == 1 && invocation.crate_types.is_empty()))
+            || (invocation.crate_types.is_empty()
+                && (test_count == 1
+                    || (test_count == 0 && invocation.cfgs.iter().any(|cfg| cfg == "test")))))
     {
         return Ok(());
     }
@@ -589,6 +595,7 @@ mod tests {
         for shape in [
             vec!["--crate-type=bin"],
             vec!["--test"],
+            vec!["--cfg", "test"],
             vec!["--test", "--crate-type=lib"],
             vec!["--test", "--crate-type=rlib"],
             vec!["--test", "--crate-type=bin"],
@@ -615,7 +622,11 @@ mod tests {
 
     #[test]
     fn workspace_metadata_adapter_refuses_linking_unknown_modes_and_redirected_outputs() {
-        for shape in [vec!["--crate-type=bin"], vec!["--test"]] {
+        for shape in [
+            vec!["--crate-type=bin"],
+            vec!["--test"],
+            vec!["--cfg", "test"],
+        ] {
             let mut args = vec![
                 "--crate-name=app",
                 "--emit=dep-info,metadata",
@@ -658,6 +669,8 @@ mod tests {
         }
         for shape in [
             vec![],
+            vec!["--cfg=testing"],
+            vec!["--cfg=test=\"true\""],
             vec!["--crate-type=cdylib"],
             vec!["--crate-type=proc-macro"],
             vec!["--crate-type=bin,lib"],

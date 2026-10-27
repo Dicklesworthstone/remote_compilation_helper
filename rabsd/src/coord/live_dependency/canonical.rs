@@ -271,6 +271,8 @@ impl CanonicalPaths {
             .collect::<BTreeSet<_>>();
         let mode =
             remote_dependency_output_class(&plan.invocation).map_err(|error| error.to_string())?;
+        rabs_key::output_derivation::check_workspace_output_options(&plan.invocation)
+            .map_err(|error| error.to_string())?;
         let test_harness = plan
             .invocation
             .passthrough
@@ -297,6 +299,17 @@ impl CanonicalPaths {
                 mode == RemoteDependencyOutputClass::Metadata
                     && harness_selected
                     && (crate_types.is_empty() || unit.crate_types() == crate_types)
+            } else if crate_types.is_empty() {
+                // Cargo's harness=false integration tests and benchmarks use
+                // --cfg test with an implicit binary type, without --test.
+                // Only their selected roots establish this custom harness
+                // family; ordinary roots and prerequisites cannot borrow it.
+                mode == RemoteDependencyOutputClass::Metadata
+                    && plan.invocation.cfgs.iter().any(|cfg| cfg == "test")
+                    && unit.is_root()
+                    && unit.crate_types() == ["bin"]
+                    && unit.target_kinds().len() == 1
+                    && matches!(unit.target_kinds()[0].as_str(), "test" | "bench")
             } else {
                 unit.crate_types() == crate_types
             };
@@ -629,6 +642,14 @@ mod tests {
         crate_type: Option<&str>,
         test_harness: bool,
     ) -> DependencyActionPlan {
+        workspace_metadata_plan_with_test_cfg(crate_type, test_harness, false)
+    }
+
+    fn workspace_metadata_plan_with_test_cfg(
+        crate_type: Option<&str>,
+        test_harness: bool,
+        test_cfg: bool,
+    ) -> DependencyActionPlan {
         let mut argv = [
             "/__rabs/toolchain/bin/rustc",
             "--crate-name",
@@ -652,6 +673,9 @@ mod tests {
         }
         if test_harness {
             argv.push("--test".into());
+        }
+        if test_cfg {
+            argv.extend(["--cfg".into(), "test".into()]);
         }
         let env = [
             ("CARGO_MANIFEST_DIR", "/__rabs/workspace/app"),
@@ -883,6 +907,71 @@ mod tests {
             let unselected =
                 workspace_target_paths_with_check_roots(kind, crate_type, false, true, None, true);
             assert!(unselected.require_workspace_execution(&harness).is_err());
+        }
+    }
+
+    #[test]
+    fn custom_harness_checks_require_selected_test_or_bench_roots_and_exact_metadata_options() {
+        let all_targets = CompilationSelection {
+            all_targets: true,
+            ..CompilationSelection::default()
+        };
+        let custom = workspace_metadata_plan_with_test_cfg(None, false, true);
+        assert!(custom.invocation.crate_types.is_empty());
+        assert!(
+            !custom
+                .invocation
+                .passthrough
+                .iter()
+                .any(|arg| arg == "--test")
+        );
+        assert_eq!(custom.invocation.cfgs, ["test"]);
+        for kind in ["test", "bench"] {
+            for testable in [false, true] {
+                for selection in [None, Some(&all_targets)] {
+                    let selected = workspace_target_paths(kind, "bin", testable, true, selection);
+                    assert!(
+                        selected.require_workspace_execution(&custom).is_ok(),
+                        "{kind}"
+                    );
+                    let prerequisite =
+                        workspace_target_paths(kind, "bin", testable, false, selection);
+                    assert!(
+                        prerequisite.require_workspace_execution(&custom).is_err(),
+                        "{kind}"
+                    );
+                    for mutation in 0..4 {
+                        let mut invalid = custom.clone();
+                        match mutation {
+                            0 => invalid.invocation.cfgs.clear(),
+                            1 => invalid.invocation.emit.push("link".into()),
+                            2 => invalid
+                                .invocation
+                                .passthrough
+                                .push("--future-output-option".into()),
+                            _ => invalid.invocation.features.clear(),
+                        }
+                        assert!(
+                            selected.require_workspace_execution(&invalid).is_err(),
+                            "{kind}, mutation {mutation}"
+                        );
+                    }
+                }
+            }
+        }
+        for (kind, crate_type) in [("lib", "lib"), ("bin", "bin"), ("example", "bin")] {
+            let ordinary = workspace_target_paths_with_check_roots(
+                kind,
+                crate_type,
+                true,
+                true,
+                Some(&all_targets),
+                true,
+            );
+            assert!(
+                ordinary.require_workspace_execution(&custom).is_err(),
+                "ordinary {kind} roots cannot authorize an implicit custom harness"
+            );
         }
     }
 
@@ -1122,6 +1211,7 @@ mod tests {
         for workspace in [
             workspace_metadata_plan(Some("bin"), false),
             workspace_metadata_plan(None, true),
+            workspace_metadata_plan_with_test_cfg(None, false, true),
         ] {
             request.plan = workspace.clone();
             assert!(request.verify_output_contract().is_ok());

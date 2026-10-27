@@ -1185,7 +1185,9 @@ The same configured worker pool can execute the project's own compilation
 units, including primary packages and local path dependencies. Canonical
 `build` and the library-compilation portions of `test` support ordinary Rust
 libraries. Canonical `check` additionally supports binaries, examples,
-integration tests, library and binary test harnesses, and benchmark targets:
+integration tests, library and binary test harnesses, and benchmark targets.
+Custom `harness = false` tests and benchmarks use Cargo's actual `--cfg test`
+arguments without inventing a crate type or adding `--test`:
 
 ```sh
 cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace --all-targets
@@ -1193,14 +1195,19 @@ cargo rabs --rabs-canonical-local ./canonical-compile.json -- check --workspace 
 
 The coordinator matches each request to Cargo's retained selected unit graph:
 package, source, crate name/type, compilation mode, target and features must
-agree. Test harness checks additionally bind the trusted command's target
-selection and selected root units. Ordinary wrapper requests cannot enable
-this path by supplying canonical-looking names.
+agree. Cargo can serialize ordinary and test-harness graph rows identically,
+so graph membership alone does not attest an exact harness mode. Harness checks
+also bind the trusted command's target selection and selected root units;
+custom harnesses require selected integration-test or benchmark roots. The
+actual compiler arguments are independently bound into each execution identity.
+Ordinary wrapper requests cannot enable this path by supplying canonical-looking
+names.
 
-This uses the separately negotiated `canonical-workspace-exec-v1` context.
+This uses the separately negotiated `canonical-workspace-exec-v2` context.
 Workers must advertise that version and the requested `metadata` or `rlib`
-mode. Matching binaries and the worker setup above are sufficient; there is no
-new cache-enablement switch. Unsupported units continue through Cargo's
+mode; update both coordinator and worker binaries together. Matching binaries
+and the worker setup above are sufficient; there is no new cache-enablement
+switch. Unsupported units continue through Cargo's
 ordinary compiler path. Binary and harness checks require exactly metadata and
 dep-info outputs. Their legitimate empty `.rmeta` files are retained and
 installed; no executable is linked, and no test or benchmark body runs during

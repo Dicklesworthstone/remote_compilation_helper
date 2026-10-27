@@ -32,7 +32,9 @@ pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exe
 /// Fresh execution of a Cargo-selected workspace compilation. This separately
 /// negotiated context carries the complete retained workspace directory tree;
 /// it grants no dependency-cache or workspace-result publication authority.
-pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-v1";
+/// Version 2 includes binary, example, standard harness and custom test/bench
+/// metadata compilation while preserving the exact compiler arguments.
+pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-v2";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -3139,6 +3141,11 @@ mod tests {
             )
             .unwrap();
         }
+        std::fs::write(
+            source.join("member/tests/custom.rs"),
+            "const _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: &str = include_str!(\"../../shared.txt\");\nfn main() { panic!(\"metadata checking must not execute custom harnesses\"); }\n",
+        )
+        .unwrap();
         let runtime = crate::runtime_cohort::retain_runtime_cohort(
             &toolchain.join("bin/rustc"),
             &toolchain,
@@ -3148,16 +3155,42 @@ mod tests {
             || false,
         )
         .unwrap();
-        for (name, relative, crate_type, test) in [
-            ("workspace_bin", "member/src/main.rs", Some("bin"), false),
+        for (name, relative, crate_type, test, custom_harness) in [
+            (
+                "workspace_bin",
+                "member/src/main.rs",
+                Some("bin"),
+                false,
+                false,
+            ),
             (
                 "workspace_example",
                 "member/examples/demo.rs",
                 Some("bin"),
                 false,
+                false,
             ),
-            ("workspace_integration", "member/tests/check.rs", None, true),
-            ("workspace_unit", "member/src/main.rs", Some("lib"), true),
+            (
+                "workspace_integration",
+                "member/tests/check.rs",
+                None,
+                true,
+                false,
+            ),
+            (
+                "workspace_unit",
+                "member/src/main.rs",
+                Some("lib"),
+                true,
+                false,
+            ),
+            (
+                "workspace_custom",
+                "member/tests/custom.rs",
+                None,
+                false,
+                true,
+            ),
         ] {
             let destination = output.join(name);
             std::fs::create_dir(&destination).unwrap();
@@ -3188,6 +3221,9 @@ mod tests {
             }
             if test {
                 args.push("--test".into());
+            }
+            if custom_harness {
+                args.push("--cfg=test".into());
             }
             let launch = build_workspace_dependency_argv(
                 &context,

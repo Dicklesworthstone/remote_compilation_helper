@@ -28,8 +28,8 @@ const COMPILER: &str = "/__rabs/toolchain/bin/rustc";
 const TOOLCHAIN: &str = "/__rabs/toolchain";
 const TARGET: &str = "/__rabs/out/cargo";
 const POLICY_DOMAIN: &str = "rabs.canonical-workspace-execution.isolation.v1";
-pub(super) const WORKSPACE_EXECUTION_PROFILE: &str = "canonical-workspace-execution-only-v1: \
-    canonical-workspace-exec-v1 explicitly negotiated; one fresh independently \
+pub(super) const WORKSPACE_EXECUTION_PROFILE: &str = "canonical-workspace-execution-only-v2: \
+    canonical-workspace-exec-v2 explicitly negotiated; one fresh independently \
     supervised worker rustc for a coordinator-retained Cargo-selected compilation; \
     exact canonical argv, working directory, manifest directory, complete \
     presented environment including primary-package and lint behavior; complete \
@@ -38,7 +38,9 @@ pub(super) const WORKSPACE_EXECUTION_PROFILE: &str = "canonical-workspace-execut
     independently retained toolchain and measured ELF runtime; exact read-only \
     Rust metadata/archive candidate inventories; fresh private output, HOME and \
     temporary storage; library metadata or closed pure-Rust archive mode, binary \
-    and test-harness metadata with exact dep-info and required possibly empty rmeta, \
+    and standard or custom test/bench harness metadata with exact dep-info and \
+    required possibly empty rmeta; exact --test, cfg and crate-type presence \
+    retained and matched against the driver's selected target families and roots; \
     no binary/test linking or test execution; no native link \
     inputs, executable externs, incremental state or coordinator control socket; \
     authenticated request-owned receipt and drained process group required; \
@@ -258,7 +260,7 @@ pub fn remote_workspace_execution_key(
         retained_toolchain_sha256,
         runtime,
     )?;
-    key.descriptor.key_epoch = 1;
+    key.descriptor.key_epoch = 2;
     key.descriptor.projection_epoch = 1;
     key.descriptor.action_class = ActionClass::RustcWorkspaceCompile;
     // Every presented value participates here, including wrapper/jobserver
@@ -482,6 +484,7 @@ mod tests {
         for shape in [
             vec!["--crate-type=bin"],
             vec!["--test"],
+            vec!["--cfg", "test"],
             vec!["--test", "--crate-type=lib"],
             vec!["--test", "--crate-type=rlib"],
             vec!["--test", "--crate-type=bin"],
@@ -497,6 +500,8 @@ mod tests {
             let inputs = inputs(&plan);
             let directories = directories(&plan);
             let key = key(&plan, &inputs).unwrap();
+            assert_eq!(key.descriptor.key_epoch, 2);
+            assert_eq!(key.descriptor.projection_epoch, 1);
             assert_eq!(
                 key.descriptor.action_class,
                 ActionClass::RustcWorkspaceCompile

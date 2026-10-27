@@ -156,11 +156,12 @@ fn workspace_decoder_preserves_primary_environment_relative_argv_and_both_input_
 
 #[test]
 fn workspace_metadata_decoder_accepts_bins_and_harnesses_with_exact_output_names() {
-    for (crate_type, harness) in [
-        (Some("bin"), false),
-        (Some("bin"), true),
-        (Some("lib"), true),
-        (None, true),
+    for (crate_type, harness, custom_harness) in [
+        (Some("bin"), false, false),
+        (Some("bin"), true, false),
+        (Some("lib"), true, false),
+        (None, true, false),
+        (None, false, true),
     ] {
         let mut wire = canonical_workspace_request(false);
         let mut args = vec![
@@ -175,15 +176,15 @@ fn workspace_metadata_decoder_accepts_bins_and_harnesses_with_exact_output_names
         if harness {
             args.push("--test".into());
         }
+        if custom_harness {
+            args.push("--cfg=test".into());
+        }
         wire["args"] = json!(args);
         let parsed = parse_exec_request(&wire).unwrap();
         assert_eq!(parsed.args, args);
-        assert!(
-            parsed
-                .dependency_context
-                .unwrap()
-                .workspace_execution_only()
-        );
+        let context = parsed.dependency_context.unwrap();
+        assert!(context.workspace_execution_only());
+        assert_eq!(context.version(), "canonical-workspace-exec-v2");
 
         let mut missing_metadata = wire.clone();
         missing_metadata["artifacts"]["files"] = json!(["leaf.d"]);
@@ -191,6 +192,18 @@ fn workspace_metadata_decoder_accepts_bins_and_harnesses_with_exact_output_names
         let mut invented_binary = wire.clone();
         invented_binary["artifacts"]["files"] = json!(["leaf.d", "libleaf.rmeta", "leaf"]);
         assert!(parse_exec_request(&invented_binary).is_err());
+        let mut invented_archive = wire.clone();
+        invented_archive["artifacts"]["files"] = json!(["leaf.d", "libleaf.rlib"]);
+        assert!(parse_exec_request(&invented_archive).is_err());
+
+        let mut dependency = canonical_dependency_request();
+        let mut dependency_args = args.clone();
+        dependency_args[3] = "src/lib.rs".into();
+        dependency["args"] = json!(dependency_args);
+        assert!(
+            parse_exec_request(&dependency).is_err(),
+            "workspace metadata forms cannot borrow dependency authority"
+        );
 
         // A metadata-only admission never permits a final binary or harness
         // link, even when the namespace version and source remain unchanged.
@@ -198,15 +211,6 @@ fn workspace_metadata_decoder_accepts_bins_and_harnesses_with_exact_output_names
         wire["args"] = json!(args);
         assert!(parse_exec_request(&wire).is_err());
     }
-    let mut dependency = canonical_dependency_request();
-    dependency["args"] = json!([
-        "--crate-name=leaf",
-        "--crate-type=bin",
-        "--emit=dep-info,metadata",
-        "--out-dir=/__rabs/out/cargo/debug/deps",
-        "src/lib.rs",
-    ]);
-    assert!(parse_exec_request(&dependency).is_err());
 }
 
 #[test]
@@ -214,6 +218,7 @@ fn workspace_decoder_requires_its_exact_profile_and_complete_directory_shape() {
     let valid = canonical_workspace_request(false);
     for (field, value) in [
         ("version", json!(CANONICAL_DEPENDENCY_CONTEXT_VERSION)),
+        ("version", json!("canonical-workspace-exec-v1")),
         ("source_root", json!("/__rabs/workspace/member")),
         ("source_directories", Value::Null),
         ("source_directories", json!(["member/src"])),
@@ -1532,6 +1537,7 @@ fn workspace_execution_requires_its_own_negotiated_version_in_both_modes() {
         for version in [
             DEPENDENCY_CONTEXT_VERSION,
             CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            "canonical-workspace-exec-v1",
         ] {
             assert!(
                 validate_execution_selection(

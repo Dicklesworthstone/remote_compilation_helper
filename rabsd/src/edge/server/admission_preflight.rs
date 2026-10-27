@@ -346,11 +346,12 @@ mod tests {
     fn workspace_metadata_bins_and_harnesses_do_not_borrow_dependency_or_link_authority() {
         use rabs_key::live_dependency::workspace_execution::plan_canonical_workspace_execution;
 
-        for (crate_type, harness) in [
-            (Some("bin"), false),
-            (Some("bin"), true),
-            (Some("lib"), true),
-            (None, true),
+        for (crate_type, harness, test_cfg) in [
+            (Some("bin"), false, false),
+            (Some("bin"), true, false),
+            (Some("lib"), true, false),
+            (None, true, false),
+            (None, false, true),
         ] {
             let mut argv = vec![
                 "/__rabs/toolchain/bin/rustc".into(),
@@ -365,6 +366,9 @@ mod tests {
             }
             if harness {
                 argv.push("--test".into());
+            }
+            if test_cfg {
+                argv.extend(["--cfg".into(), "test".into()]);
             }
             let env = vec![
                 ("HOME".into(), "/__rabs/home".into()),
