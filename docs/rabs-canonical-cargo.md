@@ -1188,21 +1188,24 @@ its stored files are never mounted writable. Unchanged captured source files
 receive their previous timestamps in a separate runtime workspace. Eligible
 local source/data edits are stamped after every retained fingerprint; removed
 or renamed inputs also dirty their surviving parent directories and manifests.
-Cargo then decides which units rebuild. Ordinary build/check, package and
-feature selections can reuse compatible state; toolchain, target/profile,
+Cargo then decides which units rebuild. Compiler-only checks can retain this
+source-edit family. Identical captured inputs can also reuse compatible build,
+package and feature selections; toolchain, target/profile,
 runtime epoch, lockfile, manifest, configuration and captured dependency changes
 separate the seed family. Immutable registry/Git/vendor inputs remain exact.
 This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
 
-Selected graphs with build scripts or procedural macros use the **complete
-captured source identity** for private target reuse. An unchanged capture can
+Code-generating builds and selected graphs with build scripts or procedural
+macros use the **complete captured source identity** for private target reuse. An unchanged capture can
 reuse its verified target, but any captured file edit starts that graph with a
 cold target. Procedural macros may read data through ordinary filesystem calls
 that do not appear in rustc's dependency information; changing only such a file
 must invalidate the prior expansion even when Cargo would otherwise report the
-consumer as fresh. The more selective source-edit reuse above remains available
-to graphs containing only ordinary compiler units.
+consumer as fresh. Pure Rust codegen has a similar gap: LLVM assembler
+`.incbin` reads can embed data without reporting it in rustc's dep-info.
+Changing only that data must not return an old archive or executable. The more
+selective source-edit reuse above remains available to compiler-only checks.
 
 The `canonical-compilation-started` stderr record reports
 `private_target_state` as `disabled`, `cold` or `restored`. A failed optional

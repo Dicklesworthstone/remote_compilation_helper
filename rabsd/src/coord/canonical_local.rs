@@ -761,16 +761,18 @@ impl TargetReuseContext<'_> {
             .ok_or_else(|| invalid("private target requires a captured toolchain"))?;
         let args = compatible_arguments(CARGO, self.args, CargoArtifactMode::Compilation)
             .unwrap_or_else(|| self.args.to_vec());
-        // Build scripts and procedural macros can read captured source/data
-        // without reporting it to Cargo or rustc dep-info. Retiming an edited
-        // file cannot dirty a unit that never declared that file. Such graphs
-        // may reuse an identical snapshot, but every captured source change
-        // must select a cold target until their complete reads are tracked.
-        let source = if self.closed_dependency_execution {
-            self.full_source
-        } else {
+        // Build scripts, procedural macros and LLVM's assembler can read
+        // captured data without reporting it to Cargo or rustc dep-info.
+        // Retiming a file cannot dirty a unit that never declared that file:
+        // even a pure Rust build can embed an untracked global_asm! .incbin.
+        // Source-edit families therefore require a compiler-only check. All
+        // codegen and project-executor graphs keep their complete source key.
+        let metadata_only = self.args.first().is_some_and(|command| command == "check");
+        let source = if metadata_only && !self.closed_dependency_execution {
             source_edit_identity(self.workspace, self.full_source, self.projection)
                 .unwrap_or(self.full_source)
+        } else {
+            self.full_source
         };
         let mut ro: Vec<_> = self
             .spec
@@ -1468,7 +1470,7 @@ mod tests {
                     landlock: false,
                 },
                 args: [
-                    "build",
+                    "check",
                     "--offline",
                     "--locked",
                     "--manifest-path",
@@ -1527,11 +1529,10 @@ mod tests {
     }
 
     #[test]
-    fn private_target_key_reuses_only_cargo_compatible_commands_selections_and_source_edits() {
+    fn private_target_key_reuses_only_metadata_check_selections_and_source_edits() {
         let fixture = ReuseKeyFixture::new();
         let original = fixture.key();
         let mut changed = ReuseKeyFixture::new();
-        changed.args[0] = "check".into();
         changed
             .args
             .extend(["--features".into(), "extra".into(), "--lib".into()]);
@@ -1551,6 +1552,50 @@ mod tests {
         let mut changed = ReuseKeyFixture::new();
         *changed.args.last_mut().unwrap() = "4".into();
         assert_ne!(changed.key(), original, "job grant is an exact input");
+    }
+
+    #[test]
+    fn private_target_codegen_binds_data_that_assembler_dep_info_does_not_track() {
+        use rabs_sandbox::source_transfer::SourceFile;
+
+        let with_payload = |bytes: &[u8]| {
+            let mut files = ReuseKeyFixture::new().source.files().to_vec();
+            files.push(SourceFile {
+                path: "assembly-payload.bin".into(),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(bytes).into(),
+                executable: false,
+            });
+            SourceManifest::new(files).unwrap()
+        };
+        let mut build = ReuseKeyFixture::new();
+        build.args[0] = "build".into();
+        build.source = with_payload(b"first embedded payload");
+        let original = build.key();
+        build
+            .args
+            .extend(["--lib".into(), "--features".into(), "fast".into()]);
+        assert_eq!(
+            build.key(),
+            original,
+            "identical source still shares Cargo selections"
+        );
+        build.source = with_payload(b"other embedded payload");
+        assert_ne!(
+            build.key(),
+            original,
+            "untracked assembler data must invalidate codegen"
+        );
+
+        // A build must not import a check's normalized source-edit seed and
+        // thereby inherit codegen outputs from an earlier build in that family.
+        let mut check = ReuseKeyFixture::new();
+        check.source = with_payload(b"first embedded payload");
+        assert_ne!(
+            check.key(),
+            original,
+            "check and codegen source policies are separate"
+        );
     }
 
     #[test]
